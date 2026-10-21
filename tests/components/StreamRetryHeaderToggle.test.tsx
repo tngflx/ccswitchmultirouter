@@ -1,19 +1,26 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { StreamRetryHeaderToggle } from "@/components/proxy/StreamRetryHeaderToggle";
 
-const { patch, query } = vi.hoisted(() => ({
-  patch: vi.fn(),
-  query: vi.fn(),
-}));
+const { patch, get, query, showError, cancelQueries, setQueryData } =
+  vi.hoisted(() => ({
+    patch: vi.fn(),
+    get: vi.fn(),
+    query: vi.fn(),
+    showError: vi.fn(),
+    cancelQueries: vi.fn(),
+    setQueryData: vi.fn(),
+  }));
+
+vi.mock("sonner", () => ({ toast: { error: showError } }));
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
 vi.mock("@tanstack/react-query", () => ({
-  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
+  useQueryClient: () => ({ cancelQueries, setQueryData }),
 }));
 
 vi.mock("@/lib/query", () => ({
@@ -21,7 +28,7 @@ vi.mock("@/lib/query", () => ({
 }));
 
 vi.mock("@/lib/api", () => ({
-  settingsApi: { patch },
+  settingsApi: { patch, get },
 }));
 
 const settings = {
@@ -38,6 +45,12 @@ beforeEach(() => {
   });
   patch.mockReset();
   patch.mockResolvedValue(undefined);
+  get.mockReset();
+  get.mockResolvedValue(settings);
+  cancelQueries.mockReset();
+  cancelQueries.mockResolvedValue(undefined);
+  setQueryData.mockReset();
+  showError.mockReset();
 });
 
 describe("StreamRetryHeaderToggle", () => {
@@ -61,6 +74,25 @@ describe("StreamRetryHeaderToggle", () => {
       streamRetryMode: "safe",
       enableStreamRetry: true,
     });
+  });
+
+  it("reports a failed retry policy save and allows another attempt", async () => {
+    patch.mockRejectedValueOnce(new Error("settings write failed"));
+    const user = userEvent.setup();
+    render(<StreamRetryHeaderToggle />);
+
+    await user.click(screen.getByRole("switch"));
+
+    await waitFor(() =>
+      expect(showError).toHaveBeenCalledWith("settings.saveFailedGeneric"),
+    );
+    expect(screen.getByRole("switch")).not.toBeChecked();
+    expect(screen.getByRole("switch")).toBeEnabled();
+    expect(setQueryData).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("switch"));
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(2));
+    expect(showError).toHaveBeenCalledTimes(1);
+    expect(setQueryData).toHaveBeenCalledTimes(1);
   });
 
   it("persists aggressive mode and the compatibility flag together", async () => {

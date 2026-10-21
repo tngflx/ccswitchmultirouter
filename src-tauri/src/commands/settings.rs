@@ -603,6 +603,72 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn stream_retry_policy_survives_reload_and_stale_general_saves() {
+        use crate::settings::StreamRetryMode;
+
+        let home = crate::config::TestHomeGuard::new();
+        let initial = AppSettings {
+            language: Some("en".to_string()),
+            ..AppSettings::default()
+        };
+        crate::settings::update_settings(initial.clone()).expect("persist initial settings");
+
+        super::patch_settings(SettingsPatch {
+            enable_stream_retry: Some(true),
+            stream_retry_mode: Some(StreamRetryMode::Aggressive),
+            stream_retry_max_attempts: Some(2),
+            ..SettingsPatch::default()
+        })
+        .await
+        .expect("enable continuation through the dedicated retry control");
+        crate::settings::reload_settings().expect("reload retry policy");
+        assert_eq!(crate::settings::get_settings().stream_recovery_budget(), 2);
+
+        let mut stale_form = initial;
+        stale_form.language = Some("ja".to_string());
+        crate::settings::update_settings_preserving_dedicated_settings(stale_form.clone())
+            .expect("save unrelated General setting from a stale form");
+        crate::settings::reload_settings().expect("reload after unrelated General save");
+
+        let persisted: AppSettings = serde_json::from_slice(
+            &std::fs::read(home.path().join(".cc-switch/settings.json"))
+                .expect("read durable settings"),
+        )
+        .expect("parse durable settings");
+        assert_eq!(persisted.stream_retry_mode, StreamRetryMode::Aggressive);
+        assert!(persisted.enable_stream_retry);
+        assert_eq!(persisted.stream_retry_max_attempts, 2);
+        assert_eq!(persisted.stream_recovery_budget(), 2);
+        assert_eq!(persisted.language.as_deref(), Some("ja"));
+
+        // Deliberate retry policy changes still belong to the patch command.
+        // A stale full form cannot re-enable recovery after it has been stopped.
+        for (mode, enabled, budget) in [
+            (StreamRetryMode::Off, false, 0),
+            (StreamRetryMode::Safe, true, 0),
+            (StreamRetryMode::Aggressive, true, 3),
+        ] {
+            super::patch_settings(SettingsPatch {
+                enable_stream_retry: Some(enabled),
+                stream_retry_mode: Some(mode),
+                stream_retry_max_attempts: Some(3),
+                ..SettingsPatch::default()
+            })
+            .await
+            .expect("persist intentional retry policy change");
+            crate::settings::update_settings_preserving_dedicated_settings(stale_form.clone())
+                .expect("save unrelated stale form after retry policy change");
+            crate::settings::reload_settings().expect("reload intentional retry policy");
+            let current = crate::settings::get_settings();
+            assert_eq!(current.stream_retry_mode, mode);
+            assert_eq!(current.enable_stream_retry, enabled);
+            assert_eq!(current.stream_retry_max_attempts, 3);
+            assert_eq!(current.stream_recovery_budget(), budget);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn request_health_master_switch_survives_reload_and_stale_general_saves() {
         use crate::settings::{
             RequestHealthConfig, RequestHealthReviewMode, RequestOptimizationMode,

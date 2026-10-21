@@ -3,10 +3,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { UsageHero } from "@/components/usage/UsageHero";
 
 const useUsageSummaryByAppMock = vi.hoisted(() => vi.fn());
+const useUsageRecentRateMock = vi.hoisted(() => vi.fn());
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
-    t: (key: string, fallback?: string) => fallback ?? key,
+    t: (key: string, fallback?: string, values?: { count: number }) =>
+      (fallback ?? key).replace("{{count}}", String(values?.count)),
     i18n: { resolvedLanguage: "en", language: "en" },
   }),
 }));
@@ -20,6 +22,7 @@ vi.mock("framer-motion", () => ({
 vi.mock("@/lib/query/usage", () => ({
   useUsageSummaryByApp: (...args: unknown[]) =>
     useUsageSummaryByAppMock(...args),
+  useUsageRecentRate: (...args: unknown[]) => useUsageRecentRateMock(...args),
 }));
 
 const summary = {
@@ -46,6 +49,18 @@ const renderHero = (appType: string) =>
 describe("UsageHero cache-write availability", () => {
   beforeEach(() => {
     useUsageSummaryByAppMock.mockReset();
+    useUsageRecentRateMock.mockReset();
+    useUsageRecentRateMock.mockReturnValue({
+      data: {
+        inputTokens: 0,
+        outputTokens: 0,
+        inputTokensPerSecond: 0,
+        outputTokensPerSecond: 0,
+        windowSeconds: 300,
+      },
+      isLoading: false,
+      isError: false,
+    });
   });
 
   it("marks mixed-protocol Pi usage as partial", () => {
@@ -85,5 +100,90 @@ describe("UsageHero cache-write availability", () => {
     expect(
       screen.getByTitle("OpenAI 协议不区分缓存写入，仅上报缓存命中"),
     ).toBeInTheDocument();
+  });
+
+  it("shows the rolling input and output rates while historical totals are loading", () => {
+    useUsageSummaryByAppMock.mockReturnValue({ data: [], isLoading: true });
+    useUsageRecentRateMock.mockReturnValue({
+      data: {
+        inputTokens: 600,
+        outputTokens: 300,
+        inputTokensPerSecond: 2,
+        outputTokensPerSecond: 1,
+        windowSeconds: 300,
+      },
+      isLoading: false,
+      isError: false,
+    });
+
+    renderHero("all");
+
+    expect(screen.getByText("2 tok/s")).toBeInTheDocument();
+    expect(screen.getByText("1 tok/s")).toBeInTheDocument();
+  });
+
+  it("does not show stale rate data after a failed refresh", () => {
+    useUsageSummaryByAppMock.mockReturnValue({ data: [], isLoading: false });
+    useUsageRecentRateMock.mockReturnValue({
+      data: {
+        inputTokens: 600,
+        outputTokens: 300,
+        inputTokensPerSecond: 2,
+        outputTokensPerSecond: 1,
+        windowSeconds: 300,
+      },
+      isLoading: false,
+      isError: true,
+    });
+
+    renderHero("all");
+
+    expect(screen.queryByText("2 tok/s")).not.toBeInTheDocument();
+    expect(screen.queryByText("1 tok/s")).not.toBeInTheDocument();
+    expect(screen.getAllByText("--").length).toBeGreaterThan(0);
+  });
+
+  it.each([0, 5000])(
+    "uses the dashboard refresh setting %s for the scoped recent query",
+    (refreshIntervalMs) => {
+      useUsageSummaryByAppMock.mockReturnValue({ data: [], isLoading: false });
+      render(
+        <UsageHero
+          range={{ preset: "today" }}
+          appType="claude"
+          providerName="selected-provider"
+          model="selected-model"
+          refreshIntervalMs={refreshIntervalMs}
+        />,
+      );
+
+      expect(useUsageRecentRateMock).toHaveBeenLastCalledWith(
+        "claude",
+        "selected-provider",
+        "selected-model",
+        { refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false },
+      );
+      expect(useUsageSummaryByAppMock).toHaveBeenLastCalledWith(
+        { preset: "today" },
+        { providerName: "selected-provider", model: "selected-model" },
+        { refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false },
+      );
+    },
+  );
+
+  it("keeps rate values unavailable until the initial recent query completes", () => {
+    useUsageSummaryByAppMock.mockReturnValue({ data: [], isLoading: false });
+    useUsageRecentRateMock.mockReturnValue({
+      data: undefined,
+      isLoading: true,
+      isError: false,
+    });
+
+    renderHero("all");
+
+    expect(screen.getByText("Last 5 min input rate")).toBeInTheDocument();
+    expect(screen.getByText("Last 5 min output rate")).toBeInTheDocument();
+    expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
+    expect(screen.getAllByText("--").length).toBeGreaterThanOrEqual(2);
   });
 });

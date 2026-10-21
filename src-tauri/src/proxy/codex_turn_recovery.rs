@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::providers::codex_terminal::{
-    classify_native_responses_terminal, NativeResponsesEvidence, NativeResponsesTerminalDisposition,
+    classify_native_responses_terminal, terminal_error_code, terminal_error_code_from_body,
+    NativeResponsesEvidence, NativeResponsesTerminalDisposition,
 };
 use super::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
 
@@ -41,20 +42,33 @@ pub(crate) struct TurnRecoveryContext {
 #[derive(Debug)]
 struct RecoveryState {
     submitted: u32,
-    in_flight: bool,
+    phase: RecoveryPhase,
     updated_at: Instant,
     tracked: Option<TurnRecoveryContext>,
-    active: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum RecoveryPhase {
+    #[default]
+    Idle,
+    ActiveRequest,
+    ToolStepComplete,
+    ReservedRecovery,
+    CommittingRecovery,
+    // Acknowledged or ambiguous submission, or cancelled queued recovery with
+    // an already-spent budget. Keep the budget for the next continuation, but
+    // never replay this old failed turn after a process restart.
+    AwaitingContinuation,
 }
 
 impl Default for RecoveryState {
     fn default() -> Self {
         Self {
             submitted: 0,
-            in_flight: false,
+            phase: RecoveryPhase::Idle,
             updated_at: Instant::now(),
             tracked: None,
-            active: false,
         }
     }
 }
@@ -77,43 +91,34 @@ fn reserve_recovery(context: &TurnRecoveryContext) -> Option<u32> {
     let mut states = recovery_states().lock().ok()?;
     states.retain(|_, state| now.duration_since(state.updated_at) <= RECOVERY_STATE_TTL);
     let state = states.entry(context.desktop_thread_id.clone()).or_default();
+    if state.phase == RecoveryPhase::AwaitingContinuation
+        && state
+            .tracked
+            .as_ref()
+            .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
+    {
+        return None;
+    }
     if state.tracked.as_ref().is_some_and(|tracked| {
         tracked.recovery_id != context.recovery_id
-            && (state.active || tracked.observed_at_ms >= context.observed_at_ms)
+            && (state.phase == RecoveryPhase::ActiveRequest
+                || tracked.observed_at_ms >= context.observed_at_ms)
     }) {
         return None;
     }
-    if state.in_flight || state.submitted >= context.max_recoveries {
+    if matches!(
+        state.phase,
+        RecoveryPhase::ReservedRecovery | RecoveryPhase::CommittingRecovery
+    ) || state.submitted >= context.max_recoveries
+    {
         return None;
     }
-    state.in_flight = true;
+    state.phase = RecoveryPhase::ReservedRecovery;
     state.tracked = Some(context.clone());
-    state.active = false;
     state.updated_at = now;
     let attempt = state.submitted.saturating_add(1);
     persist_states(&states);
     Some(attempt)
-}
-
-#[cfg(test)]
-fn finish_recovery(session_id: &str, submitted: bool) -> u32 {
-    let Ok(mut states) = recovery_states().lock() else {
-        return 0;
-    };
-    let Some(state) = states.get_mut(session_id) else {
-        return 0;
-    };
-    if submitted && state.in_flight {
-        state.submitted = state.submitted.saturating_add(1);
-    }
-    state.in_flight = false;
-    state.updated_at = Instant::now();
-    if submitted && !state.active {
-        state.tracked = None;
-    }
-    let submitted = state.submitted;
-    persist_states(&states);
-    submitted
 }
 
 pub(crate) fn mark_turn_completed(session_id: &str) {
@@ -126,10 +131,11 @@ pub(crate) fn mark_turn_completed(session_id: &str) {
 pub(crate) fn mark_observed_turn_completed(context: &TurnRecoveryContext) {
     if let Ok(mut states) = recovery_states().lock() {
         let owned = states.get(&context.desktop_thread_id).is_some_and(|state| {
-            state
-                .tracked
-                .as_ref()
-                .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
+            state.phase != RecoveryPhase::AwaitingContinuation
+                && state
+                    .tracked
+                    .as_ref()
+                    .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
         });
         if owned {
             states.remove(&context.desktop_thread_id);
@@ -141,18 +147,18 @@ pub(crate) fn mark_observed_turn_completed(context: &TurnRecoveryContext) {
 fn mark_observed_tool_step_completed(context: &TurnRecoveryContext) {
     if let Ok(mut states) = recovery_states().lock() {
         if let Some(state) = states.get_mut(&context.desktop_thread_id) {
-            if state
-                .tracked
-                .as_ref()
-                .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
+            if state.phase != RecoveryPhase::AwaitingContinuation
+                && state
+                    .tracked
+                    .as_ref()
+                    .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
             {
                 // A successful tool step hands control back to the Desktop's
                 // tool loop. Its next request is still the same user turn.
                 // Keep crash evidence across the gap between delivering a
                 // completed tool item and the next tool-result request. A
                 // final assistant response or explicit cancellation clears it.
-                state.active = false;
-                state.in_flight = false;
+                state.phase = RecoveryPhase::ToolStepComplete;
                 state.updated_at = Instant::now();
                 persist_states(&states);
             }
@@ -166,9 +172,9 @@ pub(crate) fn begin_turn(session_id: &str, is_continuation: bool) {
     if is_continuation {
         if let Ok(mut states) = recovery_states().lock() {
             if let Some(state) = states.get_mut(session_id) {
-                if state.in_flight {
+                if state.phase == RecoveryPhase::CommittingRecovery {
                     state.submitted = state.submitted.saturating_add(1);
-                    state.in_flight = false;
+                    state.phase = RecoveryPhase::AwaitingContinuation;
                 }
                 state.updated_at = Instant::now();
             }
@@ -185,14 +191,75 @@ fn recovery_is_active(context: &TurnRecoveryContext) -> bool {
         .ok()
         .and_then(|states| {
             states.get(&context.desktop_thread_id).map(|state| {
-                state.in_flight
-                    && state
-                        .tracked
-                        .as_ref()
-                        .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
+                matches!(
+                    state.phase,
+                    RecoveryPhase::ReservedRecovery | RecoveryPhase::CommittingRecovery
+                ) && state
+                    .tracked
+                    .as_ref()
+                    .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
             })
         })
         .unwrap_or(false)
+}
+
+fn authorize_reserved_recovery(context: &TurnRecoveryContext) -> bool {
+    let Ok(mut states) = recovery_states().lock() else {
+        return false;
+    };
+    let Some(state) = states.get_mut(&context.desktop_thread_id) else {
+        return false;
+    };
+    if !matches!(
+        state.phase,
+        RecoveryPhase::ReservedRecovery | RecoveryPhase::CommittingRecovery
+    ) || state
+        .tracked
+        .as_ref()
+        .is_none_or(|tracked| tracked.recovery_id != context.recovery_id)
+    {
+        return false;
+    }
+    state.phase = RecoveryPhase::CommittingRecovery;
+    state.updated_at = Instant::now();
+    persist_states(&states);
+    true
+}
+
+#[cfg(test)]
+pub(crate) fn authorize_recovery_commit_for_test(context: &TurnRecoveryContext) -> bool {
+    authorize_reserved_recovery(context)
+}
+
+fn recovery_commit_started(context: &TurnRecoveryContext) -> bool {
+    recovery_states().lock().ok().is_some_and(|states| {
+        states.get(&context.desktop_thread_id).is_some_and(|state| {
+            state.phase == RecoveryPhase::CommittingRecovery
+                && state
+                    .tracked
+                    .as_ref()
+                    .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
+        })
+    })
+}
+
+fn release_refused_recovery_commit(context: &TurnRecoveryContext) {
+    let Ok(mut states) = recovery_states().lock() else {
+        return;
+    };
+    let Some(state) = states.get_mut(&context.desktop_thread_id) else {
+        return;
+    };
+    if state.phase == RecoveryPhase::CommittingRecovery
+        && state
+            .tracked
+            .as_ref()
+            .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
+    {
+        state.phase = RecoveryPhase::ReservedRecovery;
+        state.updated_at = Instant::now();
+        persist_states(&states);
+    }
 }
 
 fn finish_reserved_recovery(context: &TurnRecoveryContext, submitted: bool) -> u32 {
@@ -202,25 +269,55 @@ fn finish_reserved_recovery(context: &TurnRecoveryContext, submitted: bool) -> u
     let Some(state) = states.get_mut(&context.desktop_thread_id) else {
         return 0;
     };
-    if !state.in_flight
-        || state
-            .tracked
-            .as_ref()
-            .is_none_or(|tracked| tracked.recovery_id != context.recovery_id)
+    if !matches!(
+        state.phase,
+        RecoveryPhase::ReservedRecovery | RecoveryPhase::CommittingRecovery
+    ) || state
+        .tracked
+        .as_ref()
+        .is_none_or(|tracked| tracked.recovery_id != context.recovery_id)
     {
         return state.submitted;
     }
-    if submitted {
+    let committed_submission = submitted && state.phase == RecoveryPhase::CommittingRecovery;
+    if committed_submission {
         state.submitted = state.submitted.saturating_add(1);
     }
-    state.in_flight = false;
+    state.phase = if committed_submission {
+        RecoveryPhase::AwaitingContinuation
+    } else {
+        RecoveryPhase::Idle
+    };
     state.updated_at = Instant::now();
-    if submitted && !state.active {
-        state.tracked = None;
-    }
     let submitted = state.submitted;
     persist_states(&states);
     submitted
+}
+
+fn cancel_reserved_recovery(context: &TurnRecoveryContext) {
+    let Ok(mut states) = recovery_states().lock() else {
+        return;
+    };
+    let Some(state) = states.get_mut(&context.desktop_thread_id) else {
+        return;
+    };
+    if !matches!(
+        state.phase,
+        RecoveryPhase::ReservedRecovery | RecoveryPhase::CommittingRecovery
+    ) || state
+        .tracked
+        .as_ref()
+        .is_none_or(|tracked| tracked.recovery_id != context.recovery_id)
+    {
+        return;
+    }
+    if state.submitted > 0 {
+        state.phase = RecoveryPhase::AwaitingContinuation;
+        state.updated_at = Instant::now();
+    } else {
+        states.remove(&context.desktop_thread_id);
+    }
+    persist_states(&states);
 }
 
 #[cfg(test)]
@@ -228,7 +325,14 @@ pub(crate) fn recovery_reserved_for_test(thread_id: &str) -> bool {
     recovery_states()
         .lock()
         .ok()
-        .and_then(|states| states.get(thread_id).map(|state| state.in_flight))
+        .and_then(|states| {
+            states.get(thread_id).map(|state| {
+                matches!(
+                    state.phase,
+                    RecoveryPhase::ReservedRecovery | RecoveryPhase::CommittingRecovery
+                )
+            })
+        })
         .unwrap_or(false)
 }
 
@@ -258,7 +362,7 @@ impl Drop for TrackedTurn {
             let owned_active = states
                 .get(&self.context.desktop_thread_id)
                 .is_some_and(|state| {
-                    state.active
+                    state.phase == RecoveryPhase::ActiveRequest
                         && state
                             .tracked
                             .as_ref()
@@ -281,12 +385,13 @@ pub(crate) fn track_turn(context: &TurnRecoveryContext) -> TrackedTurn {
         if let Ok(mut states) = recovery_states().lock() {
             let state = states.entry(context.desktop_thread_id.clone()).or_default();
             let can_claim = state.tracked.as_ref().is_none_or(|tracked| {
-                tracked.recovery_id == context.recovery_id
+                (tracked.recovery_id == context.recovery_id
+                    && state.phase != RecoveryPhase::AwaitingContinuation)
                     || context.observed_at_ms > tracked.observed_at_ms
             });
             if can_claim {
                 state.tracked = Some(context.clone());
-                state.active = true;
+                state.phase = RecoveryPhase::ActiveRequest;
                 state.updated_at = Instant::now();
                 persist_states(&states);
                 owns_state = true;
@@ -307,7 +412,7 @@ pub(crate) fn track_turn(context: &TurnRecoveryContext) -> TrackedTurn {
                     let Some(state) = states.get_mut(&heartbeat_context.desktop_thread_id) else {
                         return;
                     };
-                    if !state.active
+                    if state.phase != RecoveryPhase::ActiveRequest
                         || !state.tracked.as_ref().is_some_and(|tracked| {
                             tracked.recovery_id == heartbeat_context.recovery_id
                         })
@@ -362,6 +467,9 @@ pub(crate) fn capture_startup_recovery(
 struct PersistedTurn {
     context: TurnRecoveryContext,
     submitted: u32,
+    // Older ledgers only contain interrupted request evidence.
+    #[serde(default)]
+    phase: RecoveryPhase,
 }
 
 fn ledger_from_states(states: &HashMap<String, RecoveryState>) -> RecoveryLedger {
@@ -375,6 +483,7 @@ fn ledger_from_states(states: &HashMap<String, RecoveryState>) -> RecoveryLedger
                 (state.updated_at.elapsed() <= RECOVERY_STATE_TTL).then(|| PersistedTurn {
                     context: context.clone(),
                     submitted: state.submitted,
+                    phase: state.phase,
                 })
             })
             .collect(),
@@ -431,7 +540,7 @@ pub(crate) fn restore_after_startup(
     db: &crate::database::Database,
 ) {
     let budget = crate::settings::get_settings().stream_recovery_budget();
-    if !classification.allows_crash_recovery() || budget == 0 {
+    if !classification.allows_crash_recovery() {
         return;
     }
     let ledger = STARTUP_LEDGER
@@ -452,14 +561,23 @@ fn restore_ledger(ledger: Option<RecoveryLedger>, budget: u32, db: &crate::datab
     };
     for turn in ledger.turns {
         let mut context = turn.context;
-        context.max_recoveries = context.max_recoveries.min(budget);
+        let submitted = turn
+            .submitted
+            .saturating_add(u32::from(turn.phase == RecoveryPhase::CommittingRecovery));
+        if budget > 0 {
+            context.max_recoveries = context.max_recoveries.min(budget);
+        }
+        let dormant = matches!(
+            turn.phase,
+            RecoveryPhase::AwaitingContinuation | RecoveryPhase::CommittingRecovery
+        ) || (submitted > 0 && (budget == 0 || submitted >= context.max_recoveries));
         let provider_matches = db
             .get_provider_by_id(&context.durable_provider_id, "codex")
             .ok()
             .flatten()
             .is_some_and(|provider| durable_provider_matches(&context, &provider));
         if context.desktop_thread_id.is_empty()
-            || turn.submitted >= context.max_recoveries
+            || (!dormant && (budget == 0 || submitted >= context.max_recoveries))
             || !provider_matches
         {
             continue;
@@ -472,10 +590,19 @@ fn restore_ledger(ledger: Option<RecoveryLedger>, budget: u32, db: &crate::datab
             states.insert(
                 context.desktop_thread_id.clone(),
                 RecoveryState {
-                    submitted: turn.submitted,
+                    submitted,
+                    phase: if dormant {
+                        RecoveryPhase::AwaitingContinuation
+                    } else {
+                        RecoveryPhase::Idle
+                    },
+                    tracked: dormant.then(|| context.clone()),
                     ..RecoveryState::default()
                 },
             );
+        }
+        if dormant {
+            continue;
         }
         schedule_turn_recovery(context, "app_crash_interrupted_turn");
     }
@@ -496,10 +623,13 @@ fn durable_provider_matches(
 }
 
 #[cfg(not(test))]
-fn recovery_binding_is_current(context: &TurnRecoveryContext) -> bool {
-    crate::settings::get_settings().stream_recovery_budget() > 0
-        && crate::settings::get_current_provider(&crate::app_config::AppType::Codex).as_deref()
-            == Some(context.durable_provider_id.as_str())
+fn recovery_binding_is_current(context: &TurnRecoveryContext, next_attempt: u32) -> bool {
+    recovery_policy_allows_attempt(
+        context,
+        next_attempt,
+        crate::settings::get_settings().stream_recovery_budget(),
+    ) && crate::settings::get_current_provider(&crate::app_config::AppType::Codex).as_deref()
+        == Some(context.durable_provider_id.as_str())
         && crate::database::Database::init_readonly()
             .ok()
             .and_then(|db| {
@@ -508,6 +638,14 @@ fn recovery_binding_is_current(context: &TurnRecoveryContext) -> bool {
                     .flatten()
             })
             .is_some_and(|provider| durable_provider_matches(context, &provider))
+}
+
+fn recovery_policy_allows_attempt(
+    context: &TurnRecoveryContext,
+    next_attempt: u32,
+    current_budget: u32,
+) -> bool {
+    next_attempt > 0 && next_attempt <= context.max_recoveries && next_attempt <= current_budget
 }
 
 pub(crate) fn forward_error_is_recoverable(error: &super::error::ProxyError) -> bool {
@@ -524,11 +662,8 @@ pub(crate) fn forward_error_is_recoverable(error: &super::error::ProxyError) -> 
         ProxyError::UpstreamError { status, body } => {
             let permanent = body
                 .as_deref()
-                .map(|body| {
-                    serde_json::from_str::<Value>(body)
-                        .unwrap_or_else(|_| serde_json::json!({"error":{"message":body}}))
-                })
-                .is_some_and(|payload| !terminal_is_recoverable("response.failed", &payload));
+                .and_then(terminal_error_code_from_body)
+                .is_some();
             !permanent && (*status == 429 || (500..=599).contains(status))
         }
         // ResponsePending is an unknown still-running upstream operation;
@@ -552,11 +687,17 @@ pub(crate) fn schedule_turn_recovery(context: TurnRecoveryContext, reason: &'sta
         reason,
         next_attempt,
         |context, next_attempt| async move {
+            let authorization_context = context.clone();
             crate::codex_desktop::submit_codex_continuation(
                 &context.desktop_thread_id,
                 &format!("{}:{next_attempt}", context.recovery_id),
                 &context.desktop_model,
                 context.observed_at_ms,
+                move |final_commit| {
+                    recovery_is_active(&authorization_context)
+                        && recovery_binding_is_current(&authorization_context, next_attempt)
+                        && (!final_commit || authorize_reserved_recovery(&authorization_context))
+                },
             )
             .await
         },
@@ -574,7 +715,7 @@ async fn run_turn_recovery<Submit, SubmitFuture, Binding>(
     Submit: FnMut(TurnRecoveryContext, u32) -> SubmitFuture,
     SubmitFuture:
         std::future::Future<Output = Result<crate::codex_desktop::CodexContinuationResult, String>>,
-    Binding: Fn(&TurnRecoveryContext) -> bool,
+    Binding: Fn(&TurnRecoveryContext, u32) -> bool,
 {
     let mut last_message = String::from("Codex Desktop did not become ready");
     let deadline = tokio::time::Instant::now() + DESKTOP_READY_TIMEOUT;
@@ -582,9 +723,8 @@ async fn run_turn_recovery<Submit, SubmitFuture, Binding>(
         if !recovery_is_active(&context) {
             return;
         }
-        if !binding_is_current(&context) {
-            finish_reserved_recovery(&context, false);
-            mark_observed_turn_completed(&context);
+        if !binding_is_current(&context, next_attempt) {
+            cancel_reserved_recovery(&context);
             log_recovery_event(
                 &context,
                 "cancelled",
@@ -599,12 +739,17 @@ async fn run_turn_recovery<Submit, SubmitFuture, Binding>(
         match result {
             Err(_) => {
                 // CDP can lose the acknowledgement after the renderer has
-                // started its job. Conservatively consume this attempt;
-                // the renderer's per-turn marker prevents duplicate sends.
-                finish_reserved_recovery(&context, true);
+                // started its mutation. Consume only a potentially committed
+                // attempt; read-only preparation has not spent the budget.
+                let commit_started = recovery_commit_started(&context);
+                finish_reserved_recovery(&context, commit_started);
                 log_recovery_event(
                     &context,
-                    "outcome_unknown",
+                    if commit_started {
+                        "outcome_unknown"
+                    } else {
+                        "submit_failed"
+                    },
                     "desktop_ready_deadline",
                     Some(next_attempt),
                 );
@@ -636,7 +781,25 @@ async fn run_turn_recovery<Submit, SubmitFuture, Binding>(
                     );
                     return;
                 }
-                Ok(result) => last_message = result.message,
+                Ok(result) => {
+                    // A positive no-mutation result makes another preparation
+                    // safe. Do not leave a phantom commit for an arriving
+                    // manual continuation to charge against this budget.
+                    release_refused_recovery_commit(&context);
+                    last_message = result.message;
+                }
+                Err(_) if recovery_commit_started(&context) => {
+                    // A transport or polling error after final authorization
+                    // cannot prove that the renderer mutation did not run.
+                    finish_reserved_recovery(&context, true);
+                    log_recovery_event(
+                        &context,
+                        "outcome_unknown",
+                        "desktop_commit_acknowledgement_disconnected",
+                        Some(next_attempt),
+                    );
+                    return;
+                }
                 Err(error) => last_message = error,
             },
         }
@@ -709,25 +872,9 @@ pub(crate) fn observe_responses_turn_stream(
                             continue;
                         };
                         terminal_seen = true;
-                        match recovery_decision(
-                            disposition,
-                            &event_name,
-                            &payload,
-                            evidence,
-                        ) {
-                            RecoveryDecision::Complete => {
-                                mark_observed_turn_completed(&context);
-                            }
-                            RecoveryDecision::ToolStepComplete => {
-                                mark_observed_tool_step_completed(&context);
-                            }
-                            RecoveryDecision::Recover(reason) => {
-                                schedule_turn_recovery(context.clone(), reason);
-                            }
-                            RecoveryDecision::Ignore => {
-                                mark_observed_turn_completed(&context);
-                            }
-                        }
+                        apply_recovery_decision(&context, recovery_decision(
+                            disposition, &event_name, &payload, evidence,
+                        ));
                     }
                 }
                 Err(_) if !terminal_seen && stream_interruption_is_recoverable(evidence) => {
@@ -742,6 +889,67 @@ pub(crate) fn observe_responses_turn_stream(
         if !terminal_seen && stream_interruption_is_recoverable(evidence) {
             schedule_turn_recovery(context, "terminal_event_missing");
         }
+    }
+}
+
+/// Non-SSE Responses bodies use the same terminal classifier and recovery
+/// ownership as streams. Unknown JSON cannot prove an interrupted turn.
+pub(crate) fn observe_responses_turn_json(value: &Value, context: &TurnRecoveryContext) {
+    let event_type = value.get("type").and_then(Value::as_str);
+    let status = value
+        .pointer("/response/status")
+        .or_else(|| value.get("status"))
+        .and_then(Value::as_str);
+    let event_name = match event_type {
+        Some(
+            event @ ("response.completed"
+            | "response.failed"
+            | "response.incomplete"
+            | "response.cancelled"
+            | "response.canceled"
+            | "response.aborted"
+            | "response.error"
+            | "error"),
+        ) => event,
+        _ => match status {
+            Some("completed") => "response.completed",
+            Some("failed") => "response.failed",
+            Some("incomplete") => "response.incomplete",
+            Some("cancelled") => "response.cancelled",
+            Some("canceled") => "response.canceled",
+            Some("aborted") => "response.aborted",
+            _ if value.get("error").is_some_and(|error| !error.is_null()) => "error",
+            _ => {
+                mark_observed_turn_completed(context);
+                return;
+            }
+        },
+    };
+    let payload =
+        if value.get("response").is_some() || matches!(event_name, "error" | "response.error") {
+            value.clone()
+        } else {
+            serde_json::json!({"response": value})
+        };
+    let mut evidence = NativeResponsesEvidence::default();
+    evidence.observe_event(event_name, &payload);
+    if let Some(disposition) = classify_native_responses_terminal(event_name, &payload, evidence) {
+        apply_recovery_decision(
+            context,
+            recovery_decision(disposition, event_name, &payload, evidence),
+        );
+    } else {
+        mark_observed_turn_completed(context);
+    }
+}
+
+fn apply_recovery_decision(context: &TurnRecoveryContext, decision: RecoveryDecision) {
+    match decision {
+        RecoveryDecision::Complete | RecoveryDecision::Ignore => {
+            mark_observed_turn_completed(context)
+        }
+        RecoveryDecision::ToolStepComplete => mark_observed_tool_step_completed(context),
+        RecoveryDecision::Recover(reason) => schedule_turn_recovery(context.clone(), reason),
     }
 }
 
@@ -811,67 +1019,7 @@ fn parse_event(block: &str) -> Option<(String, Value)> {
 }
 
 fn terminal_is_recoverable(event_name: &str, payload: &Value) -> bool {
-    if matches!(
-        event_name,
-        "response.cancelled" | "response.canceled" | "response.aborted"
-    ) {
-        return false;
-    }
-    let summary = [
-        "/response/error/code",
-        "/response/error/type",
-        "/response/error/message",
-        "/response/incomplete_details/reason",
-        "/response/status",
-        "/error/code",
-        "/error/type",
-        "/error/message",
-        "/code",
-        "/type",
-        "/message",
-        "/status",
-    ]
-    .iter()
-    .filter_map(|pointer| payload.pointer(pointer))
-    .filter_map(|value| value.as_str())
-    .collect::<Vec<_>>()
-    .join(" ")
-    .to_ascii_lowercase();
-    ![
-        "content_filter",
-        "content filter",
-        "context_length",
-        "context window",
-        "maximum context",
-        "authentication",
-        "unauthorized",
-        "forbidden",
-        "invalid_api_key",
-        "invalid api key",
-        "permission",
-        "unsupported_model",
-        "unsupported model",
-        "model_not_found",
-        "model not found",
-        "invalid_request",
-        "invalid request",
-        "policy_violation",
-        "policy violation",
-        "insufficient_quota",
-        "insufficient quota",
-        "quota_exceeded",
-        "quota exceeded",
-        "exceeded your current quota",
-        "billing",
-        "credit balance",
-        "usage limit",
-        "usage_limit",
-        "cancelled",
-        "canceled",
-        "aborted",
-    ]
-    .iter()
-    .any(|marker| summary.contains(marker))
+    terminal_error_code(event_name, payload).is_none()
 }
 
 #[cfg(test)]
@@ -894,18 +1042,30 @@ mod tests {
         }
     }
 
+    fn observe_next_continuation(context: &mut TurnRecoveryContext) -> TrackedTurn {
+        begin_turn(&context.desktop_thread_id, true);
+        context.recovery_id.push_str("-next");
+        context.observed_at_ms += 1;
+        track_turn(context)
+    }
+
     #[test]
     fn reserves_exactly_the_configured_number_of_submissions() {
-        let context = context("recovery-budget", 3);
+        let mut context = context("recovery-budget", 3);
         mark_turn_completed(&context.session_id);
 
         assert_eq!(reserve_recovery(&context), Some(1));
         assert_eq!(reserve_recovery(&context), None);
-        assert_eq!(finish_recovery(&context.session_id, true), 1);
+        assert!(authorize_reserved_recovery(&context));
+        assert_eq!(finish_reserved_recovery(&context, true), 1);
+        observe_next_continuation(&mut context).hand_off_to_stream();
         assert_eq!(reserve_recovery(&context), Some(2));
-        assert_eq!(finish_recovery(&context.session_id, true), 2);
+        assert!(authorize_reserved_recovery(&context));
+        assert_eq!(finish_reserved_recovery(&context, true), 2);
+        observe_next_continuation(&mut context).hand_off_to_stream();
         assert_eq!(reserve_recovery(&context), Some(3));
-        assert_eq!(finish_recovery(&context.session_id, true), 3);
+        assert!(authorize_reserved_recovery(&context));
+        assert_eq!(finish_reserved_recovery(&context, true), 3);
         assert_eq!(reserve_recovery(&context), None);
         mark_turn_completed(&context.session_id);
     }
@@ -916,10 +1076,250 @@ mod tests {
         mark_turn_completed(&context.session_id);
 
         assert_eq!(reserve_recovery(&context), Some(1));
-        assert_eq!(finish_recovery(&context.session_id, false), 0);
+        assert_eq!(finish_reserved_recovery(&context, false), 0);
         assert_eq!(reserve_recovery(&context), Some(1));
-        finish_recovery(&context.session_id, false);
+        finish_reserved_recovery(&context, false);
         mark_turn_completed(&context.session_id);
+    }
+
+    #[test]
+    fn acknowledged_continuation_budget_survives_crash_before_its_next_proxy_request() {
+        let db = crate::database::Database::memory().unwrap();
+        let provider = crate::provider::Provider::with_id(
+            "ack-gap-provider".into(),
+            "test".into(),
+            serde_json::json!({"baseUrl":"https://example.test"}),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        for budget in [1, 3] {
+            let mut context = context(&format!("recovery-ack-crash-gap-{budget}"), budget);
+            context.durable_provider_id = provider.id.clone();
+            context.provider_fingerprint = provider_fingerprint(&provider);
+            assert_eq!(reserve_recovery(&context), Some(1));
+            assert!(authorize_reserved_recovery(&context));
+            assert_eq!(finish_reserved_recovery(&context, true), 1);
+            let ledger = ledger_from_states(&recovery_states().lock().unwrap());
+            assert!(
+                ledger.turns.iter().any(|turn| {
+                    turn.context.desktop_thread_id == context.desktop_thread_id
+                        && turn.submitted == 1
+                }),
+                "an acknowledged continuation must retain its consumed budget in the crash ledger"
+            );
+            mark_turn_completed(&context.desktop_thread_id);
+
+            restore_ledger(Some(ledger), budget, &db);
+            assert!(
+                !recovery_reserved_for_test(&context.desktop_thread_id),
+                "restoring a budget must not submit another continue to the old failed turn"
+            );
+            begin_turn(&context.desktop_thread_id, true);
+            let mut next = context.clone();
+            next.recovery_id = "next-proxy-request".into();
+            next.observed_at_ms += 1;
+            let tracked = track_turn(&next);
+            let next_attempt = reserve_recovery(&next);
+            assert_eq!(next_attempt, (budget > 1).then_some(2));
+            if next_attempt.is_some() {
+                finish_reserved_recovery(&next, false);
+            }
+            drop(tracked);
+            mark_turn_completed(&context.desktop_thread_id);
+        }
+    }
+
+    #[test]
+    fn acknowledged_generation_cannot_reserve_or_reclaim_another_attempt() {
+        let mut context = context("recovery-ack-duplicate-generation", 3);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        assert!(authorize_reserved_recovery(&context));
+        assert_eq!(finish_reserved_recovery(&context, true), 1);
+        assert_eq!(reserve_recovery(&context), None);
+        let stale_tracking = track_turn(&context);
+        assert_eq!(reserve_recovery(&context), None);
+        mark_observed_turn_completed(&context);
+        mark_observed_tool_step_completed(&context);
+        assert_eq!(reserve_recovery(&context), None);
+        let states = recovery_states().lock().unwrap();
+        let state = states.get(&context.desktop_thread_id).unwrap();
+        assert_eq!(state.submitted, 1);
+        assert_eq!(state.phase, RecoveryPhase::AwaitingContinuation);
+        drop(states);
+        drop(stale_tracking);
+
+        let next = observe_next_continuation(&mut context);
+        assert_eq!(reserve_recovery(&context), Some(2));
+        drop(next);
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[test]
+    fn committing_continuation_restores_once_without_replaying_an_unknown_outcome() {
+        let db = crate::database::Database::memory().unwrap();
+        let provider = crate::provider::Provider::with_id(
+            "committing-recovery-provider".into(),
+            "test".into(),
+            serde_json::json!({"baseUrl":"https://example.test"}),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        let mut context = context("recovery-committing-crash-gap", 3);
+        context.durable_provider_id = provider.id.clone();
+        context.provider_fingerprint = provider_fingerprint(&provider);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        assert!(authorize_reserved_recovery(&context));
+        assert!(authorize_reserved_recovery(&context));
+        let ledger = ledger_from_states(&recovery_states().lock().unwrap());
+        mark_turn_completed(&context.desktop_thread_id);
+
+        restore_ledger(Some(ledger), 3, &db);
+        assert!(!recovery_reserved_for_test(&context.desktop_thread_id));
+        let restored_ledger = {
+            let states = recovery_states().lock().unwrap();
+            let state = states.get(&context.desktop_thread_id).unwrap();
+            assert_eq!(state.submitted, 1);
+            assert_eq!(state.phase, RecoveryPhase::AwaitingContinuation);
+            ledger_from_states(&states)
+        };
+        mark_turn_completed(&context.desktop_thread_id);
+        restore_ledger(Some(restored_ledger), 3, &db);
+        assert_eq!(
+            recovery_states()
+                .lock()
+                .unwrap()
+                .get(&context.desktop_thread_id)
+                .unwrap()
+                .submitted,
+            1,
+            "a second restart must not charge the same ambiguous commit twice"
+        );
+        let next = observe_next_continuation(&mut context);
+        assert_eq!(reserve_recovery(&context), Some(2));
+        drop(next);
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[test]
+    fn startup_with_recovery_disabled_preserves_spent_budget_without_queuing_a_turn() {
+        let db = crate::database::Database::memory().unwrap();
+        let provider = crate::provider::Provider::with_id(
+            "dormant-budget-provider".into(),
+            "test".into(),
+            serde_json::json!({"baseUrl":"https://example.test"}),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        for phase in [
+            RecoveryPhase::ActiveRequest,
+            RecoveryPhase::AwaitingContinuation,
+        ] {
+            let mut context = context(&format!("recovery-disabled-startup-{phase:?}"), 3);
+            context.durable_provider_id = provider.id.clone();
+            context.provider_fingerprint = provider_fingerprint(&provider);
+            let ledger = RecoveryLedger {
+                config_scope: crate::process_identity::config_scope_fingerprint(),
+                saved_at: chrono::Utc::now().timestamp(),
+                turns: vec![PersistedTurn {
+                    context: context.clone(),
+                    submitted: 1,
+                    phase,
+                }],
+            };
+            restore_ledger(Some(ledger), 0, &db);
+            assert!(!recovery_reserved_for_test(&context.desktop_thread_id));
+            let states = recovery_states().lock().unwrap();
+            let state = states.get(&context.desktop_thread_id).unwrap();
+            assert_eq!(state.submitted, 1);
+            assert_eq!(state.phase, RecoveryPhase::AwaitingContinuation);
+            assert_eq!(state.tracked.as_ref().unwrap().max_recoveries, 3);
+            drop(states);
+            let next = observe_next_continuation(&mut context);
+            assert_eq!(reserve_recovery(&context), Some(2));
+            drop(next);
+            mark_turn_completed(&context.desktop_thread_id);
+        }
+    }
+
+    #[test]
+    fn explicit_json_terminals_use_the_same_recovery_and_cancellation_policy_as_streams() {
+        for (id, payload, recoverable) in [
+            (
+                "json-overload",
+                serde_json::json!({"status":"failed","error":{"code":"server_error","message":"Our servers are currently overloaded. Please try again later."}}),
+                true,
+            ),
+            (
+                "json-overload-wrapper",
+                serde_json::json!({"type":"response.failed","response":{"status":"failed","error":{"code":"server_error"}}}),
+                true,
+            ),
+            (
+                "json-incomplete",
+                serde_json::json!({"status":"incomplete","incomplete_details":{"reason":"upstream_timeout"}}),
+                true,
+            ),
+            (
+                "json-top-error",
+                serde_json::json!({"error":{"code":"server_error"}}),
+                true,
+            ),
+            (
+                "json-auth",
+                serde_json::json!({"error":{"code":"invalid_api_key"}}),
+                false,
+            ),
+            (
+                "json-quota",
+                serde_json::json!({"status":"failed","error":{"code":"insufficient_quota"}}),
+                false,
+            ),
+            (
+                "json-cancelled",
+                serde_json::json!({"status":"cancelled"}),
+                false,
+            ),
+            (
+                "json-unknown",
+                serde_json::json!({"message":"not an explicit Responses terminal"}),
+                false,
+            ),
+        ] {
+            let context = context(id, 3);
+            let tracked = track_turn(&context);
+            observe_responses_turn_json(&payload, &context);
+            assert_eq!(
+                recovery_reserved_for_test(&context.desktop_thread_id),
+                recoverable,
+                "{id}"
+            );
+            drop(tracked);
+            mark_turn_completed(&context.desktop_thread_id);
+        }
+    }
+
+    #[test]
+    fn completed_json_tool_step_preserves_the_existing_continuation_budget() {
+        let mut context = context("recovery-json-tool-step", 3);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        assert!(authorize_reserved_recovery(&context));
+        assert_eq!(finish_reserved_recovery(&context, true), 1);
+        let tracked = observe_next_continuation(&mut context);
+        observe_responses_turn_json(
+            &serde_json::json!({
+                "status":"completed",
+                "output":[{"type":"function_call","id":"item-1","call_id":"call-1","name":"shell","arguments":"{}"}]
+            }),
+            &context,
+        );
+        let states = recovery_states().lock().unwrap();
+        let state = states.get(&context.desktop_thread_id).unwrap();
+        assert_eq!(state.submitted, 1);
+        assert!(state.tracked.is_some());
+        drop(states);
+        drop(tracked);
+        assert_eq!(reserve_recovery(&context), Some(2));
+        mark_turn_completed(&context.desktop_thread_id);
     }
 
     #[test]
@@ -934,13 +1334,14 @@ mod tests {
         let context = context("recovery-cancel-drop", 3);
         mark_turn_completed(&context.desktop_thread_id);
         let tracked = track_turn(&context);
-        assert!(
+        assert_eq!(
             recovery_states()
                 .lock()
                 .unwrap()
                 .get(&context.desktop_thread_id)
                 .unwrap()
-                .active
+                .phase,
+            RecoveryPhase::ActiveRequest
         );
         drop(tracked);
         assert!(!recovery_states()
@@ -1002,18 +1403,296 @@ mod tests {
             context.clone(),
             "test_hanging_desktop",
             1,
-            |_, _| {
+            |context, _| {
+                assert!(authorize_reserved_recovery(&context));
                 futures::future::pending::<
                     Result<crate::codex_desktop::CodexContinuationResult, String>,
                 >()
             },
-            |_| true,
+            |_, _| true,
         )
         .await;
         assert_eq!(started.elapsed(), DESKTOP_READY_TIMEOUT);
         assert!(!recovery_is_active(&context));
         assert_eq!(reserve_recovery(&context), None);
         mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_only_desktop_preparation_timeout_does_not_consume_an_attempt() {
+        let context = context("recovery-read-only-deadline", 1);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        let started = tokio::time::Instant::now();
+        run_turn_recovery(
+            context.clone(),
+            "test_hanging_read_only_preparation",
+            1,
+            |_, _| {
+                futures::future::pending::<
+                    Result<crate::codex_desktop::CodexContinuationResult, String>,
+                >()
+            },
+            |_, _| true,
+        )
+        .await;
+        assert_eq!(started.elapsed(), DESKTOP_READY_TIMEOUT);
+        assert!(!recovery_is_active(&context));
+        assert_eq!(reserve_recovery(&context), Some(1));
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn definite_renderer_refusal_returns_to_preparation_without_spending_budget() {
+        let context = context("recovery-definite-renderer-refusal", 1);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        run_turn_recovery(
+            context.clone(),
+            "test_definite_renderer_refusal",
+            1,
+            |context, _| {
+                let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    assert!(authorize_reserved_recovery(&context));
+                } else {
+                    let phase = recovery_states()
+                        .lock()
+                        .unwrap()
+                        .get(&context.desktop_thread_id)
+                        .unwrap()
+                        .phase;
+                    assert_eq!(
+                        phase,
+                        RecoveryPhase::ReservedRecovery,
+                        "a positive no-mutation result must release the committing phase"
+                    );
+                    begin_turn(&context.desktop_thread_id, true);
+                    assert_eq!(
+                        recovery_states()
+                            .lock()
+                            .unwrap()
+                            .get(&context.desktop_thread_id)
+                            .unwrap()
+                            .submitted,
+                        0
+                    );
+                    cancel_reserved_recovery(&context);
+                }
+                std::future::ready(Ok(crate::codex_desktop::CodexContinuationResult {
+                    submitted: false,
+                    mutation_attempted: false,
+                    debug_port: None,
+                    target_id: None,
+                    message: "renderer positively refused before mutation".into(),
+                }))
+            },
+            |_, _| true,
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnected_commit_acknowledgement_consumes_once_without_retrying_submission() {
+        let context = context("recovery-commit-ack-disconnect", 1);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        run_turn_recovery(
+            context.clone(),
+            "test_commit_ack_disconnect",
+            1,
+            |context, _| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(authorize_reserved_recovery(&context));
+                std::future::ready(Err("simulated commit acknowledgement disconnect".into()))
+            },
+            |_, _| true,
+        )
+        .await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a potentially accepted mutation must not be submitted again"
+        );
+        let states = recovery_states().lock().unwrap();
+        let state = states.get(&context.desktop_thread_id).unwrap();
+        assert_eq!(state.submitted, 1);
+        assert_eq!(state.phase, RecoveryPhase::AwaitingContinuation);
+        drop(states);
+        assert_eq!(reserve_recovery(&context), None);
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn precommit_connection_error_retries_preparation_without_spending_an_attempt() {
+        let context = context("recovery-precommit-connection-error", 1);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        run_turn_recovery(
+            context.clone(),
+            "test_precommit_connection_error",
+            1,
+            |context, _| {
+                let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    return std::future::ready(Err("simulated precommit connection error".into()));
+                }
+                assert_eq!(
+                    recovery_states()
+                        .lock()
+                        .unwrap()
+                        .get(&context.desktop_thread_id)
+                        .unwrap()
+                        .submitted,
+                    0
+                );
+                assert!(authorize_reserved_recovery(&context));
+                std::future::ready(Ok(crate::codex_desktop::CodexContinuationResult {
+                    submitted: true,
+                    mutation_attempted: true,
+                    debug_port: None,
+                    target_id: None,
+                    message: "simulated successful continuation".into(),
+                }))
+            },
+            |_, _| true,
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let states = recovery_states().lock().unwrap();
+        let state = states.get(&context.desktop_thread_id).unwrap();
+        assert_eq!(state.submitted, 1);
+        assert_eq!(state.phase, RecoveryPhase::AwaitingContinuation);
+        drop(states);
+        assert_eq!(reserve_recovery(&context), None);
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reduced_live_budget_cancels_a_reserved_attempt_before_submission() {
+        let mut context = context("recovery-live-budget-before-submit", 3);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        assert!(authorize_reserved_recovery(&context));
+        assert_eq!(finish_reserved_recovery(&context, true), 1);
+        observe_next_continuation(&mut context).hand_off_to_stream();
+        assert_eq!(reserve_recovery(&context), Some(2));
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        run_turn_recovery(
+            context.clone(),
+            "test_reduced_live_budget",
+            2,
+            |_, _| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok(crate::codex_desktop::CodexContinuationResult {
+                    submitted: true,
+                    mutation_attempted: true,
+                    debug_port: None,
+                    target_id: None,
+                    message: "simulated submission".into(),
+                }))
+            },
+            |context, attempt| recovery_policy_allows_attempt(context, attempt, 1),
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        {
+            let states = recovery_states().lock().unwrap();
+            let retained = states.get(&context.desktop_thread_id).unwrap();
+            assert_eq!(retained.submitted, 1);
+            assert_eq!(retained.phase, RecoveryPhase::AwaitingContinuation);
+        }
+        begin_turn(&context.desktop_thread_id, true);
+        let mut next = context.clone();
+        next.recovery_id = "manual-continue-after-policy-cancellation".into();
+        next.observed_at_ms += 1;
+        next.max_recoveries = 1;
+        let tracked = track_turn(&next);
+        assert_eq!(
+            reserve_recovery(&next),
+            None,
+            "cancelling an over-budget queued attempt must not reset the already-spent budget"
+        );
+        drop(tracked);
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_recovery_rechecks_reduced_or_disabled_policy_before_another_submission() {
+        for next_budget in [1, 0] {
+            let mut context = context(&format!("recovery-live-policy-pending-{next_budget}"), 3);
+            assert_eq!(reserve_recovery(&context), Some(1));
+            assert!(authorize_reserved_recovery(&context));
+            assert_eq!(finish_reserved_recovery(&context, true), 1);
+            observe_next_continuation(&mut context).hand_off_to_stream();
+            assert_eq!(reserve_recovery(&context), Some(2));
+            let current_budget = std::sync::atomic::AtomicU32::new(3);
+            let calls = std::sync::atomic::AtomicU32::new(0);
+            run_turn_recovery(
+                context.clone(),
+                "test_live_policy_changed_while_pending",
+                2,
+                |_, _| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    current_budget.store(next_budget, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(Ok(crate::codex_desktop::CodexContinuationResult {
+                        submitted: false,
+                        mutation_attempted: false,
+                        debug_port: None,
+                        target_id: None,
+                        message: "simulated Desktop readiness wait".into(),
+                    }))
+                },
+                |context, attempt| {
+                    recovery_policy_allows_attempt(
+                        context,
+                        attempt,
+                        current_budget.load(std::sync::atomic::Ordering::SeqCst),
+                    )
+                },
+            )
+            .await;
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let states = recovery_states().lock().unwrap();
+            let retained = states.get(&context.desktop_thread_id).unwrap();
+            assert_eq!(retained.submitted, 1);
+            assert_eq!(retained.phase, RecoveryPhase::AwaitingContinuation);
+            drop(states);
+            mark_turn_completed(&context.desktop_thread_id);
+        }
+    }
+
+    #[test]
+    fn policy_cancellation_cannot_erase_a_newer_generation() {
+        let old = context("recovery-policy-cancel-generation", 3);
+        assert_eq!(reserve_recovery(&old), Some(1));
+        let mut newer = old.clone();
+        newer.recovery_id = "newer-live-generation".into();
+        newer.observed_at_ms += 1;
+        let tracked = track_turn(&newer);
+        cancel_reserved_recovery(&old);
+        let states = recovery_states().lock().unwrap();
+        let state = states.get(&newer.desktop_thread_id).unwrap();
+        assert_eq!(state.phase, RecoveryPhase::ActiveRequest);
+        assert_eq!(
+            state.tracked.as_ref().unwrap().recovery_id,
+            newer.recovery_id
+        );
+        drop(states);
+        drop(tracked);
+    }
+
+    #[test]
+    fn old_crash_ledgers_without_a_phase_keep_their_interrupted_request_semantics() {
+        let context = context("recovery-old-ledger-phase", 3);
+        let value = serde_json::json!({
+            "configScope":"test-scope", "savedAt":1,
+            "turns":[{"context":context,"submitted":1}]
+        });
+        let ledger: RecoveryLedger = serde_json::from_value(value).unwrap();
+        assert_eq!(ledger.turns[0].phase, RecoveryPhase::Idle);
+        assert_eq!(ledger.turns[0].submitted, 1);
     }
 
     #[test]
@@ -1024,7 +1703,7 @@ mod tests {
             context.desktop_thread_id.clone(),
             RecoveryState {
                 submitted: 1,
-                active: true,
+                phase: RecoveryPhase::ActiveRequest,
                 tracked: Some(context),
                 ..RecoveryState::default()
             },
@@ -1097,14 +1776,17 @@ mod tests {
                 PersistedTurn {
                     context: valid.clone(),
                     submitted: 1,
+                    phase: RecoveryPhase::Idle,
                 },
                 PersistedTurn {
                     context: changed.clone(),
                     submitted: 0,
+                    phase: RecoveryPhase::Idle,
                 },
                 PersistedTurn {
                     context: old,
                     submitted: 0,
+                    phase: RecoveryPhase::Idle,
                 },
             ],
         };
@@ -1126,6 +1808,7 @@ mod tests {
             newer.recovery_id
         );
         drop(states);
+        assert!(authorize_reserved_recovery(&valid));
         finish_reserved_recovery(&valid, true);
         assert_eq!(
             reserve_recovery(&TurnRecoveryContext {
@@ -1155,8 +1838,7 @@ mod tests {
             let states = recovery_states().lock().unwrap();
             let state = states.get(&newer.desktop_thread_id).unwrap();
             assert_eq!(state.tracked.as_ref().unwrap().recovery_id, newer.recovery_id);
-            assert!(state.active);
-            assert!(!state.in_flight);
+            assert_eq!(state.phase, RecoveryPhase::ActiveRequest);
             drop(states);
             drop(tracked);
         }
@@ -1207,21 +1889,23 @@ mod tests {
 
     #[test]
     fn successful_tool_step_preserves_budget_and_crash_evidence_for_the_tool_loop() {
-        let context = context("recovery-tool-budget", 2);
+        let mut context = context("recovery-tool-budget", 2);
         assert_eq!(reserve_recovery(&context), Some(1));
-        finish_recovery(&context.desktop_thread_id, true);
-        let tracked = track_turn(&context);
+        assert!(authorize_reserved_recovery(&context));
+        finish_reserved_recovery(&context, true);
+        let tracked = observe_next_continuation(&mut context);
         mark_observed_tool_step_completed(&context);
         drop(tracked);
         let states = recovery_states().lock().unwrap();
         let state = states.get(&context.desktop_thread_id).unwrap();
         assert_eq!(state.submitted, 1);
         assert!(state.tracked.is_some());
-        assert!(!state.active);
+        assert_eq!(state.phase, RecoveryPhase::ToolStepComplete);
         drop(states);
-        begin_turn(&context.desktop_thread_id, true);
+        observe_next_continuation(&mut context).hand_off_to_stream();
         assert_eq!(reserve_recovery(&context), Some(2));
-        finish_recovery(&context.desktop_thread_id, true);
+        assert!(authorize_reserved_recovery(&context));
+        finish_reserved_recovery(&context, true);
         begin_turn(&context.desktop_thread_id, true);
         assert_eq!(reserve_recovery(&context), None);
         mark_turn_completed(&context.desktop_thread_id);
@@ -1243,8 +1927,7 @@ mod tests {
             state.tracked.as_ref().unwrap().recovery_id,
             newer.recovery_id
         );
-        assert!(!state.active);
-        assert!(!state.in_flight);
+        assert_eq!(state.phase, RecoveryPhase::ToolStepComplete);
         drop(states);
         drop(tracked);
         mark_turn_completed(&newer.desktop_thread_id);
@@ -1265,6 +1948,10 @@ mod tests {
                 body: Some(r#"{"error":{"type":"overloaded_error"}}"#.into()),
             },
             ProxyError::UpstreamError {
+                status: 503,
+                body: Some("Our servers are currently overloaded. Please try again later.".into()),
+            },
+            ProxyError::UpstreamError {
                 status: 502,
                 body: None,
             },
@@ -1278,6 +1965,14 @@ mod tests {
             ProxyError::UpstreamError {
                 status: 429,
                 body: Some(r#"{"error":{"type":"insufficient_quota"}}"#.into()),
+            },
+            ProxyError::UpstreamError {
+                status: 429,
+                body: Some("Daily quota exhausted. Our servers are currently overloaded.".into()),
+            },
+            ProxyError::UpstreamError {
+                status: 503,
+                body: Some("Daily usage limit reached.".into()),
             },
             ProxyError::UpstreamError {
                 status: 500,
@@ -1294,33 +1989,75 @@ mod tests {
 
     #[test]
     fn new_user_turn_resets_budget_but_continuation_keeps_it() {
-        let context = context("recovery-new-turn", 2);
+        let mut context = context("recovery-new-turn", 2);
         mark_turn_completed(&context.session_id);
         assert_eq!(reserve_recovery(&context), Some(1));
-        assert_eq!(finish_recovery(&context.session_id, true), 1);
+        assert!(authorize_reserved_recovery(&context));
+        assert_eq!(finish_reserved_recovery(&context, true), 1);
 
-        begin_turn(&context.session_id, true);
+        observe_next_continuation(&mut context).hand_off_to_stream();
         assert_eq!(reserve_recovery(&context), Some(2));
-        assert_eq!(finish_recovery(&context.session_id, true), 2);
+        assert!(authorize_reserved_recovery(&context));
+        assert_eq!(finish_reserved_recovery(&context, true), 2);
 
         begin_turn(&context.session_id, false);
         assert_eq!(reserve_recovery(&context), Some(1));
-        finish_recovery(&context.session_id, false);
+        finish_reserved_recovery(&context, false);
         mark_turn_completed(&context.session_id);
     }
 
     #[test]
     fn arriving_continuation_consumes_an_in_flight_reservation_once() {
-        let context = context("recovery-arrival-race", 2);
+        let mut context = context("recovery-arrival-race", 2);
         mark_turn_completed(&context.session_id);
         assert_eq!(reserve_recovery(&context), Some(1));
 
+        assert!(authorize_reserved_recovery(&context));
         begin_turn(&context.session_id, true);
-        assert_eq!(finish_recovery(&context.session_id, true), 1);
+        assert_eq!(finish_reserved_recovery(&context, true), 1);
+        observe_next_continuation(&mut context).hand_off_to_stream();
         assert_eq!(reserve_recovery(&context), Some(2));
 
-        finish_recovery(&context.session_id, false);
+        finish_reserved_recovery(&context, false);
         mark_turn_completed(&context.session_id);
+    }
+
+    #[test]
+    fn manually_arriving_continuation_during_preparation_does_not_spend_automatic_budget() {
+        let mut context = context("recovery-manual-during-preparation", 2);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        let next = observe_next_continuation(&mut context);
+        assert_eq!(
+            recovery_states()
+                .lock()
+                .unwrap()
+                .get(&context.desktop_thread_id)
+                .unwrap()
+                .submitted,
+            0
+        );
+        assert_eq!(reserve_recovery(&context), Some(1));
+        drop(next);
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[test]
+    fn response_pending_terminal_cannot_start_another_automatic_turn() {
+        for payload in [
+            serde_json::json!({"response":{"status":"failed","error":{"code":"response_pending","message":"The upstream operation may still be running"}}}),
+            serde_json::json!({"error":{"code":"response_pending"}}),
+        ] {
+            assert_eq!(
+                recovery_decision(
+                    NativeResponsesTerminalDisposition::Failed,
+                    "response.failed",
+                    &payload,
+                    NativeResponsesEvidence::default(),
+                ),
+                RecoveryDecision::Ignore,
+                "an unknown still-running operation must not produce a second turn"
+            );
+        }
     }
 
     #[test]
@@ -1332,12 +2069,18 @@ mod tests {
             serde_json::json!({"response":{"error":{"code":"unsupported_model"}}}),
             serde_json::json!({"response":{"error":{"code":"invalid_request_error"}}}),
             serde_json::json!({"response":{"error":{"code":"policy_violation"}}}),
+            serde_json::json!({"response":{"error":{"code":"token_expired"}}}),
             serde_json::json!({"response":{"error":{"code":"insufficient_quota"}}}),
             serde_json::json!({"response":{"error":{"code":"turn_cancelled"}}}),
+            serde_json::json!({"response":{"error":{"code":"response_pending","message":"The upstream operation may still be running"}}}),
         ] {
             assert!(!terminal_is_recoverable("response.failed", &payload));
         }
-        for reason in ["content_filter", "context_length_exceeded"] {
+        for reason in [
+            "content_filter",
+            "policy_violation",
+            "context_length_exceeded",
+        ] {
             assert!(!terminal_is_recoverable(
                 "response.incomplete",
                 &serde_json::json!({"response":{"incomplete_details":{"reason": reason}}}),
@@ -1416,10 +2159,12 @@ mod tests {
 
     #[tokio::test]
     async fn completed_turn_clears_the_existing_recovery_budget() {
-        let context = context("recovery-completed", 1);
+        let mut context = context("recovery-completed", 1);
         mark_turn_completed(&context.session_id);
         assert_eq!(reserve_recovery(&context), Some(1));
-        assert_eq!(finish_recovery(&context.session_id, true), 1);
+        assert!(authorize_reserved_recovery(&context));
+        assert_eq!(finish_reserved_recovery(&context, true), 1);
+        observe_next_continuation(&mut context).hand_off_to_stream();
 
         let sse = concat!(
             "event: response.output_text.done\n",
@@ -1433,7 +2178,7 @@ mod tests {
             .await;
         assert_eq!(output.len(), 1);
         assert_eq!(reserve_recovery(&context), Some(1));
-        finish_recovery(&context.session_id, false);
+        finish_reserved_recovery(&context, false);
         mark_turn_completed(&context.session_id);
     }
 }

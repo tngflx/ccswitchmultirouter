@@ -3,6 +3,11 @@ import { readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import {
+  parseWindowsJsonQueryOutput,
+  runWindowsJsonQuery,
+  windowsJsonQueryCommand,
+} from "./windows-json-query.mjs";
 
 // Debug Cargo artifacts accumulate multiple test/linkage generations. Keep the
 // normal target bounded near the size users expect; cleanup remains guarded by
@@ -127,36 +132,40 @@ export function processOwnsCargoTarget(
   );
 }
 
-function windowsCargoProcesses() {
-  const script = [
-    "Get-CimInstance Win32_Process",
-    "Where-Object { $_.Name -in @('cargo.exe','rustc.exe','cc-switch.exe') }",
-    "Select-Object Name,ProcessId,ExecutablePath,CommandLine",
-    "ConvertTo-Json -Compress",
-  ].join(" | ");
-  const result = spawnSync(
-    "powershell",
-    ["-NoProfile", "-NonInteractive", "-Command", script],
-    {
-      encoding: "utf8",
-      windowsHide: true,
-    },
+export function windowsCargoProcesses({ run = spawnSync } = {}) {
+  const script = windowsJsonQueryCommand(
+    [
+      "Get-CimInstance Win32_Process -ErrorAction Stop",
+      "Where-Object { $_.Name -in @('cargo.exe','rustc.exe','cc-switch.exe') }",
+      "Select-Object Name,ProcessId,ExecutablePath,CommandLine",
+      "ConvertTo-Json -Compress",
+    ].join(" | "),
   );
-  if (result.error) {
-    throw result.error;
-  }
-  if (result.status !== 0) {
-    throw new Error(
-      String(result.stderr ?? "").trim() ||
-        `PowerShell process query exited with status ${result.status}.`,
-    );
-  }
-  const text = String(result.stdout ?? "").trim();
+  const text = runWindowsJsonQuery(script, "Cargo process", { run }).trim();
   if (!text) {
     return [];
   }
-  const parsed = JSON.parse(text);
-  return Array.isArray(parsed) ? parsed : [parsed];
+  const parsed = parseWindowsJsonQueryOutput(text, "Cargo process");
+  const processes = Array.isArray(parsed) ? parsed : [parsed];
+  for (const candidate of processes) {
+    if (
+      candidate === null ||
+      typeof candidate !== "object" ||
+      !["cargo.exe", "rustc.exe", "cc-switch.exe"].includes(
+        String(candidate.Name ?? "").toLowerCase(),
+      ) ||
+      !Number.isSafeInteger(candidate.ProcessId) ||
+      candidate.ProcessId < 1 ||
+      ![candidate.ExecutablePath, candidate.CommandLine].some(
+        (value) => typeof value === "string" && value.trim().length > 0,
+      )
+    ) {
+      throw new Error(
+        "PowerShell 7 Cargo process query returned incomplete ownership data.",
+      );
+    }
+  }
+  return processes;
 }
 
 function unixCargoProcesses() {

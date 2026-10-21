@@ -163,7 +163,6 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
         // 2) pending_message_delta: 缓存延迟到 [DONE] 发送，确保 usage 完整
         let mut has_emitted_message_delta = false;
         let mut pending_message_delta: Option<(Option<String>, Option<Value>)> = None;
-        let mut has_sent_message_stop = false;
         let mut stream_ended_with_error = false;
         let mut latest_usage: Option<Value> = None;
         let mut current_non_tool_block_type: Option<&'static str> = None;
@@ -202,8 +201,9 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                         serde_json::to_string(&event).unwrap_or_default());
                                     log::debug!("[Claude/OpenRouter] >>> Anthropic SSE: message_stop");
                                     yield Ok(Bytes::from(sse_data));
-                                    has_sent_message_stop = true;
-                                    continue;
+                                    // [DONE] is terminal; ignore same-chunk and later
+                                    // upstream input, including a late transport error.
+                                    return;
                                 }
 
                                 if let Ok(chunk) = serde_json::from_str::<OpenAIStreamChunk>(data) {
@@ -661,7 +661,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                 false
             };
 
-            if emitted_pending_message_delta && !has_sent_message_stop {
+            if emitted_pending_message_delta {
                 let event = json!({"type": "message_stop"});
                 let sse_data = format!("event: message_stop\ndata: {}\n\n",
                     serde_json::to_string(&event).unwrap_or_default());
@@ -722,6 +722,58 @@ mod tests {
     use futures::StreamExt;
     use serde_json::Value;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn terminal_boundary_done_ignores_late_data_and_transport_error() {
+        let upstream = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"visible\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"late-data\"}}]}\n\n",
+            )),
+            Err(std::io::Error::other("late-transport")),
+        ]);
+        let output = create_anthropic_sse_stream(upstream)
+            .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+
+        assert_eq!(output.matches("event: message_stop\n").count(), 1);
+        assert!(output.contains("visible"));
+        assert!(!output.contains("late-data"));
+        assert!(!output.contains("late-transport"));
+        assert!(!output.contains("event: error\n"));
+    }
+
+    #[tokio::test]
+    async fn terminal_boundary_done_closes_before_upstream_eof() {
+        let upstream = stream::once(async {
+            Ok::<_, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"))
+        })
+        .chain(stream::pending());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            create_anthropic_sse_stream(upstream).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("DONE must close the converter without waiting for EOF");
+    }
+
+    #[tokio::test]
+    async fn terminal_boundary_finish_reason_without_done_preserves_transport_error() {
+        let upstream = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"visible\"},\"finish_reason\":\"stop\"}]}\n\n",
+            )),
+            Err(std::io::Error::other("reset")),
+        ]);
+        let output = create_anthropic_sse_stream(upstream)
+            .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert_eq!(output.matches("event: error\n").count(), 1);
+        assert!(!output.contains("event: message_stop\n"));
+    }
 
     async fn collect_anthropic_events(input: &str) -> Vec<Value> {
         let upstream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(

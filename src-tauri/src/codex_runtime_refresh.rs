@@ -792,17 +792,15 @@ struct RawWindowsCodexRuntimeProcess {
 fn powershell_utf8_output(script: &str) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
-    let output = Command::new("powershell")
+    let output = crate::powershell::command()
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("powershell_start_failed: {error}"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8(output.stderr)
-            .unwrap_or_else(|error| format!("PowerShell stderr was not UTF-8: {error}"));
         return Err(format!(
-            "powershell_failed: {}",
-            stderr.trim().replace(['\r', '\n'], " ")
+            "powershell_failed: PowerShell 7 exited with {}",
+            output.status
         ));
     }
     String::from_utf8(output.stdout)
@@ -815,7 +813,7 @@ fn query_codex_runtime_processes() -> Result<Vec<RawCodexRuntimeProcess>, String
     let output = powershell_utf8_output(
         r#"
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-$items = @(Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'codex.exe' OR Name = 'ChatGPT.exe'" |
+$items = @(Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'codex.exe' OR Name = 'ChatGPT.exe'" -ErrorAction Stop |
   Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,@{Name='StartedAt';Expression={$_.CreationDate.ToLocalTime().ToString('o')}})
 ConvertTo-Json -InputObject $items -Compress
 "#,

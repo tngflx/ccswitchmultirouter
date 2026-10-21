@@ -9,6 +9,8 @@ $ErrorActionPreference = "Stop"
 
 $releaseBuildConfigHelperPath = Join-Path (Split-Path -Parent $PSCommandPath) "release-build-config.ps1"
 . $releaseBuildConfigHelperPath
+. (Join-Path (Split-Path -Parent $PSCommandPath) "powershell7-runtime.ps1")
+$powerShell7Executable = Resolve-CcsmPowerShell7Executable
 
 # Resolve the repository root for hook, terminal, and scheduled calls.
 function Get-RepoRoot {
@@ -195,7 +197,7 @@ try {
                 $exportArgs += "-SkipBuild"
             }
 
-            Invoke-CheckedCommand -FilePath "powershell" -Arguments $exportArgs
+            Invoke-CheckedCommand -FilePath $powerShell7Executable -Arguments $exportArgs
             Assert-ReleaseSourceIdentity `
                 -Expected $sourceIdentity `
                 -Actual (Get-ReleaseSourceIdentity -RepoRoot $repoRoot)

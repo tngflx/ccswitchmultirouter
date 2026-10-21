@@ -1,0 +1,97 @@
+{
+  "settings": [
+    { "name": "missing", "value": {}, "enabled": true },
+    {
+      "name": "canonical off",
+      "value": { "watchdogEnabled": false },
+      "enabled": false
+    },
+    {
+      "name": "legacy off",
+      "value": { "watchdog_enabled": false },
+      "enabled": false
+    },
+    {
+      "name": "canonical wins",
+      "value": { "watchdogEnabled": true, "watchdog_enabled": false },
+      "enabled": true
+    },
+    {
+      "name": "canonical null is not a legacy fallback",
+      "value": { "watchdogEnabled": null, "watchdog_enabled": false },
+      "enabled": true
+    },
+    {
+      "name": "canonical wrong type uses default",
+      "value": { "watchdogEnabled": "false", "watchdog_enabled": false },
+      "enabled": true
+    },
+    { "name": "null document", "value": null, "enabled": true },
+    {
+      "name": "wrong-case field is unknown",
+      "value": { "WATCHDOGENABLED": false },
+      "enabled": true
+    },
+    { "name": "scalar document", "value": 7, "enabled": true }
+  ],
+  "overrides": [
+    {
+      "name": "true override",
+      "environment": { "CC_SWITCH_DEV_WATCHDOG_ENABLED": " TRUE " },
+      "enabled": true
+    },
+    {
+      "name": "yes override",
+      "environment": { "CC_SWITCH_DEV_WATCHDOG_ENABLED": "yes" },
+      "enabled": true
+    },
+    {
+      "name": "false override",
+      "environment": { "CC_SWITCH_DEV_WATCHDOG_ENABLED": "false" },
+      "enabled": false
+    },
+    {
+      "name": "invalid override fails closed",
+      "environment": { "CC_SWITCH_DEV_WATCHDOG_ENABLED": "invalid" },
+      "enabled": false
+    },
+    {
+      "name": "unknown-case override is ignored",
+      "environment": { "cc_switch_dev_watchdog_enabled": "true" },
+      "enabled": false
+    },
+    {
+      "name": "missing override uses settings",
+      "environment": {},
+      "enabled": false
+    }
+  ],
+  "history": [
+    {
+      "name": "inclusive cutoff and malformed entries",
+      "nowMs": 2000000,
+      "session": {
+        "restartTimesMs": [199999, 200000, 2000000, "2000000", null, 1.5]
+      },
+      "times": [200000, 2000000]
+    },
+    {
+      "name": "canonical empty wins",
+      "nowMs": 2000000,
+      "session": {
+        "restartTimesMs": [],
+        "supervisorRestartTimesMs": [2000000]
+      },
+      "times": []
+    },
+    {
+      "name": "legacy migration",
+      "nowMs": 2000000,
+      "session": {
+        "restartTimesMs": null,
+        "supervisorRestartTimesMs": [2000000]
+      },
+      "times": [2000000]
+    }
+  ]
+}

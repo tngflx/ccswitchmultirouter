@@ -196,6 +196,8 @@ pub async fn handle_streaming(
 
     let mut response_headers = response.headers().clone();
     strip_hop_by_hop_response_headers(&mut response_headers);
+    // SSE keepalives can change the byte count, so upstream length cannot frame this body.
+    response_headers.remove(axum::http::header::CONTENT_LENGTH);
 
     let mut builder = axum::response::Response::builder().status(status);
 
@@ -1122,6 +1124,79 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains(": keep-alive\n\n"), "{text:?}");
         assert!(text.contains("response.completed"), "{text:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finite_sse_keepalive_drops_upstream_content_length() {
+        use crate::app_config::AppType;
+        use crate::provider::Provider;
+        use crate::proxy::handler_config::CODEX_PARSER_CONFIG;
+        use http_body_util::BodyExt;
+
+        let state = build_state(Arc::new(Database::memory().unwrap()));
+        state.config.write().await.enable_logging = false;
+        let mut context = RequestContext::new_with_provider(
+            &state,
+            &serde_json::json!({"model": "test-model"}),
+            &HeaderMap::new(),
+            AppType::Codex,
+            "test-finite-sse",
+            "codex",
+            Provider::with_id(
+                "test-provider".to_string(),
+                "Test Provider".to_string(),
+                serde_json::json!({}),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        context.app_config.auto_failover_enabled = true;
+        context.app_config.streaming_first_byte_timeout = 1;
+        context.app_config.streaming_idle_timeout = 3;
+
+        let created = Bytes::from_static(b"data: {\"type\":\"response.created\"}\n\n");
+        let completed = Bytes::from_static(b"data: {\"type\":\"response.completed\"}\n\n");
+        let upstream_length = created.len() + completed.len();
+        let first_chunk = created.clone();
+        let final_chunk = completed.clone();
+        let upstream = async_stream::stream! {
+            yield Ok(first_chunk);
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            yield Ok(final_chunk);
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        headers.insert(
+            "content-length",
+            upstream_length.to_string().parse().unwrap(),
+        );
+        headers.insert("content-encoding", "identity".parse().unwrap());
+        headers.insert("x-request-id", "finite-sse-fixture".parse().unwrap());
+        let response = handle_streaming(
+            ProxyResponse::streamed(http::StatusCode::OK, headers, upstream),
+            &context,
+            &state,
+            &CODEX_PARSER_CONFIG,
+            None,
+        )
+        .await;
+
+        let (parts, body) = response.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        assert!(bytes.len() > upstream_length);
+        assert!(bytes.starts_with(&created));
+        assert!(bytes.ends_with(&completed));
+        assert!(String::from_utf8_lossy(&bytes).contains(": keep-alive\n\n"));
+        assert_eq!(parts.status, http::StatusCode::OK);
+        assert_eq!(parts.headers["content-type"], "text/event-stream");
+        assert_eq!(parts.headers["content-encoding"], "identity");
+        assert_eq!(parts.headers["x-request-id"], "finite-sse-fixture");
+        assert!(
+            !parts.headers.contains_key(axum::http::header::CONTENT_LENGTH),
+            "SSE keepalives changed the body from {upstream_length} to {} bytes; the upstream Content-Length must not frame the downstream stream",
+            bytes.len()
+        );
     }
 
     #[test]

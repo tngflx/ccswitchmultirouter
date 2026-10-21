@@ -1,4 +1,5 @@
 $helperPath = Join-Path (Split-Path -Parent $PSScriptRoot) "release-build-config.ps1"
+. (Join-Path (Split-Path -Parent $PSScriptRoot) "powershell7-runtime.ps1")
 
 Describe "CCSwitchMulti local release build config" {
     function Get-CargoPackageVersion {
@@ -92,7 +93,7 @@ Describe "CCSwitchMulti local release build config" {
         $pipeline = [System.IO.File]::ReadAllText($pipelinePath)
         $installOffset = $pipeline.IndexOf('Invoke-CheckedCommand -FilePath "pnpm" -Arguments @("install", "--frozen-lockfile", "--force")')
         $assertOffset = $pipeline.IndexOf("Assert-LocalTauriCliVersion -RepoRoot `$repoRoot")
-        $exportOffset = $pipeline.IndexOf('Invoke-CheckedCommand -FilePath "powershell" -Arguments $exportArgs')
+        $exportOffset = $pipeline.IndexOf('Invoke-CheckedCommand -FilePath $powerShell7Executable -Arguments $exportArgs')
 
         $installOffset | Should BeGreaterThan -1
         $assertOffset | Should BeGreaterThan $installOffset
@@ -105,7 +106,7 @@ Describe "CCSwitchMulti local release build config" {
         $captureOffset = $pipeline.IndexOf('$sourceIdentity = Get-ReleaseSourceIdentity -RepoRoot $repoRoot')
         $stageOffset = $pipeline.IndexOf('"-ReleaseRoot",')
         $stageVariableOffset = $pipeline.IndexOf('$stageRoot', $stageOffset)
-        $postExportGuardOffset = $pipeline.IndexOf('Assert-ReleaseSourceIdentity', $pipeline.IndexOf('Invoke-CheckedCommand -FilePath "powershell"'))
+        $postExportGuardOffset = $pipeline.IndexOf('Assert-ReleaseSourceIdentity', $pipeline.IndexOf('Invoke-CheckedCommand -FilePath $powerShell7Executable'))
         $swapOffset = $pipeline.IndexOf('Replace-ReleaseRootFromStage')
 
         $captureOffset | Should BeGreaterThan -1
@@ -294,8 +295,8 @@ Remove-LocalReleaseCargoTargetDir -RepoRoot '$($fixtureRoot.Replace("'", "''"))'
 "@
             [System.IO.File]::WriteAllText($scriptPath, $scriptBody, [System.Text.UTF8Encoding]::new($false))
 
-            $windowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-            $output = & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $scriptPath 2>&1
+            $powerShell7Executable = Resolve-CcsmPowerShell7Executable
+            $output = & $powerShell7Executable -NoProfile -ExecutionPolicy Bypass -File $scriptPath 2>&1
             $exitCode = $LASTEXITCODE
 
             $exitCode | Should Be 0
@@ -642,36 +643,20 @@ Remove-LocalReleaseCargoTargetDir -RepoRoot '$($fixtureRoot.Replace("'", "''"))'
     It "routes normal builds through the isolated Cargo target lifecycle" {
         $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
         $packageJson = [System.IO.File]::ReadAllText((Join-Path $repoRoot "package.json")) | ConvertFrom-Json
-        $buildScriptPath = Join-Path $repoRoot "scripts\local-build-pipeline.ps1"
+        $buildScriptPath = Join-Path $repoRoot "scripts\local-build-pipeline.mjs"
 
-        $packageJson.scripts.build | Should Be "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/local-build-pipeline.ps1"
+        $packageJson.scripts.build | Should Be "node scripts/local-build-pipeline.mjs"
         (Test-Path -LiteralPath $buildScriptPath -PathType Leaf) | Should Be $true
         if (-not (Test-Path -LiteralPath $buildScriptPath -PathType Leaf)) {
             return
         }
 
-        $tokens = $null
-        $errors = $null
-        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-            $buildScriptPath,
-            [ref]$tokens,
-            [ref]$errors
-        )
-        $errors.Count | Should Be 0
-        $lifecycleCalls = @($ast.FindAll({
-                    param($node)
-                    $node -is [System.Management.Automation.Language.CommandAst] -and
-                    $node.GetCommandName() -eq "Invoke-WithLocalReleaseCargoTarget"
-                }, $true))
-        $tauriBuildCalls = @($ast.FindAll({
-                    param($node)
-                    $node -is [System.Management.Automation.Language.CommandAst] -and
-                    $node.GetCommandName() -eq "pnpm" -and
-                    $node.Extent.Text -match 'tauri\s+build'
-                }, $true))
-
-        $lifecycleCalls.Count | Should Be 1
-        $tauriBuildCalls.Count | Should Be 1
+        # Execute the migrated isolation/cleanup/rollback contract instead of
+        # inspecting the removed PowerShell implementation's command AST.
+        $suitePath = Join-Path $repoRoot "scripts\local-build-pipeline.node-test.mjs"
+        $output = & node --test $suitePath 2>&1
+        $LASTEXITCODE | Should Be 0
+        ($output -join "`n") | Should Match '(?:#|ℹ) pass [1-9]'
     }
 
     It "computes SHA256 without PowerShell utility cmdlets" {

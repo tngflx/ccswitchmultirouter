@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "evidenceKind": "planned-development-reload",
+  "observedAtUtc": "2026-10-21T12:01:22.6438654+00:00",
+  "state": "ready",
+  "oldSupervisorPid": 59132,
+  "oldWatchdogPid": 52748,
+  "supervisorPid": 58868,
+  "workerPid": 50980,
+  "watchdogPid": 56280,
+  "exactOwnedWatchdogCount": 1,
+  "appPid": 9360,
+  "appPath": "D:\\repos\\ccswitchmultirouter\\src-tauri\\target\\debug\\cc-switch.exe",
+  "appStartedAtUtc": "2026-10-21T12:01:15.7130461Z",
+  "appMarkerStartMatches": true,
+  "appAncestry": [9360, 31396, 24648, 46132, 50980, 58868],
+  "exeLastWriteUtc": "2026-10-21T12:01:15.2426854Z",
+  "restartTimesMs": [],
+  "postActivation": {
+    "allFourOwnersAlive": true,
+    "helperAlive": false,
+    "maintenanceLeasePresent": false
+  },
+  "automaticHandoffEvidence": "scripts/dev-watchdog-handoff.integration.node-test.mjs",
+  "liveProviderInterruptionAuditPerformed": false,
+  "productionBinaryBuiltOrInstalled": false
+}

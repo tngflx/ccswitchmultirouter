@@ -9,6 +9,11 @@ import type { EnvInjectionSyncReport, Settings } from "@/types";
 import type { RequestHealthConfig } from "@/types/proxy";
 import { useSettingsForm, type SettingsFormState } from "./useSettingsForm";
 import {
+  persistStreamRetryPatch as persistStreamRetryPatchWithCache,
+  STREAM_RETRY_SETTING_KEYS,
+  type StreamRetrySettingsPatch,
+} from "@/lib/streamRetryPolicy";
+import {
   useDirectorySettings,
   type DirectoryAppId,
   type ResolvedDirectories,
@@ -56,6 +61,18 @@ const sanitizeDir = (value?: string | null): string | undefined => {
   if (!value) return undefined;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+};
+
+const splitStreamRetryUpdates = (updates: Partial<SettingsFormState>) => {
+  const remainingUpdates = { ...updates };
+  const retryPatch: StreamRetrySettingsPatch = {};
+  for (const key of STREAM_RETRY_SETTING_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(updates, key)) {
+      Object.assign(retryPatch, { [key]: updates[key] });
+      delete remainingUpdates[key];
+    }
+  }
+  return { remainingUpdates, retryPatch };
 };
 
 const buildSettingsPayload = (source: Settings): Settings => {
@@ -214,19 +231,37 @@ export function useSettings(): UseSettingsResult {
     [t],
   );
 
+  const persistStreamRetryPatch = useCallback(
+    async (patch: StreamRetrySettingsPatch): Promise<Settings> => {
+      return persistStreamRetryPatchWithCache(queryClient, patch);
+    },
+    [queryClient],
+  );
+
   // 即时保存设置（用于 General 标签页的实时更新）
   // 保存基础配置 + 独立的系统 API 调用（开机自启）
   const persistSettingsUpdates = useCallback(
     async (updates: Partial<SettingsFormState>): Promise<SaveResult | null> => {
-      const persistedSettings =
+      let persistedSettings =
         queryClient.getQueryData<Settings>(["settings"]) ?? data;
       if (!settings || !persistedSettings) return null;
 
       try {
+        // Retry controls have a dedicated writer. Full settings snapshots can
+        // be stale relative to the header toggle and cannot own these fields.
+        const { remainingUpdates, retryPatch } =
+          splitStreamRetryUpdates(updates);
+        if (Object.keys(retryPatch).length > 0) {
+          persistedSettings = await persistStreamRetryPatch(retryPatch);
+          if (Object.keys(remainingUpdates).length === 0) {
+            return { requiresRestart: false };
+          }
+        }
+
         // General autosaves must not publish unrelated Advanced drafts.
         const payload = buildSettingsPayload({
           ...persistedSettings,
-          ...updates,
+          ...remainingUpdates,
         });
 
         // 在 mutate 之前从实时缓存捕获上一次持久化的插件集成状态，
@@ -327,7 +362,15 @@ export function useSettings(): UseSettingsResult {
         throw error;
       }
     },
-    [data, queryClient, saveMutation, settings, syncClaudePluginIfChanged, t],
+    [
+      data,
+      persistStreamRetryPatch,
+      queryClient,
+      saveMutation,
+      settings,
+      syncClaudePluginIfChanged,
+      t,
+    ],
   );
 
   // 完整保存设置（用于 Advanced 标签页的手动保存）
@@ -340,6 +383,10 @@ export function useSettings(): UseSettingsResult {
       const mergedSettings = settings ? { ...settings, ...overrides } : null;
       if (!mergedSettings) return null;
       try {
+        const { retryPatch } = splitStreamRetryUpdates(overrides ?? {});
+        if (Object.keys(retryPatch).length > 0) {
+          await persistStreamRetryPatch(retryPatch);
+        }
         const persistedSettings =
           queryClient.getQueryData<Settings>(["settings"]) ?? data;
         const sanitizedAppDir = sanitizeDir(appConfigDir);
@@ -498,6 +545,7 @@ export function useSettings(): UseSettingsResult {
       appConfigDir,
       data,
       initialAppConfigDir,
+      persistStreamRetryPatch,
       queryClient,
       saveMutation,
       settings,

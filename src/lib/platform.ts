@@ -30,9 +30,8 @@ export const isLinux = (): boolean => {
   }
 };
 
-// Linux 上禁用所有 drag region，规避 Wayland 下 gtk_window_begin_move_drag
-// 相关的窗口事件异常（Tauri #13440）。macOS 上保留原有拖动行为；Windows
-// 项目原本就不依赖这个。
+// Linux omits drag regions to avoid Wayland window-event issues (Tauri #13440).
+// Windows keeps Tauri's event-based dragging; macOS also uses native CSS dragging.
 //
 // 这些常量设计为通过 JSX 属性 spread 消费（`{...DRAG_REGION_ATTR}`），
 // 因为 `data-tauri-drag-region` 是 wry 侧的 attribute 存在性检测，必须
@@ -43,6 +42,6 @@ export const DRAG_REGION_ATTR: Record<string, unknown> = DRAG_REGION_ENABLED
   ? { "data-tauri-drag-region": true }
   : {};
 
-export const DRAG_REGION_STYLE: Record<string, unknown> = DRAG_REGION_ENABLED
+export const DRAG_REGION_STYLE: Record<string, unknown> = isMac()
   ? { WebkitAppRegion: "drag" }
   : {};

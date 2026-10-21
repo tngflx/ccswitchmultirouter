@@ -4,15 +4,15 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { Settings } from "@/types";
+import {
+  clampStreamRetryMaxAttempts,
+  resolveStreamRetryMode,
+  streamRetryModePatch,
+  type StreamRetryMode,
+  type StreamRetrySettingsPatch,
+} from "@/lib/streamRetryPolicy";
 
-type StreamRetryMode = NonNullable<Settings["streamRetryMode"]>;
-
-export type StreamRetrySettingsUpdate = Partial<
-  Pick<
-    Settings,
-    "enableStreamRetry" | "streamRetryMode" | "streamRetryMaxAttempts"
-  >
->;
+export type StreamRetrySettingsUpdate = StreamRetrySettingsPatch;
 
 interface StreamRetryToggleProps {
   mode?: Settings["streamRetryMode"];
@@ -50,19 +50,6 @@ const MODES: Array<{
   },
 ];
 
-const resolveMode = (
-  mode: Settings["streamRetryMode"],
-  legacyEnabled: boolean | undefined,
-): StreamRetryMode => {
-  if (legacyEnabled === false && (mode === undefined || mode === "safe")) {
-    return "off";
-  }
-  return mode ?? "safe";
-};
-
-const clampAttempts = (value: number | undefined): number =>
-  Math.min(3, Math.max(1, value ?? 3));
-
 export function StreamRetryToggle({
   mode,
   enableStreamRetry,
@@ -72,8 +59,8 @@ export function StreamRetryToggle({
 }: StreamRetryToggleProps) {
   const { t } = useTranslation();
   const [isSaving, setIsSaving] = useState(false);
-  const resolvedMode = resolveMode(mode, enableStreamRetry);
-  const attempts = clampAttempts(maxAttempts);
+  const resolvedMode = resolveStreamRetryMode(mode, enableStreamRetry);
+  const attempts = clampStreamRetryMaxAttempts(maxAttempts);
   const selectedMode = MODES.find((option) => option.value === resolvedMode)!;
   const controlsDisabled = disabled || isSaving;
 
@@ -88,14 +75,11 @@ export function StreamRetryToggle({
 
   const handleModeChange = (nextMode: StreamRetryMode) => {
     if (nextMode === resolvedMode || controlsDisabled) return;
-    void persist({
-      streamRetryMode: nextMode,
-      enableStreamRetry: nextMode !== "off",
-    });
+    void persist(streamRetryModePatch(nextMode));
   };
 
   const handleAttemptsChange = (value: number) => {
-    const nextAttempts = clampAttempts(value);
+    const nextAttempts = clampStreamRetryMaxAttempts(value);
     if (nextAttempts === attempts || controlsDisabled) return;
     void persist({ streamRetryMaxAttempts: nextAttempts });
   };

@@ -41,25 +41,98 @@ where
     const MAX_OBSERVED_BYTES: usize = 1024 * 1024;
     async_stream::stream! {
         futures::pin_mut!(stream);
-        let mut captured = Vec::new();
-        let mut overflowed = false;
+        let mut scanner = SseDoneScanner::new(MAX_OBSERVED_BYTES);
+        let mut on_shape = Some(on_shape);
         while let Some(item) = stream.next().await {
             if let Ok(bytes) = &item {
-                if captured.len().saturating_add(bytes.len()) <= MAX_OBSERVED_BYTES {
-                    captured.extend_from_slice(bytes);
-                } else {
-                    overflowed = true;
-                    captured.clear();
+                if !scanner.done && !scanner.overflowed {
+                    scanner.push(bytes);
+                    if scanner.done {
+                        if let Some(callback) = on_shape.take() {
+                            if let Ok(body) = std::str::from_utf8(&scanner.captured) {
+                                callback(capture_chat_sse_shape(body));
+                            }
+                        }
+                    }
                 }
             }
             yield item;
         }
-        if !overflowed {
-            if let Ok(body) = std::str::from_utf8(&captured) {
-                on_shape(capture_chat_sse_shape(body));
+        if !scanner.overflowed {
+            if let Some(callback) = on_shape.take() {
+                if let Ok(body) = std::str::from_utf8(&scanner.captured) {
+                    callback(capture_chat_sse_shape(body));
+                }
             }
         }
     }
+}
+
+/// Incrementally captures only the bounded SSE prefix needed for runtime
+/// compatibility observation. Once a complete `[DONE]` frame is seen, the
+/// callback runs immediately and later bytes are ignored for observation while
+/// still passing through unchanged to the caller.
+struct SseDoneScanner {
+    captured: Vec<u8>,
+    frame_start: usize,
+    line_start: usize,
+    max_bytes: usize,
+    done: bool,
+    overflowed: bool,
+}
+
+impl SseDoneScanner {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            captured: Vec::new(),
+            frame_start: 0,
+            line_start: 0,
+            max_bytes,
+            done: false,
+            overflowed: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        for byte in chunk {
+            if self.captured.len() == self.max_bytes {
+                self.captured.clear();
+                self.overflowed = true;
+                return;
+            }
+            self.captured.push(*byte);
+            if *byte != b'\n' {
+                continue;
+            }
+
+            let mut line_end = self.captured.len() - 1;
+            if line_end > self.line_start && self.captured[line_end - 1] == b'\r' {
+                line_end -= 1;
+            }
+            if line_end == self.line_start {
+                let frame = &self.captured[self.frame_start..self.line_start];
+                if sse_frame_is_done(frame) {
+                    self.done = true;
+                    return;
+                }
+                self.frame_start = self.captured.len();
+            }
+            self.line_start = self.captured.len();
+        }
+    }
+}
+
+fn sse_frame_is_done(frame: &[u8]) -> bool {
+    let Ok(frame) = std::str::from_utf8(frame) else {
+        return false;
+    };
+    let data = frame
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n");
+    data.trim() == "[DONE]"
 }
 
 fn parse_sse_json_payloads(body: &str) -> Vec<Value> {
@@ -100,9 +173,98 @@ fn chat_payload_has_tool_call(payload: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_chat_json_shape, capture_chat_sse_shape};
+    use super::{capture_chat_json_shape, capture_chat_sse_shape, capture_chat_sse_stream};
     use crate::protocol_compatibility::{ReasoningSemantic, ReasoningSource};
+    use bytes::Bytes;
+    use futures::{stream, StreamExt};
     use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn terminal_boundary_capture_observes_split_done_before_pending_upstream() {
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let chunks = [b"data: [DO".as_slice(), b"NE]\r\n\r\n".as_slice()];
+        let upstream = stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk))),
+        )
+        .chain(stream::pending());
+        let mut wrapped = Box::pin(capture_chat_sse_stream(upstream, move |shape| {
+            let _ = sender.send(shape);
+        }));
+        for chunk in chunks {
+            assert_eq!(wrapped.next().await.unwrap().unwrap(), chunk);
+        }
+        let observed = receiver
+            .try_recv()
+            .expect("observe DONE before returning its chunk");
+        assert_eq!(observed.reasoning_shape.source, ReasoningSource::None);
+    }
+
+    #[tokio::test]
+    async fn terminal_boundary_capture_ignores_post_done_shape_and_observes_once() {
+        let input = Bytes::from_static(
+            b"data: [DONE]\n\ndata: {\"choices\":[{\"delta\":{\"reasoning\":\"late\"}}]}\n\n",
+        );
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let output = capture_chat_sse_stream(
+            stream::iter(vec![Ok::<_, std::io::Error>(input.clone())]),
+            move |shape| {
+                let _ = sender.send(shape);
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(
+            receiver.await.unwrap().reasoning_shape.source,
+            ReasoningSource::None
+        );
+        assert_eq!(output.into_iter().next().unwrap().unwrap(), input);
+    }
+
+    #[tokio::test]
+    async fn terminal_boundary_capture_overflow_never_observes_partial_shape() {
+        let input = Bytes::from(vec![b'x'; 1024 * 1024 + 1]);
+        let after_overflow = Bytes::from_static(b"\n\ndata:[DONE]\n\n");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let output = capture_chat_sse_stream(
+            stream::iter(vec![
+                Ok::<_, std::io::Error>(input.clone()),
+                Ok(after_overflow.clone()),
+            ]),
+            move |_| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(
+            output.into_iter().map(Result::unwrap).collect::<Vec<_>>(),
+            vec![input, after_overflow],
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_boundary_capture_drop_before_done_does_not_observe_partial_shape() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let upstream = stream::once(async {
+            Ok::<_, std::io::Error>(Bytes::from_static(b"data: {\"choices\":[]}\n\n"))
+        })
+        .chain(stream::pending());
+        let mut wrapped = Box::pin(capture_chat_sse_stream(upstream, move |_| {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(wrapped.next().await.unwrap().is_ok());
+        drop(wrapped);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn runtime_capture_retains_structure_without_response_text() {

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Loader2, RadioTower, RefreshCw, Settings2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 import {
   Popover,
   PopoverContent,
@@ -9,9 +10,14 @@ import {
 } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
 import { useSettingsQuery } from "@/lib/query";
-import { settingsApi } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import type { Settings } from "@/types";
+import {
+  clampStreamRetryMaxAttempts,
+  persistStreamRetryPatch,
+  resolveStreamRetryMode,
+  streamRetryModePatch,
+  type StreamRetrySettingsPatch,
+} from "@/lib/streamRetryPolicy";
 
 interface StreamRetryHeaderToggleProps {
   className?: string;
@@ -21,16 +27,6 @@ interface StreamRetryHeaderToggleProps {
 const modes = ["off", "safe", "aggressive"] as const;
 type Mode = (typeof modes)[number];
 
-const resolveMode = (
-  mode: Settings["streamRetryMode"],
-  legacyEnabled: boolean | undefined,
-): Mode => {
-  if (legacyEnabled === false && (mode === undefined || mode === "safe")) {
-    return "off";
-  }
-  return mode ?? "safe";
-};
-
 export function StreamRetryHeaderToggle({
   className,
   onOpenActivity,
@@ -38,34 +34,30 @@ export function StreamRetryHeaderToggle({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { data: settings, isLoading } = useSettingsQuery();
-  const mode = resolveMode(
+  const mode = resolveStreamRetryMode(
     settings?.streamRetryMode,
     settings?.enableStreamRetry,
   );
-  const attempts = Math.min(
-    3,
-    Math.max(1, settings?.streamRetryMaxAttempts ?? 3),
+  const attempts = clampStreamRetryMaxAttempts(
+    settings?.streamRetryMaxAttempts,
   );
   const label = t("streamRetry.label", { defaultValue: "Stream Retry" });
   const modeLabel = t(`streamRetry.mode.${mode}`, { defaultValue: mode });
   const [isSaving, setIsSaving] = useState(false);
   const busy = !settings || isLoading || isSaving;
 
-  const update = async (patch: Partial<Settings>) => {
+  const update = async (patch: StreamRetrySettingsPatch) => {
     if (!settings) return;
     setIsSaving(true);
     try {
-      await settingsApi.patch(patch);
-      await queryClient.invalidateQueries({ queryKey: ["settings"] });
+      await persistStreamRetryPatch(queryClient, patch);
+    } catch {
+      toast.error(t("settings.saveFailedGeneric"));
     } finally {
       setIsSaving(false);
     }
   };
-  const setMode = (next: Mode) =>
-    void update({
-      streamRetryMode: next,
-      enableStreamRetry: next !== "off",
-    });
+  const setMode = (next: Mode) => void update(streamRetryModePatch(next));
 
   return (
     <div

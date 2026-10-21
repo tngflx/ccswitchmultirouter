@@ -1005,7 +1005,7 @@ fn codex_debug_port_has_verified_desktop_listener(debug_port: u16) -> bool {
     let script = format!(
         "Get-NetTCPConnection -State Listen -LocalPort {debug_port} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique"
     );
-    let Ok(output) = Command::new("powershell")
+    let Ok(output) = crate::powershell::command()
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(0x08000000)
         .output()
@@ -1296,12 +1296,33 @@ fn codex_runtime_timezone_from_evaluation(
 }
 
 async fn evaluate_cdp_expression(websocket_url: &str, expression: &str) -> Result<Value, String> {
+    evaluate_cdp_expression_if_authorized(websocket_url, expression, &|_| true)
+        .await?
+        .ok_or_else(|| "CDP expression authorization was revoked".to_string())
+}
+
+async fn evaluate_cdp_expression_if_authorized(
+    websocket_url: &str,
+    expression: &str,
+    authorize: &(impl Fn(bool) -> bool + Sync),
+) -> Result<Option<Value>, String> {
+    if !authorize(false) {
+        return Ok(None);
+    }
     let (socket, _) = tokio::time::timeout(CDP_CONNECT_TIMEOUT, connect_async(websocket_url))
         .await
         .map_err(|_| "timed out connecting CDP websocket".to_string())?
         .map_err(|error| format!("failed to connect CDP websocket: {error}"))?;
     let mut session = CdpSession::new(socket);
     session.send_command(1, "Runtime.enable", json!({})).await?;
+    // Connection/Runtime.enable can wait while the user disables recovery or
+    // changes providers. Recheck canonical authorization immediately before
+    // sending the renderer expression that commits a prepared continuation.
+    // Only this final check transitions the backend reservation to committing;
+    // connection preflight must not consume a continuation attempt.
+    if !authorize(true) {
+        return Ok(None);
+    }
     session
         .send_command(
             2,
@@ -1313,6 +1334,7 @@ async fn evaluate_cdp_expression(websocket_url: &str, expression: &str) -> Resul
             }),
         )
         .await
+        .map(Some)
 }
 
 /// Read the timezone from a currently running Codex renderer. This verifies the
@@ -1739,7 +1761,15 @@ pub(crate) struct CodexContinuationResult {
 }
 
 fn codex_continuation_core_script() -> &'static str {
-    include_str!("resources/codex_desktop/continuation.js")
+    static SCRIPT: OnceLock<String> = OnceLock::new();
+    SCRIPT
+        .get_or_init(|| {
+            include_str!("resources/codex_desktop/continuation.js").replace(
+                "__CCSWITCH_TERMINAL_ERROR_POLICY__",
+                crate::proxy::providers::codex_terminal::TERMINAL_ERROR_POLICY_JSON,
+            )
+        })
+        .as_str()
 }
 
 /// Submit a literal `continue` to the exact failed Codex thread through the
@@ -1751,6 +1781,7 @@ pub(crate) async fn submit_codex_continuation(
     recovery_id: &str,
     expected_model: &str,
     observed_at_ms: i64,
+    authorize: impl Fn(bool) -> bool + Send + Sync,
 ) -> Result<CodexContinuationResult, String> {
     if thread_id.trim().is_empty() || recovery_id.trim().is_empty() {
         return Err("An exact Codex thread and recovery id are required".to_string());
@@ -1792,8 +1823,8 @@ pub(crate) async fn submit_codex_continuation(
             let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
                 continue;
             };
-            // This synchronous expression only registers a job. If its reply
-            // is lost, do not try another renderer: the job may be submitting.
+            // This synchronous expression only starts read-only preparation.
+            // The backend authorizes a separate commit after the thread reads.
             let evaluation = match evaluate_cdp_expression(websocket_url, &start_script).await {
                 Ok(value) => value,
                 Err(error) => return Err(format!("target {}: {error}", target.id)),
@@ -1830,6 +1861,23 @@ pub(crate) async fn submit_codex_continuation(
                 }})()"#,
                 patch_key = MODEL_PICKER_PATCH_KEY,
             );
+            let commit_script = format!(
+                r#"(() => {{
+                  const state = window[{patch_key:?}];
+                  return state && typeof state.commitCodexContinuation === 'function'
+                    ? state.commitCodexContinuation({recovery_id_json})
+                    : {{started:false, reason:'Codex continuation commit is not ready'}};
+                }})()"#,
+                patch_key = MODEL_PICKER_PATCH_KEY,
+            );
+            let cancel_script = format!(
+                r#"(() => {{
+                  const state = window[{patch_key:?}];
+                  return state && typeof state.cancelCodexContinuation === 'function'
+                    ? state.cancelCodexContinuation({recovery_id_json}) : null;
+                }})()"#,
+                patch_key = MODEL_PICKER_PATCH_KEY,
+            );
             let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
             loop {
                 let evaluation = evaluate_cdp_expression(websocket_url, &poll_script).await?;
@@ -1837,6 +1885,44 @@ pub(crate) async fn submit_codex_continuation(
                     .pointer("/result/result/value")
                     .cloned()
                     .unwrap_or(Value::Null);
+                if value.get("status").and_then(Value::as_str) == Some("prepared") {
+                    let committed = evaluate_cdp_expression_if_authorized(
+                        websocket_url,
+                        &commit_script,
+                        &authorize,
+                    )
+                    .await?;
+                    let Some(committed) = committed else {
+                        let _ = evaluate_cdp_expression(websocket_url, &cancel_script).await;
+                        return Ok(CodexContinuationResult {
+                            submitted: false,
+                            mutation_attempted: false,
+                            debug_port: Some(port),
+                            target_id: Some(target.id),
+                            message: "Continuation authorization was revoked".to_string(),
+                        });
+                    };
+                    if let Some(exception) = committed.pointer("/result/exceptionDetails") {
+                        return Err(format!(
+                            "target {}: CDP continuation commit failed: {exception}",
+                            target.id
+                        ));
+                    }
+                    if committed.pointer("/result/result/value/started") != Some(&Value::Bool(true))
+                    {
+                        return Ok(CodexContinuationResult {
+                            submitted: false,
+                            mutation_attempted: false,
+                            debug_port: Some(port),
+                            target_id: Some(target.id),
+                            message: committed
+                                .pointer("/result/result/value/reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Codex continuation commit was not started")
+                                .to_string(),
+                        });
+                    }
+                }
                 if value.get("status").and_then(Value::as_str) == Some("completed") {
                     return Ok(CodexContinuationResult {
                         submitted: value
@@ -2101,7 +2187,7 @@ pub(crate) fn detect_running_codex_main_process() -> Option<PathBuf> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         let script = DETECT_CODEX_MAIN_PROCESS_SCRIPT;
-        let output = Command::new("powershell")
+        let output = crate::powershell::command()
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
@@ -2150,7 +2236,7 @@ Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'ChatGPT.exe
   } |
   Select-Object -ExpandProperty ProcessId
 "#;
-    let output = Command::new("powershell")
+    let output = crate::powershell::command()
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -3018,7 +3104,7 @@ fn powershell_json_value(script: &str) -> Option<Value> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     const POWERSHELL_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-    let mut command = Command::new("powershell");
+    let mut command = crate::powershell::command();
     command
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .creation_flags(CREATE_NO_WINDOW);
@@ -3932,6 +4018,24 @@ const normalizedCatalogProvider = (value) =>
     fn run_codex_continuation_probe(probe: &str) -> serde_json::Value {
         let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
         let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let probe = format!(
+            r#"
+// Simulate the backend's authorized prepare/commit handshake for existing
+// client-binding probes; the runtime itself never auto-commits a prepared job.
+const runCodexContinuation = async (threadId, recoveryId, model, observedAtMs) => {{
+  const started = state.startCodexContinuation(threadId, recoveryId, model, observedAtMs);
+  if (!started.started) return {{ submitted: false, reason: started.reason }};
+  for (let pending = 0; pending < 256; pending += 1) {{
+    const job = state.readCodexContinuationJob(recoveryId);
+    if (job?.status === "prepared") state.commitCodexContinuation(recoveryId);
+    if (job?.status === "completed") return job;
+    await Promise.resolve();
+  }}
+  throw new Error("The simulated authorized continuation did not finish");
+}};
+{probe}
+"#
+        );
         let script = format!(
             r#"
 const state = {{}};
@@ -4159,6 +4263,49 @@ JSON.stringify({
     }
 
     #[test]
+    fn terminal_error_policy_renderer_and_rust_share_contract() {
+        let cases: Vec<Value> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/terminalErrorPolicy.json"
+        ))
+        .expect("parse shared terminal-error fixtures");
+        let cases_json = serde_json::to_string(&cases).expect("encode terminal-error fixtures");
+        let result = run_codex_continuation_probe(&format!(
+            r#"
+const cases = {cases_json};
+globalThis.__codexContinuationResult = JSON.stringify(cases.map((testCase) => {{
+  const disposition = classifyCodexContinuationThread({{
+    id: "exact-thread", model: "request-model",
+    turns: [{{ id: "failed-turn", status: "failed", error: testCase.error }}],
+  }}, "exact-thread", "request-model");
+  return {{
+    ready: disposition.ready,
+    code: codexContinuationTerminalErrorCode(testCase.event, {{ error: testCase.error }}),
+  }};
+}}));
+"#,
+        ));
+        for (case, renderer) in cases.iter().zip(result.as_array().unwrap()) {
+            let backend = crate::proxy::providers::codex_terminal::terminal_error_code(
+                case["event"].as_str().unwrap(),
+                &json!({ "error": case["error"] }),
+            );
+            assert_eq!(backend, case["expectedCode"].as_str(), "{}", case["name"]);
+            assert_eq!(
+                renderer["code"].as_str(),
+                backend,
+                "renderer and backend categories disagree: {}",
+                case["name"],
+            );
+            assert_eq!(
+                renderer["ready"],
+                backend.is_none(),
+                "renderer and backend disagree: {}",
+                case["name"],
+            );
+        }
+    }
+
+    #[test]
     fn codex_continuation_targets_only_the_exact_failed_thread_without_picker_overrides() {
         let result = run_codex_continuation_probe(
             r#"
@@ -4188,6 +4335,56 @@ void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.no
                 { "method": "turn/start", "params": { "threadId": "exact-thread", "input": [{ "type": "text", "text": "continue" }] } },
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_rechecks_authorization_after_cdp_connection() {
+        use std::sync::Arc;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind simulated CDP server");
+        let address = listener.local_addr().unwrap();
+        let authorized = Arc::new(AtomicBool::new(true));
+        let authorization_stages = Arc::new(Mutex::new(Vec::new()));
+        let checked_stages = authorization_stages.clone();
+        let server_authorized = authorized.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let enabled = socket.next().await.unwrap().unwrap();
+            let enabled: Value = serde_json::from_str(enabled.to_text().unwrap()).unwrap();
+            assert_eq!(enabled["method"], "Runtime.enable");
+            server_authorized.store(false, Ordering::Release);
+            socket
+                .send(Message::Text(
+                    json!({"id": enabled["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            match tokio::time::timeout(Duration::from_millis(250), socket.next()).await {
+                Ok(Some(Ok(Message::Text(message)))) => {
+                    let message: Value = serde_json::from_str(&message).unwrap();
+                    message["method"].as_str().map(str::to_string)
+                }
+                _ => None,
+            }
+        });
+        let result = evaluate_cdp_expression_if_authorized(
+            &format!("ws://{address}"),
+            "state.commitCodexContinuation('simulated-recovery')",
+            &move |final_commit| {
+                checked_stages.lock().unwrap().push(final_commit);
+                authorized.load(Ordering::Acquire)
+            },
+        )
+        .await
+        .expect("inspect simulated authorization boundary");
+        assert!(result.is_none());
+        assert_eq!(server.await.unwrap(), None);
+        assert_eq!(*authorization_stages.lock().unwrap(), vec![false, true]);
     }
 
     #[test]
@@ -6524,7 +6721,7 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
         use std::os::windows::process::CommandExt;
 
         const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let mut command = Command::new("powershell");
+        let mut command = crate::powershell::command();
         command
             .args([
                 "-NoProfile",

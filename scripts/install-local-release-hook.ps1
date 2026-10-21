@@ -3,6 +3,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "powershell7-runtime.ps1")
 
 # Resolve the repository root so the hook is installed into the correct .git directory.
 function Get-RepoRoot {
@@ -15,9 +16,9 @@ function New-PostCommitHookContent {
     param([bool]$RunSynchronously)
 
     $modeLine = if ($RunSynchronously) {
-        'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$repo_root/scripts/local-release-pipeline.ps1" -Reason post-commit >> "$log_file" 2>&1'
+        'pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "$repo_root/scripts/local-release-pipeline.ps1" -Reason post-commit >> "$log_file" 2>&1'
     } else {
-        'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$repo_root/scripts/local-release-pipeline.ps1" -Reason post-commit >> "$log_file" 2>&1 &'
+        'pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "$repo_root/scripts/local-release-pipeline.ps1" -Reason post-commit >> "$log_file" 2>&1 &'
     }
 
     return @(
@@ -28,11 +29,13 @@ function New-PostCommitHookContent {
         "log_dir=`"`$repo_root/scripts/logs`"",
         "mkdir -p `"`$log_dir`"",
         "log_file=`"`$log_dir/post-commit-release.log`"",
+        'command -v pwsh.exe >/dev/null 2>&1 || { echo "PowerShell 7 is required: install the latest stable PowerShell 7 and add pwsh.exe to PATH." >&2; exit 1; }',
         "echo `"[`$(date '+%Y-%m-%d %H:%M:%S')] post-commit release triggered for `$(git rev-parse --short HEAD)`" >> `"`$log_file`"",
         $modeLine
     ) -join "`n"
 }
 
+$null = Resolve-CcsmPowerShell7Executable
 $repoRoot = Get-RepoRoot
 $hooksDir = Join-Path $repoRoot ".git\hooks"
 $hookPath = Join-Path $hooksDir "post-commit"

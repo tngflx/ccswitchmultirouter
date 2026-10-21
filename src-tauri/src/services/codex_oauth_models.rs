@@ -4,10 +4,13 @@
 //! which is not an OpenAI-compatible `/v1/models` endpoint.
 
 use crate::proxy::providers::CODEX_OAUTH_ORIGINATOR;
-use crate::services::model_fetch::{extract_model_identity_fields, FetchedModel};
+use crate::services::model_fetch::{
+    explicit_positive_model_limit, extract_model_identity_fields, FetchedModel,
+};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -32,6 +35,85 @@ static CODEX_PUBLIC_CATALOG_REFRESH_COMPLETED: Lazy<tokio::sync::Notify> =
     Lazy::new(tokio::sync::Notify::new);
 static CODEX_PUBLIC_CATALOG_APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> =
     std::sync::OnceLock::new();
+
+const AUTHENTICATED_MODEL_LIMITS_TTL: Duration = Duration::from_secs(15 * 60);
+const AUTHENTICATED_MODEL_LIMITS_MAX_ACCOUNTS: usize = 32;
+const AUTHENTICATED_MODEL_LIMITS_MAX_MODELS: usize = 2_048;
+const AUTHENTICATED_MODEL_LIMITS_MAX_ID_BYTES: usize = 256;
+
+/// Only successful authenticated responses populate this process-local cache.
+/// Store limits and model IDs, never tokens, account details, or instructions.
+#[derive(Default)]
+struct AuthenticatedModelLimitsCache {
+    accounts: HashMap<String, (Instant, Vec<FetchedModel>)>,
+}
+
+impl AuthenticatedModelLimitsCache {
+    fn record(&mut self, account_id: &str, models: &[FetchedModel], now: Instant) {
+        let account_id = account_id.trim();
+        if account_id.is_empty() || account_id.len() > AUTHENTICATED_MODEL_LIMITS_MAX_ID_BYTES {
+            return;
+        }
+        self.accounts.retain(|_, (fetched_at, _)| {
+            now.saturating_duration_since(*fetched_at) < AUTHENTICATED_MODEL_LIMITS_TTL
+        });
+        if !self.accounts.contains_key(account_id)
+            && self.accounts.len() >= AUTHENTICATED_MODEL_LIMITS_MAX_ACCOUNTS
+        {
+            if let Some(oldest) = self
+                .accounts
+                .iter()
+                .min_by_key(|(_, (time, _))| *time)
+                .map(|(id, _)| id.clone())
+            {
+                self.accounts.remove(&oldest);
+            }
+        }
+        let limits = models
+            .iter()
+            .filter(|model| {
+                !model.id.trim().is_empty()
+                    && model.id.trim().len() <= AUTHENTICATED_MODEL_LIMITS_MAX_ID_BYTES
+            })
+            .take(AUTHENTICATED_MODEL_LIMITS_MAX_MODELS)
+            .map(|model| FetchedModel {
+                id: model.id.trim().to_string(),
+                context_window: model.context_window.filter(|limit| *limit > 0),
+                max_context_window: model.max_context_window.filter(|limit| *limit > 0),
+                max_input_tokens: model.max_input_tokens.filter(|limit| *limit > 0),
+                max_output_tokens: model.max_output_tokens.filter(|limit| *limit > 0),
+                ..Default::default()
+            })
+            .collect();
+        self.accounts.insert(account_id.to_string(), (now, limits));
+    }
+
+    fn get(&mut self, account_id: &str, now: Instant) -> Vec<FetchedModel> {
+        self.accounts.retain(|_, (fetched_at, _)| {
+            now.saturating_duration_since(*fetched_at) < AUTHENTICATED_MODEL_LIMITS_TTL
+        });
+        self.accounts
+            .get(account_id.trim())
+            .map(|(_, models)| models.clone())
+            .unwrap_or_default()
+    }
+}
+
+static AUTHENTICATED_MODEL_LIMITS: Lazy<Mutex<AuthenticatedModelLimitsCache>> =
+    Lazy::new(|| Mutex::new(AuthenticatedModelLimitsCache::default()));
+
+pub(crate) fn record_authenticated_model_limits(account_id: &str, models: &[FetchedModel]) {
+    if let Ok(mut cache) = AUTHENTICATED_MODEL_LIMITS.lock() {
+        cache.record(account_id, models, Instant::now());
+    }
+}
+
+pub(crate) fn authenticated_model_limits(account_id: &str) -> Vec<FetchedModel> {
+    AUTHENTICATED_MODEL_LIMITS
+        .lock()
+        .map(|mut cache| cache.get(account_id, Instant::now()))
+        .unwrap_or_default()
+}
 
 pub(crate) fn register_public_catalog_app_handle(app_handle: tauri::AppHandle) {
     let _ = CODEX_PUBLIC_CATALOG_APP_HANDLE.set(app_handle);
@@ -569,6 +651,18 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
 
     models.push(FetchedModel {
         context_window,
+        max_context_window: explicit_positive_model_limit(
+            obj,
+            &["max_context_window", "maxContextWindow"],
+        ),
+        max_input_tokens: explicit_positive_model_limit(
+            obj,
+            &["max_input_tokens", "maxInputTokens"],
+        ),
+        max_output_tokens: explicit_positive_model_limit(
+            obj,
+            &["max_output_tokens", "maxOutputTokens"],
+        ),
         id,
         input_modalities,
         owned_by,
@@ -635,16 +729,7 @@ fn string_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<S
 ///
 /// 官方接口字段可能随客户端版本变化，只有明确的正整数才会被接受。
 fn extract_context_window(obj: &serde_json::Map<String, Value>) -> Option<u64> {
-    const KEYS: &[&str] = &[
-        "context_window",
-        "max_context_window",
-        "contextWindow",
-        "maxContextWindow",
-    ];
-
-    KEYS.iter()
-        .filter_map(|key| obj.get(*key))
-        .find_map(parse_positive_u64)
+    explicit_positive_model_limit(obj, &["context_window", "contextWindow"])
 }
 
 /// 从官方 Codex 模型条目读取输入模态。
@@ -705,17 +790,6 @@ fn extract_supports_image(
     })
 }
 
-/// 将 JSON 数字或纯数字字符串转换为正整数。
-///
-/// 带单位的文本会保留为未知值，让前端继续使用用户填写或默认兜底。
-fn parse_positive_u64(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(number) => number.as_u64().filter(|v| *v > 0),
-        Value::String(text) => text.trim().parse::<u64>().ok().filter(|value| *value > 0),
-        _ => None,
-    }
-}
-
 fn truncate_body(body: String) -> String {
     if body.chars().count() <= ERROR_BODY_MAX_CHARS {
         body
@@ -728,9 +802,116 @@ fn truncate_body(body: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn official_context_account_cache_is_scoped_bounded_and_redacts_extra_metadata() {
+        let mut cache = super::AuthenticatedModelLimitsCache::default();
+        let now = std::time::Instant::now();
+        let source = super::FetchedModel {
+            id: " wire ".into(),
+            owned_by: Some("private-account-details".into()),
+            aliases: Some(serde_json::json!({"private-alias": "private"})),
+            display_name: Some("Private profile".into()),
+            context_window: Some(272000),
+            max_context_window: Some(1000000),
+            max_input_tokens: Some(800000),
+            max_output_tokens: Some(32000),
+            ..Default::default()
+        };
+        let mut models = vec![source; super::AUTHENTICATED_MODEL_LIMITS_MAX_MODELS + 1];
+        models.push(super::FetchedModel {
+            id: "x".repeat(super::AUTHENTICATED_MODEL_LIMITS_MAX_ID_BYTES + 1),
+            ..Default::default()
+        });
+        cache.record("account-a", &models, now);
+        let cached = cache.get("account-a", now);
+        assert_eq!(cached.len(), super::AUTHENTICATED_MODEL_LIMITS_MAX_MODELS);
+        assert_eq!(cached[0].id, "wire");
+        assert_eq!(cached[0].context_window, Some(272000));
+        assert_eq!(cached[0].max_context_window, Some(1000000));
+        assert_eq!(cached[0].max_input_tokens, Some(800000));
+        assert_eq!(cached[0].max_output_tokens, Some(32000));
+        assert!(cached[0].owned_by.is_none());
+        assert!(cached[0].aliases.is_none());
+        assert!(cached[0].display_name.is_none());
+        assert!(cache.get("account-b", now).is_empty());
+        for index in 0..super::AUTHENTICATED_MODEL_LIMITS_MAX_ACCOUNTS {
+            cache.record(
+                &format!("account-{index}"),
+                &[],
+                now + std::time::Duration::from_secs(index as u64 + 1),
+            );
+        }
+        assert_eq!(
+            cache.accounts.len(),
+            super::AUTHENTICATED_MODEL_LIMITS_MAX_ACCOUNTS
+        );
+        assert!(cache
+            .get("account-a", now + std::time::Duration::from_secs(40))
+            .is_empty());
+    }
+
+    #[test]
+    fn official_context_account_cache_expires_without_failed_fetch_overwriting_prior_snapshot() {
+        let mut cache = super::AuthenticatedModelLimitsCache::default();
+        let now = std::time::Instant::now();
+        cache.record(
+            "account",
+            &[super::FetchedModel {
+                id: "wire".into(),
+                context_window: Some(272000),
+                ..Default::default()
+            }],
+            now,
+        );
+        // Failed fetches return before record_authenticated_model_limits. The
+        // prior successful snapshot remains available until its bounded TTL.
+        assert_eq!(
+            cache.get("account", now + std::time::Duration::from_secs(60))[0].context_window,
+            Some(272000)
+        );
+        assert!(cache
+            .get("account", now + super::AUTHENTICATED_MODEL_LIMITS_TTL)
+            .is_empty());
+    }
+
     use super::*;
     use axum::{routing::get, Json, Router};
     use serde_json::json;
+
+    #[test]
+    fn official_context_metadata_keeps_default_max_and_token_budgets_independent() {
+        let models = parse_models(json!({"models":[
+            {"slug":"with-default","context_window":272000,"max_context_window":872000,"max_input_tokens":"800000","max_output_tokens":32000},
+            {"slug":"max-only","maxContextWindow":"1000000"},
+            {"slug":"invalid","context_window":0,"max_context_window":-1,"max_input_tokens":1.5,"max_output_tokens":"8000 tokens"}
+        ]}));
+        let with_default = models
+            .iter()
+            .find(|model| model.id == "with-default")
+            .unwrap();
+        assert_eq!(with_default.context_window, Some(272_000));
+        assert_eq!(with_default.max_context_window, Some(872_000));
+        assert_eq!(with_default.max_input_tokens, Some(800_000));
+        assert_eq!(with_default.max_output_tokens, Some(32_000));
+        let max_only = models.iter().find(|model| model.id == "max-only").unwrap();
+        assert_eq!(
+            max_only.context_window, None,
+            "a maximum must not become the directory default"
+        );
+        assert_eq!(max_only.max_context_window, Some(1_000_000));
+        assert_eq!(max_only.max_input_tokens, None);
+        assert_eq!(max_only.max_output_tokens, None);
+        let invalid = models.iter().find(|model| model.id == "invalid").unwrap();
+        assert_eq!(
+            (
+                invalid.context_window,
+                invalid.max_context_window,
+                invalid.max_input_tokens,
+                invalid.max_output_tokens
+            ),
+            (None, None, None, None)
+        );
+    }
 
     async fn spawn_public_catalog_server(body: Value) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -947,7 +1128,8 @@ mod tests {
 
         assert_eq!(models[0].context_window, None);
         assert_eq!(models[1].context_window, Some(272_000));
-        assert_eq!(models[2].context_window, Some(1_000_000));
+        assert_eq!(models[2].context_window, None);
+        assert_eq!(models[2].max_context_window, Some(1_000_000));
     }
 
     #[test]

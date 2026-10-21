@@ -8,6 +8,10 @@ import {
   type SupportedLanguage,
 } from "@/i18n/language";
 import type { Settings } from "@/types";
+import {
+  clampStreamRetryMaxAttempts,
+  resolveStreamRetryMode,
+} from "@/lib/streamRetryPolicy";
 
 export type SettingsFormState = Omit<Settings, "language"> & {
   language: SupportedLanguage;
@@ -18,19 +22,6 @@ const sanitizeDir = (value?: string | null): string | undefined => {
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
 };
-
-const normalizeStreamRetryMode = (
-  mode: Settings["streamRetryMode"],
-  legacyEnabled: boolean | undefined,
-): NonNullable<Settings["streamRetryMode"]> => {
-  if (legacyEnabled === false && (mode === undefined || mode === "safe")) {
-    return "off";
-  }
-  return mode ?? "safe";
-};
-
-const normalizeStreamRetryMaxAttempts = (value: number | undefined): number =>
-  Math.min(3, Math.max(1, value ?? 3));
 
 export interface UseSettingsFormResult {
   settings: SettingsFormState | null;
@@ -106,11 +97,11 @@ export function useSettingsForm(): UseSettingsFormResult {
         data.preserveCodexOfficialAuthOnSwitch ?? false,
       unifyCodexSessionHistory: data.unifyCodexSessionHistory ?? false,
       enableStreamRetry: data.enableStreamRetry ?? true,
-      streamRetryMode: normalizeStreamRetryMode(
+      streamRetryMode: resolveStreamRetryMode(
         data.streamRetryMode,
         data.enableStreamRetry,
       ),
-      streamRetryMaxAttempts: normalizeStreamRetryMaxAttempts(
+      streamRetryMaxAttempts: clampStreamRetryMaxAttempts(
         data.streamRetryMaxAttempts,
       ),
       claudeConfigDir: sanitizeDir(data.claudeConfigDir),
@@ -205,11 +196,11 @@ export function useSettingsForm(): UseSettingsFormResult {
           serverData.preserveCodexOfficialAuthOnSwitch ?? false,
         unifyCodexSessionHistory: serverData.unifyCodexSessionHistory ?? false,
         enableStreamRetry: serverData.enableStreamRetry ?? true,
-        streamRetryMode: normalizeStreamRetryMode(
+        streamRetryMode: resolveStreamRetryMode(
           serverData.streamRetryMode,
           serverData.enableStreamRetry,
         ),
-        streamRetryMaxAttempts: normalizeStreamRetryMaxAttempts(
+        streamRetryMaxAttempts: clampStreamRetryMaxAttempts(
           serverData.streamRetryMaxAttempts,
         ),
         claudeConfigDir: sanitizeDir(serverData.claudeConfigDir),

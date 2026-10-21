@@ -846,21 +846,36 @@ def detect_running_codex_processes() -> list[str]:
     system = platform.system().lower()
     try:
         if system == "windows":
+            query = (
+                "if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7 or newer is required.' }; "
+                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+                "Get-CimInstance Win32_Process -ErrorAction Stop | "
+                "Where-Object { $_.CommandLine -and ($_.CommandLine -like '*OpenAI.Codex*' "
+                "-or $_.CommandLine -like '*\\codex.exe*app-server*' "
+                "-or $_.CommandLine -like '*\\Codex.exe*') } | "
+                "Select-Object -First 8 | ForEach-Object { \"$($_.ProcessId) $($_.Name)\" }"
+            )
             output = subprocess.check_output(
                 [
-                    "powershell",
+                    "pwsh.exe",
                     "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
+                    "-NonInteractive",
                     "-Command",
-                    "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -like '*OpenAI.Codex*' -or $_.CommandLine -like '*\\codex.exe*app-server*' -or $_.CommandLine -like '*\\Codex.exe*') } | Select-Object -First 8 | ForEach-Object { \"$($_.ProcessId) $($_.Name)\" }",
+                    query,
                 ],
-                text=True,
+                encoding="utf-8",
+                timeout=10,
                 stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         else:
             output = subprocess.check_output(["ps", "-eo", "pid=,comm=,args="], text=True)
     except Exception:
+        if system == "windows":
+            raise RuntimeError(
+                "PowerShell 7 (pwsh.exe) process detection failed; "
+                "cannot verify that Codex Desktop/app-server is closed."
+            ) from None
         return []
     lines = []
     for line in output.splitlines():

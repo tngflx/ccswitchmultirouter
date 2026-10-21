@@ -318,10 +318,12 @@ fn tool_process_matches(tool: &str, executable: &str, command_line: &str) -> boo
 }
 
 fn tool_process_is_running(tool: &str) -> Result<bool, String> {
-    use std::process::{Command, Stdio};
+    #[cfg(not(target_os = "windows"))]
+    use std::process::Command;
+    use std::process::Stdio;
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = Command::new("powershell");
+        let mut command = crate::powershell::command();
         command.args([
             "-NoProfile", "-NonInteractive", "-Command",
             "$ErrorActionPreference='Stop'; ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | Select-Object Name,CommandLine)",
@@ -732,7 +734,8 @@ fn powershell_encoded_command(script: &str) -> String {
 #[cfg(target_os = "windows")]
 fn hermes_install_windows_command() -> String {
     format!(
-        "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {}",
+        "{} -NoProfile -ExecutionPolicy Bypass -EncodedCommand {}",
+        crate::powershell::POWERSHELL7_EXECUTABLE,
         powershell_encoded_command(HERMES_INSTALL_WINDOWS_SCRIPT)
     )
 }
@@ -740,14 +743,15 @@ fn hermes_install_windows_command() -> String {
 #[cfg(target_os = "windows")]
 fn grok_install_windows_command() -> String {
     format!(
-        "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {}",
+        "{} -NoProfile -ExecutionPolicy Bypass -EncodedCommand {}",
+        crate::powershell::POWERSHELL7_EXECUTABLE,
         powershell_encoded_command(GROK_INSTALL_WINDOWS_SCRIPT)
     )
 }
 
 #[cfg(target_os = "windows")]
 fn hermes_update_windows_command() -> String {
-    // fallback 是 powershell.exe，不是 .cmd/.bat；这里不需要 `call`。PowerShell 的
+    // fallback 是 pwsh.exe，不是 .cmd/.bat；这里不需要 `call`。PowerShell 的
     // `irm | iex` 已被 EncodedCommand 收进单一参数,避免 `cmd.exe` 解析管道符。
     format!("hermes update || {}", hermes_install_windows_command())
 }
@@ -2857,7 +2861,7 @@ fn grok_native_update_command(update: String) -> String {
 
 /// Windows 版同上，fallback 换成官方 PowerShell installer。
 /// **不走 `chain_update_commands`**：它会给 `||` 右侧加 `call`，而这里的 fallback 是
-/// `powershell.exe`（不是 `.cmd`/`.bat`），不需要 `call`——与 `hermes_update_windows_command`
+/// `pwsh.exe`（不是 `.cmd`/`.bat`），不需要 `call`——与 `hermes_update_windows_command`
 /// 同一理由。
 #[cfg(target_os = "windows")]
 fn grok_native_update_command(update: String) -> String {
@@ -4519,17 +4523,8 @@ del \"%~f0\" >nul 2>&1
     std::fs::write(&bat_file, &content).map_err(|e| format!("写入批处理文件失败: {e}"))?;
 
     let bat_path = bat_file.to_string_lossy();
-    let ps_cmd = format!("& '{}'", bat_path);
-
-    // Try the preferred terminal first
-    let result = match terminal {
-        "powershell" => run_windows_start_command(
-            &["powershell", "-NoExit", "-Command", &ps_cmd],
-            "PowerShell",
-        ),
-        "wt" => run_windows_start_command(&["wt", "cmd", "/K", &bat_path], "Windows Terminal"),
-        _ => run_windows_start_command(&["cmd", "/K", &bat_path], "cmd"), // "cmd" or default
-    };
+    // Try the preferred terminal first.
+    let result = launch_preferred_windows_terminal(terminal, &bat_path);
 
     // If preferred terminal fails and it's not the default, try cmd as fallback
     if result.is_err() && terminal != "cmd" {
@@ -4609,6 +4604,42 @@ fn run_windows_start_command(args: &[&str], terminal_name: &str) -> Result<(), S
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_terminal_start_args(terminal: &str, bat_path: &str) -> (Vec<String>, &'static str) {
+    match terminal {
+        // Preserve the saved settings value while always launching PowerShell 7.
+        "powershell" => (
+            vec![
+                crate::powershell::POWERSHELL7_EXECUTABLE.to_string(),
+                "-NoExit".to_string(),
+                "-Command".to_string(),
+                format!("& '{bat_path}'"),
+            ],
+            "PowerShell 7",
+        ),
+        "wt" => (
+            vec![
+                "wt".to_string(),
+                "cmd".to_string(),
+                "/K".to_string(),
+                bat_path.to_string(),
+            ],
+            "Windows Terminal",
+        ),
+        _ => (
+            vec!["cmd".to_string(), "/K".to_string(), bat_path.to_string()],
+            "cmd",
+        ),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn launch_preferred_windows_terminal(terminal: &str, bat_path: &str) -> Result<(), String> {
+    let (args, name) = windows_terminal_start_args(terminal, bat_path);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_windows_start_command(&args, name)
 }
 
 /// 打开用户首选终端并在其中执行一段可信命令脚本。脚本尾部 `read -r` / `pause`
@@ -4759,16 +4790,7 @@ read -r _
         std::fs::write(&bat_file, &content).map_err(|e| format!("写入批处理文件失败: {e}"))?;
 
         let bat_path = bat_file.to_string_lossy();
-        let ps_cmd = format!("& '{}'", bat_path);
-
-        let result = match terminal {
-            "powershell" => run_windows_start_command(
-                &["powershell", "-NoExit", "-Command", &ps_cmd],
-                "PowerShell",
-            ),
-            "wt" => run_windows_start_command(&["wt", "cmd", "/K", &bat_path], "Windows Terminal"),
-            _ => run_windows_start_command(&["cmd", "/K", &bat_path], "cmd"),
-        };
+        let result = launch_preferred_windows_terminal(terminal, &bat_path);
 
         let final_result = if result.is_err() && terminal != "cmd" {
             log::warn!(
@@ -5596,11 +5618,8 @@ mod tests {
                 grok_install_windows_command()
             );
             assert_eq!(cmd, expected);
-            // fallback 是 powershell.exe 不是 .cmd/.bat —— `||` 右侧不该有 `call`。
-            assert!(
-                !cmd.contains("|| call"),
-                "powershell needs no `call`: {cmd}"
-            );
+            // fallback 是 pwsh.exe 不是 .cmd/.bat —— `||` 右侧不该有 `call`。
+            assert!(!cmd.contains("|| call"), "pwsh.exe needs no `call`: {cmd}");
             assert!(!cmd.contains("npm"), "npm must not be the fallback: {cmd}");
         }
 
@@ -5659,9 +5678,8 @@ mod tests {
         fn hermes_windows_static_fallback_uses_powershell_installer_without_pip() {
             let install = static_fallback_command_for("hermes", ToolLifecycleAction::Install);
             assert!(
-                install
-                    .starts_with("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand "),
-                "should use PowerShell EncodedCommand installer: {install}"
+                install.starts_with("pwsh.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand "),
+                "should use PowerShell 7 EncodedCommand installer: {install}"
             );
             let encoded = install
                 .split_once("-EncodedCommand ")
@@ -5686,7 +5704,7 @@ mod tests {
             let update = static_fallback_command("hermes");
             assert!(
                 update.starts_with(
-                    "hermes update || powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand "
+                    "hermes update || pwsh.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand "
                 ),
                 "should try CLI update before PowerShell installer: {update}"
             );
@@ -5701,11 +5719,35 @@ mod tests {
             assert!(
                 !fallback_prefix.contains('|')
                     && !fallback_prefix.contains("-Command")
-                    && !update.contains("call powershell")
+                    && !update.contains("call pwsh.exe")
                     && !fallback_prefix.contains("python")
                     && !fallback_prefix.contains("pip"),
                 "PowerShell fallback should be encoded, not called like a batch file or use pip: {update}"
             );
+        }
+
+        #[test]
+        fn persisted_powershell_terminal_choice_launches_powershell_7() {
+            let bat_path = r"C:\fixture path\launch.bat";
+            let (args, label) = windows_terminal_start_args("powershell", bat_path);
+            assert_eq!(
+                args,
+                vec![
+                    "pwsh.exe",
+                    "-NoExit",
+                    "-Command",
+                    "& 'C:\\fixture path\\launch.bat'"
+                ]
+            );
+            assert_eq!(label, "PowerShell 7");
+
+            let (args, label) = windows_terminal_start_args("cmd", bat_path);
+            assert_eq!(args, vec!["cmd", "/K", bat_path]);
+            assert_eq!(label, "cmd");
+
+            let (args, label) = windows_terminal_start_args("wt", bat_path);
+            assert_eq!(args, vec!["wt", "cmd", "/K", bat_path]);
+            assert_eq!(label, "Windows Terminal");
         }
 
         #[test]

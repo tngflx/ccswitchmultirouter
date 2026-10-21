@@ -1,3 +1,277 @@
+## 2026-10-21 - Apply permanent plaintext errors at every retry boundary
+
+When asked to confirm crash and stream recovery, source inspection found a
+remaining quota gap: reconnect HTTP/transport errors parsed JSON only, while
+initial HTTP retries used six separate quota strings and checked OpenCode
+admission first. Plaintext daily quota could therefore send another request.
+Both paths were reproduced RED with two requests instead of one; the genuine
+temporary 429 control remained retryable.
+
+Added shared `terminal_error_code_from_body` over the canonical policy and
+used it in reconnect, initial HTTP, and Desktop forward-error eligibility.
+Permanent classification precedes admission/capacity retries, quota retains
+its structured envelope, and authentication/category precedence is preserved.
+Regressions cover four stream adapters, raw transport errors, loopback HTTP
+429/503 and capacity on/off, mixed admission/quota, and transient controls.
+
+Final validation passed 4,977 Rust library tests (10 existing ignored), 156
+multirouter, strict Clippy, Rust formatting, typecheck, 476 catalog tests,
+frontend formatting, and diff checks. A guarded dev reload rebuilt the app;
+the follow-up current-session receipt verifies exactly one owned watcher,
+exact app-marker identity, and worker/supervisor ancestry. It does not claim
+live provider interruption or automatic failover from that manual activation.
+See [the plaintext-error audit](../audits/2026-10-21-stream-retry-plaintext-errors.md).
+
+## 2026-10-21 - Move external watchdog and local production build to JavaScript
+
+The user explicitly requested the JavaScript migration after the PS7-only
+recovery fix. `pnpm build`, `watchdog:run`, `watchdog:install`, and
+`watchdog:uninstall` now invoke Node directly. The old entry-point PS1 files
+only forward arguments and exit status; transaction/release-maintenance tools
+remain PowerShell. Windows identity, native exclusive lock, and task APIs use
+inline PS7 boundaries. Guardian execution requires Node 22.12 or newer for raw
+JSON FILETIME parsing with exact 100 ns BigInt identity checks.
+
+Preserved production/dev separation, canonical restart policy/history and
+maintenance leases, retained-handle stop guards, and build staging/rollback.
+Review found and fixed cleanup-error masking, lock-loss budget-write races,
+and stale-lock installer startup proof, with regression coverage. Startup now
+requires a post-lock event tied to the exact fresh guardian identity.
+
+Final checks: 129 lifecycle Node, 145 dev recovery, 213 Pester, 2,607 frontend
+tests across 269 files, 476 catalog, 28 CI Python, typecheck, formatting, and
+diff checks. No Rust source changed in this migration. The Windows CI lifecycle
+gate was added; remote Actions were not run. The read-only live install preview
+refused because the default installed production executable is absent; no
+task/runtime installation or production build was performed. See
+[the migration audit](../audits/2026-10-21-javascript-lifecycle.md).
+
+## 2026-10-21 - Keep the dev watchdog alive after a failed supervisor replacement
+
+The user reported that `pnpm dev` still exited without recovery. The earlier
+suite covered worker crashes and publication checks separately, leaving the
+outer watcher launch/failure path untested. A direct loop regression failed:
+the first replacement died before publication, the watcher logged failure,
+reported success anyway, and retired instead of starting the second attempt.
+The fix returns an explicit retry outcome and retains the same persisted
+five-attempt/thirty-minute budget. Budget exhaustion now records its reason.
+The completed-session marker-deletion hypothesis was rejected: normal nonzero
+returns are explicit disabled/budget stops; exceptions already retain ownership.
+
+The combined Node verification passed 145/145, including an isolated Windows
+integration with real Node fixture processes, PowerShell 7 CIM identity probes,
+a failed first replacement, and an owned second publication. The integration
+did not start Vite, Cargo, providers, or the target application. Its exact
+launch metadata is checked against the real JavaScript dev entry point.
+
+Development queries and Cargo cleanup now share `windows-json-query.mjs`:
+PowerShell 7 only, UTF-8, ten-second timeout, redacted diagnostics, WMI errors
+terminating, incomplete ownership blocking cleanup. Package build/release
+commands, task/upgrade/hook launchers, and history tooling also moved to
+PowerShell 7. App-side probes and terminal launches now share the Rust PS7
+factory, and history migration fails closed when its offline guard cannot
+complete. Final checks passed: 221 Pester, 2 history Python, 27 CI Python,
+12 About, 4,970 Rust library (10 existing ignored), 156 multirouter, strict
+Clippy, typecheck, formatting, and the gated renderer build with 476 catalog
+tests. The 145-test recovery command also runs in Windows backend CI;
+remote Actions were not run.
+
+A guarded planned dev reload rebuilt the debug application and activated the
+new JavaScript supervisor/watchdog. The runtime receipt verifies one owned
+watchdog, the fresh app marker/OS creation identity, and worker/supervisor
+ancestry. The helper exited and released maintenance ownership. This activates
+the fix; the isolated failed-replacement integration proves automatic retry.
+No production build/install or live provider interruption audit was performed.
+The configured provider monitor was unavailable. See
+[the watchdog audit](../audits/2026-10-21-dev-watchdog-recovery.md).
+
+Do not call a rebuilt app proof of watcher handoff. Exercise the actual outer
+monitor loop with a failed replacement, not only successful publication or a
+fake worker exit. Do not add a competing restart owner to stream retry.
+
+## 2026-10-21 - Finish structural deduplication and the remaining upstream ports (earlier phase)
+
+What happened: the user asked whether the earlier duplication audit had really
+finished and requested all six remaining upstream candidates. The first phase
+had fixed concrete bugs but left repeated retry orchestration, renderer marker
+policy, OAuth setup, and watchdog policy. These now share a reconnect driver,
+pinned credential helpers, a terminal-policy JSON consumed by Rust/renderer,
+and a development recovery policy consumed by Node/PowerShell.
+
+The remaining ports add source-preserving TOML boundaries, macOS-only native
+drag CSS, rolling usage rates, official native image forwarding, provider-owned
+official context controls, and conservative docs-only CI classification. Review
+also found raw image aliases bypassed by forwarding and several context trust
+boundaries: default/max conflation, top-level override aliases, stale account
+metadata, ordinary OAuth account switching, per-route auth overrides, native
+projection precedence, and source settings lost during live backfill. The
+fixes preserve canonical inventory and reuse existing auth owners. Published
+API limits remain display references; no unverified fixed account default was
+imported.
+
+Evidence: focused Node recovery tests passed 118/118, Windows Pester 126/126,
+CI Python 27/27, TOML 69/69, usage 36/36, and renderer terminal policy 27/27.
+The Pi timeouts were profiled and 114 positive queries were scoped to their
+existing rendered sections; assertions, event flows, global absence guards,
+discovery, and the five-second timeout were preserved. The final Pi file
+passed 46/46.
+
+Final combined verification: the full frontend command
+`pnpm test:unit --maxWorkers=1 --minWorkers=1` passed 269 files and 2,606 tests
+with a fresh completion receipt on current global Node 26.2.0. The full Rust
+library passed 4,965 tests with ten existing ignored; the required multirouter
+scope passed 156/156. Catalog verification passed its reader guard,
+reader/configuration checks, and all 476 feature tests across 15 files.
+Strict Clippy, typecheck, frontend formatting, and Rustfmt passed.
+
+An earlier Node 26.2.0 broad attempt exited after 91 passing files without a
+completion report and was correctly rejected by the guard. A checksum-verified
+portable Node 22.12.0, matching `.node-version`, was then attempted without
+changing global Node. That run encountered real five-second timeouts; its
+owned process tree was cancelled. The cause of the runtime/run differences
+remains unproven. No guards, assertions, timeouts, or build gates were weakened.
+
+The gated `pnpm build:renderer` then passed its Responses contract, catalog
+gate, and Vite build, producing `dist/assets/index-VEWzU_ZV.js` (5,928,349
+bytes). The detached watcher was hardened after recurring Windows PowerShell
+process-probe failures (`3221225794` / `0xC0000142`): development now requires
+PowerShell 7 (`pwsh.exe`) for JSON probes, with 113/113 focused Node recovery tests
+passing. Creation dates from ISO, `/Date(ms)/`, and native WMI formats are
+normalized to UTC before process identity comparison, with malformed dates
+failing closed. The final guarded reload replaced the prior session with
+supervisor 59132, exactly one owned watcher 52748, worker 10232, Vite 10536,
+Tauri 36296, and rebuilt app 30016. The app start marker matches its
+executable identity and ancestry through Cargo, Tauri, the worker, supervisor,
+and `pnpm dev`; selected watchdog/aggressive stream-retry settings remained
+enabled. Runtime evidence is saved in
+`%TEMP%\ccswitch-allports-runtime-20261021.json`.
+
+The configured live provider/CDP monitor was unavailable, so these checks do
+not establish a real interrupted provider conversation or automatic
+`continue`, and no production artifact was built or installed. The combined
+results are recorded in
+[the port audit](../audits/2026-10-21-bigstrongsun-port-candidates.md).
+
+What NOT to do again: call structural duplication finished after only fixing
+symptoms, trust editable/public model maxima as account permission, project
+account A's limits under account B's route, normalize invalid limits into a
+different value, or accept a zero test-process exit without its completion
+receipt. Refresh the long-lived supervisor and detached watcher together when
+their imported modules change; restarting only the app worker is insufficient.
+
+## 2026-10-21 - Consolidate retry policy and adapt focused BigStrongSun fixes (earlier phase)
+
+What happened: the user requested a deeper duplication audit and a comparison
+with BigStrongSun. The audit found repeated frontend retry-policy/cache writes,
+terminal marker extraction, a test-only recovery transition, duplicate first
+OAuth fetches, and a raw passthrough retry path with stale managed credentials.
+These now use the shared policy/transition/replay owners. Node/PowerShell dev
+watchdog coordination and four protocol retry loops remain maintenance debt;
+no development/production boundary failure was established by the audit.
+
+The live upstream main ref matched cached `46398018f5e6810eaf69901f228f3191deeb4c4e`.
+Focused adaptations preserve official catalogs during authentication saves,
+centralize local transport-error identity, stop converters/capture at explicit
+terminal boundaries, and remove ambiguous `ResponsePending` replay. The global
+upstream client-only retry policy was not copied: it changes Codex retry
+ownership in both development and production and conflicts with the requested
+configurable proxy recovery. Native TOML, canonical empty catalogs, disabled
+models, actual upstream error identity, and safe-connect retry budgets remain
+covered by explicit guards.
+
+Evidence: regression failures were recorded before the official catalog,
+transport identity, pending-replay, and terminal-boundary fixes. Focused suites
+and combined verification are recorded in
+[the port audit](../audits/2026-10-21-bigstrongsun-port-candidates.md) and
+[the retry audit](../audits/2026-10-20-stream-retry-edge-cases.md). The full UI
+suite has unresolved Pi provider timeouts; no timeout or guard was weakened.
+The configured live audit monitor was unavailable, so no real interrupted
+provider turn or `continue` submission was claimed as verified.
+
+Final combined evidence: Rust 4,928 passed, ten ignored; multirouter 153 passed;
+catalog 473 passed; TypeScript, production Clippy, formatting, and gated
+renderer build passed. Full frontend 2,511 passed / seven Pi provider timeouts.
+The development supervisor rebuilt the app after stopping the verified old
+instance: new worker 13060, app 45584, executable written 13:06:46.799 +08:00,
+identity/ancestry verified at 13:08:04. Saved policy stayed Aggressive/three.
+No production installer was built or installed.
+
+What NOT to do again: treat pre-header silence as proof an upstream request was
+not executed, copy upstream retry ownership over the user's policy, replace
+whole provider files and lose canonical catalog guards, or equate source tests
+with a production installation/live provider acceptance.
+
+## 2026-10-20 - Audit retry boundaries and preserve recovery ownership
+
+What happened: the user asked whether additional stream retry bugs remained
+after the overload/settings repair. A deeper source and regression audit found
+missed final JSON failures, retry waits killed by outer timeouts, stale OAuth
+headers, permanent errors entering retry paths, unsafe SSE evidence, and gaps
+in continuation accounting across preparation, acknowledgement loss, and crash.
+
+Root cause: recovery state did not distinguish read-only preparation from an
+authorized mutation, body observation assumed EOF would always be polled, and
+retry wrappers did not consistently preserve heartbeat, framing, credential,
+and permanent-error contracts at their boundaries.
+
+What we did: introduced canonical persisted recovery phases and live budget
+checks; separated renderer preparation from backend-authorized commit; retained
+spent budgets without replaying uncertain submissions; observed bounded final
+JSON using the shared classifier; preserved strict heartbeats across adapters;
+removed stale SSE Content-Length; stopped permanent and pending-operation
+errors; honored bounded Retry-After; and refreshed pinned managed-account
+credentials before sends. Header policy-save errors now remain actionable.
+
+Evidence: confirmed defects have before/after regressions. The final Rust
+library passed 4,910 tests with ten existing ignored; the required multirouter
+scope passed 153. The full frontend passed 2,507 tests across 263 files with a
+fresh receipt. Typecheck, catalog verification, gated renderer build, Rust and
+frontend formatting, Clippy with warnings denied, and diff checks passed.
+Runtime freshness and the unavailable live-monitor boundary are recorded in
+`docs/audits/2026-10-20-stream-retry-edge-cases.md`.
+The existing development supervisor rebuilt the app; executable write time was
+23:47:04 +08:00 and the verified new startup PID was 30880 at 23:47:05.
+Aggressive mode, enabled state, and three-attempt policy were preserved.
+
+What NOT to do again: infer complete retry correctness from one passing suite,
+charge a read-only preparation, repeat an uncertain mutation, treat generic
+server errors as capacity without considering permanent codes, or preserve an
+upstream byte count after changing a stream body. No bug-free guarantee or live
+provider/continuation audit is claimed.
+
+## 2026-10-20 - Preserve stream retry policy across unrelated settings saves
+
+What happened: Codex reported the exact server-overload disconnect again, while
+the device settings had returned to Safe mode. Safe has a zero post-output
+continuation budget even when the configured attempt count is three.
+
+Root cause: the header patched retry policy, but unrelated full settings saves
+did not preserve those independently updated fields. A stale Safe snapshot could
+overwrite a newer Aggressive policy. The Advanced retry control also used the
+full-save path. The incident logs do not identify which historical action reset
+this device; the stale-save defect was reproduced independently.
+
+What we did: preserve the three canonical retry fields under the backend write
+lock and route explicit Advanced/manual retry updates through patch_settings.
+Added durable backend and frontend stale-save regressions, including intentional
+Off/Safe/Aggressive changes, mixed updates, and failed patches. Restored this
+device to Aggressive with three attempts and rebuilt the development backend.
+
+Evidence: regression failed before the fix and passed afterward. Full Rust
+library tests passed 4,864 with 10 existing ignored; focused frontend passed
+63 tests and the complete frontend passed 2,501 tests across 262 files with a
+fresh completion receipt. Typecheck, formatting, Clippy with warnings denied, gated renderer
+build/catalog verification, and diff checks passed. Rebuilt dev app startup
+marker recorded PID 39156 at 22:28:30 +08:00; the recorded recovery ledger now
+contains Desktop-eligible turns with budget three. No test continuation or
+provider request was sent.
+The configured background monitor was unavailable; no live Desktop audit was
+claimed. See `docs/audits/2026-10-20-stream-retry-policy-persistence.md`.
+
+What NOT to do again: treat an enabled retry switch or max-attempt setting as
+proof that post-output continuation is enabled, or let stale full settings
+snapshots own policy fields that have a dedicated patch writer.
+
 ## 2026-10-13 - Development and production recovery have separate owners
 
 What happened: the user required development crashes to restart the complete

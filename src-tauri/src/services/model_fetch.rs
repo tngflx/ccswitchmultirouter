@@ -33,6 +33,12 @@ pub struct FetchedModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_parallel_tool_calls: Option<bool>,
     pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     pub input_modalities: Option<Vec<String>>,
     pub supports_image: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -585,6 +591,9 @@ fn parse_provider_models_response(
                 });
             FetchedModel {
                 context_window: extract_context_window(&entry.extra),
+                max_context_window: explicit_positive_model_limit(&entry.extra, &["max_context_window", "maxContextWindow"]),
+                max_input_tokens: explicit_positive_model_limit(&entry.extra, &["max_input_tokens", "maxInputTokens"]),
+                max_output_tokens: explicit_positive_model_limit(&entry.extra, &["max_output_tokens", "maxOutputTokens"]),
                 id: entry.id,
                 input_modalities: extract_input_modalities(&entry.extra),
                 owned_by: entry.owned_by,
@@ -1802,6 +1811,18 @@ fn extract_context_window(obj: &serde_json::Map<String, serde_json::Value>) -> O
     .find_map(extract_context_window)
 }
 
+/// Read only explicit positive limits. A directory default is not a maximum,
+/// and input/output token budgets must never be inferred from context size.
+pub(crate) fn explicit_positive_model_limit(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    fields: &[&str],
+) -> Option<u64> {
+    fields
+        .iter()
+        .filter_map(|field| obj.get(*field))
+        .find_map(parse_positive_u64)
+}
+
 /// 从 OpenAI-compatible `/models` 的供应商扩展字段中读取输入模态。
 ///
 /// 只有上游明确声明时才透传，避免把未知能力误推成支持图片。
@@ -1988,6 +2009,18 @@ fn parse_volcengine_plan_model_entry(entry: &serde_json::Value) -> Option<Fetche
         id: id.to_string(),
         owned_by: Some("volcengine".to_string()),
         context_window: extract_context_window(obj),
+        max_context_window: explicit_positive_model_limit(
+            obj,
+            &["max_context_window", "maxContextWindow"],
+        ),
+        max_input_tokens: explicit_positive_model_limit(
+            obj,
+            &["max_input_tokens", "maxInputTokens"],
+        ),
+        max_output_tokens: explicit_positive_model_limit(
+            obj,
+            &["max_output_tokens", "maxOutputTokens"],
+        ),
         input_modalities: extract_input_modalities(obj),
         supports_image: extract_supports_image(obj),
         reasoning: None,

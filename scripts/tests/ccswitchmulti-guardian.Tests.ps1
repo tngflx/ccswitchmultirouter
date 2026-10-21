@@ -2,8 +2,6 @@ $corePath = Join-Path (Split-Path -Parent $PSScriptRoot) "ccswitchmulti-guardian
 if (Test-Path -LiteralPath $corePath -PathType Leaf) {
     . $corePath
 }
-$watchdogPath = Join-Path (Split-Path -Parent $PSScriptRoot) "watch-ccswitchmulti.ps1"
-. $watchdogPath -PlanOnly | Out-Null
 
 function Write-TestLease {
     param([string]$Path, [hashtable]$Lease)
@@ -624,23 +622,14 @@ Describe "CCSwitchMulti shared development restart budget" {
     }
 
     It "uses the shared development budget without consulting the production restart allowance" {
-        $script:DevelopmentMode = $true
-        $script:ConfigPath = $script:budgetConfig
-        $restartTimesUtc = New-Object "System.Collections.Generic.List[datetime]"
-        foreach ($index in 1..6) { $restartTimesUtc.Add([datetime]::UtcNow) }
-        Write-BudgetSession
-        Mock Get-CcsmGuardianProcessIdentity { $null }
-        Mock Get-CcsmGuardianListenerOwner { $null }
-        Mock Start-CcsmDevSessionLauncher { $script:budgetLaunches++; 9876 }
-        Mock Test-CcsmGuardianRestartBudget { throw "development must not use the production restart allowance" }
-
-        Invoke-CcsmGuardianRecoveryPolicy -IsMaintenance { $false } `
-            -WriteEvent { param($Level, $Event, $Detail) $script:budgetEvents.Add($Event) | Out-Null } `
-            -RestartTimesUtc $restartTimesUtc
-
-        $script:budgetLaunches | Should Be 1
-        $restartTimesUtc.Count | Should Be 6
-        Assert-MockCalled Test-CcsmGuardianRestartBudget -Times 0 -Exactly -Scope It
+        # The runner policy now lives in JavaScript. Exercise that implementation
+        # while preserving the separately tested PowerShell transaction helpers.
+        $runnerTests = Join-Path (Split-Path -Parent $PSScriptRoot) "watch-ccswitchmulti.node-test.mjs"
+        $output = & node --test --test-reporter=tap `
+            --test-name-pattern '^development recovery does not consult production restart budget$' `
+            $runnerTests 2>&1
+        $LASTEXITCODE | Should Be 0
+        ($output -join "`n") | Should Match '(?m)^# pass 1$'
     }
 }
 
@@ -800,8 +789,8 @@ Describe "CCSwitchMulti owned child process wait" {
             $spawnScript,
             @'
 param([string]$ChildPidPath)
-$powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-$child = Start-Process -FilePath $powershell -WindowStyle Hidden -PassThru `
+$powerShell7Executable = Join-Path $PSHOME "pwsh.exe"
+$child = Start-Process -FilePath $powerShell7Executable -WindowStyle Hidden -PassThru `
     -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Seconds 30")
 [System.IO.File]::WriteAllText(
     $ChildPidPath,
@@ -812,8 +801,8 @@ $child = Start-Process -FilePath $powershell -WindowStyle Hidden -PassThru `
             [System.Text.UTF8Encoding]::new($false)
         )
         try {
-            $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-            $parent = Start-Process -FilePath $powershell -WindowStyle Hidden -PassThru `
+            $powerShell7Executable = Join-Path $PSHOME "pwsh.exe"
+            $parent = Start-Process -FilePath $powerShell7Executable -WindowStyle Hidden -PassThru `
                 -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $spawnScript, $childPidPath)
             $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 

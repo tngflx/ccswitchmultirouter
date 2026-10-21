@@ -1283,12 +1283,12 @@ pub(crate) fn query_codex_processes() -> (Vec<CodexAppServerProcessDiagnostics>,
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         let script = r#"
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-$all = @(Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'codex.exe' OR Name = 'ChatGPT.exe'") |
+$all = @(Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'codex.exe' OR Name = 'ChatGPT.exe'" -ErrorAction Stop) |
   Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,@{Name='StartedAt';Expression={$_.CreationDate.ToLocalTime().ToString('o')}}
 $all |
   ConvertTo-Json -Compress
 "#;
-        let output = match Command::new("powershell")
+        let output = match crate::powershell::command()
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
@@ -1297,17 +1297,9 @@ $all |
             Err(err) => return (Vec::new(), Some(format!("PowerShell failed: {err}"))),
         };
         if !output.status.success() {
-            let stderr = String::from_utf8(output.stderr)
-                .unwrap_or_else(|error| format!("PowerShell stderr was not UTF-8: {error}"))
-                .trim()
-                .to_string();
             return (
                 Vec::new(),
-                Some(if stderr.is_empty() {
-                    format!("PowerShell exited with {}", output.status)
-                } else {
-                    stderr
-                }),
+                Some(format!("PowerShell 7 exited with {}", output.status)),
             );
         }
         let stdout = match String::from_utf8(output.stdout) {

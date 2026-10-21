@@ -19,6 +19,10 @@ export interface FetchedModel {
   /** Explicit upstream billing metadata; null/undefined means unknown. */
   isFree?: boolean | null;
   contextWindow?: number | null;
+  /** Explicit directory/account limits; independent from its default context. */
+  maxContextWindow?: number | null;
+  maxInputTokens?: number | null;
+  maxOutputTokens?: number | null;
   inputModalities?: string[] | null;
   supportsImage?: boolean | null;
   supportsParallelToolCalls?: boolean | null;

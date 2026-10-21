@@ -1,3 +1,4 @@
+#Requires -Version 7.0
 [CmdletBinding()]
 param(
     [string]$InstalledExecutable = "$env:LOCALAPPDATA\CCSwitchMulti\cc-switch.exe",
@@ -16,282 +17,27 @@ param(
     [int]$MaxCycles = 0,
     [switch]$NoRestart,
     [switch]$DevelopmentMode,
-    [switch]$PlanOnly
+    [switch]$PlanOnly,
+    [switch]$Help
 )
 
-$ErrorActionPreference = "Stop"
-Set-StrictMode -Version Latest
-. (Join-Path $PSScriptRoot "ccswitchmulti-guardian-core.ps1")
-
-if ($FailureThresholdSeconds -lt 1 -or $PollSeconds -lt 1 -or $ReadyTimeoutSeconds -lt 1) {
-    throw "timing values must be positive"
-}
-$InstalledExecutable = ConvertTo-CcsmGuardianCanonicalPath -Path $InstalledExecutable
-
-function Write-CcsmGuardianEvent {
-    param([string]$Level, [string]$Event, $Detail = $null)
-
-    $record = [ordered]@{
-        timestamp = [datetime]::UtcNow.ToString("o")
-        level = $Level
-        event = $Event
-        detail = $Detail
-    }
-    [System.IO.File]::AppendAllText(
-        $LogPath,
-        ($record | ConvertTo-Json -Compress -Depth 6) + [Environment]::NewLine,
-        [System.Text.UTF8Encoding]::new($false)
-    )
-}
-
-function Get-CcsmGuardianListenerOwner {
-    $listener = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
-        Where-Object { $_.LocalAddress -in @("127.0.0.1", "0.0.0.0", "::") } |
-        Select-Object -First 1
-    if ($null -eq $listener) { return $null }
-    return [int]$listener.OwningProcess
-}
-
-function Test-CcsmExpectedProductIdentity {
-    param($Identity)
-
-    return $null -ne $Identity -and
-        (Test-CcsmGuardianSamePath -Left ([string]$Identity.Path) -Right $InstalledExecutable) -and
-        [string]::Equals(
-            [System.IO.Path]::GetFileName([string]$Identity.Path),
-            "cc-switch.exe",
-            [System.StringComparison]::OrdinalIgnoreCase
-        )
-}
-
-function Test-CcsmGuardianHealth {
-    try {
-        $response = Invoke-WebRequest -UseBasicParsing -Uri $HealthUri -TimeoutSec 3
-        return [int]$response.StatusCode -ge 200 -and [int]$response.StatusCode -lt 300
-    } catch {
-        return $false
+# Compatibility entry only. The JavaScript file owns all lifecycle behavior.
+$ErrorActionPreference = 'Stop'
+$nodeExecutable = Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1
+$nodeArguments = @((Join-Path $PSScriptRoot 'watch-ccswitchmulti.mjs'))
+foreach ($name in $PSBoundParameters.Keys) {
+    $value = $PSBoundParameters[$name]
+    if ($name -eq 'Help') {
+        if ($value) { $nodeArguments += '--help' }
+    } elseif ($value -is [System.Management.Automation.SwitchParameter]) {
+        if ($value.IsPresent) { $nodeArguments += "-$name" }
+    } else {
+        $nodeArguments += "-$name"
+        $nodeArguments += [string]$value
     }
 }
-
-function Test-CcsmUpgradeProcessActive {
-    foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue)) {
-        if ([string]$process.CommandLine -like "*install-ccswitchmulti-transaction.ps1*") { return $true }
-    }
-    foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='uninstall.exe'" -ErrorAction SilentlyContinue)) {
-        if (Test-CcsmGuardianSamePath -Left ([string]$process.ExecutablePath) `
-                -Right (Join-Path (Split-Path -Parent $InstalledExecutable) "uninstall.exe")) {
-            return $true
-        }
-    }
-    return @(Get-CimInstance Win32_Process -Filter "Name LIKE 'CCSwitchMulti%setup.exe'" -ErrorAction SilentlyContinue).Count -gt 0
-}
-
-function Test-CcsmGuardianMaintenance {
-    $leaseActive = Test-CcsmMaintenanceLease -MarkerPath $MaintenanceMarker -NowUtc ([datetime]::UtcNow) `
-        -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId }
-    if ($DevelopmentMode) {
-        $devSession = Get-CcsmDevSessionRecoveryPlan -ConfigPath $ConfigPath `
-            -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId }
-        return $leaseActive -or (Test-CcsmUpgradeProcessActive) -or
-            -not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $ConfigPath) -or
-            $devSession.Active -or $devSession.WatchdogActive -or $devSession.WatchdogOwnershipUnknown -or
-            $devSession.State -eq "stopping"
-    }
-    return $leaseActive -or (Test-CcsmUpgradeProcessActive) -or
-        -not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $ConfigPath)
-}
-
-function Stop-CcsmGuardianVerifiedProcess {
-    param($ExpectedIdentity)
-
-    $live = Get-CcsmGuardianProcessIdentity -ProcessId ([int]$ExpectedIdentity.ProcessId)
-    if (-not (Test-CcsmExpectedProductIdentity -Identity $live) -or
-        -not [string]::Equals([string]$live.StartTimeUtc, [string]$ExpectedIdentity.StartTimeUtc, [System.StringComparison]::Ordinal)) {
-        throw "process identity changed before stop"
-    }
-    $handle = Get-Process -Id ([int]$live.ProcessId) -ErrorAction Stop
-    [void]$handle.CloseMainWindow()
-    if (-not $handle.WaitForExit(10000)) {
-        Stop-Process -Id ([int]$live.ProcessId) -Force -ErrorAction Stop
-        if (-not $handle.WaitForExit(10000)) { throw "verified CCSwitchMulti process did not exit" }
-    }
-}
-
-function Wait-CcsmGuardianPortFree {
-    $deadline = (Get-Date).AddSeconds(20)
-    while ((Get-Date) -lt $deadline) {
-        if ($null -eq (Get-CcsmGuardianListenerOwner)) { return $true }
-        Start-Sleep -Milliseconds 500
-    }
-    return $false
-}
-
-function Wait-CcsmGuardianReady {
-    param([int]$ExpectedPid)
-
-    $deadline = (Get-Date).AddSeconds($ReadyTimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        if ((Get-CcsmGuardianListenerOwner) -eq $ExpectedPid -and (Test-CcsmGuardianHealth)) { return $true }
-        if (-not (Get-Process -Id $ExpectedPid -ErrorAction SilentlyContinue)) { return $false }
-        Start-Sleep -Seconds 1
-    }
-    return $false
-}
-
-function Invoke-CcsmGuardianRecoveryPolicy {
-    param(
-        [Parameter(Mandatory = $true)][scriptblock]$IsMaintenance,
-        [Parameter(Mandatory = $true)][scriptblock]$WriteEvent,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[datetime]]$RestartTimesUtc
-    )
-
-    if (-not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $ConfigPath)) {
-        Write-CcsmGuardianEvent -Level "info" -Event "restart-skipped-watchdog-disabled" -Detail @{ Port = $Port }
-        return
-    }
-    if ($NoRestart) {
-        Write-CcsmGuardianEvent -Level "warning" -Event "restart-suppressed" -Detail @{ Port = $Port }
-        return
-    }
-    $devSession = $null
-    if ($DevelopmentMode) {
-        $devSession = Get-CcsmDevSessionRecoveryPlan -ConfigPath $ConfigPath `
-            -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId }
-        if ($devSession.PreventInstalledFallback -and -not $devSession.Recoverable) {
-            Invoke-CcsmDevSessionRecovery -Plan $devSession -IsMaintenance $IsMaintenance `
-                -GetListenerOwner { Get-CcsmGuardianListenerOwner } `
-                -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId } `
-                -StartDevSession { throw "an inactive dev recovery plan must not start a process" } `
-                -WriteEvent $WriteEvent
-            return
-        }
-    }
-    # 只重启“异常死亡”的实例：应用正常退出（含托盘退出）时会自己移除运行标记，
-    # 此时不重启，避免用户主动退出后被守护反复拉起。
-    if ((-not $DevelopmentMode -or -not $devSession.Recoverable) -and -not $RestartOnCleanExit) {
-        $uncleanExit = Test-CcsmGuardianUncleanExit -ConfigPath $ConfigPath `
-            -ExpectedExecutable $InstalledExecutable -GetProcessIdentity {
-            param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId
-        }
-        if (-not $uncleanExit) {
-            Write-CcsmGuardianEvent -Level "info" -Event "restart-skipped-clean-exit" -Detail @{ Port = $Port }
-            return
-        }
-    }
-    if ($DevelopmentMode -and $devSession.Recoverable) {
-        Invoke-CcsmDevSessionRecovery -Plan $devSession -IsMaintenance $IsMaintenance `
-            -GetListenerOwner { Get-CcsmGuardianListenerOwner } `
-            -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId } `
-            -StartDevSession {
-                param($DevPlan)
-                return Start-CcsmDevSessionLauncher -Plan $DevPlan
-            } -WriteEvent $WriteEvent
-        return
-    }
-    $budgetOk = Test-CcsmGuardianRestartBudget -RestartTimesUtc $RestartTimesUtc.ToArray() `
-        -NowUtc ([datetime]::UtcNow) -WindowMinutes $RestartWindowMinutes -MaxRestarts $MaxRestartsPerWindow
-    if (-not $budgetOk) {
-        Write-CcsmGuardianEvent -Level "warning" -Event "restart-rate-limited" -Detail @{
-            Port = $Port
-            WindowMinutes = $RestartWindowMinutes
-            MaxRestarts = $MaxRestartsPerWindow
-            RestartsInWindow = $RestartTimesUtc.Count
-        }
-        return
-    }
-    $RestartTimesUtc.Add([datetime]::UtcNow)
-    Invoke-CcsmGuardianRecovery -InstalledExecutable $InstalledExecutable `
-        -IsMaintenance $IsMaintenance `
-        -InstalledExecutableExists { Test-Path -LiteralPath $InstalledExecutable -PathType Leaf } `
-        -GetListenerOwner { Get-CcsmGuardianListenerOwner } `
-        -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId } `
-        -IsExpectedProductIdentity { param($Identity) Test-CcsmExpectedProductIdentity -Identity $Identity } `
-        -GetExpectedProductProcesses {
-            $identities = @()
-            foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='cc-switch.exe'" -ErrorAction SilentlyContinue)) {
-                try {
-                    $identity = Get-CcsmGuardianProcessIdentity -ProcessId ([int]$process.ProcessId)
-                    if (Test-CcsmExpectedProductIdentity -Identity $identity) { $identities += $identity }
-                } catch { }
-            }
-            return $identities
-        } `
-        -StopVerifiedProductProcess { param($Identity) Stop-CcsmGuardianVerifiedProcess -ExpectedIdentity $Identity } `
-        -WaitPortFree { Wait-CcsmGuardianPortFree } `
-        -StartProduct { (Start-Process -FilePath $InstalledExecutable -WindowStyle Hidden -PassThru).Id } `
-        -WaitReady { param($ProcessId) Wait-CcsmGuardianReady -ExpectedPid $ProcessId } `
-        -WriteEvent $WriteEvent
-}
-
-$plan = [ordered]@{
-    InstalledExecutable = $InstalledExecutable
-    Port = $Port
-    HealthUri = $HealthUri
-    FailureThresholdSeconds = $FailureThresholdSeconds
-    PollSeconds = $PollSeconds
-    ReadyTimeoutSeconds = $ReadyTimeoutSeconds
-    MaintenanceMarker = ConvertTo-CcsmGuardianCanonicalPath -Path $MaintenanceMarker
-    LogPath = ConvertTo-CcsmGuardianCanonicalPath -Path $LogPath
-    LockPath = ConvertTo-CcsmGuardianCanonicalPath -Path $LockPath
-    ConfigPath = ConvertTo-CcsmGuardianCanonicalPath -Path $ConfigPath
-    MaxRestartsPerWindow = $MaxRestartsPerWindow
-    RestartWindowMinutes = $RestartWindowMinutes
-    RestartOnCleanExit = [bool]$RestartOnCleanExit
-    NoRestart = [bool]$NoRestart
-    DevelopmentMode = [bool]$DevelopmentMode
-}
-if ($PlanOnly) {
-    $plan | ConvertTo-Json -Depth 4
-    return
-}
-
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LockPath), (Split-Path -Parent $LogPath) | Out-Null
-$lockStream = $null
-try {
-    $lockStream = [System.IO.File]::Open(
-        $LockPath,
-        [System.IO.FileMode]::OpenOrCreate,
-        [System.IO.FileAccess]::ReadWrite,
-        [System.IO.FileShare]::None
-    )
-    $state = [pscustomobject]@{ FailureSinceUtc = $null }
-    $restartTimesUtc = New-Object "System.Collections.Generic.List[datetime]"
-    $cycles = 0
-    Write-CcsmGuardianEvent -Level "info" -Event "guardian-started" -Detail $plan
-    try {
-    while ($true) {
-        $cycles++
-        $isMaintenance = { Test-CcsmGuardianMaintenance }
-        $writeEvent = { param($Level, $Event, $Detail) Write-CcsmGuardianEvent -Level $Level -Event $Event -Detail $Detail }
-        $inspectRuntime = {
-            $owner = Get-CcsmGuardianListenerOwner
-            if ($null -eq $owner) { return [pscustomobject]@{ Healthy = $false; ListenerOwner = $null } }
-            try {
-                $identity = Get-CcsmGuardianProcessIdentity -ProcessId $owner
-                $healthy = (Test-CcsmExpectedProductIdentity -Identity $identity) -and (Test-CcsmGuardianHealth)
-                return [pscustomobject]@{ Healthy = $healthy; ListenerOwner = $owner }
-            } catch {
-                return [pscustomobject]@{ Healthy = $false; ListenerOwner = $owner }
-            }
-        }
-        $recover = {
-            Invoke-CcsmGuardianRecoveryPolicy -IsMaintenance $isMaintenance -WriteEvent $writeEvent `
-                -RestartTimesUtc $restartTimesUtc
-        }
-        Invoke-CcsmGuardianSafeIteration -WriteEvent $writeEvent -Action {
-            Invoke-CcsmGuardianIteration -State $state -NowUtc ([datetime]::UtcNow) `
-                -FailureThresholdSeconds $FailureThresholdSeconds -IsMaintenance $isMaintenance `
-                -InspectRuntime $inspectRuntime -Recover $recover -WriteEvent $writeEvent
-        } | Out-Null
-        if ($MaxCycles -gt 0 -and $cycles -ge $MaxCycles) { break }
-        Start-Sleep -Seconds $PollSeconds
-    }
-    } catch {
-        Write-CcsmGuardianEvent -Level "error" -Event "guardian-exiting" -Detail @{ Error = $_.Exception.Message; Cycles = $cycles }
-        throw
-    }
-} catch [System.IO.IOException] {
-    throw "another CCSwitchMulti guardian instance already owns $LockPath"
-} finally {
-    if ($null -ne $lockStream) { $lockStream.Dispose() }
+& $nodeExecutable.Source @nodeArguments
+if ($LASTEXITCODE -ne 0) {
+    if ($MyInvocation.InvocationName -eq '.') { throw "JavaScript lifecycle command failed with exit code $LASTEXITCODE" }
+    exit $LASTEXITCODE
 }

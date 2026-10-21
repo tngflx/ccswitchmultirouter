@@ -821,6 +821,9 @@ fn codex_settings_for_live_projection(provider: &Provider) -> Result<Value, AppE
         });
 
     let mut settings = provider.settings_config.clone();
+    if should_project {
+        crate::codex_context::apply_official_context_defaults(provider, &mut settings);
+    }
     if !should_project {
         if let Some(obj) = settings.as_object_mut() {
             obj.remove("modelCatalog");
@@ -860,6 +863,7 @@ pub(crate) fn write_codex_config_only_with_common_config(
                 .and_then(|meta| meta.api_format.as_deref()),
         ),
         &provider_context,
+        Some(provider),
     )
 }
 
@@ -1430,6 +1434,7 @@ fn write_codex_live_snapshot(
             config_str,
             profile,
             provider_context,
+            Some(provider),
         )
     } else {
         // `write_live_snapshot` is the legacy no-DB utility boundary. Normal provider switching
@@ -1440,6 +1445,7 @@ fn write_codex_live_snapshot(
             auth,
             config_str,
             profile,
+            Some(provider),
         )
     }
 }

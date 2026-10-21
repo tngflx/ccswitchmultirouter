@@ -27,6 +27,161 @@ afterEach(() => {
 });
 
 describe("useSettings persistence", () => {
+  it("patches explicit stream retry changes without saving a stale settings snapshot", async () => {
+    setSettings({
+      claudeConfigDir: "/persisted/claude",
+      enableStreamRetry: true,
+      streamRetryMode: "safe",
+      streamRetryMaxAttempts: 3,
+    });
+    const patch = vi.spyOn(settingsApi, "patch");
+    const fullSave = vi.spyOn(settingsApi, "save");
+    const client = createTestQueryClient();
+    const wrapper = ({ children }: PropsWithChildren) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result, unmount } = renderHook(() => useSettings(), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    act(() => {
+      result.current.updateSettings({ claudeConfigDir: "/draft/claude" });
+    });
+
+    const retryPatch = {
+      enableStreamRetry: true,
+      streamRetryMode: "aggressive" as const,
+      streamRetryMaxAttempts: 2,
+    };
+    await act(async () => {
+      await result.current.autoSaveSettings(retryPatch);
+    });
+
+    expect(patch).toHaveBeenCalledTimes(1);
+    expect(patch).toHaveBeenCalledWith(retryPatch);
+    expect(fullSave).not.toHaveBeenCalled();
+    expect(getSettings()).toMatchObject(retryPatch);
+    expect(client.getQueryData<Settings>(["settings"])).toMatchObject(
+      retryPatch,
+    );
+    await waitFor(() =>
+      expect(result.current.settings).toMatchObject(retryPatch),
+    );
+    expect(result.current.settings?.claudeConfigDir).toBe("/draft/claude");
+    expect(getSettings().claudeConfigDir).toBe("/persisted/claude");
+    unmount();
+    client.clear();
+  });
+
+  it("preserves a header retry patch through stale General and manual saves", async () => {
+    setSettings({
+      enableStreamRetry: true,
+      streamRetryMode: "safe",
+      streamRetryMaxAttempts: 3,
+    });
+    const client = createTestQueryClient();
+    const wrapper = ({ children }: PropsWithChildren) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result, unmount } = renderHook(() => useSettings(), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    // The header writes a patch while this Settings form still has Safe.
+    const retryPatch = {
+      enableStreamRetry: true,
+      streamRetryMode: "aggressive" as const,
+      streamRetryMaxAttempts: 2,
+    };
+    await settingsApi.patch(retryPatch);
+    await act(async () => {
+      await result.current.autoSaveSettings({ showInTray: false });
+      await result.current.saveSettings(undefined, { silent: true });
+    });
+
+    expect(getSettings()).toMatchObject(retryPatch);
+    expect(result.current.settings).toMatchObject(retryPatch);
+    unmount();
+    client.clear();
+  });
+
+  it.each(["auto", "manual"] as const)(
+    "patches only explicit retry keys in mixed %s saves",
+    async (saveKind) => {
+      setSettings({
+        enableStreamRetry: true,
+        streamRetryMode: "aggressive",
+        streamRetryMaxAttempts: 3,
+      });
+      const patch = vi.spyOn(settingsApi, "patch");
+      const fullSave = vi.spyOn(settingsApi, "save");
+      const client = createTestQueryClient();
+      const wrapper = ({ children }: PropsWithChildren) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      const { result, unmount } = renderHook(() => useSettings(), { wrapper });
+      await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+      await act(async () => {
+        const updates = { streamRetryMaxAttempts: 1, showInTray: false };
+        if (saveKind === "auto") {
+          await result.current.autoSaveSettings(updates);
+        } else {
+          await result.current.saveSettings(updates, { silent: true });
+        }
+      });
+
+      expect(patch).toHaveBeenCalledTimes(1);
+      expect(patch).toHaveBeenCalledWith({ streamRetryMaxAttempts: 1 });
+      expect(fullSave).toHaveBeenCalledTimes(1);
+      expect(getSettings()).toMatchObject({
+        enableStreamRetry: true,
+        streamRetryMode: "aggressive",
+        streamRetryMaxAttempts: 1,
+        showInTray: false,
+      });
+      unmount();
+      client.clear();
+    },
+  );
+
+  it("does not publish retry or unrelated settings when a retry patch fails", async () => {
+    setSettings({
+      showInTray: true,
+      enableStreamRetry: true,
+      streamRetryMode: "safe",
+      streamRetryMaxAttempts: 3,
+    });
+    vi.spyOn(settingsApi, "patch").mockRejectedValueOnce(
+      new Error("retry patch failed"),
+    );
+    const fullSave = vi.spyOn(settingsApi, "save");
+    const client = createTestQueryClient();
+    const wrapper = ({ children }: PropsWithChildren) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result, unmount } = renderHook(() => useSettings(), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await act(async () => {
+      await expect(
+        result.current.autoSaveSettings({
+          streamRetryMode: "aggressive",
+          showInTray: false,
+        }),
+      ).rejects.toThrow("retry patch failed");
+    });
+
+    expect(fullSave).not.toHaveBeenCalled();
+    expect(getSettings()).toMatchObject({
+      showInTray: true,
+      streamRetryMode: "safe",
+      streamRetryMaxAttempts: 3,
+    });
+    expect(client.getQueryData<Settings>(["settings"])?.streamRetryMode).toBe(
+      "safe",
+    );
+    unmount();
+    client.clear();
+  });
+
   it("acknowledges a durable master switch save before queued General saves", async () => {
     setSettings({
       claudeConfigDir: "/persisted/claude",

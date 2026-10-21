@@ -20,16 +20,18 @@ There are many ways to contribute:
 
 ### Prerequisites
 
-- Node.js 18+ and pnpm 8+
-- Rust 1.85+ and Cargo
+- Node.js from `.node-version` (22.12.0) and pnpm from `package.json`'s
+  `packageManager` field
+- Rust and Cargo from `rust-toolchain.toml`
+- PowerShell 7 on Windows for process identity and Task Scheduler probes
 - [Tauri 2.0 prerequisites](https://v2.tauri.app/start/prerequisites/)
 
 > **pnpm version**: the exact version is pinned via the `packageManager` field
 > in `package.json` (and used by CI, which sets pnpm up through Corepack).
 > With Corepack enabled locally (`corepack enable`), your pnpm shim switches
 > to the pinned version automatically, with a one-time download on first use;
-> without Corepack, any pnpm 8+ keeps working (`package-manager-strict-version`
-> defaults to off). To upgrade pnpm, edit the `packageManager` field — Dependabot
+> without Corepack, install the pinned version explicitly. To upgrade pnpm,
+> edit the `packageManager` field — Dependabot
 > bumps no longer cover the version.
 
 ### Quick Start
@@ -56,9 +58,18 @@ are recorded in `<config-dir>/logs/dev-watchdog.jsonl`.
 
 The Node restart/rebuild supervisor runs only through the development commands.
 Release builds ignore `CC_SWITCH_DEV_SUPERVISOR` and use the app's Rust watchdog
-to relaunch the installed executable after a crash. The installed PowerShell
-guardian also monitors the installed executable; development session recovery
-requires explicitly running `watch-ccswitchmulti.ps1 -DevelopmentMode`.
+to relaunch the installed executable after a crash. The external guardian is
+JavaScript too; it monitors the installed executable by default, and development
+recovery requires its explicit `--development-mode` flag. Windows identity
+probes and task registration use inline PowerShell 7 commands.
+
+Use `pnpm watchdog:run --plan-only` to inspect its options without monitoring
+or restarting anything. `pnpm watchdog:install --dry-run` previews the
+scheduled task migration; `pnpm watchdog:install` installs it for the current
+user, and `pnpm watchdog:uninstall` removes that task. The installed guardian
+uses the absolute Node executable that ran the installer, so Node 22.12 or
+newer and PowerShell 7 must remain available. The previous `.ps1` entry points
+only forward to the corresponding JavaScript files.
 
 Stream retry is available in both development and production. Safe mode
 reconnects before output is delivered. Aggressive mode also resumes a failed
@@ -74,11 +85,14 @@ pnpm install --frozen-lockfile
 pnpm build
 ```
 
-This builds the frontend, compiles the Rust app in release mode, and creates an
+The JavaScript pipeline builds the frontend, compiles the Rust app in release mode, and creates an
 NSIS installer locally. No CI is needed. The executable is exported to
 `output/production/cc-switch.exe`, with resources alongside it and installers
 under `output/production/bundle/nsis/`, before the temporary Cargo target is
 cleaned up. To choose another directory, use `pnpm build -OutputDir D:\builds\ccswitch`.
+The JavaScript spelling `pnpm build --output-dir D:\builds\ccswitch` also works.
+`pnpm test:lifecycle` verifies the guardian, installer, build transaction, and
+legacy argument forwarding without building or installing the application.
 Local builds do not require an updater signing key or install or publish the artifacts.
 
 For a complete release export with frozen dependencies, type checking, build
@@ -202,14 +216,16 @@ CC Switch supports three languages. When modifying user-facing text:
 
 ### 前提条件
 
-- Node.js 18+ 和 pnpm 8+
-- Rust 1.85+ 和 Cargo
+- `.node-version` 固定的 Node.js（22.12.0）和 `package.json` 的
+  `packageManager` 固定的 pnpm
+- `rust-toolchain.toml` 固定的 Rust 和 Cargo
+- Windows 进程身份和计划任务查询需要 PowerShell 7
 - [Tauri 2.0 开发环境](https://v2.tauri.app/start/prerequisites/)
 
 > **pnpm 版本**：确切版本由 `package.json` 的 `packageManager` 字段固定
 > （CI 通过 Corepack 按此字段安装）。本地启用 Corepack（`corepack enable`）
 > 后，pnpm shim 会自动切到该版本（首次使用需一次性下载）；未启用 Corepack
-> 时任意 pnpm 8+ 均可正常使用（`package-manager-strict-version` 默认关闭）。
+> 时请显式安装固定版本。
 > 升级 pnpm 请直接修改 `packageManager` 字段，不再由 Dependabot 代劳。
 
 ### 快速开始
@@ -234,8 +250,15 @@ pnpm dev
 
 Node 重启与重新构建守护只由开发命令启动。发布版忽略
 `CC_SWITCH_DEV_SUPERVISOR`，崩溃后由 Rust 看门狗重新启动安装态程序。
-安装态 PowerShell 守护同样只监控安装态程序；要恢复开发会话，必须显式运行
-`watch-ccswitchmulti.ps1 -DevelopmentMode`。
+外部守护也已改为 JavaScript，默认只监控安装态程序；要恢复开发会话，必须
+显式使用 `--development-mode`。Windows 身份查询和计划任务注册使用内联
+PowerShell 7 命令。
+
+`pnpm watchdog:run --plan-only` 只查看配置；
+`pnpm watchdog:install --dry-run` 预览当前用户的计划任务迁移；
+`pnpm watchdog:install` 安装，`pnpm watchdog:uninstall` 卸载该任务。
+安装后的任务使用安装时的绝对 Node 路径，因此需要保留 Node 22.12 或更新版本
+以及 PowerShell 7。旧 `.ps1` 入口仅转发到对应 JavaScript 文件。
 
 开发版与生产版都支持流重试。Safe 模式只在尚未交付输出时重新连接；Aggressive
 模式还会在配置的次数限制内向发生失败的 Codex Desktop 对话发送 `continue`。
@@ -249,11 +272,14 @@ pnpm install --frozen-lockfile
 pnpm build
 ```
 
-无需 CI：该命令构建前端、编译 release 模式的 Rust 程序，并生成 NSIS 安装包。
+无需 CI：JavaScript 构建脚本构建前端、编译 release 模式的 Rust 程序，并生成 NSIS 安装包。
 清理临时 Cargo target 前，可执行文件会导出到
 `output/production/cc-switch.exe`，资源保存在旁边，安装包位于
 `output/production/bundle/nsis/`。可通过
 `pnpm build -OutputDir D:\builds\ccswitch` 指定输出目录。
+也可使用 `pnpm build --output-dir D:\builds\ccswitch`。
+`pnpm test:lifecycle` 验证守护、安装器、构建事务和旧入口参数转发，
+不会实际构建或安装应用。
 本地构建不签署更新包，也不会自动安装或发布。
 
 需要包含依赖校验、类型检查、构建校验、元数据和校验和的完整发布导出时，

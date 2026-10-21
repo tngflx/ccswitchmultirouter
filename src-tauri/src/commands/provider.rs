@@ -5252,7 +5252,9 @@ mod universal_codex_protocol_preflight_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn universal_projection_failure_reports_committed_warning_without_rolling_back_data() {
+        let _home = crate::config::TestHomeGuard::new();
         let db = Arc::new(Database::memory().expect("memory database"));
         let state = AppState::new(db.clone());
         let (universal, receipt_ids) =

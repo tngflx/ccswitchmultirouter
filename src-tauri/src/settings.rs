@@ -758,7 +758,7 @@ pub struct AppSettings {
     // ===== 终端设置 =====
     /// 首选终端应用（可选，默认使用系统默认终端）
     /// - macOS: "terminal" | "iterm2" | "warp" | "alacritty" | "kitty" | "ghostty" | "otty" | "wezterm" | "kaku"
-    /// - Windows: "cmd" | "powershell" | "wt" (Windows Terminal)
+    /// - Windows: "cmd" | "powershell" (PowerShell 7) | "wt" (Windows Terminal)
     /// - Linux: "gnome-terminal" | "konsole" | "xfce4-terminal" | "alacritty" | "kitty" | "ghostty"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_terminal: Option<String>,
@@ -1160,6 +1160,11 @@ pub(crate) fn preserve_dedicated_settings(incoming: &mut AppSettings, existing: 
     incoming.tool_auto_update = existing.tool_auto_update.clone();
     incoming.auto_update_codex_cli = existing.auto_update_codex_cli;
     incoming.request_health = existing.request_health.clone();
+    // Both retry controls update these fields through `patch_settings`.
+    // General form snapshots must not silently replace a newer retry policy.
+    incoming.enable_stream_retry = existing.enable_stream_retry;
+    incoming.stream_retry_mode = existing.stream_retry_mode;
+    incoming.stream_retry_max_attempts = existing.stream_retry_max_attempts;
     incoming.current_provider_claude = existing.current_provider_claude.clone();
     incoming.current_provider_claude_desktop = existing.current_provider_claude_desktop.clone();
     incoming.current_provider_codex = existing.current_provider_codex.clone();

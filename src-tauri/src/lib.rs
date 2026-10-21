@@ -7,6 +7,7 @@ mod claude_mcp;
 mod claude_plugin;
 pub mod codex_config;
 pub mod codex_config_consistency;
+mod codex_context;
 mod codex_desktop;
 mod codex_egress_timezone;
 #[cfg(test)]
@@ -40,6 +41,8 @@ mod opencode_config;
 mod orchestration;
 mod panic_hook;
 mod pi_config;
+#[cfg(any(target_os = "windows", test))]
+mod powershell;
 mod process_identity;
 mod prompt;
 mod prompt_files;

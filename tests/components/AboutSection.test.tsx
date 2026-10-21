@@ -49,6 +49,11 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
+vi.mock("@/lib/platform", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/platform")>()),
+  isWindows: () => true,
+}));
+
 vi.mock("framer-motion", () => ({
   motion: new Proxy(
     {},
@@ -265,5 +270,25 @@ describe("AboutSection", () => {
     await waitFor(() => expect(screen.getAllByText("0.162.0")).toHaveLength(2));
     expect(getToolVersionsMock).toHaveBeenCalledWith(["codex"], undefined);
     expect(getToolVersionsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the Windows Hermes installer through PowerShell 7", async () => {
+    render(<AboutSection isPortable={false} />);
+    await waitFor(() =>
+      expect(screen.getAllByRole("switch")[0]).not.toBeDisabled(),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "settings.manualInstallCommands" }),
+    );
+    const commands = screen.getByText(/# Claude Code/).textContent ?? "";
+    expect(commands).toContain(
+      "pwsh.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ",
+    );
+    expect(commands).not.toMatch(/\bpowershell(?:\.exe)?\s/i);
+    const encoded = commands.match(/-EncodedCommand ([A-Za-z0-9+/=]+)/)?.[1];
+    expect(encoded).toBeDefined();
+    expect(atob(encoded!).replace(/\0/g, "")).toBe(
+      "irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex",
+    );
   });
 });

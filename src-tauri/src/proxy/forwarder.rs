@@ -44,8 +44,6 @@ use crate::commands::{CodexOAuthState, CopilotAuthState, XaiOAuthState};
 use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
 use crate::proxy::providers::codex_oauth_auth::NATIVE_CODEX_ACCOUNT_ID;
 use crate::proxy::providers::codex_oauth_pool::CodexPoolAttemptOutcome;
-use crate::proxy::providers::copilot_auth::CopilotAuthManager;
-use crate::proxy::providers::xai_oauth_auth::XaiOAuthManager;
 use crate::proxy::providers::CODEX_ACCOUNT_POOL_ENABLED;
 use crate::{
     app_config::AppType,
@@ -56,7 +54,9 @@ use futures::StreamExt;
 use http::{Extensions, StatusCode};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Manager;
 use tokio::sync::{OwnedSemaphorePermit, RwLock};
@@ -71,17 +71,138 @@ const CODEX_RESPONSES_LITE_FALLBACK_TTL: Duration = Duration::from_secs(24 * 60 
 // Keep pre-dispatch/connect failures inside CCSM long enough that a short TLS or edge outage
 // does not consume Codex's own five reconnect attempts. `ForwardFailed` is restricted below to
 // failures for which no upstream execution is possible; ambiguous in-flight requests remain
-// `ResponsePending` unless an explicitly scoped native Codex Responses stream opts into this
-// bounded pre-header retry path.
+// `ResponsePending` and are never replayed by this transport wrapper.
 const UPSTREAM_TRANSPORT_RETRY_LIMIT: usize = 5;
 /// 真实上游在尚未建立成功响应时明确返回 429，等价于拒绝接收本次采样请求，
 /// 因而可以安全重放同一份 headers/body。次数与 Codex 默认流恢复预算对齐。
 const CODEX_RATE_LIMIT_RETRY_LIMIT: usize = 5;
-const CODEX_RATE_LIMIT_MAX_SINGLE_DELAY: Duration = Duration::from_secs(60);
-const CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET: Duration = Duration::from_secs(180);
+pub(crate) const CODEX_RATE_LIMIT_MAX_SINGLE_DELAY: Duration = Duration::from_secs(60);
+pub(crate) const CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET: Duration = Duration::from_secs(180);
 const CODEX_RAW_ROUTE_RESOLUTION_ATTEMPTED: &str = "codexRawRouteResolutionAttempted";
 const CODEX_RAW_ROUTING_CONFIGURED: &str = "codexRawRoutingConfigured";
 const CODEX_RAW_ROUTE_MISSED: &str = "codexRawRouteMissed";
+
+#[derive(Clone)]
+struct ManagedReplayCredentials {
+    access_token: String,
+    workspace_id: Option<String>,
+}
+
+type ManagedReplayAuthFuture =
+    Pin<Box<dyn Future<Output = Result<ManagedReplayCredentials, ProxyError>> + Send>>;
+type ManagedReplayAuth = Arc<dyn Fn() -> ManagedReplayAuthFuture + Send + Sync>;
+
+fn managed_replay_auth_for_account<F, Fut>(account_id: String, fetch: F) -> ManagedReplayAuth
+where
+    F: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<ManagedReplayCredentials, ProxyError>> + Send + 'static,
+{
+    Arc::new(move || Box::pin(fetch(account_id.clone())))
+}
+
+fn codex_managed_replay_auth_for_account(
+    manager: Arc<RwLock<CodexOAuthManager>>,
+    account_id: String,
+) -> ManagedReplayAuth {
+    managed_replay_auth_for_account(account_id, move |account_id| {
+        let manager = Arc::clone(&manager);
+        async move {
+            let (access_token, workspace_id) = manager
+                .read()
+                .await
+                .get_valid_token_and_workspace_for_account(&account_id)
+                .await
+                .map_err(|_| {
+                    ProxyError::AuthError(
+                        "Codex OAuth authentication failed; sign in again".to_string(),
+                    )
+                })?;
+            Ok(ManagedReplayCredentials {
+                access_token,
+                workspace_id: Some(workspace_id),
+            })
+        }
+    })
+}
+
+fn reuse_initial_managed_replay_credentials(
+    auth: ManagedReplayAuth,
+    credentials: ManagedReplayCredentials,
+) -> ManagedReplayAuth {
+    let initial = Arc::new(Mutex::new(Some(credentials)));
+    Arc::new(move || {
+        let cached = initial.lock().ok().and_then(|mut value| value.take());
+        if let Some(credentials) = cached {
+            Box::pin(async move { Ok(credentials) })
+        } else {
+            auth()
+        }
+    })
+}
+
+async fn initialize_managed_replay_auth(
+    replay_auth: ManagedReplayAuth,
+    strategy: AuthStrategy,
+) -> Result<(AuthInfo, Option<String>, ManagedReplayAuth), ProxyError> {
+    let credentials = replay_auth().await?;
+    let auth = AuthInfo::new(credentials.access_token.clone(), strategy);
+    let workspace_id = credentials.workspace_id.clone();
+    let replay_auth = reuse_initial_managed_replay_credentials(replay_auth, credentials);
+    Ok((auth, workspace_id, replay_auth))
+}
+
+async fn refresh_managed_replay_headers(
+    mut headers: http::HeaderMap,
+    auth: Option<&ManagedReplayAuth>,
+) -> Result<http::HeaderMap, ProxyError> {
+    let Some(auth) = auth else {
+        return Ok(headers);
+    };
+    let credentials = auth().await?;
+    if let Some(workspace_id) = credentials.workspace_id.as_deref() {
+        if headers
+            .get("chatgpt-account-id")
+            .and_then(|value| value.to_str().ok())
+            != Some(workspace_id)
+        {
+            return Err(ProxyError::AuthError(
+                "Managed account workspace changed; sign in and retry the request".to_string(),
+            ));
+        }
+    }
+    if credentials.access_token.trim().is_empty() {
+        return Err(ProxyError::AuthError(
+            "Managed account returned an empty access token; sign in again".to_string(),
+        ));
+    }
+    let mut authorization =
+        super::providers::auth_header_value(&format!("Bearer {}", credentials.access_token))?;
+    authorization.set_sensitive(true);
+    headers.insert(http::header::AUTHORIZATION, authorization);
+    Ok(headers)
+}
+
+fn ensure_stream_replay_enabled(retry_budget: u32) -> Result<(), ProxyError> {
+    if retry_budget == 0 {
+        return Err(ProxyError::InvalidRequest(
+            "Stream Retry was turned off before automatic reconnect".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn prepare_stream_replay_headers(
+    headers: http::HeaderMap,
+    auth: Option<&ManagedReplayAuth>,
+    current_retry_budget: impl Fn() -> u32,
+) -> Result<http::HeaderMap, ProxyError> {
+    ensure_stream_replay_enabled(current_retry_budget())?;
+    let headers = refresh_managed_replay_headers(headers, auth).await?;
+    // Token refresh can await network I/O. Recheck the user's current policy
+    // after that wait, immediately before the reconnect dispatch.
+    ensure_stream_replay_enabled(current_retry_budget())?;
+    Ok(headers)
+}
 
 /// Exact decoded JSON bytes observed by the local handler before parsing or
 /// protocol conversion. Internal callers that do not pass through a handler
@@ -528,46 +649,30 @@ impl RequestForwarder {
             .map(|app_handle| app_handle.state::<CodexOAuthState>().0.clone())
     }
 
-    async fn resolve_raw_codex_oauth_credentials(
+    async fn resolve_raw_codex_oauth_replay_auth(
         &self,
         provider: &Provider,
-    ) -> Result<(String, String), String> {
+    ) -> Result<ManagedReplayAuth, String> {
         let account_id = provider
             .meta
             .as_ref()
             .and_then(|meta| meta.managed_account_id_for("codex_oauth"));
-
-        #[cfg(test)]
-        if let Some(manager) = self.codex_oauth_test_manager.as_ref() {
-            let manager = manager.read().await;
-            return match account_id.as_deref() {
-                Some(account_id) => manager
-                    .get_valid_token_and_workspace_for_account(account_id)
-                    .await
-                    .map_err(|error| error.to_string()),
-                None => manager
-                    .get_valid_token_and_workspace()
-                    .await
-                    .map_err(|error| error.to_string()),
-            };
-        }
-
-        let app_handle = self
-            .app_handle
-            .as_ref()
+        let manager = self
+            .codex_oauth_manager()
             .ok_or_else(|| "Codex OAuth 认证不可用（无 AppHandle）".to_string())?;
-        let codex_state = app_handle.state::<CodexOAuthState>();
-        let manager = codex_state.0.read().await;
-        match account_id.as_deref() {
-            Some(account_id) => manager
-                .get_valid_token_and_workspace_for_account(account_id)
-                .await
-                .map_err(|error| error.to_string()),
+        let selected_account_id = match account_id {
+            Some(account_id) => account_id,
             None => manager
-                .get_valid_token_and_workspace()
+                .read()
                 .await
-                .map_err(|error| error.to_string()),
-        }
+                .default_account_id()
+                .await
+                .ok_or_else(|| "Codex OAuth account is unavailable; sign in again".to_string())?,
+        };
+        Ok(codex_managed_replay_auth_for_account(
+            manager,
+            selected_account_id,
+        ))
     }
 
     /// 把 retry 层已经选中的 Codex route 物化为真实目标 provider。
@@ -3475,148 +3580,144 @@ impl RequestForwarder {
         // 获取认证头（提前准备，用于内联替换），同时保留仅用于日志脱敏的
         // 精确认证材料。实际日志永远不输出这些值。
         let mut log_secrets: Vec<String> = Vec::new();
+        let mut managed_replay_auth: Option<ManagedReplayAuth> = None;
         let mut auth_headers = if let Some(policy) = codex_third_party_request_policy.as_ref() {
             auth_strategy_for_log = policy.authentication_kind().to_string();
             policy.auth_header_pairs()
         } else if let Some(mut auth) = adapter.extract_auth(provider) {
-            // GitHub Copilot 特殊处理：从 CopilotAuthManager 获取真实 token
+            // Resolve each managed account once. Retries may refresh its token,
+            // but must never switch to a newly selected default account.
             if auth.strategy == AuthStrategy::GitHubCopilot {
-                if let Some(app_handle) = &self.app_handle {
-                    let copilot_state = app_handle.state::<CopilotAuthState>();
-                    let copilot_auth: tokio::sync::RwLockReadGuard<'_, CopilotAuthManager> =
-                        copilot_state.0.read().await;
-
-                    // 从 provider.meta 获取关联的 GitHub 账号 ID（多账号支持）
-                    let account_id = provider
-                        .meta
-                        .as_ref()
-                        .and_then(|m| m.managed_account_id_for("github_copilot"));
-
-                    // 根据账号 ID 获取对应 token（向后兼容：无账号 ID 时使用第一个账号）
-                    let token_result = match &account_id {
-                        Some(id) => {
-                            log::debug!("[Copilot] 使用指定账号 {id} 获取 token");
-                            copilot_auth.get_valid_token_for_account(id).await
-                        }
-                        None => {
-                            log::debug!("[Copilot] 使用默认账号获取 token");
-                            copilot_auth.get_valid_token().await
-                        }
-                    };
-
-                    match token_result {
-                        Ok(token) => {
-                            auth = AuthInfo::new(token, AuthStrategy::GitHubCopilot);
-                            log::debug!(
-                                "[Copilot] 成功获取 Copilot token (account={})",
-                                account_id.as_deref().unwrap_or("default")
-                            );
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "[Copilot] 获取 Copilot token 失败 (account={}): {e}",
-                                account_id.as_deref().unwrap_or("default")
-                            );
-                            return Err(ProxyError::AuthError(format!(
-                                "GitHub Copilot 认证失败: {e}"
-                            )));
-                        }
+                let app_handle = self.app_handle.as_ref().ok_or_else(|| {
+                    ProxyError::AuthError(
+                        "GitHub Copilot authentication is unavailable".to_string(),
+                    )
+                })?;
+                let state = app_handle.state::<CopilotAuthState>();
+                let manager = Arc::clone(&state.0);
+                let account_id = match provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.managed_account_id_for("github_copilot"))
+                {
+                    Some(account_id) => account_id,
+                    None => manager
+                        .read()
+                        .await
+                        .get_status()
+                        .await
+                        .default_account_id
+                        .ok_or_else(|| {
+                            ProxyError::AuthError(
+                                "GitHub Copilot account is unavailable; sign in again".to_string(),
+                            )
+                        })?,
+                };
+                let replay_auth = managed_replay_auth_for_account(account_id, move |account_id| {
+                    let manager = Arc::clone(&manager);
+                    async move {
+                        let access_token = manager
+                            .read()
+                            .await
+                            .get_valid_token_for_account(&account_id)
+                            .await
+                            .map_err(|_| {
+                                ProxyError::AuthError(
+                                    "GitHub Copilot authentication failed; sign in again"
+                                        .to_string(),
+                                )
+                            })?;
+                        Ok(ManagedReplayCredentials {
+                            access_token,
+                            workspace_id: None,
+                        })
                     }
-                } else {
-                    log::error!("[Copilot] AppHandle 不可用");
-                    return Err(ProxyError::AuthError(
-                        "GitHub Copilot 认证不可用（无 AppHandle）".to_string(),
-                    ));
-                }
+                });
+                let (initial_auth, _, replay_auth) =
+                    initialize_managed_replay_auth(replay_auth, AuthStrategy::GitHubCopilot)
+                        .await?;
+                auth = initial_auth;
+                managed_replay_auth = Some(replay_auth);
             }
 
-            // Codex OAuth 特殊处理：从 CodexOAuthManager 获取真实 access_token
             if auth.strategy == AuthStrategy::CodexOAuth {
-                if let Some(app_handle) = &self.app_handle {
-                    let codex_state = app_handle.state::<CodexOAuthState>();
-                    let codex_auth: tokio::sync::RwLockReadGuard<'_, CodexOAuthManager> =
-                        codex_state.0.read().await;
-
-                    // 从 provider.meta 获取关联的 ChatGPT 账号 ID
-                    let account_id = provider
-                        .meta
-                        .as_ref()
-                        .and_then(|m| m.managed_account_id_for("codex_oauth"));
-
-                    let credentials_result = match &account_id {
-                        Some(id) => {
-                            log::debug!("[CodexOAuth] 使用指定账号 {id} 获取 token");
-                            codex_auth
-                                .get_valid_token_and_workspace_for_account(id)
-                                .await
-                        }
-                        None => {
-                            log::debug!("[CodexOAuth] 使用默认账号获取 token");
-                            codex_auth.get_valid_token_and_workspace().await
-                        }
-                    };
-
-                    match credentials_result {
-                        Ok((token, workspace_id)) => {
-                            auth = AuthInfo::new(token, AuthStrategy::CodexOAuth);
-                            is_codex_oauth = true;
-                            codex_oauth_account_id = Some(workspace_id);
-                            log::debug!(
-                                "[CodexOAuth] 成功获取 access_token (account={})",
-                                codex_oauth_account_id.as_deref().unwrap_or("default")
-                            );
-                        }
-                        Err(e) => {
-                            log::error!("[CodexOAuth] 获取 access_token 失败: {e}");
-                            return Err(ProxyError::AuthError(format!(
-                                "Codex OAuth 认证失败: {e}"
-                            )));
-                        }
-                    }
-                } else {
-                    log::error!("[CodexOAuth] AppHandle 不可用");
-                    return Err(ProxyError::AuthError(
-                        "Codex OAuth 认证不可用（无 AppHandle）".to_string(),
-                    ));
-                }
+                let app_handle = self.app_handle.as_ref().ok_or_else(|| {
+                    ProxyError::AuthError("Codex OAuth authentication is unavailable".to_string())
+                })?;
+                let state = app_handle.state::<CodexOAuthState>();
+                let manager = Arc::clone(&state.0);
+                let account_id = match provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+                {
+                    Some(account_id) => account_id,
+                    None => manager
+                        .read()
+                        .await
+                        .default_account_id()
+                        .await
+                        .ok_or_else(|| {
+                            ProxyError::AuthError(
+                                "Codex OAuth account is unavailable; sign in again".to_string(),
+                            )
+                        })?,
+                };
+                let replay_auth = codex_managed_replay_auth_for_account(manager, account_id);
+                let (initial_auth, workspace_id, replay_auth) =
+                    initialize_managed_replay_auth(replay_auth, AuthStrategy::CodexOAuth).await?;
+                auth = initial_auth;
+                codex_oauth_account_id = workspace_id;
+                is_codex_oauth = true;
+                managed_replay_auth = Some(replay_auth);
             }
 
-            // xAI OAuth: resolve a managed account token immediately before
-            // sending the request. Invalid refresh credentials are persisted as
-            // requiring re-authentication by the manager.
             if auth.strategy == AuthStrategy::XaiOAuth {
-                if let Some(app_handle) = &self.app_handle {
-                    let xai_state = app_handle.state::<XaiOAuthState>();
-                    let xai_auth: tokio::sync::RwLockReadGuard<'_, XaiOAuthManager> =
-                        xai_state.0.read().await;
-                    let account_id = provider
-                        .meta
-                        .as_ref()
-                        .and_then(|meta| meta.managed_account_id_for("xai_oauth"));
-                    let token_result = match &account_id {
-                        Some(id) => xai_auth.get_valid_token_for_account(id).await,
-                        None => xai_auth.get_valid_token().await,
-                    };
-                    match token_result {
-                        Ok(token) => {
-                            auth = AuthInfo::new(token, AuthStrategy::XaiOAuth);
-                            log::debug!(
-                                "[XaiOAuth] 成功获取 access_token (account={})",
-                                account_id.as_deref().unwrap_or("default")
-                            );
-                        }
-                        Err(error) => {
-                            log::error!("[XaiOAuth] 获取 access_token 失败: {error}");
-                            return Err(ProxyError::AuthError(format!(
-                                "xAI OAuth 认证失败: {error}"
-                            )));
-                        }
+                let app_handle = self.app_handle.as_ref().ok_or_else(|| {
+                    ProxyError::AuthError("xAI OAuth authentication is unavailable".to_string())
+                })?;
+                let state = app_handle.state::<XaiOAuthState>();
+                let manager = Arc::clone(&state.0);
+                let account_id = match provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.managed_account_id_for("xai_oauth"))
+                {
+                    Some(account_id) => account_id,
+                    None => manager
+                        .read()
+                        .await
+                        .default_account_id()
+                        .await
+                        .ok_or_else(|| {
+                            ProxyError::AuthError(
+                                "xAI OAuth account is unavailable; sign in again".to_string(),
+                            )
+                        })?,
+                };
+                let replay_auth = managed_replay_auth_for_account(account_id, move |account_id| {
+                    let manager = Arc::clone(&manager);
+                    async move {
+                        let access_token = manager
+                            .read()
+                            .await
+                            .get_valid_token_for_account(&account_id)
+                            .await
+                            .map_err(|_| {
+                                ProxyError::AuthError(
+                                    "xAI OAuth authentication failed; sign in again".to_string(),
+                                )
+                            })?;
+                        Ok(ManagedReplayCredentials {
+                            access_token,
+                            workspace_id: None,
+                        })
                     }
-                } else {
-                    return Err(ProxyError::AuthError(
-                        "xAI OAuth 认证不可用（无 AppHandle）".to_string(),
-                    ));
-                }
+                });
+                let (initial_auth, _, replay_auth) =
+                    initialize_managed_replay_auth(replay_auth, AuthStrategy::XaiOAuth).await?;
+                auth = initial_auth;
+                managed_replay_auth = Some(replay_auth);
             }
 
             auth_strategy_for_log = format!("{:?}", auth.strategy);
@@ -4495,6 +4596,10 @@ impl RequestForwarder {
         // HTTP 请求；是否重试、重试多少次由转换层根据下游状态决定。
         let stream_retry_budget = crate::settings::get_settings()
             .stream_retry_budget(super::providers::streaming_retry::STREAM_MAX_RETRIES);
+        let capacity_retry_enabled = effective_codex_capacity_retry_enabled(
+            self.capacity_retry_enabled,
+            stream_retry_budget,
+        );
         let build_stream_reconnect =
             |replay_headers: http::HeaderMap, replay_payload: FinalizedRequestPayload| {
                 if stream_retry_budget == 0
@@ -4516,12 +4621,24 @@ impl RequestForwarder {
                     if is_socks_proxy || !preserve_exact_header_case {
                         let url = url.clone();
                         let method = method.clone();
+                        let replay_auth = managed_replay_auth.clone();
                         Box::new(move || {
                             let url = url.clone();
                             let method = method.clone();
                             let headers = replay_headers.clone();
                             let body = replay_payload.replay_body();
+                            let replay_auth = replay_auth.clone();
                             Box::pin(async move {
+                                let headers = prepare_stream_replay_headers(
+                                    headers,
+                                    replay_auth.as_ref(),
+                                    || {
+                                        crate::settings::get_settings().stream_retry_budget(
+                                            super::providers::streaming_retry::STREAM_MAX_RETRIES,
+                                        )
+                                    },
+                                )
+                                .await?;
                                 let client = super::http_client::get();
                                 let mut request = client
                                     .request(method, &url)
@@ -4543,6 +4660,7 @@ impl RequestForwarder {
                         let method = method.clone();
                         let extensions = extensions.clone();
                         let upstream_proxy_url = upstream_proxy_url.clone();
+                        let replay_auth = managed_replay_auth.clone();
                         Box::new(move || {
                             let url = url.clone();
                             let target_for_log = target_for_log.clone();
@@ -4551,12 +4669,23 @@ impl RequestForwarder {
                             let extensions = extensions.clone();
                             let body = replay_payload.replay_body();
                             let upstream_proxy_url = upstream_proxy_url.clone();
+                            let replay_auth = replay_auth.clone();
                             Box::pin(async move {
                                 let uri: http::Uri = url.parse().map_err(|e| {
                                     ProxyError::ForwardFailed(format!(
                                         "Invalid upstream URL ({target_for_log}): {e}"
                                     ))
                                 })?;
+                                let headers = prepare_stream_replay_headers(
+                                    headers,
+                                    replay_auth.as_ref(),
+                                    || {
+                                        crate::settings::get_settings().stream_retry_budget(
+                                            super::providers::streaming_retry::STREAM_MAX_RETRIES,
+                                        )
+                                    },
+                                )
+                                .await?;
                                 super::hyper_client::send_request(
                                     uri,
                                     &target_for_log,
@@ -4609,7 +4738,10 @@ impl RequestForwarder {
             let extensions = extensions.clone();
             let upstream_proxy_url = upstream_proxy_url.clone();
             let target_for_log = target_for_log.clone();
+            let managed_replay_auth = managed_replay_auth.clone();
             async move {
+                let headers =
+                    refresh_managed_replay_headers(headers, managed_replay_auth.as_ref()).await?;
                 send_forwarder_upstream_request(
                     method,
                     url,
@@ -4630,20 +4762,14 @@ impl RequestForwarder {
         };
 
         let send_once = || {
-            send_upstream_request_with_transport_retry(
-                adapter.name(),
-                should_retry_native_codex_responses_before_headers(
-                    app_type,
-                    endpoint,
-                    request_is_streaming,
-                ),
-                || send_upstream_request(ordered_headers.clone(), payload.replay_body()),
-            )
+            send_upstream_request_with_transport_retry(adapter.name(), || {
+                send_upstream_request(ordered_headers.clone(), payload.replay_body())
+            })
         };
         let mut response = if matches!(app_type, AppType::Codex) {
             send_codex_request_with_rate_limit_retry(
                 adapter.name(),
-                self.capacity_retry_enabled,
+                capacity_retry_enabled,
                 super::codex_traffic_policy::resolve_codex_traffic_policy(provider),
                 send_once,
             )
@@ -4786,24 +4912,13 @@ impl RequestForwarder {
                     );
                 }
                 let retry_send_once = || {
-                    send_upstream_request_with_transport_retry(
-                        adapter.name(),
-                        should_retry_native_codex_responses_before_headers(
-                            app_type,
-                            endpoint,
-                            request_is_streaming,
-                        ),
-                        || {
-                            send_upstream_request(
-                                retry_headers.clone(),
-                                retry_payload.replay_body(),
-                            )
-                        },
-                    )
+                    send_upstream_request_with_transport_retry(adapter.name(), || {
+                        send_upstream_request(retry_headers.clone(), retry_payload.replay_body())
+                    })
                 };
                 response = send_codex_request_with_rate_limit_retry(
                     adapter.name(),
-                    self.capacity_retry_enabled,
+                    capacity_retry_enabled,
                     super::codex_traffic_policy::resolve_codex_traffic_policy(provider),
                     retry_send_once,
                 )
@@ -5387,6 +5502,7 @@ impl RequestForwarder {
         let mut log_secrets: Vec<String> = Vec::new();
         let mut codex_oauth_account_id: Option<String> = None;
         let mut is_codex_oauth = false;
+        let mut managed_replay_auth: Option<ManagedReplayAuth> = None;
         let codex_official_auth_passthrough =
             should_passthrough_codex_official_auth(app_type, provider, headers);
         if codex_official_auth_passthrough {
@@ -5394,11 +5510,21 @@ impl RequestForwarder {
         }
         let mut auth_headers = if let Some(mut auth) = adapter.extract_auth(provider) {
             if auth.strategy == AuthStrategy::CodexOAuth {
-                match self.resolve_raw_codex_oauth_credentials(provider).await {
-                    Ok((token, workspace_id)) => {
-                        auth = AuthInfo::new(token, AuthStrategy::CodexOAuth);
-                        is_codex_oauth = true;
-                        codex_oauth_account_id = Some(workspace_id);
+                match self.resolve_raw_codex_oauth_replay_auth(provider).await {
+                    Ok(replay_auth) => {
+                        match initialize_managed_replay_auth(replay_auth, AuthStrategy::CodexOAuth)
+                            .await
+                        {
+                            Ok((initial_auth, workspace_id, replay_auth)) => {
+                                auth = initial_auth;
+                                codex_oauth_account_id = workspace_id;
+                                managed_replay_auth = Some(replay_auth);
+                                is_codex_oauth = true;
+                            }
+                            Err(error) => {
+                                return Err(ProxyError::AuthError(error.to_string()));
+                            }
+                        }
                     }
                     Err(err) => {
                         return Err(ProxyError::AuthError(format!(
@@ -5555,41 +5681,38 @@ impl RequestForwarder {
             endpoint,
             request_model_for_log
         );
-        let response = send_upstream_request_with_transport_retry(
-            adapter.name(),
-            should_retry_native_codex_responses_before_headers(
-                app_type,
-                endpoint,
-                request_is_streaming,
-            ),
-            || {
-                let method = method.clone();
-                let url = url.clone();
-                let target_for_log = target_for_log.clone();
-                let ordered_headers = ordered_headers.clone();
-                let extensions = extensions.clone();
-                let body_bytes = body_bytes.clone();
-                let upstream_proxy_url = upstream_proxy_url.clone();
-                async move {
-                    send_forwarder_upstream_request(
-                        method,
-                        url,
-                        target_for_log,
-                        ordered_headers,
-                        extensions,
-                        body_bytes,
-                        timeout,
-                        request_is_streaming,
-                        self.non_streaming_timeout,
-                        self.streaming_first_byte_timeout,
-                        is_socks_proxy,
-                        preserve_exact_header_case,
-                        upstream_proxy_url.as_deref(),
-                    )
-                    .await
-                }
-            },
-        )
+        let response = send_upstream_request_with_transport_retry(adapter.name(), || {
+            let method = method.clone();
+            let url = url.clone();
+            let target_for_log = target_for_log.clone();
+            let ordered_headers = ordered_headers.clone();
+            let extensions = extensions.clone();
+            let body_bytes = body_bytes.clone();
+            let upstream_proxy_url = upstream_proxy_url.clone();
+            let managed_replay_auth = managed_replay_auth.clone();
+            async move {
+                let ordered_headers =
+                    refresh_managed_replay_headers(ordered_headers, managed_replay_auth.as_ref())
+                        .await
+                        .map_err(|error| ProxyError::AuthError(error.to_string()))?;
+                send_forwarder_upstream_request(
+                    method,
+                    url,
+                    target_for_log,
+                    ordered_headers,
+                    extensions,
+                    body_bytes,
+                    timeout,
+                    request_is_streaming,
+                    self.non_streaming_timeout,
+                    self.streaming_first_byte_timeout,
+                    is_socks_proxy,
+                    preserve_exact_header_case,
+                    upstream_proxy_url.as_deref(),
+                )
+                .await
+            }
+        })
         .await
         .inspect_err(|err| {
             if let Some(trace_id) = codex_trace_id.as_deref() {
@@ -7663,17 +7786,6 @@ fn should_create_stream_reconnector(
                     || endpoint.contains("/chat/completions"))))
 }
 
-/// Only native Codex Responses streaming requests can replay before response headers.
-fn should_retry_native_codex_responses_before_headers(
-    app_type: &AppType,
-    endpoint: &str,
-    request_is_streaming: bool,
-) -> bool {
-    request_is_streaming
-        && matches!(app_type, AppType::Codex)
-        && super::providers::is_codex_responses_endpoint(endpoint)
-}
-
 /// 生成 Codex Responses-Lite fallback 的能力缓存 key。
 ///
 /// 参数:
@@ -7848,12 +7960,10 @@ async fn send_forwarder_upstream_request_inner(
 /// 对“还没有收到上游 HTTP 状态”的传输失败做有界重试。
 ///
 /// 默认只重试 `ForwardFailed`（连接失败、请求构造失败、hyper/reqwest 发送阶段失败）。
-/// `ResponsePending` 只有在调用方确认是原生 Codex Responses 流式请求时才允许有界重试；
-/// 此处尚未取得上游响应头，也未向客户端提交语义输出，但上游是否处理请求仍未确认。
+/// `ResponsePending` 永远不重试：此处尚未取得上游响应头，但上游是否处理请求仍未确认。
 /// 每个 attempt 都重新执行传入的发送闭包，因此重试使用的是同一份已经转换好的 headers/body。
 async fn send_upstream_request_with_transport_retry<F, Fut>(
     app_tag: &str,
-    retry_pre_response_pending: bool,
     mut send: F,
 ) -> Result<ProxyResponse, ProxyError>
 where
@@ -7865,34 +7975,28 @@ where
         match send().await {
             Ok(response) => return Ok(response),
             Err(error) if attempt < UPSTREAM_TRANSPORT_RETRY_LIMIT => {
-                let retry_pending =
-                    retry_pre_response_pending && matches!(error, ProxyError::ResponsePending(_));
-                if !matches!(error, ProxyError::ForwardFailed(_)) && !retry_pending {
+                if !matches!(error, ProxyError::ForwardFailed(_)) {
                     return Err(error);
                 }
                 let backoff = upstream_transport_retry_backoff(attempt);
-                if retry_pending {
-                    log::warn!(
-                        "[{app_tag}] 原生 Codex Responses 尚未收到上游响应头，未向客户端提交语义输出；上游处理结果未确认，仅在有界预算内尝试重发 {}/{}（最多 {} 次，等待 {}ms），不会无限重试: {error}",
-                        attempt + 1,
-                        UPSTREAM_TRANSPORT_RETRY_LIMIT,
-                        UPSTREAM_TRANSPORT_RETRY_LIMIT,
-                        backoff.as_millis()
-                    );
-                } else {
-                    log::warn!(
-                        "[{app_tag}] 上游传输阶段失败，同一 Provider 重试 {}/{}（等待 {}ms）: {error}",
-                        attempt + 1,
-                        UPSTREAM_TRANSPORT_RETRY_LIMIT,
-                        backoff.as_millis()
-                    );
-                }
+                log::warn!(
+                    "[{app_tag}] 上游传输阶段失败，同一 Provider 重试 {}/{}（等待 {}ms）: {error}",
+                    attempt + 1,
+                    UPSTREAM_TRANSPORT_RETRY_LIMIT,
+                    backoff.as_millis()
+                );
                 tokio::time::sleep(backoff).await;
                 attempt += 1;
             }
             Err(error) => return Err(error),
         }
     }
+}
+
+fn effective_codex_capacity_retry_enabled(configured: bool, stream_retry_budget: u32) -> bool {
+    // Capacity retries obey both the app's capacity switch and the global
+    // retry policy, including sends before a stream reconnector exists.
+    configured && stream_retry_budget > 0
 }
 
 /// 对真实上游 HTTP 429 做有界、可等待的同请求重放。
@@ -7933,6 +8037,19 @@ where
         let mut response_headers = response.headers().clone();
         let retry_after = parse_retry_after_delay(&response_headers);
         let body_text = read_decoded_error_body(response).await?;
+        if let Some(terminal_code) = body_text
+            .as_deref()
+            .and_then(super::providers::codex_terminal::terminal_error_code_from_body)
+        {
+            // Permanent failures take precedence over admission/capacity status
+            // and endpoint-unavailable hints. Preserve shared category ordering.
+            return Ok(rebuild_codex_error_response(
+                status,
+                &mut response_headers,
+                body_text,
+                terminal_code == "insufficient_quota",
+            ));
+        }
 
         if status == http::StatusCode::SERVICE_UNAVAILABLE
             && traffic_policy.rejection_retry_mode
@@ -7960,7 +8077,6 @@ where
                 body_text,
             ));
         }
-        let terminal_quota = is_terminal_codex_quota_429(body_text.as_deref());
         let capacity = super::providers::streaming_retry::is_capacity_error_response(
             status,
             body_text.as_deref(),
@@ -7972,14 +8088,12 @@ where
                     body_text.as_deref(),
                 );
             if !capacity_retry_enabled
-                || terminal_quota
                 || retry_count >= super::providers::streaming_retry::STREAM_MAX_RETRIES as usize
             {
-                return Ok(rebuild_codex_error_response(
+                return Ok(rebuild_consumed_error_response(
                     status,
                     &mut response_headers,
                     body_text,
-                    terminal_quota,
                 ));
             }
             let requested_delay = retry_after.unwrap_or_else(|| {
@@ -8035,12 +8149,11 @@ where
             ));
         }
 
-        if terminal_quota || retry_count >= CODEX_RATE_LIMIT_RETRY_LIMIT {
-            return Ok(rebuild_codex_error_response(
+        if retry_count >= CODEX_RATE_LIMIT_RETRY_LIMIT {
+            return Ok(rebuild_consumed_error_response(
                 http::StatusCode::TOO_MANY_REQUESTS,
                 &mut response_headers,
                 body_text,
-                terminal_quota,
             ));
         }
 
@@ -8079,7 +8192,7 @@ fn is_retryable_opencode_admission_503(body: Option<&str>) -> bool {
     normalized.contains("upstream request failed") && normalized.contains("endpoint is unavailable")
 }
 
-fn parse_retry_after_delay(headers: &http::HeaderMap) -> Option<Duration> {
+pub(crate) fn parse_retry_after_delay(headers: &http::HeaderMap) -> Option<Duration> {
     let value = headers
         .get(http::header::RETRY_AFTER)?
         .to_str()
@@ -8098,23 +8211,6 @@ fn parse_retry_after_delay(headers: &http::HeaderMap) -> Option<Duration> {
 
 fn codex_rate_limit_backoff(retry_count: usize) -> Duration {
     Duration::from_secs(1u64 << retry_count.min(5))
-}
-
-fn is_terminal_codex_quota_429(body: Option<&str>) -> bool {
-    let Some(body) = body else {
-        return false;
-    };
-    let normalized = body.to_ascii_lowercase();
-    [
-        "usage_limit_reached",
-        "insufficient_quota",
-        "billing_hard_limit_reached",
-        "the usage limit has been reached",
-        "daily_limit_exceeded",
-        "daily usage limit exceeded",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
 }
 
 fn rebuild_consumed_error_response(
@@ -10963,35 +11059,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn only_native_codex_responses_streams_opt_into_pre_response_retry() {
-        assert!(should_retry_native_codex_responses_before_headers(
-            &AppType::Codex,
-            "/v1/responses/compact",
-            true,
-        ));
-        assert!(!should_retry_native_codex_responses_before_headers(
-            &AppType::Codex,
-            "/v1/responses",
-            false,
-        ));
-        assert!(!should_retry_native_codex_responses_before_headers(
-            &AppType::Codex,
-            "/v1/chat/completions",
-            true,
-        ));
-        assert!(!should_retry_native_codex_responses_before_headers(
-            &AppType::Claude,
-            "/v1/responses",
-            true,
-        ));
-        assert!(!should_retry_native_codex_responses_before_headers(
-            &AppType::OpenCode,
-            "/v1/responses",
-            true,
-        ));
-    }
-
     // 验证短期负缓存命中期间有效，过期后会自动删除并允许下一次重新带头探测。
     #[test]
     fn codex_responses_lite_fallback_cache_expires() {
@@ -12425,6 +12492,228 @@ mod tests {
 
         assert!(!headers.contains_key(http::header::CONTENT_ENCODING));
         assert_eq!(encoded, original);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn managed_replay_auth_refreshes_pinned_account_after_capacity_wait() {
+        let default_account = Arc::new(RwLock::new("account-a".to_string()));
+        let observed_accounts = Arc::new(RwLock::new(Vec::new()));
+        let token = Arc::new(RwLock::new("<redacted-before>".to_string()));
+        let selected_account = default_account.read().await.clone();
+        let auth = managed_replay_auth_for_account(selected_account, {
+            let observed_accounts = Arc::clone(&observed_accounts);
+            let token = Arc::clone(&token);
+            move |account_id| {
+                let observed_accounts = Arc::clone(&observed_accounts);
+                let token = Arc::clone(&token);
+                async move {
+                    observed_accounts.write().await.push(account_id);
+                    Ok(ManagedReplayCredentials {
+                        access_token: token.read().await.clone(),
+                        workspace_id: Some("workspace-a".to_string()),
+                    })
+                }
+            }
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer <redacted-before>"),
+        );
+        headers.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("workspace-a"),
+        );
+        headers.insert("session_id", HeaderValue::from_static("session-a"));
+        let payload = FinalizedRequestPayload::from_transformed_json(
+            34,
+            br#"{"model":"gpt-test","input":[]}"#.to_vec(),
+            &mut headers,
+            true,
+        )
+        .unwrap();
+        let frozen_body = payload.replay_body();
+        let frozen_hash = payload.wire_hash();
+        let frozen_headers = headers.clone();
+        tokio::time::advance(Duration::from_secs(5 * 60)).await;
+        *default_account.write().await = "account-b".to_string();
+        *token.write().await = "<redacted-after>".to_string();
+
+        let refreshed = refresh_managed_replay_headers(headers, Some(&auth))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            refreshed[http::header::AUTHORIZATION],
+            "Bearer <redacted-after>"
+        );
+        assert!(refreshed[http::header::AUTHORIZATION].is_sensitive());
+        for (name, value) in &frozen_headers {
+            if name != http::header::AUTHORIZATION {
+                assert_eq!(refreshed.get(name), Some(value));
+            }
+        }
+        assert_eq!(*observed_accounts.read().await, vec!["account-a"]);
+        assert_eq!(*default_account.read().await, "account-b");
+        assert_eq!(payload.replay_body(), frozen_body);
+        assert_eq!(payload.wire_hash(), frozen_hash);
+    }
+
+    #[tokio::test]
+    async fn managed_replay_auth_rejects_workspace_drift_and_invalid_tokens() {
+        for (token, workspace) in [
+            ("<redacted>", Some("workspace-b")),
+            ("", Some("workspace-a")),
+            ("<redacted>\r\ninvalid", Some("workspace-a")),
+        ] {
+            let auth =
+                managed_replay_auth_for_account("account-a".to_string(), move |_| async move {
+                    Ok(ManagedReplayCredentials {
+                        access_token: token.to_string(),
+                        workspace_id: workspace.map(str::to_string),
+                    })
+                });
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "chatgpt-account-id",
+                HeaderValue::from_static("workspace-a"),
+            );
+            assert!(matches!(
+                refresh_managed_replay_headers(headers, Some(&auth)).await,
+                Err(ProxyError::AuthError(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_replay_auth_reuses_initial_credentials_before_refreshing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for (strategy, workspace_id) in [
+            (AuthStrategy::GitHubCopilot, None),
+            (AuthStrategy::CodexOAuth, Some("workspace-a")),
+            (AuthStrategy::XaiOAuth, None),
+        ] {
+            let fetches = Arc::new(AtomicUsize::new(0));
+            let default_account = Arc::new(RwLock::new("account-a".to_string()));
+            let observed_accounts = Arc::new(RwLock::new(Vec::new()));
+            let selected_account = default_account.read().await.clone();
+            let replay_auth = managed_replay_auth_for_account(selected_account, {
+                let fetches = Arc::clone(&fetches);
+                let observed_accounts = Arc::clone(&observed_accounts);
+                move |account_id| {
+                    let fetches = Arc::clone(&fetches);
+                    let observed_accounts = Arc::clone(&observed_accounts);
+                    async move {
+                        let attempt = fetches.fetch_add(1, Ordering::SeqCst) + 1;
+                        observed_accounts.write().await.push(account_id);
+                        Ok(ManagedReplayCredentials {
+                            access_token: format!("<redacted-{attempt}>"),
+                            workspace_id: workspace_id.map(str::to_string),
+                        })
+                    }
+                }
+            });
+            let (initial_auth, initial_workspace, replay_auth) =
+                initialize_managed_replay_auth(replay_auth, strategy)
+                    .await
+                    .unwrap();
+
+            assert_eq!(initial_auth.api_key, "<redacted-1>");
+            assert_eq!(initial_auth.strategy, strategy);
+            assert!(initial_auth.access_token.is_none());
+            assert_eq!(initial_workspace.as_deref(), workspace_id);
+            assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+            *default_account.write().await = "account-b".to_string();
+            let first_send = replay_auth().await.unwrap();
+            assert_eq!(first_send.access_token, initial_auth.api_key);
+            assert_eq!(first_send.workspace_id, initial_workspace);
+            assert_eq!(fetches.load(Ordering::SeqCst), 1);
+            assert_eq!(*observed_accounts.read().await, vec!["account-a"]);
+
+            let refreshed = replay_auth().await.unwrap();
+            assert_eq!(refreshed.access_token, "<redacted-2>");
+            assert_eq!(refreshed.workspace_id.as_deref(), workspace_id);
+            assert_eq!(fetches.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                *observed_accounts.read().await,
+                vec!["account-a", "account-a"]
+            );
+            assert_eq!(*default_account.read().await, "account-b");
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_replay_auth_preserves_static_credentials_and_refresh_errors() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer <redacted-static>"),
+        );
+        assert_eq!(
+            refresh_managed_replay_headers(headers.clone(), None)
+                .await
+                .unwrap(),
+            headers
+        );
+        let auth = managed_replay_auth_for_account("account-a".to_string(), |_| async {
+            Err(ProxyError::AuthError(
+                "Managed account requires sign-in".to_string(),
+            ))
+        });
+        assert!(matches!(
+            refresh_managed_replay_headers(headers, Some(&auth)).await,
+            Err(ProxyError::AuthError(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn managed_replay_auth_off_during_refresh_prevents_dispatch() {
+        use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+        let budget = Arc::new(AtomicU32::new(5));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let auth = managed_replay_auth_for_account("account-a".to_string(), {
+            let refreshes = Arc::clone(&refreshes);
+            move |_| {
+                let refreshes = Arc::clone(&refreshes);
+                async move {
+                    refreshes.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(ManagedReplayCredentials {
+                        access_token: "<redacted-refreshed>".to_string(),
+                        workspace_id: None,
+                    })
+                }
+            }
+        });
+        assert!(matches!(
+            prepare_stream_replay_headers(HeaderMap::new(), Some(&auth), || 0).await,
+            Err(ProxyError::InvalidRequest(_))
+        ));
+        assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+        let attempt = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            let dispatches = Arc::clone(&dispatches);
+            async move {
+                let _headers = prepare_stream_replay_headers(HeaderMap::new(), Some(&auth), || {
+                    budget.load(Ordering::SeqCst)
+                })
+                .await?;
+                dispatches.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ProxyError>(())
+            }
+        });
+        tokio::task::yield_now().await;
+        budget.store(0, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(matches!(
+            attempt.await.unwrap(),
+            Err(ProxyError::InvalidRequest(_))
+        ));
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -15472,7 +15761,7 @@ mod tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_upstream_request_with_transport_retry("test", false, || {
+        let result = send_upstream_request_with_transport_retry("test", || {
             let attempts = attempts_for_send.clone();
             async move {
                 if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -15494,32 +15783,12 @@ mod tests {
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
-    async fn upstream_transport_retry_does_not_replay_response_pending() {
-        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let attempts_for_send = attempts.clone();
-
-        let result = send_upstream_request_with_transport_retry("test", false, || {
-            let attempts = attempts_for_send.clone();
-            async move {
-                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Err(ProxyError::ResponsePending(
-                    "请求可能已在处理中".to_string(),
-                ))
-            }
-        })
-        .await;
-
-        assert!(matches!(result, Err(ProxyError::ResponsePending(_))));
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
     #[tokio::test(start_paused = true)]
-    async fn upstream_transport_retry_with_pending_opt_in_recovers_before_response_headers() {
+    async fn upstream_transport_retry_never_replays_response_pending() {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_upstream_request_with_transport_retry("test", true, || {
+        let result = send_upstream_request_with_transport_retry("test", || {
             let attempts = attempts_for_send.clone();
             async move {
                 if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -15537,8 +15806,8 @@ mod tests {
         })
         .await;
 
-        assert!(result.is_ok());
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(matches!(result, Err(ProxyError::ResponsePending(_))));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -15546,7 +15815,7 @@ mod tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_upstream_request_with_transport_retry("test", false, || {
+        let result = send_upstream_request_with_transport_retry("test", || {
             let attempts = attempts_for_send.clone();
             async move {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -15569,7 +15838,7 @@ mod tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_upstream_request_with_transport_retry("test", false, || {
+        let result = send_upstream_request_with_transport_retry("test", || {
             let attempts = attempts_for_send.clone();
             async move {
                 if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 5 {
@@ -15741,6 +16010,242 @@ mod tests {
             .and_then(Value::as_str)
             .is_some_and(|message| message.contains("Daily usage limit exceeded")));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    async fn initial_http_retry_fixture(
+        status: http::StatusCode,
+        rejection_body: &'static str,
+        capacity_enabled: bool,
+        traffic_policy: super::super::codex_traffic_policy::ResolvedCodexTrafficPolicy,
+    ) -> (ProxyResponse, usize) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind initial HTTP retry fixture");
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..count]);
+                    if request
+                        .windows(4)
+                        .position(|bytes| bytes == b"\r\n\r\n")
+                        .is_some_and(|header_end| request.len() >= header_end + 6)
+                    {
+                        // Consume the fixture's two-byte JSON body as well, so
+                        // closing the response cannot reset an unread request.
+                        break;
+                    }
+                }
+                let attempt = server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (response_status, body) = if attempt == 0 {
+                    (status, rejection_body)
+                } else {
+                    (http::StatusCode::OK, "{\"ok\":true}")
+                };
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_status.as_u16(),
+                    response_status.canonical_reason().unwrap_or("Fixture"),
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let result = send_codex_request_with_rate_limit_retry(
+            "test",
+            capacity_enabled,
+            traffic_policy,
+            || async {
+                client
+                    .post(&endpoint)
+                    .body("{}")
+                    .send()
+                    .await
+                    .map(ProxyResponse::Reqwest)
+                    .map_err(|_| {
+                        ProxyError::ForwardFailed("initial HTTP fixture request failed".into())
+                    })
+            },
+        )
+        .await;
+        server.abort();
+        (
+            result.expect("initial HTTP fixture response"),
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn codex_initial_http_plaintext_quota_uses_shared_policy_without_replay() {
+        for status in [
+            http::StatusCode::TOO_MANY_REQUESTS,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            for capacity_enabled in [false, true] {
+                for body in [
+                    "Daily quota exhausted",
+                    "billing payment required",
+                    r#"{"error":{"type":"server_error","message":"Daily quota exhausted"}}"#,
+                    r#"{"error":{"details":{"message":"billing payment required"}}}"#,
+                ] {
+                    let (response, requests) = initial_http_retry_fixture(
+                        status,
+                        body,
+                        capacity_enabled,
+                        safe_test_codex_traffic_policy(),
+                    )
+                    .await;
+                    assert_eq!(requests, 1, "status={status}, capacity={capacity_enabled}");
+                    assert_eq!(response.status(), status);
+                    let bytes = response.bytes_with_limit(16 * 1024).await.unwrap();
+                    let payload: Value = serde_json::from_slice(&bytes)
+                        .expect("quota rejection remains a structured terminal envelope");
+                    assert_eq!(
+                        payload.pointer("/error/type").and_then(Value::as_str),
+                        Some("usage_limit_reached")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_initial_http_quota_precedes_opencode_admission_retry() {
+        let mut policy = safe_test_codex_traffic_policy();
+        policy.rejection_retry_mode =
+            crate::provider::CodexRejectionRetryMode::OpencodeEndpointUnavailable;
+        policy.rejection_max_retries = 1;
+        policy.rejection_initial_delay = Duration::from_millis(1);
+        policy.rejection_max_delay = Duration::from_millis(1);
+        let (response, requests) = initial_http_retry_fixture(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "upstream request failed: endpoint is unavailable; daily quota exhausted",
+            true,
+            policy,
+        )
+        .await;
+        assert_eq!(requests, 1);
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn codex_initial_http_plaintext_transient_rate_limit_still_retries() {
+        let (response, requests) = initial_http_retry_fixture(
+            http::StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests. Please retry shortly.",
+            true,
+            safe_test_codex_traffic_policy(),
+        )
+        .await;
+        assert_eq!(requests, 2);
+        assert_eq!(response.status(), http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn codex_initial_http_preserves_shared_terminal_category_precedence() {
+        let body = r#"{"error":{"type":"authentication_error","message":"Daily quota exhausted"}}"#;
+        let (response, requests) = initial_http_retry_fixture(
+            http::StatusCode::TOO_MANY_REQUESTS,
+            body,
+            true,
+            safe_test_codex_traffic_policy(),
+        )
+        .await;
+        assert_eq!(requests, 1);
+        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+        let bytes = response.bytes_with_limit(16 * 1024).await.unwrap();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), body);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_capacity_retry_respects_stream_retry_mode_before_headers() {
+        use crate::settings::{AppSettings, StreamRetryMode};
+
+        for (mode, configured, expected_attempts) in [
+            (StreamRetryMode::Off, true, 1),
+            (StreamRetryMode::Safe, true, 2),
+            (StreamRetryMode::Aggressive, true, 2),
+            (StreamRetryMode::Safe, false, 1),
+            (StreamRetryMode::Aggressive, false, 1),
+        ] {
+            let settings = AppSettings {
+                stream_retry_mode: mode,
+                ..AppSettings::default()
+            };
+            let enabled = effective_codex_capacity_retry_enabled(
+                configured,
+                settings.stream_retry_budget(
+                    crate::proxy::providers::streaming_retry::STREAM_MAX_RETRIES,
+                ),
+            );
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let attempts_for_send = attempts.clone();
+            let started_at = tokio::time::Instant::now();
+            let response = send_codex_request_with_rate_limit_retry(
+                "test",
+                enabled,
+                safe_test_codex_traffic_policy(),
+                || {
+                    let attempts = attempts_for_send.clone();
+                    async move {
+                        if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                            Ok(ProxyResponse::buffered(
+                                http::StatusCode::SERVICE_UNAVAILABLE,
+                                http::HeaderMap::new(),
+                                Bytes::from_static(
+                                    br#"{"error":{"code":"server_error","message":"Our servers are currently overloaded. Please try again later."}}"#,
+                                ),
+                            ))
+                        } else {
+                            Ok(ProxyResponse::buffered(
+                                http::StatusCode::OK,
+                                http::HeaderMap::new(),
+                                Bytes::new(),
+                            ))
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                attempts.load(std::sync::atomic::Ordering::SeqCst),
+                expected_attempts,
+                "mode={mode:?}, capacity retry configured={configured}"
+            );
+            assert_eq!(
+                response.status(),
+                if expected_attempts == 1 {
+                    http::StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    http::StatusCode::OK
+                }
+            );
+            assert_eq!(
+                tokio::time::Instant::now() - started_at,
+                if expected_attempts == 1 {
+                    Duration::ZERO
+                } else {
+                    crate::proxy::providers::streaming_retry::capacity_retry_delay(1)
+                }
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

@@ -4,7 +4,144 @@
 //! must provide the upstream protocol's explicit terminal signal together
 //! with the structured output they successfully decoded.
 
+use serde::Deserialize;
 use serde_json::Value;
+use std::sync::OnceLock;
+
+// Embedded into the renderer by codex_desktop.rs as well. Marker vocabulary,
+// extraction paths, separators, and category precedence have one source.
+pub(crate) const TERMINAL_ERROR_POLICY_JSON: &str = include_str!("terminal_error_policy.json");
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerminalErrorCategory {
+    code: String,
+    markers: Vec<String>,
+    serialized_markers: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerminalErrorPolicy {
+    schema_version: u8,
+    ignored_separators: Vec<char>,
+    summary_paths: Vec<String>,
+    serialized_paths: Vec<String>,
+    cancelled_events: Vec<String>,
+    cancelled_code: String,
+    categories: Vec<TerminalErrorCategory>,
+}
+
+impl TerminalErrorPolicy {
+    fn normalize(&self, value: &str) -> String {
+        value
+            .chars()
+            .filter(|ch| !self.ignored_separators.contains(ch))
+            .map(|ch| ch.to_ascii_lowercase())
+            .collect()
+    }
+}
+
+fn terminal_error_policy() -> &'static TerminalErrorPolicy {
+    static POLICY: OnceLock<TerminalErrorPolicy> = OnceLock::new();
+    POLICY.get_or_init(|| {
+        let mut policy: TerminalErrorPolicy = serde_json::from_str(TERMINAL_ERROR_POLICY_JSON)
+            .expect("embedded terminal-error policy must be valid");
+        assert_eq!(
+            policy.schema_version, 1,
+            "unsupported terminal-error policy"
+        );
+        assert!(
+            !policy.categories.is_empty() && !policy.cancelled_code.is_empty(),
+            "terminal-error policy must preserve permanent guards"
+        );
+        let mut categories = std::mem::take(&mut policy.categories);
+        for category in &mut categories {
+            assert!(
+                !category.code.is_empty() && !category.markers.is_empty(),
+                "terminal-error categories must contain a code and markers"
+            );
+            let markers: Vec<_> = category
+                .markers
+                .iter()
+                .map(|marker| policy.normalize(marker))
+                .collect();
+            let serialized_markers = category.serialized_markers.as_ref().map(|markers| {
+                markers
+                    .iter()
+                    .map(|marker| policy.normalize(marker))
+                    .collect::<Vec<_>>()
+            });
+            assert!(
+                markers.iter().all(|marker| !marker.is_empty())
+                    && serialized_markers
+                        .as_ref()
+                        .is_none_or(|markers| !markers.is_empty()
+                            && markers.iter().all(|marker| !marker.is_empty())),
+                "terminal-error markers must not normalize to an empty string"
+            );
+            category.markers = markers;
+            category.serialized_markers = serialized_markers;
+        }
+        policy.categories = categories;
+        policy
+    })
+}
+
+/// Map a decoded terminal payload to one stable category shared by reconnect
+/// and Desktop continuation boundaries. The callers can still choose their
+/// protocol-specific wire message while this function owns marker precedence.
+pub(crate) fn terminal_error_code(event_name: &str, payload: &Value) -> Option<&'static str> {
+    let policy = terminal_error_policy();
+    if policy
+        .cancelled_events
+        .iter()
+        .any(|event| event == event_name)
+    {
+        return Some(&policy.cancelled_code);
+    }
+    // Keep fields separate: joining an unrelated code and message must not
+    // manufacture a permanent marker across their boundary.
+    let summary: Vec<_> = policy
+        .summary_paths
+        .iter()
+        .filter_map(|pointer| payload.pointer(pointer))
+        .filter_map(Value::as_str)
+        .map(|value| policy.normalize(value))
+        .collect();
+    // Preserve the renderer's conservative guards for nested error details and
+    // keys. JSON punctuation keeps separate fields from forming new markers.
+    let serialized: Vec<_> = policy
+        .serialized_paths
+        .iter()
+        .filter_map(|pointer| payload.pointer(pointer))
+        .map(|value| policy.normalize(&value.to_string()))
+        .collect();
+    policy.categories.iter().find_map(|category| {
+        let serialized_markers = category
+            .serialized_markers
+            .as_ref()
+            .unwrap_or(&category.markers);
+        (summary
+            .iter()
+            .any(|value| category.markers.iter().any(|marker| value.contains(marker)))
+            || serialized.iter().any(|value| {
+                serialized_markers
+                    .iter()
+                    .any(|marker| value.contains(marker))
+            }))
+        .then_some(category.code.as_str())
+    })
+}
+
+/// Apply the same terminal policy to structured provider errors and plaintext
+/// gateway responses. HTTP 429/5xx must not turn a quota or authentication
+/// rejection into a transient failure merely because its body is not JSON.
+pub(crate) fn terminal_error_code_from_body(body: &str) -> Option<&'static str> {
+    let payload =
+        serde_json::from_str::<Value>(body).unwrap_or_else(|_| Value::String(body.to_string()));
+    terminal_error_code("response.failed", &payload)
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ChatTerminalEvidence {
@@ -322,6 +459,55 @@ fn is_complete_client_tool_call(item_type: &str, item: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn terminal_error_body_uses_shared_policy_for_json_and_plaintext() {
+        for (body, expected) in [
+            ("Daily quota exhausted", Some("insufficient_quota")),
+            ("Daily usage limit reached", Some("insufficient_quota")),
+            ("Billing payment required", Some("insufficient_quota")),
+            ("Token expired", Some("authentication_error")),
+            ("Permission denied", Some("permission_denied")),
+            ("Context length exceeded", Some("context_length_exceeded")),
+            (
+                r#"{"error":{"code":"daily_limit","message":"redacted rejection"}}"#,
+                Some("insufficient_quota"),
+            ),
+            (
+                r#"{"response":{"error":{"code":"token_expired"}}}"#,
+                Some("authentication_error"),
+            ),
+            (r#""Daily quota exhausted""#, Some("insufficient_quota")),
+            ("Our servers are currently overloaded", None),
+            ("Connection reset before completion", None),
+            ("HTTP 429, retry later", None),
+            (
+                r#"{"error":{"type":"server_error","message":"Service temporarily overloaded","metadata":{"quota_remaining":42}}}"#,
+                None,
+            ),
+        ] {
+            assert_eq!(terminal_error_code_from_body(body), expected);
+        }
+    }
+
+    #[test]
+    fn terminal_error_policy_shared_contract() {
+        let cases: Vec<Value> = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/terminalErrorPolicy.json"
+        ))
+        .expect("parse shared terminal-error fixtures");
+        for case in cases {
+            assert_eq!(
+                terminal_error_code(
+                    case["event"].as_str().unwrap(),
+                    &json!({ "error": case["error"] }),
+                ),
+                case["expectedCode"].as_str(),
+                "{}",
+                case["name"],
+            );
+        }
+    }
 
     #[test]
     fn chat_terminal_never_completes_after_dropping_any_tool_call() {

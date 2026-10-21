@@ -127,7 +127,7 @@ const powershellEncodedCommand = (script: string): string => {
   return btoa(binary);
 };
 
-const HERMES_WINDOWS_INSTALL_COMMAND = `powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${powershellEncodedCommand(
+const HERMES_WINDOWS_INSTALL_COMMAND = `pwsh.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${powershellEncodedCommand(
   HERMES_WINDOWS_INSTALL_SCRIPT,
 )}`;
 

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -19,6 +20,7 @@ import {
   devSessionEnvironment,
   devWorkerCommand,
   devWorkerRestartDecision,
+  handoffDetachedDevSupervisor,
   isDevCrashMarker,
   isPathInside,
   isTauriAppStartedOutput,
@@ -31,12 +33,15 @@ import {
   readDevRestartTimesMs,
   readDevRunMarkerPresent,
   readDevWatchdogEnabled,
+  reportDevSupervisorDecision,
   resolveDevRunMarkerPath,
   resolveDevSettingsPath,
   parseWindowsListeners,
   resolveRepoRootBackendInput,
   resolveTauriRootBackendInput,
   runCargoTargetMaintenance,
+  runDetachedDevWatchdog,
+  runWindowsJsonQuery,
   sameWindowsProcess,
   snapshotBackendFileFingerprints,
   stopVerifiedWindowsApp,
@@ -550,6 +555,70 @@ test("development restart history migrates legacy sessions without competing can
     [nowMs - 1_800_000, nowMs],
   );
   assert.deepEqual(readDevRestartTimesMs(undefined, nowMs), []);
+});
+
+test("every development recovery decision rejects malformed restart history consistently", () => {
+  const defaults = {
+    exitCode: 1,
+    signal: null,
+    watchdogEnabled: true,
+    nowMs: 2_000_000,
+    restartTimesMs: ["2000000", "2000000", Infinity, 2_000_000.5, Infinity],
+  };
+  for (const decide of [devAutoRestartDecision, devWorkerRestartDecision]) {
+    assert.deepEqual(decide(defaults), {
+      restart: true,
+      reason: "unexpected-exit",
+    });
+  }
+});
+
+test("development settings use canonical field presence instead of a stale legacy fallback", () => {
+  assert.equal(
+    readDevWatchdogEnabled(
+      { CC_SWITCH_TEST_HOME: "tmp" },
+      () => '{"watchdogEnabled":null,"watchdog_enabled":false}',
+    ),
+    true,
+  );
+});
+
+test("development and external recovery share settings and restart-history fixtures", () => {
+  const cases = JSON.parse(
+    readFileSync(
+      new URL(
+        "./tests/fixtures/dev-recovery-policy-cases.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  for (const entry of cases.settings) {
+    assert.equal(
+      readDevWatchdogEnabled({ CC_SWITCH_TEST_HOME: "tmp" }, () =>
+        JSON.stringify(entry.value),
+      ),
+      entry.enabled,
+      entry.name,
+    );
+  }
+  for (const entry of cases.history) {
+    assert.deepEqual(
+      readDevRestartTimesMs(entry.session, entry.nowMs),
+      entry.times,
+      entry.name,
+    );
+  }
+  for (const entry of cases.overrides) {
+    assert.equal(
+      readDevWatchdogEnabled(
+        { ...entry.environment, CC_SWITCH_TEST_HOME: "tmp" },
+        () => '{"watchdogEnabled":false}',
+      ),
+      entry.enabled,
+      entry.name,
+    );
+  }
 });
 
 test("live development recovery requests one worker failure without a second restart budget", () => {
@@ -1259,6 +1328,35 @@ test("development supervisor stops a repeated startup crash loop at five restart
   assert.equal(cleanups, 6);
   assert.equal(delays, 5);
   assert.equal(decisions.at(-1), "rate-limited");
+});
+
+test("development supervisor reports budget exhaustion without throwing", async () => {
+  const messages = [];
+  const nowMs = 1_800_000;
+  let launches = 0;
+  const code = await superviseDevSessions({
+    spawnSession: () => {
+      const child = fakeDevWorker(++launches);
+      queueMicrotask(() => child.finish(1));
+      return child;
+    },
+    cleanSession: async () => {},
+    readEnabled: () => true,
+    now: () => nowMs,
+    restartTimesMs: Array(5).fill(nowMs),
+    waitToRestart: async () =>
+      assert.fail("exhausted budget must stop recovery"),
+    onEvent: (decision, outcome) =>
+      reportDevSupervisorDecision(decision, outcome, {
+        log: () => assert.fail("exhausted budget must not announce a restart"),
+        error: (message) => messages.push(message),
+      }),
+  });
+  assert.equal(code, 1);
+  assert.equal(launches, 1);
+  assert.deepEqual(messages, [
+    "[dev watchdog] Restart limit reached (5 in 30 minutes).",
+  ]);
 });
 
 test("development supervisor cancels a delayed restart when shutting down", async () => {
@@ -2185,6 +2283,96 @@ test("Windows JSON queries explicitly select UTF-8 output without rewriting the 
   assert.ok(script.endsWith(`\n${pipeline}`));
 });
 
+test("Windows JSON queries use PowerShell 7 only", () => {
+  const calls = [];
+  const stdout = runWindowsJsonQuery(
+    "Get-CimInstance Win32_Process | ConvertTo-Json -Compress",
+    "process",
+    {
+      run: (executable) => {
+        calls.push(executable);
+        return { status: 0, stdout: '{"ProcessId":42}' };
+      },
+    },
+  );
+  assert.deepEqual(calls, ["pwsh.exe"]);
+  assert.deepEqual(JSON.parse(stdout), { ProcessId: 42 });
+});
+
+test("Windows JSON query reports a clear PowerShell 7 setup failure", () => {
+  assert.throws(
+    () =>
+      runWindowsJsonQuery("Get-CimInstance Win32_Process", "process", {
+        run: () => ({
+          error: new Error("[REDACTED_COMMAND_OUTPUT]"),
+          status: null,
+        }),
+      }),
+    (error) => {
+      assert.match(error.message, /PowerShell 7 \(pwsh\.exe\) is required/);
+      assert.equal(error.message.includes("REDACTED_COMMAND_OUTPUT"), false);
+      return true;
+    },
+  );
+});
+
+test("Windows JSON query status failures redact command output", () => {
+  assert.throws(
+    () =>
+      runWindowsJsonQuery("Get-CimInstance Win32_Process", "process", {
+        run: () => ({
+          status: 3221225794,
+          stderr: "[REDACTED_COMMAND_OUTPUT]",
+        }),
+      }),
+    (error) => {
+      assert.equal(
+        error.message,
+        "PowerShell 7 process query failed with status 3221225794.",
+      );
+      assert.equal(error.message.includes("REDACTED_COMMAND_OUTPUT"), false);
+      return true;
+    },
+  );
+});
+
+test("Windows process identity accepts equivalent PowerShell creation-date formats", () => {
+  const original = {
+    ProcessId: 42,
+    Name: "cc-switch.exe",
+    ExecutablePath: path.resolve(
+      "isolated",
+      "target",
+      "debug",
+      "cc-switch.exe",
+    ),
+    CreationDate: "/Date(1792576562434)/",
+  };
+  assert.equal(
+    sameWindowsProcess(original, {
+      ...original,
+      CreationDate: "2026-10-21T09:56:02.434Z",
+    }),
+    true,
+  );
+});
+
+test("Windows process identity rejects malformed creation dates without throwing", () => {
+  const malformed = {
+    ProcessId: 42,
+    Name: "cc-switch.exe",
+    ExecutablePath: path.resolve(
+      "isolated",
+      "target",
+      "debug",
+      "cc-switch.exe",
+    ),
+    CreationDate: "not-a-date",
+  };
+  assert.equal(sameWindowsProcess(malformed, malformed), false);
+  assert.equal(windowsProcessObservationCrashed(malformed, undefined), false);
+});
+
 test("Windows malformed query diagnostics omit redacted process output", () => {
   for (const queryName of ["process", "listener"]) {
     assert.throws(
@@ -2208,7 +2396,7 @@ test("Windows malformed query diagnostics omit redacted process output", () => {
 });
 
 test(
-  "Windows JSON queries preserve Unicode quotes and prompt text under a legacy console",
+  "Windows JSON queries preserve Unicode quotes and prompt text under PowerShell 7",
   { skip: process.platform !== "win32" },
   () => {
     const fixture = [
@@ -2220,7 +2408,7 @@ test(
       windowsJsonQueryCommand(fixture),
     ].join("\n");
     const result = spawnSync(
-      "powershell.exe",
+      "pwsh.exe",
       ["-NoProfile", "-NonInteractive", "-Command", script],
       { encoding: "utf8", windowsHide: true },
     );
@@ -2483,6 +2671,12 @@ test("Windows process creation dates normalize PowerShell JSON and UTC forms", (
     }),
     iso,
   );
+  assert.equal(
+    windowsProcessStartedAtUtc({
+      CreationDate: "20261013120000.000000+480",
+    }),
+    "2026-10-13T04:00:00.000Z",
+  );
 });
 
 test("Windows process exit wait tolerates delayed WMI disappearance", async () => {
@@ -2690,6 +2884,249 @@ function replacementDevSession() {
     launchedAtMs: Date.parse("2026-10-14T02:00:00.000Z"),
   };
 }
+
+test("detached watchdog relaunches the pnpm dev entry point after supervisor death", async () => {
+  const session = {
+    ...replacementDevSession(),
+    supervisorPid: 100,
+    args: ["--delay", "0"],
+    environment: { TAURI_DEV_NO_REBUILD: "0" },
+  };
+  const persisted = [];
+  const launches = [];
+  const events = [];
+  const replacement = {
+    pid: 200,
+    exitCode: null,
+    signalCode: null,
+    unref() {},
+  };
+  const result = await handoffDetachedDevSupervisor({
+    supervisorPid: session.supervisorPid,
+    markerPath: path.join("isolated", "dev-session.json"),
+    session,
+    scriptPath: session.scriptPath,
+    repoRoot: session.repoRoot,
+    now: () => 1_000,
+    readEnabled: () => true,
+    persistSession: (nextSession) =>
+      persisted.push(JSON.parse(JSON.stringify(nextSession))),
+    spawnReplacement: async (specification) => {
+      launches.push(specification);
+      return replacement;
+    },
+    waitForPublication: async (publication) => {
+      assert.equal(publication.expected.supervisorPid, replacement.pid);
+      assert.equal(publication.expected.repoRoot, session.repoRoot);
+      assert.equal(publication.expected.scriptPath, session.scriptPath);
+      assert.equal(publication.isRunning(), true);
+      return { ...session, supervisorPid: replacement.pid };
+    },
+    writeEvent: (event, detail) => events.push({ event, detail }),
+  });
+
+  assert.equal(result.restarted, true);
+  assert.deepEqual(persisted[0].restartTimesMs, [1_000]);
+  assert.equal(launches.length, 1);
+  assert.equal(launches[0].executable, process.execPath);
+  assert.deepEqual(launches[0].args, [session.scriptPath, "--delay", "0"]);
+  assert.equal(launches[0].options.cwd, session.repoRoot);
+  assert.equal(launches[0].options.env.TAURI_DEV_NO_REBUILD, "0");
+  assert.deepEqual(events, [
+    {
+      event: "dev-supervisor-restarted",
+      detail: { oldPid: session.supervisorPid, newPid: replacement.pid },
+    },
+  ]);
+});
+
+test("detached watchdog retries when the replacement pnpm dev supervisor dies before claiming ownership", async () => {
+  const repoRoot = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+  );
+  const scriptPath = path.join(repoRoot, "scripts", "dev-tauri-delayed.mjs");
+  const nowMs = Date.parse("2026-10-21T01:00:00Z");
+  let session = {
+    ...replacementDevSession(),
+    supervisorPid: 100,
+    supervisorExecutablePath: process.execPath,
+    repoRoot,
+    scriptPath,
+    args: ["--no-rebuild"],
+    environment: {},
+    restartTimesMs: [],
+  };
+  const launches = [];
+  const events = [];
+  let waits = 0;
+  let released = 0;
+  await runDetachedDevWatchdog(100, {
+    markerPath: path.join("isolated", "dev-session.json"),
+    readSession: () => session,
+    wait: async () =>
+      assert.ok(
+        ++waits <= 3,
+        "watcher should finish after the owned second publication",
+      ),
+    queryProcesses: (pid) => {
+      if (pid === 100) return [];
+      return [
+        {
+          ProcessId: pid,
+          ExecutablePath: process.execPath,
+          CreationDate: session.supervisorStartedAtUtc,
+        },
+      ];
+    },
+    writeEvent: (event, detail) => events.push({ event, detail }),
+    handoff: (options) =>
+      handoffDetachedDevSupervisor({
+        ...options,
+        now: () => nowMs,
+        readEnabled: () => true,
+        persistSession: (next) => {
+          session = JSON.parse(JSON.stringify(next));
+        },
+        spawnReplacement: async (specification) => {
+          launches.push(specification);
+          const pid = 200 + launches.length;
+          const failed = launches.length === 1;
+          if (!failed)
+            session = {
+              ...session,
+              supervisorPid: pid,
+              startedAtUtc: new Date(nowMs).toISOString(),
+              supervisorStartedAtUtc: new Date(nowMs).toISOString(),
+            };
+          return {
+            pid,
+            exitCode: failed ? 1 : null,
+            signalCode: null,
+            unref: () => {
+              released++;
+            },
+          };
+        },
+        writeEvent: (event, detail) => events.push({ event, detail }),
+      }),
+  });
+  assert.equal(
+    launches.length,
+    2,
+    "the old watchdog must stay alive after the first replacement fails",
+  );
+  assert.equal(released, 2);
+  assert.deepEqual(session.restartTimesMs, [nowMs, nowMs]);
+  assert.equal(
+    events.filter(({ event }) => event === "dev-supervisor-publication-failed")
+      .length,
+    1,
+  );
+  assert.deepEqual(
+    events.filter(({ event }) => event === "dev-supervisor-restarted"),
+    [
+      {
+        event: "dev-supervisor-restarted",
+        detail: { oldPid: 100, newPid: 202 },
+      },
+    ],
+  );
+  assert.ok(
+    launches.every(
+      ({ args }) =>
+        JSON.stringify(args) === JSON.stringify([scriptPath, "--no-rebuild"]),
+    ),
+  );
+});
+
+test("detached watchdog stops failed replacement launches at the shared restart limit", async () => {
+  const repoRoot = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+  );
+  let session = {
+    ...replacementDevSession(),
+    repoRoot,
+    scriptPath: path.join(repoRoot, "scripts", "dev-tauri-delayed.mjs"),
+    supervisorPid: 100,
+    args: [],
+    environment: {},
+    restartTimesMs: [],
+  };
+  const events = [];
+  let launches = 0;
+  let iterations = 0;
+  await runDetachedDevWatchdog(100, {
+    markerPath: path.join("isolated", "dev-session.json"),
+    readSession: () => session,
+    queryProcesses: () => [],
+    wait: async () => assert.ok(++iterations <= 6),
+    handoff: (options) =>
+      handoffDetachedDevSupervisor({
+        ...options,
+        now: () => 1_000,
+        readEnabled: () => true,
+        persistSession: (next) => {
+          session = structuredClone(next);
+        },
+        spawnReplacement: async () => ({
+          pid: 200 + ++launches,
+          exitCode: 1,
+          signalCode: null,
+          unref() {},
+        }),
+        writeEvent: (event, detail) => events.push({ event, detail }),
+      }),
+  });
+  assert.equal(launches, 5);
+  assert.equal(session.restartTimesMs.length, 5);
+  assert.deepEqual(events.at(-1), {
+    event: "dev-supervisor-restart-skipped",
+    detail: { supervisorPid: 100, reason: "rate-limited", restartCount: 5 },
+  });
+  assert.equal(
+    events.filter(({ event }) => event === "dev-supervisor-restarted").length,
+    0,
+  );
+});
+
+test("detached watchdog preserves recovery ownership across a failed process query", async () => {
+  const repoRoot = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+  );
+  const session = {
+    ...replacementDevSession(),
+    supervisorPid: 100,
+    repoRoot,
+    scriptPath: path.join(repoRoot, "scripts", "dev-tauri-delayed.mjs"),
+  };
+  let queries = 0;
+  let handoffs = 0;
+  const events = [];
+  await runDetachedDevWatchdog(100, {
+    markerPath: path.join("isolated", "dev-session.json"),
+    readSession: () => session,
+    wait: async () => {},
+    queryProcesses: (pid) => {
+      assert.equal(pid, 100);
+      if (++queries === 1)
+        throw new Error("PowerShell 7 process query timed out");
+      return [];
+    },
+    handoff: async () => {
+      handoffs++;
+      return { restarted: true };
+    },
+    writeEvent: (event) => events.push(event),
+  });
+  assert.equal(handoffs, 1);
+  if (process.platform === "win32") {
+    assert.equal(queries, 2);
+    assert.deepEqual(events, ["dev-watchdog-iteration-failed"]);
+  }
+});
 
 test("detached watchdog publication does not release ownership at spawn acknowledgement", async () => {
   const expected = replacementDevSession();

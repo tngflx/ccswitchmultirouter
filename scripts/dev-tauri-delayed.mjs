@@ -21,7 +21,22 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   createDevReconnectTracker,
   createDevWatchdogOutputReader,
+  DEV_RECOVERY_POLICY,
+  devRestartDecision,
+  readDevWatchdogOverride,
+  readWatchdogEnabledSetting,
+  recentDevRestartTimesMs,
 } from "./dev-watchdog-policy.mjs";
+import {
+  windowsJsonQueryCommand,
+  parseWindowsJsonQueryOutput,
+  runWindowsJsonQuery,
+} from "./windows-json-query.mjs";
+export {
+  windowsJsonQueryCommand,
+  parseWindowsJsonQueryOutput,
+  runWindowsJsonQuery,
+} from "./windows-json-query.mjs";
 
 // A four-hour quiet period keeps the running Tauri binary stable during normal
 // development while still rebuilding automatically after sustained backend
@@ -40,20 +55,12 @@ const CHILD_EXIT_TIMEOUT_MS = 10_000;
 const DEV_CHILD_STDIO_DRAIN_TIMEOUT_MS = 250;
 const WINDOWS_PROCESS_EXIT_TIMEOUT_MS = 2_000;
 const WINDOWS_LISTENER_RELEASE_TIMEOUT_MS = 60_000;
-const DEV_AUTO_RESTART_WINDOW_MS = 30 * 60 * 1_000;
-const DEV_MAX_AUTO_RESTARTS = 5;
 const DEV_AUTO_RESTART_DELAY_MS = 1_000;
 const DEV_SUPERVISOR_PUBLICATION_TIMEOUT_MS = 30_000;
 const DEV_SUPERVISOR_ENV = "CC_SWITCH_DEV_SUPERVISOR";
 const DEV_WORKER_FLAG = "--ccsm-dev-worker";
 const DEV_WATCHDOG_FLAG = "--ccsm-dev-watchdog";
-const DEV_SESSION_ENV_KEYS = [
-  "TAURI_DEV_REBUILD_DELAY_MS",
-  "TAURI_DEV_NO_REBUILD",
-  "TAURI_DEV_PORT",
-  "CC_SWITCH_TEST_HOME",
-  "CC_SWITCH_DEV_WATCHDOG_ENABLED",
-];
+const DEV_SESSION_ENV_KEYS = DEV_RECOVERY_POLICY.sessionEnvironmentKeys;
 const BACKEND_WATCH_DIRECTORIES = [
   "src",
   "capabilities",
@@ -228,17 +235,8 @@ export function readDevWatchdogEnabled(
   environment = process.env,
   read = readFileSync,
 ) {
-  const override = environment.CC_SWITCH_DEV_WATCHDOG_ENABLED;
-  if (override !== undefined) {
-    const normalized = String(override).trim().toLowerCase();
-    if (["1", "true", "yes", "on"].includes(normalized)) {
-      return true;
-    }
-    if (["0", "false", "no", "off"].includes(normalized)) {
-      return false;
-    }
-    return false;
-  }
+  const override = readDevWatchdogOverride(environment);
+  if (override !== undefined) return override;
 
   const settingsPath = resolveDevSettingsPath(environment);
   if (!settingsPath) {
@@ -259,8 +257,7 @@ export function readDevWatchdogEnabled(
   } catch {
     return false;
   }
-  const value = settings?.watchdogEnabled ?? settings?.watchdog_enabled;
-  return typeof value === "boolean" ? value : true;
+  return readWatchdogEnabledSetting(settings);
 }
 
 export function devAutoRestartDecision({
@@ -274,29 +271,21 @@ export function devAutoRestartDecision({
   nowMs = Date.now(),
   restartTimesMs = [],
 }) {
-  if (signal === "SIGINT" || signal === "SIGTERM") {
-    return { restart: false, reason: "signal" };
-  }
-  if (!watchdogEnabled) {
-    return { restart: false, reason: "disabled" };
-  }
   // The exact app marker distinguishes a crash from an intentional live quit.
   // Before startup, code zero still means the dev session failed to launch.
-  if (
-    (appRunning ||
-      (exitCode === 0 && signal === null && appStarted !== false)) &&
-    !uncleanExit &&
-    !runMarkerPresent
-  ) {
-    return { restart: false, reason: "clean-exit" };
-  }
-  const recent = restartTimesMs.filter(
-    (timestamp) => timestamp >= nowMs - DEV_AUTO_RESTART_WINDOW_MS,
-  );
-  if (recent.length >= DEV_MAX_AUTO_RESTARTS) {
-    return { restart: false, reason: "rate-limited" };
-  }
-  return { restart: true, reason: "unexpected-exit" };
+  return devRestartDecision({
+    intentionalExitReason: ["SIGINT", "SIGTERM"].includes(signal)
+      ? "signal"
+      : undefined,
+    cleanExit:
+      (appRunning ||
+        (exitCode === 0 && signal === null && appStarted !== false)) &&
+      !uncleanExit &&
+      !runMarkerPresent,
+    watchdogEnabled,
+    nowMs,
+    restartTimesMs,
+  });
 }
 
 export function readDevRunMarker(
@@ -350,34 +339,20 @@ export function devWorkerRestartDecision({
   nowMs = Date.now(),
   restartTimesMs = [],
 }) {
-  if (expectedExit) {
-    return { restart: false, reason: "expected-exit" };
-  }
-  if (!watchdogEnabled) {
-    return { restart: false, reason: "disabled" };
-  }
-  if (exitCode === 0 && signal === null) {
-    return { restart: false, reason: "clean-exit" };
-  }
-  const recent = restartTimesMs.filter(
-    (timestamp) => timestamp >= nowMs - DEV_AUTO_RESTART_WINDOW_MS,
-  );
-  if (recent.length >= DEV_MAX_AUTO_RESTARTS) {
-    return { restart: false, reason: "rate-limited" };
-  }
-  return { restart: true, reason: "unexpected-exit" };
+  return devRestartDecision({
+    intentionalExitReason: expectedExit ? "expected-exit" : undefined,
+    cleanExit: exitCode === 0 && signal === null,
+    watchdogEnabled,
+    nowMs,
+    restartTimesMs,
+  });
 }
 
 export function readDevRestartTimesMs(session, nowMs = Date.now()) {
   const history = Array.isArray(session?.restartTimesMs)
     ? session.restartTimesMs
     : session?.supervisorRestartTimesMs;
-  if (!Array.isArray(history)) return [];
-  return history.filter(
-    (timestamp) =>
-      Number.isSafeInteger(timestamp) &&
-      timestamp >= nowMs - DEV_AUTO_RESTART_WINDOW_MS,
-  );
+  return recentDevRestartTimesMs(history, nowMs);
 }
 
 export function createDevWorkerRecovery({
@@ -926,51 +901,22 @@ export function windowsDevWorkerDescendants(
   return descendants.sort((left, right) => right.depth - left.depth);
 }
 
-export function windowsJsonQueryCommand(script) {
-  return [
-    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
-    "$OutputEncoding = [Console]::OutputEncoding",
-    script,
-  ].join("\n");
-}
-
-export function parseWindowsJsonQueryOutput(stdout, queryName) {
-  try {
-    return JSON.parse(stdout);
-  } catch {
-    throw new Error(`PowerShell ${queryName} query returned malformed JSON.`);
-  }
-}
-
 function queryWindowsProcesses(processId) {
   if (processId !== undefined && !Number.isInteger(processId)) {
     throw new Error("A process query requires an integer PID.");
   }
   const script = windowsJsonQueryCommand(
     [
-      `Get-CimInstance Win32_Process${processId === undefined ? "" : ` -Filter 'ProcessId = ${processId}'`} |`,
+      `Get-CimInstance Win32_Process${processId === undefined ? "" : ` -Filter 'ProcessId = ${processId}'`} -ErrorAction Stop |`,
       "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate |",
       "ConvertTo-Json -Compress",
     ].join(" "),
   );
-  const result = spawnSync(
-    "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", script],
-    { encoding: "utf8", windowsHide: true },
-  );
-  if (result.error) {
-    throw result.error;
-  }
-  if (result.status !== 0) {
-    const stderr = String(result.stderr ?? "").trim();
-    throw new Error(
-      stderr || `PowerShell process query exited with status ${result.status}.`,
-    );
-  }
-  if (!result.stdout.trim()) {
+  const stdout = runWindowsJsonQuery(script, "process");
+  if (!stdout.trim()) {
     return [];
   }
-  const parsed = parseWindowsJsonQueryOutput(result.stdout, "process");
+  const parsed = parseWindowsJsonQueryOutput(stdout, "process");
   return (Array.isArray(parsed) ? parsed : [parsed]).filter(Boolean);
 }
 
@@ -1004,22 +950,7 @@ function queryWindowsListeners(processInfo) {
       "ConvertTo-Json -Compress",
     ].join(" "),
   );
-  const result = spawnSync(
-    "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", script],
-    { encoding: "utf8", windowsHide: true },
-  );
-  if (result.error) {
-    throw result.error;
-  }
-  if (result.status !== 0) {
-    const stderr = String(result.stderr ?? "").trim();
-    throw new Error(
-      stderr ||
-        `PowerShell listener query exited with status ${result.status}.`,
-    );
-  }
-  return parseWindowsListeners(result.stdout);
+  return parseWindowsListeners(runWindowsJsonQuery(script, "listener"));
 }
 
 export function sameWindowsProcess(left, right) {
@@ -1035,13 +966,21 @@ export function sameWindowsProcess(left, right) {
   ) {
     return false;
   }
+  let leftStartedAtUtc;
+  let rightStartedAtUtc;
+  try {
+    leftStartedAtUtc = windowsProcessStartedAtUtc(left);
+    rightStartedAtUtc = windowsProcessStartedAtUtc(right);
+  } catch {
+    return false;
+  }
   return (
     Number(left?.ProcessId) === Number(right?.ProcessId) &&
     String(left?.Name ?? "").toLowerCase() ===
       String(right?.Name ?? "").toLowerCase() &&
     path.resolve(leftExecutable).toLowerCase() ===
       path.resolve(rightExecutable).toLowerCase() &&
-    leftCreationDate === rightCreationDate
+    leftStartedAtUtc === rightStartedAtUtc
   );
 }
 
@@ -1062,7 +1001,28 @@ export function windowsProcessObservationCrashed(observed, current) {
 export function windowsProcessStartedAtUtc(processInfo) {
   const value = String(processInfo?.CreationDate ?? "");
   const epoch = /^\/Date\((\d+)(?:[+-]\d+)?\)\/$/.exec(value);
-  return new Date(epoch ? Number(epoch[1]) : value).toISOString();
+  if (epoch) return new Date(Number(epoch[1])).toISOString();
+  const wmi =
+    /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\.(\d{1,6}))?([+-])(\d{3})$/.exec(
+      value,
+    );
+  if (wmi) {
+    const milliseconds = Number((wmi[7] ?? "").padEnd(3, "0").slice(0, 3));
+    const local = Date.UTC(
+      Number(wmi[1]),
+      Number(wmi[2]) - 1,
+      Number(wmi[3]),
+      Number(wmi[4]),
+      Number(wmi[5]),
+      Number(wmi[6]),
+      milliseconds,
+    );
+    const offsetMinutes = Number(wmi[9]);
+    const offsetMilliseconds =
+      (wmi[8] === "+" ? 1 : -1) * offsetMinutes * 60 * 1_000;
+    return new Date(local - offsetMilliseconds).toISOString();
+  }
+  return new Date(value).toISOString();
 }
 
 export async function waitForWindowsProcessExit(
@@ -1467,6 +1427,21 @@ export function runCargoTargetMaintenance({
   }
 }
 
+export function reportDevSupervisorDecision(
+  decision,
+  outcome,
+  logger = console,
+) {
+  if (decision.restart)
+    logger.log(
+      `[dev watchdog] pnpm dev session exited (${outcome.signal ?? `code ${outcome.exitCode}`}); restarting the complete Vite + Cargo/Tauri dev build.`,
+    );
+  else if (decision.reason === "rate-limited")
+    logger.error(
+      `[dev watchdog] Restart limit reached (${DEV_RECOVERY_POLICY.maxRestarts} in ${DEV_RECOVERY_POLICY.restartWindowMs / 60_000} minutes).`,
+    );
+}
+
 export async function superviseDevSessions({
   spawnSession,
   cleanSession,
@@ -1659,15 +1634,137 @@ export async function waitForDevSupervisorPublication({
   }
 }
 
-async function runDetachedDevWatchdog(supervisorPid) {
-  const markerPath = devSessionPath();
+function persistDetachedDevSession(markerPath, session) {
+  const temporary = `${markerPath}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify(session));
+  renameSync(temporary, markerPath);
+}
+
+export async function handoffDetachedDevSupervisor({
+  supervisorPid,
+  markerPath,
+  session,
+  now = Date.now,
+  readEnabled = readDevWatchdogEnabled,
+  persistSession = (nextSession) =>
+    persistDetachedDevSession(markerPath, nextSession),
+  readSession = () => JSON.parse(readFileSync(markerPath, "utf8")),
+  spawnReplacement = async ({ executable, args, options }) => {
+    const replacement = spawn(executable, args, options);
+    await new Promise((resolve, reject) => {
+      replacement.once("spawn", resolve);
+      replacement.once("error", reject);
+    });
+    return replacement;
+  },
+  waitForPublication = waitForDevSupervisorPublication,
+  queryProcesses = queryWindowsProcesses,
+  writeEvent = writeDevWatchdogEvent,
+  executable = process.execPath,
+  scriptPath = fileURLToPath(import.meta.url),
+  repoRoot = REPO_ROOT,
+  environment = process.env,
+}) {
+  const nowMs = now();
+  const restartTimesMs = readDevRestartTimesMs(session, nowMs);
+  const decision = devWorkerRestartDecision({
+    exitCode: 1,
+    signal: null,
+    watchdogEnabled: readEnabled(),
+    nowMs,
+    restartTimesMs,
+  });
+  if (!decision.restart) {
+    writeEvent("dev-supervisor-restart-skipped", {
+      supervisorPid,
+      reason: decision.reason,
+      restartCount: restartTimesMs.length,
+    });
+    return { restarted: false, decision };
+  }
+
+  session.restartTimesMs = [...restartTimesMs, nowMs];
+  delete session.supervisorRestartTimesMs;
+  persistSession(session);
+
+  // Relaunch the entry point of pnpm dev, not the compiled application.
+  const launchedAtMs = now();
+  const replacement = await spawnReplacement({
+    executable,
+    args: [scriptPath, ...session.args],
+    options: {
+      cwd: repoRoot,
+      env: {
+        ...environment,
+        ...devSessionEnvironment(session.environment),
+      },
+      stdio: "ignore",
+      detached: true,
+      windowsHide: true,
+    },
+  });
+  try {
+    await waitForPublication({
+      expected: {
+        supervisorPid: replacement.pid,
+        supervisorExecutablePath: executable,
+        repoRoot,
+        scriptPath,
+        launchedAtMs,
+      },
+      readSession,
+      isRunning: () =>
+        replacement.exitCode === null && replacement.signalCode === null,
+      verifyOwnership: (recorded) =>
+        process.platform !== "win32" ||
+        devSupervisorIsAlive(recorded, queryProcesses(replacement.pid)),
+      onTimeout: (error) =>
+        writeEvent("dev-supervisor-publication-timeout", {
+          oldPid: supervisorPid,
+          newPid: replacement.pid,
+          error: error.message,
+        }),
+    });
+    writeEvent("dev-supervisor-restarted", {
+      oldPid: supervisorPid,
+      newPid: replacement.pid,
+    });
+  } catch (error) {
+    writeEvent("dev-supervisor-publication-failed", {
+      oldPid: supervisorPid,
+      newPid: replacement.pid,
+      error: error.message,
+    });
+    return {
+      restarted: false,
+      retry: true,
+      decision,
+      replacementPid: replacement.pid,
+    };
+  } finally {
+    replacement.unref();
+  }
+  return { restarted: true, decision, replacementPid: replacement.pid };
+}
+
+export async function runDetachedDevWatchdog(
+  supervisorPid,
+  {
+    markerPath = devSessionPath(),
+    readSession = () => JSON.parse(readFileSync(markerPath, "utf8")),
+    wait = () => new Promise((resolve) => setTimeout(resolve, 2_000)),
+    queryProcesses = queryWindowsProcesses,
+    handoff = handoffDetachedDevSupervisor,
+    writeEvent = writeDevWatchdogEvent,
+  } = {},
+) {
   if (!markerPath) return;
   while (true) {
-    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    await wait();
     try {
       let session;
       try {
-        session = JSON.parse(readFileSync(markerPath, "utf8"));
+        session = readSession();
       } catch (error) {
         if (error.code === "ENOENT") return;
         throw error;
@@ -1681,85 +1778,20 @@ async function runDetachedDevWatchdog(supervisorPid) {
         return;
       const alive = devSupervisorIsAlive(
         session,
-        process.platform === "win32" ? queryWindowsProcesses() : [],
+        process.platform === "win32" ? queryProcesses(supervisorPid) : [],
       );
       if (alive) continue;
-      const nowMs = Date.now();
-      const restartTimesMs = readDevRestartTimesMs(session, nowMs);
-      const decision = devWorkerRestartDecision({
-        exitCode: 1,
-        signal: null,
-        watchdogEnabled: readDevWatchdogEnabled(),
-        nowMs,
-        restartTimesMs,
+      const result = await handoff({
+        supervisorPid,
+        markerPath,
+        session,
+        readSession,
+        queryProcesses,
       });
-      if (!decision.restart) return;
-      session.restartTimesMs = [...restartTimesMs, nowMs];
-      delete session.supervisorRestartTimesMs;
-      const temporary = `${markerPath}.${process.pid}.tmp`;
-      writeFileSync(temporary, JSON.stringify(session));
-      renameSync(temporary, markerPath);
-      // Relaunch the entry point of pnpm dev, not the compiled application.
-      const launchedAtMs = Date.now();
-      const replacement = spawn(
-        process.execPath,
-        [fileURLToPath(import.meta.url), ...session.args],
-        {
-          cwd: REPO_ROOT,
-          env: {
-            ...process.env,
-            ...devSessionEnvironment(session.environment),
-          },
-          stdio: "ignore",
-          detached: true,
-          windowsHide: true,
-        },
-      );
-      await new Promise((resolve, reject) => {
-        replacement.once("spawn", resolve);
-        replacement.once("error", reject);
-      });
-      try {
-        await waitForDevSupervisorPublication({
-          expected: {
-            supervisorPid: replacement.pid,
-            supervisorExecutablePath: process.execPath,
-            repoRoot: REPO_ROOT,
-            scriptPath: fileURLToPath(import.meta.url),
-            launchedAtMs,
-          },
-          readSession: () => JSON.parse(readFileSync(markerPath, "utf8")),
-          isRunning: () =>
-            replacement.exitCode === null && replacement.signalCode === null,
-          verifyOwnership: (recorded) =>
-            process.platform !== "win32" ||
-            devSupervisorIsAlive(
-              recorded,
-              queryWindowsProcesses(replacement.pid),
-            ),
-          onTimeout: (error) =>
-            writeDevWatchdogEvent("dev-supervisor-publication-timeout", {
-              oldPid: supervisorPid,
-              newPid: replacement.pid,
-              error: error.message,
-            }),
-        });
-        writeDevWatchdogEvent("dev-supervisor-restarted", {
-          oldPid: supervisorPid,
-          newPid: replacement.pid,
-        });
-      } catch (error) {
-        writeDevWatchdogEvent("dev-supervisor-publication-failed", {
-          oldPid: supervisorPid,
-          newPid: replacement.pid,
-          error: error.message,
-        });
-      } finally {
-        replacement.unref();
-      }
+      if (result.retry) continue;
       return;
     } catch (error) {
-      writeDevWatchdogEvent("dev-watchdog-iteration-failed", {
+      writeEvent("dev-watchdog-iteration-failed", {
         error: error.message,
       });
     }
@@ -2039,14 +2071,7 @@ async function runDevSupervisor(args) {
         if (watchdogEvent) {
           writeDevWatchdogEvent(watchdogEvent.event, watchdogEvent.detail);
         }
-        if (decision.restart)
-          console.log(
-            `[dev watchdog] pnpm dev session exited (${outcome.signal ?? `code ${outcome.exitCode}`}); restarting the complete Vite + Cargo/Tauri dev build.`,
-          );
-        else if (decision.reason === "rate-limited")
-          console.error(
-            `[dev watchdog] Restart limit reached (${DEV_MAX_AUTO_RESTARTS} in 30 minutes).`,
-          );
+        reportDevSupervisorDecision(decision, outcome);
       },
     });
     if (!stopping) process.exitCode = code;

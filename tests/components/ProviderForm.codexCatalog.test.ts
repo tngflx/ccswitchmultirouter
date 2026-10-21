@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  CodexCatalogValidationError,
   normalizeCodexCatalogModelsForSave,
   normalizeCodexChatReasoningForSave,
 } from "@/components/providers/forms/ProviderForm";
@@ -38,6 +39,44 @@ const providerWithCatalog = (models: CodexCatalogModel[]): Provider => ({
 });
 
 describe("ProviderForm Codex catalog helpers", () => {
+  it.each([
+    0,
+    -1,
+    1.5,
+    Number.POSITIVE_INFINITY,
+    Number.NaN,
+    Number.MAX_SAFE_INTEGER + 1,
+    "0",
+    "-1",
+    "1.5",
+    "1e6",
+    "unknown",
+    "9".repeat(400),
+  ])(
+    "rejects an invalid context override %s instead of changing or clearing it",
+    (contextWindow) => {
+      expect(() =>
+        normalizeCodexCatalogModelsForSave([
+          { model: "context-model", contextWindow },
+        ]),
+      ).toThrow(CodexCatalogValidationError);
+    },
+  );
+
+  it("preserves explicit blank defaults and supported formatted positive token counts", () => {
+    expect(
+      normalizeCodexCatalogModelsForSave([
+        { model: "default-model", contextWindow: "" },
+        { model: "formatted-model", contextWindow: "128,000 tokens" },
+        { model: "numeric-model", contextWindow: 256000 },
+      ]),
+    ).toEqual([
+      { model: "default-model" },
+      { model: "formatted-model", contextWindow: 128000 },
+      { model: "numeric-model", contextWindow: 256000 },
+    ]);
+  });
+
   it("preserves bound provider API declarations when opening a saved provider", () => {
     const [loaded] = extractCodexCatalogModels({
       models: [

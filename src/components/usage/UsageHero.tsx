@@ -2,7 +2,7 @@ import { cloneElement, isValidElement } from "react";
 import { useTranslation } from "react-i18next";
 import { motion } from "framer-motion";
 import { Card, CardContent } from "@/components/ui/card";
-import { useUsageSummaryByApp } from "@/lib/query/usage";
+import { useUsageRecentRate, useUsageSummaryByApp } from "@/lib/query/usage";
 import { cn } from "@/lib/utils";
 import { APP_ICON_MAP } from "@/config/appConfig";
 import type { AppId } from "@/lib/api/types";
@@ -12,9 +12,9 @@ import {
   ArrowUpFromLine,
   Database,
   Info,
-  Loader2,
   Sparkles,
   Zap,
+  Gauge,
 } from "lucide-react";
 import {
   fmtUsd,
@@ -170,6 +170,12 @@ function AppGlyph({
   return <Zap className={cn("h-5 w-5", accentClass)} />;
 }
 
+function formatTokenRate(tokensPerSecond: number) {
+  return `${tokensPerSecond.toLocaleString(undefined, {
+    maximumFractionDigits: 1,
+  })} tok/s`;
+}
+
 export function UsageHero({
   range,
   appType,
@@ -187,6 +193,15 @@ export function UsageHero({
       refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false,
     },
   );
+  const {
+    data: recentRate,
+    isLoading: isRecentRateLoading,
+    isError: isRecentRateError,
+  } = useUsageRecentRate(appType, providerName, model, {
+    refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false,
+  });
+  const availableRecentRate =
+    !isRecentRateLoading && !isRecentRateError ? recentRate : undefined;
 
   // No client-side filtering: Hero's totals must match the Trend/Logs/Stats
   // below, which all go through the backend's full set of app_types. The
@@ -215,8 +230,11 @@ export function UsageHero({
   const requests = summary?.totalRequests ?? 0;
 
   const cacheWriteDisplay = {
-    value:
-      cacheWriteState === "na" ? "N/A" : formatTokensShort(cacheWrite, lang),
+    value: isLoading
+      ? "--"
+      : cacheWriteState === "na"
+        ? "N/A"
+        : formatTokensShort(cacheWrite, lang),
     muted: cacheWriteState === "na",
     tooltip:
       cacheWriteState === "na"
@@ -231,16 +249,6 @@ export function UsageHero({
             )
           : undefined,
   };
-
-  if (isLoading) {
-    return (
-      <Card className="border border-border/50 bg-card/40 backdrop-blur-sm">
-        <CardContent className="flex items-center justify-center min-h-[200px]">
-          <Loader2 className="h-6 w-6 animate-spin text-muted-foreground/50" />
-        </CardContent>
-      </Card>
-    );
-  }
 
   const hitPercent = Math.max(0, Math.min(100, hitRate * 100));
   const hitPercentLabel = hitPercent.toFixed(hitPercent >= 99.95 ? 0 : 1);
@@ -284,10 +292,11 @@ export function UsageHero({
                       className="text-2xl md:text-3xl font-bold tabular-nums tracking-tight leading-none"
                       title={realTotal.toLocaleString()}
                     >
-                      {realTotal.toLocaleString()}
+                      {isLoading ? "--" : realTotal.toLocaleString()}
                     </span>
                     <span className="text-xs text-muted-foreground font-medium bg-muted/40 px-1.5 py-0.5 rounded-md">
-                      ≈ {formatTokensShort(realTotal, lang, 2)}
+                      {!isLoading &&
+                        `≈ ${formatTokensShort(realTotal, lang, 2)}`}
                     </span>
                   </div>
                 </div>
@@ -300,7 +309,7 @@ export function UsageHero({
                   </span>
                   <span className="font-semibold flex items-center gap-1.5 text-sm tabular-nums">
                     <Activity className="h-3.5 w-3.5 text-blue-500" />
-                    {requests.toLocaleString()}
+                    {isLoading ? "--" : requests.toLocaleString()}
                   </span>
                 </div>
                 <div className="w-px h-8 bg-border/60" />
@@ -309,24 +318,26 @@ export function UsageHero({
                     {t("usage.totalCost")}
                   </span>
                   <span className="font-semibold text-green-500 text-sm tabular-nums">
-                    {totalCost == null ? "--" : fmtUsd(totalCost, 4)}
+                    {isLoading || totalCost == null
+                      ? "--"
+                      : fmtUsd(totalCost, 4)}
                   </span>
                 </div>
               </div>
             </div>
 
             {/* Bottom row: Breakdown and Hit Rate */}
-            <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+            <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-7 gap-3">
               <MiniStat
                 icon={<ArrowDownToLine className="h-3.5 w-3.5" />}
                 label={t("usage.freshInput", "新增输入")}
-                value={formatTokensShort(input, lang)}
+                value={isLoading ? "--" : formatTokensShort(input, lang)}
                 accent="text-blue-500"
               />
               <MiniStat
                 icon={<ArrowUpFromLine className="h-3.5 w-3.5" />}
                 label={t("usage.output")}
-                value={formatTokensShort(output, lang)}
+                value={isLoading ? "--" : formatTokensShort(output, lang)}
                 accent="text-purple-500"
               />
               <MiniStat
@@ -340,17 +351,59 @@ export function UsageHero({
               <MiniStat
                 icon={<Sparkles className="h-3.5 w-3.5" />}
                 label={t("usage.cacheRead", "缓存命中")}
-                value={formatTokensShort(cacheRead, lang)}
+                value={isLoading ? "--" : formatTokensShort(cacheRead, lang)}
                 accent="text-emerald-500"
               />
 
-              <div className="col-span-2 lg:col-span-1 flex flex-col justify-center rounded-xl border border-border/40 bg-background/40 p-3 shadow-sm">
+              <MiniStat
+                icon={<Gauge className="h-3.5 w-3.5" />}
+                label={t("usage.recentInputRate", "Last 5 min input rate")}
+                value={
+                  availableRecentRate
+                    ? formatTokenRate(availableRecentRate.inputTokensPerSecond)
+                    : "--"
+                }
+                accent="text-cyan-500"
+                tooltip={
+                  availableRecentRate
+                    ? t(
+                        "usage.recentInputRateDetail",
+                        "{{count}} input Tokens in the last 5 minutes (cache-inclusive)",
+                        {
+                          count: availableRecentRate.inputTokens,
+                        },
+                      )
+                    : undefined
+                }
+              />
+
+              <MiniStat
+                icon={<ArrowUpFromLine className="h-3.5 w-3.5" />}
+                label={t("usage.recentOutputRate", "Last 5 min output rate")}
+                value={
+                  availableRecentRate
+                    ? formatTokenRate(availableRecentRate.outputTokensPerSecond)
+                    : "--"
+                }
+                accent="text-indigo-500"
+                tooltip={
+                  availableRecentRate
+                    ? t(
+                        "usage.recentOutputRateDetail",
+                        "{{count}} output Tokens in the last 5 minutes",
+                        { count: availableRecentRate.outputTokens },
+                      )
+                    : undefined
+                }
+              />
+
+              <div className="col-span-1 flex flex-col justify-center rounded-xl border border-border/40 bg-background/40 p-3 shadow-sm">
                 <div className="flex items-center justify-between text-[11px] mb-2">
                   <span className="text-muted-foreground font-medium">
                     {t("usage.cacheHitRate", "缓存命中率")}
                   </span>
                   <span className="font-bold text-emerald-500 tabular-nums">
-                    {hitPercentLabel}%
+                    {isLoading ? "--" : `${hitPercentLabel}%`}
                   </span>
                 </div>
                 <div className="relative h-1.5 rounded-full bg-muted/60 overflow-hidden">
@@ -391,7 +444,7 @@ function MiniStat({
 }: MiniStatProps) {
   return (
     <div
-      className="flex flex-col gap-1 rounded-xl border border-border/40 bg-background/40 p-3 shadow-sm"
+      className="min-w-0 flex flex-col gap-1 rounded-xl border border-border/40 bg-background/40 p-3 shadow-sm"
       title={tooltip}
     >
       <div
@@ -405,7 +458,7 @@ function MiniStat({
       </div>
       <div
         className={cn(
-          "text-sm font-semibold tabular-nums",
+          "text-sm font-semibold tabular-nums break-words",
           muted && "text-muted-foreground/70",
         )}
       >

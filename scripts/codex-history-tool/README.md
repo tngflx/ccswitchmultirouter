@@ -2,7 +2,10 @@
 
 Standalone Python tool for listing and repairing Codex Desktop history visibility.
 
-It uses only the Python standard library. No helper executable is required.
+It uses only the Python standard library. On Windows, applying a repair also
+requires PowerShell 7 (`pwsh.exe`) to verify that Codex Desktop/app-server is
+closed. A missing or failed process probe blocks the repair unless the existing
+`--force` override is explicitly supplied.
 
 This tool complements the official **Unified Codex Session History** setting:
 

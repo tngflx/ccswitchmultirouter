@@ -1,6 +1,38 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+# Node and the external guardian consume the same declarative development
+# restart limits, settings precedence, and environment allowlist.
+$script:CcsmDevRecoveryPolicy = [System.IO.File]::ReadAllText(
+    (Join-Path $PSScriptRoot "dev-recovery-policy.json"), [System.Text.Encoding]::UTF8
+) | ConvertFrom-Json
+if ($script:CcsmDevRecoveryPolicy.schemaVersion -ne 1 -or
+    ($script:CcsmDevRecoveryPolicy.restartWindowMs -isnot [int] -and
+        $script:CcsmDevRecoveryPolicy.restartWindowMs -isnot [long]) -or
+    $script:CcsmDevRecoveryPolicy.restartWindowMs -lt 1 -or
+    $script:CcsmDevRecoveryPolicy.restartWindowMs -gt 9007199254740991 -or
+    ($script:CcsmDevRecoveryPolicy.maxRestarts -isnot [int] -and
+        $script:CcsmDevRecoveryPolicy.maxRestarts -isnot [long]) -or
+    $script:CcsmDevRecoveryPolicy.maxRestarts -lt 1 -or
+    $script:CcsmDevRecoveryPolicy.maxRestarts -gt 9007199254740991) {
+    throw "invalid development recovery policy contract"
+}
+foreach ($name in @("watchdogSettingKeys", "enabledOverrideValues", "sessionEnvironmentKeys")) {
+    $values = $script:CcsmDevRecoveryPolicy.$name
+    if ($values -isnot [array] -or $values.Count -lt 1 -or
+        @($values | Where-Object { $_ -isnot [string] -or [string]::IsNullOrEmpty($_) }).Count -gt 0) {
+        throw "invalid development recovery policy contract"
+    }
+}
+if ($script:CcsmDevRecoveryPolicy.watchdogOverrideKey -isnot [string] -or
+    [string]::IsNullOrEmpty($script:CcsmDevRecoveryPolicy.watchdogOverrideKey)) {
+    throw "invalid development recovery policy contract"
+}
+if ($script:CcsmDevRecoveryPolicy.recoveryLaunchFlag -isnot [string] -or
+    $script:CcsmDevRecoveryPolicy.recoveryLaunchFlag -cnotmatch '^--ccsm-dev-[a-z-]+$') {
+    throw "invalid development recovery policy contract"
+}
+
 function ConvertTo-CcsmGuardianCanonicalPath {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -86,15 +118,26 @@ function Test-CcsmGuardianPathInside {
 }
 
 function Test-CcsmGuardianWatchdogEnabled {
-    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [System.Collections.IDictionary]$Environment = $null
+    )
+
+    $overrideKey = $script:CcsmDevRecoveryPolicy.watchdogOverrideKey
+    if ($null -ne $Environment -and $Environment.Keys -ccontains $overrideKey) {
+        $override = ([string]$Environment[$overrideKey]).Trim().ToLowerInvariant()
+        return $script:CcsmDevRecoveryPolicy.enabledOverrideValues -ccontains $override
+    }
 
     $settingsPath = Join-Path $ConfigPath "settings.json"
     if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) { return $true }
     try {
         $settings = [System.IO.File]::ReadAllText($settingsPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-        foreach ($name in @("watchdogEnabled", "watchdog_enabled")) {
-            if ($settings.PSObject.Properties.Name -contains $name) {
-                $value = $settings.$name
+        if ($settings -isnot [pscustomobject]) { return $true }
+        foreach ($name in $script:CcsmDevRecoveryPolicy.watchdogSettingKeys) {
+            $property = $settings.PSObject.Properties[$name]
+            if ($null -ne $property -and $property.Name -ceq $name) {
+                $value = $property.Value
                 if ($value -is [bool]) { return $value }
                 return $true
             }
@@ -109,7 +152,7 @@ function Get-CcsmDevSessionEnvironment {
     param($Environment)
 
     $result = @{}
-    foreach ($name in @("TAURI_DEV_REBUILD_DELAY_MS", "TAURI_DEV_NO_REBUILD", "TAURI_DEV_PORT", "CC_SWITCH_TEST_HOME", "CC_SWITCH_DEV_WATCHDOG_ENABLED")) {
+    foreach ($name in $script:CcsmDevRecoveryPolicy.sessionEnvironmentKeys) {
         $value = $null
         if ($Environment -is [System.Collections.IDictionary]) {
             if ($Environment.Keys -ccontains $name) { $value = $Environment[$name] }
@@ -131,9 +174,9 @@ function Get-CcsmDevSessionRestartTimesMs {
     $fields = @($Session.PSObject.Properties.Name)
     if ($Session -is [System.Collections.IDictionary]) { $fields = @($Session.Keys) }
     $history = $null
-    if ($fields -contains "restartTimesMs" -and $Session.restartTimesMs -is [array]) {
+    if ($fields -ccontains "restartTimesMs" -and $Session.restartTimesMs -is [array]) {
         $history = $Session.restartTimesMs
-    } elseif ($fields -contains "supervisorRestartTimesMs" -and $Session.supervisorRestartTimesMs -is [array]) {
+    } elseif ($fields -ccontains "supervisorRestartTimesMs" -and $Session.supervisorRestartTimesMs -is [array]) {
         $history = $Session.supervisorRestartTimesMs
     }
     foreach ($timestamp in @($history)) {
@@ -142,7 +185,8 @@ function Get-CcsmDevSessionRestartTimesMs {
         $number = [double]$timestamp
         if ([double]::IsNaN($number) -or [double]::IsInfinity($number) -or
             [math]::Abs($number) -gt 9007199254740991 -or
-            $number -ne [math]::Truncate($number) -or $number -lt $NowMs - 1800000) { continue }
+            $number -ne [math]::Truncate($number) -or
+            $number -lt $NowMs - $script:CcsmDevRecoveryPolicy.restartWindowMs) { continue }
         [long]$number
     }
 }
@@ -374,7 +418,11 @@ function Start-CcsmDevSessionLauncher {
         [scriptblock]$StartProcess = { param($Info) [System.Diagnostics.Process]::Start($Info) }
     )
 
-    $arguments = @($Plan.ScriptPath) + @($Plan.Args)
+    $recoverySupervisorPid = 0
+    if (-not [int]::TryParse([string]$Plan.SupervisorPid, [ref]$recoverySupervisorPid) -or
+        $recoverySupervisorPid -lt 1) { throw "invalid development recovery owner" }
+    $arguments = @($Plan.ScriptPath, $script:CcsmDevRecoveryPolicy.recoveryLaunchFlag,
+        [string]$recoverySupervisorPid) + @($Plan.Args)
     $info = New-Object System.Diagnostics.ProcessStartInfo
     $info.FileName = $Plan.Executable
     $info.Arguments = @($arguments | ForEach-Object { ConvertTo-CcsmGuardianQuotedArgument $_ }) -join " "
@@ -406,7 +454,7 @@ function Invoke-CcsmDevSessionRecovery {
         & $WriteEvent "warning" "dev-session-recovery-required" @{ RepoRoot = $Plan.RepoRoot }
         return
     }
-    if (-not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $Plan.ConfigPath)) {
+    if (-not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $Plan.ConfigPath -Environment $Plan.Environment)) {
         & $WriteEvent "info" "dev-session-restart-skipped-watchdog-disabled" $null
         return
     }
@@ -419,7 +467,7 @@ function Invoke-CcsmDevSessionRecovery {
             return
         }
     }
-    if ((& $IsMaintenance) -or -not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $Plan.ConfigPath)) {
+    if ((& $IsMaintenance) -or -not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $Plan.ConfigPath -Environment $Plan.Environment)) {
         & $WriteEvent "info" "dev-session-recovery-deferred" @{ State = $Plan.State; Active = $Plan.Active }
         return
     }
@@ -431,9 +479,13 @@ function Invoke-CcsmDevSessionRecovery {
         return
     }
     $Plan = $currentPlan
+    if (-not (Test-CcsmGuardianWatchdogEnabled -ConfigPath $Plan.ConfigPath -Environment $Plan.Environment)) {
+        & $WriteEvent "info" "dev-session-restart-skipped-watchdog-disabled" $null
+        return
+    }
     $nowMs = [datetimeoffset]::UtcNow.ToUnixTimeMilliseconds()
     $restartTimesMs = @(Get-CcsmDevSessionRestartTimesMs -Session $Plan.Session -NowMs $nowMs)
-    if ($restartTimesMs.Count -ge 5) {
+    if ($restartTimesMs.Count -ge $script:CcsmDevRecoveryPolicy.maxRestarts) {
         & $WriteEvent "warning" "dev-session-restart-rate-limited" @{ RestartsInWindow = $restartTimesMs.Count }
         return
     }

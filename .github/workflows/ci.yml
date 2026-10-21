@@ -11,19 +11,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  scope:
+    name: Change Scope
+    runs-on: ubuntu-latest
+    outputs:
+      scope: ${{ steps.changes.outputs.scope }}
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Test change classification and CI gates
+        run: python3 -B -m unittest discover -s scripts/ci -p 'test_*.py'
+
+      - name: Classify changed files
+        id: changes
+        run: python3 -B scripts/ci/changed_files.py
+
   frontend:
     name: Frontend Checks
+    needs: scope
+    # Keep the required check successful, with a lightweight gate for docs only.
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
+      - name: Require successful change classification
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          CHANGE_SCOPE: ${{ needs.scope.outputs.scope }}
+        run: |
+          test "$SCOPE_RESULT" = success
+          if [ "$CHANGE_SCOPE" = docs ]; then
+            echo "Documentation-only change: frontend checks are satisfied without building."
+          fi
+
       - name: Checkout
+        if: needs.scope.outputs.scope != 'docs'
         uses: actions/checkout@v6
 
       - name: Setup Node.js
+        if: needs.scope.outputs.scope != 'docs'
         uses: actions/setup-node@v6
         with:
           node-version: "20"
 
       - name: Setup pnpm
+        if: needs.scope.outputs.scope != 'docs'
         env:
           COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
         run: |
@@ -32,11 +66,13 @@ jobs:
           pnpm --version
 
       - name: Get pnpm store directory
+        if: needs.scope.outputs.scope != 'docs'
         id: pnpm-store
         shell: bash
         run: echo "path=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Cache pnpm store
+        if: needs.scope.outputs.scope != 'docs'
         uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
@@ -44,49 +80,125 @@ jobs:
           restore-keys: ${{ runner.os }}-pnpm-store-
 
       - name: Install dependencies
+        if: needs.scope.outputs.scope != 'docs'
         run: pnpm install --frozen-lockfile
 
       - name: TypeScript type check
+        if: needs.scope.outputs.scope != 'docs'
         run: pnpm typecheck
 
       - name: Catalog authority and regression checks
+        if: needs.scope.outputs.scope != 'docs'
         run: pnpm catalog:verify
 
       - name: Check formatting
+        if: needs.scope.outputs.scope != 'docs'
         run: pnpm format:check
 
       - name: Verified test runner regression checks
+        if: needs.scope.outputs.scope != 'docs'
         run: pnpm test:runner
 
       - name: Unit tests
+        if: needs.scope.outputs.scope != 'docs'
         run: pnpm test:unit
 
       - name: Offline Responses contract checks
+        if: needs.scope.outputs.scope != 'docs'
         run: |
           pnpm contract:check
           pnpm contract:test
 
       - name: Synthetic canary parser tests
+        if: needs.scope.outputs.scope != 'docs'
         run: python -m unittest discover -s scripts/tests -p test_hosted_web_search_canary.py
 
+  rustfmt:
+    name: Rust Formatting
+    needs: scope
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful change classification
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          CHANGE_SCOPE: ${{ needs.scope.outputs.scope }}
+        run: |
+          test "$SCOPE_RESULT" = success
+          if [ "$CHANGE_SCOPE" = docs ]; then
+            echo "Documentation-only change: Rust formatting is satisfied without toolchain setup."
+          fi
+
+      - name: Checkout
+        if: needs.scope.outputs.scope != 'docs'
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        if: needs.scope.outputs.scope != 'docs'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check Rust formatting
+        if: needs.scope.outputs.scope != 'docs'
+        run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
+
   backend:
-    name: Backend Checks
-    runs-on: ${{ matrix.os }}
+    name: Backend Checks (${{ matrix.os }})
+    needs: [scope, frontend, rustfmt]
+    # Expand all existing matrix check names even for docs or failed prerequisites.
+    if: ${{ always() }}
+    # Use the native runner only once every prerequisite has passed for full CI.
+    runs-on: >-
+      ${{ needs.scope.result == 'success' && needs.scope.outputs.scope != 'docs' &&
+          needs.frontend.result == 'success' && needs.rustfmt.result == 'success' &&
+          matrix.os || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, windows-latest, macos-latest]
     steps:
+      - name: Require successful frontend and formatting checks
+        shell: bash
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          CHANGE_SCOPE: ${{ needs.scope.outputs.scope }}
+          FRONTEND_RESULT: ${{ needs.frontend.result }}
+          RUSTFMT_RESULT: ${{ needs.rustfmt.result }}
+        run: |
+          test "$SCOPE_RESULT" = success
+          test "$FRONTEND_RESULT" = success
+          test "$RUSTFMT_RESULT" = success
+          if [ "$CHANGE_SCOPE" = docs ]; then
+            echo "Documentation-only change: backend checks are satisfied without building."
+          fi
+
       - name: Checkout
+        if: needs.scope.outputs.scope != 'docs'
         uses: actions/checkout@v6
 
       - name: Setup Rust
+        if: needs.scope.outputs.scope != 'docs'
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
+
+      - name: Setup Node.js for Windows development recovery tests
+        if: needs.scope.outputs.scope != 'docs' && runner.os == 'Windows'
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+
+      - name: Windows development recovery regression tests
+        if: needs.scope.outputs.scope != 'docs' && runner.os == 'Windows'
+        run: npm run test:dev-recovery
+
+      - name: Windows JavaScript lifecycle regression tests
+        if: needs.scope.outputs.scope != 'docs' && runner.os == 'Windows'
+        run: npm run test:lifecycle
 
       - name: Install Linux system deps
-        if: runner.os == 'Linux'
+        if: needs.scope.outputs.scope != 'docs' && runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -98,6 +210,7 @@ jobs:
             || sudo apt-get install -y --no-install-recommends libsoup2.4-dev
 
       - name: Cache Cargo registry and build
+        if: needs.scope.outputs.scope != 'docs'
         uses: actions/cache@v6
         with:
           path: |
@@ -108,14 +221,14 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Create frontend dist placeholder
+        if: needs.scope.outputs.scope != 'docs'
         shell: bash
         run: mkdir -p dist
 
-      - name: Check Rust formatting
-        run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
-
       - name: Clippy
+        if: needs.scope.outputs.scope != 'docs'
         run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 
       - name: Run tests
+        if: needs.scope.outputs.scope != 'docs'
         run: cargo test --manifest-path src-tauri/Cargo.toml

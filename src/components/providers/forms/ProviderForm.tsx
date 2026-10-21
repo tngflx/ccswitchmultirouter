@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useTranslation } from "react-i18next";
+import { getI18n, useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Form, FormField, FormItem, FormMessage } from "@/components/ui/form";
@@ -241,13 +241,25 @@ export const normalizeCodexCatalogModelsForSave = (
       ""
     ).trim();
     const displayName = item.displayName?.trim();
-    const rawContextWindow = String(item.contextWindow ?? "").replace(
-      /[^\d]/g,
-      "",
-    );
+    const rawContextWindow = String(item.contextWindow ?? "").trim();
     const contextWindow = rawContextWindow
-      ? Number.parseInt(rawContextWindow, 10)
+      ? Number(rawContextWindow.replace(/\s*tokens$/i, "").replace(/,/g, ""))
       : undefined;
+    if (
+      rawContextWindow &&
+      (!/^(?:\d+|\d{1,3}(?:,\d{3})+)(?:\s*tokens)?$/i.test(rawContextWindow) ||
+        !Number.isSafeInteger(contextWindow) ||
+        (contextWindow ?? 0) <= 0)
+    ) {
+      const message = `${model}: Context window must be a positive safe integer; clear the field to follow the default.`;
+      throw new CodexCatalogValidationError(
+        model,
+        getI18n()?.t("providerForm.codexContextWindowInvalid", {
+          model,
+          defaultValue: message,
+        }) ?? message,
+      );
+    }
 
     const inputModalities = item.inputModalities?.filter(
       (m) => typeof m === "string" && m.trim(),
@@ -764,6 +776,7 @@ function ProviderFormFull({
   const {
     isAuthenticated: isCodexOauthAuthenticated,
     accounts: codexOauthAccounts,
+    defaultAccountId: codexOauthDefaultAccountId,
   } = useCodexOauth();
 
   const {
@@ -1845,7 +1858,8 @@ function ProviderFormFull({
             ? setCodexWireApi(codexConfig ?? "", "responses")
             : (codexConfig ?? "");
         const shouldPersistCodexCatalog =
-          shouldPersistCodexLocalConfig && codexCatalogConfigured;
+          (shouldPersistCodexLocalConfig || isCanonicalCodexOfficial) &&
+          codexCatalogConfigured;
         const normalizedCatalogModels = shouldPersistCodexCatalog
           ? normalizeCodexCatalogModelsForSave(codexCatalogModels)
           : [];
@@ -1917,8 +1931,9 @@ function ProviderFormFull({
           : codexRouting;
         // The default-model field writes the top-level `model` into the TOML
         // as the user types. Migrate aliases/renames and remove it when the
-        // catalog has no enabled model left.
-        if (shouldPersistCodexCatalog) {
+        // catalog has no enabled model left, only when this form owns the
+        // local config. Official authentication saves retain native TOML.
+        if (shouldPersistCodexLocalConfig && shouldPersistCodexCatalog) {
           const currentDefaultModel = extractCodexModelName(
             normalizedCodexConfig,
           )?.trim();
@@ -2220,7 +2235,8 @@ function ProviderFormFull({
             : (activePreset?.presetKey ?? initialData?.meta?.codexPresetId)
           : undefined,
       codexLocalModelMapping:
-        appId === "codex" && category !== "official"
+        appId === "codex" &&
+        (category !== "official" || isCanonicalCodexOfficial)
           ? effectiveCodexMenuProjection
           : undefined,
       promptCacheRouting:
@@ -3042,6 +3058,16 @@ function ProviderFormFull({
               ) : null}
               <CodexFormFields
                 providerId={providerId}
+                isCanonicalOfficial={isCanonicalCodexOfficial}
+                officialAccountId={
+                  codexOfficialAuth.mode === "managed_oauth"
+                    ? codexOfficialAuth.accountId?.trim() ||
+                      codexOauthDefaultAccountId
+                    : null
+                }
+                officialManagedOAuth={
+                  codexOfficialAuth.mode === "managed_oauth"
+                }
                 providerName={form.watch("name")}
                 codexProviderEditorSnapshot={codexProviderEditorSnapshot}
                 isXaiOauthPreset={

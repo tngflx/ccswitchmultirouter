@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "restartWindowMs": 1800000,
+  "maxRestarts": 5,
+  "recoveryLaunchFlag": "--ccsm-dev-recover",
+  "watchdogSettingKeys": ["watchdogEnabled", "watchdog_enabled"],
+  "watchdogOverrideKey": "CC_SWITCH_DEV_WATCHDOG_ENABLED",
+  "enabledOverrideValues": ["1", "true", "yes", "on"],
+  "sessionEnvironmentKeys": [
+    "TAURI_DEV_REBUILD_DELAY_MS",
+    "TAURI_DEV_NO_REBUILD",
+    "TAURI_DEV_PORT",
+    "CC_SWITCH_TEST_HOME",
+    "CC_SWITCH_DEV_WATCHDOG_ENABLED"
+  ]
+}

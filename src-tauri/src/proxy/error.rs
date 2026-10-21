@@ -5,6 +5,7 @@ use axum::{
 };
 
 pub(crate) const RESPONSE_PENDING_GRACE_SECS: u64 = 30;
+pub(crate) const CCSM_UPSTREAM_TRANSPORT_ERROR_CODE: &str = "ccsm_upstream_transport_error";
 use serde_json::json;
 use thiserror::Error;
 
@@ -192,12 +193,18 @@ impl IntoResponse for ProxyError {
                     ProxyError::UpstreamError { .. } => unreachable!(),
                 };
 
-                let error_body = json!({
+                let mut error_body = json!({
                     "error": {
                         "message": message,
                         "type": "proxy_error",
                     }
                 });
+                if let Some(error_object) = error_body
+                    .get_mut("error")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    self.apply_local_transport_error_metadata(error_object);
+                }
 
                 (http_status, error_body)
             }
@@ -214,6 +221,21 @@ impl IntoResponse for ProxyError {
 }
 
 impl ProxyError {
+    /// Mark transport failures generated locally while preserving actual upstream errors.
+    pub(crate) fn apply_local_transport_error_metadata(
+        &self,
+        error: &mut serde_json::Map<String, serde_json::Value>,
+    ) {
+        if matches!(self, ProxyError::ForwardFailed(_)) {
+            error.insert(
+                "code".to_string(),
+                serde_json::Value::String(CCSM_UPSTREAM_TRANSPORT_ERROR_CODE.to_string()),
+            );
+            error.insert("source".to_string(), json!("ccsm"));
+            error.insert("upstream_status".to_string(), serde_json::Value::Null);
+        }
+    }
+
     /// 建议客户端等待多久后重试。
     ///
     /// `ResponsePending` 的结果未知，不能用 `Retry-After` 暗示客户端自动重放。
@@ -278,6 +300,36 @@ pub fn categorize_error(error: &reqwest::Error) -> ErrorCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_transport_502_is_distinct_from_upstream_http_502() {
+        let local = ProxyError::ForwardFailed("TLS handshake failed".into()).into_response();
+        assert_eq!(local.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(local.into_body(), 8192).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "ccsm_upstream_transport_error");
+        assert_eq!(body["error"]["source"], "ccsm");
+        assert_eq!(
+            body["error"].get("upstream_status"),
+            Some(&serde_json::Value::Null)
+        );
+
+        let upstream_body =
+            json!({"error": {"message": "upstream unavailable", "code": "upstream_failure"}});
+        let upstream = ProxyError::UpstreamError {
+            status: 502,
+            body: Some(upstream_body.to_string()),
+        }
+        .into_response();
+        assert_eq!(upstream.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(upstream.into_body(), 8192)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            upstream_body
+        );
+    }
 
     #[test]
     fn error_chain_message_includes_deepest_source() {

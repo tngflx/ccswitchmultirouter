@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "evidenceKind": "current-development-runtime-after-planned-rebuild",
+  "observedAtUtc": "2026-10-21T13:22:37.751Z",
+  "state": "ready",
+  "supervisorPid": 34508,
+  "workerPid": 40268,
+  "watchdogPid": 35336,
+  "exactOwnedWatchdogCount": 1,
+  "appPid": 32656,
+  "appPath": "D:\\repos\\ccswitchmultirouter\\src-tauri\\target\\debug\\cc-switch.exe",
+  "appStartedAtUtc": "2026-10-21T13:20:21.7006133Z",
+  "appMarkerStartMatches": true,
+  "ancestry": [32656, 38808, 42728, 50428, 40268, 34508],
+  "exeLastWriteUtc": "2026-10-21T13:19:32.218Z",
+  "restartTimesMs": [],
+  "plannedReloadReceiptReadyAtUtc": "2026-10-21T13:19:39.0237232+00:00",
+  "plannedReloadHelperAlive": false,
+  "maintenanceLeasePresent": false,
+  "liveAutomaticFailoverProvenByThisReceipt": false,
+  "liveProviderInterruptionAuditPerformed": false,
+  "productionBinaryBuiltOrInstalled": false
+}

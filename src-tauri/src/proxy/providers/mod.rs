@@ -66,6 +66,7 @@ pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex"
 pub const XAI_API_BASE_URL: &str = "https://api.x.ai/v1";
 
 // 公开导出
+pub(crate) use adapter::auth_header_value;
 pub use adapter::ProviderAdapter;
 pub use auth::{AuthInfo, AuthStrategy, CODEX_OAUTH_ORIGINATOR};
 pub use claude::{
@@ -80,12 +81,12 @@ pub(crate) use codex::{
     codex_route_auth_source, codex_route_supports_responses_compaction,
     codex_route_target_provider_id_from_route, codex_route_uses_official_agent_backend,
     is_codex_desktop_reasoning_client, is_codex_remote_compact_endpoint,
-    is_codex_responses_endpoint, prepare_codex_native_responses_model,
-    provider_uses_native_codex_auth, resolve_codex_chat_protocol_target,
-    resolve_codex_chat_reasoning_projection, resolve_codex_native_responses_reasoning_projection,
-    resolve_codex_primary_route_from_settings, resolve_codex_request_compatibility,
-    strip_legacy_codex_official_auth, validate_codex_provider_api_capability,
-    CODEX_ACCOUNT_POOL_ENABLED,
+    is_codex_responses_endpoint, materialize_codex_v2_auth_context,
+    prepare_codex_native_responses_model, provider_uses_native_codex_auth,
+    resolve_codex_chat_protocol_target, resolve_codex_chat_reasoning_projection,
+    resolve_codex_native_responses_reasoning_projection, resolve_codex_primary_route_from_settings,
+    resolve_codex_request_compatibility, strip_legacy_codex_official_auth,
+    validate_codex_provider_api_capability, CODEX_ACCOUNT_POOL_ENABLED,
 };
 pub use codex::{
     apply_codex_chat_upstream_model, apply_codex_upstream_model, build_codex_route_probe_provider,

@@ -978,11 +978,12 @@ fn materialize_codex_v2_provider(
         meta.api_format = Some(model.api_format.clone());
     }
 
-    let auth_policy = effective_codex_v2_auth_policy(target_provider, &route.auth_policy);
-    if is_canonical_codex_official_provider(target_provider) {
-        reset_codex_official_auth_materialization(&mut settings, &mut meta);
-    }
-    apply_codex_v2_auth_policy(&auth_policy, &mut settings, &mut meta);
+    apply_effective_codex_v2_auth_context(
+        target_provider,
+        &route.auth_policy,
+        &mut settings,
+        &mut meta,
+    );
     materialized.settings_config = JsonValue::Object(settings);
     materialized.meta = Some(meta);
 
@@ -1049,6 +1050,42 @@ fn effective_codex_v2_auth_policy(
     } else {
         route_policy.clone()
     }
+}
+
+fn apply_effective_codex_v2_auth_context(
+    target_provider: &Provider,
+    route_policy: &CodexRouteAuthPolicy,
+    settings: &mut Map<String, JsonValue>,
+    meta: &mut ProviderMeta,
+) {
+    let policy = effective_codex_v2_auth_policy(target_provider, route_policy);
+    if is_canonical_codex_official_provider(target_provider) {
+        reset_codex_official_auth_materialization(settings, meta);
+    }
+    apply_codex_v2_auth_policy(&policy, settings, meta);
+}
+
+/// Resolve account-scoped capabilities with the same authentication owner as
+/// the routed request, without changing the persisted target provider.
+pub(crate) fn materialize_codex_v2_auth_context(
+    target_provider: &Provider,
+    route_policy: &CodexRouteAuthPolicy,
+) -> Provider {
+    let mut materialized = target_provider.clone();
+    let mut settings = target_provider
+        .settings_config
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let mut meta = target_provider.meta.clone().unwrap_or_default();
+    apply_effective_codex_v2_auth_context(target_provider, route_policy, &mut settings, &mut meta);
+    // Runtime routes also have request-local IDs. Keeping this clone distinct
+    // prevents later canonical-provider materialization from replacing a
+    // legacy route-owned account with the Desktop login.
+    materialized.id = format!("{}::auth-context", target_provider.id);
+    materialized.settings_config = JsonValue::Object(settings);
+    materialized.meta = Some(meta);
+    materialized
 }
 
 fn reset_codex_official_auth_materialization(
@@ -8857,6 +8894,104 @@ wire_api = "responses"
         assert_eq!(exact["id"], "deepseek");
         assert!(codex_route_matches_model(exact, "deepseek-v4-pro"));
         assert!(!codex_route_matches_model(exact, "deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn v2_context_auth_materialization_matches_runtime_and_preserves_the_target() {
+        let mut ordinary = Provider::with_id(
+            "managed-target".into(),
+            "Managed target".into(),
+            json!({
+                "auth":{"OPENAI_API_KEY":"<redacted>"},
+                "config":"model = \"context-model\"\n",
+                "modelCatalog":{"models":[{"model":"context-model"}]}
+            }),
+            None,
+        );
+        ordinary.meta = Some(ProviderMeta {
+            provider_type: Some("codex_oauth".into()),
+            auth_binding: Some(AuthBinding {
+                source: AuthBindingSource::ManagedAccount,
+                auth_provider: Some("codex_oauth".into()),
+                account_id: Some("account-a".into()),
+            }),
+            ..Default::default()
+        });
+        let mut legacy_official = ordinary.clone();
+        legacy_official.id = crate::database::CODEX_OFFICIAL_PROVIDER_ID.into();
+        legacy_official.category = Some("official".into());
+        let mut owned_official = legacy_official.clone();
+        owned_official.meta.as_mut().unwrap().codex_official_auth =
+            Some(crate::provider::CodexOfficialAuthConfig {
+                mode: CodexOfficialAuthMode::ManagedOauth,
+                account_id: Some("account-a".into()),
+            });
+
+        for target in [ordinary, legacy_official, owned_official] {
+            let before = serde_json::to_value(&target).unwrap();
+            for source in [
+                CodexRouteAuthSource::ProviderConfig,
+                CodexRouteAuthSource::ManagedAccount,
+                CodexRouteAuthSource::ManagedCodexOauth,
+                CodexRouteAuthSource::NativeCodexAuth,
+                CodexRouteAuthSource::AccountPool,
+            ] {
+                let policy = CodexRouteAuthPolicy {
+                    account_id: matches!(
+                        source,
+                        CodexRouteAuthSource::ManagedAccount
+                            | CodexRouteAuthSource::ManagedCodexOauth
+                    )
+                    .then(|| "account-b".into()),
+                    source,
+                };
+                let context = materialize_codex_v2_auth_context(&target, &policy);
+                let route = CompiledCodexRoute {
+                    id: "context-route".into(),
+                    label: None,
+                    enabled: true,
+                    target_provider_id: target.id.clone(),
+                    match_prefixes: Vec::new(),
+                    auth_policy: policy,
+                    visible_models: vec!["context-model".into()],
+                };
+                let runtime = materialize_codex_v2_provider(
+                    &v2_router(json!([]), "context-route"),
+                    &route,
+                    &target,
+                    "context-model",
+                    "context-model",
+                    "context-model",
+                    None,
+                    "exact",
+                );
+                assert_ne!(context.id, target.id);
+                assert_eq!(
+                    serde_json::to_value(&context.meta).unwrap(),
+                    serde_json::to_value(&runtime.meta).unwrap()
+                );
+                for field in [
+                    "auth",
+                    "apiKey",
+                    "api_key",
+                    CODEX_NATIVE_AUTH_PASSTHROUGH,
+                    CODEX_ACCOUNT_POOL_ENABLED,
+                    "config",
+                    "modelCatalog",
+                ] {
+                    assert_eq!(
+                        context.settings_config.get(field),
+                        runtime.settings_config.get(field)
+                    );
+                }
+                let rematerialized = materialize_codex_official_auth(&context, None);
+                assert_eq!(
+                    serde_json::to_value(rematerialized).unwrap(),
+                    serde_json::to_value(&context).unwrap()
+                );
+                assert_eq!(serde_json::to_value(&target).unwrap(), before);
+            }
+        }
     }
 
     #[test]

@@ -429,7 +429,7 @@ Describe "CCSwitchMulti transactional reinstall orchestration" {
                     ProcessId = 4242
                     Path = (Join-Path $env:LOCALAPPDATA "CCSwitchMulti\cc-switch.exe")
                     StartTime = "2026-08-09T08:00:00.0000000Z"
-                } -ExpectedVersion "1.0.0" } | Should Throw
+                } -ExpectedVersion "1.0.0" } | Should Throw "run marker does not belong to the exact stopped CCSwitchMulti process"
             (Test-Path -LiteralPath $markerPath) | Should Be $true
         } finally {
             Remove-Task3ATestTree -Path $fixture
@@ -551,7 +551,7 @@ Describe "CCSwitchMulti transactional reinstall orchestration" {
     It "terminates a disposable PowerShell child through the actual retained-handle helper" {
         $child = $null
         try {
-            $child = Start-Process -FilePath (Join-Path $PSHOME "powershell.exe") `
+            $child = Start-Process -FilePath (Join-Path $PSHOME "pwsh.exe") `
                 -ArgumentList @("-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30") `
                 -WindowStyle Hidden -PassThru -ErrorAction Stop
 
@@ -826,7 +826,7 @@ Describe "CCSwitchMulti transactional reinstall orchestration" {
             )[0]
             $import.CharSet | Should Be ([System.Runtime.InteropServices.CharSet]::Unicode)
             $import.ExactSpelling | Should Be $true
-            { Invoke-CcsmSqliteIntegrityCheck -DatabasePath $corruptDatabase } | Should Throw
+            { Invoke-CcsmSqliteIntegrityCheck -DatabasePath $corruptDatabase } | Should Throw "SQLite integrity_check preparation failed"
         } finally {
             Remove-Task3ATestTree -Path $fixtureRoot
         }
@@ -951,7 +951,7 @@ Describe "CCSwitchMulti transactional reinstall orchestration" {
         & {
             Set-StrictMode -Off
             . $scriptPath
-            { $undefinedTransactionVariable } | Should Throw
+            { $undefinedTransactionVariable } | Should Throw 'undefinedTransactionVariable'
         }
     }
 

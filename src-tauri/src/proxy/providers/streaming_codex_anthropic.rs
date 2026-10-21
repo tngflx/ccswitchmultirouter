@@ -554,6 +554,9 @@ fn process_anthropic_sse_block(
         }
     }
     if data_parts.is_empty() {
+        if super::streaming_retry::raw_sse_block_is_comment(block.as_bytes()) {
+            return (vec![Bytes::from(format!("{block}\n\n"))], false);
+        }
         return (Vec::new(), false);
     }
     let Ok(data) = serde_json::from_str::<Value>(&data_parts.join("\n")) else {

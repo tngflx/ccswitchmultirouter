@@ -25,6 +25,14 @@ function completeModel(id: string, name = id.trim() || "Model") {
   };
 }
 
+// Scope model editing queries to their existing section so the preset list does
+// not dominate accessible-name and label lookup work. Portal queries stay global.
+function modelQueries() {
+  const section = document.getElementById("pi-models-section");
+  if (!section) throw new Error("Pi model configuration is not rendered");
+  return within(section);
+}
+
 vi.mock("@/components/JsonEditor", () => ({
   default: ({
     id,
@@ -117,12 +125,18 @@ describe("PiProviderForm", () => {
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "pi.form.addModel" }));
+    fireEvent.click(
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
+    );
 
     expect(screen.getByText("接口格式")).toBeInTheDocument();
     expect(screen.queryByText("自定义接口格式")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("pi.form.modelId")).toBeInTheDocument();
-    expect(screen.getByLabelText("pi.form.modelName")).toBeInTheDocument();
+    expect(
+      modelQueries().getByLabelText("pi.form.modelId"),
+    ).toBeInTheDocument();
+    expect(
+      modelQueries().getByLabelText("pi.form.modelName"),
+    ).toBeInTheDocument();
     expect(screen.queryByText("pi.form.modelApi")).not.toBeInTheDocument();
     expect(screen.queryByText("pi.form.modelBaseUrl")).not.toBeInTheDocument();
     expect(models).not.toHaveClass("font-medium");
@@ -264,7 +278,9 @@ describe("PiProviderForm", () => {
         target: { value: "https://preview.example/v1" },
       },
     );
-    await user.click(screen.getByRole("button", { name: "pi.form.addModel" }));
+    await user.click(
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
+    );
     fireEvent.change(screen.getByPlaceholderText("model-id"), {
       target: { value: "preview-model" },
     });
@@ -470,10 +486,10 @@ describe("PiProviderForm", () => {
           '{"thinking":{"$var":"thinking.enabled"}}',
         ]),
       );
-      expect(screen.getByLabelText("pi.form.modelId")).toHaveValue(
+      expect(modelQueries().getByLabelText("pi.form.modelId")).toHaveValue(
         "json-model",
       );
-      expect(screen.getByLabelText("pi.form.modelName")).toHaveValue(
+      expect(modelQueries().getByLabelText("pi.form.modelName")).toHaveValue(
         "JSON Model",
       );
     });
@@ -525,7 +541,9 @@ describe("PiProviderForm", () => {
         target: { value: "https://api.example.com/v1" },
       },
     );
-    await user.click(screen.getByRole("button", { name: "pi.form.addModel" }));
+    await user.click(
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
+    );
     fireEvent.change(screen.getByPlaceholderText("model-id"), {
       target: { value: "limited-model" },
     });
@@ -544,24 +562,24 @@ describe("PiProviderForm", () => {
     ).not.toBeInTheDocument();
 
     await user.click(
-      screen.getByRole("button", { name: "展开或收起模型详情" }),
+      modelQueries().getByRole("button", { name: "展开或收起模型详情" }),
     );
     expect(
       screen.queryByText("pi.form.thinkingLevelsLabel"),
     ).not.toBeInTheDocument();
-    await user.click(screen.getByLabelText("pi.form.reasoning"));
+    await user.click(modelQueries().getByLabelText("pi.form.reasoning"));
     expect(
-      screen
+      modelQueries()
         .getByLabelText("pi.form.maxTokens")
         .compareDocumentPosition(
           screen.getByText("pi.form.thinkingLevelsLabel"),
         ) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
-    await user.click(screen.getByLabelText("pi.form.imageInput"));
-    fireEvent.change(screen.getByLabelText("pi.form.contextWindow"), {
+    await user.click(modelQueries().getByLabelText("pi.form.imageInput"));
+    fireEvent.change(modelQueries().getByLabelText("pi.form.contextWindow"), {
       target: { value: "128000.5" },
     });
-    fireEvent.change(screen.getByLabelText("pi.form.maxTokens"), {
+    fireEvent.change(modelQueries().getByLabelText("pi.form.maxTokens"), {
       target: { value: "16384.25" },
     });
     await user.click(screen.getByRole("button", { name: "Save model limits" }));
@@ -607,16 +625,18 @@ describe("PiProviderForm", () => {
         target: { value: "https://api.example.com/v1" },
       },
     );
-    await user.click(screen.getByRole("button", { name: "pi.form.addModel" }));
+    await user.click(
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
+    );
     fireEvent.change(screen.getByPlaceholderText("model-id"), {
       target: { value: "invalid-model" },
     });
 
-    const toggle = screen.getByRole("button", {
+    const toggle = modelQueries().getByRole("button", {
       name: "展开或收起模型详情",
     });
     await user.click(toggle);
-    fireEvent.change(screen.getByLabelText("pi.form.contextWindow"), {
+    fireEvent.change(modelQueries().getByLabelText("pi.form.contextWindow"), {
       target: { value: "-1" },
     });
     await user.click(toggle);
@@ -628,7 +648,9 @@ describe("PiProviderForm", () => {
       "pi.form.positiveNumberRequired",
     );
     await waitFor(() =>
-      expect(screen.getByLabelText("pi.form.contextWindow")).toHaveFocus(),
+      expect(
+        modelQueries().getByLabelText("pi.form.contextWindow"),
+      ).toHaveFocus(),
     );
   });
 
@@ -663,15 +685,19 @@ describe("PiProviderForm", () => {
         target: { value: "https://api.example.com" },
       },
     );
-    fireEvent.click(screen.getByRole("button", { name: "pi.form.addModel" }));
+    fireEvent.click(
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
+    );
     fireEvent.change(screen.getByPlaceholderText("model-id"), {
       target: { value: "identity-model" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "展开或收起模型详情" }));
-    fireEvent.change(screen.getByLabelText("pi.form.contextWindow"), {
+    fireEvent.click(
+      modelQueries().getByRole("button", { name: "展开或收起模型详情" }),
+    );
+    fireEvent.change(modelQueries().getByLabelText("pi.form.contextWindow"), {
       target: { value: "128000" },
     });
-    fireEvent.change(screen.getByLabelText("pi.form.maxTokens"), {
+    fireEvent.change(modelQueries().getByLabelText("pi.form.maxTokens"), {
       target: { value: "16384" },
     });
 
@@ -848,7 +874,9 @@ describe("PiProviderForm", () => {
         target: { value: "https://api.example.com/v1" },
       },
     );
-    fireEvent.click(screen.getByRole("button", { name: "pi.form.addModel" }));
+    fireEvent.click(
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
+    );
     fireEvent.change(screen.getByPlaceholderText("model-id"), {
       target: { value: "opaque-model" },
     });
@@ -857,12 +885,20 @@ describe("PiProviderForm", () => {
       screen.queryByLabelText("pi.form.contextWindow"),
     ).not.toBeInTheDocument();
     await user.click(
-      screen.getByRole("button", { name: "展开或收起模型详情" }),
+      modelQueries().getByRole("button", { name: "展开或收起模型详情" }),
     );
-    expect(screen.getByLabelText("pi.form.reasoning")).not.toBeChecked();
-    expect(screen.getByLabelText("pi.form.imageInput")).not.toBeChecked();
-    expect(screen.getByLabelText("pi.form.contextWindow")).toHaveValue(null);
-    expect(screen.getByLabelText("pi.form.maxTokens")).toHaveValue(null);
+    expect(
+      modelQueries().getByLabelText("pi.form.reasoning"),
+    ).not.toBeChecked();
+    expect(
+      modelQueries().getByLabelText("pi.form.imageInput"),
+    ).not.toBeChecked();
+    expect(modelQueries().getByLabelText("pi.form.contextWindow")).toHaveValue(
+      null,
+    );
+    expect(modelQueries().getByLabelText("pi.form.maxTokens")).toHaveValue(
+      null,
+    );
 
     await user.click(screen.getByRole("button", { name: "Save Pi provider" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(
@@ -870,10 +906,10 @@ describe("PiProviderForm", () => {
     );
     expect(onSubmit).not.toHaveBeenCalled();
 
-    fireEvent.change(screen.getByLabelText("pi.form.contextWindow"), {
+    fireEvent.change(modelQueries().getByLabelText("pi.form.contextWindow"), {
       target: { value: "128000" },
     });
-    fireEvent.change(screen.getByLabelText("pi.form.maxTokens"), {
+    fireEvent.change(modelQueries().getByLabelText("pi.form.maxTokens"), {
       target: { value: "16384" },
     });
     await user.click(screen.getByRole("button", { name: "Save Pi provider" }));
@@ -956,11 +992,13 @@ describe("PiProviderForm", () => {
         target: { value: "https://models.example/v1" },
       },
     );
-    fireEvent.click(screen.getByRole("button", { name: "pi.form.addModel" }));
-    await user.click(
-      screen.getByRole("button", { name: "展开或收起模型详情" }),
+    fireEvent.click(
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
     );
-    fireEvent.change(screen.getByLabelText("pi.form.maxTokens"), {
+    await user.click(
+      modelQueries().getByRole("button", { name: "展开或收起模型详情" }),
+    );
+    fireEvent.change(modelQueries().getByLabelText("pi.form.maxTokens"), {
       target: { value: "777" },
     });
     await user.click(screen.getByRole("button", { name: "Add header" }));
@@ -971,7 +1009,7 @@ describe("PiProviderForm", () => {
       target: { value: "pi-test-agent/1.0" },
     });
     fireEvent.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
+      modelQueries().getByRole("button", { name: "providerForm.fetchModels" }),
     );
 
     await waitFor(() =>
@@ -988,7 +1026,7 @@ describe("PiProviderForm", () => {
       }),
     );
 
-    const modelIdInput = screen.getByLabelText("pi.form.modelId");
+    const modelIdInput = modelQueries().getByLabelText("pi.form.modelId");
     await user.click(
       within(modelIdInput.parentElement as HTMLElement).getByRole("button"),
     );
@@ -996,11 +1034,13 @@ describe("PiProviderForm", () => {
       await screen.findByRole("option", { name: "remote-model-b" }),
     );
     expect(modelIdInput).toHaveValue("remote-model-b");
-    expect(screen.getByLabelText("pi.form.modelName")).toHaveValue(
+    expect(modelQueries().getByLabelText("pi.form.modelName")).toHaveValue(
       "remote-model-b",
     );
-    expect(screen.getByLabelText("pi.form.maxTokens")).toHaveValue(777);
-    expect(screen.getByLabelText("pi.form.contextWindow")).toHaveValue(null);
+    expect(modelQueries().getByLabelText("pi.form.maxTokens")).toHaveValue(777);
+    expect(modelQueries().getByLabelText("pi.form.contextWindow")).toHaveValue(
+      null,
+    );
   });
 
   it("ignores a stale model-list response after the request config changes", async () => {
@@ -1046,9 +1086,11 @@ describe("PiProviderForm", () => {
     fireEvent.change(endpoint, {
       target: { value: "https://slow.example/v1" },
     });
-    await user.click(screen.getByRole("button", { name: "pi.form.addModel" }));
     await user.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
+    );
+    await user.click(
+      modelQueries().getByRole("button", { name: "providerForm.fetchModels" }),
     );
     await waitFor(() => expect(slowRequestStarted).toBe(true));
 
@@ -1056,10 +1098,10 @@ describe("PiProviderForm", () => {
       target: { value: "https://current.example/v1" },
     });
     await user.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
+      modelQueries().getByRole("button", { name: "providerForm.fetchModels" }),
     );
 
-    const modelIdInput = screen.getByLabelText("pi.form.modelId");
+    const modelIdInput = modelQueries().getByLabelText("pi.form.modelId");
     await waitFor(() =>
       expect(
         within(modelIdInput.parentElement as HTMLElement).getByRole("button"),
@@ -1114,29 +1156,41 @@ describe("PiProviderForm", () => {
         target: { value: "https://provider-a.example/v1" },
       },
     );
-    await user.click(screen.getByRole("button", { name: "pi.form.addModel" }));
     await user.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
     );
-    const modelIdInput = screen.getByLabelText("pi.form.modelId");
+    await user.click(
+      modelQueries().getByRole("button", { name: "providerForm.fetchModels" }),
+    );
+    const modelIdInput = modelQueries().getByLabelText("pi.form.modelId");
     await user.click(
       within(modelIdInput.parentElement as HTMLElement).getByRole("button"),
     );
     await user.click(await screen.findByRole("option", { name: "first" }));
     await waitFor(() =>
-      expect(screen.getByLabelText("pi.form.modelName")).toHaveValue("first"),
+      expect(modelQueries().getByLabelText("pi.form.modelName")).toHaveValue(
+        "first",
+      ),
     );
 
     fireEvent.change(modelIdInput, { target: { value: "shared" } });
     await waitFor(() =>
-      expect(screen.getByLabelText("pi.form.modelName")).toHaveValue("shared"),
+      expect(modelQueries().getByLabelText("pi.form.modelName")).toHaveValue(
+        "shared",
+      ),
     );
     await user.click(
-      screen.getByRole("button", { name: "展开或收起模型详情" }),
+      modelQueries().getByRole("button", { name: "展开或收起模型详情" }),
     );
-    expect(screen.getByLabelText("pi.form.reasoning")).not.toBeChecked();
-    expect(screen.getByLabelText("pi.form.contextWindow")).toHaveValue(null);
-    expect(screen.getByLabelText("pi.form.maxTokens")).toHaveValue(null);
+    expect(
+      modelQueries().getByLabelText("pi.form.reasoning"),
+    ).not.toBeChecked();
+    expect(modelQueries().getByLabelText("pi.form.contextWindow")).toHaveValue(
+      null,
+    );
+    expect(modelQueries().getByLabelText("pi.form.maxTokens")).toHaveValue(
+      null,
+    );
   });
 
   it("keeps unknown fetched models on Pi defaults when the endpoint changes", async () => {
@@ -1165,31 +1219,43 @@ describe("PiProviderForm", () => {
     fireEvent.change(endpoint, {
       target: { value: "https://provider-a.example/v1" },
     });
-    await user.click(screen.getByRole("button", { name: "pi.form.addModel" }));
     await user.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
     );
-    const modelIdInput = screen.getByLabelText("pi.form.modelId");
+    await user.click(
+      modelQueries().getByRole("button", { name: "providerForm.fetchModels" }),
+    );
+    const modelIdInput = modelQueries().getByLabelText("pi.form.modelId");
     await user.click(
       within(modelIdInput.parentElement as HTMLElement).getByRole("button"),
     );
     await user.click(await screen.findByRole("option", { name: "shared" }));
     await waitFor(() =>
-      expect(screen.getByLabelText("pi.form.modelName")).toHaveValue("shared"),
+      expect(modelQueries().getByLabelText("pi.form.modelName")).toHaveValue(
+        "shared",
+      ),
     );
 
     fireEvent.change(endpoint, {
       target: { value: "https://provider-b.example/v1" },
     });
     await waitFor(() =>
-      expect(screen.getByLabelText("pi.form.modelName")).toHaveValue("shared"),
+      expect(modelQueries().getByLabelText("pi.form.modelName")).toHaveValue(
+        "shared",
+      ),
     );
     await user.click(
-      screen.getByRole("button", { name: "展开或收起模型详情" }),
+      modelQueries().getByRole("button", { name: "展开或收起模型详情" }),
     );
-    expect(screen.getByLabelText("pi.form.reasoning")).not.toBeChecked();
-    expect(screen.getByLabelText("pi.form.contextWindow")).toHaveValue(null);
-    expect(screen.getByLabelText("pi.form.maxTokens")).toHaveValue(null);
+    expect(
+      modelQueries().getByLabelText("pi.form.reasoning"),
+    ).not.toBeChecked();
+    expect(modelQueries().getByLabelText("pi.form.contextWindow")).toHaveValue(
+      null,
+    );
+    expect(modelQueries().getByLabelText("pi.form.maxTokens")).toHaveValue(
+      null,
+    );
   });
 
   it("does not enrich an id-only legacy model from fetched ownership data", async () => {
@@ -1220,14 +1286,14 @@ describe("PiProviderForm", () => {
       />,
     );
     await user.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
+      modelQueries().getByRole("button", { name: "providerForm.fetchModels" }),
     );
-    const modelIdInput = screen.getByLabelText("pi.form.modelId");
+    const modelIdInput = modelQueries().getByLabelText("pi.form.modelId");
     await user.click(
       within(modelIdInput.parentElement as HTMLElement).getByRole("button"),
     );
     await user.click(await screen.findByRole("option", { name: "shared" }));
-    expect(screen.getByLabelText("pi.form.modelName")).toHaveValue("");
+    expect(modelQueries().getByLabelText("pi.form.modelName")).toHaveValue("");
 
     fireEvent.change(
       screen.getByPlaceholderText("https://api.example.com/v1"),
@@ -1241,7 +1307,7 @@ describe("PiProviderForm", () => {
     await waitFor(() =>
       expect(JSON.parse(configEditor.value).models).toEqual([{ id: "shared" }]),
     );
-    expect(screen.getByLabelText("pi.form.modelName")).toHaveValue("");
+    expect(modelQueries().getByLabelText("pi.form.modelName")).toHaveValue("");
   });
 
   it("uses a fetched model ID without inferring its capabilities", async () => {
@@ -1279,12 +1345,14 @@ describe("PiProviderForm", () => {
         target: { value: "https://api.example.com/v1" },
       },
     );
-    await user.click(screen.getByRole("button", { name: "pi.form.addModel" }));
     await user.click(
-      screen.getByRole("button", { name: "providerForm.fetchModels" }),
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
+    );
+    await user.click(
+      modelQueries().getByRole("button", { name: "providerForm.fetchModels" }),
     );
 
-    const modelIdInput = screen.getByLabelText("pi.form.modelId");
+    const modelIdInput = modelQueries().getByLabelText("pi.form.modelId");
     await user.click(
       within(modelIdInput.parentElement as HTMLElement).getByRole("button"),
     );
@@ -1292,15 +1360,23 @@ describe("PiProviderForm", () => {
       await screen.findByRole("option", { name: "gpt-5.6-sol" }),
     );
 
-    const modelNameInput = screen.getByLabelText("pi.form.modelName");
+    const modelNameInput = modelQueries().getByLabelText("pi.form.modelName");
     await waitFor(() => expect(modelNameInput).toHaveValue("gpt-5.6-sol"));
     await user.click(
-      screen.getByRole("button", { name: "展开或收起模型详情" }),
+      modelQueries().getByRole("button", { name: "展开或收起模型详情" }),
     );
-    expect(screen.getByLabelText("pi.form.reasoning")).not.toBeChecked();
-    expect(screen.getByLabelText("pi.form.imageInput")).not.toBeChecked();
-    expect(screen.getByLabelText("pi.form.contextWindow")).toHaveValue(null);
-    expect(screen.getByLabelText("pi.form.maxTokens")).toHaveValue(null);
+    expect(
+      modelQueries().getByLabelText("pi.form.reasoning"),
+    ).not.toBeChecked();
+    expect(
+      modelQueries().getByLabelText("pi.form.imageInput"),
+    ).not.toBeChecked();
+    expect(modelQueries().getByLabelText("pi.form.contextWindow")).toHaveValue(
+      null,
+    );
+    expect(modelQueries().getByLabelText("pi.form.maxTokens")).toHaveValue(
+      null,
+    );
     expect(
       screen.queryByRole("button", { name: "pi.form.restoreModelAutofill" }),
     ).not.toBeInTheDocument();
@@ -1358,16 +1434,18 @@ describe("PiProviderForm", () => {
     await user.click(
       screen.getByRole("button", { name: "providerPreset.custom" }),
     );
-    await user.click(screen.getByRole("button", { name: "pi.form.addModel" }));
-    fireEvent.change(screen.getByLabelText("pi.form.modelId"), {
+    await user.click(
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
+    );
+    fireEvent.change(modelQueries().getByLabelText("pi.form.modelId"), {
       target: { value: "custom-reasoning-model" },
     });
     await user.click(
-      screen.getByRole("button", { name: "展开或收起模型详情" }),
+      modelQueries().getByRole("button", { name: "展开或收起模型详情" }),
     );
-    await user.click(screen.getByLabelText("pi.form.reasoning"));
+    await user.click(modelQueries().getByLabelText("pi.form.reasoning"));
     await user.click(
-      screen.getByRole("button", {
+      modelQueries().getByRole("button", {
         name: "pi.form.customizeThinkingLevels",
       }),
     );
@@ -1406,7 +1484,7 @@ describe("PiProviderForm", () => {
       xhigh: "xhigh-vendor-value",
     });
 
-    await user.click(screen.getByLabelText("pi.form.reasoning"));
+    await user.click(modelQueries().getByLabelText("pi.form.reasoning"));
     expect(
       screen.queryByText("pi.form.thinkingLevelsLabel"),
     ).not.toBeInTheDocument();
@@ -1415,7 +1493,7 @@ describe("PiProviderForm", () => {
       xhigh: "xhigh-vendor-value",
     });
 
-    await user.click(screen.getByLabelText("pi.form.reasoning"));
+    await user.click(modelQueries().getByLabelText("pi.form.reasoning"));
     expect(screen.getByText("pi.form.thinkingLevelsLabel")).toBeVisible();
   });
 
@@ -1432,7 +1510,7 @@ describe("PiProviderForm", () => {
 
     await user.click(screen.getByText("DeepSeek", { selector: "span" }));
     await user.click(
-      screen.getAllByRole("button", {
+      modelQueries().getAllByRole("button", {
         name: "展开或收起模型详情",
       })[0],
     );
@@ -1452,7 +1530,7 @@ describe("PiProviderForm", () => {
     );
 
     await user.click(
-      screen.getByRole("button", {
+      modelQueries().getByRole("button", {
         name: "pi.form.customizeThinkingLevels",
       }),
     );
@@ -1603,7 +1681,7 @@ describe("PiProviderForm", () => {
     });
 
     await user.click(
-      screen.getAllByRole("button", {
+      modelQueries().getAllByRole("button", {
         name: "展开或收起模型详情",
       })[0],
     );
@@ -1612,7 +1690,7 @@ describe("PiProviderForm", () => {
         name: "pi.form.restoreModelAutofill",
       }),
     ).not.toBeInTheDocument();
-    expect(screen.getByLabelText("pi.form.reasoning")).toBeChecked();
+    expect(modelQueries().getByLabelText("pi.form.reasoning")).toBeChecked();
   });
 
   it("keeps manual fields stable after an unrelated JSON edit", async () => {
@@ -1629,11 +1707,13 @@ describe("PiProviderForm", () => {
     await user.click(
       screen.getByRole("button", { name: "providerPreset.custom" }),
     );
-    await user.click(screen.getByRole("button", { name: "pi.form.addModel" }));
-    fireEvent.change(screen.getByLabelText("pi.form.modelId"), {
+    await user.click(
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
+    );
+    fireEvent.change(modelQueries().getByLabelText("pi.form.modelId"), {
       target: { value: "gpt-5.6-sol" },
     });
-    expect(screen.getByLabelText("pi.form.modelName")).toHaveValue(
+    expect(modelQueries().getByLabelText("pi.form.modelName")).toHaveValue(
       "gpt-5.6-sol",
     );
 
@@ -1645,20 +1725,28 @@ describe("PiProviderForm", () => {
     fireEvent.change(configEditor, {
       target: { value: JSON.stringify(config, null, 2) },
     });
-    fireEvent.change(screen.getByLabelText("pi.form.modelId"), {
+    fireEvent.change(modelQueries().getByLabelText("pi.form.modelId"), {
       target: { value: "unknown-after-json-edit" },
     });
 
-    expect(screen.getByLabelText("pi.form.modelName")).toHaveValue(
+    expect(modelQueries().getByLabelText("pi.form.modelName")).toHaveValue(
       "unknown-after-json-edit",
     );
     await user.click(
-      screen.getByRole("button", { name: "展开或收起模型详情" }),
+      modelQueries().getByRole("button", { name: "展开或收起模型详情" }),
     );
-    expect(screen.getByLabelText("pi.form.reasoning")).not.toBeChecked();
-    expect(screen.getByLabelText("pi.form.imageInput")).not.toBeChecked();
-    expect(screen.getByLabelText("pi.form.contextWindow")).toHaveValue(null);
-    expect(screen.getByLabelText("pi.form.maxTokens")).toHaveValue(null);
+    expect(
+      modelQueries().getByLabelText("pi.form.reasoning"),
+    ).not.toBeChecked();
+    expect(
+      modelQueries().getByLabelText("pi.form.imageInput"),
+    ).not.toBeChecked();
+    expect(modelQueries().getByLabelText("pi.form.contextWindow")).toHaveValue(
+      null,
+    );
+    expect(modelQueries().getByLabelText("pi.form.maxTokens")).toHaveValue(
+      null,
+    );
     expect(JSON.parse(configEditor.value).nativeField).toEqual({ keep: true });
   });
 
@@ -1676,8 +1764,10 @@ describe("PiProviderForm", () => {
     await user.click(
       screen.getByRole("button", { name: "providerPreset.custom" }),
     );
-    await user.click(screen.getByRole("button", { name: "pi.form.addModel" }));
-    fireEvent.change(screen.getByLabelText("pi.form.modelId"), {
+    await user.click(
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
+    );
+    fireEvent.change(modelQueries().getByLabelText("pi.form.modelId"), {
       target: { value: "gpt-5.6-sol" },
     });
 
@@ -1690,16 +1780,24 @@ describe("PiProviderForm", () => {
       target: { value: JSON.stringify(config, null, 2) },
     });
 
-    expect(screen.getByLabelText("pi.form.modelName")).toHaveValue(
+    expect(modelQueries().getByLabelText("pi.form.modelName")).toHaveValue(
       "gpt-5.6-sol",
     );
     await user.click(
-      screen.getByRole("button", { name: "展开或收起模型详情" }),
+      modelQueries().getByRole("button", { name: "展开或收起模型详情" }),
     );
-    expect(screen.getByLabelText("pi.form.reasoning")).not.toBeChecked();
-    expect(screen.getByLabelText("pi.form.imageInput")).not.toBeChecked();
-    expect(screen.getByLabelText("pi.form.contextWindow")).toHaveValue(null);
-    expect(screen.getByLabelText("pi.form.maxTokens")).toHaveValue(null);
+    expect(
+      modelQueries().getByLabelText("pi.form.reasoning"),
+    ).not.toBeChecked();
+    expect(
+      modelQueries().getByLabelText("pi.form.imageInput"),
+    ).not.toBeChecked();
+    expect(modelQueries().getByLabelText("pi.form.contextWindow")).toHaveValue(
+      null,
+    );
+    expect(modelQueries().getByLabelText("pi.form.maxTokens")).toHaveValue(
+      null,
+    );
     expect(
       screen.queryByRole("button", { name: "pi.form.restoreModelAutofill" }),
     ).not.toBeInTheDocument();
@@ -1719,8 +1817,10 @@ describe("PiProviderForm", () => {
     await user.click(
       screen.getByRole("button", { name: "providerPreset.custom" }),
     );
-    await user.click(screen.getByRole("button", { name: "pi.form.addModel" }));
-    fireEvent.change(screen.getByLabelText("pi.form.modelId"), {
+    await user.click(
+      modelQueries().getByRole("button", { name: "pi.form.addModel" }),
+    );
+    fireEvent.change(modelQueries().getByLabelText("pi.form.modelId"), {
       target: { value: "gpt-5.6-sol" },
     });
 
@@ -1734,14 +1834,16 @@ describe("PiProviderForm", () => {
       target: { value: JSON.stringify(config, null, 2) },
     });
 
-    expect(screen.getByLabelText("pi.form.modelName")).toHaveValue(
+    expect(modelQueries().getByLabelText("pi.form.modelName")).toHaveValue(
       "gpt-5.6-sol",
     );
     await user.click(
-      screen.getByRole("button", { name: "展开或收起模型详情" }),
+      modelQueries().getByRole("button", { name: "展开或收起模型详情" }),
     );
-    expect(screen.getByLabelText("pi.form.contextWindow")).toHaveValue(null);
-    expect(screen.getByLabelText("pi.form.maxTokens")).toHaveValue(777);
+    expect(modelQueries().getByLabelText("pi.form.contextWindow")).toHaveValue(
+      null,
+    );
+    expect(modelQueries().getByLabelText("pi.form.maxTokens")).toHaveValue(777);
     expect(
       screen.queryByRole("button", { name: "pi.form.restoreModelAutofill" }),
     ).not.toBeInTheDocument();
@@ -1786,7 +1888,7 @@ describe("PiProviderForm", () => {
         { id: "json-only-model" },
       ]),
     );
-    expect(screen.getByLabelText("pi.form.modelName")).toHaveValue("");
+    expect(modelQueries().getByLabelText("pi.form.modelName")).toHaveValue("");
 
     await user.click(screen.getByRole("button", { name: "Save JSON model" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(
@@ -1794,16 +1896,16 @@ describe("PiProviderForm", () => {
     );
     expect(onSubmit).not.toHaveBeenCalled();
 
-    fireEvent.change(screen.getByLabelText("pi.form.modelName"), {
+    fireEvent.change(modelQueries().getByLabelText("pi.form.modelName"), {
       target: { value: "JSON model" },
     });
     await user.click(
-      screen.getByRole("button", { name: "展开或收起模型详情" }),
+      modelQueries().getByRole("button", { name: "展开或收起模型详情" }),
     );
-    fireEvent.change(screen.getByLabelText("pi.form.contextWindow"), {
+    fireEvent.change(modelQueries().getByLabelText("pi.form.contextWindow"), {
       target: { value: "128000" },
     });
-    fireEvent.change(screen.getByLabelText("pi.form.maxTokens"), {
+    fireEvent.change(modelQueries().getByLabelText("pi.form.maxTokens"), {
       target: { value: "16384" },
     });
     await user.click(screen.getByRole("button", { name: "Save JSON model" }));
@@ -2209,12 +2311,12 @@ describe("PiProviderForm", () => {
       />,
     );
 
-    for (const button of screen.getAllByRole("button", {
+    for (const button of modelQueries().getAllByRole("button", {
       name: "pi.form.removeModel",
     })) {
       expect(button).toBeEnabled();
     }
-    fireEvent.change(screen.getAllByLabelText("pi.form.modelId")[0], {
+    fireEvent.change(modelQueries().getAllByLabelText("pi.form.modelId")[0], {
       target: { value: "model-a-renamed" },
     });
     fireEvent.click(

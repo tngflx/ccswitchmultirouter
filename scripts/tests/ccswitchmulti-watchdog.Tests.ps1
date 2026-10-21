@@ -1,8 +1,6 @@
 $corePath = Join-Path (Split-Path -Parent $PSScriptRoot) "ccswitchmulti-guardian-core.ps1"
 . $corePath
 $watchdogPath = Join-Path (Split-Path -Parent $PSScriptRoot) "watch-ccswitchmulti.ps1"
-. $watchdogPath -PlanOnly | Out-Null
-$script:boundaryGetDevPlan = ${function:Get-CcsmDevSessionRecoveryPlan}
 
 function New-WatchdogTempConfig {
     param([string]$MarkerJson = "")
@@ -19,6 +17,29 @@ function New-WatchdogTempConfig {
 }
 
 Describe "CCSwitchMulti watchdog restart policy" {
+    It "uses the same settings and history contract as the development supervisor" {
+        $casesPath = Join-Path $PSScriptRoot "fixtures\dev-recovery-policy-cases.json"
+        $cases = Get-Content -LiteralPath $casesPath -Raw | ConvertFrom-Json
+        $root = New-WatchdogTempConfig
+        try {
+            foreach ($case in $cases.settings) {
+                ConvertTo-Json -InputObject $case.value -Depth 8 | Set-Content -LiteralPath (Join-Path $root "settings.json") -Encoding utf8
+                (Test-CcsmGuardianWatchdogEnabled -ConfigPath $root) | Should Be $case.enabled
+            }
+            foreach ($case in $cases.history) {
+                $actual = @(Get-CcsmDevSessionRestartTimesMs -Session $case.session -NowMs $case.nowMs)
+                ($actual -join ',') | Should Be ($case.times -join ',')
+            }
+            Set-Content -LiteralPath (Join-Path $root "settings.json") -Value '{"watchdogEnabled":false}' -Encoding utf8
+            foreach ($case in $cases.overrides) {
+                $environment = Get-CcsmDevSessionEnvironment $case.environment
+                (Test-CcsmGuardianWatchdogEnabled -ConfigPath $root -Environment $environment) | Should Be $case.enabled
+            }
+        } finally {
+            Remove-Item -LiteralPath $root -Recurse -Force
+        }
+    }
+
     It "never restarts a clean exit or a fresh install" {
         $root = New-WatchdogTempConfig
         (Test-CcsmGuardianUncleanExit -ConfigPath $root -GetProcessIdentity { param($ProcessId) $null }) | Should Be $false
@@ -241,6 +262,22 @@ Describe "CCSwitchMulti development session ownership" {
         (Test-CcsmGuardianWatchdogEnabled -ConfigPath $script:devConfig) | Should Be $false
     }
 
+    It "honors the recorded development override before recovery or budget changes" {
+        $written = Write-DevSession
+        $written.Session["environment"] = @{ CC_SWITCH_DEV_WATCHDOG_ENABLED = "false" }
+        $written.Session | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $script:devConfig "logs\dev-session.json") -Encoding utf8
+        $plan = Get-CcsmDevSessionRecoveryPlan -ConfigPath $script:devConfig -GetProcessIdentity { param($ProcessId) $null }
+        $before = [System.IO.File]::ReadAllText($plan.SessionPath)
+        $events = New-Object System.Collections.Generic.List[string]
+        Invoke-CcsmDevSessionRecovery -Plan $plan -IsMaintenance { $false } `
+            -GetListenerOwner { throw "disabled development recovery must not probe or dispatch" } `
+            -GetProcessIdentity { param($ProcessId) $null } `
+            -StartDevSession { throw "disabled development recovery must not launch" } `
+            -WriteEvent { param($Level, $Event, $Detail) $events.Add($Event) | Out-Null }
+        ($events -contains "dev-session-restart-skipped-watchdog-disabled") | Should Be $true
+        [System.IO.File]::ReadAllText($plan.SessionPath) | Should Be $before
+    }
+
     It "quotes Node launcher arguments with spaces, quotes, and trailing backslashes" {
         (ConvertTo-CcsmGuardianQuotedArgument 'C:\repo with space\scripts\dev-tauri-delayed.mjs') | Should Be '"C:\repo with space\scripts\dev-tauri-delayed.mjs"'
         (ConvertTo-CcsmGuardianQuotedArgument 'quote"value') | Should Be '"quote\"value"'
@@ -279,6 +316,9 @@ Describe "CCSwitchMulti development session ownership" {
         $newPid = Start-CcsmDevSessionLauncher -Plan $plan -StartProcess { param($Info) $captured.Add($Info); [pscustomobject]@{ Id = 9876 } }
         $newPid | Should Be 9876
         $captured[0].FileName | Should Be $script:nodePath
+        $captured[0].Arguments | Should Match ([regex]::Escape(
+            '"' + $script:CcsmDevRecoveryPolicy.recoveryLaunchFlag + '" "' + $plan.SupervisorPid + '"'
+        ))
         $captured[0].WorkingDirectory | Should Be $script:repoRoot
         $captured[0].CreateNoWindow | Should Be $true
         $captured[0].UseShellExecute | Should Be $false
@@ -293,245 +333,64 @@ Describe "CCSwitchMulti development session ownership" {
     }
 }
 
-Describe "CCSwitchMulti production and development guardian boundary" {
-    BeforeEach {
-        $script:boundaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ccsm-guardian-boundary-" + [guid]::NewGuid().ToString("N"))
-        $script:ConfigPath = Join-Path $script:boundaryRoot "config"
-        $script:boundaryRepo = Join-Path $script:boundaryRoot "repo"
-        $script:boundaryNode = Join-Path $script:boundaryRoot "node.exe"
-        $script:InstalledExecutable = Join-Path $script:boundaryRoot "installed\cc-switch.exe"
-        $script:boundaryScript = Join-Path $script:boundaryRepo "scripts\dev-tauri-delayed.mjs"
-        $script:DevelopmentMode = $false
-        $script:RestartOnCleanExit = $false
-        $script:NoRestart = $false
-        $script:MaxRestartsPerWindow = 6
-        $script:RestartWindowMinutes = 30
-        $script:boundaryEvents = New-Object System.Collections.Generic.List[string]
-        $script:boundaryRestarts = New-Object System.Collections.Generic.List[datetime]
-        $script:boundaryInstalledTarget = ""
-        $script:boundaryStartedDevPlan = $null
-        $script:boundarySupervisorAlive = $false
-        New-Item -ItemType Directory -Force -Path (Join-Path $script:ConfigPath "logs"), (Split-Path -Parent $script:boundaryScript) | Out-Null
-        [System.IO.File]::WriteAllText($script:boundaryScript, "")
-        [System.IO.File]::WriteAllText((Join-Path $script:boundaryRepo "package.json"), "{}")
-        [System.IO.File]::WriteAllText($script:boundaryNode, "")
-        [System.IO.File]::WriteAllText((Join-Path $script:ConfigPath "logs\app-run-marker.json"), '{"pid":7777}')
-        Mock Test-CcsmMaintenanceLease { $false }
-        Mock Test-CcsmUpgradeProcessActive { $false }
-        Mock Get-CcsmGuardianListenerOwner { $null }
-        Mock Get-CcsmDevSessionRecoveryPlan {
-            param($ConfigPath, $GetProcessIdentity)
-            & $script:boundaryGetDevPlan -ConfigPath $ConfigPath -GetProcessIdentity $GetProcessIdentity
-        }
-        Mock Get-CcsmGuardianProcessIdentity {
-            param($ProcessId)
-            if ($script:boundarySupervisorAlive -and $ProcessId -eq 4242) {
-                return [pscustomobject]@{
-                    ProcessId = 4242; Path = $script:boundaryNode
-                    StartTimeUtc = "2026-10-13T00:00:00.000Z"; CimStartTimeUtc = "2026-10-13T00:00:00.000Z"
-                    CommandLine = "node `"$script:boundaryScript`" --delay 0"
-                }
-            }
-            return $null
-        }
-        Mock Invoke-CcsmGuardianRecovery {
-            param($InstalledExecutable)
-            $script:boundaryInstalledTarget = $InstalledExecutable
-        }
-        Mock Start-CcsmDevSessionLauncher {
-            param($Plan)
-            $script:boundaryStartedDevPlan = $Plan
-            return 9876
-        }
-        Mock Write-CcsmGuardianEvent {
-            param($Level, $Event, $Detail)
-            $script:boundaryEvents.Add($Event) | Out-Null
-        }
+Describe "CCSwitchMulti JavaScript watchdog compatibility boundary" {
+    It "runs the migrated production and development recovery regressions" {
+        # The former runner-specific policy cases execute the JavaScript owner.
+        # Existing PowerShell core and transaction tests above remain independent.
+        $runnerTests = Join-Path (Split-Path -Parent $PSScriptRoot) "watch-ccswitchmulti.node-test.mjs"
+        $output = & node --test --test-reporter=tap $runnerTests 2>&1
+        $LASTEXITCODE | Should Be 0
+        ($output -join "`n") | Should Match '(?m)^# fail 0$'
+        ($output -join "`n") | Should Match '(?m)^# pass [1-9][0-9]*$'
     }
 
-    AfterEach {
-        if (Test-Path -LiteralPath $script:boundaryRoot) { Remove-Item -LiteralPath $script:boundaryRoot -Recurse -Force }
-    }
-
-    function Write-BoundaryDevSession {
-        param([string]$State = "running", [switch]$Malformed)
-        $markerPath = Join-Path $script:ConfigPath "logs\dev-session.json"
-        if ($Malformed) {
-            [System.IO.File]::WriteAllText($markerPath, "{")
-            return
-        }
-        [ordered]@{
-            schemaVersion = 1; state = $State; supervisorPid = 4242
-            supervisorExecutablePath = $script:boundaryNode; supervisorStartedAtUtc = "2026-10-13T00:00:00.000Z"
-            startedAtUtc = "2026-10-13T00:00:01.000Z"; repoRoot = $script:boundaryRepo
-            scriptPath = $script:boundaryScript; args = @("--delay", "0"); roots = @()
-        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $markerPath -Encoding utf8
-    }
-
-    function Invoke-BoundaryRecovery {
-        Invoke-CcsmGuardianRecoveryPolicy -IsMaintenance { Test-CcsmGuardianMaintenance } `
-            -WriteEvent { param($Level, $Event, $Detail) Write-CcsmGuardianEvent -Level $Level -Event $Event -Detail $Detail } `
-            -RestartTimesUtc $script:boundaryRestarts
-    }
-
-    It "requires explicit development opt-in in the executable guardian plan" {
-        $watchdogPath = Join-Path (Split-Path -Parent $PSScriptRoot) "watch-ccswitchmulti.ps1"
+    It "preserves the production plan and requires explicit development opt-in" {
+        $jsWatchdogPath = Join-Path (Split-Path -Parent $PSScriptRoot) "watch-ccswitchmulti.mjs"
         $defaultPlan = & $watchdogPath -PlanOnly | ConvertFrom-Json
+        $LASTEXITCODE | Should Be 0
+        $directPlan = & node $jsWatchdogPath -PlanOnly | ConvertFrom-Json
+        $LASTEXITCODE | Should Be 0
         $devPlan = & $watchdogPath -PlanOnly -DevelopmentMode | ConvertFrom-Json
+        $LASTEXITCODE | Should Be 0
         $defaultPlan.DevelopmentMode | Should Be $false
         $devPlan.DevelopmentMode | Should Be $true
+        ($defaultPlan | ConvertTo-Json -Compress -Depth 6) |
+            Should Be ($directPlan | ConvertTo-Json -Compress -Depth 6)
     }
 
-    It "ignores a <Marker> dev marker and recovers the installed app by default" -TestCases @(
-        @{ Marker = "live"; State = "running"; Alive = $true; Malformed = $false; ExpectedActive = $true; ExpectedRecoverable = $false }
-        @{ Marker = "stale"; State = "running"; Alive = $false; Malformed = $false; ExpectedActive = $false; ExpectedRecoverable = $true }
-        @{ Marker = "stopping"; State = "stopping"; Alive = $false; Malformed = $false; ExpectedActive = $false; ExpectedRecoverable = $false }
-        @{ Marker = "malformed"; State = "running"; Alive = $false; Malformed = $true; ExpectedActive = $false; ExpectedRecoverable = $false }
-    ) {
-        param($Marker, $State, $Alive, $Malformed, $ExpectedActive, $ExpectedRecoverable)
-        $script:boundarySupervisorAlive = $Alive
-        Write-BoundaryDevSession -State $State -Malformed:$Malformed
-        $devPlan = & $script:boundaryGetDevPlan -ConfigPath $script:ConfigPath `
-            -GetProcessIdentity { param($ProcessId) Get-CcsmGuardianProcessIdentity -ProcessId $ProcessId }
-        $devPlan.Active | Should Be $ExpectedActive
-        $devPlan.Recoverable | Should Be $ExpectedRecoverable
-        $devPlan.PreventInstalledFallback | Should Be $true
-        Mock Get-CcsmDevSessionRecoveryPlan { throw "production must not read development session markers" }
-
-        (Test-CcsmGuardianMaintenance) | Should Be $false
-        Invoke-BoundaryRecovery
-
-        $script:boundaryInstalledTarget | Should Be $script:InstalledExecutable
-        $script:boundaryStartedDevPlan | Should Be $null
-        $script:boundaryRestarts.Count | Should Be 1
-        Assert-MockCalled Get-CcsmDevSessionRecoveryPlan -Times 0 -Exactly -Scope It
-        Assert-MockCalled Invoke-CcsmGuardianRecovery -Times 1 -Exactly -Scope It
-        Assert-MockCalled Start-CcsmDevSessionLauncher -Times 0 -Exactly -Scope It
+    It "passes custom paths, timing, restart limits, and switches to the JavaScript plan" {
+        $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) 'ccsm-guardian space $() & literal'
+        $parameters = @{
+            InstalledExecutable = Join-Path $fixtureRoot 'installed\cc-switch.exe'
+            Port = 16729
+            HealthUri = 'http://127.0.0.1:16729/health?probe=$()&literal=%22'
+            FailureThresholdSeconds = 75
+            PollSeconds = 7
+            ReadyTimeoutSeconds = 50
+            MaintenanceMarker = Join-Path $fixtureRoot 'maintenance.lock'
+            LogPath = Join-Path $fixtureRoot 'guardian.jsonl'
+            LockPath = Join-Path $fixtureRoot 'guardian.lock'
+            ConfigPath = Join-Path $fixtureRoot 'config'
+            MaxRestartsPerWindow = 4
+            RestartWindowMinutes = 20
+            MaxCycles = 3
+            RestartOnCleanExit = $true
+            NoRestart = $true
+            DevelopmentMode = $true
+        }
+        $plan = & $watchdogPath @parameters -PlanOnly | ConvertFrom-Json
+        $LASTEXITCODE | Should Be 0
+        foreach ($name in $parameters.Keys) {
+            $plan.$name | Should Be $parameters[$name]
+        }
     }
 
-    It "does not launch the installed app from a modern dev crash while the supervisor is <SupervisorState>" -TestCases @(
-        @{ SupervisorState = "rebuilding"; Alive = $true }
-        @{ SupervisorState = "stale"; Alive = $false }
-    ) {
-        param($SupervisorState, $Alive)
-        $script:boundarySupervisorAlive = $Alive
-        Write-BoundaryDevSession
-        [ordered]@{
-            pid = 7777
-            executablePath = (Join-Path $script:boundaryRepo "src-tauri\target\debug\cc-switch.exe")
-            processStartedAtTicks = 134000000000000001L
-        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:ConfigPath "logs\app-run-marker.json") -Encoding utf8
-        Mock Get-CcsmDevSessionRecoveryPlan { throw "production must not inspect the development session" }
-
-        Invoke-BoundaryRecovery
-
-        $script:boundaryInstalledTarget | Should Be ""
-        $script:boundaryStartedDevPlan | Should Be $null
-        $script:boundaryRestarts.Count | Should Be 0
-        Assert-MockCalled Invoke-CcsmGuardianRecovery -Times 0 -Exactly -Scope It
-        Assert-MockCalled Start-CcsmDevSessionLauncher -Times 0 -Exactly -Scope It
-        Assert-MockCalled Get-CcsmDevSessionRecoveryPlan -Times 0 -Exactly -Scope It
-    }
-
-    It "does not authorize production launch from a modern foreign executable marker" {
-        [ordered]@{
-            pid = 7777; executablePath = "C:\OtherApp\cc-switch.exe"
-            processStartedAtTicks = 134000000000000001L
-        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:ConfigPath "logs\app-run-marker.json") -Encoding utf8
-
-        Invoke-BoundaryRecovery
-
-        $script:boundaryInstalledTarget | Should Be ""
-        $script:boundaryRestarts.Count | Should Be 0
-        Assert-MockCalled Invoke-CcsmGuardianRecovery -Times 0 -Exactly -Scope It
-    }
-
-    It "recovers the expected modern installed executable independently of a live dev session" {
-        $script:boundarySupervisorAlive = $true
-        Write-BoundaryDevSession
-        [ordered]@{
-            pid = 7777; executablePath = $script:InstalledExecutable
-            processStartedAtTicks = 134000000000000001L
-        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:ConfigPath "logs\app-run-marker.json") -Encoding utf8
-        Mock Get-CcsmDevSessionRecoveryPlan { throw "production must not inspect the development session" }
-
-        Invoke-BoundaryRecovery
-
-        $script:boundaryInstalledTarget | Should Be $script:InstalledExecutable
-        $script:boundaryStartedDevPlan | Should Be $null
-        $script:boundaryRestarts.Count | Should Be 1
-        Assert-MockCalled Invoke-CcsmGuardianRecovery -Times 1 -Exactly -Scope It
-        Assert-MockCalled Start-CcsmDevSessionLauncher -Times 0 -Exactly -Scope It
-        Assert-MockCalled Get-CcsmDevSessionRecoveryPlan -Times 0 -Exactly -Scope It
-    }
-
-    It "keeps explicit production clean-exit restart opt-in bound to the installed app" {
-        $script:RestartOnCleanExit = $true
-        Write-BoundaryDevSession
-        [ordered]@{
-            pid = 7777
-            executablePath = (Join-Path $script:boundaryRepo "src-tauri\target\debug\cc-switch.exe")
-            processStartedAtTicks = 134000000000000001L
-        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:ConfigPath "logs\app-run-marker.json") -Encoding utf8
-        Mock Get-CcsmDevSessionRecoveryPlan { throw "production opt-in must not select development recovery" }
-
-        Invoke-BoundaryRecovery
-
-        $script:boundaryInstalledTarget | Should Be $script:InstalledExecutable
-        $script:boundaryStartedDevPlan | Should Be $null
-        Assert-MockCalled Invoke-CcsmGuardianRecovery -Times 1 -Exactly -Scope It
-        Assert-MockCalled Start-CcsmDevSessionLauncher -Times 0 -Exactly -Scope It
-        Assert-MockCalled Get-CcsmDevSessionRecoveryPlan -Times 0 -Exactly -Scope It
-    }
-
-    It "restarts the recorded dev launcher only after opting into development mode" {
-        $script:DevelopmentMode = $true
-        Write-BoundaryDevSession
-        Remove-Item -LiteralPath (Join-Path $script:ConfigPath "logs\app-run-marker.json")
-        (Test-CcsmGuardianMaintenance) | Should Be $false
-
-        Invoke-BoundaryRecovery
-
-        $script:boundaryStartedDevPlan.Executable | Should Be $script:boundaryNode
-        $script:boundaryStartedDevPlan.ScriptPath | Should Be $script:boundaryScript
-        $script:boundaryInstalledTarget | Should Be ""
-        ($script:boundaryEvents -contains "dev-session-started") | Should Be $true
-        Assert-MockCalled Invoke-CcsmGuardianRecovery -Times 0 -Exactly -Scope It
-        Assert-MockCalled Start-CcsmDevSessionLauncher -Times 1 -Exactly -Scope It
-    }
-
-    It "defers development recovery while the recorded supervisor is still alive" {
-        $script:DevelopmentMode = $true
-        $script:boundarySupervisorAlive = $true
-        Write-BoundaryDevSession
-
-        (Test-CcsmGuardianMaintenance) | Should Be $true
-        Invoke-BoundaryRecovery
-
-        ($script:boundaryEvents -contains "dev-session-recovery-deferred") | Should Be $true
-        Assert-MockCalled Invoke-CcsmGuardianRecovery -Times 0 -Exactly -Scope It
-        Assert-MockCalled Start-CcsmDevSessionLauncher -Times 0 -Exactly -Scope It
-    }
-
-    It "does not select the installed app for an invalid marker in explicit development mode" {
-        $script:DevelopmentMode = $true
-        Write-BoundaryDevSession -Malformed
-
-        Invoke-BoundaryRecovery
-
-        ($script:boundaryEvents -contains "dev-session-recovery-required") | Should Be $true
-        Assert-MockCalled Invoke-CcsmGuardianRecovery -Times 0 -Exactly -Scope It
-        Assert-MockCalled Start-CcsmDevSessionLauncher -Times 0 -Exactly -Scope It
-    }
-
-    It "still honors production clean exit instead of a stale development marker" {
-        Write-BoundaryDevSession
-        Remove-Item -LiteralPath (Join-Path $script:ConfigPath "logs\app-run-marker.json")
-
-        Invoke-BoundaryRecovery
-
-        ($script:boundaryEvents -contains "restart-skipped-clean-exit") | Should Be $true
-        Assert-MockCalled Invoke-CcsmGuardianRecovery -Times 0 -Exactly -Scope It
-        Assert-MockCalled Start-CcsmDevSessionLauncher -Times 0 -Exactly -Scope It
+    It "keeps explicitly false switches disabled in the JavaScript plan" {
+        $plan = & $watchdogPath -PlanOnly -DevelopmentMode:$false `
+            -RestartOnCleanExit:$false -NoRestart:$false | ConvertFrom-Json
+        $LASTEXITCODE | Should Be 0
+        $plan.DevelopmentMode | Should Be $false
+        $plan.RestartOnCleanExit | Should Be $false
+        $plan.NoRestart | Should Be $false
     }
 }

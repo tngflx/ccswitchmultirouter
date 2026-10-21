@@ -35,6 +35,7 @@ import {
   AlertTriangle,
   Plus,
   Trash2,
+  RefreshCw,
 } from "lucide-react";
 import EndpointSpeedTest from "./EndpointSpeedTest";
 import { ApiKeySection, EndpointField, ModelDropdown } from "./shared";
@@ -42,6 +43,8 @@ import { XaiOAuthSection } from "./XaiOAuthSection";
 import {
   fetchModelsForConfig,
   fetchXaiOauthModels,
+  fetchCodexOauthModels,
+  fetchCodexOfficialFallbackModels,
   showFetchModelsError,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
@@ -63,6 +66,7 @@ import { CodexCatalogViewport } from "./CodexCatalogViewport";
 import { CodexModelReasoningCard } from "./CodexModelReasoningCard";
 import { CodexModelReasoningEditor } from "./CodexModelReasoningEditor";
 import { CodexModelReasoningSummary } from "./CodexModelReasoningSummary";
+import { CodexOfficialContextRow } from "./CodexOfficialContextRow";
 import { cn } from "@/lib/utils";
 import { buildCodexProtocolProbeProviderDraft } from "@/lib/codexProtocolSettings";
 import {
@@ -260,6 +264,9 @@ interface CodexFormFieldsProps {
   // xAI OAuth 托管预设（Grok 订阅）：隐藏 API Key / 端点输入，挂账号选择区块
   isXaiOauthPreset?: boolean;
   isMaintainedPreset?: boolean;
+  isCanonicalOfficial?: boolean;
+  officialAccountId?: string | null;
+  officialManagedOAuth?: boolean;
   isXaiOauthAuthenticated?: boolean;
   selectedXaiAccountId?: string | null;
   onXaiAccountSelect?: (accountId: string | null) => void;
@@ -712,6 +719,9 @@ export function CodexFormFields({
   providerName,
   isXaiOauthPreset,
   isMaintainedPreset = false,
+  isCanonicalOfficial = false,
+  officialAccountId = null,
+  officialManagedOAuth = false,
   isXaiOauthAuthenticated,
   selectedXaiAccountId,
   onXaiAccountSelect,
@@ -836,6 +846,9 @@ export function CodexFormFields({
     isXaiOauthPreset,
     isXaiOauthAuthenticated,
     selectedXaiAccountId,
+    isCanonicalOfficial,
+    officialAccountId,
+    officialManagedOAuth,
   ]);
   // 思考能力随 Chat 格式显示（仅 Chat Completions 转换路径用得上）；模型映射常驻
   //（填了才生成 catalog）。两者都已与「路由接管」概念解耦。
@@ -1311,6 +1324,81 @@ export function CodexFormFields({
   );
 
   const handleFetchModels = useCallback(() => {
+    if (isCanonicalOfficial) {
+      // Bind account limits to an observed account identity. A null ID would
+      // let the backend select a changing default outside this request key.
+      if (officialManagedOAuth && !officialAccountId?.trim()) return;
+      const seq = ++fetchModelsSeqRef.current;
+      setIsFetchingModels(true);
+      const request = officialManagedOAuth
+        ? fetchCodexOauthModels(officialAccountId)
+        : fetchCodexOfficialFallbackModels();
+      request
+        .then((models) => {
+          if (seq !== fetchModelsSeqRef.current) return;
+          setFetchedModels(models);
+          const rows = [...catalogRowsRef.current];
+          for (const fetched of models) {
+            const model = fetched.id.trim();
+            if (!model) continue;
+            const upstreamKey = model.toLowerCase();
+            if (
+              rows.some(
+                (row) =>
+                  catalogRowUpstreamModel(row).toLowerCase() === upstreamKey,
+              )
+            ) {
+              // Discovery is metadata, not a user context override. Keep
+              // explicit windows, aliases, disabled rows, and row choices.
+              continue;
+            }
+            if (
+              rows.some((row) => row.model.trim().toLowerCase() === upstreamKey)
+            ) {
+              continue;
+            }
+            rows.push(
+              createCatalogRow({
+                model,
+                upstreamModel: model,
+                displayName: fetched.displayName?.trim() || model,
+                ...normalizeModelIdentityMetadata(fetched),
+                ...(Array.isArray(fetched.inputModalities)
+                  ? { inputModalities: [...fetched.inputModalities] }
+                  : {}),
+                ...(typeof fetched.supportsImage === "boolean"
+                  ? { supportsImage: fetched.supportsImage }
+                  : {}),
+                ...(typeof fetched.supportsParallelToolCalls === "boolean"
+                  ? {
+                      supportsParallelToolCalls:
+                        fetched.supportsParallelToolCalls,
+                    }
+                  : {}),
+              }),
+            );
+          }
+          catalogRowsRef.current = rows;
+          setCatalogRows(rows);
+          if (models.length === 0) {
+            toast.info(t("providerForm.fetchModelsEmpty"));
+          } else {
+            toast.success(
+              t("providerForm.fetchModelsSuccess", { count: models.length }),
+            );
+          }
+        })
+        .catch(() => {
+          if (seq !== fetchModelsSeqRef.current) return;
+          // The selected account remains authoritative even when discovery
+          // fails; never silently substitute a public catalog or log auth data.
+          toast.error(t("codexConfig.officialCatalogFailed"));
+        })
+        .finally(() => {
+          if (seq === fetchModelsSeqRef.current) setIsFetchingModels(false);
+        });
+      return;
+    }
     // xAI OAuth 托管预设不使用表单里的 Base URL 与 API Key。
     if (isXaiOauthPreset) {
       if (!isXaiOauthAuthenticated) {
@@ -1444,6 +1532,9 @@ export function CodexFormFields({
     isXaiOauthPreset,
     isXaiOauthAuthenticated,
     selectedXaiAccountId,
+    isCanonicalOfficial,
+    officialAccountId,
+    officialManagedOAuth,
     t,
   ]);
 
@@ -2053,6 +2144,68 @@ export function CodexFormFields({
           selectedAccountId={selectedXaiAccountId}
           onAccountSelect={onXaiAccountSelect}
         />
+      )}
+
+      {isCanonicalOfficial && canEditCatalog && (
+        <section className="space-y-3 border-t border-border-default pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="min-w-0">
+              <h3 className="text-sm font-medium">
+                {t("codexConfig.officialContextTitle")}
+              </h3>
+              <p className="break-words text-xs text-muted-foreground">
+                {officialManagedOAuth
+                  ? `${t("codexConfig.officialAccountCatalog")} (${officialAccountId ?? t("codexConfig.officialDefaultAccount")})`
+                  : t("codexConfig.officialPublicCatalog")}
+              </p>
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={
+                isFetchingModels ||
+                (officialManagedOAuth && !officialAccountId?.trim())
+              }
+              onClick={handleFetchModels}
+            >
+              <RefreshCw className="mr-1 h-3.5 w-3.5" />
+              {isFetchingModels
+                ? t("codexConfig.officialCatalogFetching")
+                : t("codexConfig.officialCatalogFetch")}
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {t("codexConfig.officialContextTokenBudget")}
+          </p>
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-sm">
+              {t("codexConfig.officialMenuProjection")}
+            </span>
+            <Switch
+              checked={takeoverEnabled}
+              onCheckedChange={onTakeoverEnabledChange}
+              aria-label={t("codexConfig.officialMenuProjection")}
+            />
+          </div>
+          {catalogRows.map((row, index) => (
+            <CodexOfficialContextRow
+              key={row.rowId}
+              model={row.model}
+              upstreamModel={catalogRowUpstreamModel(row)}
+              value={String(row.contextWindow ?? "")}
+              maximumIsTrusted={officialManagedOAuth}
+              discovered={fetchedModels.find(
+                (item) =>
+                  item.id.trim().toLowerCase() ===
+                  catalogRowUpstreamModel(row).toLowerCase(),
+              )}
+              onChange={(contextWindow) =>
+                handleUpdateCatalogRow(index, { contextWindow })
+              }
+            />
+          ))}
+        </section>
       )}
 
       {/* Codex API Key 输入框（托管 OAuth 预设无需 Key） */}

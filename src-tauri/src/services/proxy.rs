@@ -4056,6 +4056,7 @@ impl ProxyService {
                     config_str,
                     profile,
                     &provider_context,
+                    Some(&provider),
                 )
                 .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
             }
@@ -5062,6 +5063,7 @@ impl ProxyService {
             config_str,
             profile,
             &provider_context,
+            Some(provider),
         )
         .map_err(|e| format!("写入 Codex 配置失败: {e}"))
     }
@@ -5226,6 +5228,12 @@ impl ProxyService {
                 config_str.to_string()
             };
             let prepared_config = Self::align_codex_takeover_login(&prepared_config, provider)?;
+            let prepared_config = crate::codex_config::official_catalog_context_config_for_live(
+                &prepared_config,
+                &prepared_config,
+                provider.is_some_and(crate::codex_config::codex_provider_record_is_official),
+            )
+            .map_err(|e| format!("Prepare official model context: {e}"))?;
             crate::codex_config::write_codex_live_config_atomic(Some(&prepared_config))
                 .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
             return Ok(());
@@ -5305,6 +5313,7 @@ impl ProxyService {
                     }
                 }
             }
+            crate::codex_context::apply_official_context_defaults(provider, &mut next);
             return next;
         }
 
@@ -7421,6 +7430,49 @@ wire_api = "responses"
                 read_json_file(&crate::codex_config::get_codex_auth_path()).ok();
             assert_eq!(after, auth, "takeover must never mutate login material");
         }
+    }
+
+    #[test]
+    #[serial]
+    fn official_takeover_keeps_per_model_context_without_global_override_or_auth_changes() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().unwrap();
+        let service = ProxyService::new(Arc::new(Database::memory().unwrap()));
+        let login = json!({"auth_mode":"chatgpt", "tokens":{"access_token":"<redacted>"}});
+        write_json_file(&crate::codex_config::get_codex_auth_path(), &login).unwrap();
+        let mut provider = Provider::with_id(
+            "official-context".into(),
+            "Official".into(),
+            json!({
+                "config":"model = \"context-long\"\nmodel_context_window = 272000\nmodel_auto_compact_token_limit = 244800\n[mcp_servers.user]\ncommand = \"keep\"\n",
+                "modelCatalog":{"models":[
+                    {"model":"context-long","contextWindow":872000},
+                    {"model":"context-small","contextWindow":128000}
+                ]}
+            }),
+            None,
+        );
+        provider.category = Some("official".into());
+        let before = provider.settings_config.clone();
+        let mut config = before.clone();
+        config["auth"] = json!({"OPENAI_API_KEY": PROXY_TOKEN_PLACEHOLDER});
+        service
+            .write_codex_takeover_live_for_provider(&config, Some(&provider))
+            .unwrap();
+        let text = std::fs::read_to_string(crate::codex_config::get_codex_config_path()).unwrap();
+        let doc: toml::Value = text.parse().unwrap();
+        assert!(doc.get("model_context_window").is_none());
+        assert!(doc.get("model_auto_compact_token_limit").is_none());
+        assert_eq!(doc["mcp_servers"]["user"]["command"].as_str(), Some("keep"));
+        let catalog: Value = read_json_file(std::path::Path::new(
+            doc["model_catalog_json"].as_str().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(catalog["models"][0]["context_window"], 872000);
+        assert_eq!(catalog["models"][1]["context_window"], 128000);
+        let after: Value = read_json_file(&crate::codex_config::get_codex_auth_path()).unwrap();
+        assert_eq!(after, login);
+        assert_eq!(provider.settings_config, before);
     }
 
     #[test]
@@ -11750,7 +11802,7 @@ wire_api = "responses"
         crate::config::write_text_file(&agent_path, agent).expect("seed managed agent");
         let pointer = catalog_path.to_string_lossy().replace('\\', "/");
         let snapshot_config = format!(
-            "model_provider = \"codex_model_router_v2\"\nmodel_catalog_json = \"{pointer}\"\n"
+            "model_provider = \"codex_model_router_v2\"\nmodel_catalog_json = \"{pointer}\"\nmodel_context_window = 128000\nmodel_auto_compact_token_limit = 96000\n"
         );
         let snapshot = json!({
             "auth": {"OPENAI_API_KEY": PROXY_TOKEN_PLACEHOLDER},
@@ -11760,6 +11812,14 @@ wire_api = "responses"
         service
             .write_codex_takeover_live_for_provider(&snapshot, None)
             .expect("preserve snapshot when its Provider is unavailable");
+        let written =
+            std::fs::read_to_string(crate::codex_config::get_codex_config_path()).unwrap();
+        let doc: toml::Value = written.parse().unwrap();
+        assert_eq!(doc["model_context_window"].as_integer(), Some(128000));
+        assert_eq!(
+            doc["model_auto_compact_token_limit"].as_integer(),
+            Some(96000)
+        );
 
         let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
             .expect("read snapshot config");

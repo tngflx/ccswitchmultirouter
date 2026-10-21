@@ -178,6 +178,33 @@ pub fn compile_v2(
 
     for candidate in candidates {
         let route = &plan.routes[candidate.route_index];
+        let context_provider = crate::proxy::providers::materialize_codex_v2_auth_context(
+            candidate.provider,
+            &route.auth_policy,
+        );
+        let context_auth_changed = !crate::codex_context::official_auth_binding_matches(
+            &context_provider,
+            candidate.provider,
+        );
+        if context_auth_changed {
+            // Validate only the selected model against the route's actual
+            // authentication owner. Provider inventory remains owned by its
+            // saved source; route account B cannot inherit account A's limit.
+            let mut selected = context_provider.clone();
+            if let Some(settings) = selected.settings_config.as_object_mut() {
+                settings.insert(
+                    "modelCatalog".into(),
+                    json!({"models":[candidate.model_entry.clone()]}),
+                );
+                settings.remove("model_catalog");
+            }
+            let models = crate::codex_context::trusted_official_models(&selected);
+            crate::codex_context::validate_official_context_changes(&selected, None, &models)
+                .map_err(|error| CodexRoutingCompileError {
+                    code: "route_auth_context_unverified".into(),
+                    message: format!("Route '{}' context: {error}", route.id),
+                })?;
+        }
         let explicit_aliases = route
             .aliases
             .iter()
@@ -214,11 +241,17 @@ pub fn compile_v2(
             );
             let (api_format, api_format_source) =
                 effective_api_format(candidate.provider, candidate.model_entry);
-            let capability_summary = effective_capability_summary(
+            let mut capability_summary = effective_capability_summary(
                 candidate.provider,
                 candidate.model_entry,
                 &official_models,
             );
+            if context_auth_changed {
+                let (window, source) =
+                    effective_context_window(&context_provider, candidate.model_entry);
+                capability_summary.context_window = window;
+                capability_summary.context_window_source = source;
+            }
             route_visible_models[candidate.route_index].push(visible_model.clone());
             model_catalog.push(CompiledCodexModel {
                 visible_model,
@@ -742,18 +775,46 @@ fn normalize_api_format(value: &str) -> String {
     }
 }
 
+fn effective_context_window(provider: &Provider, model_entry: &Value) -> (Option<u64>, String) {
+    let (mut context_window, mut context_window_source) = value_with_source(
+        crate::codex_context::explicit_context_window(
+            model_entry,
+            &["contextWindow", "context_window"],
+        ),
+        crate::codex_context::explicit_context_window(
+            &provider.settings_config,
+            &[
+                "contextWindow",
+                "context_window",
+                "modelContextWindow",
+                "model_context_window",
+            ],
+        ),
+    );
+    if context_window.is_none() {
+        let model = string_field(model_entry, &["upstreamModel", "upstream_model"])
+            .or_else(|| string_field(model_entry, &["model", "id", "slug"]))
+            .unwrap_or("");
+        let maximum = crate::codex_context::explicit_context_window(
+            model_entry,
+            &["maxContextWindow", "max_context_window"],
+        );
+        if let Some((window, source)) =
+            crate::codex_context::resolved_official_context_window(provider, model, maximum)
+        {
+            context_window = Some(window);
+            context_window_source = source.to_string();
+        }
+    }
+    (context_window, context_window_source)
+}
+
 fn effective_capability_summary(
     provider: &Provider,
     model_entry: &Value,
     official_models: &[Value],
 ) -> CodexModelCapabilitySummary {
-    let (context_window, context_window_source) = value_with_source(
-        u64_field(model_entry, &["contextWindow", "context_window"]),
-        u64_field(
-            &provider.settings_config,
-            &["contextWindow", "context_window", "modelContextWindow"],
-        ),
-    );
+    let (context_window, context_window_source) = effective_context_window(provider, model_entry);
     let (input_modalities, input_modalities_source) = value_with_source(
         model_input_modalities(model_entry),
         string_array_field(
@@ -1224,12 +1285,6 @@ fn value_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a Value> {
     names.iter().find_map(|name| value.get(*name))
 }
 
-fn u64_field(value: &Value, names: &[&str]) -> Option<u64> {
-    value_field(value, names)
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0)
-}
-
 fn bool_field(value: &Value, names: &[&str]) -> Option<bool> {
     value_field(value, names).and_then(Value::as_bool)
 }
@@ -1371,6 +1426,248 @@ mod tests {
             ..Default::default()
         });
         provider
+    }
+
+    fn context_oauth_provider(id: &str, account: &str, models: Value) -> Provider {
+        let mut provider = provider(id, "Managed OAuth", "openai_responses", models);
+        provider.category = Some("custom".into());
+        let meta = provider.meta.as_mut().unwrap();
+        meta.provider_type = Some("codex_oauth".into());
+        meta.auth_binding = Some(crate::provider::AuthBinding {
+            source: crate::provider::AuthBindingSource::ManagedAccount,
+            auth_provider: Some("codex_oauth".into()),
+            account_id: Some(account.into()),
+        });
+        provider
+    }
+
+    #[test]
+    fn compiler_route_account_override_rechecks_context_without_changing_provider_inventory() {
+        let suffix = uuid::Uuid::new_v4();
+        let model = format!("route-bound-{suffix}");
+        let account_a = format!("route-a-{suffix}");
+        let account_b = format!("route-b-{suffix}");
+        let snapshot = |default, maximum| {
+            [crate::services::model_fetch::FetchedModel {
+                id: model.clone(),
+                context_window: default,
+                max_context_window: maximum,
+                ..Default::default()
+            }]
+        };
+        crate::services::codex_oauth_models::record_authenticated_model_limits(
+            &account_a,
+            &snapshot(Some(272000), Some(1000000)),
+        );
+        let provider = context_oauth_provider(
+            "managed-route",
+            &account_a,
+            json!([
+                {"model":"visible-alias", "upstreamModel":model, "contextWindow":1000000},
+                {"model":"excluded", "upstreamModel":"unused", "contextWindow":2000000, "enabled":false}
+            ]),
+        );
+        let before = provider.settings_config.clone();
+        let mut route = route("managed", &provider.id, CodexModelSelection::All);
+        route.auth_policy = CodexRouteAuthPolicy {
+            source: crate::codex_multirouter::schema::CodexRouteAuthSource::ManagedCodexOauth,
+            account_id: Some(account_b.clone()),
+        };
+        let routing_plan = plan(vec![route.clone()]);
+        let providers = HashMap::from([(provider.id.clone(), provider.clone())]);
+        for maximum in [None, Some(872000)] {
+            crate::services::codex_oauth_models::record_authenticated_model_limits(
+                &account_b,
+                &snapshot(Some(128000), maximum),
+            );
+            let error = compile_v2(&routing_plan, &providers)
+                .expect_err("route B cannot inherit account A's enlarged context");
+            assert_eq!(error.code, "route_auth_context_unverified");
+        }
+        crate::services::codex_oauth_models::record_authenticated_model_limits(
+            &account_b,
+            &snapshot(None, Some(1000000)),
+        );
+        let compiled = compile_v2(&routing_plan, &providers).unwrap();
+        assert_eq!(compiled.model_catalog.len(), 1);
+        assert_eq!(
+            compiled.model_catalog[0].capability_summary.context_window,
+            Some(1000000),
+            "an explicit context may use B's authenticated maximum without inventing a default"
+        );
+        assert_eq!(providers[&provider.id].settings_config, before);
+
+        let mut canonical = provider.clone();
+        canonical.id = crate::database::CODEX_OFFICIAL_PROVIDER_ID.into();
+        canonical.category = Some("official".into());
+        canonical.meta.as_mut().unwrap().codex_official_auth =
+            Some(crate::provider::CodexOfficialAuthConfig {
+                mode: crate::provider::CodexOfficialAuthMode::ManagedOauth,
+                account_id: Some(account_a),
+            });
+        route.target_provider_id = canonical.id.clone();
+        crate::services::codex_oauth_models::record_authenticated_model_limits(
+            &account_b,
+            &snapshot(Some(128000), None),
+        );
+        let compiled = compile(&plan(vec![route]), [canonical]);
+        assert_eq!(
+            compiled.model_catalog[0].capability_summary.context_window,
+            Some(1000000),
+            "canonical Official keeps provider-owned account A over route B"
+        );
+    }
+
+    #[test]
+    fn compiler_route_defaults_follow_selected_account_and_pool_without_maximum_promotion() {
+        let suffix = uuid::Uuid::new_v4();
+        let model = format!("route-default-{suffix}");
+        let account_a = format!("default-a-{suffix}");
+        let account_b = format!("default-b-{suffix}");
+        let snapshot = |default, maximum| {
+            [crate::services::model_fetch::FetchedModel {
+                id: model.clone(),
+                context_window: default,
+                max_context_window: maximum,
+                ..Default::default()
+            }]
+        };
+        crate::services::codex_oauth_models::record_authenticated_model_limits(
+            &account_a,
+            &snapshot(Some(600000), Some(1000000)),
+        );
+        crate::services::codex_oauth_models::record_authenticated_model_limits(
+            &account_b,
+            &snapshot(Some(128000), Some(256000)),
+        );
+        let provider = context_oauth_provider(
+            "managed-defaults",
+            &account_a,
+            json!([{"model":"visible-alias", "upstreamModel":model}]),
+        );
+        let before = provider.settings_config.clone();
+        let mut route = route("managed", &provider.id, CodexModelSelection::All);
+        route.auth_policy = CodexRouteAuthPolicy {
+            source: crate::codex_multirouter::schema::CodexRouteAuthSource::ManagedCodexOauth,
+            account_id: Some(account_b.clone()),
+        };
+        let compiled = compile(&plan(vec![route.clone()]), [provider.clone()]);
+        assert_eq!(
+            compiled.model_catalog[0].capability_summary.context_window,
+            Some(128000)
+        );
+        assert_eq!(
+            compiled.model_catalog[0]
+                .capability_summary
+                .context_window_source,
+            "account_directory"
+        );
+        crate::services::codex_oauth_models::record_authenticated_model_limits(
+            &account_b,
+            &snapshot(None, Some(1000000)),
+        );
+        let compiled = compile(&plan(vec![route.clone()]), [provider.clone()]);
+        assert_eq!(
+            compiled.model_catalog[0].capability_summary.context_window, None,
+            "B maximum-only response cannot become the default"
+        );
+        route.auth_policy.account_id = Some(format!("unknown-{suffix}"));
+        let compiled = compile(&plan(vec![route.clone()]), [provider.clone()]);
+        assert_eq!(
+            compiled.model_catalog[0].capability_summary.context_window,
+            None
+        );
+        route.auth_policy = CodexRouteAuthPolicy {
+            source: crate::codex_multirouter::schema::CodexRouteAuthSource::AccountPool,
+            account_id: None,
+        };
+        let compiled = compile(&plan(vec![route.clone()]), [provider.clone()]);
+        assert_eq!(
+            compiled.model_catalog[0].capability_summary.context_window, None,
+            "pool cannot inherit fixed account A's context default"
+        );
+        let mut enlarged = provider.clone();
+        enlarged.settings_config["modelCatalog"]["models"][0]["contextWindow"] = json!(1000000);
+        for source in [
+            crate::codex_multirouter::schema::CodexRouteAuthSource::AccountPool,
+            crate::codex_multirouter::schema::CodexRouteAuthSource::NativeCodexAuth,
+        ] {
+            route.auth_policy = CodexRouteAuthPolicy {
+                source,
+                account_id: None,
+            };
+            let error = compile_v2(
+                &plan(vec![route.clone()]),
+                &HashMap::from([(enlarged.id.clone(), enlarged.clone())]),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "route_auth_context_unverified");
+        }
+        let mut third_party = enlarged.clone();
+        third_party.meta.as_mut().unwrap().provider_type = None;
+        third_party.meta.as_mut().unwrap().auth_binding = None;
+        let error = compile_v2(
+            &plan(vec![route]),
+            &HashMap::from([(third_party.id.clone(), third_party)]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code, "route_auth_context_unverified",
+            "custom category native route still uses the real Desktop trust boundary"
+        );
+        assert_eq!(provider.settings_config, before);
+    }
+
+    #[test]
+    fn compiler_official_context_uses_selected_account_alias_and_keeps_explicit_precedence() {
+        let account = format!("compiler-context-{}", uuid::Uuid::new_v4());
+        crate::services::codex_oauth_models::record_authenticated_model_limits(
+            &account,
+            &[crate::services::model_fetch::FetchedModel {
+                id: "wire".into(),
+                context_window: Some(272000),
+                max_context_window: Some(1000000),
+                ..Default::default()
+            }],
+        );
+        let mut provider = provider(
+            crate::database::CODEX_OFFICIAL_PROVIDER_ID,
+            "Official",
+            "openai_responses",
+            json!([]),
+        );
+        provider.category = Some("official".into());
+        provider.meta.as_mut().unwrap().codex_official_auth =
+            Some(crate::provider::CodexOfficialAuthConfig {
+                mode: crate::provider::CodexOfficialAuthMode::ManagedOauth,
+                account_id: Some(account),
+            });
+        let entry =
+            json!({"model":"visible-alias", "upstreamModel":"wire", "maxContextWindow":2000000});
+        let summary = effective_capability_summary(&provider, &entry, &[]);
+        assert_eq!(summary.context_window, Some(272000));
+        assert_eq!(summary.context_window_source, "account_directory");
+        let capped = effective_capability_summary(
+            &provider,
+            &json!({"model":"visible-alias", "upstreamModel":"wire", "maxContextWindow":128000}),
+            &[],
+        );
+        assert_eq!(capped.context_window, Some(128000));
+        provider.settings_config["model_context_window"] = json!("64000");
+        let provider_summary = effective_capability_summary(&provider, &entry, &[]);
+        assert_eq!(provider_summary.context_window, Some(64000));
+        assert_eq!(provider_summary.context_window_source, "provider");
+        let explicit = effective_capability_summary(
+            &provider,
+            &json!({"model":"visible-alias", "upstreamModel":"wire", "contextWindow":"1000000"}),
+            &[],
+        );
+        assert_eq!(explicit.context_window, Some(1000000));
+        assert_eq!(explicit.context_window_source, "provider_model");
+        assert!(provider.settings_config["modelCatalog"]["models"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     fn route(

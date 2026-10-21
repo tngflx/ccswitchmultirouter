@@ -987,6 +987,9 @@ pub fn should_restore_codex_provider_token_for_backfill(
     !has_oauth_login || has_provider_api_key
 }
 
+// Only the test override-file reader and its assertions use this fixture helper.
+// Production catalog defaults use the shared explicit context-field reader.
+#[cfg(test)]
 fn parse_codex_positive_u64(value: Option<&Value>) -> Option<u64> {
     match value {
         Some(Value::Number(n)) => n.as_u64().filter(|v| *v > 0),
@@ -1042,12 +1045,9 @@ fn codex_model_context_windows_from_cache(cache: &Value) -> std::collections::Ha
             else {
                 continue;
             };
-            if let Some(context_window) = parse_codex_positive_u64(
-                model
-                    .get("context_window")
-                    .or_else(|| model.get("max_context_window"))
-                    .or_else(|| model.get("contextWindow"))
-                    .or_else(|| model.get("maxContextWindow")),
+            if let Some(context_window) = crate::codex_context::explicit_context_window(
+                model,
+                &["context_window", "contextWindow"],
             ) {
                 windows.insert(id.to_string(), context_window);
             }
@@ -1064,12 +1064,9 @@ fn codex_model_context_windows_from_cache(cache: &Value) -> std::collections::Ha
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .unwrap_or(fallback_id);
-            if let Some(context_window) = parse_codex_positive_u64(
-                model
-                    .get("context_window")
-                    .or_else(|| model.get("max_context_window"))
-                    .or_else(|| model.get("contextWindow"))
-                    .or_else(|| model.get("maxContextWindow")),
+            if let Some(context_window) = crate::codex_context::explicit_context_window(
+                model,
+                &["context_window", "contextWindow"],
             ) {
                 windows.insert(id.to_string(), context_window);
             }
@@ -1965,6 +1962,15 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
 
     let default_context_window =
         extract_codex_top_level_u64(config_text, "model_context_window").unwrap_or(128_000);
+    let provider_context_window = crate::codex_context::explicit_context_window(
+        settings,
+        &[
+            "contextWindow",
+            "context_window",
+            "modelContextWindow",
+            "model_context_window",
+        ],
+    );
     let default_model = extract_codex_top_level_string(config_text, "model");
     let cached_context_windows = codex_cached_model_context_windows();
     let mut seen = std::collections::HashSet::new();
@@ -2026,11 +2032,11 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
             .map(str::trim)
             .filter(|upstream_model| !upstream_model.is_empty() && *upstream_model != model)
             .map(ToString::to_string);
-        let context_window = parse_codex_positive_u64(
-            model_config
-                .get("contextWindow")
-                .or_else(|| model_config.get("context_window")),
+        let context_window = crate::codex_context::explicit_context_window(
+            model_config,
+            &["contextWindow", "context_window"],
         )
+        .or(provider_context_window)
         .or_else(|| cached_context_windows.get(model).copied())
         .unwrap_or(default_context_window);
 
@@ -3994,9 +4000,10 @@ fn codex_resolve_route_with_mode_all<'a>(
         })
 }
 
-fn codex_provider_record_is_official(provider: &Provider) -> bool {
+pub(crate) fn codex_provider_record_is_official(provider: &Provider) -> bool {
     provider.category.as_deref() == Some("official")
         || is_codex_official_provider(provider)
+        || crate::proxy::providers::provider_uses_native_codex_auth(provider)
         || provider.is_codex_oauth()
         || provider
             .settings_config
@@ -8134,6 +8141,93 @@ pub(crate) fn merge_codex_provider_config_with_live(config_text: &str) -> Result
     merge_codex_provider_config_texts(&live_config, config_text)
 }
 
+fn merge_codex_provider_config_for_context(
+    live: &str,
+    provider_config: &str,
+    is_official: bool,
+) -> Result<String, AppError> {
+    let merged = merge_codex_provider_config_texts(live, provider_config)?;
+    official_catalog_context_config_for_live(&merged, provider_config, is_official)
+}
+
+pub(crate) fn official_catalog_context_config_for_live(
+    config: &str,
+    provider_config: &str,
+    is_official: bool,
+) -> Result<String, AppError> {
+    if !is_official {
+        return Ok(config.to_string());
+    }
+    let provider_doc = provider_config
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    let owns_catalog = provider_doc
+        .get("model_catalog_json")
+        .and_then(Item::as_str)
+        .is_some_and(codex_model_catalog_path_is_cc_switch_owned);
+    if !owns_catalog {
+        return Ok(config.to_string());
+    }
+    // Remove both source and stale live overrides only when this provider owns
+    // the projected catalog. Native Codex must use each model's own window.
+    let mut doc = config
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    remove_multi_router_context_overrides(&mut doc);
+    Ok(doc.to_string())
+}
+
+/// Live official catalogs own per-model windows. Preserve the provider's
+/// original global preferences when normalized live config is stored back.
+pub(crate) fn codex_context_config_for_storage(
+    config: &str,
+    provider: &Provider,
+) -> Result<String, AppError> {
+    if !codex_provider_record_is_official(provider) {
+        return Ok(config.to_string());
+    }
+    let mut live_doc = config
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    let owns_catalog = live_doc
+        .get("model_catalog_json")
+        .and_then(Item::as_str)
+        .is_some_and(codex_model_catalog_path_is_cc_switch_owned);
+    if !owns_catalog {
+        return Ok(config.to_string());
+    }
+    let source_doc = provider
+        .settings_config
+        .get("config")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid provider Codex config.toml: {e}")))?;
+    for field in ["model_context_window", "model_auto_compact_token_limit"] {
+        if let Some(value) = source_doc.get(field) {
+            live_doc.insert(field, value.clone());
+        } else {
+            live_doc.remove(field);
+        }
+    }
+    Ok(live_doc.to_string())
+}
+
+fn codex_context_projection(
+    settings: &Value,
+    category: Option<&str>,
+    context_provider: Option<&Provider>,
+) -> (Value, bool) {
+    let is_official = context_provider
+        .map(codex_provider_record_is_official)
+        .unwrap_or(category == Some("official"));
+    let mut effective_settings = settings.clone();
+    if let Some(provider) = context_provider {
+        crate::codex_context::apply_official_context_defaults(provider, &mut effective_settings);
+    }
+    (effective_settings, is_official)
+}
+
 pub(crate) fn write_codex_provider_live_with_catalog_and_provider_context(
     settings: &Value,
     category: Option<&str>,
@@ -8141,18 +8235,26 @@ pub(crate) fn write_codex_provider_live_with_catalog_and_provider_context(
     config_text: Option<&str>,
     profile: CodexCatalogToolProfile,
     provider_context: &ProviderClassificationContext,
+    context_provider: Option<&Provider>,
 ) -> Result<(), AppError> {
+    let (effective_settings, is_official) =
+        codex_context_projection(settings, category, context_provider);
     let prepared_config = config_text
         .map(|text| {
             prepare_codex_config_text_with_model_catalog_and_provider_context(
-                settings,
+                &effective_settings,
                 text,
                 profile,
                 provider_context,
             )
         })
         .transpose()?;
-    write_codex_live_for_provider(category, auth, prepared_config.as_deref())
+    write_codex_live_for_provider_with_context(
+        category,
+        auth,
+        prepared_config.as_deref(),
+        is_official,
+    )
 }
 
 pub(crate) fn write_codex_provider_live_with_catalog_without_provider_context(
@@ -8161,15 +8263,25 @@ pub(crate) fn write_codex_provider_live_with_catalog_without_provider_context(
     auth: &Value,
     config_text: Option<&str>,
     profile: CodexCatalogToolProfile,
+    context_provider: Option<&Provider>,
 ) -> Result<(), AppError> {
+    let (effective_settings, is_official) =
+        codex_context_projection(settings, category, context_provider);
     let prepared_config = config_text
         .map(|text| {
             prepare_codex_config_text_with_model_catalog_without_provider_context(
-                settings, text, profile,
+                &effective_settings,
+                text,
+                profile,
             )
         })
         .transpose()?;
-    write_codex_live_for_provider(category, auth, prepared_config.as_deref())
+    write_codex_live_for_provider_with_context(
+        category,
+        auth,
+        prepared_config.as_deref(),
+        is_official,
+    )
 }
 
 /// 只按 provider 配置刷新 Codex `config.toml`，显式保留当前 `auth.json`。
@@ -8184,11 +8296,14 @@ pub(crate) fn write_codex_provider_config_only_with_catalog_and_provider_context
     config_text: Option<&str>,
     profile: CodexCatalogToolProfile,
     provider_context: &ProviderClassificationContext,
+    context_provider: Option<&Provider>,
 ) -> Result<(), AppError> {
+    let (effective_settings, is_official) =
+        codex_context_projection(settings, category, context_provider);
     let prepared_config = config_text
         .map(|text| {
             prepare_codex_config_text_with_model_catalog_and_provider_context(
-                settings,
+                &effective_settings,
                 text,
                 profile,
                 provider_context,
@@ -8207,8 +8322,10 @@ pub(crate) fn write_codex_provider_config_only_with_catalog_and_provider_context
         .as_deref()
         .or(prepared_config.as_deref())
         .unwrap_or("");
-    reconcile_codex_live_config_atomic(|live| merge_codex_provider_config_texts(live, config_text))
-        .map(|_| ())
+    reconcile_codex_live_config_atomic(|live| {
+        merge_codex_provider_config_for_context(live, config_text, is_official)
+    })
+    .map(|_| ())
 }
 
 /// Extract a provider-scoped `experimental_bearer_token` from Codex `config.toml`.
@@ -9005,6 +9122,20 @@ pub fn write_codex_live_for_provider(
     auth: &Value,
     config_text: Option<&str>,
 ) -> Result<(), AppError> {
+    write_codex_live_for_provider_with_context(
+        category,
+        auth,
+        config_text,
+        category == Some("official"),
+    )
+}
+
+fn write_codex_live_for_provider_with_context(
+    category: Option<&str>,
+    auth: &Value,
+    config_text: Option<&str>,
+    is_official_context: bool,
+) -> Result<(), AppError> {
     let unified_official_config =
         if category == Some("official") && crate::settings::unify_codex_session_history() {
             Some(inject_codex_unified_session_bucket(
@@ -9021,7 +9152,13 @@ pub fn write_codex_live_for_provider(
     if should_write_auth {
         reconcile_codex_live_with_auth_atomic(auth, |live| {
             config_text
-                .map(|provider_config| merge_codex_provider_config_texts(live, provider_config))
+                .map(|provider_config| {
+                    merge_codex_provider_config_for_context(
+                        live,
+                        provider_config,
+                        is_official_context,
+                    )
+                })
                 .transpose()
                 .map(|merged| merged.unwrap_or_else(|| live.to_string()))
         })
@@ -9029,7 +9166,13 @@ pub fn write_codex_live_for_provider(
     } else {
         reconcile_codex_live_config_atomic(|live| {
             let merged = config_text
-                .map(|provider_config| merge_codex_provider_config_texts(live, provider_config))
+                .map(|provider_config| {
+                    merge_codex_provider_config_for_context(
+                        live,
+                        provider_config,
+                        is_official_context,
+                    )
+                })
                 .transpose()?
                 .unwrap_or_else(|| live.to_string());
             prepare_codex_provider_live_config(auth, &merged)
@@ -9290,6 +9433,383 @@ pub fn remove_codex_toml_base_url_if(toml_str: &str, predicate: impl Fn(&str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn official_owned_catalog_backfill_restores_source_context_preferences_only() {
+        let source = "model_context_window = 272000\nmodel_auto_compact_token_limit = 244800\n";
+        let mut provider = Provider::with_id(
+            "managed-context".into(),
+            "Managed OAuth".into(),
+            json!({"config":source}),
+            None,
+        );
+        provider.category = Some("custom".into());
+        provider.meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("codex_oauth".into()),
+            ..Default::default()
+        });
+        let live = format!("model = \"normalized-live\"\nmodel_catalog_json = \"C:/test/{CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME}\"\n[features]\nmemories = true\n[mcp_servers.user]\ncommand = \"keep\"\n");
+        let before = provider.settings_config.clone();
+        let stored = codex_context_config_for_storage(&live, &provider).unwrap();
+        let doc = stored.parse::<DocumentMut>().unwrap();
+        assert_eq!(doc["model_context_window"].as_integer(), Some(272000));
+        assert_eq!(
+            doc["model_auto_compact_token_limit"].as_integer(),
+            Some(244800)
+        );
+        assert_eq!(doc["model"].as_str(), Some("normalized-live"));
+        assert_eq!(doc["features"]["memories"].as_bool(), Some(true));
+        assert_eq!(doc["mcp_servers"]["user"]["command"].as_str(), Some("keep"));
+        assert_eq!(provider.settings_config, before);
+
+        provider.settings_config["config"] =
+            json!("model = \"source-with-no-global-preference\"\n");
+        let live_with_globals = format!(
+            "model_context_window = 999000\nmodel_auto_compact_token_limit = 888000\n{live}"
+        );
+        let stored = codex_context_config_for_storage(&live_with_globals, &provider).unwrap();
+        let doc = stored.parse::<DocumentMut>().unwrap();
+        assert!(doc.get("model_context_window").is_none());
+        assert!(doc.get("model_auto_compact_token_limit").is_none());
+        assert_eq!(doc["features"]["memories"].as_bool(), Some(true));
+
+        let external =
+            live_with_globals.replace(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME, "user-catalog.json");
+        assert_eq!(
+            codex_context_config_for_storage(&external, &provider).unwrap(),
+            external
+        );
+        provider.meta = None;
+        assert_eq!(
+            codex_context_config_for_storage(&live_with_globals, &provider).unwrap(),
+            live_with_globals
+        );
+    }
+
+    #[test]
+    fn native_context_cache_keeps_default_maximum_and_token_budgets_independent() {
+        let entries = vec![
+            json!({"slug":"default-and-max", "context_window":272000, "max_context_window":1000000, "max_input_tokens":800000}),
+            json!({"slug":"camel-default", "contextWindow":"128000", "max_context_window":2000000}),
+            json!({"slug":"max-only", "max_context_window":1000000}),
+            json!({"slug":"camel-max-only", "maxContextWindow":1000000}),
+            json!({"slug":"input-only", "max_input_tokens":800000, "maxInputTokens":800000}),
+            json!({"slug":"invalid-default", "context_window":0, "max_context_window":1000000}),
+        ];
+        let mut keyed_entries = serde_json::Map::new();
+        for entry in &entries {
+            let mut keyed_entry = entry.clone();
+            let id = keyed_entry.as_object_mut().unwrap().remove("slug").unwrap();
+            keyed_entries.insert(id.as_str().unwrap().to_string(), keyed_entry);
+        }
+        for cache in [json!({"models":entries}), json!({"models":keyed_entries})] {
+            let windows = codex_model_context_windows_from_cache(&cache);
+            assert_eq!(windows.len(), 2);
+            assert_eq!(windows.get("default-and-max"), Some(&272000));
+            assert_eq!(windows.get("camel-default"), Some(&128000));
+            for id in [
+                "max-only",
+                "camel-max-only",
+                "input-only",
+                "invalid-default",
+            ] {
+                assert!(!windows.contains_key(id), "{id} has no default context");
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_catalog_max_only_cache_metadata_does_not_enlarge_active_context() {
+        let _guard = TestHomeGuard::new();
+        write_json_file(
+            &get_codex_models_cache_path(),
+            &json!({"models":[
+                {"slug":"context-max-only", "max_context_window":1000000, "max_input_tokens":800000},
+                {"slug":"context-camel-max-only", "maxContextWindow":2000000}
+            ]}),
+        ).unwrap();
+        let settings = json!({"modelCatalog":{"models":[
+            {"model":"context-max-only"},
+            {"model":"context-camel-max-only"}
+        ]}});
+        let specs = codex_catalog_model_specs(&settings, "model_context_window = 64000\n");
+        assert_eq!(specs.len(), 2);
+        for spec in specs {
+            assert_eq!(
+                spec.context_window, 64000,
+                "maximum metadata cannot become a default"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_catalog_context_uses_provider_json_aliases_before_cache_and_toml() {
+        let _guard = TestHomeGuard::new();
+        write_json_file(
+            &get_codex_models_cache_path(),
+            &json!({"models":[
+                {"slug":"context-alias", "context_window":600000},
+                {"slug":"wire-model", "context_window":872000}
+            ]}),
+        )
+        .unwrap();
+        for key in [
+            "contextWindow",
+            "context_window",
+            "modelContextWindow",
+            "model_context_window",
+        ] {
+            for value in [json!(256000), json!("256000")] {
+                let mut settings = json!({"modelCatalog":{"models":[
+                    {"model":"context-alias", "upstreamModel":"wire-model"},
+                    {"model":"explicit-alias", "upstreamModel":"wire-model", "contextWindow":"128000"},
+                    {"model":"snake-alias", "upstreamModel":"wire-model", "contextWindow":null, "context_window":"64000"}
+                ]}});
+                settings[key] = value;
+                let specs = codex_catalog_model_specs(&settings, "model_context_window = 32000\n");
+                let alias = specs
+                    .iter()
+                    .find(|spec| spec.model == "context-alias")
+                    .unwrap();
+                assert_eq!(
+                    alias.context_window, 256000,
+                    "provider field {key} outranks cache and TOML"
+                );
+                assert_eq!(alias.upstream_model.as_deref(), Some("wire-model"));
+                assert_eq!(
+                    specs
+                        .iter()
+                        .find(|spec| spec.model == "explicit-alias")
+                        .unwrap()
+                        .context_window,
+                    128000
+                );
+                assert_eq!(
+                    specs
+                        .iter()
+                        .find(|spec| spec.model == "snake-alias")
+                        .unwrap()
+                        .context_window,
+                    64000
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn official_managed_catalog_windows_survive_source_and_live_global_overrides() {
+        let live = "model_context_window = 128000\nmodel_auto_compact_token_limit = 96000\n[mcp_servers.user]\ncommand = \"keep\"\n";
+        let provider = format!("model = \"context-long\"\nmodel_context_window = 272000\nmodel_auto_compact_token_limit = 244800\nmodel_catalog_json = \"C:/test/{}\"\n", CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        let original_provider = provider.clone();
+        let merged = merge_codex_provider_config_for_context(live, &provider, true).unwrap();
+        let doc = merged.parse::<DocumentMut>().unwrap();
+        assert!(doc.get("model_context_window").is_none());
+        assert!(doc.get("model_auto_compact_token_limit").is_none());
+        assert_eq!(doc["mcp_servers"]["user"]["command"].as_str(), Some("keep"));
+        assert_eq!(
+            provider, original_provider,
+            "source preferences remain stored"
+        );
+        for (is_official, config) in [
+            (false, provider.clone()),
+            (
+                true,
+                provider.replace(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME, "user-catalog.json"),
+            ),
+            (
+                true,
+                "model = \"context-long\"\nmodel_context_window = 272000\n".into(),
+            ),
+        ] {
+            let merged =
+                merge_codex_provider_config_for_context(live, &config, is_official).unwrap();
+            assert_eq!(
+                merged.parse::<DocumentMut>().unwrap()["model_context_window"].as_integer(),
+                Some(272000),
+                "only a known official provider's owned catalog authorizes cleanup"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn official_owned_context_cleanup_covers_auth_no_auth_and_config_only_writers() {
+        for writer in ["auth", "no-auth", "config-only"] {
+            let _guard = TestHomeGuard::new();
+            crate::settings::reload_settings().unwrap();
+            let live_auth = json!({"auth_mode":"chatgpt", "tokens":{"account_id":"source-account", "access_token":"<redacted>"}});
+            let selected_auth = json!({"auth_mode":"chatgpt", "tokens":{"account_id":"selected-account", "access_token":"<redacted>"}});
+            let live = "model_context_window = 128000\nmodel_auto_compact_token_limit = 96000\n[mcp_servers.user]\ncommand = \"keep\"\n";
+            write_codex_live_atomic(&live_auth, Some(live)).unwrap();
+            let provider = "model = \"context-long\"\nmodel_context_window = 272000\nmodel_auto_compact_token_limit = 244800\n";
+            let settings = json!({"modelCatalog":{"models":[
+                {"model":"context-long", "contextWindow":872000},
+                {"model":"context-small", "contextWindow":128000}
+            ]}});
+            let before = settings.clone();
+            let profile = CodexCatalogToolProfile::NativeResponses;
+            let context = ProviderClassificationContext::from_providers(std::iter::empty());
+            if writer == "config-only" {
+                write_codex_provider_config_only_with_catalog_and_provider_context(
+                    &settings,
+                    Some("official"),
+                    Some(provider),
+                    profile,
+                    &context,
+                    None,
+                )
+                .unwrap();
+            } else {
+                let empty_auth = json!({});
+                let auth = if writer == "auth" {
+                    &selected_auth
+                } else {
+                    &empty_auth
+                };
+                write_codex_provider_live_with_catalog_and_provider_context(
+                    &settings,
+                    Some("official"),
+                    auth,
+                    Some(provider),
+                    profile,
+                    &context,
+                    None,
+                )
+                .unwrap();
+            }
+            let written = read_codex_config_text().unwrap();
+            let doc = written.parse::<DocumentMut>().unwrap();
+            assert!(doc.get("model_context_window").is_none(), "{writer}");
+            assert!(
+                doc.get("model_auto_compact_token_limit").is_none(),
+                "{writer}"
+            );
+            assert_eq!(doc["mcp_servers"]["user"]["command"].as_str(), Some("keep"));
+            let after_auth: Value = read_json_file(&get_codex_auth_path()).unwrap();
+            assert_eq!(
+                after_auth,
+                if writer == "auth" {
+                    selected_auth
+                } else {
+                    live_auth
+                }
+            );
+            assert_eq!(settings, before, "effective writes preserve source catalog");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn managed_oauth_context_projection_uses_provider_identity_without_changing_auth_ownership() {
+        for writer in ["classified", "unclassified", "config-only"] {
+            let _guard = TestHomeGuard::new();
+            crate::settings::reload_settings().unwrap();
+            let account = format!("native-context-{}", uuid::Uuid::new_v4());
+            crate::services::codex_oauth_models::record_authenticated_model_limits(
+                &account,
+                &[crate::services::model_fetch::FetchedModel {
+                    id: "context-wire".into(),
+                    context_window: Some(272000),
+                    max_context_window: Some(450000),
+                    ..Default::default()
+                }],
+            );
+            let login = json!({"auth_mode":"chatgpt", "tokens":{"access_token":"<redacted>"}});
+            write_codex_live_atomic(
+                &login,
+                Some("model_context_window = 64000\nmodel_auto_compact_token_limit = 48000\n"),
+            )
+            .unwrap();
+            let mut provider = Provider::with_id(
+                "managed-context".into(),
+                "Managed OAuth".into(),
+                json!({
+                    "config":"model = \"context-alias\"\nmodel_context_window = 128000\nmodel_auto_compact_token_limit = 96000\n",
+                    "modelCatalog":{"models":[
+                        {"model":"context-alias", "upstreamModel":"context-wire"},
+                        {"model":"context-explicit", "upstreamModel":"context-wire", "contextWindow":64000}
+                    ]}
+                }),
+                None,
+            );
+            provider.category = Some("custom".into());
+            provider.meta = Some(crate::provider::ProviderMeta {
+                provider_type: Some("codex_oauth".into()),
+                auth_binding: Some(crate::provider::AuthBinding {
+                    source: crate::provider::AuthBindingSource::ManagedAccount,
+                    auth_provider: Some("codex_oauth".into()),
+                    account_id: Some(account),
+                }),
+                ..Default::default()
+            });
+            let before = provider.settings_config.clone();
+            let settings = &provider.settings_config;
+            let config = settings["config"].as_str();
+            let context = ProviderClassificationContext::from_providers(std::iter::once(&provider));
+            let category = provider.category.as_deref();
+            let profile = CodexCatalogToolProfile::NativeResponses;
+            let selected_auth = json!({"auth_mode":"chatgpt", "tokens":{"account_id":"different", "access_token":"<redacted>"}});
+            match writer {
+                "classified" => write_codex_provider_live_with_catalog_and_provider_context(
+                    settings,
+                    category,
+                    &selected_auth,
+                    config,
+                    profile,
+                    &context,
+                    Some(&provider),
+                ),
+                "unclassified" => write_codex_provider_live_with_catalog_without_provider_context(
+                    settings,
+                    category,
+                    &selected_auth,
+                    config,
+                    profile,
+                    Some(&provider),
+                ),
+                _ => write_codex_provider_config_only_with_catalog_and_provider_context(
+                    settings,
+                    category,
+                    config,
+                    profile,
+                    &context,
+                    Some(&provider),
+                ),
+            }
+            .unwrap();
+            let written = read_codex_config_text().unwrap();
+            let doc = written.parse::<DocumentMut>().unwrap();
+            assert!(doc.get("model_context_window").is_none(), "{writer}");
+            assert!(
+                doc.get("model_auto_compact_token_limit").is_none(),
+                "{writer}"
+            );
+            let catalog: Value =
+                read_json_file(Path::new(doc["model_catalog_json"].as_str().unwrap())).unwrap();
+            let rows = catalog["models"].as_array().unwrap();
+            let default = rows
+                .iter()
+                .find(|entry| entry["slug"] == "context-alias")
+                .unwrap();
+            let explicit = rows
+                .iter()
+                .find(|entry| entry["slug"] == "context-explicit")
+                .unwrap();
+            assert_eq!(default["context_window"], 272000, "{writer}");
+            assert_eq!(explicit["context_window"], 64000, "{writer}");
+            let after_auth: Value = read_json_file(&get_codex_auth_path()).unwrap();
+            assert_eq!(
+                after_auth, login,
+                "custom category keeps existing auth ownership"
+            );
+            assert_eq!(
+                provider.settings_config, before,
+                "defaults apply only to effective clones"
+            );
+        }
+    }
 
     #[test]
     fn required_live_config_snapshot_distinguishes_missing_from_existing_empty_config() {

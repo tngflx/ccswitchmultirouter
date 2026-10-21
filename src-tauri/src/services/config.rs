@@ -181,12 +181,15 @@ impl ConfigService {
             cfg_text,
             profile,
             &provider_context,
+            Some(provider),
         )?;
         // 注意：MCP 同步在 v3.7.0 中已通过 McpService 进行，不再在此调用
         // sync_enabled_to_codex 使用旧的 config.mcp.codex 结构，在新架构中为空
         // MCP 的启用/禁用应通过 McpService::toggle_app 进行
 
         let cfg_text_after = crate::codex_config::read_and_validate_codex_config_text()?;
+        let cfg_text_after =
+            crate::codex_config::codex_context_config_for_storage(&cfg_text_after, provider)?;
         if let Some(manager) = config.get_manager_mut(&AppType::Codex) {
             if let Some(target) = manager.providers.get_mut(provider_id) {
                 if let Some(obj) = target.settings_config.as_object_mut() {

@@ -3,6 +3,8 @@ Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "release-build-config.ps1")
+. (Join-Path $PSScriptRoot "powershell7-runtime.ps1")
+$powerShell7Executable = Resolve-CcsmPowerShell7Executable
 
 $installer = "C:\Users\sunda\Documents\LLMservice\ccswitchmulti-qwen38-original-toml-root-7e6515db\windows\installer\CCSwitchMulti_3.19.1-31_x64-setup.exe"
 $rawExecutable = Join-Path $repoRoot "src-tauri\target\release\cc-switch.exe"
@@ -39,7 +41,7 @@ $arguments = @(
     "-BackupRoot", $backupRoot
 )
 
-$process = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList $arguments `
+$process = Start-Process -FilePath $powerShell7Executable -WindowStyle Hidden -PassThru -ArgumentList $arguments `
     -RedirectStandardOutput $resultPath -RedirectStandardError $stderrPath
 
 [pscustomobject]@{

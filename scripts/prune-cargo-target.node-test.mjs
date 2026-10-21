@@ -8,7 +8,117 @@ import {
   maintainCargoTarget,
   parseCleanupOptions,
   processOwnsCargoTarget,
+  windowsCargoProcesses,
 } from "./prune-cargo-target.mjs";
+
+test("Windows target ownership uses only PowerShell 7 with a bounded UTF-8 probe", () => {
+  const owners = windowsCargoProcesses({
+    run: (executable, args, options) => {
+      assert.equal(executable, "pwsh.exe");
+      assert.equal(options.timeout, 10_000);
+      assert.equal(options.encoding, "utf8");
+      assert.equal(options.windowsHide, true);
+      assert.match(
+        args.at(-1),
+        /Get-CimInstance Win32_Process -ErrorAction Stop/,
+      );
+      assert.match(args.at(-1), /\$PSVersionTable\.PSVersion\.Major -lt 7/);
+      return {
+        status: 0,
+        stdout: JSON.stringify({
+          Name: "cargo.exe",
+          ProcessId: 42,
+          ExecutablePath: "C:/fixture/cargo.exe",
+          CommandLine: "cargo check --manifest-path D:/fixture/Cargo.toml",
+        }),
+      };
+    },
+  });
+  assert.equal(owners.length, 1);
+  assert.equal(owners[0].ProcessId, 42);
+});
+
+test("Windows ownership probe failures prevent cleanup without exposing process output", () => {
+  for (const failure of [
+    { status: 1, stderr: "[REDACTED_PROCESS_OUTPUT]" },
+    {
+      error: Object.assign(new Error("[REDACTED_PROCESS_OUTPUT]"), {
+        code: "ETIMEDOUT",
+      }),
+    },
+  ]) {
+    const calls = [];
+    assert.throws(
+      () =>
+        maintainCargoTarget({
+          actualTarget: "src-tauri/target",
+          options: { dryRun: false, force: true, maxGb: 5 },
+          getOwners: () => windowsCargoProcesses({ run: () => failure }),
+          measureSize: () => calls.push("measure"),
+          clean: () => calls.push("clean"),
+          log: () => calls.push("log"),
+        }),
+      (error) => {
+        assert.match(error.message, /PowerShell 7/);
+        assert.equal(error.message.includes("REDACTED_PROCESS_OUTPUT"), false);
+        return true;
+      },
+    );
+    assert.deepEqual(calls, []);
+  }
+});
+
+test("Windows malformed ownership results prevent cleanup without exposing process output", () => {
+  const calls = [];
+  assert.throws(
+    () =>
+      maintainCargoTarget({
+        actualTarget: "src-tauri/target",
+        options: { dryRun: false, force: true, maxGb: 5 },
+        getOwners: () =>
+          windowsCargoProcesses({
+            run: () => ({ status: 0, stdout: "[REDACTED_PROCESS_OUTPUT]" }),
+          }),
+        measureSize: () => calls.push("measure"),
+        clean: () => calls.push("clean"),
+        log: () => calls.push("log"),
+      }),
+    (error) => {
+      assert.match(error.message, /query returned malformed JSON/);
+      assert.equal(error.message.includes("REDACTED_PROCESS_OUTPUT"), false);
+      return true;
+    },
+  );
+  assert.deepEqual(calls, []);
+});
+
+test("Windows incomplete owner identities block target measurement and cleanup", () => {
+  const calls = [];
+  assert.throws(
+    () =>
+      maintainCargoTarget({
+        actualTarget: "src-tauri/target",
+        options: { dryRun: false, force: true, maxGb: 5 },
+        getOwners: () =>
+          windowsCargoProcesses({
+            run: () => ({
+              status: 0,
+              stdout: JSON.stringify({
+                Name: "cargo.exe",
+                ProcessId: 42,
+                ExecutablePath: null,
+                CommandLine: null,
+              }),
+            }),
+          }),
+        measureSize: () => calls.push("measure"),
+        clean: () => calls.push("clean"),
+        log: () => calls.push("log"),
+      }),
+    /returned incomplete ownership data/,
+  );
+  assert.deepEqual(calls, []);
+});
 
 test("cleanup options use a bounded default and accept overrides", () => {
   assert.deepEqual(parseCleanupOptions([], {}), {

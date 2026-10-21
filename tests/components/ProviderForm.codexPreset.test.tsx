@@ -1,4 +1,5 @@
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -12,6 +13,7 @@ import { toast } from "sonner";
 import { ProviderForm } from "@/components/providers/forms/ProviderForm";
 import { CodexProviderSetCancelled } from "@/components/providers/forms/useCodexProviderSetSave";
 import type { Provider } from "@/types";
+import type { ManagedAuthStatus } from "@/lib/api/auth";
 import * as providerConfigUtils from "@/utils/providerConfigUtils";
 import { readCodexModelProtocolCapability } from "@/lib/codexProtocolCapability";
 import { createSingleCodexProtocolLabAdapter } from "@/lib/protocol-lab/codex-adapters";
@@ -19,6 +21,7 @@ import { createSingleCodexProtocolLabAdapter } from "@/lib/protocol-lab/codex-ad
 const codexCandidateApiMocks = vi.hoisted(() => ({
   validateProviderCandidate: vi.fn(),
   getTeProviderDescriptor: vi.fn().mockResolvedValue(null),
+  authGetStatus: vi.fn().mockResolvedValue({ authenticated: false }),
 }));
 
 vi.mock("@/lib/query", () => ({
@@ -42,7 +45,7 @@ vi.mock("@/lib/api", async () => {
   return {
     ...actual,
     authApi: {
-      authGetStatus: vi.fn().mockResolvedValue({ authenticated: false }),
+      authGetStatus: codexCandidateApiMocks.authGetStatus,
       authStartLogin: vi.fn(),
       authPollForAccount: vi.fn(),
       authLogout: vi.fn(),
@@ -61,6 +64,10 @@ vi.mock("@/lib/api", async () => {
     },
     providersApi: {
       ...actual.providersApi,
+      migrateCodexOfficialAuthOwnership: vi.fn().mockResolvedValue({
+        state: "already_current",
+        conflictingRouterIds: [],
+      }),
       getTeProviderDescriptor: (...args: unknown[]) =>
         codexCandidateApiMocks.getTeProviderDescriptor(...args),
     },
@@ -122,7 +129,11 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
     presetCatalogModels,
     takeoverEnabled,
     allowModelMenuProjectionToggle,
+    isCanonicalOfficial,
+    officialAccountId,
+    officialManagedOAuth,
     onApiKeyChange,
+    onTakeoverEnabledChange,
     onCatalogModelsChange,
     onProtocolProbeReceiptIdsChange,
     onProtocolModeChange,
@@ -139,7 +150,11 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
     presetCatalogModels?: Array<{ model: string; reasoning?: unknown }>;
     takeoverEnabled: boolean;
     allowModelMenuProjectionToggle?: boolean;
+    isCanonicalOfficial?: boolean;
+    officialAccountId?: string | null;
+    officialManagedOAuth?: boolean;
     onApiKeyChange?: (value: string) => void;
+    onTakeoverEnabledChange?: (value: boolean) => void;
     onCatalogModelsChange?: (
       models: Array<{ model: string; contextWindow?: number | string }>,
     ) => void;
@@ -159,6 +174,19 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
       <div data-testid="codex-menu-projection-editability">
         {allowModelMenuProjectionToggle ? "editable" : "managed"}
       </div>
+      <div data-testid="codex-official-context-source">
+        {isCanonicalOfficial
+          ? officialManagedOAuth
+            ? `managed:${officialAccountId ?? ""}`
+            : "public"
+          : "third-party"}
+      </div>
+      <button
+        type="button"
+        onClick={() => onTakeoverEnabledChange?.(!takeoverEnabled)}
+      >
+        mock-toggle-projection
+      </button>
       <div data-testid="codex-catalog">
         {(catalogModels ?? []).map((model) => model.model).join(",")}
       </div>
@@ -222,13 +250,16 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
 function renderProviderForm(
   props: Partial<ComponentProps<typeof ProviderForm>> = {},
   providers?: Record<string, Provider>,
+  suppliedQueryClient?: QueryClient,
 ) {
-  const queryClient = new QueryClient({
-    defaultOptions: {
-      queries: { retry: false },
-      mutations: { retry: false },
-    },
-  });
+  const queryClient =
+    suppliedQueryClient ??
+    new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
   if (providers) {
     queryClient.setQueryDefaults(["providers", "codex"], {
       staleTime: Infinity,
@@ -267,11 +298,319 @@ const legacyTeProviderSettings = {
   },
 };
 
+function managedCodexStatus(defaultAccountId: string): ManagedAuthStatus {
+  return {
+    provider: "codex_oauth",
+    authenticated: true,
+    default_account_id: defaultAccountId,
+    migration_error: null,
+    auth_error: null,
+    accounts: ["account-a", "account-b"].map((id) => ({
+      id,
+      provider: "codex_oauth",
+      login: `synthetic-${id}`,
+      avatar_url: null,
+      authenticated_at: 1,
+      is_default: id === defaultAccountId,
+      github_domain: "",
+      requires_reauth: false,
+    })),
+  };
+}
+
+function managedCodexQueryClient(defaultAccountId: string) {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  });
+  queryClient.setQueryData(
+    ["managed-auth-status", "codex_oauth"],
+    managedCodexStatus(defaultAccountId),
+  );
+  return queryClient;
+}
+
 describe("ProviderForm Codex preset selection", () => {
   beforeEach(() => {
+    codexCandidateApiMocks.authGetStatus
+      .mockReset()
+      .mockResolvedValue({ authenticated: false });
     codexCandidateApiMocks.validateProviderCandidate
       .mockReset()
       .mockResolvedValue(undefined);
+  });
+
+  it("follows the current default OAuth account for official context discovery without changing the selected binding", async () => {
+    const queryClient = managedCodexQueryClient("account-a");
+    renderProviderForm(
+      {
+        providerId: "codex-official",
+        initialData: {
+          name: "OpenAI Official",
+          category: "official",
+          settingsConfig: {
+            auth: { OPENAI_API_KEY: null },
+            config: 'model = "native-official-model"\n',
+            modelCatalog: { models: [] },
+          },
+          meta: { codexOfficialAuth: { mode: "managed_oauth" } },
+        },
+      },
+      undefined,
+      queryClient,
+    );
+
+    expect(
+      screen.getByTestId("codex-official-context-source"),
+    ).toHaveTextContent("managed:account-a");
+
+    await act(async () => {
+      queryClient.setQueryData(
+        ["managed-auth-status", "codex_oauth"],
+        managedCodexStatus("account-b"),
+      );
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("codex-official-context-source"),
+      ).toHaveTextContent("managed:account-b"),
+    );
+
+    expect(
+      screen.getByRole("combobox", { name: "CCSM OAuth 固定账号" }),
+    ).toHaveValue("");
+  });
+
+  it("keeps an explicit official context OAuth account pinned when the default account changes", async () => {
+    const queryClient = managedCodexQueryClient("account-a");
+    renderProviderForm(
+      {
+        providerId: "codex-official",
+        initialData: {
+          name: "OpenAI Official",
+          category: "official",
+          settingsConfig: {
+            auth: { OPENAI_API_KEY: null },
+            config: 'model = "native-official-model"\n',
+            modelCatalog: { models: [] },
+          },
+          meta: {
+            codexOfficialAuth: {
+              mode: "managed_oauth",
+              accountId: "account-a",
+            },
+          },
+        },
+      },
+      undefined,
+      queryClient,
+    );
+
+    expect(
+      screen.getByTestId("codex-official-context-source"),
+    ).toHaveTextContent("managed:account-a");
+
+    await act(async () => {
+      queryClient.setQueryData(
+        ["managed-auth-status", "codex_oauth"],
+        managedCodexStatus("account-b"),
+      );
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "CCSM OAuth 固定账号" }),
+      ).toHaveValue("account-a"),
+    );
+    expect(
+      screen.getByTestId("codex-official-context-source"),
+    ).toHaveTextContent("managed:account-a");
+  });
+
+  it("preserves the official catalog and native config when switching authentication", async () => {
+    codexCandidateApiMocks.authGetStatus.mockResolvedValue({
+      authenticated: true,
+      accounts: [
+        {
+          id: "managed-account",
+          login: "test-account",
+          is_default: true,
+          requires_reauth: false,
+        },
+      ],
+    });
+    const onSubmit = vi.fn();
+    const config = 'model = "official-disabled"\n';
+    const catalog = {
+      models: [
+        {
+          model: "official-active",
+          upstreamModel: "upstream-active",
+          contextWindow: 272000,
+        },
+        { model: "official-disabled", enabled: false },
+      ],
+      spawnAgentModels: ["official-active"],
+    };
+    renderProviderForm({
+      providerId: "codex-official",
+      showButtons: true,
+      submitLabel: "Save",
+      onSubmit,
+      initialData: {
+        name: "OpenAI Official",
+        category: "official",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: null },
+          config,
+          modelCatalog: catalog,
+        },
+        meta: { codexOfficialAuth: { mode: "desktop_current_login" } },
+      },
+    });
+
+    expect(
+      screen.getByTestId("codex-official-context-source"),
+    ).toHaveTextContent("public");
+    fireEvent.change(
+      await screen.findByRole("combobox", { name: "官方认证方式" }),
+      { target: { value: "managed_oauth" } },
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "CCSM OAuth 固定账号" }),
+      ).toHaveValue("managed-account"),
+    );
+    expect(
+      screen.getByTestId("codex-official-context-source"),
+    ).toHaveTextContent("managed:managed-account");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    const saved = onSubmit.mock.calls[0][0];
+    expect(saved.meta.codexOfficialAuth).toEqual({
+      mode: "managed_oauth",
+      accountId: "managed-account",
+    });
+    const settings = JSON.parse(saved.settingsConfig);
+    expect(settings.modelCatalog).toMatchObject(catalog);
+    expect(settings.config).toBe(config);
+    expect(settings).not.toHaveProperty("codexRouting");
+  });
+
+  it("saves the official model menu projection opt-in without rewriting native config", async () => {
+    const onSubmit = vi.fn();
+    const config = 'model = "native-official-model"\n';
+    renderProviderForm({
+      providerId: "codex-official",
+      showButtons: true,
+      submitLabel: "Save",
+      onSubmit,
+      initialData: {
+        name: "OpenAI Official",
+        category: "official",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: null },
+          config,
+          modelCatalog: { models: [] },
+        },
+        meta: {
+          codexOfficialAuth: { mode: "desktop_current_login" },
+          codexLocalModelMapping: false,
+        },
+      },
+    });
+
+    expect(screen.getByTestId("codex-takeover")).toHaveTextContent("disabled");
+    fireEvent.click(
+      screen.getByRole("button", { name: "mock-toggle-projection" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    const saved = onSubmit.mock.calls[0][0];
+    expect(saved.meta.codexLocalModelMapping).toBe(true);
+    expect(JSON.parse(saved.settingsConfig)).toMatchObject({
+      config,
+      modelCatalog: { models: [] },
+    });
+  });
+
+  it("preserves an explicitly empty official catalog over stale legacy models when switching authentication", async () => {
+    const onSubmit = vi.fn();
+    const config = 'model = "native-official-model"\n';
+    renderProviderForm({
+      providerId: "codex-official",
+      showButtons: true,
+      submitLabel: "Save",
+      onSubmit,
+      initialData: {
+        name: "OpenAI Official",
+        category: "official",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: null },
+          config,
+          modelCatalog: { models: [] },
+          model_catalog: {
+            models: [{ model: "stale-legacy-model" }],
+            spawnAgentModels: ["stale-legacy-model"],
+          },
+        },
+        meta: { codexOfficialAuth: { mode: "desktop_current_login" } },
+      },
+    });
+
+    fireEvent.change(
+      await screen.findByRole("combobox", { name: "官方认证方式" }),
+      { target: { value: "account_pool" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    const saved = onSubmit.mock.calls[0][0];
+    expect(saved.meta.codexOfficialAuth).toEqual({ mode: "account_pool" });
+    const settings = JSON.parse(saved.settingsConfig);
+    expect(settings.modelCatalog).toEqual({ models: [] });
+    expect(settings).not.toHaveProperty("model_catalog");
+    expect(settings).not.toHaveProperty("codexRouting");
+    expect(settings.config).toBe(config);
+  });
+
+  it("keeps an unconfigured official catalog absent when switching authentication", async () => {
+    const onSubmit = vi.fn();
+    const config = 'model = "native-official-model"\n';
+    renderProviderForm({
+      providerId: "codex-official",
+      showButtons: true,
+      submitLabel: "Save",
+      onSubmit,
+      initialData: {
+        name: "OpenAI Official",
+        category: "official",
+        settingsConfig: {
+          auth: { OPENAI_API_KEY: null },
+          config,
+        },
+        meta: { codexOfficialAuth: { mode: "desktop_current_login" } },
+      },
+    });
+
+    fireEvent.change(
+      await screen.findByRole("combobox", { name: "官方认证方式" }),
+      { target: { value: "account_pool" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    const saved = onSubmit.mock.calls[0][0];
+    expect(saved.meta.codexOfficialAuth).toEqual({ mode: "account_pool" });
+    const settings = JSON.parse(saved.settingsConfig);
+    expect(settings).not.toHaveProperty("modelCatalog");
+    expect(settings).not.toHaveProperty("codexRouting");
+    expect(settings.config).toBe(config);
   });
 
   it("defaults new Codex providers to model menu projection", async () => {

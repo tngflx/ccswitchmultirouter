@@ -14,10 +14,10 @@
 //! 重发同一上游请求，并抑制重复的 `message_start`，对客户端完全透明；一旦转发过
 //! 实质内容，行为与现状一致（错误事件透传）。
 //!
-//! 上游语义性失败（`response.failed`/`error` 事件）不重试：那是上游的明确判决，
-//! 与 #5546 在提交边界前的处理保持同一分界。可重试与否由转换器附加的
-//! [`RETRYABLE_STREAM_MARKER`] 注释行标识，而非事件里的 `error.type`——后者
-//! 逐字透传自上游可控字段，不可信。
+//! 上游明确失败由共享 terminal policy 分类：配额、鉴权、权限等永久错误不重试，
+//! 临时过载只在尚未交付实质输出时重连。传输失败的可重试标记由转换器附加的
+//! [`RETRYABLE_STREAM_MARKER`] 注释行提供，不能仅凭上游透传的 `error.type`
+//! 绕过永久错误或已交付输出的边界。
 //!
 //! 包装器同时承担正常流转期间的思考期心跳：推理模型隐藏思考时上游可整段
 //! 无事件，`message_start` 之后上游每静默 [`KEEPALIVE_INTERVAL`] 即向下游发
@@ -26,13 +26,17 @@
 //! 长思考误判为断流。
 
 use super::codex_terminal::{
-    classify_native_responses_terminal, NativeResponsesEvidence, NativeResponsesTerminalDisposition,
+    classify_native_responses_terminal, terminal_error_code, terminal_error_code_from_body,
+    NativeResponsesEvidence, NativeResponsesTerminalDisposition,
 };
 use super::streaming_responses::{
     anthropic_error_sse, anthropic_sse,
     create_anthropic_sse_stream_from_responses_with_web_search_options, RETRYABLE_STREAM_MARKER,
 };
 use crate::proxy::error::ProxyError;
+use crate::proxy::forwarder::{
+    parse_retry_after_delay, CODEX_RATE_LIMIT_MAX_SINGLE_DELAY, CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET,
+};
 use crate::proxy::hyper_client::ProxyResponse;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::{Bytes, BytesMut};
@@ -88,11 +92,227 @@ pub(crate) type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Er
 type ConnectFuture = Pin<Box<dyn Future<Output = Result<ProxyResponse, ProxyError>> + Send>>;
 pub(crate) type ConnectFn = Box<dyn Fn() -> ConnectFuture + Send + Sync>;
 
+#[derive(Clone, Copy)]
+struct ReconnectTerminal {
+    code: &'static str,
+    message: &'static str,
+}
+
+impl ReconnectTerminal {
+    fn new(code: &'static str) -> Self {
+        let message = match code {
+            "authentication_error" => "Upstream authentication failed during reconnect; refresh the provider credentials before retrying.",
+            "permission_denied" => "The upstream provider denied this request; review the provider permissions before retrying.",
+            "insufficient_quota" => "The upstream provider has no usable quota; review the provider billing or usage limits before retrying.",
+            "context_length_exceeded" => "The upstream request exceeds the context limit; reduce its context before retrying.",
+            "response_pending" => "The upstream request may still be running; automatic replay stopped because its outcome is unknown.",
+            "overloaded_error" => "The upstream provider is overloaded; automatic capacity retry is disabled.",
+            _ => "The upstream request or reconnect configuration was rejected; review it before retrying.",
+        };
+        Self { code, message }
+    }
+
+    fn native(self, response_id: Option<&str>) -> Bytes {
+        let payload = json!({"type":"error","error":{"type":self.code,"code":self.code,"message":self.message,"retryable":false}});
+        native_responses_client_failure(
+            Bytes::from(format!("event: error\ndata: {payload}\n\n")),
+            response_id,
+        )
+    }
+
+    fn chat(self) -> Bytes {
+        let payload = json!({"error":{"type":self.code,"code":self.code,"message":self.message,"retryable":false}});
+        Bytes::from(format!("data: {payload}\n\ndata: [DONE]\n\n"))
+    }
+
+    fn anthropic(self) -> Bytes {
+        anthropic_error_sse(self.message, self.code)
+    }
+}
+
+struct ReconnectFailure {
+    reason: String,
+    reason_class: &'static str,
+    terminal: Option<ReconnectTerminal>,
+    retry_after: Option<Duration>,
+    long_wait_capacity: bool,
+}
+
+enum ReconnectProgress {
+    Heartbeat,
+    Finished(Result<ByteStream, ReconnectFailure>),
+}
+
+fn permanent_reconnect_status(status: http::StatusCode) -> Option<ReconnectTerminal> {
+    let code = match status.as_u16() {
+        401 => "authentication_error",
+        402 => "insufficient_quota",
+        403 => "permission_denied",
+        400..=499 if !matches!(status.as_u16(), 408 | 425 | 429) => "invalid_request_error",
+        _ => return None,
+    };
+    Some(ReconnectTerminal::new(code))
+}
+
+fn permanent_reconnect_payload(payload: &Value) -> Option<ReconnectTerminal> {
+    terminal_error_code("response.failed", payload).map(permanent_reconnect_terminal)
+}
+
+fn permanent_reconnect_terminal(code: &'static str) -> ReconnectTerminal {
+    let code = match code {
+        "response_pending" => "response_pending",
+        "authentication_error" => "authentication_error",
+        "insufficient_quota" => "insufficient_quota",
+        "permission_denied" => "permission_denied",
+        "context_length_exceeded" => "context_length_exceeded",
+        // Cancellation and all other permanent request categories remain
+        // terminal, but use the adapter's generic static request code.
+        _ => "invalid_request_error",
+    };
+    ReconnectTerminal::new(code)
+}
+
+impl ReconnectFailure {
+    fn from_error(error: &ProxyError) -> Self {
+        let terminal = match error {
+            ProxyError::AuthError(_) => Some(ReconnectTerminal::new("authentication_error")),
+            ProxyError::ResponsePending(_) => Some(ReconnectTerminal::new("response_pending")),
+            ProxyError::InvalidRequest(_)
+            | ProxyError::ConfigError(_)
+            | ProxyError::RequestHealthBlocked(_) => {
+                Some(ReconnectTerminal::new("invalid_request_error"))
+            }
+            ProxyError::UpstreamError { status, body } => body
+                .as_deref()
+                .and_then(terminal_error_code_from_body)
+                .map(permanent_reconnect_terminal)
+                .or_else(|| {
+                    http::StatusCode::from_u16(*status)
+                        .ok()
+                        .and_then(permanent_reconnect_status)
+                }),
+            _ => None,
+        };
+        Self {
+            reason: "reconnect transport or preflight failed".to_string(),
+            reason_class: "reconnect_transport_failure",
+            terminal,
+            retry_after: None,
+            long_wait_capacity: false,
+        }
+    }
+
+    async fn from_response(response: ProxyResponse, capacity_enabled: bool) -> Self {
+        let status = response.status();
+        let retry_after = parse_retry_after_delay(response.headers());
+        let mut failure = Self {
+            reason: format!("reconnect got HTTP {} from upstream", status.as_u16()),
+            reason_class: "reconnect_http_failure",
+            terminal: permanent_reconnect_status(status),
+            retry_after,
+            long_wait_capacity: false,
+        };
+        if failure.terminal.is_some() {
+            crate::proxy::error_journal::capture_discarded_response(response);
+            return failure;
+        }
+        const ERROR_BODY_LIMIT: usize = 16 * 1024;
+        let encoding = crate::proxy::content_encoding::get_content_encoding(response.headers());
+        let body = match tokio::time::timeout(
+            Duration::from_secs(5),
+            response.bytes_with_limit(ERROR_BODY_LIMIT),
+        )
+        .await
+        {
+            Ok(Ok(bytes)) => match encoding {
+                Some(encoding) => crate::proxy::content_encoding::decompress_body_with_limit(
+                    &encoding,
+                    &bytes,
+                    ERROR_BODY_LIMIT,
+                )
+                .ok()
+                .flatten(),
+                None => Some(bytes.to_vec()),
+            },
+            _ => None,
+        };
+        let text = body
+            .as_deref()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok());
+        let payload = text.and_then(|text| serde_json::from_str::<Value>(text).ok());
+        failure.terminal = text
+            .and_then(terminal_error_code_from_body)
+            .map(permanent_reconnect_terminal);
+        if failure.terminal.is_none() {
+            if capacity_enabled && is_capacity_error_response(status, text) {
+                failure.long_wait_capacity = capacity_error_body_requires_long_wait(text);
+            } else if !capacity_enabled
+                && payload
+                    .as_ref()
+                    .is_some_and(|payload| is_capacity_error_payload(payload, Some(status)))
+            {
+                failure.terminal = Some(ReconnectTerminal::new("overloaded_error"));
+            }
+        }
+        failure
+    }
+}
+
+#[derive(Default)]
+struct ReconnectWaitState {
+    retry_after: Option<Duration>,
+    long_wait_capacity: bool,
+    total_delay: Duration,
+}
+
+impl ReconnectWaitState {
+    fn record(&mut self, failure: &ReconnectFailure) {
+        self.retry_after = failure.retry_after;
+        self.long_wait_capacity |= failure.long_wait_capacity;
+    }
+
+    fn budget(&self, long_wait: bool) -> Duration {
+        if long_wait || self.long_wait_capacity {
+            CAPACITY_RETRY_LONG_TOTAL_DELAY_BUDGET
+        } else {
+            CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET
+        }
+    }
+
+    fn exhausted(&self, long_wait: bool) -> bool {
+        self.total_delay >= self.budget(long_wait)
+    }
+
+    fn delay(&mut self, attempt: u32, long_wait: bool) -> Duration {
+        self.long_wait_capacity |= long_wait;
+        let long_wait = self.long_wait_capacity;
+        let fallback = if long_wait {
+            capacity_retry_delay(attempt)
+        } else {
+            backoff_delay(attempt)
+        };
+        let single_cap = if long_wait {
+            capacity_retry_delay(attempt)
+        } else {
+            CODEX_RATE_LIMIT_MAX_SINGLE_DELAY
+        };
+        // Clamp before adding to an Instant: Retry-After can contain u64::MAX.
+        let delay = self
+            .retry_after
+            .take()
+            .unwrap_or(fallback)
+            .min(single_cap)
+            .min(self.budget(long_wait).saturating_sub(self.total_delay));
+        self.total_delay += delay;
+        delay
+    }
+}
+
 /// 重新向同一供应商发起原始上游请求的工厂。
 ///
 /// 由 `Forwarder::forward` 在发出首次请求前捕获最终解析的 URL/headers/body 构造；
-/// 每次调用发出一条全新的上游连接（认证头沿用首次请求的令牌，重试窗口只有数秒，
-/// 不需要重新走令牌刷新）。
+/// 每次调用发出一条全新的上游连接；工厂在发送前重新验证当前重试策略与
+/// 捕获的供应商/账号身份，并刷新该账号的托管认证，覆盖容量重试的长等待。
 pub struct StreamReconnector {
     connect: ConnectFn,
     first_byte_timeout: Duration,
@@ -258,16 +478,11 @@ impl StreamReconnector {
         self
     }
 
-    fn retry_limit_for(&self, capacity_error: bool) -> u32 {
-        let _ = capacity_error;
-        self.max_retries
-    }
-
     fn retry_limit(&self) -> u32 {
         self.max_retries
     }
 
-    pub(crate) async fn connect(&self) -> Result<ProxyResponse, ProxyError> {
+    async fn connect(&self) -> Result<ProxyResponse, ReconnectFailure> {
         let diagnostic = crate::proxy::error_journal::Context::new(
             "responses_reconnect",
             &http::HeaderMap::new(),
@@ -287,9 +502,77 @@ impl StreamReconnector {
             }
         }
         .await;
-        result
-            .inspect_err(|error| diagnostic.failed(error))
-            .map(|response| diagnostic.observe(response))
+        match result {
+            Ok(response) => {
+                let response = diagnostic.observe(response);
+                if response.status().is_success() {
+                    Ok(response)
+                } else {
+                    Err(
+                        ReconnectFailure::from_response(response, self.capacity_retry_enabled)
+                            .await,
+                    )
+                }
+            }
+            Err(error) => {
+                diagnostic.failed(&error);
+                Err(ReconnectFailure::from_error(&error))
+            }
+        }
+    }
+
+    /// Run one already-scheduled attempt with the same backoff, keepalive, and
+    /// failed-attempt accounting for every wire protocol. Callers retain their
+    /// semantic replay gates and translate heartbeats/terminal errors themselves.
+    fn connect_with_keepalives<'a>(
+        &'a self,
+        wait: &'a mut ReconnectWaitState,
+        activity: &'a mut StreamRetryActivityGuard,
+        stage: &'static str,
+        attempt: u32,
+        long_wait: bool,
+    ) -> impl Stream<Item = ReconnectProgress> + Send + 'a {
+        async_stream::stream! {
+            // A cold scheduled retry must reach the downstream before either
+            // sleeping or refreshing credentials/dispatching another request.
+            yield ReconnectProgress::Heartbeat;
+            let mut remaining = wait.delay(attempt, long_wait);
+            while !remaining.is_zero() {
+                let slice = remaining.min(KEEPALIVE_INTERVAL);
+                tokio::time::sleep(slice).await;
+                remaining = remaining.saturating_sub(slice);
+                if !remaining.is_zero() {
+                    yield ReconnectProgress::Heartbeat;
+                }
+            }
+
+            let connect = self.connect();
+            futures::pin_mut!(connect);
+            let result = loop {
+                match tokio::time::timeout(KEEPALIVE_INTERVAL, connect.as_mut()).await {
+                    Ok(result) => break result,
+                    Err(_) => yield ReconnectProgress::Heartbeat,
+                }
+            };
+            match &result {
+                Ok(_) => activity.emit(stage, "reconnected", attempt, self.retry_limit(), None),
+                Err(failure) => {
+                    activity.emit(
+                        stage,
+                        "reconnect_failed",
+                        attempt,
+                        self.retry_limit(),
+                        Some(failure.reason_class),
+                    );
+                    if failure.terminal.is_none() {
+                        wait.record(failure);
+                    }
+                }
+            }
+            yield ReconnectProgress::Finished(result.map(|response| {
+                Box::pin(response.bytes_stream()) as ByteStream
+            }));
+        }
     }
 }
 
@@ -304,12 +587,24 @@ fn upstream_sse_block_is_error(block: &[u8]) -> bool {
         .is_some_and(|value| value.get("error").is_some())
 }
 
+fn anthropic_sse_block_type(block: &[u8]) -> Option<String> {
+    // Match the converter's type precedence, including data-only SSE blocks.
+    raw_responses_sse_payload(block)
+        .and_then(|payload| {
+            payload
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| raw_responses_sse_event_name(block))
+}
+
 fn anthropic_sse_block_is_semantic(block: &[u8]) -> bool {
-    if raw_sse_block_is_comment(block) || upstream_sse_block_is_error(block) {
+    if raw_sse_block_is_comment(block) {
         return false;
     }
-    let event = raw_responses_sse_event_name(block);
-    !matches!(event.as_deref(), None | Some("message_start" | "ping"))
+    let event = anthropic_sse_block_type(block);
+    !matches!(event.as_deref(), Some("message_start" | "ping" | "error"))
 }
 
 /// Reconnect raw Anthropic Messages SSE before the Responses converter.
@@ -330,6 +625,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
         let mut current = Some(initial);
         let mut semantic_output_seen = false;
         let mut retry_attempt = 0u32;
+        let mut retry_wait = ReconnectWaitState::default();
         let mut long_wait_capacity_mode = false;
         let mut scaffold_forwarded = false;
 
@@ -348,7 +644,8 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                     }
                     Err(_) => {
                         silence += KEEPALIVE_INTERVAL;
-                        if scaffold_forwarded && silence <= UPSTREAM_SILENCE_KEEPALIVE_LIMIT {
+                        if (scaffold_forwarded || retry_attempt > 0)
+                            && silence <= UPSTREAM_SILENCE_KEEPALIVE_LIMIT {
                             yield Ok(Bytes::from_static(b": ping\n\n"));
                         }
                         continue;
@@ -401,14 +698,14 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                         break 'read;
                     }
                     if matches!(
-                        raw_responses_sse_event_name(&block).as_deref(),
+                        anthropic_sse_block_type(&block).as_deref(),
                         Some("message_start")
                     ) {
                         scaffold_forwarded = true;
                     }
                     semantic_output_seen |= anthropic_sse_block_is_semantic(&block);
                     let terminal = matches!(
-                        raw_responses_sse_event_name(&block).as_deref(),
+                        anthropic_sse_block_type(&block).as_deref(),
                         Some("message_stop" | "error")
                     );
                     if terminal {
@@ -443,14 +740,14 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                 break;
             }
 
-            let retry_limit = reconnector.retry_limit_for(is_capacity_retry);
+            let retry_limit = reconnector.retry_limit();
             let reason_class = if is_capacity_retry {
                 "capacity_pressure"
             } else {
                 "stream_interrupted"
             };
             loop {
-                if retry_attempt >= retry_limit {
+                if retry_attempt >= retry_limit || retry_wait.exhausted(long_wait_capacity_mode) {
                     let exhausted_class = if is_capacity_retry {
                         "capacity_retry_exhausted"
                     } else {
@@ -494,56 +791,35 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                         );
                     }
                 }
-                if scaffold_forwarded {
-                    yield Ok(Bytes::from_static(b": ping\n\n"));
-                }
-                let delay = if is_capacity_retry && long_wait_capacity_mode {
-                    capacity_retry_delay(retry_attempt)
-                } else {
-                    backoff_delay(retry_attempt)
-                };
-                let mut remaining = delay;
-                while !remaining.is_zero() {
-                    let slice = remaining.min(KEEPALIVE_INTERVAL);
-                    tokio::time::sleep(slice).await;
-                    remaining = remaining.saturating_sub(slice);
-                    if !remaining.is_zero() && scaffold_forwarded {
-                        yield Ok(Bytes::from_static(b": ping\n\n"));
+                // A comment is valid before message_start and protects cold retries too.
+                let connect_result = {
+                    let progress = reconnector.connect_with_keepalives(
+                        &mut retry_wait,
+                        &mut retry_activity,
+                        "anthropic_messages",
+                        retry_attempt,
+                        is_capacity_retry && long_wait_capacity_mode,
+                    );
+                    futures::pin_mut!(progress);
+                    loop {
+                        match progress.next().await.expect("reconnect attempt reports its result") {
+                            ReconnectProgress::Heartbeat => yield Ok(Bytes::from_static(b": ping\n\n")),
+                            ReconnectProgress::Finished(result) => break result,
+                        }
                     }
-                }
-                match reconnector.connect().await {
-                    Ok(response) if response.status().is_success() => {
-                        retry_activity.emit(
-                            "anthropic_messages",
-                            "reconnected",
-                            retry_attempt,
-                            retry_limit,
-                            None,
-                        );
-                        current = Some(Box::pin(response.bytes_stream()));
+                };
+                match connect_result {
+                    Ok(stream) => {
+                        current = Some(stream);
                         continue 'attempts;
                     }
-                    Ok(response) => {
-                        let status = response.status();
-                        reason = format!("reconnect got HTTP {} from upstream", status.as_u16());
-                        retry_activity.emit(
-                            "anthropic_messages",
-                            "reconnect_failed",
-                            retry_attempt,
-                            retry_limit,
-                            Some("reconnect_http_failure"),
-                        );
-                        crate::proxy::error_journal::capture_discarded_response(response);
-                    }
-                    Err(error) => {
-                        reason = format!("reconnect failed: {error}");
-                        retry_activity.emit(
-                            "anthropic_messages",
-                            "reconnect_failed",
-                            retry_attempt,
-                            retry_limit,
-                            Some("reconnect_transport_failure"),
-                        );
+                    Err(failure) => {
+                        reason = failure.reason.clone();
+                        if let Some(terminal) = failure.terminal {
+                            retry_activity.finish();
+                            yield Ok(terminal.anthropic());
+                            break 'attempts;
+                        }
                     }
                 }
             }
@@ -612,16 +888,19 @@ fn raw_responses_sse_payload(block: &[u8]) -> Option<Value> {
 /// 类型码是强信号；文案只接受明确的容量语义。泛化的 `please try again later`
 /// 只有与 overload 类型或 5xx HTTP 状态组合时才成立，避免把业务错误误重放。
 pub(crate) fn is_capacity_error_payload(payload: &Value, status: Option<http::StatusCode>) -> bool {
+    if permanent_reconnect_payload(payload).is_some() {
+        return false;
+    }
     let error = payload
         .pointer("/response/error")
         .or_else(|| payload.get("error"))
         .unwrap_or(payload);
-    let error_type = error
-        .get("type")
-        .and_then(Value::as_str)
-        .or_else(|| error.get("code").and_then(Value::as_str))
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let error_type = format!(
+        "{} {}",
+        error.get("type").and_then(Value::as_str).unwrap_or(""),
+        error.get("code").and_then(Value::as_str).unwrap_or("")
+    )
+    .to_ascii_lowercase();
     let message = error
         .get("message")
         .and_then(Value::as_str)
@@ -722,47 +1001,7 @@ pub(crate) fn is_capacity_error_response(status: http::StatusCode, body: Option<
 }
 
 fn is_explicit_non_replayable_error_payload(payload: &Value) -> bool {
-    let error = payload
-        .pointer("/response/error")
-        .or_else(|| payload.get("error"))
-        .unwrap_or(payload);
-    let kind = error
-        .get("type")
-        .and_then(Value::as_str)
-        .or_else(|| error.get("code").and_then(Value::as_str))
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .or_else(|| payload.get("message").and_then(Value::as_str))
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    [
-        "quota",
-        "billing",
-        "authentication",
-        "unauthorized",
-        "forbidden",
-        "permission",
-        "policy",
-        "invalid_request",
-        "invalid_parameter",
-        "unsupported_parameter",
-    ]
-    .iter()
-    .any(|marker| kind.contains(marker))
-        || [
-            "quota exhausted",
-            "insufficient quota",
-            "invalid token",
-            "authentication failed",
-            "request blocked by policy",
-            "unsupported parameter",
-        ]
-        .iter()
-        .any(|marker| message.contains(marker))
+    permanent_reconnect_payload(payload).is_some()
 }
 
 struct NativeResponsesSseErrorDiagnostic {
@@ -943,12 +1182,18 @@ fn native_responses_client_failure(block: Bytes, response_id: Option<&str>) -> B
     Bytes::from(format!("event: response.failed\ndata: {failure}\n\n"))
 }
 
-fn raw_sse_block_is_comment(block: &[u8]) -> bool {
-    block
-        .iter()
-        .copied()
-        .find(|byte| !byte.is_ascii_whitespace())
-        == Some(b':')
+pub(crate) fn raw_sse_block_is_comment(block: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(block) else {
+        return false;
+    };
+    let mut comment_seen = false;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        if !line.starts_with(':') {
+            return false;
+        }
+        comment_seen = true;
+    }
+    comment_seen
 }
 
 fn native_responses_transport_error_message(error: &std::io::Error) -> &'static str {
@@ -1021,6 +1266,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
     async_stream::stream! {
         let mut retry_activity = StreamRetryActivityGuard::new(log_context.clone());
         let mut retry_attempt = 0;
+        let mut retry_wait = ReconnectWaitState::default();
         let mut created_forwarded = false;
         let mut response_id: Option<String> = None;
         let mut semantic_output_forwarded = false;
@@ -1042,7 +1288,8 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     }
                     Err(_) => {
                         silence += KEEPALIVE_INTERVAL;
-                        if created_forwarded && silence <= UPSTREAM_SILENCE_KEEPALIVE_LIMIT {
+                        if (created_forwarded || retry_attempt > 0)
+                            && silence <= UPSTREAM_SILENCE_KEEPALIVE_LIMIT {
                             yield Ok(Bytes::from_static(b": ping\n\n"));
                         }
                         continue;
@@ -1186,8 +1433,8 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     ));
                     break 'attempts;
                 };
-                let retry_limit = reconnector.retry_limit_for(retrying_capacity);
-                if retry_attempt >= retry_limit {
+                let retry_limit = reconnector.retry_limit();
+                if retry_attempt >= retry_limit || retry_wait.exhausted(capacity_retry_long_wait_mode) {
                     let message = if retrying_capacity {
                         "上游模型持续处于容量压力，自动续跑次数已耗尽，请稍后重试"
                     } else {
@@ -1236,55 +1483,34 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                         "stream_interrupted"
                     }),
                 );
-                if created_forwarded {
-                    yield Ok(Bytes::from_static(b": ping\n\n"));
-                }
-                let delay = if retrying_capacity && capacity_retry_long_wait_mode {
-                    capacity_retry_delay(retry_attempt)
-                } else {
-                    backoff_delay(retry_attempt)
-                };
-                let mut remaining = delay;
-                while !remaining.is_zero() {
-                    let slice = remaining.min(KEEPALIVE_INTERVAL);
-                    tokio::time::sleep(slice).await;
-                    remaining = remaining.saturating_sub(slice);
-                    if !remaining.is_zero() && created_forwarded {
-                        yield Ok(Bytes::from_static(b": ping\n\n"));
+                let connect_result = {
+                    let progress = reconnector.connect_with_keepalives(
+                        &mut retry_wait,
+                        &mut retry_activity,
+                        "native_responses",
+                        retry_attempt,
+                        retrying_capacity && capacity_retry_long_wait_mode,
+                    );
+                    futures::pin_mut!(progress);
+                    loop {
+                        match progress.next().await.expect("reconnect attempt reports its result") {
+                            ReconnectProgress::Heartbeat => yield Ok(Bytes::from_static(b": ping\n\n")),
+                            ReconnectProgress::Finished(result) => break result,
+                        }
                     }
-                }
-                match reconnector.connect().await {
-                    Ok(response) if response.status().is_success() => {
-                        retry_activity.emit(
-                            "native_responses",
-                            "reconnected",
-                            retry_attempt,
-                            retry_limit,
-                            None,
-                        );
-                        current = Some(Box::pin(response.bytes_stream()));
+                };
+                match connect_result {
+                    Ok(stream) => {
+                        current = Some(stream);
                         continue 'attempts;
                     }
-                    Ok(response) => {
-                        reason = format!("reconnect got HTTP {} from upstream", response.status().as_u16());
-                        retry_activity.emit(
-                            "native_responses",
-                            "reconnect_failed",
-                            retry_attempt,
-                            retry_limit,
-                            Some("reconnect_http_failure"),
-                        );
-                        crate::proxy::error_journal::capture_discarded_response(response);
-                    }
-                    Err(error) => {
-                        retry_activity.emit(
-                            "native_responses",
-                            "reconnect_failed",
-                            retry_attempt,
-                            retry_limit,
-                            Some("reconnect_transport_failure"),
-                        );
-                        reason = format!("reconnect failed: {error}");
+                    Err(failure) => {
+                        reason = failure.reason.clone();
+                        if let Some(terminal) = failure.terminal {
+                            retry_activity.finish();
+                            yield Ok(terminal.native(response_id.as_deref()));
+                            break 'attempts;
+                        }
                     }
                 }
             }
@@ -1306,6 +1532,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
     async_stream::stream! {
         let mut retry_activity = StreamRetryActivityGuard::new(log_context.clone());
         let mut attempt = 0;
+        let mut retry_wait = ReconnectWaitState::default();
         let mut current = Some(initial);
         let mut scaffold_forwarded = false;
         let mut semantic_output_forwarded = false;
@@ -1326,7 +1553,8 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                     }
                     Err(_) => {
                         silence += KEEPALIVE_INTERVAL;
-                        if scaffold_forwarded && silence <= UPSTREAM_SILENCE_KEEPALIVE_LIMIT {
+                        if (scaffold_forwarded || attempt > 0)
+                            && silence <= UPSTREAM_SILENCE_KEEPALIVE_LIMIT {
                             yield Ok(Bytes::from_static(b": ping\n\n"));
                         }
                         continue;
@@ -1478,8 +1706,8 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                 let mut reason = reason;
                 let capacity_retry = reason_class.starts_with("capacity_error");
                 loop {
-                    let effective_max_retries = reconnector.retry_limit_for(capacity_retry);
-                    if attempt >= effective_max_retries {
+                    let effective_max_retries = reconnector.retry_limit();
+                    if attempt >= effective_max_retries || retry_wait.exhausted(capacity_long_wait_mode) {
                         let message = if capacity_retry {
                             "上游 Chat Completions 持续处于容量压力，自动重连已耗尽，请稍后重试"
                         } else {
@@ -1523,60 +1751,35 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                     if let Some(context) = log_context.as_ref() {
                         log_chat_stream_drop(context, "retry_scheduled", &reason, attempt);
                     }
-                    if scaffold_forwarded {
-                        yield Ok(Bytes::from_static(b": ping\n\n"));
-                    }
-                    let delay = if capacity_retry && capacity_long_wait_mode {
-                        capacity_retry_delay(attempt)
-                    } else {
-                        backoff_delay(attempt)
-                    };
-                    let mut remaining = delay;
-                    while !remaining.is_zero() {
-                        let slice = remaining.min(KEEPALIVE_INTERVAL);
-                        tokio::time::sleep(slice).await;
-                        remaining = remaining.saturating_sub(slice);
-                        if !remaining.is_zero() && scaffold_forwarded {
-                            yield Ok(Bytes::from_static(b": ping\n\n"));
+                    let connect_result = {
+                        let progress = reconnector.connect_with_keepalives(
+                            &mut retry_wait,
+                            &mut retry_activity,
+                            "chat_completions",
+                            attempt,
+                            capacity_retry && capacity_long_wait_mode,
+                        );
+                        futures::pin_mut!(progress);
+                        loop {
+                            match progress.next().await.expect("reconnect attempt reports its result") {
+                                ReconnectProgress::Heartbeat => yield Ok(Bytes::from_static(b": ping\n\n")),
+                                ReconnectProgress::Finished(result) => break result,
+                            }
                         }
-                    }
-                    match reconnector.connect().await {
-                        Ok(response) if response.status().is_success() => {
-                            retry_activity.emit(
-                                "chat_completions",
-                                "reconnected",
-                                attempt,
-                                effective_max_retries,
-                                None,
-                            );
-                            current = Some(Box::pin(response.bytes_stream()));
+                    };
+                    match connect_result {
+                        Ok(stream) => {
+                            current = Some(stream);
                             continue 'attempts;
                         }
-                        Ok(response) => {
-                            reason = format!(
-                                "reconnect got HTTP {} from upstream",
-                                response.status().as_u16()
-                            );
-                            reason_class = "reconnect_http_failure".into();
-                            retry_activity.emit(
-                                "chat_completions",
-                                "reconnect_failed",
-                                attempt,
-                                effective_max_retries,
-                                Some(reason_class.as_str()),
-                            );
-                            crate::proxy::error_journal::capture_discarded_response(response);
-                        }
-                        Err(error) => {
-                            reason = format!("reconnect failed: {error}");
-                            reason_class = "reconnect_transport_failure".into();
-                            retry_activity.emit(
-                                "chat_completions",
-                                "reconnect_failed",
-                                attempt,
-                                effective_max_retries,
-                                Some(reason_class.as_str()),
-                            );
+                        Err(failure) => {
+                            reason = failure.reason.clone();
+                            reason_class = failure.reason_class.into();
+                            if let Some(terminal) = failure.terminal {
+                                retry_activity.finish();
+                                yield Ok(terminal.chat());
+                                break 'attempts;
+                            }
                         }
                     }
                 }
@@ -1601,11 +1804,7 @@ fn classify_chat_sse_block(block: &[u8]) -> ChatSseBlockDisposition {
         Ok(text) => text,
         Err(_) => return ChatSseBlockDisposition::Semantic,
     };
-    if text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .is_some_and(|line| line.starts_with(':'))
-    {
+    if raw_sse_block_is_comment(block) {
         return ChatSseBlockDisposition::Comment;
     }
 
@@ -1897,6 +2096,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
         };
 
         let mut attempt: u32 = 0;
+        let mut retry_wait = ReconnectWaitState::default();
         let mut message_start_forwarded = false;
         let mut content_forwarded = false;
         let mut current: Option<ByteStream> = Some(initial);
@@ -1934,8 +2134,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                                 break;
                             }
                             Err(_) => {
-                                if message_start_forwarded
-                                    && tokio::time::Instant::now() < deadline
+                                if tokio::time::Instant::now() < deadline
                                 {
                                     yield Ok(anthropic_sse("ping", &json!({"type": "ping"})));
                                 }
@@ -1960,7 +2159,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                             Ok(item) => break item,
                             Err(_) => {
                                 silent += KEEPALIVE_INTERVAL;
-                                if message_start_forwarded
+                                if (message_start_forwarded || attempt > 0)
                                     && silent <= UPSTREAM_SILENCE_KEEPALIVE_LIMIT
                                 {
                                     yield Ok(anthropic_sse("ping", &json!({"type": "ping"})));
@@ -2020,7 +2219,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
 
             loop {
                 let retry_limit = reconnector.retry_limit();
-                if attempt >= retry_limit {
+                if attempt >= retry_limit || retry_wait.exhausted(false) {
                     retry_activity.emit(
                         "anthropic_messages",
                         "retries_exhausted",
@@ -2051,60 +2250,35 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                     retry_limit,
                     Some("stream_interrupted"),
                 );
-                if message_start_forwarded {
-                    // 喂一下下游的空闲计时器（Anthropic 协议允许任意时刻出现 ping）。
-                    yield Ok(anthropic_sse("ping", &json!({"type": "ping"})));
-                }
-                tokio::time::sleep(backoff_delay(attempt)).await;
+                // Anthropic permits ping before message_start during a scheduled retry.
                 let connect_result = {
-                    let connect = reconnector.connect();
-                    futures::pin_mut!(connect);
+                    let progress = reconnector.connect_with_keepalives(
+                        &mut retry_wait,
+                        &mut retry_activity,
+                        "anthropic_messages",
+                        attempt,
+                        false,
+                    );
+                    futures::pin_mut!(progress);
                     loop {
-                        match tokio::time::timeout(KEEPALIVE_INTERVAL, connect.as_mut()).await {
-                            Ok(result) => break result,
-                            Err(_) => {
-                                if message_start_forwarded {
-                                    yield Ok(anthropic_sse("ping", &json!({"type": "ping"})));
-                                }
-                            }
+                        match progress.next().await.expect("reconnect attempt reports its result") {
+                            ReconnectProgress::Heartbeat => yield Ok(anthropic_sse("ping", &json!({"type": "ping"}))),
+                            ReconnectProgress::Finished(result) => break result,
                         }
                     }
                 };
                 match connect_result {
-                    Ok(response) if response.status().is_success() => {
-                        retry_activity.emit(
-                            "anthropic_messages",
-                            "reconnected",
-                            attempt,
-                            retry_limit,
-                            None,
-                        );
-                        current = Some(Box::pin(response.bytes_stream()));
+                    Ok(stream) => {
+                        current = Some(stream);
                         continue 'attempts;
                     }
-                    Ok(response) => {
-                        reason = format!(
-                            "reconnect got HTTP {} from upstream",
-                            response.status().as_u16()
-                        );
-                        retry_activity.emit(
-                            "anthropic_messages",
-                            "reconnect_failed",
-                            attempt,
-                            retry_limit,
-                            Some("reconnect_http_failure"),
-                        );
-                        crate::proxy::error_journal::capture_discarded_response(response);
-                    }
-                    Err(error) => {
-                        retry_activity.emit(
-                            "anthropic_messages",
-                            "reconnect_failed",
-                            attempt,
-                            retry_limit,
-                            Some("reconnect_transport_failure"),
-                        );
-                        reason = format!("reconnect failed: {error}");
+                    Err(failure) => {
+                        reason = failure.reason.clone();
+                        if let Some(terminal) = failure.terminal {
+                            retry_activity.finish();
+                            yield Ok(terminal.anthropic());
+                            break 'attempts;
+                        }
                     }
                 }
             }
@@ -2419,7 +2593,7 @@ mod tests {
         for protocol in DEV_WATCHDOG_PROTOCOLS {
             take_dev_watchdog_packets();
             let (scaffold, _, _) = dev_watchdog_frames(protocol);
-            let (reconnector, _) = scripted_reconnector(vec![]);
+            let (reconnector, calls) = scripted_reconnector(vec![]);
             let mut stream = dev_watchdog_stream(
                 protocol,
                 chunks_then_error(&[scaffold.as_str()]),
@@ -2431,7 +2605,18 @@ mod tests {
                     break;
                 }
             }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{protocol:?}: the scheduled-retry heartbeat must precede dispatch",
+            );
             drop(stream);
+            tokio::time::advance(Duration::from_secs(120)).await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{protocol:?}: cancellation during backoff must not leave a detached reconnect",
+            );
 
             let packets = take_dev_watchdog_packets();
             assert_eq!(
@@ -2920,6 +3105,603 @@ mod tests {
         assert_eq!(out.matches("event: response.created").count(), 1);
         assert!(out.contains("recovered chat"));
         assert!(!out.contains("capacity_exceeded"));
+    }
+
+    async fn assert_capacity_wait_survives_client_timeouts(
+        protocol: DevWatchdogProtocol,
+        scaffold_first: bool,
+    ) {
+        let overload = "Our servers are currently overloaded. Please try again later.";
+        let (scaffold, _, _) = dev_watchdog_frames(protocol);
+        let (failure, replay) = match protocol {
+            DevWatchdogProtocol::Responses => (
+                capacity_failed("service_unavailable_error", overload),
+                [created(), text_delta("recovered-output"), completed()].concat(),
+            ),
+            DevWatchdogProtocol::Chat => (
+                sse("error", json!({"error":{"type":"server_error","message":overload}})),
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"recovered-output\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ).into(),
+            ),
+            DevWatchdogProtocol::Anthropic => (
+                sse("error", json!({"type":"error","error":{"type":"overloaded_error","message":overload}})),
+                concat!(
+                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"redacted-message\",\"model\":\"redacted-model\"}}\n\n",
+                    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"recovered-output\"}}\n\n",
+                    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+                ).into(),
+            ),
+            DevWatchdogProtocol::Translated => unreachable!(),
+        };
+        let initial = if scaffold_first {
+            ok_chunks(&[scaffold.as_str(), failure.as_str()])
+        } else {
+            ok_chunks(&[failure.as_str()])
+        };
+        let (reconnector, calls) = scripted_reconnector(vec![Ok(streamed_response(&[&replay]))]);
+        let reconnector = reconnector.with_capacity_retry(true);
+        // Match the real handler ordering, including conversion and the outer
+        // first-byte/idle deadlines that a retry-only unit test cannot observe.
+        let converted: ByteStream = match protocol {
+            DevWatchdogProtocol::Responses => {
+                Box::pin(create_resilient_responses_sse_stream_with_context(
+                    initial,
+                    Some(reconnector),
+                    None,
+                    true,
+                ))
+            }
+            DevWatchdogProtocol::Chat => Box::pin(
+                super::super::streaming_codex_chat::create_responses_sse_stream_from_chat(
+                    create_resilient_chat_sse_stream_with_context(initial, Some(reconnector), None),
+                ),
+            ),
+            DevWatchdogProtocol::Anthropic => {
+                let upstream = create_resilient_anthropic_upstream_sse_stream(
+                    initial,
+                    Some(reconnector),
+                    true,
+                    None,
+                );
+                let converted = super::super::streaming_codex_anthropic::create_responses_sse_stream_from_anthropic(upstream);
+                Box::pin(create_resilient_responses_sse_stream_with_context(
+                    Box::pin(converted),
+                    None,
+                    None,
+                    false,
+                ))
+            }
+            DevWatchdogProtocol::Translated => unreachable!(),
+        };
+        let logged = crate::proxy::response_processor::create_logged_passthrough_stream(
+            converted,
+            "capacity-heartbeat-regression",
+            None,
+            crate::proxy::handler_context::StreamingTimeoutConfig {
+                first_byte_timeout: 60,
+                idle_timeout: 120,
+            },
+            None,
+        );
+        let started_at = tokio::time::Instant::now();
+        futures::pin_mut!(logged);
+        let mut out = String::new();
+        while let Some(chunk) = logged.next().await {
+            let chunk = chunk
+                .expect("planned capacity backoff must survive the client-facing timeout wrapper");
+            out.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tokio::time::Instant::now() - started_at,
+            capacity_retry_delay(1)
+        );
+        assert!(
+            out.contains("recovered-output"),
+            "missing recovery output: {out}"
+        );
+        assert_eq!(out.matches("event: response.created").count(), 1);
+        assert!(out.contains("event: response.completed"));
+        assert!(!out.contains("event: response.failed"));
+        assert!(
+            out.matches(": ping").count() >= 29,
+            "retry heartbeats were lost: {out}"
+        );
+        if !scaffold_first {
+            assert!(
+                out.starts_with(": ping"),
+                "only a comment may precede the recovered lifecycle: {out}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_capacity_wait_survives_first_byte_timeout_without_created() {
+        assert_capacity_wait_survives_client_timeouts(DevWatchdogProtocol::Responses, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_capacity_wait_survives_first_byte_timeout_without_role() {
+        assert_capacity_wait_survives_client_timeouts(DevWatchdogProtocol::Chat, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_capacity_wait_survives_idle_timeout_after_role() {
+        assert_capacity_wait_survives_client_timeouts(DevWatchdogProtocol::Chat, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn anthropic_capacity_wait_survives_first_byte_timeout_without_start() {
+        assert_capacity_wait_survives_client_timeouts(DevWatchdogProtocol::Anthropic, false).await;
+    }
+
+    fn reconnect_test_stream(
+        protocol: DevWatchdogProtocol,
+        initial: ByteStream,
+        reconnector: StreamReconnector,
+    ) -> ByteStream {
+        match protocol {
+            DevWatchdogProtocol::Responses => {
+                Box::pin(create_resilient_responses_sse_stream_with_context(
+                    initial,
+                    Some(reconnector),
+                    None,
+                    true,
+                ))
+            }
+            DevWatchdogProtocol::Chat => Box::pin(create_resilient_chat_sse_stream_with_context(
+                initial,
+                Some(reconnector),
+                None,
+            )),
+            DevWatchdogProtocol::Anthropic => {
+                Box::pin(create_resilient_anthropic_upstream_sse_stream(
+                    initial,
+                    Some(reconnector),
+                    true,
+                    None,
+                ))
+            }
+            DevWatchdogProtocol::Translated => Box::pin(
+                create_resilient_anthropic_sse_stream_from_responses(initial, Some(reconnector)),
+            ),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn anthropic_data_only_semantic_frames_never_replay() {
+        let delta = json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"redacted-output"}});
+        let tool = json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"redacted-tool","name":"read_file","input":{}}});
+        for semantic in [
+            format!(
+                "data: {}\n\n",
+                serde_json::to_string_pretty(&delta)
+                    .unwrap()
+                    .replace('\n', "\ndata: ")
+            ),
+            format!("event: message_start\ndata: {tool}\n\n"),
+            "data: {\"unexpected\":\"redacted-output\"}\n\n".to_string(),
+            format!("data: {delta}\n\n"),
+            format!("data: {tool}\n\n"),
+        ] {
+            let (head, text, terminal) = dev_watchdog_frames(DevWatchdogProtocol::Anthropic);
+            let recovered = [head.clone(), text, terminal].concat();
+            let (reconnector, calls) =
+                scripted_reconnector(vec![Ok(streamed_response(&[&recovered]))]);
+            let mut stream = reconnect_test_stream(
+                DevWatchdogProtocol::Anthropic,
+                chunks_then_error(&[&head, &semantic]),
+                reconnector.with_capacity_retry(true),
+            );
+            let mut out = String::new();
+            let mut transport_error_forwarded = false;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(bytes) => out.push_str(&String::from_utf8_lossy(&bytes)),
+                    Err(_) => {
+                        transport_error_forwarded = true;
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "replayed data-only Anthropic semantic output: {semantic}"
+            );
+            assert!(out.contains(&semantic));
+            assert!(
+                transport_error_forwarded,
+                "the downstream converter must receive the actual transport failure"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_reconnect_pending_body_survives_client_idle_timeout() {
+        for protocol in DEV_WATCHDOG_PROTOCOLS {
+            let (head, text, terminal) = dev_watchdog_frames(protocol);
+            let recovered = [head, text, terminal].concat();
+            let pending_body = ProxyResponse::streamed(
+                http::StatusCode::OK,
+                http::HeaderMap::new(),
+                async_stream::stream! {
+                    tokio::time::sleep(Duration::from_secs(130)).await;
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(recovered));
+                },
+            );
+            let (mut reconnector, calls) = scripted_reconnector(vec![Ok(pending_body)]);
+            reconnector.first_byte_timeout = Duration::from_secs(300);
+            let stream = reconnect_test_stream(protocol, chunks_then_error(&[]), reconnector);
+            let logged = crate::proxy::response_processor::create_logged_passthrough_stream(
+                stream,
+                "cold-reconnect-body-heartbeat-regression",
+                None,
+                crate::proxy::handler_context::StreamingTimeoutConfig {
+                    first_byte_timeout: 60,
+                    idle_timeout: 120,
+                },
+                None,
+            );
+            futures::pin_mut!(logged);
+            let mut out = String::new();
+            while let Some(chunk) = logged.next().await {
+                let chunk = chunk
+                    .expect("a permitted cold reconnect must stay alive while its body is pending");
+                out.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{protocol:?}");
+            assert!(out.contains("redacted-output"), "{protocol:?}: {out}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_reconnect_local_errors_stop_before_another_request() {
+        for protocol in DEV_WATCHDOG_PROTOCOLS {
+            for pending in [false, true] {
+                let (head, text, terminal) = dev_watchdog_frames(protocol);
+                let recovered = [head.clone(), text, terminal].concat();
+                let failure = if pending {
+                    ProxyError::ResponsePending("redacted unknown outcome".to_string())
+                } else {
+                    ProxyError::AuthError("redacted authentication failure".to_string())
+                };
+                let (reconnector, calls) =
+                    scripted_reconnector(vec![Ok(streamed_response(&[&recovered])), Err(failure)]);
+                let out = collect(reconnect_test_stream(
+                    protocol,
+                    chunks_then_error(&[&head]),
+                    reconnector.with_capacity_retry(true),
+                ))
+                .await;
+                let code = if pending {
+                    "response_pending"
+                } else {
+                    "authentication_error"
+                };
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "{protocol:?}: {code}");
+                assert!(out.contains(code), "{protocol:?} lost {code}: {out}");
+                assert!(!out.contains("redacted-output"));
+                assert!(!out.contains("redacted authentication failure"));
+                assert!(!out.contains("redacted unknown outcome"));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn comment_prefixed_semantic_frames_never_replay() {
+        for protocol in [
+            DevWatchdogProtocol::Responses,
+            DevWatchdogProtocol::Chat,
+            DevWatchdogProtocol::Anthropic,
+        ] {
+            let (head, text, terminal) = dev_watchdog_frames(protocol);
+            // A comment line can legally share an SSE block with event/data.
+            let semantic = format!(": keepalive\n{text}");
+            let recovered = [head.clone(), text, terminal].concat();
+            let (reconnector, calls) =
+                scripted_reconnector(vec![Ok(streamed_response(&[&recovered]))]);
+            let mut stream = reconnect_test_stream(
+                protocol,
+                chunks_then_error(&[&head, &semantic]),
+                reconnector.with_capacity_retry(true),
+            );
+            let mut out = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(bytes) => out.push_str(&String::from_utf8_lossy(&bytes)),
+                    Err(_) => break,
+                }
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{protocol:?} replayed semantic output hidden behind a comment"
+            );
+            assert!(out.contains("redacted-output"), "{protocol:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn comment_only_classifier_requires_every_nonempty_line_to_be_a_comment() {
+        assert!(raw_sse_block_is_comment(b": one\n: two\n\n"));
+        assert!(!raw_sse_block_is_comment(
+            b": ping\ndata: {\"unknown\":\"payload\"}\n\n"
+        ));
+        assert!(!raw_sse_block_is_comment(b"\n\n"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_reconnect_http_errors_stop_before_another_request() {
+        for protocol in DEV_WATCHDOG_PROTOCOLS {
+            for (status, kind, expected) in [
+                (
+                    http::StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "invalid_request_error",
+                ),
+                (
+                    http::StatusCode::UNAUTHORIZED,
+                    "invalid_api_key",
+                    "authentication_error",
+                ),
+                (
+                    http::StatusCode::FORBIDDEN,
+                    "permission_denied",
+                    "permission_denied",
+                ),
+                (
+                    http::StatusCode::TOO_MANY_REQUESTS,
+                    "insufficient_quota",
+                    "insufficient_quota",
+                ),
+                (
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "token_expired",
+                    "authentication_error",
+                ),
+                (
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "content_filter",
+                    "invalid_request_error",
+                ),
+                (
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "policy_violation",
+                    "permission_denied",
+                ),
+            ] {
+                let (head, text, terminal) = dev_watchdog_frames(protocol);
+                let recovered = [head.clone(), text, terminal].concat();
+                let rejected = ProxyResponse::buffered(
+                    status,
+                    http::HeaderMap::new(),
+                    Bytes::from(json!({"error":{"type":"server_error","code":kind,"message":"redacted rejection"}}).to_string()),
+                );
+                let (reconnector, calls) =
+                    scripted_reconnector(vec![Ok(streamed_response(&[&recovered])), Ok(rejected)]);
+                let out = collect(reconnect_test_stream(
+                    protocol,
+                    chunks_then_error(&[&head]),
+                    reconnector.with_capacity_retry(true),
+                ))
+                .await;
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    1,
+                    "{protocol:?} must stop after permanent HTTP {status}"
+                );
+                assert!(
+                    out.contains(expected),
+                    "{protocol:?} discarded the actionable rejection: {out}"
+                );
+                assert!(
+                    !out.contains("redacted-output"),
+                    "{protocol:?} issued a new request after a permanent rejection"
+                );
+                assert!(!out.contains("retries_exhausted"));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn plaintext_permanent_reconnect_http_errors_stop_before_another_request() {
+        for protocol in DEV_WATCHDOG_PROTOCOLS {
+            for (status, message, expected) in [
+                (
+                    http::StatusCode::TOO_MANY_REQUESTS,
+                    "Daily quota limit reached",
+                    "insufficient_quota",
+                ),
+                (
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Daily usage limit reached; please try again later",
+                    "insufficient_quota",
+                ),
+                (
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "Token expired; sign in again",
+                    "authentication_error",
+                ),
+                (
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Permission denied",
+                    "permission_denied",
+                ),
+            ] {
+                let (head, text, terminal) = dev_watchdog_frames(protocol);
+                let recovered = [head.clone(), text, terminal].concat();
+                let rejected =
+                    ProxyResponse::buffered(status, http::HeaderMap::new(), Bytes::from(message));
+                let (reconnector, calls) =
+                    scripted_reconnector(vec![Ok(streamed_response(&[&recovered])), Ok(rejected)]);
+                let out = collect(reconnect_test_stream(
+                    protocol,
+                    chunks_then_error(&[&head]),
+                    reconnector.with_capacity_retry(true),
+                ))
+                .await;
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    1,
+                    "{protocol:?} must stop after plaintext permanent HTTP {status}"
+                );
+                assert!(
+                    out.contains(expected),
+                    "{protocol:?} discarded the actionable rejection: {out}"
+                );
+                assert!(
+                    !out.contains("redacted-output"),
+                    "{protocol:?} issued a new request after a plaintext permanent rejection"
+                );
+                assert!(!out.contains("retries_exhausted"));
+            }
+        }
+    }
+
+    #[test]
+    fn plaintext_permanent_reconnect_transport_errors_are_terminal() {
+        for status in [429, 503] {
+            for (message, expected) in [
+                ("Daily quota exhausted", "insufficient_quota"),
+                ("Billing payment required", "insufficient_quota"),
+                ("Token expired", "authentication_error"),
+                ("Permission denied", "permission_denied"),
+            ] {
+                let failure = ReconnectFailure::from_error(&ProxyError::UpstreamError {
+                    status,
+                    body: Some(message.to_string()),
+                });
+                assert_eq!(
+                    failure.terminal.map(|terminal| terminal.code),
+                    Some(expected)
+                );
+            }
+        }
+        for message in [
+            "Our servers are currently overloaded. Please try again later.",
+            "Connection reset before completion",
+            "HTTP 429, retry later",
+        ] {
+            let failure = ReconnectFailure::from_error(&ProxyError::UpstreamError {
+                status: 503,
+                body: Some(message.to_string()),
+            });
+            assert!(failure.terminal.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_http_retry_after_is_honored_and_capped() {
+        for protocol in DEV_WATCHDOG_PROTOCOLS {
+            for (requested, expected_wait) in [(7, 7), (999_999, 60)] {
+                let (head, text, terminal) = dev_watchdog_frames(protocol);
+                let recovered = [head.clone(), text, terminal].concat();
+                let mut headers = http::HeaderMap::new();
+                headers.insert(
+                    http::header::RETRY_AFTER,
+                    requested.to_string().parse().unwrap(),
+                );
+                let unavailable = ProxyResponse::buffered(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    headers,
+                    Bytes::from_static(
+                        br#"{"error":{"type":"server_error","message":"temporarily unavailable"}}"#,
+                    ),
+                );
+                let (reconnector, calls) = scripted_reconnector(vec![
+                    Ok(streamed_response(&[&recovered])),
+                    Ok(unavailable),
+                ]);
+                let started_at = tokio::time::Instant::now();
+                let out = collect(reconnect_test_stream(
+                    protocol,
+                    chunks_then_error(&[&head]),
+                    reconnector.with_capacity_retry(true),
+                ))
+                .await;
+                assert_eq!(calls.load(Ordering::SeqCst), 2, "{protocol:?}");
+                assert_eq!(
+                    tokio::time::Instant::now() - started_at,
+                    backoff_delay(1) + Duration::from_secs(expected_wait),
+                    "{protocol:?} ignored or failed to cap Retry-After {requested}",
+                );
+                assert!(
+                    out.contains("redacted-output"),
+                    "{protocol:?} did not recover: {out}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_http_retry_after_respects_total_wait_budget() {
+        for protocol in DEV_WATCHDOG_PROTOCOLS {
+            let (head, text, terminal) = dev_watchdog_frames(protocol);
+            let recovered = [head.clone(), text, terminal].concat();
+            let mut script = vec![Ok(streamed_response(&[&recovered]))];
+            for _ in 0..4 {
+                let mut headers = http::HeaderMap::new();
+                headers.insert(http::header::RETRY_AFTER, "999999".parse().unwrap());
+                script.push(Ok(ProxyResponse::buffered(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    headers,
+                    Bytes::new(),
+                )));
+            }
+            let (reconnector, calls) = scripted_reconnector(script);
+            let started_at = tokio::time::Instant::now();
+            let mut stream = reconnect_test_stream(
+                protocol,
+                chunks_then_error(&[&head]),
+                reconnector.with_capacity_retry(true),
+            );
+            let mut out = String::new();
+            let mut transport_error_forwarded = false;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(bytes) => out.push_str(&String::from_utf8_lossy(&bytes)),
+                    Err(_) => {
+                        transport_error_forwarded = true;
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                4,
+                "{protocol:?} continued after its total wait budget"
+            );
+            assert_eq!(
+                tokio::time::Instant::now() - started_at,
+                Duration::from_secs(180),
+                "{protocol:?}"
+            );
+            assert!(
+                !out.contains("redacted-output"),
+                "{protocol:?} exceeded the wait budget"
+            );
+            if matches!(protocol, DevWatchdogProtocol::Anthropic) {
+                assert!(
+                    transport_error_forwarded,
+                    "raw Anthropic must forward its exhausted transport failure"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn capacity_classifier_rejects_quota_code_beneath_generic_server_error_type() {
+        let payload = json!({"error":{"type":"server_error","code":"insufficient_quota","message":"Our servers are currently overloaded. Please try again later."}});
+        assert!(!is_capacity_error_payload(
+            &payload,
+            Some(http::StatusCode::TOO_MANY_REQUESTS)
+        ));
     }
 
     #[tokio::test(start_paused = true)]

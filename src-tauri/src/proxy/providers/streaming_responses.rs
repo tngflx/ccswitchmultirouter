@@ -1551,7 +1551,7 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                     );
                                     yield Ok(anthropic_error_sse(&message, &error_type));
                                     terminated = true;
-                                    continue;
+                                    break 'stream_loop;
                                 }
                                 if !has_sent_message_start {
                                     if let Some(id) = response_obj.get("id").and_then(Value::as_str) {
@@ -2104,9 +2104,15 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                             // Any other unknown/future events — silently skip.
                             _ => {}
                         }
+                        if terminated {
+                            break 'stream_loop;
+                        }
                     }
                 }
                 Err(e) => {
+                    if terminated {
+                        break;
+                    }
                     let chain = crate::proxy::error::error_chain_message(&e);
                     log::error!("Responses stream error: {chain}");
                     yield Ok(retryable_stream_error_sse(
@@ -2213,6 +2219,82 @@ mod tests {
             .into_iter()
             .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn terminal_boundary_responses_ignore_late_transport_error() {
+        for (event, response, message_stops, errors) in [
+            (
+                "response.completed",
+                r#"{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}"#,
+                1,
+                0,
+            ),
+            (
+                "response.incomplete",
+                r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":1,"output_tokens":1}}"#,
+                1,
+                0,
+            ),
+            (
+                "response.failed",
+                r#"{"status":"failed","error":{"type":"server_error","message":"failed"}}"#,
+                0,
+                1,
+            ),
+        ] {
+            let prefix = format!(
+                "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}}}\n\nevent: {event}\ndata: {{\"type\":\"{event}\",\"response\":{response}}}\n\n"
+            );
+            let expected = convert_stream_text(prefix.clone()).await;
+            let actual = create_anthropic_sse_stream_from_responses(stream::iter(vec![
+                Ok::<_, std::io::Error>(Bytes::from(prefix)),
+                Err(std::io::Error::other("late-transport")),
+            ]))
+            .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+            assert_eq!(actual, expected, "late error after {event}");
+            assert_eq!(
+                actual.matches("event: message_stop\n").count(),
+                message_stops
+            );
+            assert_eq!(actual.matches("event: error\n").count(), errors);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_boundary_responses_close_before_upstream_eof() {
+        let upstream = stream::once(async {
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            ))
+        })
+        .chain(stream::pending());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            create_anthropic_sse_stream_from_responses(upstream).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("terminal Responses event must close the converter before EOF");
+    }
+
+    #[tokio::test]
+    async fn terminal_boundary_responses_partial_output_preserves_transport_error() {
+        let upstream = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"visible\"}\n\n",
+            )),
+            Err(std::io::Error::other("reset")),
+        ]);
+        let output = create_anthropic_sse_stream_from_responses(upstream)
+            .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert_eq!(output.matches("event: error\n").count(), 1);
+        assert!(!output.contains("event: message_stop\n"));
     }
 
     async fn convert_stream_text_with_web_search_limit(

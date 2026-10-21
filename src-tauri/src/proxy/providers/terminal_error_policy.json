@@ -1,0 +1,112 @@
+{
+  "schemaVersion": 1,
+  "ignoredSeparators": [" ", ".", "_", "-", "\t", "\n", "\r", "\u000b", "\f"],
+  "summaryPaths": [
+    "/response/error/code",
+    "/response/error/type",
+    "/response/error/message",
+    "/response/incomplete_details/reason",
+    "/response/status",
+    "/error/code",
+    "/error/type",
+    "/error/message",
+    "/code",
+    "/type",
+    "/message",
+    "/status",
+    "/error",
+    ""
+  ],
+  "serializedPaths": ["/response/error", "/error"],
+  "cancelledEvents": [
+    "response.cancelled",
+    "response.canceled",
+    "response.aborted"
+  ],
+  "categories": [
+    {
+      "code": "response_pending",
+      "markers": ["response pending"]
+    },
+    {
+      "code": "authentication_error",
+      "markers": [
+        "authentication",
+        "unauthorized",
+        "unauthorised",
+        "invalid api key",
+        "invalid token",
+        "token expired"
+      ]
+    },
+    {
+      "code": "insufficient_quota",
+      "markers": [
+        "quota",
+        "billing",
+        "payment required",
+        "usage limit",
+        "daily limit",
+        "insufficient credit",
+        "insufficient balance",
+        "credit balance"
+      ],
+      "serializedMarkers": [
+        "quota exceeded",
+        "quota exhausted",
+        "insufficient quota",
+        "billing",
+        "payment required",
+        "usage limit",
+        "daily limit",
+        "insufficient credit",
+        "insufficient balance",
+        "credit balance"
+      ]
+    },
+    {
+      "code": "permission_denied",
+      "markers": [
+        "permission",
+        "forbidden",
+        "policy",
+        "safety",
+        "access denied"
+      ],
+      "serializedMarkers": [
+        "permission",
+        "forbidden",
+        "content policy",
+        "policy violation",
+        "request blocked by policy",
+        "safety",
+        "access denied"
+      ]
+    },
+    {
+      "code": "context_length_exceeded",
+      "markers": ["context length", "context window", "maximum context"]
+    },
+    {
+      "code": "invalid_request_error",
+      "markers": [
+        "content filter",
+        "unsupported model",
+        "model not found",
+        "invalid model",
+        "invalid request",
+        "invalid parameter",
+        "unsupported parameter",
+        "bad request",
+        "cancelled",
+        "canceled",
+        "aborted",
+        "cancel",
+        "user abort",
+        "turn abort",
+        "user interrupt"
+      ]
+    }
+  ],
+  "cancelledCode": "cancelled"
+}

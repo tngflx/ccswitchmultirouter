@@ -10,8 +10,8 @@
 use super::{
     codex_turn_recovery::{
         begin_turn, forward_error_is_recoverable, mark_observed_turn_completed,
-        observe_responses_turn_stream, provider_fingerprint, schedule_turn_recovery, track_turn,
-        TurnRecoveryContext,
+        observe_responses_turn_json, observe_responses_turn_stream, provider_fingerprint,
+        schedule_turn_recovery, track_turn, TurnRecoveryContext,
     },
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{
@@ -735,6 +735,73 @@ fn observe_aggressive_recovery(
     }
 }
 
+const MAX_RECOVERY_JSON_BYTES: usize = 64 * 1024;
+
+/// Inspect up to 64 KiB of JSON while forwarding the original body immediately.
+/// A failed native Responses body can arrive instead of SSE on a stream request.
+fn observe_aggressive_json_recovery(
+    stream: impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    context: TurnRecoveryContext,
+    expected_bytes: Option<u64>,
+) -> ByteStream {
+    let tracked = track_turn(&context);
+    Box::pin(async_stream::stream! {
+        let _tracked = tracked;
+        let mut stream = Box::pin(stream);
+        let mut captured = Vec::new();
+        let mut oversized = false;
+        let mut received_bytes = 0_u64;
+        let mut finished = false;
+        while let Some(item) = stream.next().await {
+            match &item {
+                Ok(bytes) if !finished => {
+                    received_bytes = received_bytes.saturating_add(bytes.len() as u64);
+                    if !oversized {
+                        if bytes.len() > MAX_RECOVERY_JSON_BYTES.saturating_sub(captured.len()) {
+                            captured.clear();
+                            oversized = true;
+                        } else {
+                            captured.extend_from_slice(bytes);
+                        }
+                    }
+                    // HTTP framing can stop polling after the final data frame,
+                    // without polling None. Classify before yielding that frame.
+                    if expected_bytes == Some(received_bytes) {
+                        observe_captured_recovery_json(&captured, oversized, &context);
+                        finished = true;
+                    }
+                }
+                Err(_) if !finished => {
+                    schedule_turn_recovery(context.clone(), "downstream_json_error");
+                    finished = true;
+                }
+                _ => {}
+            }
+            yield item;
+        }
+        if !finished {
+            observe_captured_recovery_json(&captured, oversized, &context);
+        }
+    })
+}
+
+fn observe_captured_recovery_json(captured: &[u8], oversized: bool, context: &TurnRecoveryContext) {
+    if !oversized {
+        match serde_json::from_slice::<Value>(captured) {
+            Ok(value) => {
+                observe_responses_turn_json(&value, context);
+                return;
+            }
+            Err(error) if error.is_eof() => {
+                schedule_turn_recovery(context.clone(), "downstream_json_eof");
+                return;
+            }
+            Err(_) => {}
+        }
+    }
+    mark_observed_turn_completed(context);
+}
+
 /// Observe after response conversion, logging, and timeout handling. Otherwise
 /// an outer idle timeout drops the provider observer as a cancelled request
 /// before that observer can see the error returned to Desktop.
@@ -763,6 +830,50 @@ fn finalize_aggressive_recovery(
                 .into_data_stream()
                 .map(|item| item.map_err(std::io::Error::other));
             let stream = observe_aggressive_recovery(stream, Some(context));
+            Ok(axum::response::Response::from_parts(
+                parts,
+                axum::body::Body::from_stream(stream),
+            ))
+        }
+        Ok(response)
+            if context.max_recoveries > 0
+                && !matches!(
+                    response.status(),
+                    StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT
+                )
+                && (response.status().is_success()
+                    || forward_error_is_recoverable(&ProxyError::UpstreamError {
+                        status: response.status().as_u16(),
+                        body: None,
+                    }))
+                && response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.split(';').next())
+                    .is_some_and(|value| {
+                        let mime = value.trim().to_ascii_lowercase();
+                        mime == "application/json" || mime.ends_with("+json")
+                    }) =>
+        {
+            let (parts, body) = response.into_parts();
+            let expected_bytes = http_body::Body::size_hint(&body).exact().or_else(|| {
+                parts
+                    .headers
+                    .get(axum::http::header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+            });
+            if expected_bytes == Some(0) {
+                // HTTP framing can skip an empty body entirely. Treat an empty
+                // expected JSON response as truncated before handing it to Hyper.
+                observe_captured_recovery_json(&[], false, &context);
+                return Ok(axum::response::Response::from_parts(parts, body));
+            }
+            let stream = body
+                .into_data_stream()
+                .map(|item| item.map_err(std::io::Error::other));
+            let stream = observe_aggressive_json_recovery(stream, context, expected_bytes);
             Ok(axum::response::Response::from_parts(
                 parts,
                 axum::body::Body::from_stream(stream),
@@ -1902,23 +2013,45 @@ pub async fn handle_image_generations(
     };
 
     let endpoint = endpoint_with_query(&uri, "/images/generations");
-    let providers = resolve_codex_image_generation_provider(&state, &ctx.provider, &body)?
+    let image_provider = resolve_codex_image_generation_provider(&state, &ctx.provider, &body)?;
+    let use_raw_images = !is_external_openai_client && image_provider.is_some();
+    let (body, body_bytes) = match image_provider.as_ref().filter(|_| use_raw_images) {
+        Some(provider) => prepare_codex_image_generation_payload(provider, body, body_bytes)?,
+        None => (body, body_bytes),
+    };
+    let providers = image_provider
         .map(|provider| vec![provider])
         .unwrap_or_else(|| ctx.get_providers());
 
     let forwarder = ctx.create_forwarder(&state);
-    let mut result = match forwarder
-        .forward_with_retry(
-            &AppType::Codex,
-            method,
-            &endpoint,
-            body,
-            headers,
-            extensions,
-            providers,
-        )
-        .await
-    {
+    // Official Images requests must not inherit the text route's model rewriting.
+    let result = if use_raw_images {
+        forwarder
+            .forward_raw_with_retry(
+                &AppType::Codex,
+                method,
+                &endpoint,
+                body,
+                body_bytes,
+                headers,
+                extensions,
+                providers,
+            )
+            .await
+    } else {
+        forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                method,
+                &endpoint,
+                body,
+                headers,
+                extensions,
+                providers,
+            )
+            .await
+    };
+    let mut result = match result {
         Ok(result) => result,
         Err(mut err) => {
             update_context_provider_for_forward_error(&state, &mut ctx, err.provider.take());
@@ -1963,9 +2096,7 @@ fn resolve_codex_image_generation_provider(
     body: &Value,
 ) -> Result<Option<crate::provider::Provider>, ProxyError> {
     if provider_is_codex_image_generation_oauth_target(provider) {
-        return Ok(Some(sanitize_codex_image_generation_provider(
-            provider.clone(),
-        )));
+        return prepare_codex_image_generation_provider(provider.clone(), body).map(Some);
     }
 
     if !codex_provider_has_routing_config(provider) {
@@ -1986,7 +2117,7 @@ fn resolve_codex_image_generation_provider(
             resolve_codex_v2_runtime_provider_from_db(state, provider, &probe_body, None)?
         {
             if provider_is_codex_image_generation_oauth_target(&candidate) {
-                return Ok(Some(sanitize_codex_image_generation_provider(candidate)));
+                return prepare_codex_image_generation_provider(candidate, body).map(Some);
             }
             if request_model
                 .as_deref()
@@ -2007,7 +2138,7 @@ fn resolve_codex_image_generation_provider(
         };
         let candidate = materialize_codex_image_generation_route_provider(state, route_provider)?;
         if provider_is_codex_image_generation_oauth_target(&candidate) {
-            return Ok(Some(sanitize_codex_image_generation_provider(candidate)));
+            return prepare_codex_image_generation_provider(candidate, body).map(Some);
         }
         if request_model
             .as_deref()
@@ -2020,7 +2151,7 @@ fn resolve_codex_image_generation_provider(
         }
     }
 
-    resolve_codex_image_generation_official_route_by_identity(state, provider)
+    resolve_codex_image_generation_official_route_by_identity(state, provider, body)
 }
 
 fn resolve_codex_v2_runtime_provider_from_db(
@@ -2207,6 +2338,7 @@ fn materialize_codex_image_generation_route_provider(
 fn resolve_codex_image_generation_official_route_by_identity(
     state: &ProxyState,
     provider: &crate::provider::Provider,
+    body: &Value,
 ) -> Result<Option<crate::provider::Provider>, ProxyError> {
     for route in codex_image_generation_routes(provider) {
         if !codex_image_generation_route_is_enabled(route) {
@@ -2216,13 +2348,19 @@ fn resolve_codex_image_generation_official_route_by_identity(
         let mut route_provider =
             super::providers::build_codex_route_probe_provider(provider, route, None);
         if let Some(settings) = route_provider.settings_config.as_object_mut() {
+            if codex_provider_has_v2_routing(provider) {
+                // This legacy probe builder carries a router catalog snapshot.
+                // V2 image policy must follow the current target catalog instead.
+                settings.remove("modelCatalog");
+                settings.remove("model_catalog");
+            }
             // 这里是 endpoint 专属兜底，不是请求模型真实命中该 route。把 matched
             // 标成 false，便于日志和后续转换区分“图片原生能力回官方”和普通模型匹配。
             settings.insert("codexResolvedRouteMatched".to_string(), json!(false));
         }
         let candidate = materialize_codex_image_generation_route_provider(state, route_provider)?;
         if provider_is_codex_image_generation_oauth_target(&candidate) {
-            return Ok(Some(sanitize_codex_image_generation_provider(candidate)));
+            return prepare_codex_image_generation_provider(candidate, body).map(Some);
         }
     }
 
@@ -2285,6 +2423,8 @@ fn provider_is_codex_image_generation_oauth_target(provider: &crate::provider::P
     provider.is_codex_oauth()
         || provider.uses_managed_account_auth()
         || is_codex_official_managed_oauth_provider(provider)
+        || (super::providers::is_codex_official_provider(provider)
+            && super::providers::provider_uses_native_codex_auth(provider))
 }
 
 /// 清理图片请求不应继承的文本 route 模型覆盖。
@@ -2292,14 +2432,75 @@ fn provider_is_codex_image_generation_oauth_target(provider: &crate::provider::P
 /// Images API 的 `model` 是图像模型名，不能被 MultiRouter 文本 route 的
 /// `codexResolvedUpstreamModelOverride` 覆盖成 `gpt-5.5`。该清理只作用于本次
 /// request-local provider，不写回用户配置。
-fn sanitize_codex_image_generation_provider(
+/// Native capability fallback may use absent image rows, but explicit catalog
+/// exclusions and ambiguous identities must stop before upstream dispatch.
+fn prepare_codex_image_generation_provider(
     mut provider: crate::provider::Provider,
-) -> crate::provider::Provider {
+    body: &Value,
+) -> Result<crate::provider::Provider, ProxyError> {
+    codex_image_generation_catalog_entry(&provider, body)?;
     if let Some(mut settings) = provider.settings_config.as_object().cloned() {
         settings.remove("codexResolvedUpstreamModelOverride");
         provider.settings_config = Value::Object(settings);
     }
-    provider
+    Ok(provider)
+}
+
+fn codex_image_generation_catalog_entry<'a>(
+    provider: &'a crate::provider::Provider,
+    body: &Value,
+) -> Result<Option<&'a Value>, ProxyError> {
+    use crate::codex_multirouter::catalog::{lookup_catalog_model, CatalogModelLookup};
+
+    if let Some(model) = body.get("model").and_then(Value::as_str) {
+        match lookup_catalog_model(&provider.settings_config, model) {
+            CatalogModelLookup::Found(entry)
+                if entry.get("enabled").and_then(Value::as_bool) == Some(false) =>
+            {
+                return Err(ProxyError::InvalidRequest(
+                    "The requested image model is excluded from this provider's catalog"
+                        .to_string(),
+                ));
+            }
+            CatalogModelLookup::Ambiguous => {
+                return Err(ProxyError::InvalidRequest(
+                    "The requested image model has an ambiguous catalog identity".to_string(),
+                ));
+            }
+            CatalogModelLookup::Found(entry) => return Ok(Some(entry)),
+            // Missing image rows may use the native-image capability fallback.
+            CatalogModelLookup::Missing => {}
+        }
+    }
+    Ok(None)
+}
+
+/// Preserve native image bytes unless the selected catalog explicitly maps the
+/// requested image identity. Text defaults and route overrides do not apply.
+fn prepare_codex_image_generation_payload(
+    provider: &crate::provider::Provider,
+    mut body: Value,
+    body_bytes: Bytes,
+) -> Result<(Value, Bytes), ProxyError> {
+    let upstream_model = codex_image_generation_catalog_entry(provider, &body)?.and_then(|entry| {
+        entry
+            .get("upstreamModel")
+            .or_else(|| entry.get("upstream_model"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+    });
+    let Some(upstream_model) = upstream_model else {
+        return Ok((body, body_bytes));
+    };
+    if body.get("model").and_then(Value::as_str) == Some(upstream_model) {
+        return Ok((body, body_bytes));
+    }
+    body["model"] = json!(upstream_model);
+    let body_bytes = serde_json::to_vec(&body).map(Bytes::from).map_err(|err| {
+        ProxyError::Internal(format!("Failed to encode image request body: {err}"))
+    })?;
+    Ok((body, body_bytes))
 }
 
 /// 记录第三方 Agent API 转发到 Codex OAuth 前的 Unicode 摘要，避免把用户 prompt 原文写入日志。
@@ -3354,7 +3555,7 @@ fn build_chat_proxy_error_response(
 ) -> Result<axum::response::Response, ProxyError> {
     let status = axum::http::StatusCode::from_u16(map_proxy_error_to_status(error))
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-    let body = json!({
+    let mut body = json!({
         "error": {
             "message": format!(
                 "{} (provider={}, model={}, endpoint={})",
@@ -3368,6 +3569,9 @@ fn build_chat_proxy_error_response(
             "param": Value::Null
         }
     });
+    if let Some(error_object) = body.get_mut("error").and_then(Value::as_object_mut) {
+        error.apply_local_transport_error_metadata(error_object);
+    }
     let body = serde_json::to_vec(&body)
         .map_err(|e| ProxyError::Internal(format!("Failed to serialize proxy error: {e}")))?;
     let mut builder = axum::response::Response::builder().status(status).header(
@@ -3397,6 +3601,16 @@ fn should_wrap_native_codex_responses_stream(
     response: &super::hyper_client::ProxyResponse,
 ) -> bool {
     request_is_streaming && response.status().is_success() && !response.is_json()
+}
+
+fn rebuilt_codex_responses_stream(
+    status: StatusCode,
+    mut headers: HeaderMap,
+    stream: impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+) -> super::hyper_client::ProxyResponse {
+    // Replay, history projection, and heartbeats can change the byte count.
+    headers.remove(axum::http::header::CONTENT_LENGTH);
+    super::hyper_client::ProxyResponse::streamed(status, headers, stream)
 }
 
 pub async fn handle_grokbuild_responses(
@@ -3719,7 +3933,7 @@ async fn handle_responses_for_app(
                     state.codex_chat_history.clone(),
                     request_body_for_history,
                 );
-                super::hyper_client::ProxyResponse::streamed(status, response_headers, stream)
+                rebuilt_codex_responses_stream(status, response_headers, stream)
             } else {
                 let (response_headers, status, body_bytes) =
                     read_decoded_body(response, ctx.tag, std::time::Duration::ZERO).await?;
@@ -3821,7 +4035,7 @@ async fn handle_responses_for_app(
                         Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
                     >
             };
-            super::hyper_client::ProxyResponse::streamed(status, response_headers, stream)
+            rebuilt_codex_responses_stream(status, response_headers, stream)
         } else if desktop_reasoning_mapping && response.status().is_success() && response.is_json()
         {
             let (mut response_headers, status, body_bytes) =
@@ -4053,7 +4267,7 @@ async fn handle_responses_compact_for_app(
                 state.codex_chat_history.clone(),
                 request_body_for_history,
             );
-            super::hyper_client::ProxyResponse::streamed(status, response_headers, stream)
+            rebuilt_codex_responses_stream(status, response_headers, stream)
         } else {
             let (response_headers, status, body_bytes) =
                 read_decoded_body(response, ctx.tag, std::time::Duration::ZERO).await?;
@@ -4163,6 +4377,7 @@ async fn handle_codex_xai_native_responses_rewrite(
     if response.is_sse() {
         let mut response_headers = response.headers().clone();
         strip_hop_by_hop_response_headers(&mut response_headers);
+        response_headers.remove(axum::http::header::CONTENT_LENGTH);
 
         let mut builder = axum::response::Response::builder().status(status);
         for (key, value) in &response_headers {
@@ -5846,6 +6061,8 @@ fn codex_proxy_error_json(
         );
     }
 
+    error.apply_local_transport_error_metadata(error_obj);
+
     if !error_obj.contains_key("param") {
         error_obj.insert("param".to_string(), Value::Null);
     }
@@ -5872,7 +6089,7 @@ fn codex_proxy_error_json(
 
 fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
     match error {
-        ProxyError::ForwardFailed(_) => "cc_switch_forward_failed",
+        ProxyError::ForwardFailed(_) => super::error::CCSM_UPSTREAM_TRANSPORT_ERROR_CODE,
         ProxyError::Timeout(_) | ProxyError::StreamIdleTimeout(_) => "cc_switch_timeout",
         ProxyError::ResponsePending(_) => "cc_switch_response_pending",
         ProxyError::RequestHealthBlocked(_) => "cc_switch_request_health_blocked",
@@ -6830,7 +7047,8 @@ mod image_edits_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        body_looks_like_sse, build_external_codex_official_oauth_provider,
+        body_looks_like_sse, build_chat_proxy_error_response, build_codex_proxy_error_response,
+        build_external_codex_official_oauth_provider,
         chat_completion_to_response_from_verified_profile, chat_sse_to_response_value,
         classify_body_for_diagnostics, codex_catalog_models_response, codex_proxy_error_json,
         codex_proxy_error_status, codex_request_classification_fields,
@@ -6859,6 +7077,7 @@ mod tests {
                 ExternalOpenAiApiProfileUpdate,
             },
             failover_switch::FailoverSwitchManager,
+            handler_context::RequestContext,
             provider_router::ProviderRouter,
             providers::{
                 codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore,
@@ -7174,6 +7393,64 @@ mod tests {
             true,
             &json_response
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rebuilt_native_responses_stream_drops_original_content_length_after_replay() {
+        use crate::proxy::{
+            hyper_client::ProxyResponse,
+            providers::streaming_retry::{
+                create_resilient_responses_sse_stream_with_context, StreamReconnector,
+            },
+        };
+        let initial = Bytes::from_static(
+            b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+        );
+        let replay = Bytes::from_static(concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        ).as_bytes());
+        let replay_for_connect = replay.clone();
+        let reconnector = StreamReconnector::new(
+            Box::new(move || {
+                let bytes = replay_for_connect.clone();
+                Box::pin(async move {
+                    Ok(ProxyResponse::buffered(
+                        StatusCode::OK,
+                        HeaderMap::new(),
+                        bytes,
+                    ))
+                })
+            }),
+            std::time::Duration::from_secs(1),
+        )
+        .with_max_retries(1);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("content-length", initial.len().into());
+        headers.insert("x-request-id", HeaderValue::from_static("preserved"));
+        let initial_length = initial.len();
+        let stream = create_resilient_responses_sse_stream_with_context(
+            Box::pin(futures::stream::iter([Ok(initial)])),
+            Some(reconnector),
+            None,
+            false,
+        );
+        let response = super::rebuilt_codex_responses_stream(StatusCode::OK, headers, stream);
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_headers = response.headers().clone();
+        let body = response.bytes_with_limit(4096).await.unwrap();
+        assert!(body.len() > initial_length);
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("recovered"), "{text}");
+        assert!(text.contains("event: response.completed"), "{text}");
+        assert_eq!(response_headers["content-type"], "text/event-stream");
+        assert_eq!(response_headers["x-request-id"], "preserved");
+        assert!(!response_headers.contains_key("content-length"));
     }
 
     #[test]
@@ -8221,20 +8498,333 @@ data: [DONE]\n\n";
         let context = final_recovery_context("final-json-completed");
         super::schedule_turn_recovery(context.clone(), "test_interruption");
         assert!(recovery_reserved_for_test(&context.desktop_thread_id));
+        let body = Bytes::from_static(
+            br#"{"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}]}"#,
+        );
         let response = axum::response::Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
             .header("x-upstream-request-id", "unchanged")
-            .body(axum::body::Body::from("{\"status\":\"completed\"}"))
+            .body(axum::body::Body::from(body.clone()))
             .unwrap();
         let response =
             super::finalize_aggressive_recovery(Ok(response), Some(context.clone())).unwrap();
-        assert!(!recovery_reserved_for_test(&context.desktop_thread_id));
         assert_eq!(response.headers()["x-upstream-request-id"], "unchanged");
         assert_eq!(
             response.into_body().collect().await.unwrap().to_bytes(),
-            Bytes::from_static(b"{\"status\":\"completed\"}")
+            body
         );
+        assert!(!recovery_reserved_for_test(&context.desktop_thread_id));
+    }
+
+    #[tokio::test]
+    async fn final_failed_json_preserves_response_and_schedules_recovery() {
+        use crate::proxy::codex_turn_recovery::{mark_turn_completed, recovery_reserved_for_test};
+        let context = final_recovery_context("final-json-overloaded");
+        let body = Bytes::from_static(
+            br#"{"object":"response","status":"failed","error":{"code":"server_error","message":"Our servers are currently overloaded. Please try again later."}}"#,
+        );
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json; charset=utf-8")
+            .header("x-upstream-request-id", "unchanged")
+            .body(axum::body::Body::from(body.clone()))
+            .unwrap();
+        let response =
+            super::finalize_aggressive_recovery(Ok(response), Some(context.clone())).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-upstream-request-id"], "unchanged");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            body
+        );
+        assert!(recovery_reserved_for_test(&context.desktop_thread_id));
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test]
+    async fn final_framed_json_classifies_before_the_last_data_frame_is_dropped() {
+        use crate::proxy::codex_turn_recovery::{mark_turn_completed, recovery_reserved_for_test};
+        let bytes = Bytes::from_static(
+            br#"{"status":"failed","error":{"code":"server_error","message":"overloaded"}}"#,
+        );
+        for exact_body_size in [true, false] {
+            let context = final_recovery_context(&format!("final-framed-json-{exact_body_size}"));
+            let body = if exact_body_size {
+                axum::body::Body::from(bytes.clone())
+            } else {
+                axum::body::Body::from_stream(futures::stream::iter([Ok::<_, std::io::Error>(
+                    bytes.clone(),
+                )]))
+            };
+            let mut builder = axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json");
+            if !exact_body_size {
+                builder = builder.header("content-length", bytes.len().to_string());
+            }
+            let response = super::finalize_aggressive_recovery(
+                Ok(builder.body(body).unwrap()),
+                Some(context.clone()),
+            )
+            .unwrap();
+            let mut stream = Box::pin(response.into_body().into_data_stream());
+            assert_eq!(stream.next().await.unwrap().unwrap(), bytes);
+            // Hyper need not poll None once the HTTP framing length is reached.
+            drop(stream);
+            assert!(recovery_reserved_for_test(&context.desktop_thread_id));
+            mark_turn_completed(&context.desktop_thread_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn final_empty_framed_json_is_observed_without_body_polling() {
+        use crate::proxy::codex_turn_recovery::{mark_turn_completed, recovery_reserved_for_test};
+        for (status, should_recover) in [
+            (StatusCode::OK, true),
+            (StatusCode::INTERNAL_SERVER_ERROR, true),
+            (StatusCode::NO_CONTENT, false),
+            (StatusCode::RESET_CONTENT, false),
+            (StatusCode::UNAUTHORIZED, false),
+        ] {
+            for exact_body_size in [true, false] {
+                let context = final_recovery_context(&format!(
+                    "final-empty-json-{}-{exact_body_size}",
+                    status.as_u16()
+                ));
+                let body = if exact_body_size {
+                    axum::body::Body::empty()
+                } else {
+                    axum::body::Body::from_stream(futures::stream::empty::<
+                        Result<Bytes, std::io::Error>,
+                    >())
+                };
+                let response = axum::response::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .header("content-length", "0")
+                    .body(body)
+                    .unwrap();
+                let response =
+                    super::finalize_aggressive_recovery(Ok(response), Some(context.clone()))
+                        .unwrap();
+                // Hyper skips polling a body framed as empty, so classification
+                // must already have happened at the response boundary.
+                assert_eq!(
+                    recovery_reserved_for_test(&context.desktop_thread_id),
+                    should_recover,
+                    "status={status}, exact_body_size={exact_body_size}"
+                );
+                assert_eq!(response.status(), status);
+                assert_eq!(response.headers()["content-length"], "0");
+                assert!(response
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .is_empty());
+                assert_eq!(
+                    recovery_reserved_for_test(&context.desktop_thread_id),
+                    should_recover
+                );
+                mark_turn_completed(&context.desktop_thread_id);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_json_permanent_http_status_does_not_continue_transient_looking_body() {
+        use crate::proxy::codex_turn_recovery::recovery_reserved_for_test;
+        let bytes = Bytes::from_static(
+            br#"{"error":{"code":"gateway_error","message":"temporarily unavailable"}}"#,
+        );
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+        ] {
+            let context = final_recovery_context(&format!("final-json-http-{}", status.as_u16()));
+            super::schedule_turn_recovery(context.clone(), "test_interruption");
+            let response = axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(bytes.clone()))
+                .unwrap();
+            let response =
+                super::finalize_aggressive_recovery(Ok(response), Some(context.clone())).unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                bytes
+            );
+            assert!(!recovery_reserved_for_test(&context.desktop_thread_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn final_json_permanent_failures_and_cancellation_do_not_continue() {
+        use crate::proxy::codex_turn_recovery::recovery_reserved_for_test;
+        for (label, value) in [
+            (
+                "authentication",
+                serde_json::json!({"status":"failed","error":{"code":"invalid_api_key"}}),
+            ),
+            (
+                "quota",
+                serde_json::json!({"status":"failed","error":{"code":"insufficient_quota"}}),
+            ),
+            ("cancelled", serde_json::json!({"status":"cancelled"})),
+            (
+                "content-filter",
+                serde_json::json!({"status":"incomplete","incomplete_details":{"reason":"content_filter"}}),
+            ),
+        ] {
+            let context = final_recovery_context(&format!("final-json-{label}"));
+            super::schedule_turn_recovery(context.clone(), "test_interruption");
+            let body = Bytes::from(serde_json::to_vec(&value).unwrap());
+            let response = axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.clone()))
+                .unwrap();
+            let response =
+                super::finalize_aggressive_recovery(Ok(response), Some(context.clone())).unwrap();
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                body
+            );
+            assert!(
+                !recovery_reserved_for_test(&context.desktop_thread_id),
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn final_unknown_or_oversized_json_is_preserved_without_continuation() {
+        use crate::proxy::codex_turn_recovery::recovery_reserved_for_test;
+        let oversized = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "status":"failed",
+                "error":{"code":"server_error","message":"overloaded"},
+                "padding":"x".repeat(super::MAX_RECOVERY_JSON_BYTES),
+            }))
+            .unwrap(),
+        );
+        for (label, body) in [
+            (
+                "unknown",
+                Bytes::from_static(br#"{"message":"ordinary JSON"}"#),
+            ),
+            ("invalid", Bytes::from_static(b"not valid JSON")),
+            ("oversized", oversized),
+        ] {
+            let context = final_recovery_context(&format!("final-json-{label}"));
+            super::schedule_turn_recovery(context.clone(), "test_interruption");
+            let chunks = body
+                .chunks(1024)
+                .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>();
+            let response = axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from_stream(futures::stream::iter(chunks)))
+                .unwrap();
+            let response =
+                super::finalize_aggressive_recovery(Ok(response), Some(context.clone())).unwrap();
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                body
+            );
+            assert!(
+                !recovery_reserved_for_test(&context.desktop_thread_id),
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn final_json_transport_error_is_preserved_and_schedules_recovery() {
+        use crate::proxy::codex_turn_recovery::{mark_turn_completed, recovery_reserved_for_test};
+        let context = final_recovery_context("final-json-transport-error");
+        let upstream = futures::stream::iter([
+            Ok(Bytes::from_static(b"{\"status\":")),
+            Err(std::io::Error::other("connection interrupted")),
+        ]);
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from_stream(upstream))
+            .unwrap();
+        let response =
+            super::finalize_aggressive_recovery(Ok(response), Some(context.clone())).unwrap();
+        let mut stream = Box::pin(response.into_body().into_data_stream());
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"{\"status\":")
+        );
+        assert!(stream
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("connection interrupted"));
+        assert!(stream.next().await.is_none());
+        drop(stream);
+        assert!(recovery_reserved_for_test(&context.desktop_thread_id));
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test]
+    async fn final_json_overflow_then_error_preserves_the_spent_recovery_budget() {
+        use crate::proxy::codex_turn_recovery::{
+            authorize_recovery_commit_for_test, begin_turn, mark_turn_completed,
+            recovery_reserved_for_test,
+        };
+        let mut context = final_recovery_context("final-json-overflow-error");
+        context.max_recoveries = 1;
+        super::schedule_turn_recovery(context.clone(), "test_interruption");
+        assert!(recovery_reserved_for_test(&context.desktop_thread_id));
+        assert!(authorize_recovery_commit_for_test(&context));
+        begin_turn(&context.desktop_thread_id, true);
+        context.recovery_id.push_str("-next-request");
+        context.observed_at_ms += 1;
+        let upstream = futures::stream::iter([
+            Ok(Bytes::from(vec![b' '; super::MAX_RECOVERY_JSON_BYTES + 1])),
+            Err(std::io::Error::other("connection interrupted")),
+        ]);
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from_stream(upstream))
+            .unwrap();
+        let response =
+            super::finalize_aggressive_recovery(Ok(response), Some(context.clone())).unwrap();
+        assert!(response.into_body().collect().await.is_err());
+        assert!(!recovery_reserved_for_test(&context.desktop_thread_id));
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test]
+    async fn final_truncated_json_schedules_recovery_without_changing_bytes() {
+        use crate::proxy::codex_turn_recovery::{mark_turn_completed, recovery_reserved_for_test};
+        let context = final_recovery_context("final-json-truncated");
+        let bytes = Bytes::from_static(b"{\"status\":\"failed\",\"error\":");
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(bytes.clone()))
+            .unwrap();
+        let response =
+            super::finalize_aggressive_recovery(Ok(response), Some(context.clone())).unwrap();
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            bytes
+        );
+        assert!(recovery_reserved_for_test(&context.desktop_thread_id));
+        mark_turn_completed(&context.desktop_thread_id);
     }
 
     #[test]
@@ -8779,9 +9369,127 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
         assert!(message.contains("gpt-5.6-sol"));
         assert!(message.contains("/responses"));
         assert!(message.contains("dns lookup failed"));
-        assert_eq!(body["error"]["code"], "cc_switch_forward_failed");
+        assert_eq!(body["error"]["code"], "ccsm_upstream_transport_error");
+        assert_eq!(body["error"]["source"], "ccsm");
+        assert_eq!(body["error"].get("upstream_status"), Some(&Value::Null));
         assert_eq!(body["error"]["provider"], "OpenAI Official");
         assert_eq!(body["error"]["model"], "gpt-5.6-sol");
+    }
+
+    async fn codex_error_test_context() -> RequestContext {
+        let state = build_state(Arc::new(Database::memory().expect("memory db")));
+        RequestContext::new_with_provider(
+            &state,
+            &json!({"model": "gpt-image-2"}),
+            &HeaderMap::new(),
+            AppType::Codex,
+            "Codex",
+            "codex",
+            Provider::with_id(
+                "codex-test".to_string(),
+                "OpenAI Official".to_string(),
+                json!({}),
+                None,
+            ),
+        )
+        .await
+        .expect("Codex request context")
+    }
+
+    #[tokio::test]
+    async fn codex_local_transport_502_is_marked_for_text_and_image_responses() {
+        for endpoint in ["/responses", "/v1/images/generations", "/v1/images/edits"] {
+            let ctx = codex_error_test_context().await;
+            let response = build_codex_proxy_error_response(
+                &ctx,
+                endpoint,
+                &ProxyError::ForwardFailed("TLS handshake failed".to_string()),
+            )
+            .expect("Codex error response");
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).expect("JSON error body");
+            assert_eq!(body["error"]["code"], "ccsm_upstream_transport_error");
+            assert_eq!(body["error"]["source"], "ccsm");
+            assert_eq!(body["error"].get("upstream_status"), Some(&Value::Null));
+            assert_eq!(body["error"]["provider"], "OpenAI Official");
+            assert_eq!(body["error"]["model"], "gpt-image-2");
+            assert_eq!(body["error"]["endpoint"], endpoint);
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("TLS handshake failed"));
+            assert!(body["error"]["param"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_chat_local_transport_502_has_canonical_source_metadata() {
+        let ctx = codex_error_test_context().await;
+        let response = build_chat_proxy_error_response(
+            &ctx,
+            "/v1/chat/completions",
+            &ProxyError::ForwardFailed("connection refused".to_string()),
+        )
+        .expect("Chat error response");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).expect("JSON error body");
+        assert_eq!(body["error"]["code"], "ccsm_upstream_transport_error");
+        assert_eq!(body["error"]["source"], "ccsm");
+        assert_eq!(body["error"].get("upstream_status"), Some(&Value::Null));
+        assert_eq!(body["error"]["param"], Value::Null);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn codex_upstream_http_502_keeps_upstream_identity() {
+        let ctx = codex_error_test_context().await;
+        let response = build_codex_proxy_error_response(
+            &ctx,
+            "/responses",
+            &ProxyError::UpstreamError {
+                status: 502,
+                body: Some(
+                    json!({"error":{"message":"gateway unavailable","code":"upstream_failure"}})
+                        .to_string(),
+                ),
+            },
+        )
+        .expect("Codex error response");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).expect("JSON error body");
+        assert_eq!(body["error"]["upstream_status"], 502);
+        assert!(!body["error"].as_object().unwrap().contains_key("source"));
+        assert_eq!(body["error"]["code"], "upstream_failure");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("gateway unavailable"));
+    }
+
+    #[tokio::test]
+    async fn codex_response_pending_keeps_424_nonretryable_without_retry_after() {
+        let ctx = codex_error_test_context().await;
+        let response = build_codex_proxy_error_response(
+            &ctx,
+            "/responses",
+            &ProxyError::ResponsePending("upstream response not received".to_string()),
+        )
+        .expect("Codex error response");
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+        assert!(!response
+            .headers()
+            .contains_key(axum::http::header::RETRY_AFTER));
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).expect("JSON error body");
+        assert_eq!(body["error"]["code"], "cc_switch_response_result_unknown");
+        assert_eq!(body["error"]["retryable"], false);
+        assert!(!body["error"].as_object().unwrap().contains_key("source"));
     }
 
     #[test]

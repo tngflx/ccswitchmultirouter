@@ -39,8 +39,6 @@ use toml_edit::DocumentMut;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-#[cfg(target_os = "windows")]
-use std::process::Command;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -583,7 +581,13 @@ pub fn sync_codex_history_provider_bucket_to_multirouter(
 /// 此检查必须放在一键切官方的任何状态变更之前；检测到进程时不会写配置、
 /// settings 或历史文件。
 pub fn ensure_codex_history_write_is_offline() -> Result<(), AppError> {
-    let running = running_codex_desktop_process_descriptions();
+    ensure_codex_history_write_is_offline_with(running_codex_desktop_process_descriptions)
+}
+
+fn ensure_codex_history_write_is_offline_with(
+    probe: impl FnOnce() -> Result<Vec<String>, AppError>,
+) -> Result<(), AppError> {
+    let running = probe()?;
     if running.is_empty() {
         return Ok(());
     }
@@ -1036,7 +1040,7 @@ pub fn repair_codex_history_visibility_standalone(
         .unwrap_or_else(|| CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID.to_string());
     let dry_run = options.dry_run;
     if !dry_run && !options.force_while_codex_running.unwrap_or(false) {
-        let running = running_codex_desktop_process_descriptions();
+        let running = running_codex_desktop_process_descriptions()?;
         if !running.is_empty() {
             return Err(AppError::Message(format!(
                 "Codex Desktop/app-server 仍在运行。请先完全退出 Codex 后再写入，或勾选强制写入。检测到: {}",
@@ -1688,10 +1692,10 @@ fn resolve_active_codex_state_db_with_override(
 
 /// 检测正在运行的 Codex Desktop/app-server 进程，写入前用于提示并发覆盖风险。
 #[cfg(target_os = "windows")]
-fn running_codex_desktop_process_descriptions() -> Vec<String> {
+fn running_codex_desktop_process_descriptions() -> Result<Vec<String>, AppError> {
     let script = r#"
 $current = $PID
-Get-CimInstance Win32_Process |
+Get-CimInstance Win32_Process -ErrorAction Stop |
   Where-Object {
     $_.ProcessId -ne $current -and
     $_.CommandLine -and
@@ -1706,34 +1710,54 @@ Get-CimInstance Win32_Process |
   Select-Object -First 8 |
   ForEach-Object { "$($_.ProcessId) $($_.Name)" }
 "#;
-    let mut command = Command::new("powershell");
+    let mut command = crate::powershell::command();
     command
         .args([
             "-NoProfile",
+            "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
             script,
         ])
         .creation_flags(CREATE_NO_WINDOW);
-    let Ok(output) = command.output() else {
-        return Vec::new();
-    };
+    parse_codex_history_process_probe(command.output())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_codex_history_process_probe(
+    result: std::io::Result<std::process::Output>,
+) -> Result<Vec<String>, AppError> {
+    let output = result.map_err(|_| {
+        AppError::Message(
+            "PowerShell 7 (pwsh.exe) is required to verify Codex history is offline; no history was changed."
+                .to_string(),
+        )
+    })?;
     if !output.status.success() {
-        return Vec::new();
+        return Err(AppError::Message(format!(
+            "Could not verify Codex history is offline: PowerShell 7 exited with {}; no history was changed.",
+            output.status
+        )));
     }
-    String::from_utf8_lossy(&output.stdout)
+    let stdout = String::from_utf8(output.stdout).map_err(|_| {
+        AppError::Message(
+            "Could not verify Codex history is offline: PowerShell 7 output was not UTF-8; no history was changed."
+                .to_string(),
+        )
+    })?;
+    Ok(stdout
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
-        .collect()
+        .collect())
 }
 
 /// 非 Windows 平台暂不主动扫描 Codex Desktop 进程。
 #[cfg(not(target_os = "windows"))]
-fn running_codex_desktop_process_descriptions() -> Vec<String> {
-    Vec::new()
+fn running_codex_desktop_process_descriptions() -> Result<Vec<String>, AppError> {
+    Ok(Vec::new())
 }
 
 /// 读取 live config 顶层 model_provider，用于结果展示和误修排查。
@@ -3544,7 +3568,7 @@ pub fn maybe_migrate_codex_official_history_to_unified_bucket(
     // Never rewrite Codex-owned rollout files or its active SQLite database while
     // Desktop/app-server is running. Besides WAL contention, replacing every JSONL
     // invalidates Desktop's history cache and can stall its startup/session UI.
-    if !running_codex_desktop_process_descriptions().is_empty() {
+    if !running_codex_desktop_process_descriptions()?.is_empty() {
         return Ok(CodexHistoryProviderBucketMigrationOutcome {
             skipped_reason: Some("codex_running".to_string()),
             ..Default::default()
@@ -4983,6 +5007,57 @@ mod tests {
     use crate::provider::Provider;
     use serial_test::serial;
     use tempfile::tempdir;
+
+    #[test]
+    fn history_write_guard_rejects_missing_powershell7_without_exposing_probe_details() {
+        let error = ensure_codex_history_write_is_offline_with(|| {
+            parse_codex_history_process_probe(Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "[REDACTED_PROBE_COMMAND]",
+            )))
+        })
+        .expect_err("an unavailable process probe must not authorize history writes");
+        let message = error.to_string();
+        assert!(message.contains("PowerShell 7 (pwsh.exe) is required"));
+        assert!(!message.contains("REDACTED_PROBE_COMMAND"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn history_write_guard_rejects_failed_or_malformed_powershell7_output() {
+        use std::os::windows::process::ExitStatusExt;
+
+        for (status, stdout) in [(1, b"[REDACTED_PROCESS_OUTPUT]".to_vec()), (0, vec![0xff])] {
+            let output = std::process::Output {
+                status: std::process::ExitStatus::from_raw(status),
+                stdout,
+                stderr: b"[REDACTED_PROCESS_OUTPUT]".to_vec(),
+            };
+            let error = ensure_codex_history_write_is_offline_with(|| {
+                parse_codex_history_process_probe(Ok(output))
+            })
+            .expect_err("failed or malformed probes must block history writes");
+            assert!(!error.to_string().contains("REDACTED_PROCESS_OUTPUT"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn history_write_guard_allows_only_successful_empty_process_results() {
+        use std::os::windows::process::ExitStatusExt;
+
+        for (stdout, expected_offline) in [("", true), ("\r\n123 Codex.exe\r\n", false)] {
+            let output = std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            };
+            let result = ensure_codex_history_write_is_offline_with(|| {
+                parse_codex_history_process_probe(Ok(output))
+            });
+            assert_eq!(result.is_ok(), expected_offline);
+        }
+    }
 
     struct EnvVarGuard {
         previous: Option<Option<String>>,

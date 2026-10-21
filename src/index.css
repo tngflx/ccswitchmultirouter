@@ -113,7 +113,8 @@
   border-top: 2px solid hsl(var(--border));
 }
 
-[data-tauri-drag-region] {
+/* Windows uses Tauri drag events; native CSS drag regions are macOS-only. */
+.is-mac [data-tauri-drag-region] {
   -webkit-app-region: drag;
 }
 

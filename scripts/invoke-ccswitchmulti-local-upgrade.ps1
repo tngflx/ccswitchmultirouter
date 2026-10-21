@@ -17,6 +17,8 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot "ccswitchmulti-guardian-core.ps1")
+. (Join-Path $PSScriptRoot "powershell7-runtime.ps1")
+$powerShell7Executable = Resolve-CcsmPowerShell7Executable
 
 $transactionScript = Join-Path $PSScriptRoot "install-ccswitchmulti-transaction.ps1"
 $installDirectory = Split-Path -Parent $InstalledExecutable
@@ -77,7 +79,7 @@ Invoke-CcsmMaintenanceLeaseScope -MarkerPath $MaintenanceMarker -Purpose "local-
         "-TimeoutSeconds", [string]$TimeoutSeconds,
         "-BackupRoot", $backupRoot
     )
-    $process = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList $arguments `
+    $process = Start-Process -FilePath $powerShell7Executable -WindowStyle Hidden -PassThru -ArgumentList $arguments `
         -RedirectStandardOutput $transactionResultPath -RedirectStandardError $transactionStderrPath
     $exitCode = Wait-CcsmOwnedProcessExit -Process $process
     if ($exitCode -ne 0) { throw "install transaction failed with exit code $exitCode" }

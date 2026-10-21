@@ -1106,14 +1106,20 @@ pub fn create_responses_sse_stream_from_chat_with_context_and_projection<
                         }
 
                         if data_parts.is_empty() {
+                            if super::streaming_retry::raw_sse_block_is_comment(block.as_bytes()) {
+                                yield Ok(Bytes::from(format!("{block}\n\n")));
+                            }
                             continue;
                         }
 
                         let data = data_parts.join("\n");
                         if data.trim() == "[DONE]" {
-                            // Chat's [DONE] sentinel closes the SSE transport. It
-                            // does not carry the model's terminal semantics.
-                            continue;
+                            // Finalize through the canonical Chat terminal classifier,
+                            // then stop consuming the upstream transport.
+                            for event in state.finalize() {
+                                yield Ok(event);
+                            }
+                            return;
                         }
 
                         let chunk: Value = match serde_json::from_str(&data) {
@@ -1214,6 +1220,7 @@ where
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut stream_failed = false;
+        let mut done_received = false;
 
         'rounds: loop {
             while let Some(chunk) = current_stream.next().await {
@@ -1240,13 +1247,17 @@ where
                                 }
                             }
                             if data_parts.is_empty() {
+                            if super::streaming_retry::raw_sse_block_is_comment(block.as_bytes()) {
+                                yield Ok(Bytes::from(format!("{block}\n\n")));
+                            }
                                 continue;
                             }
                             let data = data_parts.join("\n");
                             if data.trim() == "[DONE]" {
-                                // Transport closure is classified only after an
-                                // explicit finish_reason has been observed.
-                                continue;
+                                // Let the existing round finalizer apply the canonical
+                                // terminal classifier, then stop this hosted round.
+                                done_received = true;
+                                break;
                             }
                             let chunk: Value = match serde_json::from_str(&data) {
                                 Ok(value) => value,
@@ -1298,7 +1309,7 @@ where
                                 }
                             }
                         }
-                        if stream_failed {
+                        if stream_failed || done_received {
                             break;
                         }
                     }
@@ -1327,6 +1338,12 @@ where
             }
 
             if stream_failed || state.completed {
+                break;
+            }
+            if done_received {
+                for event in state.finalize() {
+                    yield Ok(event);
+                }
                 break;
             }
             if state.finish_reason.is_some() {
@@ -1376,6 +1393,106 @@ mod tests {
     use super::*;
     use crate::protocol_compatibility::ReasoningProjection;
     use futures::{stream, StreamExt};
+
+    async fn collect_terminal_boundary_stream(
+        chunks: Vec<Result<Bytes, std::io::Error>>,
+    ) -> String {
+        create_responses_sse_stream_from_chat(stream::iter(chunks))
+            .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
+            .collect::<Vec<_>>()
+            .await
+            .concat()
+    }
+
+    #[tokio::test]
+    async fn terminal_boundary_done_ignores_late_data_and_transport_error() {
+        let terminal = Bytes::from_static(b"data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"visible\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\ndata: [DONE]\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"late-data\"}}]}\n\n");
+        let output = collect_terminal_boundary_stream(vec![
+            Ok(terminal),
+            Err(std::io::Error::other("late-transport")),
+        ])
+        .await;
+
+        assert_eq!(output.matches("event: response.completed\n").count(), 1);
+        assert!(output.contains("\"input_tokens\":7"));
+        assert!(output.contains("\"output_tokens\":3"));
+        assert!(output.contains("visible"));
+        assert!(!output.contains("late-data"));
+        assert!(!output.contains("late-transport"));
+        assert!(!output.contains("event: response.failed\n"));
+    }
+
+    #[tokio::test]
+    async fn terminal_boundary_done_closes_before_upstream_eof() {
+        let upstream = stream::once(async {
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"visible\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            ))
+        })
+        .chain(stream::pending());
+        let chunks = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            create_responses_sse_stream_from_chat(upstream).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("DONE must close the converter without waiting for EOF");
+        let output = String::from_utf8(
+            chunks
+                .into_iter()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .concat(),
+        )
+        .unwrap();
+        assert!(output.contains("event: response.completed\n"));
+    }
+
+    #[tokio::test]
+    async fn terminal_boundary_finish_reason_without_done_preserves_transport_error() {
+        let output = collect_terminal_boundary_stream(vec![
+            Ok(Bytes::from_static(
+                b"data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"visible\"},\"finish_reason\":\"stop\"}]}\n\n",
+            )),
+            Err(std::io::Error::other("reset")),
+        ])
+        .await;
+        assert_eq!(output.matches("event: response.failed\n").count(), 1);
+        assert!(!output.contains("event: response.completed\n"));
+        assert!(output.contains("reset"));
+    }
+
+    #[tokio::test]
+    async fn terminal_boundary_hosted_loop_done_closes_before_eof_and_ignores_late_data() {
+        let upstream = stream::once(async {
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"visible\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\ndata: {\"error\":{\"message\":\"late-data\"}}\n\n",
+            ))
+        })
+        .chain(stream::pending());
+        let converted = create_responses_sse_stream_from_chat_with_hosted_loop(
+            Box::pin(upstream),
+            CodexToolContext::default(),
+            None,
+            |_calls, _assistant| async { Ok(None) },
+        );
+        let chunks = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            converted.collect::<Vec<_>>(),
+        )
+        .await
+        .expect("DONE must close the hosted round without waiting for EOF");
+        let output = String::from_utf8(
+            chunks
+                .into_iter()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .concat(),
+        )
+        .unwrap();
+        assert_eq!(output.matches("event: response.completed\n").count(), 1);
+        assert!(output.contains("visible"));
+        assert!(!output.contains("late-data"));
+    }
 
     async fn collect(chunks: Vec<&str>) -> String {
         collect_with_context(chunks, CodexToolContext::default()).await

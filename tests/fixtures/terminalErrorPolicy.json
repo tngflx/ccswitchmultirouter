@@ -1,0 +1,166 @@
+[
+  {
+    "name": "ambiguous pending operation with dotted code",
+    "event": "response.failed",
+    "error": {
+      "code": "response.pending",
+      "message": "The upstream operation is still running"
+    },
+    "expectedCode": "response_pending"
+  },
+  {
+    "name": "expired token with hyphenated code",
+    "event": "response.failed",
+    "error": { "code": "TOKEN-EXPIRED", "message": "Sign in again" },
+    "expectedCode": "authentication_error"
+  },
+  {
+    "name": "token error with spaces",
+    "event": "response.failed",
+    "error": { "code": "invalid token", "message": "Sign in again" },
+    "expectedCode": "authentication_error"
+  },
+  {
+    "name": "auth has precedence over quota",
+    "event": "response.failed",
+    "error": { "code": "authentication_error", "message": "quota unavailable" },
+    "expectedCode": "authentication_error"
+  },
+  {
+    "name": "plain quota code blocks overloaded message",
+    "event": "response.failed",
+    "error": {
+      "code": "quota",
+      "message": "The service is temporarily overloaded"
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "quota has precedence over policy",
+    "event": "response.failed",
+    "error": { "code": "quota_exceeded", "message": "policy limit" },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "denied request with dotted code",
+    "event": "response.failed",
+    "error": {
+      "code": "access.denied",
+      "message": "Contact your administrator"
+    },
+    "expectedCode": "permission_denied"
+  },
+  {
+    "name": "context window has whitespace separators",
+    "event": "response.failed",
+    "error": {
+      "code": "context\twindow",
+      "message": "Start a smaller request"
+    },
+    "expectedCode": "context_length_exceeded"
+  },
+  {
+    "name": "invalid model with compact code",
+    "event": "response.failed",
+    "error": { "code": "invalidmodel", "message": "Choose an available model" },
+    "expectedCode": "invalid_request_error"
+  },
+  {
+    "name": "bad request with hyphenated code",
+    "event": "response.failed",
+    "error": { "code": "bad-request", "message": "Correct the request" },
+    "expectedCode": "invalid_request_error"
+  },
+  {
+    "name": "content filter remains permanent",
+    "event": "response.failed",
+    "error": {
+      "code": "content_filter",
+      "message": "The request cannot be processed"
+    },
+    "expectedCode": "invalid_request_error"
+  },
+  {
+    "name": "cancelled event has precedence over pending",
+    "event": "response.cancelled",
+    "error": {
+      "code": "response_pending",
+      "message": "The user cancelled the turn"
+    },
+    "expectedCode": "cancelled"
+  },
+  {
+    "name": "nested permanent detail remains blocked",
+    "event": "response.failed",
+    "error": { "details": { "reason": "TOKEN_EXPIRED" } },
+    "expectedCode": "authentication_error"
+  },
+  {
+    "name": "permanent marker in error key remains blocked",
+    "event": "response.failed",
+    "error": { "permissionDenied": "Temporary overload" },
+    "expectedCode": "permission_denied"
+  },
+  {
+    "name": "plain string error remains permanent",
+    "event": "response.failed",
+    "error": "The provider rejected an unsupported model",
+    "expectedCode": "invalid_request_error"
+  },
+  {
+    "name": "separate error fields cannot manufacture a permanent marker",
+    "event": "response.failed",
+    "error": {
+      "code": "invalid",
+      "message": "token temporarily unavailable"
+    },
+    "expectedCode": null
+  },
+  {
+    "name": "retry policy metadata does not block transient recovery",
+    "event": "response.failed",
+    "error": {
+      "code": "server_error",
+      "message": "Service temporarily overloaded",
+      "metadata": { "retry_policy": "retry later" }
+    },
+    "expectedCode": null
+  },
+  {
+    "name": "quota metadata does not block transient recovery",
+    "event": "response.failed",
+    "error": {
+      "code": "server_error",
+      "message": "Service temporarily overloaded",
+      "metadata": { "quota_remaining": 42 }
+    },
+    "expectedCode": null
+  },
+  {
+    "name": "transient overload remains recoverable",
+    "event": "response.failed",
+    "error": {
+      "code": "server_error",
+      "message": "Our servers are currently overloaded. Please try again later."
+    },
+    "expectedCode": null
+  },
+  {
+    "name": "connection reset remains recoverable",
+    "event": "response.failed",
+    "error": {
+      "code": "stream_error",
+      "message": "The connection reset before completion"
+    },
+    "expectedCode": null
+  },
+  {
+    "name": "rate limit remains recoverable",
+    "event": "response.failed",
+    "error": {
+      "code": "rate_limit_exceeded",
+      "message": "HTTP 429, retry later"
+    },
+    "expectedCode": null
+  }
+]

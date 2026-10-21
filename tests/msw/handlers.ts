@@ -464,7 +464,14 @@ export const handlers = [
 
   http.post(`${TAURI_ENDPOINT}/save_settings`, async ({ request }) => {
     const { settings } = await withJson<{ settings: Settings }>(request);
-    setSettings({ ...settings, requestHealth: getSettings().requestHealth });
+    const current = getSettings();
+    setSettings({
+      ...settings,
+      requestHealth: current.requestHealth,
+      enableStreamRetry: current.enableStreamRetry,
+      streamRetryMode: current.streamRetryMode,
+      streamRetryMaxAttempts: current.streamRetryMaxAttempts,
+    });
     return success(true);
   }),
 

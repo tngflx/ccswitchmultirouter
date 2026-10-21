@@ -648,6 +648,72 @@ mod tests {
         })
     }
 
+    #[test]
+    fn official_context_save_rejects_unverified_million_before_database_mutation() {
+        with_test_home(|state, _| {
+            let mut provider = Provider::with_id(
+                crate::database::CODEX_OFFICIAL_PROVIDER_ID.into(),
+                "Official".into(),
+                json!({"modelCatalog":{"models":[]}}),
+                None,
+            );
+            provider.category = Some("official".into());
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .unwrap();
+            let before = provider.clone();
+            provider.settings_config["modelCatalog"]["models"] = json!([
+                {"model":"context-without-authenticated-max", "contextWindow":1000000, "maxContextWindow":2000000}
+            ]);
+            let error = ProviderService::persist_provider_mutation(
+                state,
+                &AppType::Codex,
+                &provider,
+                &[],
+                &[],
+            )
+            .expect_err("editable metadata cannot authorize account enlargement");
+            assert!(error
+                .to_string()
+                .contains("Discover models for the selected authentication source"));
+            let saved = state
+                .db
+                .get_provider_by_id(&provider.id, AppType::Codex.as_str())
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.settings_config, before.settings_config);
+            for field in [
+                "contextWindow",
+                "context_window",
+                "modelContextWindow",
+                "model_context_window",
+            ] {
+                let mut fallback = before.clone();
+                fallback.settings_config["modelCatalog"]["models"] =
+                    json!([{"model":"context-without-authenticated-max"}]);
+                fallback.settings_config[field] = json!("1000000");
+                ProviderService::persist_provider_mutation(
+                    state,
+                    &AppType::Codex,
+                    &fallback,
+                    &[],
+                    &[],
+                )
+                .expect_err("provider fallback cannot bypass account limits");
+                let saved = state
+                    .db
+                    .get_provider_by_id(&provider.id, AppType::Codex.as_str())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    saved.settings_config, before.settings_config,
+                    "{field} must fail before persistence"
+                );
+            }
+        });
+    }
+
     fn codex_settings_with_unknown_subagent(base_url: &str, api_key: &str) -> Value {
         let mut settings = codex_settings(base_url, api_key);
         settings["modelCatalog"] = json!({
@@ -3716,6 +3782,31 @@ model = "gpt-5.4-mini"
             }),
             None,
         );
+        // This route deliberately changes from provider-config credentials to
+        // a managed account. Give that selected account its own successful
+        // discovery snapshot instead of borrowing editable provider limits.
+        let managed_account = format!("router-takeover-{}", uuid::Uuid::new_v4());
+        let account_models = [
+            ("gpt-5.5", 272_000),
+            ("gpt-5.4", 272_000),
+            ("gpt-5.4-mini", 128_000),
+            ("gpt-5.3-codex-spark", 128_000),
+            ("qwen3.6", 262_144),
+            ("deepseek-v4-flash", 1_000_000),
+            ("deepseek-v4-pro", 1_000_000),
+        ]
+        .into_iter()
+        .map(|(id, window)| crate::services::model_fetch::FetchedModel {
+            id: id.into(),
+            context_window: Some(window),
+            max_context_window: Some(window),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+        crate::services::codex_oauth_models::record_authenticated_model_limits(
+            &managed_account,
+            &account_models,
+        );
         let mut router = Provider::with_id(
             "codex-openai-router".to_string(),
             "OpenAI Multi-Model Router".to_string(),
@@ -3735,7 +3826,7 @@ openai_base_url = "http://127.0.0.1:15721/v1"
                             "targetProviderId": "openai",
                             "modelSelection": { "mode": "all" },
                             "matchPrefixes": ["gpt-"],
-                            "authPolicy": { "source": "managed_codex_oauth" }
+                            "authPolicy": { "source": "managed_codex_oauth", "accountId": managed_account }
                         }
                     ]
                 }
@@ -8168,6 +8259,16 @@ impl ProviderService {
         if *app_type != AppType::Codex {
             return state.db.save_provider(app_type.as_str(), provider);
         }
+
+        let previous = state
+            .db
+            .get_provider_by_id(&provider.id, app_type.as_str())?;
+        let official_models = crate::codex_context::trusted_official_models(provider);
+        crate::codex_context::validate_official_context_changes(
+            provider,
+            previous.as_ref(),
+            &official_models,
+        )?;
 
         let is_router = Self::is_codex_schema_v2_router(app_type, provider);
         if !is_router && provider.uses_manual_codex_protocol() {
