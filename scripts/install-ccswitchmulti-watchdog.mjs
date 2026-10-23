@@ -28,6 +28,7 @@ export const GUARDIAN_RUNTIME_FILES = Object.freeze([
   "ccswitchmulti-guardian-core.mjs",
   "windows-json-query.mjs",
   "dev-watchdog-policy.mjs",
+  "dev-recovery-output.mjs",
   "dev-recovery-policy.json",
 ]);
 

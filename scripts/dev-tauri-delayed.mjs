@@ -14,6 +14,21 @@ import {
   watch,
   writeFileSync,
 } from "node:fs";
+import {
+  acquireDevSessionLaunchLock,
+  DEV_RECOVERY_FLAG,
+  parseDevSupervisorLaunchArgs,
+  prepareDevSessionLaunch,
+} from "./dev-session-launch.mjs";
+import {
+  commitPlannedDevExit,
+  stopPlannedWindowsApp,
+} from "./dev-app-exit.mjs";
+import { utcTicks } from "./ccswitchmulti-guardian-core.mjs";
+import {
+  devRecoveryLogPath,
+  spawnDevRecoveryProcess,
+} from "./dev-recovery-output.mjs";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
@@ -1171,9 +1186,23 @@ export async function stopVerifiedWindowsApp(
     waitForProcessExit = waitForWindowsProcessExit,
     waitForListenersReleased = waitForWindowsListenersReleased,
     forcedTimeoutMs = WINDOWS_PROCESS_EXIT_TIMEOUT_MS,
+    plannedExitReason,
+    plannedAppExits,
+    stopPlannedApp = stopPlannedWindowsApp,
+    writeEvent = writeDevLifecycleEvent,
     log = console.log,
   } = {},
 ) {
+  let plannedProof;
+  const planned =
+    plannedExitReason &&
+    String(processInfo.Name).toLowerCase() === "cc-switch.exe";
+  if (planned)
+    writeEvent("dev-planned-app-stop", {
+      app_pid: processInfo.ProcessId,
+      reason: plannedExitReason,
+      stage: "requested",
+    });
   const listeners = queryListeners(processInfo);
   const current = queryProcesses().find(
     (candidate) =>
@@ -1189,7 +1218,30 @@ export async function stopVerifiedWindowsApp(
     log(
       `[dev] Force-terminating verified ${processInfo.Name} PID ${processInfo.ProcessId} process tree before rebuild.`,
     );
-    const forcedResult = terminate(processInfo.ProcessId, true, true);
+    if (
+      plannedExitReason &&
+      String(processInfo.Name).toLowerCase() === "cc-switch.exe"
+    ) {
+      plannedProof = stopPlannedApp(processInfo, {
+        markerPath: resolveDevRunMarkerPath(),
+        reason: plannedExitReason,
+      });
+      writeEvent("dev-planned-app-stop", {
+        app_pid: processInfo.ProcessId,
+        reason: plannedExitReason,
+        stage: plannedProof?.terminated
+          ? plannedProof.markerText == null
+            ? "terminated_no_marker"
+            : "terminated"
+          : "already_exited",
+      });
+    }
+    // A negative native result means the retained app already exited. Never
+    // fall back to a PID-based kill after that identity may have been reused.
+    const mayTerminate = !plannedProof;
+    const forcedResult = mayTerminate
+      ? terminate(processInfo.ProcessId, true, true)
+      : undefined;
     if (forcedResult?.error) {
       throw forcedResult.error;
     }
@@ -1201,6 +1253,12 @@ export async function stopVerifiedWindowsApp(
       );
     }
   }
+  if (planned && !current)
+    writeEvent("dev-planned-app-stop", {
+      app_pid: processInfo.ProcessId,
+      reason: plannedExitReason,
+      stage: "already_exited_before_stop",
+    });
 
   if (listeners.length > 0) {
     log(
@@ -1208,6 +1266,17 @@ export async function stopVerifiedWindowsApp(
     );
     await waitForListenersReleased(listeners);
   }
+  if (plannedProof?.terminated) plannedAppExits?.push(plannedProof);
+}
+
+export async function runPlannedDevCleanup(
+  cleanup,
+  reason,
+  { commit = commitPlannedDevExit } = {},
+) {
+  const plannedAppExits = [];
+  await cleanup({ plannedExitReason: reason, plannedAppExits });
+  for (const proof of plannedAppExits) commit(proof);
 }
 
 export async function stopWindowsProcess(
@@ -1221,6 +1290,9 @@ export async function stopWindowsProcess(
     waitForListenersReleased = waitForWindowsListenersReleased,
     terminateRoot = false,
     expectedRootIdentity,
+    plannedExitReason,
+    plannedAppExits,
+    stopPlannedApp,
     log = console.log,
   } = {},
 ) {
@@ -1267,6 +1339,9 @@ export async function stopWindowsProcess(
         terminate,
         waitForProcessExit,
         waitForListenersReleased,
+        plannedExitReason,
+        plannedAppExits,
+        stopPlannedApp,
         log,
       });
       continue;
@@ -1538,6 +1613,284 @@ export function devSessionEnvironment(environment) {
   );
 }
 
+/**
+ * A worker may retire its monitors on IPC disconnect only when the canonical
+ * marker proves that a serialized manual launcher already owns the handoff.
+ * Every process identity in this check is exact; PID equality alone is not
+ * sufficient because Windows can recycle a PID between observations.
+ */
+export function isManualTakeoverHandoff(
+  session,
+  { workerPid, workerIdentity, supervisorPid } = {},
+) {
+  const owner = session?.handoffOwner;
+  const exactWorkerIdentity = (recorded) => {
+    if (!sameWindowsProcess(recorded, workerIdentity)) return false;
+    try {
+      return (
+        utcTicks(recorded.CreationDate) ===
+          utcTicks(workerIdentity.CreationDate) &&
+        Number(recorded.ParentProcessId) === Number(supervisorPid) &&
+        Number(workerIdentity.ParentProcessId) === Number(supervisorPid) &&
+        typeof recorded.CommandLine === "string" &&
+        recorded.CommandLine === workerIdentity.CommandLine
+      );
+    } catch {
+      return false;
+    }
+  };
+  if (
+    session?.schemaVersion !== 1 ||
+    session.state !== "stopping" ||
+    session.handoffIntent !== "manual_takeover" ||
+    !owner ||
+    !Number.isSafeInteger(workerPid) ||
+    workerPid < 1 ||
+    !Number.isSafeInteger(supervisorPid) ||
+    supervisorPid < 1 ||
+    Number(session.supervisorPid) !== Number(supervisorPid) ||
+    Number(owner.supervisorPid) !== Number(supervisorPid) ||
+    owner.supervisorStartedAtUtc !== session.supervisorStartedAtUtc ||
+    Number(session.workerPid) !== Number(workerPid) ||
+    Number(owner.workerPid) !== Number(workerPid) ||
+    !workerIdentity ||
+    !exactWorkerIdentity(session.workerIdentity) ||
+    !exactWorkerIdentity(owner.workerIdentity)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+export function preserveManualTakeoverHandoff(session, persisted) {
+  const {
+    handoffIntent: _intent,
+    handoffOwner: _owner,
+    handoffPhase: _phase,
+    ...current
+  } = session;
+  if (
+    current.state !== "running" ||
+    persisted?.supervisorStartedAtUtc !== current.supervisorStartedAtUtc ||
+    persisted?.repoRoot !== current.repoRoot ||
+    persisted?.scriptPath !== current.scriptPath ||
+    persisted?.supervisorExecutablePath !== current.supervisorExecutablePath ||
+    !isManualTakeoverHandoff(persisted, {
+      workerPid: current.workerPid,
+      workerIdentity: current.workerIdentity,
+      supervisorPid: current.supervisorPid,
+    })
+  )
+    return current;
+  return {
+    ...current,
+    state: "stopping",
+    handoffIntent: persisted.handoffIntent,
+    handoffOwner: persisted.handoffOwner,
+    handoffPhase: persisted.handoffPhase,
+  };
+}
+
+export function createDevSupervisorHandoff({
+  getWorker,
+  getContext,
+  readSession,
+  persistSession,
+  onRequested,
+}) {
+  const verified = () => {
+    const session = readSession();
+    const context = getContext();
+    return session?.supervisorStartedAtUtc === context.supervisorStartedAtUtc &&
+      isManualTakeoverHandoff(session, context)
+      ? session
+      : undefined;
+  };
+  return {
+    request() {
+      const child = getWorker();
+      if (!child?.connected) return false;
+      let session;
+      try {
+        session = verified();
+      } catch {
+        return false;
+      }
+      if (!session) return false;
+      onRequested();
+      if (session.handoffPhase !== "worker_ready") {
+        try {
+          child.send({ type: "dev-handoff" }, () => {});
+        } catch {
+          return false;
+        }
+      }
+      return true;
+    },
+    acknowledge(child, message) {
+      if (
+        child !== getWorker() ||
+        message?.type !== "dev-handoff-ready" ||
+        message.workerPid !== child?.pid
+      )
+        return false;
+      let session;
+      try {
+        session = verified();
+      } catch {
+        return false;
+      }
+      if (!session) return false;
+      onRequested();
+      try {
+        persistSession({ ...session, handoffPhase: "worker_ready" });
+      } catch {
+        return false;
+      }
+      return true;
+    },
+  };
+}
+
+export function retireDevWorkerForManualHandoff({
+  readSession,
+  context,
+  isRetired,
+  retireMonitors,
+  acknowledge,
+}) {
+  let session;
+  try {
+    session = readSession();
+  } catch {
+    return false;
+  }
+  if (!isManualTakeoverHandoff(session, context)) return false;
+  if (!isRetired()) retireMonitors();
+  acknowledge({ type: "dev-handoff-ready", workerPid: context.workerPid });
+  return true;
+}
+
+export async function waitForManualDevHandoffReady({
+  expected,
+  readSession,
+  refreshHandoff,
+  timeoutMs = 15_000,
+  now = Date.now,
+  wait = (milliseconds) =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds)),
+}) {
+  const deadline = now() + timeoutMs;
+  let refreshAfter = now() + 1_000;
+  while (true) {
+    let lostPublication = false;
+    try {
+      const session = readSession();
+      if (
+        session?.supervisorStartedAtUtc === expected.supervisorStartedAtUtc &&
+        session.handoffPhase === "worker_ready" &&
+        isManualTakeoverHandoff(session, {
+          supervisorPid: expected.supervisorPid,
+          workerPid: expected.workerPid,
+          workerIdentity: expected.workerIdentity,
+        })
+      )
+        return session;
+      // A queued old publication may have read running before native prepare
+      // wrote the intent. Revalidate natively before republishing only that
+      // exact still-running owner; ordinary stop and new owners stay closed.
+      lostPublication =
+        session?.state === "running" &&
+        session.supervisorStartedAtUtc === expected.supervisorStartedAtUtc &&
+        isManualTakeoverHandoff(
+          {
+            ...session,
+            state: "stopping",
+            handoffIntent: "manual_takeover",
+            handoffOwner: {
+              supervisorPid: expected.supervisorPid,
+              supervisorStartedAtUtc: expected.supervisorStartedAtUtc,
+              workerPid: expected.workerPid,
+              workerIdentity: expected.workerIdentity,
+            },
+          },
+          {
+            supervisorPid: expected.supervisorPid,
+            workerPid: expected.workerPid,
+            workerIdentity: expected.workerIdentity,
+          },
+        );
+    } catch {}
+    if (
+      lostPublication &&
+      refreshHandoff &&
+      now() >= refreshAfter &&
+      now() < deadline
+    ) {
+      await refreshHandoff();
+      refreshAfter = now() + 1_000;
+      continue;
+    }
+    if (now() >= deadline)
+      throw new Error(
+        "The previous development worker did not acknowledge a verified handoff; its owner was left running.",
+      );
+    await wait(Math.min(50, deadline - now()));
+  }
+}
+
+export async function handleDevWorkerDisconnect({
+  isStopping,
+  readSession,
+  workerPid,
+  supervisorPid,
+  queryWorkerIdentity,
+  verifiedWorkerIdentity,
+  retireMonitors,
+  shutdown,
+  writeEvent = writeDevLifecycleEvent,
+  timeoutMs = 5_000,
+  now = Date.now,
+  wait = (milliseconds) =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds)),
+}) {
+  const deadline = now() + timeoutMs;
+  let workerIdentity = verifiedWorkerIdentity;
+  while (true) {
+    if (isStopping()) return "already-stopping";
+    if (!workerIdentity) {
+      try {
+        workerIdentity = queryWorkerIdentity();
+      } catch {}
+    }
+    try {
+      if (
+        isManualTakeoverHandoff(readSession(), {
+          workerPid,
+          workerIdentity,
+          supervisorPid,
+        })
+      ) {
+        retireMonitors();
+        writeEvent("dev-worker-disconnect", {
+          worker_pid: workerPid,
+          decision: "handoff",
+          identity_source: verifiedWorkerIdentity ? "startup" : "disconnect",
+        });
+        return "handoff";
+      }
+    } catch {}
+    if (now() >= deadline) break;
+    await wait(Math.min(50, deadline - now()));
+  }
+  writeEvent("dev-worker-disconnect", {
+    worker_pid: workerPid,
+    decision: workerIdentity ? "no_exact_handoff" : "identity_unavailable",
+  });
+  void shutdown(1);
+  return "shutdown";
+}
+
 function writeDevWatchdogEvent(event, detail) {
   const markerPath = devSessionPath();
   if (!markerPath) return;
@@ -1547,6 +1900,10 @@ function writeDevWatchdogEvent(event, detail) {
       `${JSON.stringify({ timestamp: new Date().toISOString(), event, detail })}\n`,
     );
   } catch {}
+}
+
+function writeDevLifecycleEvent(event, detail) {
+  if (isMainModule) writeDevWatchdogEvent(event, detail);
 }
 
 function devSupervisorIsAlive(session, processes) {
@@ -1649,13 +2006,9 @@ export async function handoffDetachedDevSupervisor({
   persistSession = (nextSession) =>
     persistDetachedDevSession(markerPath, nextSession),
   readSession = () => JSON.parse(readFileSync(markerPath, "utf8")),
-  spawnReplacement = async ({ executable, args, options }) => {
-    const replacement = spawn(executable, args, options);
-    await new Promise((resolve, reject) => {
-      replacement.once("spawn", resolve);
-      replacement.once("error", reject);
-    });
-    return replacement;
+  spawnReplacement = async (specification) => {
+    const { child } = await spawnDevRecoveryProcess(specification);
+    return child;
   },
   waitForPublication = waitForDevSupervisorPublication,
   queryProcesses = queryWindowsProcesses,
@@ -1689,18 +2042,27 @@ export async function handoffDetachedDevSupervisor({
 
   // Relaunch the entry point of pnpm dev, not the compiled application.
   const launchedAtMs = now();
+  writeEvent("dev-supervisor-restarting", {
+    oldPid: supervisorPid,
+    outputPath: devRecoveryLogPath(markerPath),
+  });
   const replacement = await spawnReplacement({
     executable,
-    args: [scriptPath, ...session.args],
+    markerPath,
+    args: [
+      scriptPath,
+      DEV_RECOVERY_FLAG,
+      String(supervisorPid),
+      ...session.args,
+    ],
     options: {
       cwd: repoRoot,
       env: {
         ...environment,
         ...devSessionEnvironment(session.environment),
       },
-      stdio: "ignore",
-      detached: true,
-      windowsHide: true,
+      // The shared recovery launcher owns detachment and durable output.
+      // Detached Windows children cannot use inherited console handles.
     },
   });
   try {
@@ -1803,7 +2165,7 @@ function sendDevRoot(role, child) {
     process.send({ type: "dev-root", role, pid: child.pid });
 }
 
-async function cleanRecordedDevRoots(roots) {
+async function cleanRecordedDevRoots(roots, options = {}) {
   for (const root of roots) {
     const select =
       root.role === "tauri"
@@ -1829,7 +2191,11 @@ async function cleanRecordedDevRoots(roots) {
               ]
             : []),
         ],
-        { terminateRoot: true, expectedRootIdentity: root.identity },
+        {
+          ...options,
+          terminateRoot: true,
+          expectedRootIdentity: root.identity,
+        },
       );
     } else {
       try {
@@ -1841,7 +2207,7 @@ async function cleanRecordedDevRoots(roots) {
   }
 }
 
-async function cleanRecordedDevWorker(session) {
+async function cleanRecordedDevWorker(session, options = {}) {
   if (!Number.isInteger(session?.workerPid)) return;
   if (process.platform !== "win32") {
     try {
@@ -1867,244 +2233,378 @@ async function cleanRecordedDevWorker(session) {
   await stopWindowsProcess(
     { pid: session.workerPid, exitCode: 0, signalCode: null },
     windowsDevWorkerDescendants,
-    { terminateRoot: true, expectedRootIdentity: current },
+    { ...options, terminateRoot: true, expectedRootIdentity: current },
   );
 }
 
-async function runDevSupervisor(args) {
-  // Reject bad options once, before the recovery loop can retry them.
+async function runDevSupervisor(launchArgs) {
+  const launch = parseDevSupervisorLaunchArgs(launchArgs);
+  const { args } = launch;
+  // Validate the requested settings before retiring a working development session.
   parseDelayMs(args);
   parseNoRebuild(args);
   parsePort();
   const markerPath = devSessionPath();
-  let previous;
-  if (markerPath) {
-    try {
-      previous = JSON.parse(readFileSync(markerPath, "utf8"));
-    } catch {}
-  }
-  let supervisorIdentity;
-  const processes = process.platform === "win32" ? queryWindowsProcesses() : [];
-  if (devSupervisorIsAlive(previous, processes)) {
-    throw new Error(
-      `An existing pnpm dev supervisor (PID ${previous.supervisorPid}) owns this configuration.`,
-    );
-  }
-  if (process.platform === "win32") {
-    supervisorIdentity = processes.find(
-      (candidate) => Number(candidate.ProcessId) === process.pid,
-    );
-  }
-  const ownsPrevious =
-    previous?.repoRoot === REPO_ROOT &&
-    previous?.scriptPath === fileURLToPath(import.meta.url);
-  let worker;
-  let workerIdentity;
-  let stopping = false;
-  let roots = new Map(
-    (ownsPrevious ? (previous.roots ?? []) : []).map((root) => [
-      root.role,
-      root,
-    ]),
-  );
-  let restartTimer;
-  let finishRestartWait;
-  const session = {
-    schemaVersion: 1,
-    supervisorPid: process.pid,
-    supervisorExecutablePath: process.execPath,
-    supervisorStartedAtUtc: supervisorIdentity
-      ? windowsProcessStartedAtUtc(supervisorIdentity)
-      : new Date(Date.now() - process.uptime() * 1000).toISOString(),
-    repoRoot: REPO_ROOT,
-    scriptPath: fileURLToPath(import.meta.url),
-    args,
-    environment: devSessionEnvironment(process.env),
-    startedAtUtc: new Date().toISOString(),
-    restartTimesMs: readDevRestartTimesMs(previous),
-    state: "running",
-  };
-  const lockPath = markerPath ? `${markerPath}.lock` : null;
-  if (lockPath) {
-    mkdirSync(path.dirname(lockPath), { recursive: true });
-    let lock;
-    try {
-      lock = openSync(lockPath, "wx");
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-      let owner;
-      try {
-        owner = JSON.parse(readFileSync(lockPath, "utf8"));
-      } catch {}
-      if (
-        devSupervisorIsAlive(
-          owner,
+  const releaseLaunch = await acquireDevSessionLaunchLock({ markerPath });
+  let launchReleased = false;
+  try {
+    const readSession = () => JSON.parse(readFileSync(markerPath, "utf8"));
+    const cleanSessionRecord = async (record, options) => {
+      await cleanRecordedDevWorker(record, options);
+      await cleanRecordedDevRoots(record.roots ?? [], options);
+    };
+    const { previous, restartTimesMs, plannedCleanupComplete } =
+      await prepareDevSessionLaunch({
+        markerPath,
+        repoRoot: REPO_ROOT,
+        scriptPath: fileURLToPath(import.meta.url),
+        executable: process.execPath,
+        ...launch,
+        queryProcesses: () =>
           process.platform === "win32" ? queryWindowsProcesses() : [],
-        ) ||
-        (!owner && Date.now() - statSync(lockPath).mtimeMs < 5_000)
-      )
-        throw new Error("Another pnpm dev supervisor is starting or running.");
-      rmSync(lockPath);
-      lock = openSync(lockPath, "wx");
+        assertLaunchHeld: releaseLaunch.assertHeld,
+        beforeOwnerStop: async (
+          current,
+          _handoffSession,
+          { refreshHandoff },
+        ) => {
+          const ready = await waitForManualDevHandoffReady({
+            expected: current,
+            readSession,
+            refreshHandoff,
+          });
+          writeDevLifecycleEvent("dev-live-owner-handoff", {
+            supervisor_pid: current.supervisorPid,
+            stage: "worker_ready",
+          });
+          await runPlannedDevCleanup(
+            (options) => cleanSessionRecord(ready, options),
+            "development_manual_restart",
+          );
+        },
+      });
+    if (previous && !plannedCleanupComplete) {
+      console.log(
+        `[dev] Replacing previous development session (PID ${previous.supervisorPid}).`,
+      );
+      // Keep startup serialized until all old worker roots/listeners are gone.
+      // No replacement marker may discard their cleanup identity in the meantime.
+      // Old workers cannot acknowledge the live-owner protocol. Their first
+      // replacement remains an unplanned transition rather than a false proof.
+      await cleanSessionRecord(previous);
     }
-    try {
-      writeFileSync(lock, JSON.stringify(session));
-    } finally {
-      closeSync(lock);
+    releaseLaunch.assertHeld();
+    let supervisorIdentity;
+    const processes =
+      process.platform === "win32" ? queryWindowsProcesses() : [];
+    if (process.platform === "win32") {
+      supervisorIdentity = processes.find(
+        (candidate) => Number(candidate.ProcessId) === process.pid,
+      );
+      if (!supervisorIdentity) {
+        throw new Error(
+          "Could not verify this development supervisor's process identity.",
+        );
+        writeDevLifecycleEvent("dev-live-owner-handoff", {
+          supervisor_pid: current.supervisorPid,
+          stage: "app_cleanup_committed",
+        });
+      }
     }
-  }
-  const saveSession = () => {
-    if (!markerPath) return;
-    mkdirSync(path.dirname(markerPath), { recursive: true });
-    const temporary = `${markerPath}.${process.pid}.tmp`;
-    writeFileSync(
-      temporary,
-      JSON.stringify({
-        ...session,
+    let worker;
+    let workerIdentity;
+    let stopping = false;
+    let manualHandoff = false;
+    let roots = new Map();
+    let restartTimer;
+    let finishRestartWait;
+    const session = {
+      schemaVersion: 1,
+      handoffProtocolVersion: 1,
+      supervisorPid: process.pid,
+      supervisorExecutablePath: process.execPath,
+      supervisorStartedAtUtc: supervisorIdentity
+        ? windowsProcessStartedAtUtc(supervisorIdentity)
+        : new Date(Date.now() - process.uptime() * 1000).toISOString(),
+      repoRoot: REPO_ROOT,
+      scriptPath: fileURLToPath(import.meta.url),
+      args,
+      environment: devSessionEnvironment(process.env),
+      startedAtUtc: new Date().toISOString(),
+      restartTimesMs,
+      state: "running",
+    };
+    const lockPath = markerPath ? `${markerPath}.lock` : null;
+    if (lockPath) {
+      mkdirSync(path.dirname(lockPath), { recursive: true });
+      let lock;
+      try {
+        lock = openSync(lockPath, "wx");
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        let owner;
+        try {
+          owner = JSON.parse(readFileSync(lockPath, "utf8"));
+        } catch {}
+        if (
+          devSupervisorIsAlive(
+            owner,
+            process.platform === "win32" ? queryWindowsProcesses() : [],
+          ) ||
+          (!owner && Date.now() - statSync(lockPath).mtimeMs < 5_000)
+        )
+          throw new Error(
+            "Another pnpm dev supervisor is starting or running.",
+          );
+        rmSync(lockPath);
+        lock = openSync(lockPath, "wx");
+      }
+      try {
+        writeFileSync(lock, JSON.stringify(session));
+      } finally {
+        closeSync(lock);
+      }
+    }
+    const writeSession = (record) => {
+      const temporary = `${markerPath}.${process.pid}.tmp`;
+      writeFileSync(temporary, JSON.stringify(record));
+      renameSync(temporary, markerPath);
+    };
+    const saveSession = () => {
+      if (!markerPath) return;
+      mkdirSync(path.dirname(markerPath), { recursive: true });
+      let persisted;
+      // The new explicit launcher writes this record while the old supervisor
+      // is still alive. Preserve it across any queued root/worker publication
+      // so the old worker cannot lose the handoff intent before disconnect.
+      if (session.state === "running") {
+        try {
+          persisted = JSON.parse(readFileSync(markerPath, "utf8"));
+        } catch {}
+      }
+      writeSession(
+        preserveManualTakeoverHandoff(
+          {
+            ...session,
+            workerPid: worker?.pid,
+            workerIdentity,
+            roots: [...roots.values()],
+          },
+          persisted,
+        ),
+      );
+    };
+    const stop = (exitCode) => {
+      if (stopping) return;
+      stopping = true;
+      manualHandoff = false;
+      process.exitCode = exitCode;
+      session.state = "stopping";
+      delete session.handoffIntent;
+      delete session.handoffOwner;
+      delete session.handoffPhase;
+      saveSession();
+      clearTimeout(restartTimer);
+      finishRestartWait?.();
+      if (worker?.connected) worker.send({ type: "dev-shutdown", exitCode });
+    };
+    const onInterrupt = () => stop(130);
+    const onTerminate = () => stop(143);
+    process.once("SIGINT", onInterrupt);
+    process.once("SIGTERM", onTerminate);
+    saveSession();
+    const handoff = createDevSupervisorHandoff({
+      getWorker: () => worker,
+      getContext: () => ({
+        supervisorPid: process.pid,
+        supervisorStartedAtUtc: session.supervisorStartedAtUtc,
         workerPid: worker?.pid,
         workerIdentity,
-        roots: [...roots.values()],
       }),
-    );
-    renameSync(temporary, markerPath);
-  };
-  const stop = (exitCode) => {
-    if (stopping) return;
-    stopping = true;
-    process.exitCode = exitCode;
-    session.state = "stopping";
-    saveSession();
-    clearTimeout(restartTimer);
-    finishRestartWait?.();
-    if (worker?.connected) worker.send({ type: "dev-shutdown", exitCode });
-  };
-  const onInterrupt = () => stop(130);
-  const onTerminate = () => stop(143);
-  process.once("SIGINT", onInterrupt);
-  process.once("SIGTERM", onTerminate);
-  saveSession();
-  const detachedWatchdog = spawn(
-    process.execPath,
-    [fileURLToPath(import.meta.url), DEV_WATCHDOG_FLAG, String(process.pid)],
-    {
-      cwd: REPO_ROOT,
-      env: process.env,
-      stdio: "ignore",
-      detached: true,
-      windowsHide: true,
-    },
-  );
-  detachedWatchdog.unref();
-  detachedWatchdog.once("error", (error) =>
-    writeDevWatchdogEvent("dev-watchdog-spawn-failed", {
-      error: error.message,
-    }),
-  );
-  let completed = false;
-  try {
-    // Claim recovery before cleanup, which can wait up to a minute for a
-    // listener to release. The product guardian must see the live owner.
-    if (ownsPrevious) {
-      await cleanRecordedDevWorker(previous);
-      await cleanRecordedDevRoots(previous.roots ?? []);
-    }
-    const code = await superviseDevSessions({
-      spawnSession() {
-        roots = new Map();
-        const command = devWorkerCommand(args);
-        worker = spawn(command.executable, command.args, command.options);
-        workerIdentity = null;
-        saveSession();
-        if (process.platform === "win32" && worker.pid) {
-          workerIdentity = queryWindowsProcesses().find(
-            (candidate) => Number(candidate.ProcessId) === worker.pid,
-          );
-          saveSession();
-        }
-        worker.on("message", (message) => {
-          if (
-            message?.type !== "dev-root" ||
-            !["tauri", "vite"].includes(message.role) ||
-            !Number.isInteger(message.pid)
-          )
-            return;
-          const identity =
-            process.platform === "win32"
-              ? queryWindowsProcesses().find(
-                  (candidate) => Number(candidate.ProcessId) === message.pid,
-                )
-              : null;
-          if (process.platform === "win32" && !identity) return;
-          roots.set(message.role, {
-            pid: message.pid,
-            role: message.role,
-            identity,
+      readSession,
+      persistSession: writeSession,
+      onRequested: () => {
+        if (!manualHandoff)
+          writeDevLifecycleEvent("dev-live-owner-handoff", {
+            supervisor_pid: process.pid,
+            stage: "requested",
           });
-          saveSession();
-        });
-        return worker;
-      },
-      async cleanSession(child) {
-        if (!child.pid) return;
-        if (process.platform === "win32") {
-          await stopProcessTree(child, windowsDevWorkerDescendants, {
-            expectedRootIdentity: workerIdentity,
-          });
-        } else {
-          try {
-            process.kill(-child.pid, "SIGTERM");
-          } catch (error) {
-            if (error.code !== "ESRCH") throw error;
-          }
-        }
-        await cleanRecordedDevRoots([...roots.values()]);
-      },
-      isStopping: () => stopping,
-      restartTimesMs: session.restartTimesMs,
-      onRestart: saveSession,
-      waitToRestart: () =>
-        new Promise((resolve) => {
-          finishRestartWait = resolve;
-          restartTimer = setTimeout(resolve, DEV_AUTO_RESTART_DELAY_MS);
-        }),
-      onEvent(decision, outcome, watchdogEvent) {
-        if (watchdogEvent) {
-          writeDevWatchdogEvent(watchdogEvent.event, watchdogEvent.detail);
-        }
-        reportDevSupervisorDecision(decision, outcome);
+        manualHandoff = true;
+        clearTimeout(restartTimer);
+        finishRestartWait?.();
       },
     });
-    if (!stopping) process.exitCode = code;
-    completed = true;
-  } finally {
-    process.off("SIGINT", onInterrupt);
-    process.off("SIGTERM", onTerminate);
-    clearTimeout(restartTimer);
-    if (markerPath && completed) {
-      let recorded;
+    const handoffTimer = setInterval(() => {
+      if (!stopping) handoff.request();
+    }, 250);
+    if (markerPath) {
+      const outputPath = devRecoveryLogPath(markerPath);
+      console.log(
+        `[dev watchdog] Launcher recovery output: ${outputPath}. Follow it with Get-Content -LiteralPath '${outputPath.replaceAll("'", "''")}' -Tail 60 -Wait.`,
+      );
       try {
-        recorded = JSON.parse(readFileSync(markerPath, "utf8"));
-      } catch {}
-      if (
-        recorded?.supervisorPid === process.pid &&
-        recorded?.supervisorStartedAtUtc === session.supervisorStartedAtUtc
-      )
-        rmSync(markerPath, { force: true });
-      let owner;
-      try {
-        owner = JSON.parse(readFileSync(lockPath, "utf8"));
-      } catch {}
-      if (
-        owner?.supervisorPid === process.pid &&
-        owner?.supervisorStartedAtUtc === session.supervisorStartedAtUtc
-      )
-        rmSync(lockPath, { force: true });
+        const { child: detachedWatchdog } = await spawnDevRecoveryProcess({
+          executable: process.execPath,
+          markerPath,
+          args: [
+            fileURLToPath(import.meta.url),
+            DEV_WATCHDOG_FLAG,
+            String(process.pid),
+          ],
+          options: { cwd: REPO_ROOT, env: process.env },
+        });
+        detachedWatchdog.unref();
+        detachedWatchdog.once("error", (error) =>
+          writeDevWatchdogEvent("dev-watchdog-spawn-failed", {
+            error: error.message,
+          }),
+        );
+      } catch (error) {
+        writeDevWatchdogEvent("dev-watchdog-spawn-failed", {
+          error: error.message,
+        });
+        console.error(
+          "[dev watchdog] Could not start launcher recovery; see dev-watchdog.jsonl.",
+        );
+      }
     }
+    let completed = false;
+    try {
+      const code = await superviseDevSessions({
+        spawnSession() {
+          roots = new Map();
+          const command = devWorkerCommand(args);
+          worker = spawn(command.executable, command.args, command.options);
+          const sessionWorker = worker;
+          workerIdentity = null;
+          saveSession();
+          if (process.platform === "win32" && worker.pid) {
+            workerIdentity = queryWindowsProcesses().find(
+              (candidate) => Number(candidate.ProcessId) === worker.pid,
+            );
+            saveSession();
+          }
+          // The replacement now owns its first worker and its persisted identity.
+          // Concurrent explicit launches can take over after the startup gate opens.
+          if (!launchReleased) {
+            releaseLaunch.assertHeld();
+            launchReleased = true;
+            void releaseLaunch();
+          }
+          worker.on("message", (message) => {
+            if (handoff.acknowledge(sessionWorker, message)) {
+              writeDevLifecycleEvent("dev-live-owner-handoff", {
+                supervisor_pid: process.pid,
+                stage: "readiness_persisted",
+              });
+              return;
+            }
+            if (
+              message?.type !== "dev-root" ||
+              !["tauri", "vite"].includes(message.role) ||
+              !Number.isInteger(message.pid)
+            )
+              return;
+            const identity =
+              process.platform === "win32"
+                ? queryWindowsProcesses().find(
+                    (candidate) => Number(candidate.ProcessId) === message.pid,
+                  )
+                : null;
+            if (process.platform === "win32" && !identity) return;
+            roots.set(message.role, {
+              pid: message.pid,
+              role: message.role,
+              identity,
+            });
+            saveSession();
+          });
+          return worker;
+        },
+        async cleanSession(child) {
+          if (manualHandoff) return;
+          if (!child.pid) return;
+          if (process.platform === "win32") {
+            await stopProcessTree(child, windowsDevWorkerDescendants, {
+              expectedRootIdentity: workerIdentity,
+            });
+          } else {
+            try {
+              process.kill(-child.pid, "SIGTERM");
+            } catch (error) {
+              if (error.code !== "ESRCH") throw error;
+            }
+          }
+          await cleanRecordedDevRoots([...roots.values()]);
+        },
+        isStopping: () => stopping || manualHandoff,
+        restartTimesMs: session.restartTimesMs,
+        onRestart: saveSession,
+        waitToRestart: () =>
+          new Promise((resolve) => {
+            finishRestartWait = resolve;
+            restartTimer = setTimeout(resolve, DEV_AUTO_RESTART_DELAY_MS);
+          }),
+        onEvent(decision, outcome, watchdogEvent) {
+          if (watchdogEvent) {
+            writeDevWatchdogEvent(watchdogEvent.event, watchdogEvent.detail);
+          }
+          reportDevSupervisorDecision(decision, outcome);
+        },
+      });
+      // Keep the ancestor alive until the new launcher commits its app receipt
+      // and explicitly stops this owner. Windows job teardown would otherwise
+      // kill remaining roots before the new cleanup transaction can complete.
+      while (manualHandoff && !stopping) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      if (!stopping) process.exitCode = code;
+      completed = true;
+    } finally {
+      process.off("SIGINT", onInterrupt);
+      process.off("SIGTERM", onTerminate);
+      clearTimeout(restartTimer);
+      clearInterval(handoffTimer);
+      if (markerPath && completed && !manualHandoff) {
+        let recorded;
+        try {
+          recorded = JSON.parse(readFileSync(markerPath, "utf8"));
+        } catch {}
+        if (
+          recorded?.supervisorPid === process.pid &&
+          recorded?.supervisorStartedAtUtc === session.supervisorStartedAtUtc
+        )
+          rmSync(markerPath, { force: true });
+        let owner;
+        try {
+          owner = JSON.parse(readFileSync(lockPath, "utf8"));
+        } catch {}
+        if (
+          owner?.supervisorPid === process.pid &&
+          owner?.supervisorStartedAtUtc === session.supervisorStartedAtUtc
+        )
+          rmSync(lockPath, { force: true });
+      }
+    }
+  } finally {
+    await releaseLaunch();
   }
 }
 
 async function runDevWorker(args) {
   const hadParent = typeof process.send === "function";
+  const supervisorPid = process.ppid;
+  // This process cannot reuse its own PID while alive. Capture its verified
+  // identity before launching app roots so handoff cleanup never depends on
+  // an overloaded CIM probe at the moment its parent is terminated.
+  let verifiedWorkerIdentity;
+  if (hadParent && process.platform === "win32") {
+    try {
+      verifiedWorkerIdentity = queryWindowsProcesses(process.pid).find(
+        (candidate) => Number(candidate.ProcessId) === process.pid,
+      );
+    } catch {}
+  }
   let parentLost = hadParent && !process.connected;
   let requestedExitCode;
   if (hadParent) {
@@ -2521,7 +3021,11 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
       if (previousTauri) {
         expectedTauriExits.mark(previousTauri);
       }
-      await stopProcessTree(previousTauri, windowsDevDescendants);
+      await runPlannedDevCleanup(
+        (options) =>
+          stopProcessTree(previousTauri, windowsDevDescendants, options),
+        "development_backend_reload",
+      );
       // Detach only after verified cleanup. Until then shutdown must retain
       // the handle so it can retry cleanup after an intermediate failure.
       if (tauri === previousTauri) {
@@ -2557,8 +3061,13 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     rebuildGate.cancel();
     closeBackendWatchers();
     process.exitCode = exitCode;
+    const stopBackend = (options) =>
+      stopProcessTree(tauri, windowsDevDescendants, options);
+    const intentional = [0, 130, 143].includes(exitCode);
     shutdownPromise = Promise.allSettled([
-      stopProcessTree(tauri, windowsDevDescendants),
+      intentional
+        ? runPlannedDevCleanup(stopBackend, "development_requested_exit")
+        : stopBackend(),
       stopProcessTree(vite, windowsFrontendDescendants),
     ]).then((results) => {
       const failures = results
@@ -2578,14 +3087,73 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     await shutdown(1);
   };
 
+  const readWorkerSession = () => {
+    if (process.platform !== "win32") return undefined;
+    const markerPath = devSessionPath();
+    return markerPath
+      ? JSON.parse(readFileSync(markerPath, "utf8"))
+      : undefined;
+  };
+  const retireMonitors = () => {
+    shuttingDown = true;
+    tauriRecovery?.cancel();
+    rebuildGate.cancel();
+    closeBackendWatchers();
+    process.exitCode = 143;
+  };
+
   process.once("SIGINT", () => void shutdown(130));
   process.once("SIGTERM", () => void shutdown(143));
   if (process.connected) {
     process.on("message", (message) => {
       if (message?.type === "dev-shutdown")
         void shutdown(message.exitCode ?? 0);
+      if (message?.type === "dev-handoff" && !shutdownPromise) {
+        if (!verifiedWorkerIdentity) {
+          try {
+            verifiedWorkerIdentity = queryWindowsProcesses(process.pid).find(
+              (candidate) => Number(candidate.ProcessId) === process.pid,
+            );
+          } catch {}
+        }
+        const wasRetired = shuttingDown;
+        const retired = retireDevWorkerForManualHandoff({
+          readSession: readWorkerSession,
+          context: {
+            workerPid: process.pid,
+            supervisorPid,
+            workerIdentity: verifiedWorkerIdentity,
+          },
+          isRetired: () => shuttingDown,
+          retireMonitors,
+          acknowledge: (ack) => {
+            if (process.connected) process.send(ack, () => {});
+          },
+        });
+        if (retired && !wasRetired)
+          writeDevLifecycleEvent("dev-live-owner-handoff", {
+            worker_pid: process.pid,
+            stage: "monitors_retired",
+          });
+      }
     });
-    process.once("disconnect", () => void shutdown(1));
+    process.once("disconnect", () => {
+      void handleDevWorkerDisconnect({
+        isStopping: () => shuttingDown,
+        workerPid: process.pid,
+        supervisorPid,
+        verifiedWorkerIdentity,
+        readSession: readWorkerSession,
+        queryWorkerIdentity: () =>
+          process.platform === "win32"
+            ? queryWindowsProcesses(process.pid).find(
+                (candidate) => Number(candidate.ProcessId) === process.pid,
+              )
+            : undefined,
+        retireMonitors,
+        shutdown,
+      });
+    });
   }
   vite.once("error", (error) => {
     if (!shuttingDown) {

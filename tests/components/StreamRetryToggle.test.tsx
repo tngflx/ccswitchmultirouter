@@ -62,4 +62,20 @@ describe("StreamRetryToggle", () => {
       expect(onChange).toHaveBeenCalledWith({ streamRetryMaxAttempts: 1 });
     });
   });
+
+  it("explains the Desktop prerequisite only for automatic continuation", () => {
+    const { rerender } = render(
+      <StreamRetryToggle mode="safe" onChange={vi.fn()} />,
+    );
+    const prerequisite =
+      "settings.advanced.proxy.streamRetryContinuationPrerequisite";
+
+    expect(screen.queryByText(prerequisite)).not.toBeInTheDocument();
+
+    rerender(<StreamRetryToggle mode="aggressive" onChange={vi.fn()} />);
+    expect(screen.getByText(prerequisite)).toBeVisible();
+
+    rerender(<StreamRetryToggle mode="off" onChange={vi.fn()} />);
+    expect(screen.queryByText(prerequisite)).not.toBeInTheDocument();
+  });
 });

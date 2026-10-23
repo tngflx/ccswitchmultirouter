@@ -7074,7 +7074,10 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn upstream_reliability_search_paths_include_standalone_installer_dirs() {
-        let local_data = dirs::data_local_dir().expect("LOCALAPPDATA should resolve");
+        // This helper accepts the local-data root explicitly. Keep this unit
+        // fixture independent of Windows profile lookup and parallel temp-home
+        // tests, which can temporarily make SHGetKnownFolderPath unavailable.
+        let local_data = PathBuf::from(r"C:\Users\fixture\AppData\Local");
 
         let codex_paths = windows_standalone_installer_search_paths("codex", &local_data);
         assert!(codex_paths.contains(

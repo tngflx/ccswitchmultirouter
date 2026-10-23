@@ -1,0 +1,29 @@
+{
+  "marker": {
+    "startedAt": "2026-10-22 12:00:00.000",
+    "pid": 42,
+    "version": "fixture",
+    "os": "windows",
+    "arch": "x86_64",
+    "cwd": "C:\\repo\\src-tauri",
+    "executablePath": "C:\\repo\\src-tauri\\target\\debug\\cc-switch.exe",
+    "processStartedAtTicks": 134371199143854692,
+    "configScope": "fixture-scope"
+  },
+  "event": {
+    "timestamp": "2026-10-22 12:01:00.000",
+    "kind": "planned_restart",
+    "reason": "development_manual_restart",
+    "exitCode": 0,
+    "version": "fixture",
+    "os": "windows",
+    "arch": "x86_64",
+    "pid": 42,
+    "details": {
+      "executablePath": "C:\\repo\\src-tauri\\target\\debug\\cc-switch.exe",
+      "processStartedAtTicks": "134371199143854692",
+      "configScope": "fixture-scope",
+      "startedAt": "2026-10-22 12:00:00.000"
+    }
+  }
+}

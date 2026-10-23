@@ -157,9 +157,10 @@ const classifyCodexContinuationThread = (thread, threadId, expectedModel) => {
   // interrupted turns only when their error identifies an unexpected failure.
   if (
     status === "interrupted" &&
-    !/overload|capacity|rate.?limit|429|50[0234]|server.?error|transport|connection|unexpected|premature|eof|stream|timeout|timed.?out|crash|process.?exit/i.test(
+    !/overload|capacity|rate.?limit|server.?error|transport|connection|network|socket|fetch.?(?:failed|error)|econn(?:reset|refused)|enotfound|eai.?again|enetunreach|ehostunreach|unexpected|premature|eof|stream|timeout|timed.?out|crash|process.?exit/i.test(
       error,
-    )
+    ) &&
+    !/(?:^|[^\d.])(?:408|425|429|5\d{2})(?!\d|\.\d)/.test(error)
   ) {
     return {
       ready: false,
@@ -221,6 +222,13 @@ const readExactCodexContinuationThread = async (client, threadId) => {
 };
 const continuationInstallationIsCurrent = () =>
   typeof installationIsCurrent !== "function" || installationIsCurrent();
+const codexContinuationLocalClients = () =>
+  (Array.isArray(state.appServerClients) ? state.appServerClients : []).filter(
+    (client, index, array) =>
+      looksLikeAppServerRequestClient(client) &&
+      Object.getOwnPropertyDescriptor(client, "hostId")?.value === "local" &&
+      array.indexOf(client) === index,
+  );
 const prepareCodexContinuation = async (
   threadId,
   recoveryId,
@@ -232,10 +240,43 @@ const prepareCodexContinuation = async (
       submitted: false,
       reason: "The interrupted turn observation time is required",
     };
-  try {
-    await installAppServerPatch();
-  } catch (error) {
-    recordFailure(error);
+  let clients = codexContinuationLocalClients();
+  let reason = "Codex Desktop request client was not found";
+  if (!clients.length) {
+    let timer;
+    try {
+      // Installation can itself wait on a renderer module or React scan. Use
+      // one readiness budget for that work and the asynchronous scoped pass.
+      // An existing verified client needs neither operation to finish.
+      await Promise.race([
+        (async () => {
+          try {
+            await installAppServerPatch();
+          } catch (error) {
+            recordFailure(error);
+          }
+          if (!codexContinuationLocalClients().length)
+            await state.scopedAppServerDiscoveryPromise;
+        })(),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  "Codex Desktop request client was not found after discovery timed out",
+                ),
+              ),
+            5000,
+          );
+        }),
+      ]);
+    } catch (error) {
+      reason = String(error?.message || error);
+      recordFailure(error);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    clients = codexContinuationLocalClients();
   }
   if (codexContinuationHasNewerUserAction(threadId, observedAtMs))
     return {
@@ -243,15 +284,6 @@ const prepareCodexContinuation = async (
       reason:
         "The user changed or stopped the Codex thread after this request started",
     };
-  const clients = (
-    Array.isArray(state.appServerClients) ? state.appServerClients : []
-  ).filter(
-    (client, index, array) =>
-      looksLikeAppServerRequestClient(client) &&
-      Object.getOwnPropertyDescriptor(client, "hostId")?.value === "local" &&
-      array.indexOf(client) === index,
-  );
-  let reason = "Codex Desktop request client was not found";
   for (const client of clients) {
     let binding;
     try {
@@ -298,11 +330,13 @@ const prepareCodexContinuation = async (
         if (!continuationInstallationIsCurrent())
           return {
             submitted: false,
+            mutationAttempted: false,
             reason: "The Codex compatibility runtime was replaced",
           };
         if (codexContinuationHasNewerUserAction(threadId, observedAtMs))
           return {
             submitted: false,
+            mutationAttempted: false,
             reason:
               "The user changed or stopped the Codex thread before continuation",
           };
@@ -365,7 +399,20 @@ const prepareCodexContinuation = async (
       },
     };
   }
-  return { submitted: false, reason };
+  return { submitted: false, mutationAttempted: false, reason };
+};
+const codexContinuationMutationAttempted = (job) => {
+  if (!job) return false;
+  if (job.submitted === true || job.status === "submitting") return true;
+  if (
+    (job.submitted !== undefined && typeof job.submitted !== "boolean") ||
+    (job.mutationAttempted !== undefined &&
+      typeof job.mutationAttempted !== "boolean")
+  )
+    return true;
+  return typeof job.mutationAttempted === "boolean"
+    ? job.mutationAttempted
+    : !["pending", "prepared"].includes(job.status);
 };
 state.codexContinuationJobs = state.codexContinuationJobs || {};
 state.startCodexContinuation = (
@@ -403,13 +450,17 @@ state.startCodexContinuation = (
     };
   if (
     ["pending", "prepared", "submitting"].includes(existing?.status) ||
-    existing?.mutationAttempted ||
-    existing?.submitted
+    codexContinuationMutationAttempted(existing)
   ) {
     return { started: true, jobId: token };
   }
   const binding = { threadId: id, expectedModel: model, observedAtMs };
-  const job = { ...binding, status: "pending" };
+  const job = {
+    ...binding,
+    status: "pending",
+    submitted: false,
+    mutationAttempted: false,
+  };
   state.codexContinuationJobs[token] = job;
   void prepareCodexContinuation(id, token, model, observedAtMs).then(
     (result) => {
@@ -426,7 +477,10 @@ state.startCodexContinuation = (
           configurable: true,
         });
         job.status = "prepared";
-      } else Object.assign(job, result, { status: "completed" });
+      } else
+        Object.assign(job, { mutationAttempted: false }, result, {
+          status: "completed",
+        });
     },
     (error) => {
       if (
@@ -436,6 +490,7 @@ state.startCodexContinuation = (
         return;
       Object.assign(job, {
         submitted: false,
+        mutationAttempted: false,
         status: "completed",
         reason: String(error?.message || error),
       });
@@ -445,26 +500,34 @@ state.startCodexContinuation = (
 };
 state.cancelCodexContinuation = (jobId) => {
   const job = state.codexContinuationJobs[String(jobId || "")];
-  if (!job || job.status === "submitting" || job.mutationAttempted)
-    return { cancelled: false };
+  if (!job)
+    return { cancelled: true, notFound: true, mutationAttempted: false };
+  if (codexContinuationMutationAttempted(job))
+    return {
+      cancelled: false,
+      submitted: job.submitted === true,
+      mutationAttempted: true,
+    };
   delete job.commit;
   Object.assign(job, {
     status: "completed",
     submitted: false,
+    mutationAttempted: false,
     reason: "Continuation authorization was revoked",
   });
-  return { cancelled: true };
+  return { cancelled: true, mutationAttempted: false };
 };
 state.commitCodexContinuation = (jobId) => {
   const id = String(jobId || "");
   const job = state.codexContinuationJobs[id];
-  if (job?.status === "submitting" || job?.mutationAttempted || job?.submitted)
+  if (codexContinuationMutationAttempted(job))
     return { started: true, jobId: id };
   const commit = job && Object.getOwnPropertyDescriptor(job, "commit")?.value;
   if (job?.status !== "prepared" || typeof commit !== "function")
     return { started: false, reason: "Continuation is not prepared" };
   delete job.commit;
   job.status = "submitting";
+  job.mutationAttempted = true;
   void commit().then(
     (result) => {
       if (state.codexContinuationJobs[id] !== job) return;
@@ -474,6 +537,7 @@ state.commitCodexContinuation = (jobId) => {
       if (state.codexContinuationJobs[id] !== job) return;
       Object.assign(job, {
         submitted: false,
+        mutationAttempted: true,
         status: "completed",
         reason: String(error?.message || error),
       });
@@ -481,7 +545,12 @@ state.commitCodexContinuation = (jobId) => {
   );
   return { started: true, jobId: id };
 };
-state.readCodexContinuationJob = (jobId) =>
-  state.codexContinuationJobs[String(jobId || "")]
-    ? { ...state.codexContinuationJobs[String(jobId || "")] }
+state.readCodexContinuationJob = (jobId) => {
+  const job = state.codexContinuationJobs[String(jobId || "")];
+  return job
+    ? {
+        ...job,
+        mutationAttempted: codexContinuationMutationAttempted(job),
+      }
     : null;
+};

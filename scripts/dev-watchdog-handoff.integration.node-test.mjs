@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { DEV_RECOVERY_FLAG } from "./dev-session-launch.mjs";
 
 import {
   handoffDetachedDevSupervisor,
@@ -155,12 +156,12 @@ test(
               assert.equal(specification.executable, process.execPath);
               assert.deepEqual(specification.args, [
                 scriptPath,
+                DEV_RECOVERY_FLAG,
+                String(oldSupervisor.pid),
                 ...originalArgs,
               ]);
               assert.equal(specification.options.cwd, repoRoot);
-              assert.equal(specification.options.windowsHide, true);
-              assert.equal(specification.options.detached, true);
-              assert.equal(specification.options.stdio, "ignore");
+              assert.equal(specification.markerPath, markerPath);
               requestedLaunches.push(specification);
               assert.ok(
                 requestedLaunches.length <= 2,

@@ -23,7 +23,9 @@ There are many ways to contribute:
 - Node.js from `.node-version` (22.12.0) and pnpm from `package.json`'s
   `packageManager` field
 - Rust and Cargo from `rust-toolchain.toml`
-- PowerShell 7 on Windows for process identity and Task Scheduler probes
+- Current PowerShell 7 on Windows (7.5 or newer) for process identity and Task
+  Scheduler probes; planned development handoffs preserve JSON timestamp strings
+  with `ConvertFrom-Json -DateKind String`
 - [Tauri 2.0 prerequisites](https://v2.tauri.app/start/prerequisites/)
 
 > **pnpm version**: the exact version is pinned via the `packageManager` field
@@ -47,6 +49,13 @@ pnpm dev
 `pnpm dev` starts Vite with immediate frontend HMR and builds the Tauri backend
 on startup. Backend edits rebuild after a four-hour quiet period; use
 `pnpm dev:immediate` for immediate backend rebuilds.
+
+On Windows, running `pnpm dev` again replaces the previous development session
+for this repository/configuration. It stops the verified old watcher and
+supervisor, releases their worker processes and listeners, then starts with the
+new command's arguments and a fresh crash-restart budget. Concurrent manual
+launches are serialized. Automatic crash recovery preserves its existing budget
+and cannot replace a healthy newer session.
 
 When the watchdog setting is enabled, an unexpected app, worker, or launcher
 exit restarts the full dev session and runs Cargo/Tauri again. Recovery cleans
@@ -241,6 +250,11 @@ pnpm dev
 `pnpm dev` 启动 Vite（前端立即 HMR），并在启动时构建 Tauri 后端。
 后端文件连续四小时没有变更后才重新构建；需要立即构建时使用
 `pnpm dev:immediate`。
+
+在 Windows 再次运行 `pnpm dev` 会替换此仓库和配置的上一开发会话：先停止
+已验证的旧看门狗和启动器，清理其工作进程和监听端口，再使用新命令的参数启动，
+并重置崩溃重启次数。并发手动启动按顺序处理；自动崩溃恢复保留已有次数限制，
+不会替换仍在运行的新会话。
 
 启用看门狗时，应用、开发工作进程或启动器异常退出都会重新启动完整开发会话，
 再次运行 Cargo/Tauri。恢复前会清理上一会话的进程和监听端口，并保留开发参数与

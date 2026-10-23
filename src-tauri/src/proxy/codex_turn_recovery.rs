@@ -664,7 +664,7 @@ pub(crate) fn forward_error_is_recoverable(error: &super::error::ProxyError) -> 
                 .as_deref()
                 .and_then(terminal_error_code_from_body)
                 .is_some();
-            !permanent && (*status == 429 || (500..=599).contains(status))
+            !permanent && super::providers::codex_terminal::http_error_status_is_retryable(*status)
         }
         // ResponsePending is an unknown still-running upstream operation;
         // neither a replay nor a new turn may duplicate it.
@@ -709,7 +709,7 @@ async fn run_turn_recovery<Submit, SubmitFuture, Binding>(
     context: TurnRecoveryContext,
     reason: &'static str,
     next_attempt: u32,
-    mut submit: Submit,
+    submit: Submit,
     binding_is_current: Binding,
 ) where
     Submit: FnMut(TurnRecoveryContext, u32) -> SubmitFuture,
@@ -717,7 +717,102 @@ async fn run_turn_recovery<Submit, SubmitFuture, Binding>(
         std::future::Future<Output = Result<crate::codex_desktop::CodexContinuationResult, String>>,
     Binding: Fn(&TurnRecoveryContext, u32) -> bool,
 {
-    let mut last_message = String::from("Codex Desktop did not become ready");
+    run_turn_recovery_with_deadline_reporter(
+        context,
+        reason,
+        next_attempt,
+        submit,
+        binding_is_current,
+        |context, attempt, commit_started, blocker| {
+            log_recovery_event_with_blocker(
+                context,
+                if commit_started {
+                    "outcome_unknown"
+                } else {
+                    "submit_failed"
+                },
+                "desktop_ready_deadline",
+                Some(attempt),
+                Some(blocker),
+            );
+        },
+    )
+    .await;
+}
+
+// Classify only known bridge diagnostics. Arbitrary renderer/transport errors
+// may contain request data or credentials and must never enter recovery logs.
+fn desktop_readiness_blocker(message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if message.contains("compatibility layer is not ready")
+        || message.contains("continuation commit is not ready")
+        || message.contains("compatibility runtime was replaced")
+    {
+        "compatibility_runtime_unavailable"
+    } else if message.contains("request client was not found") {
+        "desktop_request_client_unavailable"
+    } else if message.contains("still active") || message.contains("latest codex turn is") {
+        "thread_not_terminal"
+    } else if message.contains("interrupted without a recoverable error") {
+        "interrupted_error_unrecognized"
+    } else if message.contains("needs a user action") {
+        "permanent_thread_error"
+    } else if message.contains("cancelled") || message.contains("user changed or stopped") {
+        "thread_changed_or_cancelled"
+    } else if message.contains("different thread")
+        || message.contains("different codex thread")
+        || message.contains("different interrupted request")
+        || message.contains("latest codex turn changed")
+        || message.contains("did not identify the interrupted turn")
+    {
+        "thread_identity_changed"
+    } else if message.contains("changed model") {
+        "thread_model_changed"
+    } else if message.contains("timed out waiting for cdp command") {
+        "desktop_command_timeout"
+    } else if message.contains("connect cdp websocket")
+        || message.contains("connecting cdp websocket")
+        || message.contains("thread/read timed out")
+        || message.contains("failed to send cdp command")
+        || message.contains("cdp websocket closed before")
+        || message.contains("failed to read cdp message")
+    {
+        "desktop_connection_unavailable"
+    } else if message.contains("failed to parse cdp message")
+        || (message.contains("cdp command ") && message.contains(" failed:"))
+    {
+        "desktop_protocol_error"
+    } else if message.contains("cdp evaluation failed")
+        || message.contains("cdp continuation commit failed")
+    {
+        "desktop_evaluation_failed"
+    } else if message.contains("continuation is still pending") {
+        "desktop_preparation_unresponsive"
+    } else if message.contains("codex desktop page target")
+        || message.contains("list cdp targets")
+        || message.contains("no codex desktop cdp target")
+    {
+        "desktop_target_unavailable"
+    } else {
+        "desktop_readiness_unknown"
+    }
+}
+
+async fn run_turn_recovery_with_deadline_reporter<Submit, SubmitFuture, Binding, Report>(
+    context: TurnRecoveryContext,
+    reason: &'static str,
+    next_attempt: u32,
+    mut submit: Submit,
+    binding_is_current: Binding,
+    mut report_deadline: Report,
+) where
+    Submit: FnMut(TurnRecoveryContext, u32) -> SubmitFuture,
+    SubmitFuture:
+        std::future::Future<Output = Result<crate::codex_desktop::CodexContinuationResult, String>>,
+    Binding: Fn(&TurnRecoveryContext, u32) -> bool,
+    Report: FnMut(&TurnRecoveryContext, u32, bool, &'static str),
+{
+    let mut last_blocker = "desktop_preparation_unresponsive";
     let deadline = tokio::time::Instant::now() + DESKTOP_READY_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
         if !recovery_is_active(&context) {
@@ -743,15 +838,15 @@ async fn run_turn_recovery<Submit, SubmitFuture, Binding>(
                 // attempt; read-only preparation has not spent the budget.
                 let commit_started = recovery_commit_started(&context);
                 finish_reserved_recovery(&context, commit_started);
-                log_recovery_event(
+                report_deadline(
                     &context,
+                    next_attempt,
+                    commit_started,
                     if commit_started {
-                        "outcome_unknown"
+                        "desktop_commit_acknowledgement_pending"
                     } else {
-                        "submit_failed"
+                        last_blocker
                     },
-                    "desktop_ready_deadline",
-                    Some(next_attempt),
                 );
                 return;
             }
@@ -777,7 +872,7 @@ async fn run_turn_recovery<Submit, SubmitFuture, Binding>(
                     log::warn!(
                         "[Codex/Recovery] continuation outcome unknown for session {}: {}",
                         context.session_id,
-                        result.message
+                        desktop_readiness_blocker(&result.message)
                     );
                     return;
                 }
@@ -786,7 +881,7 @@ async fn run_turn_recovery<Submit, SubmitFuture, Binding>(
                     // safe. Do not leave a phantom commit for an arriving
                     // manual continuation to charge against this budget.
                     release_refused_recovery_commit(&context);
-                    last_message = result.message;
+                    last_blocker = desktop_readiness_blocker(&result.message);
                 }
                 Err(_) if recovery_commit_started(&context) => {
                     // A transport or polling error after final authorization
@@ -800,7 +895,7 @@ async fn run_turn_recovery<Submit, SubmitFuture, Binding>(
                     );
                     return;
                 }
-                Err(error) => last_message = error,
+                Err(error) => last_blocker = desktop_readiness_blocker(&error),
             },
         }
         tokio::time::sleep_until(std::cmp::min(
@@ -811,11 +906,11 @@ async fn run_turn_recovery<Submit, SubmitFuture, Binding>(
     }
 
     finish_reserved_recovery(&context, false);
-    log_recovery_event(&context, "submit_failed", reason, Some(next_attempt));
+    report_deadline(&context, next_attempt, false, last_blocker);
     log::error!(
         "[Codex/Recovery] failed to submit continue for session {}: {}",
         context.session_id,
-        last_message
+        last_blocker
     );
 }
 
@@ -824,6 +919,16 @@ fn log_recovery_event(
     status: &str,
     reason: &str,
     attempt: Option<u32>,
+) {
+    log_recovery_event_with_blocker(context, status, reason, attempt, None);
+}
+
+fn log_recovery_event_with_blocker(
+    context: &TurnRecoveryContext,
+    status: &str,
+    reason: &str,
+    attempt: Option<u32>,
+    readiness_blocker: Option<&'static str>,
 ) {
     let mut fields = vec![
         ("session", context.session_id.clone()),
@@ -835,6 +940,9 @@ fn log_recovery_event(
     ];
     if let Some(attempt) = attempt {
         fields.push(("attempt", attempt.to_string()));
+    }
+    if let Some(blocker) = readiness_blocker {
+        fields.push(("readiness_blocker", blocker.to_string()));
     }
     crate::proxy::codex_router_log::append_event("turn_recovery", &fields);
 }
@@ -1083,7 +1191,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn acknowledged_continuation_budget_survives_crash_before_its_next_proxy_request() {
+        // ledger_from_states reads the process configuration scope indirectly.
+        // Hold the same home isolation as the explicit startup ledger tests.
+        let _home = crate::config::TestHomeGuard::new();
         let db = crate::database::Database::memory().unwrap();
         let provider = crate::provider::Provider::with_id(
             "ack-gap-provider".into(),
@@ -1110,6 +1222,15 @@ mod tests {
             mark_turn_completed(&context.desktop_thread_id);
 
             restore_ledger(Some(ledger), budget, &db);
+            assert_eq!(
+                recovery_states()
+                    .lock()
+                    .unwrap()
+                    .get(&context.desktop_thread_id)
+                    .map(|state| state.submitted),
+                Some(1),
+                "startup must restore the consumed budget before the next proxy request"
+            );
             assert!(
                 !recovery_reserved_for_test(&context.desktop_thread_id),
                 "restoring a budget must not submit another continue to the old failed turn"
@@ -1155,7 +1276,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn committing_continuation_restores_once_without_replaying_an_unknown_outcome() {
+        // Ledger capture and restore must observe the same configuration scope.
+        // Other serialized tests temporarily change the process-wide home.
+        let _home = crate::config::TestHomeGuard::new();
         let db = crate::database::Database::memory().unwrap();
         let provider = crate::provider::Provider::with_id(
             "committing-recovery-provider".into(),
@@ -1201,7 +1326,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn startup_with_recovery_disabled_preserves_spent_budget_without_queuing_a_turn() {
+        let _home = crate::config::TestHomeGuard::new();
         let db = crate::database::Database::memory().unwrap();
         let provider = crate::provider::Provider::with_id(
             "dormant-budget-provider".into(),
@@ -1416,6 +1543,143 @@ mod tests {
         assert!(!recovery_is_active(&context));
         assert_eq!(reserve_recovery(&context), None);
         mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_deadline_preserves_last_redacted_blocker_without_spending_attempt() {
+        let context = context("recovery-readiness-blocker", 1);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let mut diagnostics = Vec::new();
+        run_turn_recovery_with_deadline_reporter(
+            context.clone(),
+            "test_readiness_blocker",
+            1,
+            |_, _| {
+                let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if call == 0 {
+                        Ok(crate::codex_desktop::CodexContinuationResult {
+                            submitted: false,
+                            mutation_attempted: false,
+                            debug_port: None,
+                            target_id: None,
+                            message: "Codex Desktop request client was not found".into(),
+                        })
+                    } else {
+                        futures::future::pending().await
+                    }
+                }
+            },
+            |_, _| true,
+            |_, attempt, commit_started, blocker| {
+                diagnostics.push((attempt, commit_started, blocker));
+            },
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            diagnostics,
+            vec![(1, false, "desktop_request_client_unavailable")]
+        );
+        assert!(!recovery_is_active(&context));
+        assert_eq!(reserve_recovery(&context), Some(1));
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[test]
+    fn readiness_diagnostics_are_static_and_do_not_serialize_arbitrary_errors() {
+        for (message, expected) in [
+            (
+                "Codex compatibility layer is not ready",
+                "compatibility_runtime_unavailable",
+            ),
+            (
+                "The interrupted Codex thread is still active",
+                "thread_not_terminal",
+            ),
+            (
+                "The latest Codex turn was interrupted without a recoverable error",
+                "interrupted_error_unrecognized",
+            ),
+            (
+                "The latest Codex turn needs a user action",
+                "permanent_thread_error",
+            ),
+            (
+                "The user changed or stopped the Codex thread before continuation",
+                "thread_changed_or_cancelled",
+            ),
+            (
+                "Codex returned a different thread",
+                "thread_identity_changed",
+            ),
+            (
+                "The interrupted Codex thread changed model",
+                "thread_model_changed",
+            ),
+            (
+                "failed to connect CDP websocket: REDACTED transport details",
+                "desktop_connection_unavailable",
+            ),
+            (
+                "No Codex Desktop page target was found on CDP port REDACTED",
+                "desktop_target_unavailable",
+            ),
+            (
+                "REDACTED arbitrary renderer details",
+                "desktop_readiness_unknown",
+            ),
+        ] {
+            assert_eq!(desktop_readiness_blocker(message), expected);
+            assert!(!desktop_readiness_blocker(message).contains("REDACTED"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_reports_real_cdp_command_timeout_without_consuming_attempt() {
+        let context = context("recovery-cdp-command-timeout-diagnostic", 1);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        let mut diagnostics = Vec::new();
+        run_turn_recovery_with_deadline_reporter(
+            context.clone(),
+            "test_cdp_command_timeout_diagnostic",
+            1,
+            |_, _| {
+                std::future::ready(Err(
+                    "timed out waiting for CDP command Runtime.enable".into()
+                ))
+            },
+            |_, _| true,
+            |_, attempt, commit_started, blocker| {
+                diagnostics.push((attempt, commit_started, blocker))
+            },
+        )
+        .await;
+        assert_eq!(diagnostics, vec![(1, false, "desktop_command_timeout")]);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[test]
+    fn readiness_diagnostics_classify_actual_cdp_producer_templates() {
+        for (message, expected) in [
+            ("port 9229: failed to list CDP targets: REDACTED", "desktop_target_unavailable"),
+            ("timed out waiting for CDP command Runtime.enable", "desktop_command_timeout"),
+            ("failed to send CDP command Runtime.evaluate: REDACTED", "desktop_connection_unavailable"),
+            ("CDP websocket closed before Runtime.evaluate response", "desktop_connection_unavailable"),
+            ("failed to read CDP message: REDACTED", "desktop_connection_unavailable"),
+            ("failed to parse CDP message: REDACTED", "desktop_protocol_error"),
+            ("CDP command Runtime.evaluate failed: REDACTED", "desktop_protocol_error"),
+            ("target REDACTED: CDP evaluation failed: REDACTED", "desktop_evaluation_failed"),
+            ("target REDACTED: CDP continuation commit failed: REDACTED", "desktop_evaluation_failed"),
+            ("target REDACTED: continuation is still pending; no second submission was attempted", "desktop_preparation_unresponsive"),
+            ("No Codex Desktop CDP target was found", "desktop_target_unavailable"),
+            ("REDACTED arbitrary renderer details", "desktop_readiness_unknown"),
+        ] {
+            assert_eq!(desktop_readiness_blocker(message), expected, "{message}");
+            assert!(!desktop_readiness_blocker(message).contains("REDACTED"));
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1747,7 +2011,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn startup_restores_valid_router_budget_and_preserves_new_live_requests() {
+        let _home = crate::config::TestHomeGuard::new();
         let db = crate::database::Database::memory().unwrap();
         let root = crate::provider::Provider::with_id(
             "restore-router-root".into(),
@@ -1984,6 +2250,35 @@ mod tests {
             },
         ] {
             assert!(!forward_error_is_recoverable(&error));
+        }
+    }
+
+    #[test]
+    fn request_failure_recovery_includes_retryable_http_timeouts_and_early_rejections() {
+        use super::super::error::ProxyError;
+        for status in [408, 425] {
+            for body in [
+                None,
+                Some("Temporary request timeout; try again later".into()),
+            ] {
+                assert!(
+                    forward_error_is_recoverable(&ProxyError::UpstreamError { status, body }),
+                    "HTTP {status} must retain the reconnect layer's transient classification"
+                );
+            }
+            for body in [
+                "Daily quota exhausted",
+                "The user cancelled the request",
+                "Response pending",
+            ] {
+                assert!(
+                    !forward_error_is_recoverable(&ProxyError::UpstreamError {
+                        status,
+                        body: Some(body.into()),
+                    }),
+                    "HTTP {status} must not override permanent error precedence"
+                );
+            }
         }
     }
 

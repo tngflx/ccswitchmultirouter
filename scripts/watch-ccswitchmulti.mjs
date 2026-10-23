@@ -4,6 +4,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { DEV_RECOVERY_POLICY } from "./dev-watchdog-policy.mjs";
+import { spawnDevRecoveryProcess } from "./dev-recovery-output.mjs";
 import {
   devSessionEnvironment,
   samePath,
@@ -517,23 +518,31 @@ ConvertTo-Json -InputObject $items -Compress`,
       return false;
     },
     startProduct: () => start(plan.InstalledExecutable, []),
-    startDevSession: (devPlan) =>
-      start(
-        devPlan.Executable,
-        [
-          devPlan.ScriptPath,
-          DEV_RECOVERY_POLICY.recoveryLaunchFlag,
-          String(safePid(devPlan.SupervisorPid)),
-          ...devPlan.Args,
-        ],
+    startDevSession: async (devPlan) => {
+      assertHeld();
+      const { child } = await spawnDevRecoveryProcess(
         {
-          cwd: devPlan.RepoRoot,
-          env: {
-            ...process.env,
-            ...devSessionEnvironment(devPlan.Environment),
+          executable: devPlan.Executable,
+          markerPath: path.join(plan.ConfigPath, "logs", "dev-session.json"),
+          args: [
+            devPlan.ScriptPath,
+            DEV_RECOVERY_POLICY.recoveryLaunchFlag,
+            String(safePid(devPlan.SupervisorPid)),
+            ...devPlan.Args,
+          ],
+          options: {
+            cwd: devPlan.RepoRoot,
+            env: {
+              ...process.env,
+              ...devSessionEnvironment(devPlan.Environment),
+            },
           },
         },
-      ),
+        { spawnProcess },
+      );
+      child.unref();
+      return safePid(child.pid);
+    },
     waitReady: async (expectedPid) => {
       const deadline = now() + plan.ReadyTimeoutSeconds * 1000;
       while (now() < deadline) {

@@ -24,6 +24,8 @@
     "contract:drift": "node scripts/check-openai-responses-contract.mjs --live",
     "contract:refresh": "node scripts/check-openai-responses-contract.mjs --refresh --accept-reviewed-changes",
     "contract:test": "node --test scripts/check-openai-responses-contract.node-test.mjs",
+    "verify:codex-continuation": "node scripts/verify-codex-continuation.mjs",
+    "verify:codex-desktop-continuation": "node scripts/verify-codex-desktop-continuation.mjs",
     "upstream:check": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/check-upstream-updates.ps1",
     "canary:search": "python scripts/verify_third_party_hosted_web_search.py",
     "canary:replay": "python scripts/verify_third_party_hosted_web_search.py --suite replay",
@@ -39,7 +41,7 @@
     "release:hook:install": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/install-local-release-hook.ps1",
     "release:hook:install:sync": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/install-local-release-hook.ps1 -Synchronous",
     "test:unit": "node scripts/run-unit-tests.mjs",
-    "test:dev-recovery": "node --test scripts/dev-tauri-delayed.node-test.mjs scripts/dev-watchdog-policy.node-test.mjs scripts/prune-cargo-target.node-test.mjs scripts/windows-json-query.node-test.mjs scripts/dev-watchdog-handoff.integration.node-test.mjs",
+    "test:dev-recovery": "node --test --test-concurrency=1 scripts/dev-tauri-delayed.node-test.mjs scripts/dev-recovery-output.node-test.mjs scripts/dev-recovery-output.integration.node-test.mjs scripts/dev-watchdog-policy.node-test.mjs scripts/prune-cargo-target.node-test.mjs scripts/windows-json-query.node-test.mjs scripts/dev-session-launch.node-test.mjs scripts/dev-app-exit.node-test.mjs scripts/dev-session-takeover.integration.node-test.mjs scripts/dev-watchdog-handoff.integration.node-test.mjs scripts/dev-live-owner-handoff.integration.node-test.mjs",
     "test:lifecycle": "node --test scripts/ccswitchmulti-guardian-core.node-test.mjs scripts/watch-ccswitchmulti.node-test.mjs scripts/install-ccswitchmulti-watchdog.node-test.mjs scripts/local-build-pipeline.node-test.mjs scripts/lifecycle-entrypoints.node-test.mjs",
     "test:runner": "node --test scripts/run-unit-tests.node-test.mjs",
     "test:unit:watch": "vitest watch"

@@ -1,0 +1,63 @@
+{
+  "verifiedAtUtc": "2026-10-22T14:08:46.939Z",
+  "scope": "installed_app_server_with_production_continuation_core_and_client_shim",
+  "desktopCdpVerified": false,
+  "isolatedConfiguration": true,
+  "localFixtureOnly": true,
+  "executableSha256": "e757246b4de87359e660647fa9514955a0971ff6a30affdd8c145d1d5ece7b84",
+  "scenarios": [
+    {
+      "scenario": "http_overload",
+      "fixture": "http_503_overload",
+      "productionCoreSha256": "b47f489cb8dcc9a87975aa7c09fabd4f53b569242b948cf95f0f35a67c65c946",
+      "failedTurnObserved": true,
+      "preparedByProductionGuards": true,
+      "appServerAcceptedContinue": true,
+      "upstreamReceivedLiteralContinue": true,
+      "continuedTurnCompleted": true,
+      "exactlyOneContinuation": true,
+      "duplicateRecoveryTokenDidNotReplay": true,
+      "initialRequests": 1,
+      "continuedRequests": 1,
+      "turnCompletedNotifications": 2
+    },
+    {
+      "scenario": "stream_overload",
+      "fixture": "sse_response_failed_with_overload_message",
+      "productionCoreSha256": "b47f489cb8dcc9a87975aa7c09fabd4f53b569242b948cf95f0f35a67c65c946",
+      "failedTurnObserved": true,
+      "preparedByProductionGuards": true,
+      "appServerAcceptedContinue": true,
+      "upstreamReceivedLiteralContinue": true,
+      "continuedTurnCompleted": true,
+      "exactlyOneContinuation": true,
+      "duplicateRecoveryTokenDidNotReplay": true,
+      "initialRequests": 1,
+      "continuedRequests": 1,
+      "turnCompletedNotifications": 2
+    },
+    {
+      "scenario": "connection_drop",
+      "fixture": "sse_closed_before_response_completed",
+      "productionCoreSha256": "b47f489cb8dcc9a87975aa7c09fabd4f53b569242b948cf95f0f35a67c65c946",
+      "failedTurnObserved": true,
+      "preparedByProductionGuards": true,
+      "appServerAcceptedContinue": true,
+      "upstreamReceivedLiteralContinue": true,
+      "continuedTurnCompleted": true,
+      "exactlyOneContinuation": true,
+      "duplicateRecoveryTokenDidNotReplay": true,
+      "initialRequests": 1,
+      "continuedRequests": 1,
+      "turnCompletedNotifications": 2
+    },
+    {
+      "scenario": "daily_quota",
+      "initialRequests": 1,
+      "appServerAcceptedContinue": false,
+      "blockedByProductionQuotaGuard": true,
+      "noContinuationSubmitted": true,
+      "continuedRequests": 0
+    }
+  ]
+}

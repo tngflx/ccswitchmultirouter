@@ -143,6 +143,12 @@ pub(crate) fn terminal_error_code_from_body(body: &str) -> Option<&'static str> 
     terminal_error_code("response.failed", &payload)
 }
 
+/// Shared transient HTTP statuses for stream reconnection and a new Desktop
+/// continuation. A permanent error body always takes precedence at callers.
+pub(crate) fn http_error_status_is_retryable(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500..=599)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ChatTerminalEvidence {
     pub(crate) has_final_message: bool,
@@ -459,6 +465,16 @@ fn is_complete_client_tool_call(item_type: &str, item: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn retryable_http_statuses_are_shared_by_reconnect_and_continuation() {
+        for status in [408, 425, 429, 500, 502, 503, 504, 599] {
+            assert!(http_error_status_is_retryable(status), "HTTP {status}");
+        }
+        for status in [200, 400, 401, 402, 403, 404, 409, 422, 499, 600] {
+            assert!(!http_error_status_is_retryable(status), "HTTP {status}");
+        }
+    }
 
     #[test]
     fn terminal_error_body_uses_shared_policy_for_json_and_plaintext() {

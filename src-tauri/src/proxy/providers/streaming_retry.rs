@@ -148,7 +148,9 @@ fn permanent_reconnect_status(status: http::StatusCode) -> Option<ReconnectTermi
         401 => "authentication_error",
         402 => "insufficient_quota",
         403 => "permission_denied",
-        400..=499 if !matches!(status.as_u16(), 408 | 425 | 429) => "invalid_request_error",
+        400..=499 if !super::codex_terminal::http_error_status_is_retryable(status.as_u16()) => {
+            "invalid_request_error"
+        }
         _ => return None,
     };
     Some(ReconnectTerminal::new(code))

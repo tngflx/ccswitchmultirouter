@@ -1,0 +1,228 @@
+{
+  "schemaVersion": 2,
+  "phase": "complete",
+  "observerPid": 38552,
+  "transitionalActivation": {
+    "launchNumber": 0,
+    "takeover": null,
+    "countsAsFixEvidence": false,
+    "pnpmPid": 4164,
+    "launchedAtUtc": "2026-10-22T12:46:10.980Z",
+    "supervisor": {
+      "pid": 30604,
+      "parentPid": 57464,
+      "createdAtUtc": "2026-10-22T12:46:11.9667777Z"
+    },
+    "worker": {
+      "pid": 32516,
+      "parentPid": 30604,
+      "createdAtUtc": "2026-10-22T12:46:27.2700672Z"
+    },
+    "watchdog": {
+      "pid": 18844,
+      "parentPid": 30604,
+      "createdAtUtc": "2026-10-22T12:46:27.2535793Z"
+    },
+    "app": {
+      "pid": 51052,
+      "parentPid": 43268,
+      "createdAtUtc": "2026-10-22T12:46:33.2710349Z"
+    },
+    "appMarkerFiletime": "134371467932710349",
+    "binaryWriteAtUtc": "2026-10-22T08:52:16.934Z",
+    "anchoredWatchdogCount": 1,
+    "previousSupervisorGone": true,
+    "previousWatchdogGone": true,
+    "manualEntryAncestryVerified": true,
+    "freshRestartTimesMs": [],
+    "plannedRecovery": {
+      "countsAsFixEvidence": false,
+      "previousWorkerPredatesCurrentSource": true,
+      "generation": 63,
+      "previousGeneration": 62,
+      "startupJournalKind": "abnormal_exit_detected",
+      "previousRunClassification": "unclean_exit",
+      "plannedExitKind": null,
+      "plannedExitReason": null,
+      "startupOutcomeKind": null,
+      "startupOutcomeSeverity": null,
+      "currentGenerationOutcomeCount": 3,
+      "unexpectedUncleanOrCrashOutcomeCount": 1,
+      "startupCrashRecoveryOperationCount": 0,
+      "startupTakeoverRestoredInfoCount": 1,
+      "ownedProxyPort": true,
+      "proxyPort": 15721
+    }
+  },
+  "receipts": [
+    {
+      "launchNumber": 1,
+      "takeover": 1,
+      "countsAsFixEvidence": true,
+      "pnpmPid": 38736,
+      "launchedAtUtc": "2026-10-22T12:47:28.820Z",
+      "supervisor": {
+        "pid": 59960,
+        "parentPid": 41892,
+        "createdAtUtc": "2026-10-22T12:47:29.7397280Z"
+      },
+      "worker": {
+        "pid": 768,
+        "parentPid": 59960,
+        "createdAtUtc": "2026-10-22T12:48:12.9625098Z"
+      },
+      "watchdog": {
+        "pid": 51864,
+        "parentPid": 59960,
+        "createdAtUtc": "2026-10-22T12:48:12.9432884Z"
+      },
+      "app": {
+        "pid": 55428,
+        "parentPid": 26468,
+        "createdAtUtc": "2026-10-22T12:48:19.2126101Z"
+      },
+      "appMarkerFiletime": "134371468992126101",
+      "binaryWriteAtUtc": "2026-10-22T08:52:16.934Z",
+      "anchoredWatchdogCount": 1,
+      "previousSupervisorGone": true,
+      "previousWatchdogGone": true,
+      "manualEntryAncestryVerified": true,
+      "freshRestartTimesMs": [],
+      "plannedRecovery": {
+        "countsAsFixEvidence": true,
+        "previousWorkerPredatesCurrentSource": false,
+        "generation": 64,
+        "previousGeneration": 63,
+        "startupJournalKind": "previous_run_classified",
+        "previousRunClassification": "planned_restart_or_update",
+        "plannedExitKind": "planned_restart",
+        "plannedExitReason": "development_manual_restart",
+        "startupOutcomeKind": "plannedRestartOrUpdate",
+        "startupOutcomeSeverity": "info",
+        "currentGenerationOutcomeCount": 2,
+        "unexpectedUncleanOrCrashOutcomeCount": 0,
+        "startupCrashRecoveryOperationCount": 0,
+        "startupTakeoverRestoredInfoCount": 1,
+        "ownedProxyPort": true,
+        "proxyPort": 15721
+      }
+    },
+    {
+      "launchNumber": 2,
+      "takeover": 2,
+      "countsAsFixEvidence": true,
+      "pnpmPid": 54656,
+      "launchedAtUtc": "2026-10-22T12:49:20.124Z",
+      "supervisor": {
+        "pid": 49200,
+        "parentPid": 5488,
+        "createdAtUtc": "2026-10-22T12:49:21.0372999Z"
+      },
+      "worker": {
+        "pid": 31400,
+        "parentPid": 49200,
+        "createdAtUtc": "2026-10-22T12:50:03.9492744Z"
+      },
+      "watchdog": {
+        "pid": 19496,
+        "parentPid": 49200,
+        "createdAtUtc": "2026-10-22T12:50:03.9267196Z"
+      },
+      "app": {
+        "pid": 2480,
+        "parentPid": 56384,
+        "createdAtUtc": "2026-10-22T12:50:09.8875571Z"
+      },
+      "appMarkerFiletime": "134371470098875571",
+      "binaryWriteAtUtc": "2026-10-22T08:52:16.934Z",
+      "anchoredWatchdogCount": 1,
+      "previousSupervisorGone": true,
+      "previousWatchdogGone": true,
+      "manualEntryAncestryVerified": true,
+      "freshRestartTimesMs": [],
+      "plannedRecovery": {
+        "countsAsFixEvidence": true,
+        "previousWorkerPredatesCurrentSource": false,
+        "generation": 65,
+        "previousGeneration": 64,
+        "startupJournalKind": "previous_run_classified",
+        "previousRunClassification": "planned_restart_or_update",
+        "plannedExitKind": "planned_restart",
+        "plannedExitReason": "development_manual_restart",
+        "startupOutcomeKind": "plannedRestartOrUpdate",
+        "startupOutcomeSeverity": "info",
+        "currentGenerationOutcomeCount": 2,
+        "unexpectedUncleanOrCrashOutcomeCount": 0,
+        "startupCrashRecoveryOperationCount": 0,
+        "startupTakeoverRestoredInfoCount": 1,
+        "ownedProxyPort": true,
+        "proxyPort": 15721
+      }
+    }
+  ],
+  "minimumBinaryWriteAtUtc": "2026-10-22T08:35:54.244Z",
+  "minimumWorkerStartedAtUtc": "2026-10-22T12:42:19.415Z",
+  "transitionCountsAsFixEvidence": false,
+  "requiredConsecutiveUpdatedWorkerProofs": 2,
+  "updatedAtUtc": "2026-10-22T12:51:09.272Z",
+  "initial": {
+    "supervisor": {
+      "pid": 47260,
+      "parentPid": 50036,
+      "createdAtUtc": "2026-10-22T12:17:27.5859291Z"
+    },
+    "watchdog": {
+      "pid": 36556,
+      "parentPid": 47260,
+      "createdAtUtc": "2026-10-22T12:17:43.1299938Z"
+    },
+    "worker": {
+      "pid": 59404,
+      "parentPid": 47260,
+      "createdAtUtc": "2026-10-22T12:17:43.1550816Z"
+    },
+    "app": {
+      "pid": 48124,
+      "parentPid": 50680,
+      "createdAtUtc": "2026-10-22T12:17:48.9396415Z"
+    }
+  },
+  "launchNumber": 2,
+  "takeover": 2,
+  "countsAsFixEvidence": true,
+  "launchedAtUtc": "2026-10-22T12:49:20.124Z",
+  "pnpmPid": 54656,
+  "poll": 1,
+  "success": true,
+  "verifiedUpdatedWorkerTakeoverCount": 2,
+  "postActivationStability": {
+    "checkedAtUtc": "2026-10-22T12:52:42.9038088Z",
+    "processes": [
+      {
+        "role": "supervisor",
+        "pid": 49200,
+        "exactIdentityMatched": true
+      },
+      {
+        "role": "worker",
+        "pid": 31400,
+        "exactIdentityMatched": true
+      },
+      {
+        "role": "watchdog",
+        "pid": 19496,
+        "exactIdentityMatched": true
+      },
+      {
+        "role": "app",
+        "pid": 2480,
+        "exactIdentityMatched": true
+      }
+    ],
+    "appMarkerExact": true,
+    "anchoredWatchdogCount": 1,
+    "ownedProxyPort": 15721,
+    "generation": 65,
+    "currentGenerationWarningOrErrorCount": 0
+  }
+}

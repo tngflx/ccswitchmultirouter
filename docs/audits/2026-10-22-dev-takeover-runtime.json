@@ -1,0 +1,126 @@
+{
+  "schemaVersion": 1,
+  "phase": "complete",
+  "observerPid": 27120,
+  "receipts": [
+    {
+      "takeover": 1,
+      "pnpmPid": 38520,
+      "launchedAtUtc": "2026-10-22T05:15:42.948Z",
+      "supervisor": {
+        "pid": 29684,
+        "parentPid": 38480,
+        "createdAtUtc": "2026-10-22T05:15:43.7314474Z"
+      },
+      "worker": {
+        "pid": 62784,
+        "parentPid": 29684,
+        "createdAtUtc": "2026-10-22T05:15:59.7889656Z"
+      },
+      "watchdog": {
+        "pid": 50692,
+        "parentPid": 29684,
+        "createdAtUtc": "2026-10-22T05:15:59.7696466Z"
+      },
+      "app": {
+        "pid": 18064,
+        "parentPid": 56916,
+        "createdAtUtc": "2026-10-22T05:17:25.4572923Z"
+      },
+      "appMarkerFiletime": "134371198454572923",
+      "binaryWriteAtUtc": "2026-10-22T05:17:25.064Z",
+      "anchoredWatchdogCount": 1,
+      "previousSupervisorGone": true,
+      "previousWatchdogGone": true,
+      "manualEntryAncestryVerified": true,
+      "freshRestartTimesMs": []
+    },
+    {
+      "takeover": 2,
+      "pnpmPid": 57828,
+      "launchedAtUtc": "2026-10-22T05:18:12.714Z",
+      "supervisor": {
+        "pid": 43604,
+        "parentPid": 37552,
+        "createdAtUtc": "2026-10-22T05:18:13.4157259Z"
+      },
+      "worker": {
+        "pid": 58508,
+        "parentPid": 43604,
+        "createdAtUtc": "2026-10-22T05:18:29.3292707Z"
+      },
+      "watchdog": {
+        "pid": 33368,
+        "parentPid": 43604,
+        "createdAtUtc": "2026-10-22T05:18:29.2892997Z"
+      },
+      "app": {
+        "pid": 42436,
+        "parentPid": 12832,
+        "createdAtUtc": "2026-10-22T05:18:34.3854692Z"
+      },
+      "appMarkerFiletime": "134371199143854692",
+      "binaryWriteAtUtc": "2026-10-22T05:17:25.064Z",
+      "anchoredWatchdogCount": 1,
+      "previousSupervisorGone": true,
+      "previousWatchdogGone": true,
+      "manualEntryAncestryVerified": true,
+      "freshRestartTimesMs": []
+    }
+  ],
+  "minimumBinaryWriteAtUtc": "2026-10-22T04:46:54.907Z",
+  "updatedAtUtc": "2026-10-22T05:19:28.524Z",
+  "initial": {
+    "supervisor": {
+      "pid": 23996,
+      "parentPid": 17048,
+      "createdAtUtc": "2026-10-22T03:49:32.3485885Z"
+    },
+    "watchdog": {
+      "pid": 27864,
+      "parentPid": 23996,
+      "createdAtUtc": "2026-10-22T03:49:34.1592978Z"
+    },
+    "worker": {
+      "pid": 56712,
+      "parentPid": 23996,
+      "createdAtUtc": "2026-10-22T03:49:40.6583642Z"
+    },
+    "app": {
+      "pid": 48812,
+      "parentPid": 11152,
+      "createdAtUtc": "2026-10-22T03:50:19.5267982Z"
+    }
+  },
+  "takeover": 2,
+  "launchedAtUtc": "2026-10-22T05:18:12.714Z",
+  "pnpmPid": 57828,
+  "poll": 1,
+  "success": true,
+  "postActivation": {
+    "observedAtUtc": "2026-10-22T05:21:11.7308115+00:00",
+    "allFourOwnerCreationTimesMatch": true,
+    "markerSupervisorMatches": true,
+    "observerAlive": false,
+    "ownedListeningPorts": [
+      {
+        "OwningProcess": 49480,
+        "LocalAddress": "::",
+        "LocalPort": 5678
+      },
+      {
+        "OwningProcess": 49480,
+        "LocalAddress": "::1",
+        "LocalPort": 3000
+      },
+      {
+        "OwningProcess": 42436,
+        "LocalAddress": "127.0.0.1",
+        "LocalPort": 15721
+      }
+    ]
+  },
+  "evidenceKind": "two-manual-pnpm-dev-takeovers",
+  "liveProviderInterruptionAuditPerformed": false,
+  "productionBinaryBuiltOrInstalled": false
+}

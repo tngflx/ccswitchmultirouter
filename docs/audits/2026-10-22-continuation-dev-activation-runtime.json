@@ -1,0 +1,45 @@
+{
+  "phase": "ready",
+  "verifiedAtUtc": "2026-10-22T14:34:20.049Z",
+  "elapsedSeconds": 138.494,
+  "supervisor": {
+    "pid": 37956,
+    "executablePath": "C:\\Program Files\\nodejs\\node.exe",
+    "createdAtUtc": "2026-10-22T14:32:02.5572553Z",
+    "filetime": "134371531225572553"
+  },
+  "worker": {
+    "pid": 41136,
+    "executablePath": "C:\\Program Files\\nodejs\\node.exe",
+    "createdAtUtc": "2026-10-22T14:32:44.3480681Z",
+    "filetime": "134371531643480681"
+  },
+  "watchdog": {
+    "pid": 17580,
+    "executablePath": "C:\\Program Files\\nodejs\\node.exe",
+    "createdAtUtc": "2026-10-22T14:32:44.3273198Z",
+    "filetime": "134371531643273198"
+  },
+  "app": {
+    "pid": 58832,
+    "executablePath": "D:\\repos\\ccswitchmultirouter\\src-tauri\\target\\debug\\cc-switch.exe",
+    "createdAtUtc": "2026-10-22T14:34:12.0454657Z",
+    "filetime": "134371532520454657"
+  },
+  "generation": 66,
+  "appMarkerFiletime": "134371532520454657",
+  "binaryWriteAtUtc": "2026-10-22T14:34:11.6900721Z",
+  "minimumBinaryWriteAtUtc": "2026-10-22T08:52:16.934Z",
+  "anchoredWatchdogCount": 1,
+  "oldIdentitiesGone": {
+    "supervisor": true,
+    "worker": true,
+    "watchdog": true,
+    "app": true
+  },
+  "plannedExit": "planned_restart/development_manual_restart",
+  "previousRunClassification": "planned_restart_or_update",
+  "currentWarningOrErrorCount": 0,
+  "ownedProxyPort": 15721,
+  "desktopContinueDeliveryVerified": false
+}

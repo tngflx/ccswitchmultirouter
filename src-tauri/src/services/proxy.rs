@@ -30,6 +30,12 @@ const PORT_OWNERSHIP_GUARD_PREFIX: &str = "PORT_OWNERSHIP_GUARD";
 /// Codex 接管时暴露给官方客户端的本地代理入口名称。
 const CODEX_LOCAL_PROXY_PROVIDER_NAME: &str = "CCSwitch MultiRouter";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiveRestorePolicy {
+    RestoreBackup,
+    PreserveCurrentUnowned,
+}
+
 pub(crate) fn parse_local_proxy_app(app_type: &str) -> Result<AppType, String> {
     let app = AppType::from_str(app_type).map_err(|e| format!("无效的应用类型: {e}"))?;
     if !app.supports_local_proxy() {
@@ -3123,6 +3129,14 @@ impl ProxyService {
 
     /// 恢复原始 Live 配置
     async fn restore_live_configs(&self) -> Result<(), String> {
+        self.restore_live_configs_with_policy(LiveRestorePolicy::RestoreBackup)
+            .await
+    }
+
+    async fn restore_live_configs_with_policy(
+        &self,
+        policy: LiveRestorePolicy,
+    ) -> Result<(), String> {
         let mut errors = Vec::new();
 
         for app_type in [
@@ -3132,7 +3146,7 @@ impl ProxyService {
             AppType::GrokBuild,
         ] {
             if let Err(e) = self
-                .restore_live_config_for_app_with_fallback(&app_type)
+                .restore_live_config_for_app_with_policy(&app_type, policy)
                 .await
             {
                 let mut outcome = crate::services::recovery_outcome::RecoveryOutcome::for_app(
@@ -3155,13 +3169,72 @@ impl ProxyService {
         }
     }
 
-    async fn restore_live_config_for_app_with_fallback(
+    async fn restore_live_config_for_app_with_policy(
         &self,
         app_type: &AppType,
+        policy: LiveRestorePolicy,
     ) -> Result<(), String> {
         let _guard = self.switch_locks.lock_for_app(app_type.as_str()).await;
+        // A previous takeover backup can outlive the takeover itself. During
+        // crash recovery, a valid current native/direct configuration belongs
+        // to the user and must not be replaced by that older snapshot. Keep the
+        // decision under the same lock as restore and provider switching.
+        if policy == LiveRestorePolicy::PreserveCurrentUnowned
+            && self.current_unowned_live_can_be_preserved(app_type)
+        {
+            log::debug!(
+                "{} current Live is valid and no longer taken over; preserving it during crash recovery",
+                app_type.as_str()
+            );
+            return Ok(());
+        }
         self.restore_live_config_for_app_with_fallback_inner(app_type)
             .await
+    }
+
+    fn current_unowned_live_can_be_preserved(&self, app_type: &AppType) -> bool {
+        let config = if matches!(app_type, AppType::Gemini) {
+            // The ordinary env reader is intentionally permissive. Preservation
+            // requires a strict candidate, with ownership checked against that
+            // same observed text. Parsing errors can contain credentials, so
+            // use only the result and leave diagnostics to existing recovery.
+            let Ok(text) = std::fs::read_to_string(crate::gemini_config::get_gemini_env_path())
+            else {
+                return false;
+            };
+            let Ok(env) = crate::gemini_config::parse_env_file_strict(&text) else {
+                return false;
+            };
+            crate::gemini_config::env_to_json(&env)
+        } else {
+            let Ok(config) = self.read_live_config_for_app(app_type) else {
+                return false;
+            };
+            config
+        };
+        // Live readers validate file syntax. Also require supported containers
+        // before treating absence of a proxy marker as a healthy configuration.
+        let valid_shape = match app_type {
+            AppType::Claude => config
+                .as_object()
+                .is_some_and(|root| root.get("env").is_none_or(Value::is_object)),
+            AppType::Codex => {
+                config.get("auth").is_some_and(Value::is_object)
+                    && config.get("config").is_some_and(Value::is_string)
+            }
+            AppType::Gemini => config.get("env").is_some_and(Value::is_object),
+            AppType::GrokBuild => {
+                config
+                    .get("config")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| {
+                        crate::grok_config::is_official_live_config(text)
+                            || crate::grok_config::validate_config_toml(text).is_ok()
+                    })
+            }
+            _ => false,
+        };
+        valid_shape && !Self::live_has_proxy_placeholder_for_app(app_type, &config)
     }
 
     pub(crate) async fn restore_live_config_for_app_with_fallback_inner(
@@ -3659,7 +3732,8 @@ impl ProxyService {
     /// 会恢复 Live 配置、清除接管标志、删除备份。
     pub async fn recover_from_crash(&self) -> Result<(), String> {
         // 1. 恢复 Live 配置
-        self.restore_live_configs().await?;
+        self.restore_live_configs_with_policy(LiveRestorePolicy::PreserveCurrentUnowned)
+            .await?;
 
         // 2. 清除接管标志
         self.db
@@ -10291,7 +10365,10 @@ model = "gpt-5.1-codex"
         sleep(Duration::from_millis(20)).await;
         let restore = tokio::spawn(async move {
             service_for_restore
-                .restore_live_config_for_app_with_fallback(&AppType::Claude)
+                .restore_live_config_for_app_with_policy(
+                    &AppType::Claude,
+                    LiveRestorePolicy::RestoreBackup,
+                )
                 .await
                 .expect("restore claude live")
         });
@@ -10802,7 +10879,10 @@ requires_openai_auth = true
         );
 
         service
-            .restore_live_config_for_app_with_fallback(&AppType::Codex)
+            .restore_live_config_for_app_with_policy(
+                &AppType::Codex,
+                LiveRestorePolicy::RestoreBackup,
+            )
             .await
             .expect("restore Codex live config");
 
@@ -11882,7 +11962,10 @@ wire_api = "responses"
 
         // Turning takeover off restores Live from this backup.
         service
-            .restore_live_config_for_app_with_fallback(&AppType::Codex)
+            .restore_live_config_for_app_with_policy(
+                &AppType::Codex,
+                LiveRestorePolicy::RestoreBackup,
+            )
             .await
             .expect("restore codex live from backup");
 
@@ -11939,7 +12022,10 @@ wire_api = "responses"
             .expect("seed live backup");
 
         service
-            .restore_live_config_for_app_with_fallback(&AppType::Codex)
+            .restore_live_config_for_app_with_policy(
+                &AppType::Codex,
+                LiveRestorePolicy::RestoreBackup,
+            )
             .await
             .expect("restore codex live from backup");
 
@@ -12009,7 +12095,10 @@ wire_api = "responses"
             .expect("seed live backup");
 
         service
-            .restore_live_config_for_app_with_fallback(&AppType::Codex)
+            .restore_live_config_for_app_with_policy(
+                &AppType::Codex,
+                LiveRestorePolicy::RestoreBackup,
+            )
             .await
             .expect("restore codex live from backup");
 
@@ -12074,7 +12163,10 @@ wire_api = "responses"
             .expect("seed live backup");
 
         service
-            .restore_live_config_for_app_with_fallback(&AppType::Codex)
+            .restore_live_config_for_app_with_policy(
+                &AppType::Codex,
+                LiveRestorePolicy::RestoreBackup,
+            )
             .await
             .expect("restore codex live from backup");
 
@@ -12138,7 +12230,10 @@ wire_api = "responses"
             .expect("seed live backup");
 
         service
-            .restore_live_config_for_app_with_fallback(&AppType::Codex)
+            .restore_live_config_for_app_with_policy(
+                &AppType::Codex,
+                LiveRestorePolicy::RestoreBackup,
+            )
             .await
             .expect("restore codex live from backup");
 
@@ -12188,7 +12283,10 @@ wire_api = "responses"
             .expect("seed live backup");
 
         service
-            .restore_live_config_for_app_with_fallback(&AppType::Codex)
+            .restore_live_config_for_app_with_policy(
+                &AppType::Codex,
+                LiveRestorePolicy::RestoreBackup,
+            )
             .await
             .expect("restore should repair the Windows project key");
 
@@ -12244,7 +12342,10 @@ reviewDelivery = "detached"
             .expect("seed old live backup");
 
         service
-            .restore_live_config_for_app_with_fallback(&AppType::Codex)
+            .restore_live_config_for_app_with_policy(
+                &AppType::Codex,
+                LiveRestorePolicy::RestoreBackup,
+            )
             .await
             .expect("restore codex live from backup");
 
@@ -12269,6 +12370,446 @@ reviewDelivery = "detached"
         assert!(
             !restored.contains("http://127.0.0.1:15721"),
             "restore must remove the takeover proxy endpoint, got:\n{restored}"
+        );
+    }
+
+    async fn assert_crash_recovery_preserves_current_unowned_live(
+        app_type: AppType,
+        current: Value,
+        stale_backup: Value,
+    ) {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        service
+            .write_live_config_for_app(&app_type, &current)
+            .expect("seed current direct live config");
+        let before = service
+            .read_live_config_for_app(&app_type)
+            .expect("read current direct live config");
+        assert!(!ProxyService::live_has_proxy_placeholder_for_app(
+            &app_type, &before
+        ));
+        db.save_live_backup(
+            app_type.as_str(),
+            &serde_json::to_string(&stale_backup).expect("serialize stale backup"),
+        )
+        .await
+        .expect("seed stale takeover backup");
+
+        service
+            .recover_from_crash()
+            .await
+            .expect("recover after an unclean process exit");
+
+        assert_eq!(
+            service
+                .read_live_config_for_app(&app_type)
+                .expect("read live after crash recovery"),
+            before,
+            "crash recovery must not overwrite valid current Live with an older backup"
+        );
+        assert!(db
+            .get_live_backup(app_type.as_str())
+            .await
+            .expect("read retired backup")
+            .is_none());
+        let outcomes_path = crate::services::recovery_outcome::recovery_outcome_path();
+        if let Ok(raw) = std::fs::read_to_string(outcomes_path) {
+            let outcomes: Value = serde_json::from_str(&raw).expect("parse recovery outcomes");
+            let preserved_app_has_restore_outcome = outcomes
+                .get("outcomes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|outcome| {
+                    outcome.get("operation").and_then(Value::as_str) == Some("live_config_recovery")
+                        && outcome.get("kind").and_then(Value::as_str)
+                            == Some("healthyBackupRestored")
+                        && outcome.get("appType").and_then(Value::as_str) == Some(app_type.as_str())
+                });
+            assert!(
+                !preserved_app_has_restore_outcome,
+                "preserving current Live must not claim an older backup was restored"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn crash_recovery_preserves_current_unowned_claude_live() {
+        assert_crash_recovery_preserves_current_unowned_live(
+            AppType::Claude,
+            json!({
+                "env": { "ANTHROPIC_BASE_URL": "https://current.example.invalid" },
+                "permissions": { "allow": ["CURRENT_USER_RULE"] }
+            }),
+            json!({
+                "env": { "ANTHROPIC_BASE_URL": "https://old.example.invalid" },
+                "permissions": { "allow": ["OLD_USER_RULE"] }
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn crash_recovery_preserves_current_unowned_codex_live() {
+        assert_crash_recovery_preserves_current_unowned_live(
+            AppType::Codex,
+            json!({
+                "auth": {},
+                "config": "model = \"current-model\"\nmodel_provider = \"current-direct\"\n[model_providers.current-direct]\nname = \"Current\"\nbase_url = \"https://current.example.invalid/v1\"\nwire_api = \"responses\"\n[desktop]\nreviewDelivery = \"detached\"\n"
+            }),
+            json!({
+                "auth": {},
+                "config": "model = \"old-model\"\nmodel_provider = \"old-direct\"\n[model_providers.old-direct]\nname = \"Old\"\nbase_url = \"https://old.example.invalid/v1\"\nwire_api = \"responses\"\n"
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn crash_recovery_preserves_current_unowned_gemini_live() {
+        assert_crash_recovery_preserves_current_unowned_live(
+            AppType::Gemini,
+            json!({ "env": {
+                "GOOGLE_GEMINI_BASE_URL": "https://current.example.invalid",
+                "GEMINI_MODEL": "current-model",
+                "CURRENT_USER_SETTING": "preserve"
+            } }),
+            json!({ "env": {
+                "GOOGLE_GEMINI_BASE_URL": "https://old.example.invalid",
+                "GEMINI_MODEL": "old-model"
+            } }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn crash_recovery_preserves_current_unowned_grok_official_live() {
+        assert_crash_recovery_preserves_current_unowned_live(
+            AppType::GrokBuild,
+            json!({ "config": "[mcp_servers.current]\ncommand = \"current-tool\"\n" }),
+            json!({ "config": "[models]\ndefault = \"old-model\"\n[model.old-model]\nmodel = \"old-model\"\nbase_url = \"https://old.example.invalid/v1\"\nenv_key = \"REDACTED_TEST_API_KEY\"\napi_backend = \"responses\"\n" }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn crash_recovery_restores_backup_for_malformed_gemini_env() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let path = crate::gemini_config::get_gemini_env_path();
+        std::fs::create_dir_all(path.parent().expect("Gemini env parent"))
+            .expect("create Gemini config directory");
+        std::fs::write(&path, "BROKEN_WITHOUT_EQUALS\n").expect("seed malformed Gemini env line");
+        let backup = json!({ "env": {
+            "GOOGLE_GEMINI_BASE_URL": "https://restored.example.invalid",
+            "GEMINI_MODEL": "restored-model",
+            "USER_SETTING": "preserve"
+        } });
+        db.save_live_backup(AppType::Gemini.as_str(), &backup.to_string())
+            .await
+            .expect("seed healthy Gemini backup");
+
+        service
+            .recover_from_crash()
+            .await
+            .expect("malformed Gemini env must use healthy backup recovery");
+
+        assert_eq!(
+            service
+                .read_live_config_for_app(&AppType::Gemini)
+                .expect("read restored Gemini Live"),
+            backup,
+            "a permissive env reader must not turn a malformed file into healthy current Live"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn crash_recovery_restores_backup_for_incomplete_grok_custom_model() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let broken = "[models]\ndefault = \"missing-selected-model\"\n";
+        service
+            .write_live_config_for_app(&AppType::GrokBuild, &json!({ "config": broken }))
+            .expect("seed syntactically valid but incomplete Grok custom config");
+        let backup = json!({ "config": concat!(
+            "[models]\ndefault = \"restored-model\"\n",
+            "[model.restored-model]\nmodel = \"restored-model\"\n",
+            "name = \"Restored\"\nbase_url = \"https://restored.example.invalid/v1\"\n",
+            "env_key = \"REDACTED_TEST_API_KEY\"\napi_backend = \"responses\"\n",
+            "context_window = 128000\n"
+        ) });
+        crate::grok_config::validate_config_toml(
+            backup.get("config").and_then(Value::as_str).unwrap(),
+        )
+        .expect("backup must be a complete usable Grok custom config");
+        db.save_live_backup(AppType::GrokBuild.as_str(), &backup.to_string())
+            .await
+            .expect("seed healthy Grok backup");
+
+        service
+            .recover_from_crash()
+            .await
+            .expect("incomplete Grok custom config must use healthy backup recovery");
+
+        assert_eq!(
+            service
+                .read_live_config_for_app(&AppType::GrokBuild)
+                .expect("read restored Grok Live"),
+            backup,
+            "valid TOML syntax alone does not make a broken selected custom model healthy"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn crash_recovery_preserves_empty_and_comment_only_native_live() {
+        for app_type in [AppType::Gemini, AppType::GrokBuild] {
+            for current in ["", "# current native settings\n\n"] {
+                let _home = TempHome::new();
+                crate::settings::reload_settings().expect("reload settings");
+                let db = Arc::new(Database::memory().expect("init db"));
+                let service = ProxyService::new(db.clone());
+                let (path, backup) = if app_type == AppType::Gemini {
+                    (
+                        crate::gemini_config::get_gemini_env_path(),
+                        json!({ "env": { "GEMINI_MODEL": "old-model" } }),
+                    )
+                } else {
+                    (
+                        crate::grok_config::get_grok_config_path(),
+                        json!({ "config": "[mcp_servers.old]\ncommand = \"old-tool\"\n" }),
+                    )
+                };
+                std::fs::create_dir_all(path.parent().expect("native config parent"))
+                    .expect("create native config directory");
+                std::fs::write(&path, current).expect("seed valid empty native state");
+                db.save_live_backup(app_type.as_str(), &backup.to_string())
+                    .await
+                    .expect("seed stale native backup");
+
+                service
+                    .recover_from_crash()
+                    .await
+                    .expect("empty and comment-only native config remains valid");
+
+                assert_eq!(
+                    std::fs::read_to_string(&path).expect("read preserved native state"),
+                    current,
+                    "valid empty or comment-only config must remain byte-for-byte unchanged"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn crash_recovery_preserves_codex_auth_only_and_config_only_live() {
+        for config_only in [false, true] {
+            let _home = TempHome::new();
+            crate::settings::reload_settings().expect("reload settings");
+            let db = Arc::new(Database::memory().expect("init db"));
+            let service = ProxyService::new(db.clone());
+            std::fs::create_dir_all(crate::codex_config::get_codex_config_dir())
+                .expect("create Codex config directory");
+            let (present, missing) = if config_only {
+                let config_path = crate::codex_config::get_codex_config_path();
+                std::fs::write(&config_path, "model = \"current-model\"\n")
+                    .expect("seed current Codex config-only state");
+                (config_path, crate::codex_config::get_codex_auth_path())
+            } else {
+                let auth_path = crate::codex_config::get_codex_auth_path();
+                crate::config::write_json_file(&auth_path, &json!({ "auth_mode": "chatgpt" }))
+                    .expect("seed current Codex official auth-only state");
+                (auth_path, crate::codex_config::get_codex_config_path())
+            };
+            let before = std::fs::read(&present).expect("read current partial Codex state");
+            db.save_live_backup(
+                AppType::Codex.as_str(),
+                &json!({
+                    "auth": {},
+                    "config": "model = \"old-model\"\nmodel_provider = \"openai\"\n"
+                })
+                .to_string(),
+            )
+            .await
+            .expect("seed stale Codex backup");
+
+            service
+                .recover_from_crash()
+                .await
+                .expect("preserve valid partial Codex state");
+
+            assert_eq!(
+                std::fs::read(&present).expect("read preserved partial Codex state"),
+                before
+            );
+            assert!(
+                !missing.exists(),
+                "crash recovery must not recreate intentionally absent native Codex files"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn crash_recovery_restores_backup_for_missing_malformed_or_taken_over_live() {
+        for current in [
+            None,
+            Some("{ invalid-json"),
+            Some(r#"{"env":{"ANTHROPIC_API_KEY":"PROXY_MANAGED"}}"#),
+        ] {
+            let _home = TempHome::new();
+            crate::settings::reload_settings().expect("reload settings");
+            let db = Arc::new(Database::memory().expect("init db"));
+            let service = ProxyService::new(db.clone());
+            if let Some(current) = current {
+                let path = crate::config::get_claude_settings_path();
+                std::fs::create_dir_all(path.parent().expect("Claude config parent"))
+                    .expect("create Claude config directory");
+                std::fs::write(path, current).expect("seed damaged or taken-over Live");
+            }
+            let backup = json!({
+                "env": { "ANTHROPIC_BASE_URL": "https://restored.example.invalid" },
+                "permissions": { "allow": ["RESTORED_USER_RULE"] }
+            });
+            db.save_live_backup(AppType::Claude.as_str(), &backup.to_string())
+                .await
+                .expect("seed healthy recovery backup");
+
+            service
+                .recover_from_crash()
+                .await
+                .expect("restore missing, malformed, or taken-over current Live");
+
+            assert_eq!(
+                service
+                    .read_live_config_for_app(&AppType::Claude)
+                    .expect("read restored Claude Live"),
+                backup
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_restore_keeps_backup_first_semantics_for_current_unowned_live() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let current = json!({
+            "env": { "ANTHROPIC_BASE_URL": "https://current.example.invalid" }
+        });
+        let backup = json!({
+            "env": { "ANTHROPIC_BASE_URL": "https://restored.example.invalid" }
+        });
+        service
+            .write_live_config_for_app(&AppType::Claude, &current)
+            .expect("seed valid direct Live");
+        db.save_live_backup(AppType::Claude.as_str(), &backup.to_string())
+            .await
+            .expect("seed requested restore backup");
+
+        service
+            .restore_live_config_for_app_with_policy(
+                &AppType::Claude,
+                LiveRestorePolicy::RestoreBackup,
+            )
+            .await
+            .expect("explicit restore must retain backup-first behavior");
+
+        assert_eq!(
+            service
+                .read_live_config_for_app(&AppType::Claude)
+                .expect("read explicitly restored Claude Live"),
+            backup
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn crash_recovery_restores_backup_when_current_live_shape_is_invalid() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let malformed_current = json!({
+            "env": "this must be an object"
+        });
+        let healthy_backup = json!({
+            "env": { "ANTHROPIC_BASE_URL": "https://restored.example.invalid" },
+            "permissions": { "allow": ["RESTORED_USER_RULE"] }
+        });
+        service
+            .write_live_config_for_app(&AppType::Claude, &malformed_current)
+            .expect("seed malformed-shaped Claude live config");
+        db.save_live_backup(
+            AppType::Claude.as_str(),
+            &serde_json::to_string(&healthy_backup).expect("serialize healthy backup"),
+        )
+        .await
+        .expect("seed healthy backup");
+
+        service
+            .recover_from_crash()
+            .await
+            .expect("invalid current shape should fall back to backup recovery");
+        assert_eq!(
+            service
+                .read_live_config_for_app(&AppType::Claude)
+                .expect("read restored Claude live"),
+            healthy_backup
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn crash_recovery_keeps_taken_over_live_and_malformed_backup_for_retry() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let taken_over = json!({
+            "env": { "ANTHROPIC_API_KEY": PROXY_TOKEN_PLACEHOLDER }
+        });
+        service
+            .write_live_config_for_app(&AppType::Claude, &taken_over)
+            .expect("seed taken-over Claude live config");
+        db.save_live_backup(AppType::Claude.as_str(), "not-json")
+            .await
+            .expect("seed malformed backup");
+
+        let error = service
+            .recover_from_crash()
+            .await
+            .expect_err("malformed backup must fail closed while Live is taken over");
+        assert!(error.contains("解析 claude 备份失败"));
+        assert_eq!(
+            service
+                .read_live_config_for_app(&AppType::Claude)
+                .expect("read preserved taken-over live"),
+            taken_over
+        );
+        assert_eq!(
+            db.get_live_backup(AppType::Claude.as_str())
+                .await
+                .expect("read retained malformed backup")
+                .expect("malformed backup must remain for retry")
+                .original_config,
+            "not-json"
         );
     }
 
@@ -12327,7 +12868,10 @@ reviewDelivery = "detached"
 
         // Restore: must NOT use the corrupted backup
         service
-            .restore_live_config_for_app_with_fallback(&AppType::Claude)
+            .restore_live_config_for_app_with_policy(
+                &AppType::Claude,
+                LiveRestorePolicy::RestoreBackup,
+            )
             .await
             .expect("restore should succeed via SSOT");
 

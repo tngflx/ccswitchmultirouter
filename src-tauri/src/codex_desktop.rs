@@ -1635,7 +1635,7 @@ pub(crate) async fn summarize_and_restart_codex_session(
                             .and_then(Value::as_str)
                             .filter(|s| !s.trim().is_empty())
                             .unwrap_or_default()
-                            .to_string()
+                            .to_string();
                     }
                     Some("failed") => {
                         return Err(value
@@ -1772,6 +1772,20 @@ fn codex_continuation_core_script() -> &'static str {
         .as_str()
 }
 
+fn codex_continuation_bridge_script(method: &str, arguments: &str) -> String {
+    let runtime_fingerprint = codex_renderer_runtime_fingerprint();
+    format!(
+        r#"(() => {{
+          const state = window[{patch_key:?}];
+          const operation = state && Object.getOwnPropertyDescriptor(state, {method:?})?.value;
+          if (!state || state.rendererRuntimeFingerprint !== {runtime_fingerprint:?} || typeof operation !== 'function')
+            return {{started:false, status:'unavailable', reason:'Codex compatibility layer is not ready'}};
+          return operation.call(state, {arguments});
+        }})()"#,
+        patch_key = MODEL_PICKER_PATCH_KEY,
+    )
+}
+
 /// Submit a literal `continue` to the exact failed Codex thread through the
 /// renderer-owned app-server client. Recovery never changes a visible draft or
 /// uses the currently selected model/provider. A renderer job and a persisted
@@ -1795,20 +1809,16 @@ pub(crate) async fn submit_codex_continuation(
         serde_json::to_string(recovery_id.trim()).map_err(|error| error.to_string())?;
     let expected_model_json =
         serde_json::to_string(expected_model.trim()).map_err(|error| error.to_string())?;
-    let start_script = format!(
-        r#"(() => {{
-          const state = window[{patch_key:?}];
-          if (!state || typeof state.startCodexContinuation !== 'function') return {{started:false, reason:'Codex compatibility layer is not ready'}};
-          return state.startCodexContinuation({thread_id_json}, {recovery_id_json}, {expected_model_json}, {observed_at_ms});
-        }})()"#,
-        patch_key = MODEL_PICKER_PATCH_KEY,
+    let start_script = codex_continuation_bridge_script(
+        "startCodexContinuation",
+        &format!("{thread_id_json}, {recovery_id_json}, {expected_model_json}, {observed_at_ms}"),
     );
     let mut diagnostics = Vec::new();
     for port in candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT) {
         let targets = match list_cdp_targets(port).await {
             Ok(value) => value,
             Err(error) => {
-                diagnostics.push(format!("port {port}: {error}"));
+                diagnostics.push(format!("port {port}: failed to list CDP targets: {error}"));
                 continue;
             }
         };
@@ -1819,31 +1829,96 @@ pub(crate) async fn submit_codex_continuation(
                 continue;
             }
         };
-        for target in targets {
-            let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
-                continue;
-            };
-            // This synchronous expression only starts read-only preparation.
-            // The backend authorizes a separate commit after the thread reads.
-            let evaluation = match evaluate_cdp_expression(websocket_url, &start_script).await {
+        if let Some(result) = submit_codex_continuation_to_targets(
+            targets,
+            port,
+            &start_script,
+            &recovery_id_json,
+            &authorize,
+            &mut diagnostics,
+        )
+        .await?
+        {
+            return Ok(result);
+        }
+    }
+    Err(if diagnostics.is_empty() {
+        "No Codex Desktop CDP target was found".to_string()
+    } else {
+        diagnostics.join("; ")
+    })
+}
+
+async fn abandon_codex_continuation_preparation(
+    target: &CdpTarget,
+    port: u16,
+    cancel_script: &str,
+    diagnostic: String,
+    diagnostics: &mut Vec<String>,
+) -> Option<CodexContinuationResult> {
+    diagnostics.push(diagnostic);
+    let websocket_url = target.web_socket_debugger_url.as_deref()?;
+    // Preparation never sends turn/start. Retire its exact job if reachable,
+    // but do not let an unreachable target consume the next target's budget.
+    let evaluation = tokio::time::timeout(
+        Duration::from_secs(1),
+        evaluate_cdp_expression(websocket_url, cancel_script),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let value = evaluation.pointer("/result/result/value")?;
+    if value.get("cancelled").and_then(Value::as_bool) == Some(false)
+        || value.get("mutationAttempted").and_then(Value::as_bool) == Some(true)
+        || value.get("submitted").and_then(Value::as_bool) == Some(true)
+    {
+        return Some(CodexContinuationResult {
+            submitted: value.get("submitted").and_then(Value::as_bool) == Some(true),
+            mutation_attempted: true,
+            debug_port: Some(port),
+            target_id: Some(target.id.clone()),
+            message: "A continuation was already attempted; its result is uncertain".to_string(),
+        });
+    }
+    None
+}
+
+async fn submit_codex_continuation_to_targets(
+    targets: Vec<CdpTarget>,
+    port: u16,
+    start_script: &str,
+    recovery_id_json: &str,
+    authorize: &(impl Fn(bool) -> bool + Sync),
+    diagnostics: &mut Vec<String>,
+) -> Result<Option<CodexContinuationResult>, String> {
+    let poll_script =
+        codex_continuation_bridge_script("readCodexContinuationJob", recovery_id_json);
+    let commit_script =
+        codex_continuation_bridge_script("commitCodexContinuation", recovery_id_json);
+    let cancel_script =
+        codex_continuation_bridge_script("cancelCodexContinuation", recovery_id_json);
+    'targets: for target in targets {
+        let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
+            continue;
+        };
+        let diagnostic = 'preparation: {
+            // Only these read-only operations can abandon this renderer.
+            let evaluation = match evaluate_cdp_expression(websocket_url, start_script).await {
                 Ok(value) => value,
-                Err(error) => return Err(format!("target {}: {error}", target.id)),
+                Err(error) => break 'preparation format!("target {}: {error}", target.id),
             };
             if let Some(exception) = evaluation.pointer("/result/exceptionDetails") {
-                return Err(format!(
+                break 'preparation format!(
                     "target {}: CDP evaluation failed: {exception}",
                     target.id
-                ));
+                );
             }
             let started = evaluation
                 .pointer("/result/result/value")
                 .cloned()
                 .unwrap_or(Value::Null);
-            if !started
-                .get("started")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
+            if started.get("started").and_then(Value::as_bool) != Some(true) {
+                // The guarded start did not invoke preparation.
                 diagnostics.push(format!(
                     "target {}: {}",
                     target.id,
@@ -1852,108 +1927,183 @@ pub(crate) async fn submit_codex_continuation(
                         .and_then(Value::as_str)
                         .unwrap_or("Continuation was not started")
                 ));
-                continue;
+                continue 'targets;
             }
-            let poll_script = format!(
-                r#"(() => {{
-                  const state = window[{patch_key:?}];
-                  return state && typeof state.readCodexContinuationJob === 'function' ? state.readCodexContinuationJob({recovery_id_json}) : null;
-                }})()"#,
-                patch_key = MODEL_PICKER_PATCH_KEY,
-            );
-            let commit_script = format!(
-                r#"(() => {{
-                  const state = window[{patch_key:?}];
-                  return state && typeof state.commitCodexContinuation === 'function'
-                    ? state.commitCodexContinuation({recovery_id_json})
-                    : {{started:false, reason:'Codex continuation commit is not ready'}};
-                }})()"#,
-                patch_key = MODEL_PICKER_PATCH_KEY,
-            );
-            let cancel_script = format!(
-                r#"(() => {{
-                  const state = window[{patch_key:?}];
-                  return state && typeof state.cancelCodexContinuation === 'function'
-                    ? state.cancelCodexContinuation({recovery_id_json}) : null;
-                }})()"#,
-                patch_key = MODEL_PICKER_PATCH_KEY,
-            );
             let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let mut commit_requested = false;
             loop {
-                let evaluation = evaluate_cdp_expression(websocket_url, &poll_script).await?;
+                let evaluation = match evaluate_cdp_expression(websocket_url, &poll_script).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let diagnostic = format!("target {}: {error}", target.id);
+                        if commit_requested {
+                            return Err(diagnostic);
+                        }
+                        break 'preparation diagnostic;
+                    }
+                };
+                if let Some(exception) = evaluation.pointer("/result/exceptionDetails") {
+                    let diagnostic =
+                        format!("target {}: CDP evaluation failed: {exception}", target.id);
+                    if commit_requested {
+                        return Err(diagnostic);
+                    }
+                    break 'preparation diagnostic;
+                }
                 let value = evaluation
                     .pointer("/result/result/value")
                     .cloned()
                     .unwrap_or(Value::Null);
-                if value.get("status").and_then(Value::as_str) == Some("prepared") {
-                    let committed = evaluate_cdp_expression_if_authorized(
-                        websocket_url,
-                        &commit_script,
-                        &authorize,
-                    )
-                    .await?;
-                    let Some(committed) = committed else {
-                        let _ = evaluate_cdp_expression(websocket_url, &cancel_script).await;
-                        return Ok(CodexContinuationResult {
-                            submitted: false,
-                            mutation_attempted: false,
-                            debug_port: Some(port),
-                            target_id: Some(target.id),
-                            message: "Continuation authorization was revoked".to_string(),
-                        });
-                    };
-                    if let Some(exception) = committed.pointer("/result/exceptionDetails") {
-                        return Err(format!(
-                            "target {}: CDP continuation commit failed: {exception}",
-                            target.id
-                        ));
-                    }
-                    if committed.pointer("/result/result/value/started") != Some(&Value::Bool(true))
-                    {
-                        return Ok(CodexContinuationResult {
-                            submitted: false,
-                            mutation_attempted: false,
-                            debug_port: Some(port),
-                            target_id: Some(target.id),
-                            message: committed
-                                .pointer("/result/result/value/reason")
-                                .and_then(Value::as_str)
-                                .unwrap_or("Codex continuation commit was not started")
-                                .to_string(),
-                        });
-                    }
-                }
-                if value.get("status").and_then(Value::as_str) == Some("completed") {
-                    return Ok(CodexContinuationResult {
-                        submitted: value
-                            .get("submitted")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                        mutation_attempted: value
-                            .get("mutationAttempted")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
+                let status = value.get("status").and_then(Value::as_str);
+                let submitted = value.get("submitted").and_then(Value::as_bool) == Some(true);
+                let attempted =
+                    value.get("mutationAttempted").and_then(Value::as_bool) == Some(true);
+                // start can reattach to a previous job. Its mutation evidence
+                // takes precedence over this invocation's local commit flag.
+                if submitted
+                    || (!commit_requested && (attempted || status == Some("submitting")))
+                    || (status == Some("completed") && attempted)
+                {
+                    return Ok(Some(CodexContinuationResult {
+                        submitted,
+                        mutation_attempted: true,
                         debug_port: Some(port),
                         target_id: Some(target.id),
                         message: value
                             .get("reason")
                             .and_then(Value::as_str)
-                            .unwrap_or("Codex did not confirm the targeted continuation")
+                            .unwrap_or(
+                                "A continuation was already attempted; its result is uncertain",
+                            )
                             .to_string(),
-                    });
+                    }));
+                }
+                match status {
+                    Some("completed") => {
+                        if commit_requested
+                            && (value.get("submitted").and_then(Value::as_bool) != Some(false)
+                                || value.get("mutationAttempted").and_then(Value::as_bool)
+                                    != Some(false))
+                        {
+                            return Err(format!("target {}: CDP continuation commit failed: completion acknowledgement is incomplete; result is uncertain", target.id));
+                        }
+                        let reason = value
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Codex did not confirm the targeted continuation");
+                        if !commit_requested
+                            && value.get("submitted").and_then(Value::as_bool) == Some(false)
+                            && value.get("mutationAttempted").and_then(Value::as_bool)
+                                == Some(false)
+                            && reason.starts_with("Codex Desktop request client was not found")
+                        {
+                            break 'preparation format!("target {}: {reason}", target.id);
+                        }
+                        // Semantic stops are authoritative, including user
+                        // actions, terminal errors and changed thread bindings.
+                        return Ok(Some(CodexContinuationResult {
+                            submitted: false,
+                            mutation_attempted: false,
+                            debug_port: Some(port),
+                            target_id: Some(target.id),
+                            message: reason.to_string(),
+                        }));
+                    }
+                    Some("prepared") if !commit_requested => {
+                        // Set before either authorization or dispatch: losing
+                        // any later response must preserve mutation uncertainty.
+                        commit_requested = true;
+                        let committed = evaluate_cdp_expression_if_authorized(
+                            websocket_url,
+                            &commit_script,
+                            authorize,
+                        )
+                        .await?;
+                        let Some(committed) = committed else {
+                            if let Some(result) = abandon_codex_continuation_preparation(
+                                &target,
+                                port,
+                                &cancel_script,
+                                format!(
+                                    "target {}: Continuation authorization was revoked",
+                                    target.id
+                                ),
+                                diagnostics,
+                            )
+                            .await
+                            {
+                                return Ok(Some(result));
+                            }
+                            return Ok(Some(CodexContinuationResult {
+                                submitted: false,
+                                mutation_attempted: false,
+                                debug_port: Some(port),
+                                target_id: Some(target.id),
+                                message: "Continuation authorization was revoked".to_string(),
+                            }));
+                        };
+                        if let Some(exception) = committed.pointer("/result/exceptionDetails") {
+                            return Err(format!(
+                                "target {}: CDP continuation commit failed: {exception}",
+                                target.id
+                            ));
+                        }
+                        let started = committed
+                            .pointer("/result/result/value/started")
+                            .and_then(Value::as_bool);
+                        if started.is_none() {
+                            return Err(format!("target {}: CDP continuation commit failed: acknowledgement is incomplete; result is uncertain", target.id));
+                        }
+                        if started == Some(false) {
+                            return Ok(Some(CodexContinuationResult {
+                                submitted: false,
+                                mutation_attempted: false,
+                                debug_port: Some(port),
+                                target_id: Some(target.id),
+                                message: committed
+                                    .pointer("/result/result/value/reason")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("Codex continuation commit was not started")
+                                    .to_string(),
+                            }));
+                        }
+                    }
+                    Some("pending") | Some("submitting") if commit_requested => {}
+                    Some("pending") => {}
+                    Some("unavailable") if commit_requested => {
+                        return Err(format!("target {}: Codex compatibility runtime was replaced after continuation commit; result is uncertain", target.id));
+                    }
+                    _ => {
+                        let diagnostic = format!("target {}: Codex compatibility layer is not ready: continuation preparation job was not found", target.id);
+                        if commit_requested {
+                            return Err(diagnostic);
+                        }
+                        break 'preparation diagnostic;
+                    }
                 }
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(format!("target {}: continuation is still pending; no second submission was attempted", target.id));
+                    let diagnostic = format!("target {}: continuation is still pending; no second submission was attempted", target.id);
+                    if commit_requested {
+                        return Err(diagnostic);
+                    }
+                    break 'preparation diagnostic;
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
+        };
+        if let Some(result) = abandon_codex_continuation_preparation(
+            &target,
+            port,
+            &cancel_script,
+            diagnostic,
+            diagnostics,
+        )
+        .await
+        {
+            return Ok(Some(result));
         }
     }
-    Err(if diagnostics.is_empty() {
-        "No Codex Desktop CDP target was found".to_string()
-    } else {
-        diagnostics.join("; ")
-    })
+    Ok(None)
 }
 
 /// 构造 renderer 注入脚本：触发新版本地历史目录同步，并修复模型白名单和缓存。
@@ -4385,6 +4535,733 @@ void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.no
         assert!(result.is_none());
         assert_eq!(server.await.unwrap(), None);
         assert_eq!(*authorization_stages.lock().unwrap(), vec![false, true]);
+    }
+
+    #[test]
+    fn codex_continuation_bridge_checks_runtime_identity_before_every_operation() {
+        let start = codex_continuation_bridge_script(
+            "startCodexContinuation",
+            "'exact-thread', 'isolated-recovery', 'request-model', 1000",
+        );
+        let poll =
+            codex_continuation_bridge_script("readCodexContinuationJob", "'isolated-recovery'");
+        let commit =
+            codex_continuation_bridge_script("commitCodexContinuation", "'isolated-recovery'");
+        let cancel =
+            codex_continuation_bridge_script("cancelCodexContinuation", "'isolated-recovery'");
+        let runtime_fingerprint = codex_renderer_runtime_fingerprint();
+        let script = format!(
+            r#"
+const window = {{}};
+const calls = [];
+const operations = [() => {start}, () => {poll}, () => {commit}, () => {cancel}];
+const missing = operations.map((operation) => operation());
+const state = {{rendererRuntimeFingerprint: 'stale-runtime'}};
+for (const method of ['startCodexContinuation', 'readCodexContinuationJob', 'commitCodexContinuation', 'cancelCodexContinuation']) {{
+  state[method] = function(...args) {{ calls.push({{method, args, bound: this === state}}); return {{accepted: true}}; }};
+}}
+window[{MODEL_PICKER_PATCH_KEY:?}] = state;
+const stale = operations.map((operation) => operation());
+const staleCalls = calls.length;
+state.rendererRuntimeFingerprint = {runtime_fingerprint:?};
+const current = operations.map((operation) => operation());
+state.rendererRuntimeFingerprint = 'replaced-after-preparation';
+const replaced = [operations[1](), operations[2]()];
+const replacedCalls = calls.length;
+state.rendererRuntimeFingerprint = {runtime_fingerprint:?};
+const inheritedState = Object.create(state);
+inheritedState.rendererRuntimeFingerprint = {runtime_fingerprint:?};
+window[{MODEL_PICKER_PATCH_KEY:?}] = inheritedState;
+const inherited = operations.map((operation) => operation());
+JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, inherited, calls}});
+"#
+        );
+        let runtime = rquickjs::Runtime::new().expect("create bridge JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create bridge JavaScript context");
+        context.with(|ctx| {
+            let encoded: String = ctx.eval(script).expect("execute generated continuation bridges");
+            let result: Value = serde_json::from_str(&encoded).unwrap();
+            for category in ["missing", "stale", "replaced", "inherited"] {
+                for unavailable in result[category].as_array().unwrap() {
+                    assert_eq!(
+                        unavailable,
+                        &json!({
+                            "started": false, "status": "unavailable",
+                            "reason": "Codex compatibility layer is not ready"
+                        }),
+                        "{category} runtime must not invoke a continuation method"
+                    );
+                }
+            }
+            assert_eq!(result["staleCalls"], 0);
+            assert_eq!(result["replacedCalls"], 4);
+            assert_eq!(
+                result["current"],
+                json!([
+                    {"accepted": true}, {"accepted": true},
+                    {"accepted": true}, {"accepted": true}
+                ])
+            );
+            assert_eq!(
+                result["calls"],
+                json!([
+                    {"method": "startCodexContinuation", "args": ["exact-thread", "isolated-recovery", "request-model", 1000], "bound": true},
+                    {"method": "readCodexContinuationJob", "args": ["isolated-recovery"], "bound": true},
+                    {"method": "commitCodexContinuation", "args": ["isolated-recovery"], "bound": true},
+                    {"method": "cancelCodexContinuation", "args": ["isolated-recovery"], "bound": true}
+                ])
+            );
+        });
+    }
+
+    async fn codex_continuation_test_targets(
+        responses: Vec<Value>,
+    ) -> (
+        Vec<CdpTarget>,
+        u16,
+        std::sync::Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        codex_continuation_test_targets_with_evaluations(
+            responses
+                .into_iter()
+                .map(|value| Some(json!({"result": {"value": value}})))
+                .collect(),
+        )
+        .await
+    }
+
+    async fn codex_continuation_test_targets_with_evaluations(
+        responses: Vec<Option<Value>>,
+    ) -> (
+        Vec<CdpTarget>,
+        u16,
+        std::sync::Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind isolated continuation CDP server");
+        let address = listener.local_addr().unwrap();
+        let expressions = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let recorded = expressions.clone();
+        let server = tokio::spawn(async move {
+            let mut responses = std::collections::VecDeque::from(responses);
+            while let Some(response) = responses.front().cloned() {
+                let mut consume_response = true;
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                for method in ["Runtime.enable", "Runtime.evaluate"] {
+                    let command = socket.next().await.unwrap().unwrap();
+                    let command: Value = serde_json::from_str(command.to_text().unwrap()).unwrap();
+                    assert_eq!(command["method"], method);
+                    let result = if method == "Runtime.evaluate" {
+                        recorded.lock().unwrap().push(
+                            command["params"]["expression"]
+                                .as_str()
+                                .unwrap()
+                                .to_string(),
+                        );
+                        let Some(response) = response.as_ref() else {
+                            socket
+                                .close(None)
+                                .await
+                                .expect("close simulated CDP websocket");
+                            let peer_close =
+                                tokio::time::timeout(Duration::from_secs(1), socket.next())
+                                    .await
+                                    .expect("peer must acknowledge the simulated close");
+                            assert!(
+                                matches!(peer_close, Some(Ok(Message::Close(_))) | None),
+                                "unexpected simulated close acknowledgement: {peer_close:?}"
+                            );
+                            break;
+                        };
+                        if response.get("repeatPending").and_then(Value::as_bool) == Some(true) {
+                            if command["params"]["expression"]
+                                .as_str()
+                                .unwrap()
+                                .contains("readCodexContinuationJob")
+                            {
+                                consume_response = false;
+                                json!({"result": {"value": {"status": "pending"}}})
+                            } else {
+                                assert!(command["params"]["expression"]
+                                    .as_str()
+                                    .unwrap()
+                                    .contains("cancelCodexContinuation"));
+                                json!({"result": {"value": {"cancelled": true, "mutationAttempted": false}}})
+                            }
+                        } else {
+                            response.clone()
+                        }
+                    } else {
+                        json!({})
+                    };
+                    socket
+                        .send(Message::Text(
+                            json!({"id": command["id"], "result": result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                if consume_response {
+                    responses.pop_front();
+                }
+            }
+        });
+        let targets = ["unready-renderer", "ready-renderer"]
+            .into_iter()
+            .map(|id| CdpTarget {
+                id: id.to_string(),
+                target_type: "page".to_string(),
+                title: "Codex".to_string(),
+                url: "codex://desktop".to_string(),
+                web_socket_debugger_url: Some(format!("ws://{address}")),
+            })
+            .collect();
+        (targets, address.port(), expressions, server)
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_tries_ready_renderer_after_client_discovery_failure() {
+        let (targets, port, expressions, server) = codex_continuation_test_targets(vec![
+            json!({"started": true}),
+            json!({
+                "status": "completed", "submitted": false, "mutationAttempted": false,
+                "reason": "Codex Desktop request client was not found"
+            }),
+            json!({"cancelled": true, "mutationAttempted": false}),
+            json!({"started": true}),
+            json!({"status": "prepared"}),
+            json!({"started": true}),
+            json!({
+                "status": "completed", "submitted": true, "mutationAttempted": true,
+                "reason": "Continuation submitted to the interrupted Codex thread"
+            }),
+        ])
+        .await;
+        let authorization_stages = Mutex::new(Vec::new());
+        let mut diagnostics = Vec::new();
+        let result = submit_codex_continuation_to_targets(
+            targets,
+            port,
+            "start-exact-continuation",
+            "\"isolated-recovery\"",
+            &|final_commit| {
+                authorization_stages.lock().unwrap().push(final_commit);
+                true
+            },
+            &mut diagnostics,
+        )
+        .await;
+        server.abort();
+        let result = result.unwrap().expect("a ready renderer must submit");
+        assert!(
+            result.submitted,
+            "unready renderer must not starve a ready one"
+        );
+        assert!(result.mutation_attempted);
+        assert_eq!(result.target_id.as_deref(), Some("ready-renderer"));
+        assert_eq!(*authorization_stages.lock().unwrap(), vec![false, true]);
+        assert_eq!(
+            diagnostics,
+            vec!["target unready-renderer: Codex Desktop request client was not found"]
+        );
+        let expressions = expressions.lock().unwrap();
+        assert_eq!(expressions.len(), 7);
+        assert_eq!(
+            expressions
+                .iter()
+                .filter(|expression| expression.contains("commitCodexContinuation"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_never_falls_through_a_stop_or_uncertain_mutation() {
+        for completed in [
+            json!({
+                "status": "completed", "submitted": false, "mutationAttempted": true,
+                "reason": "Codex Desktop request client was not found"
+            }),
+            json!({
+                "status": "completed", "submitted": false,
+                "reason": "Codex Desktop request client was not found"
+            }),
+            json!({
+                "status": "completed", "submitted": false, "mutationAttempted": false,
+                "reason": "The user changed or stopped the Codex thread before continuation"
+            }),
+            json!({
+                "status": "completed", "submitted": false, "mutationAttempted": false,
+                "reason": "The interrupted Codex thread is still active"
+            }),
+            json!({
+                "status": "completed", "submitted": false, "mutationAttempted": false,
+                "reason": "The latest Codex turn needs a user action"
+            }),
+        ] {
+            let expected_mutation = completed["mutationAttempted"].as_bool().unwrap_or(false);
+            let (targets, port, expressions, server) =
+                codex_continuation_test_targets(vec![json!({"started": true}), completed]).await;
+            let result = submit_codex_continuation_to_targets(
+                targets,
+                port,
+                "start-exact-continuation",
+                "\"isolated-recovery\"",
+                &|_| panic!("a stopped preparation must not authorize a mutation"),
+                &mut Vec::new(),
+            )
+            .await;
+            server.abort();
+            let result = result.unwrap().expect("preserve the first stop decision");
+            assert!(!result.submitted);
+            assert_eq!(result.mutation_attempted, expected_mutation);
+            assert_eq!(result.target_id.as_deref(), Some("unready-renderer"));
+            assert_eq!(expressions.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_preserves_uncertainty_when_runtime_is_lost_after_commit() {
+        let (targets, port, expressions, server) = codex_continuation_test_targets(vec![
+            json!({"started": true}),
+            json!({"status": "prepared"}),
+            json!({"started": true}),
+            json!({
+                "started": false, "status": "unavailable",
+                "reason": "Codex compatibility layer is not ready"
+            }),
+        ])
+        .await;
+        let result = submit_codex_continuation_to_targets(
+            targets,
+            port,
+            "start-exact-continuation",
+            "\"isolated-recovery\"",
+            &|_| true,
+            &mut Vec::new(),
+        )
+        .await;
+        server.abort();
+        assert!(result.unwrap_err().contains("result is uncertain"));
+        let expressions = expressions.lock().unwrap();
+        assert_eq!(expressions.len(), 4);
+        assert_eq!(
+            expressions
+                .iter()
+                .filter(|expression| expression.contains("commitCodexContinuation"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_advances_after_precommit_transport_or_evaluation_failure() {
+        for (phase, failure) in [
+            ("start", None),
+            (
+                "start",
+                Some(json!({"exceptionDetails": {"text": "isolated exception"}})),
+            ),
+            ("poll", None),
+            (
+                "poll",
+                Some(json!({"exceptionDetails": {"text": "isolated exception"}})),
+            ),
+        ] {
+            let mut evaluations = Vec::new();
+            if phase == "poll" {
+                evaluations.push(Some(json!({"result": {"value": {"started": true}}})));
+            }
+            evaluations.push(failure);
+            evaluations.push(Some(
+                json!({"result": {"value": {"cancelled": true, "mutationAttempted": false}}}),
+            ));
+            evaluations.extend([
+                Some(json!({"result": {"value": {"started": true}}})),
+                Some(json!({"result": {"value": {"status": "prepared"}}})),
+                Some(json!({"result": {"value": {"started": true}}})),
+                Some(json!({"result": {"value": {
+                    "status": "completed", "submitted": true, "mutationAttempted": true,
+                    "reason": "Continuation submitted to the interrupted Codex thread"
+                }}})),
+            ]);
+            let (targets, port, expressions, server) =
+                codex_continuation_test_targets_with_evaluations(evaluations).await;
+            let authorization_stages = Mutex::new(Vec::new());
+            let mut diagnostics = Vec::new();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                submit_codex_continuation_to_targets(
+                    targets,
+                    port,
+                    "start-exact-continuation",
+                    "\"isolated-recovery\"",
+                    &|final_commit| {
+                        authorization_stages.lock().unwrap().push(final_commit);
+                        true
+                    },
+                    &mut diagnostics,
+                ),
+            )
+            .await;
+            server.abort();
+            let result = result
+                .expect("a failed read-only renderer must not consume the readiness deadline")
+                .expect("read-only CDP failures must advance to another renderer")
+                .expect("the second renderer must be ready");
+            assert!(
+                result.submitted,
+                "{phase} failure must not starve a ready renderer"
+            );
+            assert_eq!(result.target_id.as_deref(), Some("ready-renderer"));
+            assert_eq!(*authorization_stages.lock().unwrap(), vec![false, true]);
+            assert_eq!(diagnostics.len(), 1);
+            assert!(diagnostics[0].starts_with("target unready-renderer:"));
+            let expressions = expressions.lock().unwrap();
+            assert_eq!(expressions.len(), if phase == "poll" { 7 } else { 6 });
+            assert_eq!(
+                expressions
+                    .iter()
+                    .filter(|expression| expression.contains("commitCodexContinuation"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_never_advances_after_postcommit_transport_or_evaluation_failure() {
+        for failure in [
+            None,
+            Some(json!({"exceptionDetails": {"text": "isolated exception"}})),
+        ] {
+            let exception = failure.is_some();
+            let (targets, port, expressions, server) =
+                codex_continuation_test_targets_with_evaluations(vec![
+                    Some(json!({"result": {"value": {"started": true}}})),
+                    Some(json!({"result": {"value": {"status": "prepared"}}})),
+                    Some(json!({"result": {"value": {"started": true}}})),
+                    failure,
+                ])
+                .await;
+            let authorization_stages = Mutex::new(Vec::new());
+            let mut diagnostics = Vec::new();
+            let result = submit_codex_continuation_to_targets(
+                targets,
+                port,
+                "start-exact-continuation",
+                "\"isolated-recovery\"",
+                &|final_commit| {
+                    authorization_stages.lock().unwrap().push(final_commit);
+                    true
+                },
+                &mut diagnostics,
+            )
+            .await;
+            server.abort();
+            let error = result.expect_err("a lost commit acknowledgement must stay uncertain");
+            assert!(error.starts_with("target unready-renderer:"), "{error}");
+            assert!(
+                error.contains(if exception {
+                    "CDP evaluation failed"
+                } else {
+                    "CDP websocket closed before Runtime.evaluate response"
+                }),
+                "{error}"
+            );
+            assert!(diagnostics.is_empty());
+            assert_eq!(*authorization_stages.lock().unwrap(), vec![false, true]);
+            assert_eq!(expressions.lock().unwrap().len(), 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_reconciles_abandoned_jobs_with_cancellation_evidence() {
+        for job in [
+            Value::Null,
+            json!({"status": "unexpected"}),
+            json!({"status": "unavailable"}),
+        ] {
+            for cancellation in [
+                None,
+                Some(json!({"cancelled": true, "mutationAttempted": false})),
+                Some(json!({"cancelled": true, "notFound": true, "mutationAttempted": false})),
+                Some(json!({"cancelled": false, "mutationAttempted": true, "submitted": false})),
+                Some(json!({"cancelled": false, "mutationAttempted": true, "submitted": true})),
+            ] {
+                let attempted = cancellation
+                    .as_ref()
+                    .and_then(|value| value["mutationAttempted"].as_bool())
+                    == Some(true);
+                let already_submitted = cancellation
+                    .as_ref()
+                    .and_then(|value| value["submitted"].as_bool())
+                    == Some(true);
+                let mut evaluations = vec![
+                    Some(json!({"result": {"value": {"started": true}}})),
+                    Some(json!({"result": {"value": job}})),
+                    cancellation.map(|value| json!({"result": {"value": value}})),
+                ];
+                if !attempted {
+                    evaluations.extend([
+                        Some(json!({"result": {"value": {"started": true}}})),
+                        Some(json!({"result": {"value": {"status": "prepared"}}})),
+                        Some(json!({"result": {"value": {"started": true}}})),
+                        Some(json!({"result": {"value": {"status": "completed", "submitted": true, "mutationAttempted": true}}})),
+                    ]);
+                }
+                let (targets, port, expressions, server) =
+                    codex_continuation_test_targets_with_evaluations(evaluations).await;
+                let authorizations = Mutex::new(Vec::new());
+                let mut diagnostics = Vec::new();
+                let result = submit_codex_continuation_to_targets(
+                    targets,
+                    port,
+                    "start-exact-continuation",
+                    "\"isolated-recovery\"",
+                    &|final_commit| {
+                        authorizations.lock().unwrap().push(final_commit);
+                        true
+                    },
+                    &mut diagnostics,
+                )
+                .await;
+                server.abort();
+                let result = result.unwrap().unwrap();
+                assert!(result.mutation_attempted);
+                assert_eq!(result.submitted, !attempted || already_submitted);
+                assert_eq!(
+                    result.target_id.as_deref(),
+                    Some(if attempted {
+                        "unready-renderer"
+                    } else {
+                        "ready-renderer"
+                    })
+                );
+                assert_eq!(diagnostics.len(), 1);
+                assert_eq!(
+                    *authorizations.lock().unwrap(),
+                    if attempted { vec![] } else { vec![false, true] }
+                );
+                assert_eq!(
+                    expressions
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|script| script.contains("cancelCodexContinuation"))
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_reused_submitting_job_stops_but_own_commit_waits_for_confirmation()
+    {
+        for inherited in [
+            json!({"status": "submitting"}),
+            json!({"status": "pending", "mutationAttempted": true}),
+        ] {
+            let (targets, port, expressions, server) =
+                codex_continuation_test_targets(vec![json!({"started": true}), inherited]).await;
+            let result = submit_codex_continuation_to_targets(
+                targets,
+                port,
+                "start-exact-continuation",
+                "\"isolated-recovery\"",
+                &|_| panic!("an inherited submission must not be authorized again"),
+                &mut Vec::new(),
+            )
+            .await;
+            server.abort();
+            let result = result.unwrap().unwrap();
+            assert!(result.mutation_attempted);
+            assert!(!result.submitted);
+            assert_eq!(result.target_id.as_deref(), Some("unready-renderer"));
+            assert_eq!(expressions.lock().unwrap().len(), 2);
+        }
+        let (targets, port, expressions, server) = codex_continuation_test_targets(vec![
+            json!({"started": true}),
+            json!({"status": "prepared"}),
+            json!({"started": true}),
+            json!({"status": "submitting", "mutationAttempted": true}),
+            json!({"status": "completed", "submitted": true, "mutationAttempted": true}),
+        ])
+        .await;
+        let authorizations = Mutex::new(Vec::new());
+        let result = submit_codex_continuation_to_targets(
+            targets,
+            port,
+            "start-exact-continuation",
+            "\"isolated-recovery\"",
+            &|final_commit| {
+                authorizations.lock().unwrap().push(final_commit);
+                true
+            },
+            &mut Vec::new(),
+        )
+        .await;
+        server.abort();
+        let result = result.unwrap().unwrap();
+        assert!(result.submitted);
+        assert!(result.mutation_attempted);
+        assert_eq!(*authorizations.lock().unwrap(), vec![false, true]);
+        assert_eq!(expressions.lock().unwrap().len(), 5);
+    }
+
+    async fn codex_continuation_test_pending_deadline(after_commit: bool) {
+        let mut evaluations = vec![Some(json!({"result": {"value": {"started": true}}}))];
+        if after_commit {
+            evaluations.extend([
+                Some(json!({"result": {"value": {"status": "prepared"}}})),
+                Some(json!({"result": {"value": {"started": true}}})),
+            ]);
+        }
+        evaluations.push(Some(json!({"repeatPending": true})));
+        if !after_commit {
+            evaluations.extend([
+                Some(json!({"result": {"value": {"started": true}}})),
+                Some(json!({"result": {"value": {"status": "prepared"}}})),
+                Some(json!({"result": {"value": {"started": true}}})),
+                Some(json!({"result": {"value": {"status": "completed", "submitted": true, "mutationAttempted": true}}})),
+            ]);
+        }
+        let (targets, port, expressions, server) =
+            codex_continuation_test_targets_with_evaluations(evaluations).await;
+        let authorizations = Mutex::new(Vec::new());
+        let mut diagnostics = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            submit_codex_continuation_to_targets(
+                targets,
+                port,
+                "start-exact-continuation",
+                "\"isolated-recovery\"",
+                &|final_commit| {
+                    authorizations.lock().unwrap().push(final_commit);
+                    true
+                },
+                &mut diagnostics,
+            ),
+        )
+        .await;
+        server.abort();
+        let result = result.expect("preparation deadline must remain bounded");
+        if after_commit {
+            assert!(result
+                .unwrap_err()
+                .contains("no second submission was attempted"));
+            assert!(diagnostics.is_empty());
+        } else {
+            let result = result
+                .unwrap()
+                .expect("next renderer must be tried after timeout");
+            assert!(result.submitted);
+            assert_eq!(result.target_id.as_deref(), Some("ready-renderer"));
+            assert_eq!(diagnostics.len(), 1);
+        }
+        assert_eq!(*authorizations.lock().unwrap(), vec![false, true]);
+        let expressions = expressions.lock().unwrap();
+        assert_eq!(
+            expressions
+                .iter()
+                .filter(|script| script.contains("cancelCodexContinuation"))
+                .count(),
+            usize::from(!after_commit)
+        );
+        assert_eq!(
+            expressions
+                .iter()
+                .filter(|script| script.contains("commitCodexContinuation"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            expressions
+                .iter()
+                .filter(|script| *script == "start-exact-continuation")
+                .count(),
+            if after_commit { 1 } else { 2 }
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_pending_preparation_is_cancelled_before_next_renderer() {
+        codex_continuation_test_pending_deadline(false).await;
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_pending_commit_never_advances_after_deadline() {
+        codex_continuation_test_pending_deadline(true).await;
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_requires_positive_refusal_or_complete_commit_acknowledgement() {
+        for (acknowledgement, completion) in [
+            (Value::Null, false),
+            (json!({}), false),
+            (json!({"started": "true"}), false),
+            (json!({"status": "completed"}), true),
+            (json!({"status": "completed", "submitted": false}), true),
+        ] {
+            let mut responses = vec![json!({"started": true}), json!({"status": "prepared"})];
+            if completion {
+                responses.push(json!({"started": true}));
+            }
+            responses.push(acknowledgement);
+            let (targets, port, expressions, server) =
+                codex_continuation_test_targets(responses).await;
+            let authorizations = Mutex::new(Vec::new());
+            let result = submit_codex_continuation_to_targets(
+                targets,
+                port,
+                "start-exact-continuation",
+                "\"isolated-recovery\"",
+                &|final_commit| {
+                    authorizations.lock().unwrap().push(final_commit);
+                    true
+                },
+                &mut Vec::new(),
+            )
+            .await;
+            server.abort();
+            let error =
+                result.expect_err("an incomplete acknowledgement cannot prove non-mutation");
+            assert!(error.contains("result is uncertain"), "{error}");
+            assert_eq!(*authorizations.lock().unwrap(), vec![false, true]);
+            assert_eq!(
+                expressions.lock().unwrap().len(),
+                if completion { 4 } else { 3 }
+            );
+        }
+        let (targets, port, expressions, server) = codex_continuation_test_targets(vec![
+            json!({"started": true}),
+            json!({"status": "prepared"}),
+            json!({"started": false, "reason": "Continuation is not prepared"}),
+        ])
+        .await;
+        let result = submit_codex_continuation_to_targets(
+            targets,
+            port,
+            "start-exact-continuation",
+            "\"isolated-recovery\"",
+            &|_| true,
+            &mut Vec::new(),
+        )
+        .await;
+        server.abort();
+        let refused = result.unwrap().unwrap();
+        assert!(!refused.submitted);
+        assert!(!refused.mutation_attempted);
+        assert_eq!(refused.target_id.as_deref(), Some("unready-renderer"));
+        assert_eq!(expressions.lock().unwrap().len(), 3);
     }
 
     #[test]

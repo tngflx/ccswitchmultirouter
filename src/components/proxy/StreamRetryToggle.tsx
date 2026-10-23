@@ -135,6 +135,9 @@ export function StreamRetryToggle({
 
       {resolvedMode === "aggressive" && (
         <div className="space-y-2 border-t border-border/50 pt-3">
+          <p className="text-xs leading-5 text-muted-foreground">
+            {t("settings.advanced.proxy.streamRetryContinuationPrerequisite")}
+          </p>
           <div className="flex items-center justify-between gap-4">
             <label
               htmlFor="stream-retry-max-attempts"

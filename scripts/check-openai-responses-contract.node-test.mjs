@@ -156,6 +156,31 @@ test("extraction retains normalized public declarations with a round-trip digest
   );
 });
 
+test("reviewed schema signature spacing is normalized without hiding type drift", async () => {
+  const snapshot = JSON.parse(await readFile(snapshotPath, "utf8"));
+  const body = snapshot.declarations
+    .map((line) => {
+      const boundary = line.indexOf(":");
+      return `${" ".repeat(Number(line.slice(0, boundary)))}- \`${line.slice(boundary + 1)}\``;
+    })
+    .join("\n");
+  const markdown = `### Body Parameters\n${body}\n### Returns\n`;
+  const baseline = extractContract(markdown);
+  const spaced = markdown.replace(
+    /^- `(\w+): ([^`]+)`/gm,
+    (_, key, signature) =>
+      `- \`${key}:   ${signature.replaceAll(" ", "  ")}   \``,
+  );
+  assert.deepEqual(compareContract(baseline, extractContract(spaced)), []);
+  assert.deepEqual(
+    compareContract(
+      baseline,
+      extractContract(spaced.replace(/(- `input: +)[^`]+`/, "$1boolean`")),
+    ),
+    ["declarations_sha256", "top_level_signatures"],
+  );
+});
+
 test("tool choices are extracted separately from declarations and mode values", () => {
   const extracted = extractContract(
     referenceMarkdown().replace(

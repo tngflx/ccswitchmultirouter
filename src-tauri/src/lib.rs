@@ -1359,15 +1359,10 @@ pub fn run() {
                         outcome.next_step = Some("openLogsOrRestoreUserBackup".to_string());
                         services::recovery_outcome::record_best_effort(outcome);
                     } else {
-                        log::info!("Live 配置已恢复");
-                        let mut outcome = services::recovery_outcome::RecoveryOutcome::for_app(
-                            "startup_crash_recovery",
-                            services::recovery_outcome::RecoveryOutcomeKind::HealthyBackupRestored,
-                            services::recovery_outcome::RecoverySeverity::Info,
-                            "all",
-                        );
-                        outcome.kept_fields = vec!["liveConfig".to_string()];
-                        services::recovery_outcome::record_best_effort(outcome);
+                        // Each app records its actual restore result. A successful
+                        // crash-recovery pass can also preserve current Live
+                        // unchanged, so it must not claim every app used a backup.
+                        log::info!("Live 配置恢复检查已完成");
                     }
                 }
 

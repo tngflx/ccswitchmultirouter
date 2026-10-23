@@ -141,7 +141,56 @@ async function createFixtureScope() {
   };
 }
 
-const windowsOnly = { skip: process.platform !== "win32", timeout: 30_000 };
+// Real CIM and PowerShell startup run several times per replacement; concurrent
+// build/test load can legitimately take longer than an individual probe timeout.
+const windowsOnly = { skip: process.platform !== "win32", timeout: 60_000 };
+
+test(
+  "a dead launch mutex keeper invalidates ownership and releases the next launcher",
+  windowsOnly,
+  async () => {
+    const { acquireDevSessionLaunchLock, withDevSessionLaunchLock } =
+      await import("./dev-session-launch.mjs");
+    const directory = await mkdtemp(
+      path.join(os.tmpdir(), "ccswitch-dev-takeover-lock-"),
+    );
+    const markerPath = path.join(directory, "dev-session.json");
+    let keeper;
+    let release;
+    try {
+      release = await acquireDevSessionLaunchLock({
+        markerPath,
+        spawnProcess: (...arguments_) => {
+          keeper = spawn(...arguments_);
+          return keeper;
+        },
+      });
+      release.assertHeld();
+      const ended = once(keeper, "close");
+      keeper.kill();
+      await ended;
+      assert.throws(() => release.assertHeld(), /ownership was lost/);
+      let nextEntered = false;
+      await withDevSessionLaunchLock({ markerPath }, (assertHeld) => {
+        assertHeld();
+        nextEntered = true;
+      });
+      assert.equal(nextEntered, true);
+    } finally {
+      if (release) await release();
+      if (keeper && keeper.exitCode === null && keeper.signalCode === null) {
+        const ended = once(keeper, "close");
+        keeper.kill();
+        await ended;
+      }
+      assert.equal(path.dirname(directory), os.tmpdir());
+      assert.ok(
+        path.basename(directory).startsWith("ccswitch-dev-takeover-lock-"),
+      );
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   "explicit dev launch replaces the owned session and stops its watcher first",
@@ -152,6 +201,10 @@ test(
     const scope = await createFixtureScope();
     try {
       const first = await scope.start();
+      // Keep a deterministic trailing-zero timestamp to prove the native
+      // handoff preserves canonical strings, not only DateTime equivalence.
+      first.session.supervisorStartedAtUtc =
+        first.session.supervisorStartedAtUtc.replace(/(\.\d{3})Z$/, "$10000Z");
       scope.publish(first);
       let second;
       await withDevSessionLaunchLock(
@@ -167,6 +220,14 @@ test(
           });
           assert.equal(prepared.previous.supervisorPid, first.child.pid);
           assert.deepEqual(prepared.restartTimesMs, []);
+          const handoff = scope.readSession();
+          assert.equal(handoff.state, "stopping");
+          assert.equal(handoff.handoffIntent, "manual_takeover");
+          assert.equal(handoff.handoffOwner.supervisorPid, first.child.pid);
+          assert.equal(
+            handoff.handoffOwner.supervisorStartedAtUtc,
+            first.session.supervisorStartedAtUtc,
+          );
           second = await scope.start();
           scope.publish(second);
         },

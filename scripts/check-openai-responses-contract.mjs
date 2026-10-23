@@ -74,7 +74,7 @@ export function extractContract(markdown) {
       .digest("hex"),
     declarations,
     top_level_signatures: Object.fromEntries(
-      top.map((match) => [match[1], match[2].replace(/\s+/g, " ")]),
+      top.map((match) => [match[1], match[2].replace(/\s+/g, " ").trim()]),
     ),
     input_types: literals(input, 6),
     tool_types: literals(tools, 4),

@@ -1,0 +1,9 @@
+{
+  "verified": false,
+  "desktopCdpVerified": false,
+  "stage": "readiness",
+  "failure": "desktop_bridge_not_ready",
+  "temporaryDurableTestThread": false,
+  "existingThreadsTouched": false,
+  "verifiedAtUtc": "2026-10-22T15:01:33.818Z"
+}

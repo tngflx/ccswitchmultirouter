@@ -579,6 +579,10 @@ pub async fn diagnose_codex_multirouter(
             ),
         ],
     ));
+    checks.push(codex_continuation_bridge_check(
+        &crate::settings::get_settings(),
+        &desktop_runtime,
+    ));
     checks.push(codex_network_proxy_diagnostic_check());
     checks.push(codex_check(
         "hosted_tool_not_called",
@@ -752,6 +756,59 @@ fn codex_check(
         detail: detail.into(),
         evidence,
     }
+}
+
+/// Report the automatic-continuation prerequisite separately from routing.
+/// Process flags establish launch configuration, never delivery confirmation.
+fn codex_continuation_bridge_check(
+    settings: &crate::settings::AppSettings,
+    runtime: &CodexDesktopRuntimeDiagnostics,
+) -> CodexDiagnosticCheck {
+    let enabled = settings.stream_recovery_budget() > 0;
+    let (status, detail) = if !enabled {
+        (
+            CodexDiagnosticStatus::Info,
+            "Automatic continue is disabled by the current stream recovery policy.",
+        )
+    } else if runtime.detection_error.is_some() {
+        (
+            CodexDiagnosticStatus::Warn,
+            "Automatic continue readiness is unknown because Codex Desktop process detection failed. Retry this diagnostic before relying on automatic continuation.",
+        )
+    } else if !runtime.running {
+        (
+            CodexDiagnosticStatus::Warn,
+            "Automatic continue is blocked: Codex Desktop is not running. Use Unlock model menu to launch Codex from CCSwitchMulti with the required connection. Delivery is confirmed only after Codex accepts a new continue turn.",
+        )
+    } else if !runtime.remote_debugging_enabled {
+        (
+            CodexDiagnosticStatus::Warn,
+            "Automatic continue is blocked: this Codex Desktop launch has no recovery connection. Fully quit Codex, then use Unlock model menu to launch it from CCSwitchMulti. The launch-with-CCSwitchMulti setting applies to future launches. A scheduled recovery is not a delivered continue.",
+        )
+    } else {
+        (
+            CodexDiagnosticStatus::Info,
+            "Codex Desktop has the required debugging launch configuration. The renderer connection and exact interrupted thread are checked when recovery runs; delivery is confirmed only after Codex accepts a new continue turn.",
+        )
+    };
+    codex_check(
+        "codex_continuation_bridge",
+        "Codex automatic continue",
+        status,
+        detail,
+        vec![
+            format!("automatic_continue_enabled={enabled}"),
+            format!("desktop_running={}", runtime.running),
+            format!(
+                "remote_debugging_enabled={}",
+                runtime.remote_debugging_enabled
+            ),
+            format!(
+                "launch_with_ccswitch={}",
+                settings.launch_codex_desktop_with_ccswitch
+            ),
+        ],
+    )
 }
 
 /// 判断 live config 是否使用当前稳定的 Codex MultiRouter provider 桶。
@@ -1969,6 +2026,97 @@ mod codex_router_log_diagnostics_tests {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
+    fn continuation_runtime_fixture() -> CodexDesktopRuntimeDiagnostics {
+        CodexDesktopRuntimeDiagnostics {
+            running: true,
+            app_server_running: true,
+            remote_debugging_enabled: false,
+            remote_debugging_port: None,
+            model_picker_patchable: false,
+            process_count: 2,
+            app_server_count: 1,
+            processes: vec![],
+            newest_app_server_started_at: None,
+            may_have_stale_model_catalog: false,
+            stale_reason: None,
+            detection_error: None,
+        }
+    }
+
+    #[test]
+    fn codex_continuation_bridge_warns_when_aggressive_recovery_cannot_connect() {
+        let settings = crate::settings::AppSettings {
+            stream_retry_mode: crate::settings::StreamRetryMode::Aggressive,
+            launch_codex_desktop_with_ccswitch: false,
+            ..Default::default()
+        };
+        let mut runtime = continuation_runtime_fixture();
+        let check = codex_continuation_bridge_check(&settings, &runtime);
+        assert_eq!(check.status, CodexDiagnosticStatus::Warn);
+        assert!(check.detail.contains("Automatic continue is blocked"));
+        assert!(check.detail.contains("Fully quit Codex"));
+        assert!(check.detail.contains("Unlock model menu"));
+        assert!(check.detail.contains("scheduled recovery"));
+        let log =
+            codex_router_log_diagnostics_from_text("codex-router.log".to_string(), true, "", None);
+        assert_eq!(codex_next_action(&[check.clone()], &log), check.detail);
+        let failure = codex_check(
+            "proxy_running",
+            "Local proxy",
+            CodexDiagnosticStatus::Fail,
+            "Proxy stopped",
+            vec![],
+        );
+        assert_eq!(
+            codex_next_action(&[check, failure], &log),
+            "先在 CC Switch 开启本地代理服务。"
+        );
+
+        runtime.running = false;
+        let check = codex_continuation_bridge_check(&settings, &runtime);
+        assert_eq!(check.status, CodexDiagnosticStatus::Warn);
+        assert!(check.detail.contains("not running"));
+    }
+
+    #[test]
+    fn codex_continuation_bridge_uses_effective_policy_and_never_claims_delivery_from_flags() {
+        let mut settings = crate::settings::AppSettings {
+            enable_stream_retry: false,
+            stream_retry_mode: crate::settings::StreamRetryMode::Safe,
+            ..Default::default()
+        };
+        let mut runtime = continuation_runtime_fixture();
+        let check = codex_continuation_bridge_check(&settings, &runtime);
+        assert_eq!(check.status, CodexDiagnosticStatus::Info);
+        assert!(check.detail.contains("disabled"));
+        assert!(check
+            .evidence
+            .contains(&"automatic_continue_enabled=false".to_string()));
+
+        settings.enable_stream_retry = true;
+        settings.stream_retry_mode = crate::settings::StreamRetryMode::Aggressive;
+        runtime.remote_debugging_enabled = true;
+        runtime.remote_debugging_port = Some(9229);
+        let check = codex_continuation_bridge_check(&settings, &runtime);
+        assert_eq!(check.status, CodexDiagnosticStatus::Info);
+        assert!(check.detail.contains("launch configuration"));
+        assert!(check.detail.contains("only after Codex accepts"));
+    }
+
+    #[test]
+    fn codex_continuation_bridge_reports_unknown_detection_without_exposing_raw_error() {
+        let settings = crate::settings::AppSettings {
+            stream_retry_mode: crate::settings::StreamRetryMode::Aggressive,
+            ..Default::default()
+        };
+        let mut runtime = continuation_runtime_fixture();
+        runtime.detection_error = Some("[redacted process error]".to_string());
+        let check = codex_continuation_bridge_check(&settings, &runtime);
+        assert_eq!(check.status, CodexDiagnosticStatus::Warn);
+        assert!(check.detail.contains("readiness is unknown"));
+        assert!(!format!("{check:?}").contains("redacted process error"));
+    }
+
     #[test]
     fn disabled_websocket_transport_does_not_report_probe_failure() {
         let (status, detail) =
@@ -2660,6 +2808,11 @@ fn codex_next_action(
             }
             _ => check.detail.clone(),
         };
+    }
+    if let Some(check) = checks.iter().find(|check| {
+        check.id == "codex_continuation_bridge" && check.status == CodexDiagnosticStatus::Warn
+    }) {
+        return check.detail.clone();
     }
     if !router_log.has_recent_request {
         return "配置看起来可用；请在 Codex 发起一次请求，再回到这里重新运行 Debug 检查。"

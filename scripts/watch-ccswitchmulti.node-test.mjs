@@ -491,7 +491,34 @@ test("process stop and launch refuse lost native lock ownership", async (t) => {
     },
   });
   await assert.rejects(runtime.startProduct(), /lock lost/);
+  await assert.rejects(runtime.startDevSession({}), /lock lost/);
   assert.equal(nativeCalled, false);
+});
+
+test("runtime production launch retains its installed-app output policy without creating a development log", async (t) => {
+  const f = fixture(t);
+  let launch;
+  const runtime = createGuardianRuntime(f.plan, {
+    spawnProcess(executable, args, options) {
+      launch = { executable, args, options };
+      const child = new EventEmitter();
+      child.pid = 8080;
+      child.unref = () => {};
+      queueMicrotask(() => child.emit("spawn"));
+      return child;
+    },
+  });
+  assert.equal(await runtime.startProduct(), 8080);
+  assert.equal(launch.executable, f.plan.InstalledExecutable);
+  assert.deepEqual(launch.args, []);
+  assert.equal(launch.options.stdio, "ignore");
+  assert.equal(launch.options.detached, true);
+  assert.equal(launch.options.windowsHide, true);
+  assert.throws(
+    () =>
+      readFileSync(path.join(f.plan.ConfigPath, "logs", "dev-recovery.log")),
+    { code: "ENOENT" },
+  );
 });
 
 test("runtime product inspection combines exact installed identity and healthy response", async (t) => {
@@ -566,6 +593,17 @@ test("runtime development launcher uses Node argv without a shell or PS1 and fil
     process.env.UNRELATED_SECRET,
   );
   assert.equal(launch.options.windowsHide, true);
+  assert.equal(launch.options.detached, true);
+  assert.equal(launch.options.stdio[0], "ignore");
+  assert.equal(typeof launch.options.stdio[1], "number");
+  assert.equal(launch.options.stdio[1], launch.options.stdio[2]);
+  assert.match(
+    readFileSync(
+      path.join(f.plan.ConfigPath, "logs", "dev-recovery.log"),
+      "utf8",
+    ),
+    /"event":"dev-recovery-launch"/,
+  );
 });
 
 test("runner survives transient iteration failures and releases native lock", async (t) => {

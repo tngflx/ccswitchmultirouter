@@ -1,3 +1,189 @@
+## 2026-10-23 - Preserve development recovery output after launcher exit
+
+Detached watchdog and replacement launches discarded stdout and stderr, so a
+full development supervisor recovery silently rebuilt the app. Do not solve
+this by inheriting Windows TTY handles or removing detachment: native installed
+Node/libuv probes reproduced `EBADF` for inherited detached console writes and
+job termination of a non-detached child after its parent exited.
+
+The canonical JavaScript recovery output helper now opens one append handle
+for both streams at `dev-recovery.log` beside the session marker, closes the
+parent's descriptor after spawn, and retains detached survival. The watchdog,
+replacement supervisor, and external development guardian all use it. The
+living supervisor prints the path and PowerShell 7 follow command; worker
+restarts under that living supervisor retain its console. Full supervisor
+recovery does not promise attachment to an exited console. Include the helper
+in the installed guardian's runtime file set. Production launch behavior stays
+under its existing executable policy.
+
+Regression checks passed 195 development recovery cases and 130 lifecycle
+cases, including native output after launcher exit, the default production
+handoff adapter, descriptor cleanup, preserved args/environment, and no
+development output changes in production. The old ignored-output adapter
+failed the native regression. TypeScript, formatting, syntax, and diff checks
+passed. No live application activation occurred for this change; a fresh
+`pnpm dev` must load the updated launcher. See the
+[console investigation](../audits/2026-10-23-development-recovery-console.md).
+
+## 2026-10-22 - Verify automatic continuation against installed Codex
+
+The scoped recovery log contained 407 schedules and 12 readiness deadline
+failures without a confirmed submission. The active verified Codex Desktop
+shell had no startup debugging port; scheduling cannot retrofit that flag.
+Aggressive recovery now explains this prerequisite in existing settings and
+diagnostics, without treating a launch flag as proof of delivery or silently
+changing the launch setting.
+
+The continuation investigation also reproduced asynchronous client-discovery
+readiness, renderer starvation, stale injected runtime calls, and incomplete
+preparation lifecycle boundaries. Keep preparation read-only and bounded;
+cancel abandoned jobs before trying another usable renderer. Preserve semantic
+user stops and all submission uncertainty, including an existing submitting
+job. A newly authorized submission must still wait for its acknowledgement.
+All bridge calls use the current embedded runtime fingerprint. Known CDP
+failures produce finite diagnostic categories, never raw exception contents.
+
+Use one canonical mutation-evidence predicate across start, cancel, commit,
+and job reads, including jobs retained after runtime reinjection. Cancellation
+must preserve uncertain evidence and report submission only for boolean
+`true`. Missing or malformed commit/completion acknowledgements remain
+uncertain; only explicit refusal or explicit non-mutating completion can
+release the committing reservation. An inherited submitting job must not be
+resubmitted, while a submission started by this invocation keeps polling for
+its acknowledgement. Every possible-commit exit prevents renderer fallback.
+
+Final source verification passed 69 renderer continuation tests, 5,013 Rust
+library tests with zero failures and 10 existing ignored, and the exact
+required 156-test multirouter scope. The exact production helper harness passed
+18 cases after reproducing 14 failures before the unified fix. Rust formatting
+and strict Clippy passed. Native websocket coverage includes bounded
+preparation abandonment, cancellation, malformed acknowledgements, submission
+uncertainty, and the complete Windows close handshake without weakening its
+authorization or no-fallback assertions.
+
+The new `pnpm verify:codex-continuation --executable <installed codex path>`
+verifier uses the real installed app-server and production continuation source
+with isolated configuration and a local fixture provider. HTTP overload, SSE
+overload, and premature stream closure each produced one accepted literal
+`continue` and a completed next turn; daily quota produced no submission.
+Duplicate recovery tokens did not replay. The verifier uses a client shim;
+its receipt explicitly does not claim Desktop CDP delivery. Do not replace
+the renderer-owned client with a separate app-server that cannot observe the
+user's canonical stop/action ledger.
+
+The existing installed protocol receipt and its recorded hashes remain
+unchanged. Active Desktop delivery is still unverified; the Desktop verifier
+has no completed live result recorded here.
+
+Evidence and the remaining managed Desktop relaunch boundary are recorded in
+[the continuation delivery audit](../audits/2026-10-22-continuation-delivery.md)
+and its linked sanitized runtime receipt. Source tests and installed protocol
+acceptance must not be presented as verified delivery through the currently
+open Desktop process.
+
+## 2026-10-22 - Distinguish planned development exits from crash recovery
+
+The recurring unclean-exit notification came from real missing planned-stop
+evidence during manual development replacement. Generation 57 restored Codex
+successfully with no lost fields; the warning described missing exit evidence,
+not a failed restore. Development replacement now correlates exact retained
+Windows process termination with the canonical run marker and exit journal.
+
+Source review separately reproduced stale backups overwriting newer valid
+unowned Claude/Codex/Gemini settings during crash recovery. Recovery now preserves
+valid current unowned Live under the existing per-app lock; explicit restore
+still uses its requested backup. Gemini preservation strictly parses one raw
+snapshot; Grok uses canonical official/custom validation. Missing, malformed,
+or taken-over configurations keep the restore path, and failures retain backups.
+
+The first post-build live proof still failed: generation 59 was unclean with
+no planned receipt. A native regression then reproduced child-first teardown
+making an app exit before its planned native termination was established.
+Cleanup now verifies app termination first, then cleans retained child handles.
+A separate worker regression catches a failed disconnect-time identity probe;
+verified startup identity avoids that dependency. Native integration also
+reproduced PowerShell rewriting timestamp strings. The new native roundtrips
+preserve strings, while shared exact 100 ns parsing compares process identities.
+Do not replace those guards with millisecond or raw timestamp-string equality.
+
+Final Rust verification passed twice with 4,997 library tests, 10 existing
+ignored, plus 156 multirouter tests and strict Clippy. Four continuation-ledger
+restore tests now use the existing serial test-home guard after broad runs
+exposed environment races; production scope checks remain intact.
+
+The second real restart proof also failed: terminating a retained Windows
+supervisor killed its worker/app before disconnect callbacks could run. A
+disposable full topology reproduced that boundary under both Node and pnpm.
+Planned cleanup and receipt commit must precede supervisor termination, after
+the old worker acknowledges monitor retirement over existing IPC. The old
+supervisor must stay parked and preserve the canonical handoff during cleanup.
+The final development gate passed 188/188 with unchanged deadlines and native
+files serialized. Two consecutive actual updated-worker takeovers then passed
+in generations 64 and 65: exact planned receipts, informational planned startup,
+zero current warning/crash outcomes, and no startup crash-backup recovery. At
+20:52:42 Singapore time the final four native process identities, full app-marker
+FILETIME, one anchored watchdog, and app-owned loopback port 15721 still matched.
+Evidence is in
+[the sanitized runtime receipt](../audits/2026-10-22-planned-exit-recovery-runtime.json)
+and
+[the planned-exit recovery audit](../audits/2026-10-22-planned-exit-recovery.md).
+
+## 2026-10-22 - Replace manual development sessions and finish retry audit
+
+The user reported that `pnpm dev` refused an existing owned supervisor. The
+session-launch helper was present but not wired into the primary entry point.
+Manual launches now serialize replacement, validate retained Windows identities,
+stop the old watcher before its supervisor, clean old workers/listeners, and
+publish the replacement's first worker before releasing startup ownership.
+Manual commands reset the restart budget; internal automatic recovery preserves
+history and cannot preempt a healthy, newer, or intentionally stopping session.
+
+Regression review caught reserved argument forms, lost legacy history,
+incomplete child observations, serialization loss, and stopped-session recovery.
+The final isolated development suite passed 164 tests, including real Windows
+fixture takeovers and failed replacement recovery; all 213 Pester compatibility
+tests also passed. Fixtures do not prove a live app crash or provider failover.
+
+The stream audit reproduced renderer refusal of interrupted network errors,
+backend omission of HTTP 408/425, and renderer status-only HTTP gaps. Backend
+reconnect and continuation now share transient HTTP status classification; the
+renderer accepts the same statuses with numeric-boundary guards. Its 59 focused
+tests exercise preparation and authorized commit with exactly one mocked
+`turn/start`. Readiness deadlines now retain a static redacted blocker, including
+when a later preparation hangs. Quota/authentication/cancellation and ambiguous
+submission protections remain.
+
+The official-contract CLI now trims signature whitespace consistently with Rust.
+Its 13 tests and the 47 Request Health panel tests passed. A read-only live check
+correctly detected a real optional cache-breakpoint TTL addition in the official
+declarations. The baseline remains pending review, and runtime inspection
+preserves that additive nested field. Official drift checks are explicit UI/CLI
+actions, not automatic schema polling.
+
+The scoped logs prove scheduling followed by a readiness deadline, with no
+confirmed submitted `continue` in the inspected sample. The background provider
+monitor was unavailable; do not turn source tests or a planned dev reload into
+claims of live continuation delivery. See
+[the takeover and retry audit](../audits/2026-10-22-dev-takeover-and-retry-audit.md)
+and [the scoped log review](../audits/2026-10-22-ccswitch-log-review.md).
+
+Final source gates passed: 4,981 Rust library tests (10 existing ignored), 156
+multirouter, strict Clippy, TypeScript, formatting, and the gated renderer build
+with 476 catalog tests. The broad frontend run executed 2,639 cases with three
+timeouts. Single-worker reruns passed 160/161 affected-file tests, but the
+unchanged Sub-Agent "removes description alone" case still exceeded five
+seconds, including an exact-name rerun. Record that nonzero full-suite boundary;
+do not call the full frontend run green or weaken the test to do so.
+
+Two real manual `pnpm dev` takeovers then passed. The first rebuilt the debug
+binary at 05:17:25 UTC; the second left supervisor 43604, worker 58508, watchdog
+33368, and app 42436. At 05:21:11 UTC all four native creation identities still
+matched, app-marker FILETIME and ancestry were exact, one watchdog remained,
+the app owned loopback port 15721, and the detached observer had exited.
+[The sanitized runtime receipt](../audits/2026-10-22-dev-takeover-runtime.json)
+records both manual command ancestries and fresh restart histories. Subsequent
+scoped logs still show scheduling without a confirmed live `continue` submission.
+
 ## 2026-10-21 - Apply permanent plaintext errors at every retry boundary
 
 When asked to confirm crash and stream recovery, source inspection found a

@@ -80,7 +80,7 @@ pub fn record_startup_report() -> StartupRecoveryReport {
 
     if let Some(report) = previous.as_ref() {
         append_event(
-            "abnormal_exit_detected",
+            startup_event_kind(classification),
             "previous run marker remained at startup",
             None,
             Some(json!({
@@ -261,6 +261,7 @@ fn classify_previous_run(
             clean_exit = true;
             planned_restart |= is_planned_exit_reason(&event.reason);
         }
+        planned_restart |= same_scope && planned_restart_matches_marker(event, marker);
     }
     if confirmed_crash {
         PreviousRunClassification::ConfirmedCrash
@@ -271,6 +272,46 @@ fn classify_previous_run(
     } else {
         PreviousRunClassification::UncleanExit
     }
+}
+
+fn startup_event_kind(classification: PreviousRunClassification) -> &'static str {
+    if classification.allows_crash_recovery() {
+        "abnormal_exit_detected"
+    } else {
+        "previous_run_classified"
+    }
+}
+
+fn planned_restart_matches_marker(event: &ExitEvent, marker: &RunMarker) -> bool {
+    if event.kind != "planned_restart"
+        || !matches!(
+            event.reason.as_str(),
+            "development_manual_restart"
+                | "development_backend_reload"
+                | "development_requested_exit"
+        )
+    {
+        return false;
+    }
+    let Some(details) = event.details.as_ref() else {
+        return false;
+    };
+    let started_at_ticks = details["processStartedAtTicks"]
+        .as_str()
+        .and_then(|ticks| ticks.parse::<u64>().ok());
+    let identity = details["executablePath"]
+        .as_str()
+        .zip(started_at_ticks)
+        .map(|(path, ticks)| crate::process_identity::ProcessIdentity {
+            pid: event.pid,
+            executable_path: path.to_string(),
+            started_at_ticks: ticks,
+        });
+    details["startedAt"].as_str() == Some(marker.started_at.as_str())
+        && details["configScope"].as_str() == marker.config_scope.as_deref()
+        && identity
+            .as_ref()
+            .is_some_and(|identity| marker_matches_process(marker, identity))
 }
 
 fn is_planned_exit_reason(reason: &str) -> bool {
@@ -625,5 +666,138 @@ mod tests {
             ..owned
         };
         assert!(!marker_matches_process(&different_instance, &current));
+    }
+
+    fn planned_restart_event(marker: &RunMarker) -> ExitEvent {
+        ExitEvent {
+            timestamp: "2026-08-25 10:01:00.000".to_string(),
+            kind: "planned_restart".to_string(),
+            reason: "development_manual_restart".to_string(),
+            exit_code: Some(0),
+            version: "test".to_string(),
+            os: "test".to_string(),
+            arch: "test".to_string(),
+            pid: marker.pid,
+            details: Some(json!({
+                "executablePath": marker.executable_path,
+                "processStartedAtTicks": marker.process_started_at_ticks.unwrap().to_string(),
+                "configScope": marker.config_scope,
+                "startedAt": marker.started_at,
+            })),
+        }
+    }
+
+    #[test]
+    fn completed_development_handoff_is_planned_and_does_not_restore_crash_backups() {
+        let marker = marker_with_identity();
+        let scope = marker.config_scope.as_deref().unwrap();
+        for reason in [
+            "development_manual_restart",
+            "development_backend_reload",
+            "development_requested_exit",
+        ] {
+            let mut event = planned_restart_event(&marker);
+            event.reason = reason.into();
+            let classification = classify_previous_run(Some(&marker), &[event], false, None, scope);
+            assert_eq!(
+                classification,
+                PreviousRunClassification::PlannedRestartOrUpdate
+            );
+            assert!(!classification.allows_crash_recovery());
+            assert_eq!(
+                startup_event_kind(classification),
+                "previous_run_classified"
+            );
+        }
+    }
+
+    #[test]
+    fn native_development_exit_journal_fixture_preserves_exact_filetime() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures/devPlannedExit.json"
+        )))
+        .unwrap();
+        let marker: RunMarker = serde_json::from_value(fixture["marker"].clone()).unwrap();
+        let event: ExitEvent = serde_json::from_value(fixture["event"].clone()).unwrap();
+        assert_eq!(marker.process_started_at_ticks, Some(134371199143854692));
+        assert_eq!(
+            classify_previous_run(Some(&marker), &[event], false, None, "fixture-scope"),
+            PreviousRunClassification::PlannedRestartOrUpdate
+        );
+        let mut event: ExitEvent = serde_json::from_value(fixture["event"].clone()).unwrap();
+        event.details.as_mut().unwrap()["processStartedAtTicks"] = json!("134371199143854693");
+        assert_eq!(
+            classify_previous_run(Some(&marker), &[event], false, None, "fixture-scope"),
+            PreviousRunClassification::UncleanExit
+        );
+    }
+
+    #[test]
+    fn planned_handoff_requires_exact_marker_and_current_configuration_scope() {
+        let marker = marker_with_identity();
+        let scope = marker.config_scope.as_deref().unwrap();
+        for (field, value) in [
+            ("processStartedAtTicks", json!("101")),
+            ("processStartedAtTicks", json!(100)),
+            ("executablePath", json!(r"C:\Other\cc-switch.exe")),
+            ("configScope", json!("another-config")),
+            ("startedAt", json!("2026-08-25 09:00:00.000")),
+        ] {
+            let mut event = planned_restart_event(&marker);
+            event.details.as_mut().unwrap()[field] = value;
+            assert_eq!(
+                classify_previous_run(Some(&marker), &[event], false, None, scope),
+                PreviousRunClassification::UncleanExit
+            );
+        }
+        let mut event = planned_restart_event(&marker);
+        event.pid += 1;
+        assert_eq!(
+            classify_previous_run(Some(&marker), &[event], false, None, scope),
+            PreviousRunClassification::UncleanExit
+        );
+        assert_eq!(
+            classify_previous_run(
+                Some(&marker),
+                &[planned_restart_event(&marker)],
+                false,
+                None,
+                "foreign-scope"
+            ),
+            PreviousRunClassification::UncleanExit
+        );
+    }
+
+    #[test]
+    fn crash_evidence_wins_over_a_completed_planned_handoff() {
+        let marker = marker_with_identity();
+        let scope = marker.config_scope.as_deref().unwrap();
+        let planned = planned_restart_event(&marker);
+        let mut panic = planned_restart_event(&marker);
+        panic.kind = "panic".into();
+        panic.timestamp = "2026-08-25 10:00:59.000".into();
+        assert_eq!(
+            classify_previous_run(
+                Some(&marker),
+                &[planned_restart_event(&marker), panic],
+                false,
+                None,
+                scope
+            ),
+            PreviousRunClassification::ConfirmedCrash
+        );
+        assert_eq!(
+            classify_previous_run(Some(&marker), &[planned], true, None, scope),
+            PreviousRunClassification::ConfirmedCrash
+        );
+        assert_eq!(
+            startup_event_kind(PreviousRunClassification::ConfirmedCrash),
+            "abnormal_exit_detected"
+        );
+        assert_eq!(
+            startup_event_kind(PreviousRunClassification::UncleanExit),
+            "abnormal_exit_detected"
+        );
     }
 }

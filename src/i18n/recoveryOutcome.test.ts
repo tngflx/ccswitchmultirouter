@@ -24,8 +24,23 @@ const nextSteps = [
   "openLogsOrRetryTakeover",
   "retryingTakeoverRestore",
 ] as const;
+const uncleanExitTitles = {
+  en: "The previous run ended without a clean shutdown record",
+  ja: "前回の実行には正常終了の記録がありません",
+  zh: "上次运行结束时未留下正常退出记录",
+  "zh-TW": "上次執行結束時未留下正常退出紀錄",
+} as const;
 
 describe("recovery outcome translations", () => {
+  it.each(Object.entries(locales))(
+    "%s reports the missing clean-shutdown record without implying configuration recovery failed",
+    (locale, messages) => {
+      expect(messages.notifications.recovery.kind.uncleanExit).toBe(
+        uncleanExitTitles[locale as keyof typeof uncleanExitTitles],
+      );
+    },
+  );
+
   it.each(Object.entries(locales))(
     "%s covers every user-visible outcome and action",
     (_locale, messages) => {

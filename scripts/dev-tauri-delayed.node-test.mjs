@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { createDevReconnectTracker } from "./dev-watchdog-policy.mjs";
+import { DEV_RECOVERY_FLAG } from "./dev-session-launch.mjs";
 
 import {
   assertNormalCargoTargetDirectory,
@@ -16,11 +17,14 @@ import {
   createExpectedExitRegistry,
   createQuietPeriodScheduler,
   createDevWorkerRecovery,
+  createDevSupervisorHandoff,
   devAutoRestartDecision,
   devSessionEnvironment,
   devWorkerCommand,
   devWorkerRestartDecision,
   handoffDetachedDevSupervisor,
+  handleDevWorkerDisconnect,
+  isManualTakeoverHandoff,
   isDevCrashMarker,
   isPathInside,
   isTauriAppStartedOutput,
@@ -29,6 +33,8 @@ import {
   parseDelayMs,
   parseNoRebuild,
   parsePort,
+  preserveManualTakeoverHandoff,
+  retireDevWorkerForManualHandoff,
   parseWindowsJsonQueryOutput,
   readDevRestartTimesMs,
   readDevRunMarkerPresent,
@@ -49,6 +55,7 @@ import {
   superviseDevSessions,
   waitForChildExit,
   waitForDevSupervisorPublication,
+  waitForManualDevHandoffReady,
   waitForWindowsListenersReleased,
   waitForWindowsProcessExit,
   windowsDevDescendants,
@@ -2885,6 +2892,386 @@ function replacementDevSession() {
   };
 }
 
+function manualTakeoverFixture() {
+  const workerIdentity = {
+    Name: "node.exe",
+    ProcessId: 201,
+    ParentProcessId: 200,
+    ExecutablePath: path.resolve("runtime", "node.exe"),
+    CreationDate: "2026-10-14T02:00:02.1234567Z",
+    CommandLine: 'node "scripts/dev-tauri-delayed.mjs" --ccsm-dev-worker',
+  };
+  const session = {
+    ...replacementDevSession(),
+    state: "stopping",
+    workerPid: 201,
+    workerIdentity,
+    handoffIntent: "manual_takeover",
+    handoffOwner: {
+      supervisorPid: 200,
+      supervisorStartedAtUtc: "2026-10-14T02:00:01.000Z",
+      workerPid: 201,
+      workerIdentity,
+    },
+  };
+  const context = { workerPid: 201, supervisorPid: 200, workerIdentity };
+  return { session, context };
+}
+
+test("manual takeover disconnect retires monitors and leaves app cleanup to the new owner", async () => {
+  const { session, context } = manualTakeoverFixture();
+  const actions = [];
+  assert.equal(isManualTakeoverHandoff(session, context), true);
+  assert.equal(
+    await handleDevWorkerDisconnect({
+      ...context,
+      isStopping: () => false,
+      readSession: () => session,
+      queryWorkerIdentity: () => context.workerIdentity,
+      retireMonitors: () => actions.push("retire"),
+      shutdown: (code) => actions.push(["shutdown", code]),
+    }),
+    "handoff",
+  );
+  assert.deepEqual(actions, ["retire"]);
+});
+
+test("live-owner handoff persists readiness only after the exact current worker retires monitors", async () => {
+  const { session: original, context } = manualTakeoverFixture();
+  let session = original;
+  let retired = false;
+  const events = [];
+  const child = {
+    pid: context.workerPid,
+    connected: true,
+    send: (message) => events.push(message.type),
+  };
+  const coordinator = createDevSupervisorHandoff({
+    getWorker: () => child,
+    getContext: () => ({
+      ...context,
+      supervisorStartedAtUtc: original.supervisorStartedAtUtc,
+    }),
+    readSession: () => session,
+    persistSession: (value) => {
+      session = value;
+      events.push("readiness-persisted");
+    },
+    onRequested: () => events.push("supervisor-parked"),
+  });
+  assert.equal(coordinator.request(), true);
+  assert.equal(session.handoffPhase, undefined);
+  assert.equal(
+    coordinator.acknowledge(
+      { ...child },
+      { type: "dev-handoff-ready", workerPid: child.pid },
+    ),
+    false,
+  );
+  assert.equal(
+    retireDevWorkerForManualHandoff({
+      readSession: () => session,
+      context,
+      isRetired: () => retired,
+      retireMonitors: () => {
+        retired = true;
+        events.push("monitors-retired");
+      },
+      acknowledge: (message) =>
+        assert.equal(coordinator.acknowledge(child, message), true),
+    }),
+    true,
+  );
+  assert.equal(session.handoffPhase, "worker_ready");
+  assert.ok(
+    events.indexOf("monitors-retired") < events.indexOf("readiness-persisted"),
+  );
+  assert.equal(
+    await waitForManualDevHandoffReady({
+      expected: session,
+      readSession: () => session,
+      timeoutMs: 0,
+    }),
+    session,
+  );
+  assert.equal(
+    preserveManualTakeoverHandoff({ ...session, state: "running" }, session)
+      .handoffPhase,
+    "worker_ready",
+  );
+});
+
+test("ordinary stop and mismatched worker cannot publish or consume live handoff readiness", async () => {
+  const { session, context } = manualTakeoverFixture();
+  for (const candidate of [
+    { ...session, handoffIntent: undefined },
+    { ...session, state: "running" },
+    {
+      ...session,
+      workerIdentity: {
+        ...context.workerIdentity,
+        CreationDate: "2026-10-14T02:00:02.1234568Z",
+      },
+    },
+  ]) {
+    assert.equal(
+      retireDevWorkerForManualHandoff({
+        readSession: () => candidate,
+        context,
+        isRetired: () => false,
+        retireMonitors: () =>
+          assert.fail("unverified handoff cannot retire monitors"),
+        acknowledge: () =>
+          assert.fail("unverified handoff cannot acknowledge readiness"),
+      }),
+      false,
+    );
+    await assert.rejects(
+      waitForManualDevHandoffReady({
+        expected: session,
+        readSession: () => ({ ...candidate, handoffPhase: "worker_ready" }),
+        timeoutMs: 0,
+      }),
+      /did not acknowledge/,
+    );
+  }
+});
+
+test("handoff readiness republishes a lost intent only for its exact still-running owner", async () => {
+  const { session } = manualTakeoverFixture();
+  let recorded = { ...session, state: "running", handoffIntent: undefined };
+  let clock = 0;
+  let refreshes = 0;
+  const ready = await waitForManualDevHandoffReady({
+    expected: session,
+    readSession: () => recorded,
+    refreshHandoff: async () => {
+      refreshes++;
+      recorded = { ...session, handoffPhase: "worker_ready" };
+    },
+    now: () => clock,
+    wait: async (ms) => {
+      clock += ms;
+    },
+  });
+  assert.equal(ready.handoffPhase, "worker_ready");
+  assert.equal(refreshes, 1);
+  for (const candidate of [
+    { ...session, handoffIntent: undefined },
+    { ...session, state: "running", supervisorPid: session.supervisorPid + 1 },
+  ]) {
+    clock = 0;
+    await assert.rejects(
+      waitForManualDevHandoffReady({
+        expected: session,
+        readSession: () => candidate,
+        timeoutMs: 1_500,
+        refreshHandoff: () =>
+          assert.fail("ordinary stopping or new owner cannot be republished"),
+        now: () => clock,
+        wait: async (ms) => {
+          clock += ms;
+        },
+      }),
+      /did not acknowledge/,
+    );
+  }
+});
+
+test("disconnect uses verified startup identity when CIM is overloaded", async () => {
+  const { session, context } = manualTakeoverFixture();
+  const actions = [];
+  const result = await handleDevWorkerDisconnect({
+    ...context,
+    verifiedWorkerIdentity: context.workerIdentity,
+    isStopping: () => false,
+    readSession: () => session,
+    queryWorkerIdentity: () => {
+      throw new Error("simulated overloaded CIM query");
+    },
+    retireMonitors: () => actions.push("retire"),
+    shutdown: (code) => actions.push(["shutdown", code]),
+    timeoutMs: 0,
+  });
+  assert.equal(result, "handoff");
+  assert.deepEqual(actions, ["retire"]);
+});
+
+test("manual handoff compares creation instants at exact 100ns precision across JSON date spellings", () => {
+  const { session, context } = manualTakeoverFixture();
+  const observed = {
+    ...context.workerIdentity,
+    CreationDate: "2026-10-14T10:00:02.1234560+08:00",
+  };
+  const recorded = {
+    ...context.workerIdentity,
+    CreationDate: "2026-10-14T02:00:02.123456Z",
+  };
+  const candidate = {
+    ...session,
+    workerIdentity: recorded,
+    handoffOwner: { ...session.handoffOwner, workerIdentity: recorded },
+  };
+  assert.equal(
+    isManualTakeoverHandoff(candidate, {
+      ...context,
+      workerIdentity: observed,
+    }),
+    true,
+  );
+  assert.equal(
+    isManualTakeoverHandoff(candidate, {
+      ...context,
+      workerIdentity: {
+        ...observed,
+        CreationDate: "2026-10-14T10:00:02.1234561+08:00",
+      },
+    }),
+    false,
+  );
+});
+
+test("ordinary stop, parent crash, reused identity, and malformed handoff keep unplanned cleanup", async () => {
+  const { session, context } = manualTakeoverFixture();
+  const candidates = [
+    { ...session, state: "running" },
+    { ...session, handoffIntent: undefined },
+    { ...session, handoffIntent: "ordinary_stop" },
+    { ...session, handoffOwner: undefined },
+    { ...session, workerPid: 999 },
+    { ...session, supervisorPid: 999 },
+    {
+      ...session,
+      handoffOwner: {
+        ...session.handoffOwner,
+        supervisorStartedAtUtc: "2026-10-14T02:00:00.000Z",
+      },
+    },
+    {
+      ...session,
+      workerIdentity: {
+        ...context.workerIdentity,
+        CreationDate: "2026-10-14T02:00:02.1234568Z",
+      },
+    },
+    {
+      ...session,
+      workerIdentity: { ...context.workerIdentity, ParentProcessId: 999 },
+    },
+    {
+      ...session,
+      workerIdentity: {
+        ...context.workerIdentity,
+        CommandLine: "foreign worker",
+      },
+    },
+  ];
+  for (const candidate of candidates) {
+    const actions = [];
+    assert.equal(isManualTakeoverHandoff(candidate, context), false);
+    assert.equal(
+      await handleDevWorkerDisconnect({
+        ...context,
+        isStopping: () => false,
+        readSession: () => candidate,
+        queryWorkerIdentity: () => context.workerIdentity,
+        retireMonitors: () => actions.push("retire"),
+        shutdown: (code) => actions.push(["shutdown", code]),
+        timeoutMs: 0,
+      }),
+      "shutdown",
+    );
+    assert.deepEqual(actions, [["shutdown", 1]]);
+  }
+});
+
+test("disconnect waits for the final takeover publication after an old queued write", async () => {
+  const { session, context } = manualTakeoverFixture();
+  let recorded = { ...session, state: "running", handoffIntent: undefined };
+  let nowMs = 0;
+  let queries = 0;
+  const actions = [];
+  const result = await handleDevWorkerDisconnect({
+    ...context,
+    isStopping: () => false,
+    readSession: () => recorded,
+    queryWorkerIdentity: () => {
+      queries++;
+      return context.workerIdentity;
+    },
+    retireMonitors: () => actions.push("retire"),
+    shutdown: (code) => actions.push(["shutdown", code]),
+    now: () => nowMs,
+    wait: async (milliseconds) => {
+      nowMs += milliseconds;
+      if (nowMs >= 150) recorded = session;
+    },
+  });
+  assert.equal(result, "handoff");
+  assert.equal(nowMs, 150);
+  assert.equal(queries, 1);
+  assert.deepEqual(actions, ["retire"]);
+});
+
+test("ordinary parent crash retries marker observation only until its bounded deadline", async () => {
+  const { session, context } = manualTakeoverFixture();
+  let nowMs = 0;
+  let reads = 0;
+  const actions = [];
+  const result = await handleDevWorkerDisconnect({
+    ...context,
+    isStopping: () => false,
+    readSession: () => {
+      reads++;
+      return { ...session, handoffIntent: undefined };
+    },
+    queryWorkerIdentity: () => context.workerIdentity,
+    retireMonitors: () => actions.push("retire"),
+    shutdown: (code) => actions.push(["shutdown", code]),
+    timeoutMs: 150,
+    now: () => nowMs,
+    wait: async (milliseconds) => {
+      nowMs += milliseconds;
+    },
+  });
+  assert.equal(result, "shutdown");
+  assert.equal(nowMs, 150);
+  assert.equal(reads, 4);
+  assert.deepEqual(actions, [["shutdown", 1]]);
+});
+
+test("queued old supervisor publications preserve only their exact manual takeover", () => {
+  const { session } = manualTakeoverFixture();
+  const running = {
+    ...session,
+    state: "running",
+    roots: [{ role: "tauri", pid: 202 }],
+  };
+  const merged = preserveManualTakeoverHandoff(running, session);
+  assert.equal(merged.state, "stopping");
+  assert.equal(merged.handoffIntent, "manual_takeover");
+  assert.deepEqual(merged.roots, running.roots);
+  assert.deepEqual(merged.handoffOwner, session.handoffOwner);
+  for (const current of [running, { ...running, state: "stopping" }]) {
+    for (const persisted of [
+      undefined,
+      { ...session, handoffIntent: undefined },
+      { ...session, supervisorStartedAtUtc: "2026-10-14T02:00:00.000Z" },
+      { ...session, repoRoot: path.resolve("foreign") },
+    ]) {
+      const ordinary = preserveManualTakeoverHandoff(current, persisted);
+      assert.equal(ordinary.state, current.state);
+      assert.equal(ordinary.handoffIntent, undefined);
+      assert.equal(ordinary.handoffOwner, undefined);
+    }
+  }
+  const ordinaryStop = preserveManualTakeoverHandoff(
+    { ...running, state: "stopping" },
+    session,
+  );
+  assert.equal(ordinaryStop.handoffIntent, undefined);
+});
+
 test("detached watchdog relaunches the pnpm dev entry point after supervisor death", async () => {
   const session = {
     ...replacementDevSession(),
@@ -2929,10 +3316,28 @@ test("detached watchdog relaunches the pnpm dev entry point after supervisor dea
   assert.deepEqual(persisted[0].restartTimesMs, [1_000]);
   assert.equal(launches.length, 1);
   assert.equal(launches[0].executable, process.execPath);
-  assert.deepEqual(launches[0].args, [session.scriptPath, "--delay", "0"]);
+  assert.deepEqual(launches[0].args, [
+    session.scriptPath,
+    DEV_RECOVERY_FLAG,
+    String(session.supervisorPid),
+    "--delay",
+    "0",
+  ]);
   assert.equal(launches[0].options.cwd, session.repoRoot);
   assert.equal(launches[0].options.env.TAURI_DEV_NO_REBUILD, "0");
+  assert.equal(
+    launches[0].markerPath,
+    path.join("isolated", "dev-session.json"),
+    "recovery output must follow the canonical session's configured directory",
+  );
   assert.deepEqual(events, [
+    {
+      event: "dev-supervisor-restarting",
+      detail: {
+        oldPid: session.supervisorPid,
+        outputPath: path.resolve("isolated", "dev-recovery.log"),
+      },
+    },
     {
       event: "dev-supervisor-restarted",
       detail: { oldPid: session.supervisorPid, newPid: replacement.pid },
@@ -3035,7 +3440,8 @@ test("detached watchdog retries when the replacement pnpm dev supervisor dies be
   assert.ok(
     launches.every(
       ({ args }) =>
-        JSON.stringify(args) === JSON.stringify([scriptPath, "--no-rebuild"]),
+        JSON.stringify(args) ===
+        JSON.stringify([scriptPath, DEV_RECOVERY_FLAG, "100", "--no-rebuild"]),
     ),
   );
 });
