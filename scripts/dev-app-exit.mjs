@@ -19,7 +19,12 @@ const query = (body, name, runQuery) =>
  * merely proof that a process which was alive earlier has disappeared. */
 export function stopPlannedWindowsApp(
   identity,
-  { markerPath, reason, runQuery = runWindowsJsonQuery } = {},
+  {
+    markerPath,
+    reason,
+    requireMarker = false,
+    runQuery = runWindowsJsonQuery,
+  } = {},
 ) {
   if (!plannedReasons.has(reason))
     throw new Error("Invalid planned development exit reason.");
@@ -28,14 +33,18 @@ export function stopPlannedWindowsApp(
     !Number.isSafeInteger(identity?.ProcessId) ||
     identity.ProcessId < 1 ||
     typeof identity.ExecutablePath !== "string" ||
-    typeof identity.CreationDate !== "string"
+    typeof identity.CreationDate !== "string" ||
+    ((requireMarker || identity.NativeStartedAtFiletime !== undefined) &&
+      (typeof identity.NativeStartedAtFiletime !== "string" ||
+        !/^[1-9]\d{0,19}$/.test(identity.NativeStartedAtFiletime) ||
+        BigInt(identity.NativeStartedAtFiletime) > 18446744073709551615n))
   ) {
     throw new Error(
       "Planned development exit requires a complete process identity.",
     );
   }
   const payload = Buffer.from(
-    JSON.stringify({ identity, markerPath, reason }),
+    JSON.stringify({ identity, markerPath, reason, requireMarker }),
   ).toString("base64");
   return query(
     `
@@ -54,6 +63,8 @@ try {
   $currentTicks = if ($null -ne $current) { ([DateTimeOffset]$current.CreationDate).UtcTicks } else { 0 }
   if ($null -eq $current -or $current.ExecutablePath -ine $proof.identity.ExecutablePath -or
       $handle.Path -ine $proof.identity.ExecutablePath -or $observedTicks -ne $currentTicks -or
+      ($null -ne $proof.identity.NativeStartedAtFiletime -and
+       [uint64]$proof.identity.NativeStartedAtFiletime -ne [uint64]$handle.StartTime.ToUniversalTime().ToFileTimeUtc()) -or
       ($null -ne $marker -and ($marker.pid -ne $proof.identity.ProcessId -or $marker.executablePath -ine $handle.Path -or
       [string]::IsNullOrWhiteSpace([string]$marker.configScope) -or
       [string]::IsNullOrWhiteSpace([string]$marker.startedAt) -or
@@ -61,6 +72,7 @@ try {
     throw 'Planned development app identity or marker changed.'
   }
   if ($handle.HasExited) { '{"terminated":false}'; return }
+  if ($proof.requireMarker -and $null -eq $marker) { throw 'The verified development app marker disappeared before planned termination.' }
   Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;

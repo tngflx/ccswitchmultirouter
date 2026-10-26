@@ -116,6 +116,23 @@ test(
   },
 );
 
+test(
+  "an unopened debugging port is reported separately from an unusable bridge",
+  { skip: process.platform !== "win32", timeout: 15000 },
+  async () => {
+    const server = createServer();
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+    await new Promise((resolve) => server.close(resolve));
+    const result = await runVerifier(port);
+    assert.equal(result.code, 1);
+    const evidence = JSON.parse(result.stdout);
+    assert.equal(evidence.failure, "desktop_debug_port_unavailable");
+    assert.equal(evidence.existingThreadsTouched, false);
+    assert.equal(evidence.temporaryDurableTestThread, false);
+  },
+);
+
 test("the actual log watcher accepts newly appended same-second installation records and rotation", async () => {
   const source = await readFile(script, "utf8");
   const begin = source.indexOf("const refreshFingerprint = async () => {");
@@ -193,7 +210,7 @@ test(
     ]);
     assert.equal(result.code, 1, result.stderr);
     const evidence = JSON.parse(result.stdout);
-    assert.equal(evidence.failure, "desktop_bridge_not_ready");
+    assert.equal(evidence.failure, "desktop_debug_port_unavailable");
     assert.equal(evidence.desktopCdpVerified, false);
     assert.equal(evidence.temporaryDurableTestThread, false);
     assert.equal(evidence.existingThreadsTouched, false);
@@ -300,4 +317,107 @@ test("the actual cleanup renderer program refuses any unowned newer turn", async
     );
     if (newerTurn) assert.equal(result.reason, "unexpected_turn");
   }
+});
+
+test("the actual readiness probe reports the blocked prerequisite without calling a Desktop method", async () => {
+  const source = await readFile(script, "utf8");
+  const begin = source.indexOf("const readinessExpression = () =>");
+  const end = source.indexOf("const guarded = (body) =>", begin);
+  assert.ok(begin >= 0 && end > begin);
+  const noCall = () => {
+    throw new Error("Readiness must not call a Desktop method");
+  };
+  const healthy = () => ({
+    rendererRuntimeFingerprint: fingerprint,
+    appServerClients: [
+      {
+        hostId: "local",
+        __ccSwitchOriginalSendRequest: noCall,
+        getCompatibleThreadSortKey: noCall,
+        supportsPaginatedThreadHistory: noCall,
+      },
+    ],
+    isCodexContinuationRequestClient: () => true,
+    startCodexContinuation: noCall,
+    readCodexContinuationJob: noCall,
+    commitCodexContinuation: noCall,
+  });
+  for (const [state, blocker] of [
+    [undefined, "renderer_runtime_not_installed"],
+    [
+      { ...healthy(), rendererRuntimeFingerprint: "other-runtime" },
+      "renderer_runtime_fingerprint_mismatch",
+    ],
+    [
+      { ...healthy(), commitCodexContinuation: undefined },
+      "renderer_continuation_api_unavailable",
+    ],
+    [
+      { ...healthy(), isCodexContinuationRequestClient: undefined },
+      "renderer_continuation_api_unavailable",
+    ],
+    [
+      { ...healthy(), appServerClients: [] },
+      "desktop_request_client_unavailable",
+    ],
+    [healthy(), null],
+  ]) {
+    const patchKey = "fixture-runtime";
+    const context = vm.createContext({
+      patchKey,
+      expectedFingerprint: fingerprint,
+      window: { [patchKey]: state },
+    });
+    const expression = vm.runInContext(
+      `${source.slice(begin, end)}; readinessExpression()`,
+      context,
+    );
+    const result = vm.runInContext(expression, context);
+    assert.equal(result.ready, blocker === null);
+    assert.equal(result.readinessBlocker, blocker);
+  }
+});
+
+test("readiness rejects an unverified retained client even when an original-request marker exists", async () => {
+  const source = await readFile(script, "utf8");
+  const begin = source.indexOf("const readinessExpression = () =>");
+  const end = source.indexOf("const guarded = (body) =>", begin);
+  assert.ok(begin >= 0 && end > begin);
+  const noCall = () => {
+    throw new Error("Readiness must not call a Desktop method");
+  };
+  const client = {
+    hostId: "local",
+    __ccSwitchOriginalSendRequest: noCall,
+    getCompatibleThreadSortKey: noCall,
+    supportsPaginatedThreadHistory: noCall,
+  };
+  let ownershipChecks = 0;
+  const patchKey = "fixture-runtime";
+  const context = vm.createContext({
+    patchKey,
+    expectedFingerprint: fingerprint,
+    window: {
+      [patchKey]: {
+        rendererRuntimeFingerprint: fingerprint,
+        appServerClients: [client],
+        isCodexContinuationRequestClient(candidate) {
+          assert.equal(candidate, client);
+          ownershipChecks += 1;
+          return false;
+        },
+        startCodexContinuation: noCall,
+        readCodexContinuationJob: noCall,
+        commitCodexContinuation: noCall,
+      },
+    },
+  });
+  const expression = vm.runInContext(
+    source.slice(begin, end) + "; readinessExpression()",
+    context,
+  );
+  const result = vm.runInContext(expression, context);
+  assert.equal(result.ready, false);
+  assert.equal(result.readinessBlocker, "desktop_request_client_unavailable");
+  assert.equal(ownershipChecks, 1);
 });

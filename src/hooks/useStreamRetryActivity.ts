@@ -11,6 +11,10 @@ function isStreamRetryActivity(value: unknown): value is StreamRetryActivity {
   if (!value || typeof value !== "object") return false;
   const activity = value as Partial<StreamRetryActivity>;
   return (
+    (activity.retryAfterSeconds === undefined ||
+      (typeof activity.retryAfterSeconds === "number" &&
+        Number.isSafeInteger(activity.retryAfterSeconds) &&
+        activity.retryAfterSeconds >= 0)) &&
     typeof activity.timestamp === "string" &&
     typeof activity.stage === "string" &&
     typeof activity.event === "string" &&

@@ -578,7 +578,7 @@
         "streamRetrySafeDescription": "僅在傳送語意輸出前，使用同一份已定稿請求重新連線。",
         "streamRetryAggressive": "積極",
         "streamRetryAggressiveDescription": "使用安全重新連線，並允許 Codex Desktop 在回合中斷後進行有限次數的續寫。",
-        "streamRetryContinuationPrerequisite": "自動傳送 continue 需要從 CCSwitchMulti 啟動 Codex Desktop。若 Codex 已在執行，請先完全退出，再使用「解鎖模型選單」啟動。只有 Codex 接受新的 continue 回合後，才能確認已送達。",
+        "streamRetryContinuationPrerequisite": "自動續跑需要已就緒的 Codex Desktop 偵錯橋和本機請求用戶端。如果偵錯連接埠已可用，請先使用「Unlock model picker」修復執行中的應用程式。僅在缺少偵錯連接埠時，先儲存工作並完全退出 Codex Desktop，再使用同一操作啟用偵錯重新啟動。只有 Codex 接受新的「continue」輪次後，才能確認已送達。",
         "streamRetryMaxAttempts": "續寫嘗試次數",
         "streamRetryMaxAttemptsDescription": "單一 Codex Desktop 回合允許的最大語意續寫次數。",
         "running": "執行中",
@@ -3822,8 +3822,30 @@
         "retry_scheduled": "已排程重試",
         "reconnected": "已重連",
         "reconnect_failed": "重連失敗",
-        "retries_exhausted": "重試耗盡"
+        "retries_exhausted": "重試耗盡",
+        "continuation_scheduled": "續跑已排隊",
+        "continuation_submitted": "續跑已提交",
+        "continuation_disabled": "原則停用續跑",
+        "continuation_not_scheduled": "續跑未排程",
+        "continuation_submit_failed": "續跑準備失敗",
+        "continuation_outcome_unknown": "續跑送達未確認",
+        "continuation_cancelled": "續跑已取消"
+      },
+      "stages": {
+        "desktop_continuation": "失敗對話續跑"
       }
+    },
+    "continuation": {
+      "disabled": "Safe/Off 模式不會自動續跑已失敗的對話。串流重連不能在已有輸出的失敗輪次後傳送「continue」。",
+      "enable": "啟用自動續跑（Aggressive）",
+      "bridgeUnavailable": "自動續跑遭阻擋：Desktop 偵錯橋無法使用或尚未注入，此時無法傳送「continue」。",
+      "readinessUnknown": "無法確認 Desktop 續跑是否就緒。重試開關開啟不代表自動續跑可用。",
+      "prerequisitesDetected": "已偵測到 Desktop 偵錯橋前提條件。每次續跑仍需驗證確切的失敗對話、目前原則、供應商及較新的使用者操作；這不代表已成功續跑。",
+      "launchHelp": "未偵測到 Desktop 偵錯連接埠。請使用 CC Switch 的「Unlock model picker」操作。如果 Codex Desktop 已在未啟用偵錯的狀態下執行，請先儲存工作並完全退出，再透過該操作重新啟動。僅重新啟動 CC Switch 無法加入缺少的啟動參數。",
+      "repairHelp": "已偵測到 Desktop 偵錯連接埠。請先使用 CC Switch 的「Unlock model picker」操作，修復執行中應用程式的相容執行階段。僅缺少注入並不需要完全退出 Codex Desktop。",
+      "checkHelp": "請先檢查 Desktop 守護狀態或執行背景續跑驗證工具。就緒狀態未知不代表偵錯連接埠缺失，請勿僅憑此假設重新啟動進行中的對話。",
+      "schedule": "Aggressive 對可恢復的失敗輪次依序等待 5、10、20 分鐘（受已儲存的 1–3 次上限約束）。使用者操作、取消或原則/供應商變更會取消排隊任務。這會啟動新的「continue」輪次，不會重播已完成的工具操作。",
+      "waitSeconds": "預計等待：{{seconds}} 秒"
     }
   },
   "pi": {

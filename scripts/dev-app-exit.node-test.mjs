@@ -28,6 +28,14 @@ const app = {
   Name: "cc-switch.exe",
   ExecutablePath: "C:/repo/src-tauri/target/debug/cc-switch.exe",
   CreationDate: "2026-10-22T00:00:00.0000000Z",
+  NativeStartedAtFiletime: "134371008000000000",
+};
+
+const appIdentity = {
+  pid: app.ProcessId,
+  executablePath: app.ExecutablePath,
+  processStartedAtTicks: app.NativeStartedAtFiletime,
+  markerPath: path.resolve("fixture-app-config", "logs", "app-run-marker.json"),
 };
 
 test("a planned native app termination commits only after all tree and listener cleanup", async () => {
@@ -37,6 +45,7 @@ test("a planned native app termination commits only after all tree and listener 
     async (options) => {
       await stopVerifiedWindowsApp(app, {
         ...options,
+        appIdentities: [appIdentity],
         queryProcesses: () => [app],
         queryListeners: () => [{ address: "127.0.0.1", port: 15721 }],
         stopPlannedApp: () => {
@@ -121,6 +130,7 @@ test("an app exiting during planned termination cannot let fallback kill its reu
   await stopVerifiedWindowsApp(app, {
     plannedExitReason: "development_manual_restart",
     plannedAppExits: [],
+    appIdentities: [appIdentity],
     queryProcesses: () =>
       ++queries === 1
         ? [app]
@@ -154,6 +164,26 @@ test("planned exit entry points reject incomplete proof without running Windows 
       ),
     /complete process identity/,
   );
+  for (const NativeStartedAtFiletime of [
+    undefined,
+    "",
+    Number(app.NativeStartedAtFiletime),
+    "18446744073709551616",
+  ]) {
+    assert.throws(
+      () =>
+        stopPlannedWindowsApp(
+          { ...app, NativeStartedAtFiletime },
+          {
+            reason: "development_manual_restart",
+            markerPath: appIdentity.markerPath,
+            requireMarker: true,
+            runQuery,
+          },
+        ),
+      /complete process identity/,
+    );
+  }
   assert.equal(
     commitPlannedDevExit({ terminated: false }, { runQuery }),
     false,
@@ -216,10 +246,34 @@ test(
         "a one-tick marker mismatch cannot kill the app",
       );
       writeMarker(marker);
-      const proof = stopPlannedWindowsApp(identity, {
-        markerPath,
-        reason: "development_manual_restart",
-      });
+      assert.throws(
+        () =>
+          stopPlannedWindowsApp(
+            {
+              ...identity,
+              NativeStartedAtFiletime: (BigInt(identity.ticks) + 1n).toString(),
+            },
+            {
+              markerPath,
+              reason: "development_manual_restart",
+              requireMarker: true,
+            },
+          ),
+        /planned development app stop/,
+        "a stale exact native query proof cannot authorize a new process even when its marker matches the live handle",
+      );
+      assert.doesNotThrow(
+        () => process.kill(child.pid, 0),
+        "a one-tick native proof mismatch cannot kill the disposable fixture",
+      );
+      const proof = stopPlannedWindowsApp(
+        { ...identity, NativeStartedAtFiletime: identity.ticks },
+        {
+          markerPath,
+          reason: "development_manual_restart",
+          requireMarker: true,
+        },
+      );
       assert.equal(proof.terminated, true);
       assert.equal(commitPlannedDevExit(proof), true);
       const event = JSON.parse(readFileSync(journalPath, "utf8").trim());
@@ -370,3 +424,37 @@ test(
     }
   },
 );
+
+test("planned glue requires the verified marker to survive until native termination validation", () => {
+  let captured;
+  stopPlannedWindowsApp(app, {
+    markerPath: appIdentity.markerPath,
+    reason: "development_manual_restart",
+    requireMarker: true,
+    runQuery: (script) => {
+      captured = script;
+      return '{"terminated":false}';
+    },
+  });
+  const payload = JSON.parse(
+    Buffer.from(
+      captured.match(/FromBase64String\('([^']+)'\)/)[1],
+      "base64",
+    ).toString("utf8"),
+  );
+  assert.equal(payload.requireMarker, true);
+  const guard = captured.indexOf(
+    "if ($proof.requireMarker -and $null -eq $marker)",
+  );
+  const mutation = captured.indexOf(
+    "[CcsmPlannedExitNative]::TerminateProcess($handle.Handle",
+  );
+  assert.ok(
+    guard >= 0 && guard < mutation,
+    "a marker disappearing after JavaScript verification must fail before the native mutation",
+  );
+  assert.match(
+    captured.slice(guard, mutation),
+    /throw 'The verified development app marker disappeared before planned termination/,
+  );
+});

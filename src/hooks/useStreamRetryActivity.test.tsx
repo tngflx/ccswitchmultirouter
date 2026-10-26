@@ -59,4 +59,41 @@ describe("useStreamRetryActivity", () => {
       expect(screen.getByTestId("activity-count")).toHaveTextContent("1"),
     );
   });
+  it("accepts a bounded continuation delay but rejects malformed delay fields", async () => {
+    const bridge = render(<Bridge />);
+    render(<ActivityCount />);
+    await waitFor(() =>
+      expect(listeners.get("stream-retry-activity")).toBeTypeOf("function"),
+    );
+    const before = Number(screen.getByTestId("activity-count").textContent);
+    const payload = {
+      timestamp: "2026-10-23T10:00:00Z",
+      stage: "desktop_continuation",
+      event: "continuation_scheduled",
+      attempt: 1,
+      maxAttempts: 3,
+      sessionId: "fixture",
+      model: "fixture",
+      providerId: "fixture",
+      reasonClass: "response_failed",
+    };
+    act(() => {
+      for (const retryAfterSeconds of [-1, "300", NaN, Infinity, 1.5])
+        listeners.get("stream-retry-activity")?.({
+          payload: { ...payload, retryAfterSeconds },
+        });
+    });
+    expect(Number(screen.getByTestId("activity-count").textContent)).toBe(
+      before,
+    );
+    act(() =>
+      listeners.get("stream-retry-activity")?.({
+        payload: { ...payload, retryAfterSeconds: 300 },
+      }),
+    );
+    expect(Number(screen.getByTestId("activity-count").textContent)).toBe(
+      before + 1,
+    );
+    bridge.unmount();
+  });
 });

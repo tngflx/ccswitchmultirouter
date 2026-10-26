@@ -1,0 +1,231 @@
+{
+  "auditVersion": 2,
+  "auditScope": "Recent recovery, Desktop bridge, dev lifecycle, retry UI, Request Health and build-pipeline source; not whole-codebase live validation or upstream UI parity.",
+  "verified": false,
+  "desktopCdpVerified": false,
+  "stage": "readiness",
+  "failure": "desktop_debug_port_unavailable",
+  "temporaryDurableTestThread": false,
+  "existingThreadsTouched": false,
+  "verifiedAtUtc": "2026-10-25T15:32:32.223Z",
+  "observedAtUtc": "2026-10-25T15:32:32.223Z",
+  "updatedAtUtc": "2026-10-25T16:05:44.717Z",
+  "readinessVerified": false,
+  "readinessBlocker": "desktop_debug_port_unavailable",
+  "bridgeStatus": "not_verified",
+  "runtimeFingerprintInstalledVerified": false,
+  "sourceCommit": "0532ee16d52aa01abd14745b9e257cd6bb86c3c0",
+  "sourceTreeDirty": true,
+  "expectedRuntimeFingerprint": "sha256-84d91ba9fd3efa1271bb68a8a94e7edc16b62b15061c97cbc1622a7284db46e0",
+  "runtimeFingerprintAuthority": "fresh current-source production Rust assembly helpers and all current include_str resource inputs; source renderer identity only, not native app build/deployment",
+  "nativeBackendRebuiltDuringThisAudit": false,
+  "nativeBackendCurrentSourceVerified": false,
+  "applicationBuildRunDuringThisReaudit": false,
+  "applicationRestartedDuringThisReaudit": false,
+  "policyChangedByThisAudit": false,
+  "existingUserChatsOperatedDuringThisReaudit": false,
+  "disposableChatFixtureRunDuringThisReaudit": false,
+  "verifierCommand": "node scripts/verify-codex-desktop-continuation.mjs --port 9229 --runtime-fingerprint sha256-84d91ba9fd3efa1271bb68a8a94e7edc16b62b15061c97cbc1622a7284db46e0 --wait-ms 15000 --output C:\\Users\\Felix\\AppData\\Local\\Temp\\ccswitchmulti-reaudit-20261025\\readiness-current-source.json",
+  "verifierScope": "One tested port, 9229; read-only background readiness only, without --run-disposable-test or injection.",
+  "findingsFixed": [
+    {
+      "id": "retry_budget_incremental_followups",
+      "severity": "P1",
+      "summary": "Tool-only/assistant-only incremental requests incorrectly reset the continuation budget. Only genuine nonempty user input now resets it; injected continue and non-user follow-ups preserve it.",
+      "regressionEvidence": ["recovery-request-boundary-red-green.json"]
+    },
+    {
+      "id": "desktop_activity_hook_ownership",
+      "severity": "P2",
+      "summary": "Frozen/non-writable or replaced client hooks could be retained as ready without observing manual user activity. Runtime and verifier now share descriptor-verified wrapper ownership; raw continuation fallback is removed and ownership is rechecked at commit."
+    },
+    {
+      "id": "planned_dev_marker_and_exact_identity",
+      "severity": "P2",
+      "summary": "Planned dev cleanup used a guessed default marker rather than the actual runtime config root. The ready identity now follows worker/persisted roots/cleanup. Follow-up precision regressions caught native/CIM and Number mismatches; exact FILETIME strings are preserved and checked again against a retained handle at the mutation boundary.",
+      "regressionEvidence": [
+        "dev-custom-config-red.log",
+        "dev-custom-config-green.log",
+        "dev-filetime-native-red.log",
+        "dev-filetime-native-green.log",
+        "watchdog-lossless-ready-red.log",
+        "watchdog-lossless-ready-green.log",
+        "dev-native-mutation-proof-red.log",
+        "dev-native-sameprocess-red.log"
+      ]
+    },
+    {
+      "id": "aggressive_guidance_accuracy",
+      "severity": "P3",
+      "summary": "Guidance unnecessarily demanded a full Desktop exit and used the wrong repair-action name. Four real locale resources now prefer in-place repair when a port exists, make managed relaunch conditional, and do not equate prerequisites with delivery."
+    }
+  ],
+  "sourceVerification": {
+    "passed": true,
+    "rustLibrary": {
+      "passed": 5032,
+      "ignored": 10,
+      "failed": 0
+    },
+    "frontend": {
+      "passed": 2668,
+      "files": 271,
+      "failed": 0
+    },
+    "catalogFrontend": {
+      "passed": 476,
+      "files": 15,
+      "failed": 0
+    },
+    "codexDesktopRust": {
+      "passed": 127
+    },
+    "codexMultirouterRust": {
+      "passed": 156
+    },
+    "turnRecoveryRust": {
+      "passed": 50
+    },
+    "nodeScripts": {
+      "passed": 405,
+      "files": 21,
+      "failed": 0,
+      "skipped": 0,
+      "nodeVersion": "v26.2.0",
+      "sourceInputsStable": true,
+      "receipt": "final-node-sealed-results.json",
+      "log": "final-node-sealed.log"
+    },
+    "devLifecycleFocused": {
+      "passed": 160,
+      "log": "dev-filetime-full-unit-final.log"
+    },
+    "scope": "Tests and fixtures validate source behavior. They do not prove installed/live behavior. No gate was weakened. The Rust library test build retains three baseline warnings; strict production Clippy passed.",
+    "commandReceipts": [
+      "final-frontend-results.jsonl",
+      "final-other-gates.jsonl",
+      "final-rust-results.jsonl",
+      "final-node-sealed-results.json",
+      "final-housekeeping-results.json"
+    ]
+  },
+  "artifacts": {
+    "directory": "C:/Users/Felix/AppData/Local/Temp/ccswitchmulti-reaudit-20261025",
+    "currentReadiness": "readiness-current-source.json",
+    "sourceFingerprintProvenance": "current-runtime-provenance.json",
+    "finalRuntimeInputHashes": "final-runtime-input-hashes.json"
+  },
+  "sourceRendererIdentity": {
+    "sourceSha256": "a990615dd469c7a016ec6b0aefee7c73f506c89afc97d7b762461e93a817b29d",
+    "resourceCount": 15,
+    "finalInputHashesMatch": true,
+    "scope": "Source only, not installed/native/live renderer proof."
+  },
+  "requestSchemaChecker": {
+    "sourceReviewPassed": true,
+    "inspects": "Final outgoing wire body after transformations/replay repair",
+    "contract": "Reviewed partial Responses structural and replay contract; unknown extensions remain informational and unchanged",
+    "ui": "Codex > Status > Request Health; redacted field paths, severity and remediation; request-size growth uses size guidance",
+    "notProven": [
+      "all provider semantic constraints",
+      "upstream provider acceptance",
+      "exact token counts"
+    ]
+  },
+  "verificationLimitations": [
+    "The background verifier observed no listener owner on only the tested port 9229. Its suppressed listener-query errors can also produce an empty result; this is not proof Codex is closed or every debug port is unavailable.",
+    "Current Desktop bridge readiness, continuation delivery and live effective Aggressive settings are not established. No existing chat or disposable test thread was operated during this re-audit.",
+    "Source checks do not prove the current native app, running supervisor/watchdog scripts, or renderer has loaded these fixes; no application build, install or restart was performed during this re-audit.",
+    "The historical October 25 02:43 Singapore disposable receipt demonstrates a different process/session and directly invoked the guarded bridge. It did not wait for the native 5/10/20-minute scheduler or exercise the dev crash chain.",
+    "Request Health checks a reviewed partial Responses structural/replay contract, not all provider semantics or upstream acceptance. Byte-based sizing is approximate diagnostic information, not an exact tokenizer.",
+    "Clean/planned exit intentionally does not resume a pending turn. Killing all recovery owners cannot self-relaunch. A restored pending continuation starts a fresh cooldown; its crash ledger can expire after 15 minutes without heartbeat."
+  ],
+  "historicalEvidence": {
+    "postRestartBridge": {
+      "verifiedAtUtc": "2026-10-24T18:43:21.546Z",
+      "observedAtUtc": "2026-10-24T18:44:52.2259339+00:00",
+      "expectedRuntimeFingerprint": "sha256-a95e58894de6410050d48dc2a9f7742ea7223c9d9037addeb6712585c3b564e8",
+      "scope": "Historical actual-Desktop disposable renderer prepare/commit; not the current native scheduler or dev crash chain.",
+      "nativeOwnerVerified": true,
+      "nativeOwnerPids": [31256],
+      "temporaryDurableTestThread": true,
+      "perThreadLocalFixtureProviderConfirmed": true,
+      "sseOverloadFailedTurnObserved": true,
+      "productionGuardsPrepared": true,
+      "appServerAcceptedContinue": true,
+      "upstreamReceivedLiteralContinue": true,
+      "continuedTurnCompleted": true,
+      "exactlyOneContinuation": true,
+      "cleanupArchived": true,
+      "initialRequests": 1,
+      "continuedRequests": 1,
+      "existingThreadsTouched": false,
+      "artifact": "H:\\repos\\ccswitchmulti-refork\\.tmp\\continuation-20261025-postrestart-20261025-024312\\disposable-verifier.json"
+    },
+    "artifacts": {
+      "directory": "H:\\repos\\ccswitchmulti-refork\\.tmp\\continuation-20261025-postrestart-20261025-024332",
+      "verifier": "H:\\repos\\ccswitchmulti-refork\\.tmp\\continuation-20261025-postrestart-20261025-024332\\readiness-verifier.json",
+      "sourceFingerprintProvenance": "H:\\repos\\ccswitchmulti-refork\\.tmp\\continuation-20261025-postrestart-20261025-024332\\source-runtime-provenance.json",
+      "liveEvidence": "H:\\repos\\ccswitchmulti-refork\\.tmp\\continuation-20261025-postrestart-20261025-024332\\live-evidence.json",
+      "postRestartDirectory": "H:\\repos\\ccswitchmulti-refork\\.tmp\\continuation-20261025-postrestart-20261025-024312",
+      "postRestartVerifier": "H:\\repos\\ccswitchmulti-refork\\.tmp\\continuation-20261025-postrestart-20261025-024312\\disposable-verifier.json"
+    },
+    "previousBlockedObservation": {
+      "verifiedAtUtc": "2026-10-23T16:09:06.632Z",
+      "failure": "desktop_bridge_not_ready",
+      "readinessBlocker": "desktop_request_client_unavailable",
+      "appState": "Historical older Desktop process/runtime observation only; not a current readiness or delivery receipt."
+    },
+    "releaseBuild": {
+      "generatedBy": "local-build-pipeline.mjs",
+      "generatedAtUtc": "2026-10-24T17:03:34.439Z",
+      "updaterSigned": false,
+      "standaloneExecutablePath": "H:\\repos\\ccswitchmulti-refork\\output\\continuation-20261024\\cc-switch.exe",
+      "standaloneExecutableLastWriteTimeUtc": "2026-10-24T17:03:34.2473311Z",
+      "standaloneExecutableLength": 47227904,
+      "standaloneExecutableSha256": "5746cd4bd10326056625d6b4caa6f59e48365bce9c742f97118333e22d81d863",
+      "installerPath": "H:\\repos\\ccswitchmulti-refork\\output\\continuation-20261024\\bundle\\nsis\\CCSwitchMulti_3.20.4-3_x64-setup.exe",
+      "installerLastWriteTimeUtc": "2026-10-24T17:03:33.9598334Z",
+      "installerLength": 14674930,
+      "installerSha256": "7078eb3c7a7858c21e5bb6afb59c995a40d4e335c469cb3e18110fdfdc32c258",
+      "installedOrLaunchedVerified": false,
+      "status": "Historical build was hash-verified, never installed/launched, then removed during prior cleanup; not a build of the final re-audited source."
+    },
+    "artifactCleanup": {
+      "performedAtUtc": "2026-10-25T01:47:33.559Z",
+      "removedPaths": [
+        ".tmp/local-release-cargo",
+        ".tmp/codex-asar-26.1016.8622",
+        ".tmp/codex-asar-26.1021.3705",
+        "output/continuation-20261024",
+        ".tmp/6bab-forwarder.diff",
+        ".tmp/6bab-full.patch",
+        ".tmp/6bab.forwarder.patch",
+        ".tmp/app-shared.txt",
+        ".tmp/bc8.error.patch",
+        ".tmp/bc8.forwarder.patch",
+        ".tmp/bc8.streaming.patch",
+        ".tmp/upstream-streaming-diff.txt",
+        ".tmp/continuation-20261024-234518",
+        ".tmp/continuation-20261025-011054",
+        ".tmp/continuation-20261025-postrestart-20261025-024229"
+      ],
+      "preservedPaths": [
+        ".tmp/continuation-20261023",
+        ".tmp/continuation-20261025-postrestart-20261025-024312",
+        ".tmp/continuation-20261025-postrestart-20261025-024332",
+        "src-tauri/target/debug",
+        "output/pdf",
+        "output/picker-crash-fix-20261018",
+        "output/picker-sync-fix-20261018"
+      ],
+      "releaseArtifactsPresent": false,
+      "activeDebugTargetPreserved": true,
+      "sourceAndTestsPreserved": true
+    }
+  },
+  "releaseArtifactsPresent": false,
+  "releaseArtifactsInstalledOrLaunched": false,
+  "releaseArtifactsCleanedAfterVerification": true,
+  "completedAtLocal": "2026-10-26 Asia/Singapore"
+}

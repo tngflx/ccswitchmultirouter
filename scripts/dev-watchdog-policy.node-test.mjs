@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { parseGuardianJson } from "./ccswitchmulti-guardian-core.mjs";
 
 import {
   createDevReconnectTracker,
@@ -123,4 +124,23 @@ test("the dev control reader reconstructs split packets and ignores normal logs"
   reader.push(`nect_failed","key":"${key}"}\n`);
   reader.push("[ccsm-dev-watchdog] invalid JSON\n");
   assert.deepEqual(packets, [{ event: "reconnect_failed", key }]);
+});
+
+test("the dev control reader preserves exact FILETIME through an injected parser", () => {
+  const packets = [];
+  const reader = createDevWatchdogOutputReader(
+    (packet) => packets.push(packet),
+    { parsePacket: parseGuardianJson },
+  );
+  reader.push(
+    '[ccsm-dev-watchdog] {"event":"ready","pid":123,"processStartedAtTicks":134058312000000',
+  );
+  reader.push("039}\n");
+  assert.deepEqual(packets, [
+    {
+      event: "ready",
+      pid: 123,
+      processStartedAtTicks: "134058312000000039",
+    },
+  ]);
 });

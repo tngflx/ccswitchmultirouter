@@ -84,6 +84,7 @@ let fixtureFailure = false;
 let binaryIdentity;
 let binarySha256;
 let nativeIdentity;
+let readinessBlocker;
 let verificationDeadline = Infinity;
 const initialLogInfo = logPath ? await stat(logPath).catch(() => null) : null;
 let logFileIdentity = initialLogInfo
@@ -339,9 +340,10 @@ const connect = async (url) => {
 };
 const readinessExpression = () => `(() => {
   const state = window[${JSON.stringify(patchKey)}];
-  const declared = (value, name) => { for (let n=0; value && n<5; n++, value=Object.getPrototypeOf(value)) { const d=Object.getOwnPropertyDescriptor(value,name); if(d) return typeof d.value==='function' ? d.value : null; } return null; };
-  const client = state?.appServerClients?.find((item) => Object.getOwnPropertyDescriptor(item,'hostId')?.value==='local' && declared(item,'__ccSwitchOriginalSendRequest') && declared(item,'getCompatibleThreadSortKey') && declared(item,'supportsPaginatedThreadHistory'));
-  return {ready: Boolean(state && state.rendererRuntimeFingerprint===${JSON.stringify(expectedFingerprint)} && client && ['startCodexContinuation','readCodexContinuationJob','commitCodexContinuation'].every(k=>typeof state[k]==='function')), fingerprintMatches:state?.rendererRuntimeFingerprint===${JSON.stringify(expectedFingerprint)}};
+  const client = state?.appServerClients?.find((item) => typeof state.isCodexContinuationRequestClient==='function' && state.isCodexContinuationRequestClient(item));
+  const fingerprintMatches = state?.rendererRuntimeFingerprint===${JSON.stringify(expectedFingerprint)};
+  const readinessBlocker = !state ? 'renderer_runtime_not_installed' : !fingerprintMatches ? 'renderer_runtime_fingerprint_mismatch' : !['startCodexContinuation','readCodexContinuationJob','commitCodexContinuation','isCodexContinuationRequestClient'].every(k=>typeof state[k]==='function') ? 'renderer_continuation_api_unavailable' : !client ? 'desktop_request_client_unavailable' : null;
+  return {ready: readinessBlocker === null, fingerprintMatches, readinessBlocker};
 })()`;
 const guarded = (body) => `(async () => {
   const state = window[${JSON.stringify(patchKey)}];
@@ -390,10 +392,17 @@ const run = async () => {
   )
     throw fail("output_exists");
   const readinessDeadline = startedAt + waitMs;
+  let readinessFailure = "desktop_bridge_not_ready";
   do {
     await checkBinary();
     await refreshFingerprint();
     const owner = readNativeIdentity();
+    readinessBlocker = undefined;
+    readinessFailure = !owner
+      ? "desktop_debug_port_unavailable"
+      : !expectedFingerprint
+        ? "runtime_fingerprint_not_observed"
+        : "desktop_bridge_not_ready";
     if (owner && expectedFingerprint) {
       const targets = await readTargets();
       for (const target of targets) {
@@ -401,6 +410,15 @@ const run = async () => {
         const ready = await candidate
           .evaluate(readinessExpression())
           .catch(() => null);
+        if (
+          [
+            "renderer_runtime_not_installed",
+            "renderer_runtime_fingerprint_mismatch",
+            "renderer_continuation_api_unavailable",
+            "desktop_request_client_unavailable",
+          ].includes(ready?.readinessBlocker)
+        )
+          readinessBlocker = ready.readinessBlocker;
         if (ready?.ready) {
           connection = candidate;
           nativeIdentity = owner;
@@ -410,7 +428,7 @@ const run = async () => {
       }
     }
     if (connection) break;
-    if (Date.now() >= readinessDeadline) throw fail("desktop_bridge_not_ready");
+    if (Date.now() >= readinessDeadline) throw fail(readinessFailure);
     await sleep(500);
   } while (true);
   if (!runDisposableTest)
@@ -548,7 +566,7 @@ const run = async () => {
     guarded(`
     if(lease) throw new Error('lease_already_exists');
     const declared=(value,name)=>{for(let n=0;value&&n<5;n++,value=Object.getPrototypeOf(value)){const d=Object.getOwnPropertyDescriptor(value,name);if(d)return typeof d.value==='function'?d.value:null;}return null;};
-    const client=state.appServerClients.find(item=>Object.getOwnPropertyDescriptor(item,'hostId')?.value==='local'&&declared(item,'__ccSwitchOriginalSendRequest')&&declared(item,'getCompatibleThreadSortKey')&&declared(item,'supportsPaginatedThreadHistory'));
+    const client=state.appServerClients.find(item=>typeof state.isCodexContinuationRequestClient==='function'&&state.isCodexContinuationRequestClient(item));
     if(!client)throw new Error('client_missing');
     const request=declared(client,'__ccSwitchOriginalSendRequest').bind(client);
     const result=await request('thread/start',${JSON.stringify({ model, modelProvider: providerId, allowProviderModelFallback: false, cwd: temporary, approvalPolicy: "never", sandbox: "read-only", environments: [], dynamicTools: [], baseInstructions: "Reply only OK. Do not call tools.", developerInstructions: "This is a disposable local protocol test. Do not call tools.", config: { [`model_providers.${providerId}`]: { name: "Local Desktop continuation verification fixture", base_url: localBase, wire_api: "responses", requires_openai_auth: false, request_max_retries: 0, stream_max_retries: 0, stream_idle_timeout_ms: 5000 }, model_reasoning_effort: "low" } })});
@@ -677,6 +695,8 @@ try {
     "renderer_operation_rejected",
     "verification_deadline",
     "desktop_bridge_not_ready",
+    "desktop_debug_port_unavailable",
+    "runtime_fingerprint_not_observed",
     "local_fixture_provider_not_confirmed",
     "output_exists",
     "unexpected_test_thread_turn",
@@ -686,6 +706,9 @@ try {
     desktopCdpVerified: false,
     stage,
     failure: finiteCodes.has(code) ? code : "verification_assertion_failed",
+    ...(code === "desktop_bridge_not_ready" && readinessBlocker
+      ? { readinessBlocker }
+      : {}),
     temporaryDurableTestThread: Boolean(threadId),
     existingThreadsTouched: false,
   };

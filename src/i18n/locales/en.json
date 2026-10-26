@@ -578,7 +578,7 @@
         "streamRetrySafeDescription": "Reconnect only before semantic output, reusing the same finalized request.",
         "streamRetryAggressive": "Aggressive",
         "streamRetryAggressiveDescription": "Use safe reconnects and allow bounded Codex Desktop continuation after an interrupted turn.",
-        "streamRetryContinuationPrerequisite": "Automatic continue requires Codex Desktop to be launched from CCSwitchMulti. Fully quit an already-running Codex, then use Unlock model menu to launch it. Delivery is confirmed when Codex accepts the new continue turn.",
+        "streamRetryContinuationPrerequisite": "Automatic continuation needs a ready Codex Desktop debugging bridge and local request client. If a debugging port is already available, first use “Unlock model picker” to repair the running app in place. Only if the debugging port is missing, save your work and fully exit Codex Desktop, then use “Unlock model picker” to relaunch with debugging enabled. Delivery is confirmed only when Codex accepts the new “continue” turn.",
         "streamRetryMaxAttempts": "Continuation attempts",
         "streamRetryMaxAttemptsDescription": "Maximum semantic continuation attempts for one Codex Desktop turn.",
         "running": "Running",
@@ -3821,8 +3821,30 @@
         "retry_scheduled": "Retry scheduled",
         "reconnected": "Reconnected",
         "reconnect_failed": "Reconnect failed",
-        "retries_exhausted": "Retries exhausted"
+        "retries_exhausted": "Retries exhausted",
+        "continuation_scheduled": "Continuation queued",
+        "continuation_submitted": "Continuation submitted",
+        "continuation_disabled": "Continuation disabled by policy",
+        "continuation_not_scheduled": "Continuation not scheduled",
+        "continuation_submit_failed": "Continuation preparation failed",
+        "continuation_outcome_unknown": "Continuation delivery unconfirmed",
+        "continuation_cancelled": "Continuation cancelled"
+      },
+      "stages": {
+        "desktop_continuation": "Failed-chat continuation"
       }
+    },
+    "continuation": {
+      "disabled": "Automatic failed-chat continuation is OFF in Safe/Off mode. Stream replay cannot submit “continue” after a failed turn that has already produced output.",
+      "enable": "Enable automatic continuation (Aggressive)",
+      "bridgeUnavailable": "Automatic continuation is blocked: the Desktop debugging bridge is not available or not injected. No “continue” can be submitted in this state.",
+      "readinessUnknown": "Desktop continuation readiness could not be confirmed. Do not treat the retry toggle as proof that automatic continuation works.",
+      "prerequisitesDetected": "Desktop bridge prerequisites are detected. Each continuation still checks the exact failed thread, current policy, provider and newer user actions before sending. This is not proof of a successful continuation.",
+      "launchHelp": "No Desktop debugging port was detected. Use CC Switch’s “Unlock model picker” action. If Codex Desktop is already running without debugging enabled, save your work and fully exit it before using that action to relaunch. Restarting CC Switch alone cannot add the missing flag.",
+      "repairHelp": "A Desktop debugging port was detected. First try CC Switch’s “Unlock model picker” action to repair the compatibility runtime in the running app. Missing injection alone does not require fully exiting Codex Desktop.",
+      "checkHelp": "Check the Desktop guardian status or run the background continuation verifier first. Unknown readiness does not mean the debugging port is missing; do not restart an active chat solely on that assumption.",
+      "schedule": "After a recoverable failed turn, Aggressive continuation waits 5 minutes, then 10 and 20 minutes for subsequent attempts (within the saved 1–3 attempt limit). User activity, cancellation or policy/provider changes cancel queued work. This starts a new “continue” turn; it does not replay completed tool actions.",
+      "waitSeconds": "Planned wait: {{seconds}} seconds"
     }
   },
   "pi": {

@@ -41,3 +41,11 @@ mainWindow.js
 /.tmp/local-release-cargo/
 /target/
 /output/production/
+
+# Local audit/release evidence and extracted app fixtures
+/.tmp/codex-asar-*/
+/.tmp/continuation-*/
+/.tmp/*.patch
+/.tmp/*.diff
+/.tmp/app-shared.txt
+/output/continuation-*/

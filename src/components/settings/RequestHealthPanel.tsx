@@ -84,6 +84,7 @@ function findingHelpKey(code: string): string {
     case "large_request":
     case "large_history_item":
     case "codex_input_token_limit":
+    case "sustained_request_growth":
     case "sustained_uncached_input_growth":
       return "settings.requestHealth.findingHelp.size";
     default:

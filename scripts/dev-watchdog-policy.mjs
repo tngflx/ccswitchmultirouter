@@ -150,7 +150,10 @@ export function createDevReconnectTracker() {
   };
 }
 
-export function createDevWatchdogOutputReader(onPacket) {
+export function createDevWatchdogOutputReader(
+  onPacket,
+  { parsePacket = JSON.parse } = {},
+) {
   const decoder = new StringDecoder("utf8");
   let pending = "";
   let skippingOversizedLine = false;
@@ -168,7 +171,7 @@ export function createDevWatchdogOutputReader(onPacket) {
           continue;
         }
         try {
-          const packet = JSON.parse(line.slice(PREFIX.length));
+          const packet = parsePacket(line.slice(PREFIX.length));
           if (packet && typeof packet === "object" && !Array.isArray(packet)) {
             onPacket(packet);
           }

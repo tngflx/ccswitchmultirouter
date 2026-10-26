@@ -1,3 +1,14 @@
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { useSettingsQuery } from "@/lib/query";
+import { proxyApi } from "@/lib/api/proxy";
+import {
+  persistStreamRetryPatch,
+  resolveStreamRetryMode,
+  streamRetryModePatch,
+} from "@/lib/streamRetryPolicy";
+import { Button } from "@/components/ui/button";
 import { RadioTower, RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useStreamRetryActivity } from "@/hooks/useStreamRetryActivity";
@@ -5,17 +16,24 @@ import type { StreamRetryActivity } from "@/types/proxy";
 import { cn } from "@/lib/utils";
 
 function eventTone(event: StreamRetryActivity["event"]): string {
-  if (event === "reconnected") {
+  if (event === "reconnected" || event === "continuation_submitted") {
     return "text-emerald-700 dark:text-emerald-300";
   }
-  if (event === "retries_exhausted" || event === "reconnect_failed") {
+  if (
+    event === "retries_exhausted" ||
+    event === "reconnect_failed" ||
+    event === "continuation_submit_failed" ||
+    event === "continuation_outcome_unknown"
+  ) {
     return "text-rose-700 dark:text-rose-300";
   }
   return "text-amber-700 dark:text-amber-300";
 }
 
-function stageLabel(stage: string): string {
+function stageLabel(stage: string, t: (key: string) => string): string {
   switch (stage) {
+    case "desktop_continuation":
+      return t("streamRetry.activity.stages.desktop_continuation");
     case "native_responses":
       return "Responses";
     case "anthropic_messages":
@@ -30,6 +48,49 @@ function stageLabel(stage: string): string {
 export function StreamRetryActivityPanel() {
   const { t } = useTranslation();
   const activities = useStreamRetryActivity();
+  const { data: settings } = useSettingsQuery();
+  const queryClient = useQueryClient();
+  const mode = resolveStreamRetryMode(
+    settings?.streamRetryMode,
+    settings?.enableStreamRetry,
+  );
+  const [saving, setSaving] = useState(false);
+  const { data: guardian, isError: guardianError } = useQuery({
+    queryKey: ["codexGuardianStatus"],
+    queryFn: () => proxyApi.getCodexGuardianStatus(),
+    enabled: mode === "aggressive",
+    refetchInterval: 10_000,
+  });
+  const continuationNotice =
+    mode !== "aggressive"
+      ? "disabled"
+      : guardianError || !guardian
+        ? "readinessUnknown"
+        : !guardian.active ||
+            !guardian.codexRunning ||
+            !guardian.cdpAvailable ||
+            !guardian.injected
+          ? "bridgeUnavailable"
+          : "prerequisitesDetected";
+  const continuationHelp =
+    guardianError || !guardian
+      ? "checkHelp"
+      : guardian.cdpAvailable
+        ? "repairHelp"
+        : "launchHelp";
+  const enableContinuation = async () => {
+    setSaving(true);
+    try {
+      await persistStreamRetryPatch(
+        queryClient,
+        streamRetryModePatch("aggressive"),
+      );
+    } catch {
+      toast.error(t("settings.saveFailedGeneric"));
+    } finally {
+      setSaving(false);
+    }
+  };
 
   return (
     <section
@@ -51,6 +112,35 @@ export function StreamRetryActivityPanel() {
             })}
           </p>
         </div>
+      </div>
+
+      <div
+        role={
+          continuationNotice === "prerequisitesDetected" ? "status" : "alert"
+        }
+        className="mt-4 space-y-2 rounded-md border border-amber-500/40 bg-background/70 p-3 text-sm"
+      >
+        <p>{t(`streamRetry.continuation.${continuationNotice}`)}</p>
+        <p className="text-xs text-muted-foreground">
+          {t("streamRetry.continuation.schedule")}
+        </p>
+        {mode === "aggressive" &&
+          continuationNotice !== "prerequisitesDetected" && (
+            <p className="text-xs">
+              {t(`streamRetry.continuation.${continuationHelp}`)}
+            </p>
+          )}
+        {mode !== "aggressive" && (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={saving || !settings}
+            onClick={() => void enableContinuation()}
+          >
+            {t("streamRetry.continuation.enable")}
+          </Button>
+        )}
       </div>
 
       {activities.length === 0 ? (
@@ -75,7 +165,7 @@ export function StreamRetryActivityPanel() {
                   defaultValue: activity.event.replace(/_/g, " "),
                 },
               );
-              const routeLabel = [stageLabel(activity.stage), activity.model]
+              const routeLabel = [stageLabel(activity.stage, t), activity.model]
                 .filter(Boolean)
                 .join(" · ");
               const attemptLabel =
@@ -103,6 +193,8 @@ export function StreamRetryActivityPanel() {
                     </div>
                     <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
                       {timeLabel}
+                      {activity.retryAfterSeconds != null &&
+                        ` · ${t("streamRetry.continuation.waitSeconds", { seconds: activity.retryAfterSeconds })}`}
                       {activity.reasonClass
                         ? ` · ${activity.reasonClass.replace(/_/g, " ")}`
                         : ""}

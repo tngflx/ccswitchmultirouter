@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { EventEmitter } from "node:events";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { EventEmitter, once } from "node:events";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { utcTicks } from "./ccswitchmulti-guardian-core.mjs";
 import { createDevReconnectTracker } from "./dev-watchdog-policy.mjs";
 import { DEV_RECOVERY_FLAG } from "./dev-session-launch.mjs";
 
@@ -17,6 +19,11 @@ import {
   createExpectedExitRegistry,
   createQuietPeriodScheduler,
   createDevWorkerRecovery,
+  createDevRootRecord,
+  cleanRecordedDevRoots,
+  cleanRecordedDevWorker,
+  devAppIdentityMatchesProcess,
+  legacyDevAppIdentityForPlannedStop,
   createDevSupervisorHandoff,
   devAutoRestartDecision,
   devSessionEnvironment,
@@ -36,6 +43,7 @@ import {
   preserveManualTakeoverHandoff,
   retireDevWorkerForManualHandoff,
   parseWindowsJsonQueryOutput,
+  queryWindowsProcesses,
   readDevRestartTimesMs,
   readDevRunMarkerPresent,
   readDevWatchdogEnabled,
@@ -46,6 +54,7 @@ import {
   resolveRepoRootBackendInput,
   resolveTauriRootBackendInput,
   runCargoTargetMaintenance,
+  runPlannedDevCleanup,
   runDetachedDevWatchdog,
   runWindowsJsonQuery,
   sameWindowsProcess,
@@ -195,7 +204,7 @@ test("development recovery uses the app run marker to detect code-zero crashes",
       "debug",
       "cc-switch.exe",
     ),
-    processStartedAtTicks: 1_234,
+    processStartedAtTicks: "1234",
     markerPath: path.join("custom-config", "logs", "app-run-marker.json"),
   };
   const read = (markerPath) => {
@@ -214,7 +223,7 @@ test("development recovery uses the app run marker to detect code-zero crashes",
   assert.equal(
     readDevRunMarkerPresent(
       {},
-      () => JSON.stringify({ ...identity, processStartedAtTicks: 1_235 }),
+      () => JSON.stringify({ ...identity, processStartedAtTicks: "1235" }),
       identity,
     ),
     false,
@@ -3749,3 +3758,679 @@ test("detached watchdog publication timeout retains ownership until the unpublis
     /did not publish its owned session within 100ms/,
   );
 });
+
+function customConfigAppFixture() {
+  const repoRoot = fileURLToPath(new URL("../", import.meta.url));
+  const app = {
+    ProcessId: 30,
+    ParentProcessId: 20,
+    Name: "cc-switch.exe",
+    ExecutablePath: path.join(
+      repoRoot,
+      "src-tauri",
+      "target",
+      "debug",
+      "cc-switch.exe",
+    ),
+    CreationDate: "2026-10-25T02:00:00.000000Z",
+    NativeStartedAtFiletime: "134373672000000009",
+  };
+  const appIdentity = {
+    event: "ready",
+    pid: app.ProcessId,
+    executablePath: app.ExecutablePath,
+    processStartedAtTicks: app.NativeStartedAtFiletime,
+    markerPath: path.resolve(
+      "fixture-custom-config",
+      "logs",
+      "app-run-marker.json",
+    ),
+  };
+  const worker = {
+    ProcessId: 5,
+    ParentProcessId: 1,
+    Name: "node.exe",
+    ExecutablePath: process.execPath,
+    CommandLine: "node scripts/dev-tauri-delayed.mjs --ccsm-dev-worker",
+    CreationDate: "2026-10-25T01:59:57.0000000Z",
+  };
+  const cli = {
+    ProcessId: 10,
+    ParentProcessId: worker.ProcessId,
+    Name: "node.exe",
+    ExecutablePath: process.execPath,
+    CommandLine: "node node_modules/@tauri-apps/cli/tauri.js dev --no-watch",
+    CreationDate: "2026-10-25T01:59:58.0000000Z",
+  };
+  const cargo = {
+    ProcessId: 20,
+    ParentProcessId: cli.ProcessId,
+    Name: "cargo.exe",
+    ExecutablePath: path.resolve("fixture-toolchain", "cargo.exe"),
+    CreationDate: "2026-10-25T01:59:59.0000000Z",
+  };
+  const processes = [worker, cli, cargo, app];
+  const message = {
+    type: "dev-root",
+    role: "tauri",
+    pid: cli.ProcessId,
+    appIdentity,
+  };
+  return { repoRoot, app, appIdentity, worker, cli, cargo, processes, message };
+}
+
+test("planned Windows app cleanup uses the verified runtime marker instead of the default home", async () => {
+  const { app, appIdentity } = customConfigAppFixture();
+  const plannedAppExits = [];
+  let receivedMarkerPath;
+  await stopVerifiedWindowsApp(app, {
+    plannedExitReason: "development_backend_reload",
+    plannedAppExits,
+    appIdentities: [appIdentity],
+    queryProcesses: () => [app],
+    queryListeners: () => [],
+    stopPlannedApp: (_identity, options) => {
+      receivedMarkerPath = options.markerPath;
+      return {
+        terminated: true,
+        markerPath: options.markerPath,
+        markerText: "fixture-only",
+      };
+    },
+    terminate: () =>
+      assert.fail("a planned app stop must not fall back to taskkill"),
+    waitForProcessExit: async () => {},
+    writeEvent: () => {},
+    log: () => {},
+  });
+  assert.equal(receivedMarkerPath, appIdentity.markerPath);
+  assert.equal(plannedAppExits.length, 1);
+});
+
+test("runtime dev-root publication binds the custom marker to the exact owned app", () => {
+  const fixture = customConfigAppFixture();
+  const record = createDevRootRecord(fixture.message, fixture.processes, {
+    repoRoot: fixture.repoRoot,
+    platform: "win32",
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(record)).appIdentity, {
+    pid: fixture.appIdentity.pid,
+    executablePath: fixture.appIdentity.executablePath,
+    processStartedAtTicks: fixture.appIdentity.processStartedAtTicks,
+    processStartedAtUtc: fixture.app.CreationDate,
+    markerPath: fixture.appIdentity.markerPath,
+  });
+  const initial = createDevRootRecord(
+    { type: "dev-root", role: "tauri", pid: fixture.cli.ProcessId },
+    fixture.processes,
+    { repoRoot: fixture.repoRoot, platform: "win32" },
+  );
+  assert.equal(initial.appIdentity, undefined);
+  for (const candidate of [
+    { ...fixture.message, role: "vite" },
+    { ...fixture.message, pid: fixture.worker.ProcessId },
+    { ...fixture.message, appIdentity: { ...fixture.appIdentity, pid: 999 } },
+    {
+      ...fixture.message,
+      appIdentity: {
+        ...fixture.appIdentity,
+        processStartedAtTicks: (
+          BigInt(fixture.appIdentity.processStartedAtTicks) + 10000n
+        ).toString(),
+      },
+    },
+    {
+      ...fixture.message,
+      appIdentity: {
+        ...fixture.appIdentity,
+        executablePath: path.resolve("foreign", "cc-switch.exe"),
+      },
+    },
+    {
+      ...fixture.message,
+      appIdentity: {
+        ...fixture.appIdentity,
+        markerPath: path.join("relative-config", "logs", "app-run-marker.json"),
+      },
+    },
+    {
+      ...fixture.message,
+      appIdentity: {
+        ...fixture.appIdentity,
+        markerPath: path.resolve("fixture-custom-config", "settings.json"),
+      },
+    },
+  ]) {
+    assert.equal(
+      createDevRootRecord(candidate, fixture.processes, {
+        repoRoot: fixture.repoRoot,
+        platform: "win32",
+      }),
+      undefined,
+    );
+  }
+  const foreignApp = { ...fixture.app, ParentProcessId: 999 };
+  assert.equal(
+    createDevRootRecord(
+      fixture.message,
+      [...fixture.processes.filter((item) => item !== fixture.app), foreignApp],
+      { repoRoot: fixture.repoRoot, platform: "win32" },
+    ),
+    undefined,
+  );
+});
+
+for (const mode of ["recorded-root", "recorded-worker"]) {
+  test(
+    mode + " planned cleanup retains the serialized custom-config app marker",
+    async () => {
+      const fixture = customConfigAppFixture();
+      const root = JSON.parse(
+        JSON.stringify(
+          createDevRootRecord(fixture.message, fixture.processes, {
+            repoRoot: fixture.repoRoot,
+            platform: "win32",
+          }),
+        ),
+      );
+      let processes = [...fixture.processes];
+      const seenMarkers = [];
+      const commits = [];
+      const stopOptions = {
+        platform: "win32",
+        queryProcesses: () => processes,
+        queryListeners: () => [],
+        stopPlannedApp: (_identity, options) => {
+          assert.equal(options.markerPath, fixture.appIdentity.markerPath);
+          seenMarkers.push(options.markerPath);
+          processes = processes.filter(
+            (item) => item.ProcessId !== fixture.app.ProcessId,
+          );
+          return {
+            terminated: true,
+            markerPath: options.markerPath,
+            markerText: "fixture-only",
+            reason: options.reason,
+          };
+        },
+        terminate: (pid) => {
+          processes = processes.filter((item) => item.ProcessId !== pid);
+          return { status: 0 };
+        },
+        waitForProcessExit: async () => {},
+        waitForListenersReleased: async () => {},
+        log: () => {},
+      };
+      await runPlannedDevCleanup(
+        (options) =>
+          mode === "recorded-root"
+            ? cleanRecordedDevRoots([root], { ...stopOptions, ...options })
+            : cleanRecordedDevWorker(
+                {
+                  workerPid: fixture.worker.ProcessId,
+                  workerIdentity: fixture.worker,
+                  roots: [root],
+                },
+                { ...stopOptions, ...options },
+              ),
+        "development_manual_restart",
+        { commit: (proof) => commits.push(proof) },
+      );
+      assert.deepEqual(seenMarkers, [fixture.appIdentity.markerPath]);
+      assert.equal(commits.length, 1);
+      assert.equal(commits[0].markerPath, fixture.appIdentity.markerPath);
+    },
+  );
+}
+
+test("planned marker cleanup rejects absent, replayed and unrelated runtime identities before mutation", async () => {
+  const { app, appIdentity } = customConfigAppFixture();
+  for (const identities of [
+    [],
+    [{ ...appIdentity, pid: 999 }],
+    [
+      {
+        ...appIdentity,
+        executablePath: path.resolve("unrelated", "cc-switch.exe"),
+      },
+    ],
+    [
+      {
+        ...appIdentity,
+        processStartedAtTicks: (
+          BigInt(appIdentity.processStartedAtTicks) + 10000n
+        ).toString(),
+      },
+    ],
+    [
+      {
+        ...appIdentity,
+        markerPath: path.join("relative", "logs", "app-run-marker.json"),
+      },
+    ],
+    [
+      {
+        ...appIdentity,
+        markerPath: path.resolve(
+          "fixture-custom-config",
+          "logs",
+          "unrelated.json",
+        ),
+      },
+    ],
+  ]) {
+    await assert.rejects(
+      stopVerifiedWindowsApp(app, {
+        plannedExitReason: "development_backend_reload",
+        appIdentities: identities,
+        readLegacyAppIdentity: () =>
+          identities.length
+            ? assert.fail(
+                "a modern runtime identity is authoritative; stale data cannot fall back to default",
+              )
+            : undefined,
+        queryProcesses: () => [app],
+        queryListeners: () => [],
+        stopPlannedApp: () =>
+          assert.fail("unverified marker cannot reach the native planned stop"),
+        terminate: () =>
+          assert.fail("failed planned identity must not fall back to taskkill"),
+        log: () => {},
+        writeEvent: () => {},
+      }),
+      /no verified runtime marker identity/,
+    );
+  }
+  assert.equal(
+    devAppIdentityMatchesProcess(appIdentity, {
+      ...app,
+      CreationDate: "invalid",
+    }),
+    false,
+  );
+  assert.equal(devAppIdentityMatchesProcess(appIdentity, undefined), false);
+  let forced = 0;
+  await stopVerifiedWindowsApp(app, {
+    queryProcesses: () => [app],
+    queryListeners: () => [],
+    stopPlannedApp: () =>
+      assert.fail("crash cleanup never creates a planned marker"),
+    terminate: () => {
+      forced++;
+      return { status: 0 };
+    },
+    waitForProcessExit: async () => {},
+    log: () => {},
+  });
+  assert.equal(
+    forced,
+    1,
+    "startup failure without a ready identity still has bounded ordinary cleanup",
+  );
+});
+
+test("legacy default marker fallback requires exact process identity and canonical config scope", async () => {
+  const fixture = customConfigAppFixture();
+  const environment = {
+    CC_SWITCH_TEST_HOME: path.resolve("fixture-legacy-home"),
+  };
+  const markerPath = resolveDevRunMarkerPath(environment);
+  const configRoot = path.dirname(path.dirname(markerPath));
+  const scope = createHash("sha256")
+    .update(configRoot.replaceAll("/", "\\").toLowerCase())
+    .digest("hex")
+    .slice(0, 16);
+  const validMarker = {
+    pid: fixture.app.ProcessId,
+    executablePath: fixture.app.ExecutablePath,
+    processStartedAtTicks: String(fixture.appIdentity.processStartedAtTicks),
+    configScope: scope,
+    startedAt: "2026-10-25 10:00:00.000",
+  };
+  const readIdentity = (marker) =>
+    legacyDevAppIdentityForPlannedStop(fixture.app, {
+      environment,
+      resolveConfigPath: (value) => value,
+      read: (requested) => {
+        assert.equal(requested, markerPath);
+        return JSON.stringify(marker).replace(
+          /"processStartedAtTicks":"(\d+)"/,
+          '"processStartedAtTicks":$1',
+        );
+      },
+    });
+  const identity = readIdentity(validMarker);
+  assert.equal(identity.markerPath, markerPath);
+  assert.equal(identity.processStartedAtUtc, fixture.app.CreationDate);
+  for (const marker of [
+    { ...validMarker, pid: 999 },
+    {
+      ...validMarker,
+      executablePath: path.resolve("unrelated", "cc-switch.exe"),
+    },
+    {
+      ...validMarker,
+      processStartedAtTicks: String(
+        BigInt(validMarker.processStartedAtTicks) + 1n,
+      ),
+    },
+    { ...validMarker, configScope: "unrelated-config-scope" },
+    { ...validMarker, startedAt: "" },
+  ])
+    assert.equal(readIdentity(marker), undefined);
+  assert.equal(
+    legacyDevAppIdentityForPlannedStop(fixture.app, {
+      environment,
+      read: () => {
+        throw new Error("missing marker");
+      },
+    }),
+    undefined,
+  );
+
+  // A persisted root written by the previous launcher has no appIdentity. It
+  // remains usable only with the positively verified legacy marker above.
+  const root = createDevRootRecord(
+    { type: "dev-root", role: "tauri", pid: fixture.cli.ProcessId },
+    fixture.processes,
+    { platform: "win32" },
+  );
+  let processes = [...fixture.processes];
+  const markers = [];
+  await cleanRecordedDevRoots([JSON.parse(JSON.stringify(root))], {
+    platform: "win32",
+    plannedExitReason: "development_manual_restart",
+    plannedAppExits: [],
+    readLegacyAppIdentity: () => readIdentity(validMarker),
+    queryProcesses: () => processes,
+    queryListeners: () => [],
+    stopPlannedApp: (_app, options) => {
+      assert.equal(options.requireMarker, true);
+      markers.push(options.markerPath);
+      processes = processes.filter(
+        (item) => item.ProcessId !== fixture.app.ProcessId,
+      );
+      return {
+        terminated: true,
+        markerText: "fixture-only",
+        markerPath: options.markerPath,
+      };
+    },
+    terminate: (pid) => {
+      processes = processes.filter((item) => item.ProcessId !== pid);
+      return { status: 0 };
+    },
+    waitForProcessExit: async () => {},
+    log: () => {},
+  });
+  assert.deepEqual(markers, [markerPath]);
+});
+
+test("runtime root captures exact creation precision to reject a one-tick replay", () => {
+  const fixture = customConfigAppFixture();
+  const root = createDevRootRecord(fixture.message, fixture.processes, {
+    platform: "win32",
+  });
+  assert.equal(
+    devAppIdentityMatchesProcess(root.appIdentity, {
+      ...fixture.app,
+      CreationDate: "2026-10-25T02:00:00.0000001Z",
+    }),
+    false,
+  );
+});
+
+test("native FILETIME ready identity survives the CIM microsecond rounding boundary", () => {
+  const fixture = customConfigAppFixture();
+  const nativeFiletime = "134373672000000009";
+  const app = {
+    ...fixture.app,
+    CreationDate: "2026-10-25T02:00:00.000000Z",
+    NativeStartedAtFiletime: nativeFiletime,
+  };
+  const identity = {
+    ...fixture.appIdentity,
+    processStartedAtTicks: nativeFiletime,
+  };
+  assert.notEqual(Number(nativeFiletime), Number("134373672000000000"));
+  assert.equal(devAppIdentityMatchesProcess(identity, app), true);
+  assert.equal(
+    devAppIdentityMatchesProcess(
+      {
+        ...identity,
+        processStartedAtTicks: "134373672000000008",
+      },
+      app,
+    ),
+    false,
+    "a one-native-tick replay must never match",
+  );
+  assert.equal(
+    devAppIdentityMatchesProcess(identity, {
+      ...app,
+      NativeStartedAtFiletime: "134373672000000008",
+    }),
+    false,
+    "the native process timestamp must match exactly even within one CIM microsecond",
+  );
+});
+
+test("legacy default marker accepts the exact native FILETIME rather than truncated CIM", () => {
+  const fixture = customConfigAppFixture();
+  const environment = {
+    CC_SWITCH_TEST_HOME: path.resolve("fixture-native-legacy-home"),
+  };
+  const markerPath = resolveDevRunMarkerPath(environment);
+  const configRoot = path.dirname(path.dirname(markerPath));
+  const configScope = createHash("sha256")
+    .update(configRoot.replaceAll("/", "\\").toLowerCase())
+    .digest("hex")
+    .slice(0, 16);
+  const nativeFiletime = "134373672000000009";
+  const app = {
+    ...fixture.app,
+    CreationDate: "2026-10-25T02:00:00.000000Z",
+    NativeStartedAtFiletime: nativeFiletime,
+  };
+  const marker = {
+    pid: app.ProcessId,
+    executablePath: app.ExecutablePath,
+    processStartedAtTicks: nativeFiletime,
+    configScope,
+    startedAt: "2026-10-25 10:00:00.000",
+  };
+  const readIdentity = (value) =>
+    legacyDevAppIdentityForPlannedStop(app, {
+      environment,
+      resolveConfigPath: (value) => value,
+      read: () =>
+        JSON.stringify(value).replace(
+          /"processStartedAtTicks":"(\d+)"/,
+          '"processStartedAtTicks":$1',
+        ),
+    });
+  const identity = readIdentity(marker);
+  assert.equal(identity?.processStartedAtTicks, nativeFiletime);
+  assert.equal(identity?.markerPath, markerPath);
+  assert.equal(
+    readIdentity({ ...marker, processStartedAtTicks: "134373672000000008" }),
+    undefined,
+  );
+});
+
+test("run marker matching preserves exact FILETIME and rejects rounded one-tick replay", () => {
+  const fixture = customConfigAppFixture();
+  const identity = {
+    ...fixture.appIdentity,
+    processStartedAtTicks: "134373672000000009",
+  };
+  const text = (ticks) =>
+    JSON.stringify({ ...identity, processStartedAtTicks: ticks }).replace(
+      /"processStartedAtTicks":"(\d+)"/,
+      '"processStartedAtTicks":$1',
+    );
+  assert.equal(
+    readDevRunMarkerPresent({}, () => text("134373672000000009"), identity),
+    true,
+  );
+  assert.equal(
+    readDevRunMarkerPresent({}, () => text("134373672000000008"), identity),
+    false,
+  );
+});
+
+test("native FILETIME identity rejects one tick inside the same Number and CIM bins", () => {
+  const fixture = customConfigAppFixture();
+  const app = {
+    ...fixture.app,
+    CreationDate: "2026-10-25T02:00:00.000001Z",
+    NativeStartedAtFiletime: "134373672000000017",
+  };
+  const identity = {
+    ...fixture.appIdentity,
+    processStartedAtTicks: "134373672000000017",
+  };
+  assert.equal(Number("134373672000000017"), Number("134373672000000018"));
+  assert.equal(devAppIdentityMatchesProcess(identity, app), true);
+  assert.equal(
+    devAppIdentityMatchesProcess(
+      { ...identity, processStartedAtTicks: "134373672000000018" },
+      app,
+    ),
+    false,
+  );
+  assert.equal(
+    devAppIdentityMatchesProcess(identity, {
+      ...app,
+      NativeStartedAtFiletime: "134373672000000018",
+    }),
+    false,
+  );
+  assert.equal(
+    sameWindowsProcess(app, {
+      ...app,
+      NativeStartedAtFiletime: "134373672000000018",
+    }),
+    false,
+    "exact process comparison rejects a PID replay inside one CIM microsecond",
+  );
+  assert.equal(
+    readDevRunMarkerPresent(
+      {},
+      () =>
+        JSON.stringify({
+          ...identity,
+          processStartedAtTicks: "134373672000000018",
+        }).replace(
+          /"processStartedAtTicks":"(\d+)"/,
+          '"processStartedAtTicks":$1',
+        ),
+      identity,
+    ),
+    false,
+  );
+});
+
+test("bounded Windows process query binds app-only exact native FILETIME to its CIM row", () => {
+  const fixture = customConfigAppFixture();
+  let captured;
+  assert.deepEqual(
+    queryWindowsProcesses(fixture.app.ProcessId, {
+      runQuery: (script, name) => {
+        captured = script;
+        assert.equal(name, "process");
+        return JSON.stringify(fixture.app);
+      },
+    }),
+    [fixture.app],
+  );
+  assert.match(
+    captured,
+    /Get-CimInstance Win32_Process -Filter 'ProcessId = 30'/,
+  );
+  for (const required of [
+    "if ($row.Name -ieq 'cc-switch.exe')",
+    "$null = $native.Handle",
+    "$nativeStartedAt = $native.StartTime.ToUniversalTime()",
+    "$native.Path -ine $row.ExecutablePath",
+    "$nativeStartedAt.Ticks - ($nativeStartedAt.Ticks % 10)",
+    "NativeStartedAtFiletime -NotePropertyValue $nativeStartedAt.ToFileTimeUtc().ToString",
+    "$native.Dispose()",
+  ])
+    assert.ok(captured.includes(required), required);
+  assert.ok(
+    captured.indexOf("$null = $native.Handle") <
+      captured.indexOf("$native.StartTime"),
+  );
+  assert.equal(
+    devAppIdentityMatchesProcess(fixture.appIdentity, {
+      ...fixture.app,
+      NativeStartedAtFiletime: undefined,
+    }),
+    false,
+  );
+  assert.equal(
+    devAppIdentityMatchesProcess(fixture.appIdentity, {
+      ...fixture.app,
+      NativeStartedAtFiletime: Number(fixture.app.NativeStartedAtFiletime),
+    }),
+    false,
+  );
+  assert.equal(
+    devAppIdentityMatchesProcess(fixture.appIdentity, {
+      ...fixture.app,
+      NativeStartedAtFiletime: "18446744073709551616",
+    }),
+    false,
+  );
+  assert.equal(
+    devAppIdentityMatchesProcess(fixture.appIdentity, {
+      ...fixture.app,
+      CreationDate: "2026-10-25T02:00:01.000000Z",
+    }),
+    false,
+  );
+});
+
+test(
+  "bounded native FILETIME query validates only its disposable process fixture",
+  { skip: process.platform !== "win32", timeout: 30000 },
+  async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    await once(child, "spawn");
+    try {
+      const rows = queryWindowsProcesses(child.pid, {
+        runQuery: (script, name) => {
+          assert.ok(script.includes("-Filter 'ProcessId = " + child.pid + "'"));
+          // Test-only name substitution lets the native app-identity branch run
+          // against our own disposable node, never any actual cc-switch process.
+          return runWindowsJsonQuery(
+            script.replace(
+              "$row.Name -ieq 'cc-switch.exe'",
+              "$row.Name -ieq 'node.exe'",
+            ),
+            name,
+          );
+        },
+      });
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].ProcessId, child.pid);
+      assert.equal(
+        rows[0].ExecutablePath.toLowerCase(),
+        process.execPath.toLowerCase(),
+      );
+      assert.equal(typeof rows[0].NativeStartedAtFiletime, "string");
+      const native = BigInt(rows[0].NativeStartedAtFiletime);
+      assert.equal(
+        native - (native % 10n),
+        utcTicks(rows[0].CreationDate) + 116444736000000000n,
+      );
+    } finally {
+      child.kill();
+      await once(child, "exit");
+    }
+  },
+);

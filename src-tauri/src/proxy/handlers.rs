@@ -728,9 +728,10 @@ fn observe_aggressive_recovery(
     recovery_context: Option<TurnRecoveryContext>,
 ) -> ByteStream {
     match recovery_context {
-        Some(context) if context.max_recoveries > 0 => {
-            Box::pin(observe_responses_turn_stream(stream, context))
-        }
+        // Observation is read-only in Safe/Off: reserve_recovery still rejects
+        // a zero budget. Keep the observer so a terminal failure can explain
+        // the disabled continuation instead of silently disappearing.
+        Some(context) => Box::pin(observe_responses_turn_stream(stream, context)),
         _ => Box::pin(stream),
     }
 }
@@ -836,16 +837,14 @@ fn finalize_aggressive_recovery(
             ))
         }
         Ok(response)
-            if context.max_recoveries > 0
-                && !matches!(
-                    response.status(),
-                    StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT
-                )
-                && (response.status().is_success()
-                    || forward_error_is_recoverable(&ProxyError::UpstreamError {
-                        status: response.status().as_u16(),
-                        body: None,
-                    }))
+            if !matches!(
+                response.status(),
+                StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT
+            ) && (response.status().is_success()
+                || forward_error_is_recoverable(&ProxyError::UpstreamError {
+                    status: response.status().as_u16(),
+                    body: None,
+                }))
                 && response
                     .headers()
                     .get(axum::http::header::CONTENT_TYPE)
@@ -894,9 +893,9 @@ fn finalize_aggressive_recovery(
     }
 }
 
-/// Match only the literal recovery turn CCSM injects. Prompts that merely
+/// Identify only the literal recovery command CCSM injects. Prompts that merely
 /// contain the word "continue", tool results, and mixed-media messages do not
-/// preserve the existing recovery budget.
+/// identify that command; request-turn bookkeeping is handled separately.
 fn request_is_literal_continue(body: &Value) -> bool {
     // Tool results and assistant items can follow CCSM's injected user turn.
     // They are transport bookkeeping, so find the most recent actual user
@@ -922,6 +921,32 @@ fn request_is_literal_continue(body: &Value) -> bool {
                 && part.get("text").and_then(Value::as_str) == Some("continue")
         }
         _ => false,
+    }
+}
+
+// Keep request-turn bookkeeping at the boundary where the original Desktop
+// input is still available, before any history enrichment or conversion.
+fn begin_recovery_request(thread_id: &str, body: &Value) {
+    let is_continuation = request_is_literal_continue(body);
+    let has_user_input = match body.get("input") {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .rev()
+            .find(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+            .is_some_and(|item| match item.get("content") {
+                Some(Value::String(text)) => !text.trim().is_empty(),
+                Some(Value::Array(parts)) => !parts.is_empty(),
+                _ => false,
+            }),
+        _ => false,
+    };
+    // Codex can send only previous_response_id + function_call_output after a
+    // tool step. Absence of a user message is not evidence of a new user turn:
+    // preserve the existing attempt budget instead of granting fresh retries.
+    // Unknown/empty input also cannot prove that the user started a new turn.
+    if is_continuation || has_user_input {
+        begin_turn(thread_id, is_continuation);
     }
 }
 
@@ -3662,7 +3687,6 @@ async fn handle_responses_for_app(
     let desktop_thread_id = desktop_recovery_eligible
         .then(|| desktop_recovery_thread_id(&headers))
         .flatten();
-    let is_recovery_continuation = request_is_literal_continue(&body);
     let desktop_reasoning = app_type == AppType::Codex
         && super::providers::is_codex_desktop_reasoning_client(
             &headers,
@@ -3680,7 +3704,7 @@ async fn handle_responses_for_app(
         .then(|| desktop_thread_id.clone())
         .flatten();
     if let Some(thread_id) = recovery_thread_id.as_ref() {
-        begin_turn(thread_id, is_recovery_continuation);
+        begin_recovery_request(thread_id, &body);
     }
     let mut recovery_context = recovery_thread_id.and_then(|desktop_thread_id| {
         let durable_provider_id = crate::settings::get_current_provider(&AppType::Codex)?;
@@ -8423,6 +8447,201 @@ data: [DONE]\n\n";
             desktop_eligible: true,
             max_recoveries: 2,
         }
+    }
+
+    fn observed_recovery_tool_step(label: &str, budget: u32) -> super::TurnRecoveryContext {
+        use crate::proxy::codex_turn_recovery::{
+            authorize_recovery_commit_for_test, observe_responses_turn_json, track_turn,
+        };
+
+        let mut context = final_recovery_context(label);
+        context.max_recoveries = budget;
+        super::schedule_turn_recovery(context.clone(), "test_interruption");
+        assert!(authorize_recovery_commit_for_test(&context));
+        super::begin_recovery_request(
+            &context.desktop_thread_id,
+            &json!({"input": [{"role": "user", "content": "continue"}]}),
+        );
+        context.recovery_id.push_str("-tool-step");
+        context.observed_at_ms += 1;
+        let tracked = track_turn(&context);
+        observe_responses_turn_json(
+            &json!({
+                "status": "completed",
+                "output": [{"type": "function_call", "id": "item-1", "call_id": "call-1", "name": "shell", "arguments": "{}"}]
+            }),
+            &context,
+        );
+        drop(tracked);
+        context
+    }
+
+    #[test]
+    fn incremental_recovery_followups_preserve_the_spent_attempt_budget() {
+        use crate::proxy::codex_turn_recovery::{
+            mark_turn_completed, observe_responses_turn_json, recovery_reserved_for_test,
+            track_turn,
+        };
+
+        for (label, body) in [
+            (
+                "cursor-tool-output",
+                json!({"previous_response_id": "resp-1", "input": [{"type": "function_call_output", "call_id": "call-1", "output": "done"}]}),
+            ),
+            (
+                "tool-output",
+                json!({"input": [{"type": "function_call_output", "call_id": "call-1", "output": "done"}]}),
+            ),
+            (
+                "assistant-only",
+                json!({"input": [{"role": "assistant", "content": "working"}]}),
+            ),
+            ("empty-array", json!({"input": []})),
+            ("empty-string", json!({"input": ""})),
+            (
+                "empty-user-message",
+                json!({"input": [{"role": "user", "content": ""}]}),
+            ),
+            (
+                "empty-user-parts",
+                json!({"input": [{"role": "user", "content": []}]}),
+            ),
+            ("unknown", json!({})),
+        ] {
+            let mut context = observed_recovery_tool_step(label, 1);
+            super::begin_recovery_request(&context.desktop_thread_id, &body);
+            context.recovery_id.push_str("-followup");
+            context.observed_at_ms += 1;
+            let tracked = track_turn(&context);
+            observe_responses_turn_json(
+                &json!({"status": "failed", "error": {"code": "server_error", "message": "Temporarily overloaded"}}),
+                &context,
+            );
+            assert!(
+                !recovery_reserved_for_test(&context.desktop_thread_id),
+                "{label}: tool bookkeeping or unknown input must not grant another automatic continuation after the attempt budget was spent"
+            );
+            drop(tracked);
+            mark_turn_completed(&context.desktop_thread_id);
+        }
+    }
+
+    #[test]
+    fn incremental_recovery_followup_uses_the_second_attempt_backoff() {
+        use crate::proxy::codex_turn_recovery::{
+            mark_turn_completed, observe_responses_turn_json, track_turn,
+        };
+
+        crate::usage_events::take_test_stream_activities();
+        let mut context = observed_recovery_tool_step("second-incremental-backoff", 3);
+        crate::usage_events::take_test_stream_activities();
+        super::begin_recovery_request(
+            &context.desktop_thread_id,
+            &json!({"previous_response_id": "resp-1", "input": [{"type": "function_call_output", "call_id": "call-1", "output": "done"}]}),
+        );
+        context.recovery_id.push_str("-followup");
+        context.observed_at_ms += 1;
+        let tracked = track_turn(&context);
+        observe_responses_turn_json(
+            &json!({"status": "failed", "error": {"code": "server_error", "message": "Temporarily overloaded"}}),
+            &context,
+        );
+        let events = crate::usage_events::take_test_stream_activities();
+        let scheduled = events
+            .iter()
+            .find(|event| event.event == "continuation_scheduled")
+            .expect("the remaining automatic attempt must be scheduled");
+        assert_eq!(scheduled.attempt, 2);
+        assert_eq!(scheduled.retry_after_seconds, Some(600));
+        drop(tracked);
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[test]
+    fn actual_new_user_requests_reset_the_spent_recovery_budget() {
+        use crate::proxy::codex_turn_recovery::{
+            mark_turn_completed, observe_responses_turn_json, recovery_reserved_for_test,
+            track_turn,
+        };
+
+        for (label, body) in [
+            (
+                "new-user-message",
+                json!({"input": [{"role": "user", "content": "new request"}]}),
+            ),
+            ("new-user-string", json!({"input": "new request"})),
+        ] {
+            let mut context = observed_recovery_tool_step(label, 1);
+            super::begin_recovery_request(&context.desktop_thread_id, &body);
+            context.recovery_id.push_str("-new-user");
+            context.observed_at_ms += 1;
+            let tracked = track_turn(&context);
+            observe_responses_turn_json(
+                &json!({"status": "failed", "error": {"code": "server_error", "message": "Temporarily overloaded"}}),
+                &context,
+            );
+            assert!(
+                recovery_reserved_for_test(&context.desktop_thread_id),
+                "{label}: a genuinely new user request must have a fresh attempt budget"
+            );
+            drop(tracked);
+            mark_turn_completed(&context.desktop_thread_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_policy_observes_failure_without_reserving_or_altering_the_stream() {
+        crate::usage_events::take_test_stream_activities();
+        let mut context = final_recovery_context("safe-failure-diagnostic");
+        context.max_recoveries = 0;
+        let body = Bytes::from_static(b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n");
+        let mut stream = super::observe_aggressive_recovery(
+            futures::stream::iter(vec![Ok(body.clone())]),
+            Some(context.clone()),
+        );
+        assert_eq!(stream.next().await.unwrap().unwrap(), body);
+        assert!(stream.next().await.is_none());
+        assert!(
+            !crate::proxy::codex_turn_recovery::recovery_reserved_for_test(
+                &context.desktop_thread_id
+            )
+        );
+        let events = crate::usage_events::take_test_stream_activities();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "continuation_disabled");
+    }
+
+    #[tokio::test]
+    async fn safe_policy_observes_json_failure_without_reserving_or_altering_the_stream() {
+        crate::usage_events::take_test_stream_activities();
+        let mut context = final_recovery_context("safe-json-failure-diagnostic");
+        context.max_recoveries = 0;
+        let body = Bytes::from_static(
+            br#"{"object":"response","status":"failed","error":{"code":"server_error","message":"Our servers are currently overloaded. Please try again later."}}"#,
+        );
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.clone()))
+            .unwrap();
+        let response =
+            super::finalize_aggressive_recovery(Ok(response), Some(context.clone())).unwrap();
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            body
+        );
+        assert!(
+            !crate::proxy::codex_turn_recovery::recovery_reserved_for_test(
+                &context.desktop_thread_id
+            )
+        );
+        let events = crate::usage_events::take_test_stream_activities();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "continuation_disabled");
+        assert_eq!(
+            events[0].reason_class.as_deref(),
+            Some("continuation_policy_disabled")
+        );
     }
 
     #[tokio::test(start_paused = true)]

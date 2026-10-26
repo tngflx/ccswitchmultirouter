@@ -173,6 +173,43 @@ export function exportLocalProductionArtifacts(
   return output;
 }
 
+export function buildHistoryRepairSidecar(
+  repoRoot,
+  cargoTargetDir,
+  { run = runBuildCommand, environment = process.env } = {},
+) {
+  const repo = path.resolve(repoRoot);
+  const target = path.resolve(cargoTargetDir);
+  const manifest = path.join(repo, "src-tauri", "Cargo.toml");
+  requireBuildCommandSuccess(
+    run(
+      "cargo",
+      [
+        "build",
+        "--release",
+        "--bin",
+        "codex-history-repairer",
+        "--features",
+        "history-repairer",
+        "--manifest-path",
+        manifest,
+      ],
+      {
+        cwd: repo,
+        env: { ...environment, CARGO_TARGET_DIR: target },
+        stdio: "inherit",
+      },
+    ),
+    "codex-history-repairer sidecar build",
+  );
+  const sidecar = path.join(target, "release", "codex-history-repairer.exe");
+  if (!existsSync(sidecar) || !lstatSync(sidecar).isFile())
+    throw new Error(
+      `codex-history-repairer sidecar was not produced: ${sidecar}`,
+    );
+  return sidecar;
+}
+
 export function invokeLocalProductionBuild(
   repoRoot,
   outputRoot,
@@ -195,6 +232,7 @@ export function invokeLocalProductionBuild(
   try {
     config = createConfig();
     log(`Using isolated Cargo target for this build: ${target}`);
+    buildHistoryRepairSidecar(repo, target, { run, environment });
     requireBuildCommandSuccess(
       run(
         process.execPath,

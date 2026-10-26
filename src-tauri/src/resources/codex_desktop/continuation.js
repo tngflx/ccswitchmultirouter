@@ -194,12 +194,33 @@ const writeCodexContinuationMarker = (key, marker) => {
   markers[key] = { ...marker, writtenAt: Date.now() };
   localStorage.setItem(continuationStorageKey, JSON.stringify(markers));
 };
+const codexContinuationRequestPatchVersion =
+  typeof appServerRequestPatchVersion === "string"
+    ? appServerRequestPatchVersion
+    : "standalone";
+const isCodexContinuationRequestClient = (client) =>
+  Boolean(
+    looksLikeAppServerRequestClient(client) &&
+    Object.getOwnPropertyDescriptor(client, "hostId")?.value === "local" &&
+    codexVerifiedAppServerOriginalRequest(
+      client,
+      codexContinuationRequestPatchVersion,
+    ),
+  );
+// Readiness and mutation share this pure predicate; no Desktop RPC is needed
+// to reject a retained client whose activity hook is absent or replaced.
+state.isCodexContinuationRequestClient = isCodexContinuationRequestClient;
 const readExactCodexContinuationThread = async (client, threadId) => {
   // The compatibility wrapper deliberately changes thread/resume providers.
   // Recovery uses the original client and never resumes or changes providers.
-  const request =
-    codexDeclaredMethod(client, "__ccSwitchOriginalSendRequest") ||
-    codexDeclaredMethod(client, "sendRequest").bind(client);
+  const request = codexVerifiedAppServerOriginalRequest(
+    client,
+    codexContinuationRequestPatchVersion,
+  );
+  if (!isCodexContinuationRequestClient(client) || !request)
+    throw new Error(
+      "Codex Desktop request client was not found with its guarded activity hook",
+    );
   let timer;
   let response;
   try {
@@ -225,8 +246,7 @@ const continuationInstallationIsCurrent = () =>
 const codexContinuationLocalClients = () =>
   (Array.isArray(state.appServerClients) ? state.appServerClients : []).filter(
     (client, index, array) =>
-      looksLikeAppServerRequestClient(client) &&
-      Object.getOwnPropertyDescriptor(client, "hostId")?.value === "local" &&
+      isCodexContinuationRequestClient(client) &&
       array.indexOf(client) === index,
   );
 const prepareCodexContinuation = async (
@@ -339,6 +359,19 @@ const prepareCodexContinuation = async (
             mutationAttempted: false,
             reason:
               "The user changed or stopped the Codex thread before continuation",
+          };
+        if (
+          !isCodexContinuationRequestClient(client) ||
+          codexVerifiedAppServerOriginalRequest(
+            client,
+            codexContinuationRequestPatchVersion,
+          ) !== preparedRequest
+        )
+          return {
+            submitted: false,
+            mutationAttempted: false,
+            reason:
+              "Codex Desktop request client was not found with its guarded activity hook",
           };
         const markerKey = `${threadId}:${failedTurnId}`;
         const previous = readCodexContinuationMarkers()[markerKey];

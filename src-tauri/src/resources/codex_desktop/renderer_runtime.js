@@ -73,6 +73,7 @@
     state.scopedAppServerScopes = new Set();
     state.scopedAppServerScopeCandidates = new Set();
     state.scopedAppServerRegistryClasses = [];
+    state.scopedAppServerRegistryInstances = new Set();
     state.scopedAppServerScopesScannedAt = null;
     state.pendingReactNodes = new Set();
     state.lastReactFullScanAt = 0;
@@ -473,19 +474,34 @@
   };
   const patchRequestClient = (client) => {
     if (!installationIsCurrent()) return false;
-    if (!client || typeof client.sendRequest !== "function") return false;
-    if (!isLocalAppServerTarget(client, null)) return false;
-    state.appServerClients = Array.isArray(state.appServerClients)
-      ? state.appServerClients
-      : [];
-    if (!state.appServerClients.includes(client))
-      state.appServerClients.push(client);
-    if (!appServerRequestClientNeedsPatch(client)) return true;
+    const sendRequest = codexDeclaredMethod(client, "sendRequest");
+    if (!sendRequest || !isLocalAppServerTarget(client, null)) return false;
+    const retainVerifiedClient = () => {
+      state.appServerClients = Array.isArray(state.appServerClients)
+        ? state.appServerClients
+        : [];
+      if (!state.appServerClients.includes(client))
+        state.appServerClients.push(client);
+      return true;
+    };
+    if (
+      !appServerRequestClientNeedsPatch(client) &&
+      codexVerifiedAppServerOriginalRequest(
+        client,
+        appServerRequestPatchVersion,
+      )
+    )
+      return retainVerifiedClient();
     try {
+      const previousOriginal = Object.getOwnPropertyDescriptor(
+        client,
+        "__ccSwitchOriginalSendRequest",
+      )?.value;
       const original =
-        client.__ccSwitchOriginalSendRequest || client.sendRequest.bind(client);
-      client.__ccSwitchOriginalSendRequest = original;
-      client.sendRequest = async function ccSwitchPatchedSendRequest(
+        typeof previousOriginal === "function"
+          ? previousOriginal
+          : sendRequest.bind(client);
+      const wrapper = async function ccSwitchPatchedSendRequest(
         method,
         params,
         options,
@@ -529,11 +545,33 @@
           );
         }
       };
+      Object.defineProperty(wrapper, "__ccSwitchRequestHook", {
+        value: Object.freeze({
+          client,
+          original,
+          version: appServerRequestPatchVersion,
+        }),
+      });
+      client.__ccSwitchOriginalSendRequest = original;
+      client.sendRequest = wrapper;
       client.__ccSwitchModelRequestPatch = appServerRequestPatchVersion;
-      return true;
+      if (
+        codexVerifiedAppServerOriginalRequest(
+          client,
+          appServerRequestPatchVersion,
+        ) !== original
+      )
+        throw new Error(
+          "Codex request client did not accept the guarded activity hook",
+        );
+      return retainVerifiedClient();
     } catch (error) {
-      // rpc-BaVz... also exposes immutable RpcStub objects whose method shape
-      // resembles AppServerRequestClient. Skip them and keep scanning React.
+      // Non-writable real clients can reject assignments silently as well as
+      // throwing. Never retain one without proof that its activity hook owns
+      // the live sendRequest method, even if an older discovery retained it.
+      state.appServerClients = (state.appServerClients || []).filter(
+        (candidate) => candidate !== client,
+      );
       recordFailure(error);
       return false;
     }
@@ -800,16 +838,41 @@
       wallNow >= state.appServerModuleRetryAt
     ) {
       try {
-        // 26.1007+ merges the signal module into app-shared. Discover the
-        // initialized local manager from its declared registry and app scope.
-        try {
-          const shared = await loadAppModule("app-shared-");
-          if (!installationIsCurrent()) return;
-          if (!state.scopedAppServerDiscoveryPromise) {
-            const discovery = patchCodexScopedAppServerClients(
-              shared,
+        // 26.1007+ merges the signal module into app-shared. Current Desktop
+        // bundles export AppServerRegistry from app-server-manager-hooks, while
+        // some older bundles keep only a runtime instance in app-initial.
+        // Discover the explicit hook chunk first, then retain both fallbacks.
+        const discoverScopedModules = async () => {
+          let scopedPatched = 0;
+          const discover = async (module) => {
+            if (!installationIsCurrent()) return 0;
+            const result = await patchCodexScopedAppServerClients(
+              module,
               patchedCaches,
             );
+            return state.scopedAppServerDiscovery?.clientCount || result || 0;
+          };
+          try {
+            const shared = await loadAppModule("app-shared-");
+            scopedPatched = await discover(shared);
+          } catch {}
+          if (scopedPatched === 0) {
+            try {
+              const hooks = await loadAppModule("app-server-manager-hooks-");
+              scopedPatched = await discover(hooks);
+            } catch {}
+          }
+          if (scopedPatched === 0) {
+            try {
+              const initial = await loadAppModule("app-initial-");
+              scopedPatched = await discover(initial);
+            } catch {}
+          }
+          return scopedPatched;
+        };
+        try {
+          if (!state.scopedAppServerDiscoveryPromise) {
+            const discovery = discoverScopedModules();
             state.scopedAppServerDiscoveryPromise = discovery;
             void discovery.catch(recordFailure).finally(() => {
               if (state.scopedAppServerDiscoveryPromise === discovery)
@@ -821,9 +884,11 @@
           modulePatched = state.scopedAppServerDiscovery?.clientCount || 0;
         } catch {}
         if (modulePatched === 0) {
-          const module = await loadAppModule("app-server-manager-signals-");
-          if (!installationIsCurrent()) return;
-          modulePatched = patchAppServerModuleClients(module, patchedCaches);
+          try {
+            const module = await loadAppModule("app-server-manager-signals-");
+            if (!installationIsCurrent()) return;
+            modulePatched = patchAppServerModuleClients(module, patchedCaches);
+          } catch {}
         }
         if (!installationIsCurrent()) return;
         patched += modulePatched;

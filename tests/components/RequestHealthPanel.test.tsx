@@ -289,6 +289,43 @@ describe("RequestHealthPanel", () => {
     ).toBeInTheDocument();
   });
 
+  it.each(["sustained_request_growth", "sustained_uncached_input_growth"])(
+    "shows request-size guidance for the %s anomaly instead of claiming the payload is invalid",
+    (code) => {
+      render(
+        <RequestHealthPanel
+          mode="status"
+          snapshot={{
+            ...snapshot,
+            diagnostics: [
+              {
+                ...snapshot.diagnostics[0],
+                thresholdExceeded: false,
+                tokenLimitExceeded: false,
+                findings: [],
+                anomaly: {
+                  code,
+                  severity: "warning",
+                  count: 3,
+                  detail: "Three large requests grew before upstream dispatch",
+                },
+              },
+            ],
+          }}
+          isRefreshing={false}
+          onRefresh={vi.fn()}
+        />,
+      );
+
+      expect(
+        screen.getByText("settings.requestHealth.findingHelp.size"),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByText("settings.requestHealth.findingHelp.general"),
+      ).not.toBeInTheDocument();
+    },
+  );
+
   it("keeps diagnostics active when review mode is Never prompt", () => {
     render(
       <RequestHealthPanel

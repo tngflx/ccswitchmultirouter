@@ -354,6 +354,7 @@ fn emit_retry_activity(
         model: sanitize_diagnostic_token(&context.model),
         provider_id: sanitize_diagnostic_token(&context.provider_id),
         reason_class: reason_class.map(sanitize_diagnostic_token),
+        retry_after_seconds: None,
     });
 }
 
@@ -1092,7 +1093,7 @@ fn native_responses_sse_error_diagnostic(
     })
 }
 
-fn sanitize_diagnostic_token(value: &str) -> String {
+pub(crate) fn sanitize_diagnostic_token(value: &str) -> String {
     let token: String = value
         .chars()
         .filter(|character| {

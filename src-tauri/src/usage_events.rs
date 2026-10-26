@@ -102,15 +102,29 @@ pub(crate) struct StreamRetryActivity {
     pub(crate) model: String,
     pub(crate) provider_id: String,
     pub(crate) reason_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) retry_after_seconds: Option<u64>,
 }
 
 pub(crate) fn notify_stream_retry_activity(activity: StreamRetryActivity) {
+    #[cfg(test)]
+    TEST_STREAM_ACTIVITIES.with(|items| items.borrow_mut().push(activity.clone()));
     let Some(handle) = APP_HANDLE.get() else {
         return;
     };
     if let Err(error) = handle.emit(EVENT_STREAM_RETRY_ACTIVITY, activity) {
         log::warn!("emit {EVENT_STREAM_RETRY_ACTIVITY} failed: {error}");
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STREAM_ACTIVITIES: std::cell::RefCell<Vec<StreamRetryActivity>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_stream_activities() -> Vec<StreamRetryActivity> {
+    TEST_STREAM_ACTIVITIES.with(|items| std::mem::take(&mut *items.borrow_mut()))
 }
 
 #[cfg(test)]
@@ -140,6 +154,7 @@ mod tests {
             model: "model-1".into(),
             provider_id: "provider-1".into(),
             reason_class: Some("stream_interrupted".into()),
+            retry_after_seconds: None,
         };
 
         assert_eq!(
@@ -170,10 +185,31 @@ mod tests {
             model: "model-1".into(),
             provider_id: "provider-1".into(),
             reason_class: None,
+            retry_after_seconds: None,
         };
         let payload = serde_json::to_value(activity).expect("serialize retry activity");
 
         assert_eq!(payload.get("maxAttempts"), Some(&json!(null)));
         assert_eq!(payload.get("reasonClass"), Some(&json!(null)));
+    }
+    #[test]
+    fn continuation_delay_serializes_without_request_or_error_details() {
+        let payload = serde_json::to_value(StreamRetryActivity {
+            timestamp: "2026-10-23T10:00:00Z".into(),
+            stage: "desktop_continuation".into(),
+            event: "continuation_scheduled".into(),
+            attempt: 1,
+            max_attempts: Some(3),
+            session_id: "fixture".into(),
+            model: "fixture".into(),
+            provider_id: "fixture".into(),
+            reason_class: Some("response_failed".into()),
+            retry_after_seconds: Some(300),
+        })
+        .unwrap();
+        assert_eq!(payload["retryAfterSeconds"], 300);
+        assert!(payload.get("retry_after_seconds").is_none());
+        assert!(payload.get("message").is_none());
+        assert!(payload.get("request").is_none());
     }
 }

@@ -4189,8 +4189,22 @@ const runCodexContinuation = async (threadId, recoveryId, model, observedAtMs) =
         let script = format!(
             r#"
 const state = {{}};
+const verifiedProbeClient = (value) => {{
+  const client = {{ hostId: "local", getCompatibleThreadSortKey() {{}}, supportsPaginatedThreadHistory() {{}}, ...value }};
+  const original = client.__ccSwitchOriginalSendRequest || client.sendRequest?.bind(client);
+  if (typeof original !== "function") return client;
+  const wrapper = async (method, params, options) => {{
+    rememberCodexUserTurnAction(method, params);
+    return original(method, params, options);
+  }};
+  Object.defineProperty(wrapper, "__ccSwitchRequestHook", {{value: Object.freeze({{client, original, version: "standalone"}})}});
+  client.__ccSwitchOriginalSendRequest = original;
+  client.sendRequest = wrapper;
+  client.__ccSwitchModelRequestPatch = "standalone";
+  return client;
+}};
 Object.defineProperty(state, "appServerClients", {{
-  set(clients) {{ this.clients = clients.map((client) => ({{ hostId: "local", getCompatibleThreadSortKey() {{}}, supportsPaginatedThreadHistory() {{}}, ...client }})); }},
+  set(clients) {{ this.clients = clients.map(verifiedProbeClient); }},
   get() {{ return this.clients; }},
 }});
 state.appServerClients = [];
@@ -5271,7 +5285,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
 let proxyPropertyReads = 0;
 let starts = 0;
 const proxy = new Proxy({}, { get() { proxyPropertyReads += 1; return () => { throw new Error("stale RPC stub must not be called"); }; } });
-state.clients = [proxy, {
+state.clients = [proxy, verifiedProbeClient({
   hostId: "local",
   getCompatibleThreadSortKey() {},
   supportsPaginatedThreadHistory() {},
@@ -5279,7 +5293,7 @@ state.clients = [proxy, {
     if (method === "turn/start") { starts += 1; return { turn: { id: "continue-turn" } }; }
     return { thread: { id: "exact-thread", turns: [{ id: "failed-turn", status: "failed" }] } };
   },
-}];
+})];
 void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.now()).then((result) => {
   globalThis.__codexContinuationResult = JSON.stringify({ result, starts, proxyPropertyReads });
 });
@@ -5315,6 +5329,52 @@ void Promise.resolve().then(() => Promise.resolve()).then(() => { firstTimer(); 
         assert_eq!(result["result"]["submitted"], true);
         assert_eq!(result["starts"], 1);
         assert_eq!(result["remoteCalls"], 0);
+    }
+
+    #[test]
+    fn codex_continuation_refuses_unverified_original_marker_and_replaced_hook() {
+        for replacement_after_preparation in [false, true] {
+            let result = run_codex_continuation_probe(&format!(
+                r#"
+const replacementAfterPreparation = {replacement_after_preparation};
+let starts = 0;
+let reads = 0;
+const request = async (method) => {{
+  if (method === "turn/start") {{ starts += 1; return {{turn: {{id: "continued"}}}}; }}
+  reads += 1;
+  return {{thread: {{id: "exact-thread", model: "request-model", turns: [{{id: "failed-turn", status: "failed"}}]}}}};
+}};
+state.appServerClients = [{{sendRequest: request}}];
+const client = state.appServerClients[0];
+if (!replacementAfterPreparation) client.sendRequest = client.__ccSwitchOriginalSendRequest;
+void (async () => {{
+  state.startCodexContinuation("exact-thread", "recovery-1", "request-model", Date.now() - 1000);
+  for (let n = 0; n < 256; n += 1) {{
+    const job = state.readCodexContinuationJob("recovery-1");
+    if (job?.status === "prepared") {{
+      client.sendRequest = client.__ccSwitchOriginalSendRequest;
+      state.commitCodexContinuation("recovery-1");
+    }}
+    if (job?.status === "completed") {{
+      globalThis.__codexContinuationResult = JSON.stringify({{job, starts, reads, hookVerified: state.isCodexContinuationRequestClient(client), markers: readCodexContinuationMarkers()}});
+      return;
+    }}
+    await Promise.resolve();
+  }}
+  throw new Error("The replaced-hook continuation did not finish");
+}})();
+"#
+            ));
+            assert_eq!(result["job"]["submitted"], false);
+            assert_eq!(result["job"]["mutationAttempted"], false);
+            assert_eq!(result["starts"], 0);
+            assert_eq!(
+                result["reads"],
+                if replacement_after_preparation { 2 } else { 0 }
+            );
+            assert_eq!(result["hookVerified"], false);
+            assert_eq!(result["markers"], json!({}));
+        }
     }
 
     #[test]
@@ -6713,6 +6773,102 @@ const clearTimeout = () => {};
     }
 
     #[test]
+    fn reaudit_renderer_continuation_requires_verified_request_hook() {
+        for mode in ["frozen", "nonwritable", "mutable_inherited", "legacy_hook"] {
+            let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+            let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+            let payload = r#"{"modelProvider":"codex_model_router_v2","catalogAvailable":true,"modelNames":["worker"],"models":[{"model":"worker"}]}"#;
+            let script = assemble_codex_renderer_runtime_script(
+                payload,
+                false,
+                true,
+                "verified-request-hook-test",
+            );
+            let setup = renderer_lifecycle_test_setup();
+            context.with(|ctx| {
+                ctx.eval::<(), _>(format!(
+                    r#"
+{setup}
+const mode = {mode:?};
+let reads = 0;
+let starts = 0;
+let legacyCalls = 0;
+const request = async (method, params) => {{
+  if (method === "turn/start") {{
+    starts += 1;
+    return {{ turn: {{ id: "continued-turn" }} }};
+  }}
+  if (method === "thread/read") {{
+    reads += 1;
+    return {{ thread: {{ id: "exact-thread", model: "worker", turns: [{{id: "newer-failed-turn", status: "failed", error: {{message: "Our servers are currently overloaded"}}}}] }} }};
+  }}
+  return {{data: []}};
+}};
+if (mode === "mutable_inherited") {{
+  delete client.sendRequest;
+  delete client.getCompatibleThreadSortKey;
+  delete client.supportsPaginatedThreadHistory;
+  Object.setPrototypeOf(client, {{sendRequest: request, getCompatibleThreadSortKey() {{}}, supportsPaginatedThreadHistory() {{}}}});
+}} else if (mode === "legacy_hook") {{
+  client.__ccSwitchOriginalSendRequest = request;
+  client.__ccSwitchModelRequestPatch = "verified-request-hook-test";
+  client.sendRequest = async () => {{legacyCalls += 1; throw new Error("An unverified legacy wrapper must not be stacked");}};
+}} else {{
+  client.sendRequest = request;
+  if (mode === "frozen") Object.freeze(client);
+  else Object.defineProperty(client, "sendRequest", {{value: request, writable: false, configurable: false}});
+}}
+const installation = {script};
+void installation.then(async () => {{
+  const state = window[{MODEL_PICKER_PATCH_KEY:?}];
+  const retainedBeforeProbe = state.appServerClients.includes(client);
+  // A retained legacy/unpatchable client must be rejected at the mutation
+  // boundary too, not only omitted by a successful discovery pass.
+  if (mode === "frozen" || mode === "nonwritable") {{
+    state.appServerClients.push(client);
+    await client.sendRequest("turn/start", {{threadId: "exact-thread", input: [{{type:"text", text:"a newer user question"}}]}});
+  }}
+  globalThis.__deferDiscovery = true;
+  state.startCodexContinuation("exact-thread", "old-request-recovery", "worker", Date.now() - 1000);
+  for (let n = 0; n < 256; n += 1) {{
+    const job = state.readCodexContinuationJob("old-request-recovery");
+    if (job?.status === "prepared") state.commitCodexContinuation("old-request-recovery");
+    if (job?.status === "completed") {{
+      globalThis.__verifiedHookProbe = JSON.stringify({{retainedBeforeProbe, reads, starts, legacyCalls, submitted: job.submitted, mutationAttempted: job.mutationAttempted}});
+      return;
+    }}
+    await Promise.resolve();
+  }}
+  throw new Error("The hook-ownership probe did not finish");
+}}, error => {{globalThis.__verifiedHookProbeError = String(error);}});
+"#
+                ))
+                .expect("start real renderer hook-ownership probe");
+            });
+            while runtime
+                .execute_pending_job()
+                .expect("run hook-ownership jobs")
+            {}
+            context.with(|ctx| {
+                let result: Value = serde_json::from_str(
+                    &ctx.eval::<String, _>("globalThis.__verifiedHookProbe || globalThis.__verifiedHookProbeError")
+                        .expect("read hook-ownership probe"),
+                )
+                .expect("parse hook-ownership probe");
+                assert_eq!(
+                    result,
+                    if mode == "mutable_inherited" || mode == "legacy_hook" {
+                        json!({"retainedBeforeProbe": true, "reads": 2, "starts": 1, "legacyCalls": 0, "submitted": true, "mutationAttempted": true})
+                    } else {
+                        json!({"retainedBeforeProbe": false, "reads": 0, "starts": 1, "legacyCalls": 0, "submitted": false, "mutationAttempted": false})
+                    },
+                    "request-hook ownership must be authoritative for {mode} clients"
+                );
+            });
+        }
+    }
+
+    #[test]
     fn reaudit_background_history_failure_is_handled_and_retried_without_stopping_picker() {
         let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
         let unhandled = std::sync::Arc::new(std::sync::atomic::AtomicIsize::new(0));
@@ -6920,6 +7076,7 @@ oldInstallation.then(() => {{ globalThis.__oldCompleted = true; }});
         assert!(script.contains("patchCodexModelReasoningQueryClient(value, patchedCaches)"));
         assert!(script.contains("state.scopedAppServerScopeCandidates = new Set()"));
         assert!(script.contains("state.scopedAppServerRegistryClasses = []"));
+        assert!(script.contains("state.scopedAppServerRegistryInstances = new Set()"));
         assert!(script.contains("for (const cache of state.reasoningQueryCaches?.keys() || [])"));
         assert!(script.contains("state.reactInitialDiscoveryCompleted = false"));
         assert!(script.contains("for (const cache of reasoningQueryCachesToRebind)"));
@@ -7105,6 +7262,203 @@ void (async () => {{
             let result: String = ctx.eval("globalThis.__scopedClientDiscoveryResult").expect("read scoped discovery result");
             let result: Value = serde_json::from_str(&result).expect("parse scoped discovery result");
             assert_eq!(result, json!({ "firstCount": 1, "secondCount": 1, "remoteCount": 0, "patched": ["first", "second"], "registryMutations": 0, "scopeScans": 1, "queryClientReads": 3 }));
+        });
+    }
+
+    #[test]
+    fn app_server_scoped_discovery_uses_runtime_registry_instances_without_optional_methods() {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = format!(
+            r#"
+const state = {{}};
+const patched = [];
+let queryClientReads = 0;
+const patchRequestClient = (client) => {{ patched.push(client.id); return true; }};
+const monotonicNow = () => 1;
+const yieldReactDiscovery = async () => {{}};
+const recordFailure = (error) => {{ throw error; }};
+const document = {{ getElementById() {{ return null; }} }};
+class Client {{
+  constructor(id) {{ this.id = id; this.hostId = "local"; }}
+  sendRequest() {{}}
+  getCompatibleThreadSortKey() {{}}
+  supportsPaginatedThreadHistory() {{}}
+}}
+const manager = {{ requestClient: new Client("runtime-instance") }};
+const scope = {{ chain: {{}}, node: {{}}, get queryClient() {{ queryClientReads += 1; return {{}}; }}, get: () => manager, set() {{}}, watch() {{}} }};
+class RuntimeRegistry {{
+  constructor(scope) {{ this.scope = scope; }}
+  getForHostId(host) {{ return this.scope.get(host); }}
+  getAll() {{}}
+  getImplForHostId(host) {{ return this.scope.get(host); }}
+}}
+const current = {{ memoizedProps: {{ appServerRegistry: new RuntimeRegistry(scope) }} }};
+const window = {{ __codexRoot: {{ _internalRoot: {{ current }} }} }};
+const module = {{}};
+{}
+void (async () => {{
+  const count = await patchCodexScopedAppServerClients(module);
+  globalThis.__runtimeRegistryResult = JSON.stringify({{ count, patched, queryClientReads }});
+}})();
+"#,
+            app_server_module_client_discovery_core_script()
+        );
+        context
+            .with(|ctx| ctx.eval::<(), _>(script))
+            .expect("start runtime registry discovery probe");
+        while runtime
+            .execute_pending_job()
+            .expect("execute runtime registry discovery job")
+        {}
+        context.with(|ctx| {
+            let result: String = ctx
+                .eval("globalThis.__runtimeRegistryResult")
+                .expect("read runtime registry discovery result");
+            let result: Value =
+                serde_json::from_str(&result).expect("parse runtime registry result");
+            assert_eq!(
+                result,
+                json!({ "count": 1, "patched": ["runtime-instance"], "queryClientReads": 1 })
+            );
+        });
+    }
+
+    #[test]
+    fn renderer_discovery_uses_app_server_manager_hooks_chunk() {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let payload = r#"{"modelProvider":"codex_model_router_v2","catalogAvailable":true,"modelNames":["worker"],"models":[{"model":"worker"}]}"#;
+        let script = assemble_codex_renderer_runtime_script(
+            payload,
+            false,
+            true,
+            "app-initial-fallback-test",
+        );
+        let setup = renderer_lifecycle_test_setup();
+        context.with(|ctx| {
+            ctx.eval::<(), _>(format!(
+                r#"
+{setup}
+const scope = {{
+  chain: {{}}, node: {{}}, queryClient: {{
+    getQueryCache() {{ return {{ getAll: () => [] }}; }},
+    getQueryData() {{}}, setQueryData() {{}},
+  }},
+  get(key) {{ return key === "local" ? manager : []; }},
+  set() {{}}, watch() {{}},
+}};
+root.__reactContainerTest.memoizedProps.scope = scope;
+class AppServerRegistry {{
+  scope;
+  constructor(scope) {{ this.scope = scope; }}
+  getForHostId(host) {{ return this.scope.get(host); }}
+  getImplForHostId(host) {{ return this.scope.get(host); }}
+  getAll() {{ return []; }}
+}}
+window[{MODEL_PICKER_PATCH_KEY:?}] = {{
+  modulePromises: new Map([
+    ["app-shared-", Promise.resolve({{}})],
+    ["app-server-manager-hooks-", Promise.resolve({{AppServerRegistry}})],
+  ]),
+}};
+const installation = {script};
+installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, error => {{ globalThis.__fallbackInstallationError = String(error); }});
+"#
+            ))
+            .expect("start app-server-manager-hooks probe");
+        });
+        while runtime
+            .execute_pending_job()
+            .expect("run app-server-manager-hooks jobs")
+        {}
+        context.with(|ctx| {
+            let result: Value = serde_json::from_str(
+                &ctx
+                    .eval::<String, _>(format!(
+                        r#"JSON.stringify({{
+                          status: globalThis.__fallbackInstallation?.status || null,
+                          error: globalThis.__fallbackInstallationError || null,
+                          appServerPatchInstalled: window[{MODEL_PICKER_PATCH_KEY:?}]?.appServerPatchInstalled || false,
+                          clientCount: window[{MODEL_PICKER_PATCH_KEY:?}]?.scopedAppServerDiscovery?.clientCount || 0,
+                        }})"#
+                    ))
+                    .expect("read app-server-manager-hooks result"),
+            )
+            .expect("parse app-initial fallback result");
+            assert_eq!(result["status"], "ok");
+            assert_eq!(result["error"], Value::Null);
+            assert_eq!(result["appServerPatchInstalled"], true);
+            assert_eq!(result["clientCount"], 1);
+        });
+    }
+
+    #[test]
+    fn renderer_discovery_falls_back_to_app_initial_registry_chunk() {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let payload = r#"{"modelProvider":"codex_model_router_v2","catalogAvailable":true,"modelNames":["worker"],"models":[{"model":"worker"}]}"#;
+        let script = assemble_codex_renderer_runtime_script(
+            payload,
+            false,
+            true,
+            "app-initial-fallback-test",
+        );
+        let setup = renderer_lifecycle_test_setup();
+        context.with(|ctx| {
+            ctx.eval::<(), _>(format!(
+                r#"
+{setup}
+const scope = {{
+  chain: {{}}, node: {{}}, queryClient: {{
+    getQueryCache() {{ return {{ getAll: () => [] }}; }},
+    getQueryData() {{}}, setQueryData() {{}},
+  }},
+  get(key) {{ return key === "local" ? manager : []; }},
+  set() {{}}, watch() {{}},
+}};
+root.__reactContainerTest.memoizedProps.scope = scope;
+class AppServerRegistry {{
+  scope;
+  constructor(scope) {{ this.scope = scope; }}
+  getForHostId(host) {{ return this.scope.get(host); }}
+  getImplForHostId(host) {{ return this.scope.get(host); }}
+  getAll() {{ return []; }}
+}}
+window[{MODEL_PICKER_PATCH_KEY:?}] = {{
+  modulePromises: new Map([
+    ["app-shared-", Promise.resolve({{}})],
+    ["app-initial-", Promise.resolve({{AppServerRegistry}})],
+  ]),
+}};
+const installation = {script};
+installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, error => {{ globalThis.__fallbackInstallationError = String(error); }});
+"#
+            ))
+            .expect("start app-initial fallback probe");
+        });
+        while runtime
+            .execute_pending_job()
+            .expect("run app-initial fallback jobs")
+        {}
+        context.with(|ctx| {
+            let result: Value = serde_json::from_str(
+                &ctx
+                    .eval::<String, _>(format!(
+                        r#"JSON.stringify({{
+                          status: globalThis.__fallbackInstallation?.status || null,
+                          error: globalThis.__fallbackInstallationError || null,
+                          appServerPatchInstalled: window[{MODEL_PICKER_PATCH_KEY:?}]?.appServerPatchInstalled || false,
+                          clientCount: window[{MODEL_PICKER_PATCH_KEY:?}]?.scopedAppServerDiscovery?.clientCount || 0,
+                        }})"#
+                    ))
+                    .expect("read app-initial fallback result"),
+            )
+            .expect("parse app-initial fallback result");
+            assert_eq!(result["status"], "ok");
+            assert_eq!(result["error"], Value::Null);
+            assert_eq!(result["appServerPatchInstalled"], true);
+            assert_eq!(result["clientCount"], 1);
         });
     }
 

@@ -261,6 +261,7 @@ export interface StreamRetryActivity {
   model: string;
   providerId: string;
   reasonClass: string | null;
+  retryAfterSeconds?: number;
 }
 
 export interface CodexGuardianStatus {

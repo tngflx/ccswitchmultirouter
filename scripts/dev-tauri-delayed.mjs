@@ -8,6 +8,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -24,7 +25,7 @@ import {
   commitPlannedDevExit,
   stopPlannedWindowsApp,
 } from "./dev-app-exit.mjs";
-import { utcTicks } from "./ccswitchmulti-guardian-core.mjs";
+import { parseGuardianJson, utcTicks } from "./ccswitchmulti-guardian-core.mjs";
 import {
   devRecoveryLogPath,
   spawnDevRecoveryProcess,
@@ -234,8 +235,9 @@ export function readDevRunMarkerPresent(
     return false;
   }
   try {
-    const marker = JSON.parse(read(markerPath, "utf8"));
+    const marker = parseGuardianJson(read(markerPath, "utf8"));
     return (
+      validDevFiletime(expected.processStartedAtTicks) &&
       marker.pid === expected.pid &&
       marker.processStartedAtTicks === expected.processStartedAtTicks &&
       path.resolve(marker.executablePath).toLowerCase() ===
@@ -916,18 +918,44 @@ export function windowsDevWorkerDescendants(
   return descendants.sort((left, right) => right.depth - left.depth);
 }
 
-function queryWindowsProcesses(processId) {
+export function queryWindowsProcesses(
+  processId,
+  { runQuery = runWindowsJsonQuery } = {},
+) {
   if (processId !== undefined && !Number.isInteger(processId)) {
     throw new Error("A process query requires an integer PID.");
   }
   const script = windowsJsonQueryCommand(
-    [
-      `Get-CimInstance Win32_Process${processId === undefined ? "" : ` -Filter 'ProcessId = ${processId}'`} -ErrorAction Stop |`,
-      "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate |",
-      "ConvertTo-Json -Compress",
-    ].join(" "),
+    `$ErrorActionPreference = 'Stop'
+Get-CimInstance Win32_Process${processId === undefined ? "" : ` -Filter 'ProcessId = ${processId}'`} -ErrorAction Stop |
+ForEach-Object {
+  $row = $_ | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate
+  if ($row.Name -ieq 'cc-switch.exe') {
+    $native = $null
+    try {
+      $native = Get-Process -Id $row.ProcessId -ErrorAction Stop
+      $null = $native.Handle
+      $nativeStartedAt = $native.StartTime.ToUniversalTime()
+      # CIM retains microseconds, while the retained native handle retains
+      # 100ns FILETIME. Bind the sources at CIM precision, then publish the
+      # exact native value as a string; never round a native identity to Number.
+      if ($native.Path -ine $row.ExecutablePath -or
+          ($nativeStartedAt.Ticks - ($nativeStartedAt.Ticks % 10)) -ne
+          ([DateTimeOffset]$row.CreationDate).UtcTicks -or $native.HasExited) {
+        throw 'Development app native process identity changed.'
+      }
+      $row | Add-Member -NotePropertyName NativeStartedAtFiletime -NotePropertyValue $nativeStartedAt.ToFileTimeUtc().ToString([Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+      # A racing exit or denied native query is not authority for a planned
+      # stop. Keep inventory usable, but omit the unverified native identity.
+    } finally {
+      if ($null -ne $native) { $native.Dispose() }
+    }
+  }
+  $row
+} | ConvertTo-Json -Compress`,
   );
-  const stdout = runWindowsJsonQuery(script, "process");
+  const stdout = runQuery(script, "process");
   if (!stdout.trim()) {
     return [];
   }
@@ -990,6 +1018,10 @@ export function sameWindowsProcess(left, right) {
     return false;
   }
   return (
+    (left?.NativeStartedAtFiletime === undefined ||
+      right?.NativeStartedAtFiletime === undefined ||
+      (validDevFiletime(left.NativeStartedAtFiletime) &&
+        left.NativeStartedAtFiletime === right.NativeStartedAtFiletime)) &&
     Number(left?.ProcessId) === Number(right?.ProcessId) &&
     String(left?.Name ?? "").toLowerCase() ===
       String(right?.Name ?? "").toLowerCase() &&
@@ -997,6 +1029,174 @@ export function sameWindowsProcess(left, right) {
       path.resolve(rightExecutable).toLowerCase() &&
     leftStartedAtUtc === rightStartedAtUtc
   );
+}
+
+const FILETIME_UNIX_OFFSET = 116444736000000000n;
+const validDevFiletime = (value) =>
+  typeof value === "string" &&
+  /^[1-9]\d{0,19}$/.test(value) &&
+  BigInt(value) <= 18446744073709551615n;
+
+function nativeDevProcessFiletime(processInfo) {
+  const value = processInfo?.NativeStartedAtFiletime;
+  if (!validDevFiletime(value)) return undefined;
+  try {
+    const nativeTicks = BigInt(value);
+    // This is only the native-to-CIM binding check. The ready/marker identity
+    // below still requires equality with every exact native 100ns tick.
+    return nativeTicks - (nativeTicks % 10n) ===
+      utcTicks(processInfo.CreationDate) + FILETIME_UNIX_OFFSET
+      ? value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// This identity comes losslessly from the owning backend's ready packet. Never
+// infer its marker directory from the device-local settings path: the app-config
+// root may be overridden independently. Compare exact retained-handle FILETIME,
+// not a Number or reconstructed CIM timestamp. The native planned stop also
+// revalidates the retained process and marker at the mutation boundary.
+export function devAppIdentityMatchesProcess(identity, processInfo) {
+  if (
+    !Number.isInteger(identity?.pid) ||
+    identity.pid < 1 ||
+    Number(processInfo?.ProcessId) !== identity.pid ||
+    String(processInfo?.Name).toLowerCase() !== "cc-switch.exe" ||
+    typeof identity.executablePath !== "string" ||
+    !path.isAbsolute(identity.executablePath) ||
+    !validDevFiletime(identity.processStartedAtTicks) ||
+    typeof identity.markerPath !== "string" ||
+    !path.isAbsolute(identity.markerPath) ||
+    path.basename(identity.markerPath).toLowerCase() !==
+      "app-run-marker.json" ||
+    path.basename(path.dirname(identity.markerPath)).toLowerCase() !== "logs" ||
+    typeof processInfo.ExecutablePath !== "string" ||
+    path.resolve(identity.executablePath).toLowerCase() !==
+      path.resolve(processInfo.ExecutablePath).toLowerCase()
+  )
+    return false;
+  try {
+    return (
+      nativeDevProcessFiletime(processInfo) ===
+        identity.processStartedAtTicks &&
+      (identity.processStartedAtUtc === undefined ||
+        utcTicks(identity.processStartedAtUtc) ===
+          utcTicks(processInfo.CreationDate))
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Compatibility for an already-running older launcher which never persisted a
+// ready identity. A guessed default location is not authority: accept it only
+// after exact process and canonical config-scope verification, then require the
+// native mutation boundary to re-read a still-present marker.
+export function legacyDevAppIdentityForPlannedStop(
+  processInfo,
+  {
+    environment = process.env,
+    read = readFileSync,
+    resolveConfigPath = realpathSync,
+  } = {},
+) {
+  const markerPath = resolveDevRunMarkerPath(environment);
+  if (!markerPath) return undefined;
+  try {
+    const marker = parseGuardianJson(read(markerPath, "utf8"));
+    const configRoot = resolveConfigPath(
+      path.dirname(path.dirname(markerPath)),
+    );
+    let normalizedRoot = path.resolve(configRoot).replaceAll("/", "\\");
+    if (normalizedRoot.startsWith("\\\\?\\UNC\\"))
+      normalizedRoot = "\\\\" + normalizedRoot.slice(8);
+    else if (normalizedRoot.startsWith("\\\\?\\"))
+      normalizedRoot = normalizedRoot.slice(4);
+    const configScope = createHash("sha256")
+      .update(normalizedRoot.toLowerCase())
+      .digest("hex")
+      .slice(0, 16);
+    const expectedTicks = nativeDevProcessFiletime(processInfo);
+    if (
+      marker.configScope !== configScope ||
+      typeof marker.startedAt !== "string" ||
+      !marker.startedAt.trim() ||
+      !validDevFiletime(marker.processStartedAtTicks) ||
+      marker.processStartedAtTicks !== expectedTicks
+    )
+      return undefined;
+    const identity = {
+      pid: marker.pid,
+      executablePath: marker.executablePath,
+      processStartedAtTicks: marker.processStartedAtTicks,
+      processStartedAtUtc: processInfo.CreationDate,
+      markerPath,
+    };
+    return devAppIdentityMatchesProcess(identity, processInfo)
+      ? identity
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function createDevRootRecord(
+  message,
+  processes,
+  { repoRoot = REPO_ROOT, platform = process.platform } = {},
+) {
+  if (
+    message?.type !== "dev-root" ||
+    !["tauri", "vite"].includes(message.role) ||
+    !Number.isInteger(message.pid) ||
+    message.pid < 1
+  )
+    return undefined;
+  const identity =
+    platform === "win32"
+      ? processes.find(
+          (candidate) => Number(candidate.ProcessId) === message.pid,
+        )
+      : null;
+  if (platform === "win32") {
+    if (!identity || String(identity.Name).toLowerCase() !== "node.exe")
+      return undefined;
+    const command = String(identity.CommandLine ?? "")
+      .replaceAll("\\", "/")
+      .toLowerCase();
+    const rootScript =
+      message.role === "tauri"
+        ? "node_modules/@tauri-apps/cli/tauri.js"
+        : "node_modules/vite/bin/vite.js";
+    if (!command.includes(rootScript)) return undefined;
+  }
+  const root = { pid: message.pid, role: message.role, identity };
+  if (message.appIdentity !== undefined) {
+    if (message.role !== "tauri" || platform !== "win32") return undefined;
+    const app = windowsDevDescendants(processes, message.pid, repoRoot).find(
+      (candidate) =>
+        candidate.kind === "app" &&
+        candidate.ProcessId === message.appIdentity?.pid,
+    );
+    if (!devAppIdentityMatchesProcess(message.appIdentity, app))
+      return undefined;
+    root.appIdentity = {
+      pid: message.appIdentity.pid,
+      executablePath: message.appIdentity.executablePath,
+      processStartedAtTicks: message.appIdentity.processStartedAtTicks,
+      processStartedAtUtc: app.CreationDate,
+      markerPath: message.appIdentity.markerPath,
+    };
+  }
+  return root;
+}
+
+function devAppIdentitiesFromRoots(roots = []) {
+  return (Array.isArray(roots) ? roots : [])
+    .filter((root) => root.role === "tauri" && root.appIdentity)
+    .map((root) => root.appIdentity);
 }
 
 export function windowsProcessObservationCrashed(observed, current) {
@@ -1188,6 +1388,8 @@ export async function stopVerifiedWindowsApp(
     forcedTimeoutMs = WINDOWS_PROCESS_EXIT_TIMEOUT_MS,
     plannedExitReason,
     plannedAppExits,
+    appIdentities = [],
+    readLegacyAppIdentity = legacyDevAppIdentityForPlannedStop,
     stopPlannedApp = stopPlannedWindowsApp,
     writeEvent = writeDevLifecycleEvent,
     log = console.log,
@@ -1222,9 +1424,19 @@ export async function stopVerifiedWindowsApp(
       plannedExitReason &&
       String(processInfo.Name).toLowerCase() === "cc-switch.exe"
     ) {
-      plannedProof = stopPlannedApp(processInfo, {
-        markerPath: resolveDevRunMarkerPath(),
+      const appIdentity = appIdentities.length
+        ? appIdentities.find((identity) =>
+            devAppIdentityMatchesProcess(identity, current),
+          )
+        : readLegacyAppIdentity(current);
+      if (!appIdentity)
+        throw new Error(
+          "The live development app has no verified runtime marker identity; exit it gracefully before restarting development (legacy/default marker could not be verified).",
+        );
+      plannedProof = stopPlannedApp(current, {
+        markerPath: appIdentity.markerPath,
         reason: plannedExitReason,
+        requireMarker: true,
       });
       writeEvent("dev-planned-app-stop", {
         app_pid: processInfo.ProcessId,
@@ -1292,6 +1504,8 @@ export async function stopWindowsProcess(
     expectedRootIdentity,
     plannedExitReason,
     plannedAppExits,
+    appIdentities,
+    readLegacyAppIdentity,
     stopPlannedApp,
     log = console.log,
   } = {},
@@ -1341,6 +1555,8 @@ export async function stopWindowsProcess(
         waitForListenersReleased,
         plannedExitReason,
         plannedAppExits,
+        appIdentities,
+        readLegacyAppIdentity,
         stopPlannedApp,
         log,
       });
@@ -2160,24 +2376,37 @@ export async function runDetachedDevWatchdog(
   }
 }
 
-function sendDevRoot(role, child) {
+function sendDevRoot(role, child, appIdentity) {
   if (process.connected)
-    process.send({ type: "dev-root", role, pid: child.pid });
+    process.send({
+      type: "dev-root",
+      role,
+      pid: child.pid,
+      ...(appIdentity ? { appIdentity } : {}),
+    });
 }
 
-async function cleanRecordedDevRoots(roots, options = {}) {
+export async function cleanRecordedDevRoots(
+  roots,
+  {
+    queryProcesses = queryWindowsProcesses,
+    stopProcess = stopWindowsProcess,
+    platform = process.platform,
+    ...options
+  } = {},
+) {
   for (const root of roots) {
     const select =
       root.role === "tauri"
         ? windowsDevDescendants
         : windowsFrontendDescendants;
-    if (process.platform === "win32") {
-      const current = queryWindowsProcesses().find(
+    if (platform === "win32") {
+      const current = queryProcesses().find(
         (candidate) => Number(candidate.ProcessId) === root.pid,
       );
       if (current && !sameWindowsProcess(root.identity, current)) continue;
       const child = { pid: root.pid, exitCode: 0, signalCode: null };
-      await stopWindowsProcess(
+      await stopProcess(
         child,
         (processes, pid) => [
           ...select(processes, pid),
@@ -2193,6 +2422,8 @@ async function cleanRecordedDevRoots(roots, options = {}) {
         ],
         {
           ...options,
+          queryProcesses,
+          appIdentities: devAppIdentitiesFromRoots([root]),
           terminateRoot: true,
           expectedRootIdentity: root.identity,
         },
@@ -2207,9 +2438,17 @@ async function cleanRecordedDevRoots(roots, options = {}) {
   }
 }
 
-async function cleanRecordedDevWorker(session, options = {}) {
+export async function cleanRecordedDevWorker(
+  session,
+  {
+    queryProcesses = queryWindowsProcesses,
+    stopProcess = stopWindowsProcess,
+    platform = process.platform,
+    ...options
+  } = {},
+) {
   if (!Number.isInteger(session?.workerPid)) return;
-  if (process.platform !== "win32") {
+  if (platform !== "win32") {
     try {
       process.kill(-session.workerPid, "SIGTERM");
     } catch (error) {
@@ -2217,7 +2456,7 @@ async function cleanRecordedDevWorker(session, options = {}) {
     }
     return;
   }
-  const current = queryWindowsProcesses().find(
+  const current = queryProcesses().find(
     (candidate) => Number(candidate.ProcessId) === session.workerPid,
   );
   if (!current) return;
@@ -2230,10 +2469,16 @@ async function cleanRecordedDevWorker(session, options = {}) {
       Date.parse(windowsProcessStartedAtUtc(current)) >=
         Date.parse(session.startedAtUtc);
   if (!matchesIdentity) return;
-  await stopWindowsProcess(
+  await stopProcess(
     { pid: session.workerPid, exitCode: 0, signalCode: null },
     windowsDevWorkerDescendants,
-    { ...options, terminateRoot: true, expectedRootIdentity: current },
+    {
+      ...options,
+      queryProcesses,
+      appIdentities: devAppIdentitiesFromRoots(session.roots),
+      terminateRoot: true,
+      expectedRootIdentity: current,
+    },
   );
 }
 
@@ -2492,6 +2737,7 @@ async function runDevSupervisor(launchArgs) {
             void releaseLaunch();
           }
           worker.on("message", (message) => {
+            if (worker !== sessionWorker) return;
             if (handoff.acknowledge(sessionWorker, message)) {
               writeDevLifecycleEvent("dev-live-owner-handoff", {
                 supervisor_pid: process.pid,
@@ -2505,18 +2751,12 @@ async function runDevSupervisor(launchArgs) {
               !Number.isInteger(message.pid)
             )
               return;
-            const identity =
-              process.platform === "win32"
-                ? queryWindowsProcesses().find(
-                    (candidate) => Number(candidate.ProcessId) === message.pid,
-                  )
-                : null;
-            if (process.platform === "win32" && !identity) return;
-            roots.set(message.role, {
-              pid: message.pid,
-              role: message.role,
-              identity,
-            });
+            const root = createDevRootRecord(
+              message,
+              process.platform === "win32" ? queryWindowsProcesses() : [],
+            );
+            if (!root) return;
+            roots.set(message.role, root);
             saveSession();
           });
           return worker;
@@ -2673,6 +2913,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
   ]);
   sendDevRoot("vite", vite);
   let tauri;
+  const appIdentitiesByTauri = new WeakMap();
   let backendWatchers = [];
   let shuttingDown = false;
   let restartInProgress = false;
@@ -2824,7 +3065,6 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     let outputTail = "";
     let appStarted = false;
     const sessionStartedAt = Date.now();
-    let appIdentity;
     let observedAppProcess;
     let processQueryFailed = false;
     const reconnectTracker = createDevReconnectTracker();
@@ -2864,34 +3104,54 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
       }
     });
 
-    const packetReader = createDevWatchdogOutputReader((packet) => {
-      if (tauri !== child || shuttingDown) {
-        return;
-      }
-      if (
-        packet.event === "ready" &&
-        Number.isInteger(packet.pid) &&
-        packet.pid > 0 &&
-        typeof packet.executablePath === "string" &&
-        isPathInside(path.join(TAURI_DIR, "target"), packet.executablePath) &&
-        Number.isFinite(packet.processStartedAtTicks) &&
-        typeof packet.markerPath === "string"
-      ) {
-        appIdentity = packet;
-        if (process.platform === "win32") {
-          try {
-            observedAppProcess = queryWindowsProcesses(packet.pid).find(
-              (candidate) => Number(candidate.ProcessId) === packet.pid,
-            );
-          } catch {
-            // A failed OS query is not proof that the app crashed.
+    const packetReader = createDevWatchdogOutputReader(
+      (packet) => {
+        if (tauri !== child || shuttingDown) {
+          return;
+        }
+        if (
+          packet.event === "ready" &&
+          Number.isInteger(packet.pid) &&
+          packet.pid > 0 &&
+          typeof packet.executablePath === "string" &&
+          isPathInside(path.join(TAURI_DIR, "target"), packet.executablePath) &&
+          validDevFiletime(packet.processStartedAtTicks) &&
+          typeof packet.markerPath === "string"
+        ) {
+          if (process.platform === "win32") {
+            try {
+              const processes = queryWindowsProcesses();
+              const root = createDevRootRecord(
+                {
+                  type: "dev-root",
+                  role: "tauri",
+                  pid: child.pid,
+                  appIdentity: packet,
+                },
+                processes,
+              );
+              if (root?.appIdentity) {
+                appIdentitiesByTauri.set(child, root.appIdentity);
+                observedAppProcess = processes.find(
+                  (candidate) => Number(candidate.ProcessId) === packet.pid,
+                );
+                sendDevRoot("tauri", child, root.appIdentity);
+              }
+            } catch {
+              // A failed OS query is not proof that the app crashed and cannot
+              // authorize a planned stop against a guessed config directory.
+            }
+          } else {
+            appIdentitiesByTauri.set(child, packet);
           }
         }
-      }
-      reconnectTracker.observe(packet);
-    });
+        reconnectTracker.observe(packet);
+      },
+      { parsePacket: parseGuardianJson },
+    );
 
     const backendProcessCrashed = () => {
+      const appIdentity = appIdentitiesByTauri.get(child);
       if (process.platform !== "win32" || !observedAppProcess || !appIdentity) {
         return false;
       }
@@ -2903,7 +3163,11 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     const recovery = createDevWorkerRecovery({
       isCurrent: () => !shuttingDown && !restartInProgress && tauri === child,
       readMarkerPresent: () =>
-        readDevRunMarkerPresent(process.env, readFileSync, appIdentity),
+        readDevRunMarkerPresent(
+          process.env,
+          readFileSync,
+          appIdentitiesByTauri.get(child),
+        ),
       isRecoveryNeeded: (reason) =>
         reason === "reconnect-loop"
           ? reconnectTracker.recoveryReason() === reason
@@ -2924,7 +3188,11 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
           processQueryFailed = false;
           if (
             crashed &&
-            readDevRunMarkerPresent(process.env, readFileSync, appIdentity)
+            readDevRunMarkerPresent(
+              process.env,
+              readFileSync,
+              appIdentitiesByTauri.get(child),
+            )
           ) {
             recovery.request("backend-process-crashed");
           }
@@ -2976,6 +3244,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
         return;
       }
       if (!shuttingDown && tauri === child) {
+        const appIdentity = appIdentitiesByTauri.get(child);
         const uncleanExit = appIdentity
           ? readDevRunMarkerPresent(process.env, readFileSync, appIdentity)
           : isDevCrashMarker(readDevRunMarker(), sessionStartedAt);
@@ -3023,7 +3292,12 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
       }
       await runPlannedDevCleanup(
         (options) =>
-          stopProcessTree(previousTauri, windowsDevDescendants, options),
+          stopProcessTree(previousTauri, windowsDevDescendants, {
+            ...options,
+            appIdentities: [appIdentitiesByTauri.get(previousTauri)].filter(
+              Boolean,
+            ),
+          }),
         "development_backend_reload",
       );
       // Detach only after verified cleanup. Until then shutdown must retain
@@ -3062,7 +3336,10 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     closeBackendWatchers();
     process.exitCode = exitCode;
     const stopBackend = (options) =>
-      stopProcessTree(tauri, windowsDevDescendants, options);
+      stopProcessTree(tauri, windowsDevDescendants, {
+        ...options,
+        appIdentities: [appIdentitiesByTauri.get(tauri)].filter(Boolean),
+      });
     const intentional = [0, 130, 143].includes(exitCode);
     shutdownPromise = Promise.allSettled([
       intentional

@@ -1617,8 +1617,12 @@ describe("CodexMultiRouterWizard", () => {
   });
 
   it("moves to saveFailed state when publishing the generated plan fails", async () => {
-    vi.mocked(commitCodexProviderSetBatch).mockRejectedValueOnce(
-      new Error("db locked"),
+    let rejectCommit!: (error: Error) => void;
+    vi.mocked(commitCodexProviderSetBatch).mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectCommit = reject;
+        }),
     );
 
     renderWithQueryClient(
@@ -1639,11 +1643,16 @@ describe("CodexMultiRouterWizard", () => {
     });
     fireEvent.click(publishButtons[publishButtons.length - 1]);
 
-    expect(
-      await screen.findByText("State machine:saveFailed"),
-    ).toBeInTheDocument();
-    expect(screen.getByText("MultiRouter save failed")).toBeInTheDocument();
-    expect(screen.getAllByText("db locked").length).toBeGreaterThan(0);
+    await waitFor(() =>
+      expect(commitCodexProviderSetBatch).toHaveBeenCalledTimes(1),
+    );
+    rejectCommit(new Error("db locked"));
+    // The workflow status and issue panel can settle in separate renders.
+    await waitFor(() => {
+      expect(screen.getByText("State machine:saveFailed")).toBeInTheDocument();
+      expect(screen.getByText("MultiRouter save failed")).toBeInTheDocument();
+      expect(screen.getAllByText("db locked").length).toBeGreaterThan(0);
+    });
   });
 
   it("saves a renamed curated plan without requiring manual subagent selection", async () => {

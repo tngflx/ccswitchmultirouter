@@ -17,6 +17,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   assertLocalProductionOutputRoot,
+  buildHistoryRepairSidecar,
   invokeLocalProductionBuild,
   parseLocalBuildOptions,
   resolveLocalProductionOutputRoot,
@@ -83,8 +84,27 @@ function controlledRunner(
   const run = (executable, args, options) => {
     calls.push({ executable, args, options });
     if (executable === "cargo") {
+      const target = options.env.CARGO_TARGET_DIR;
+      if (args[0] === "build") {
+        assert.deepEqual(args, [
+          "build",
+          "--release",
+          "--bin",
+          "codex-history-repairer",
+          "--features",
+          "history-repairer",
+          "--manifest-path",
+          path.join(options.cwd, "src-tauri", "Cargo.toml"),
+        ]);
+        mkdirSync(path.join(target, "release"), { recursive: true });
+        writeFileSync(
+          path.join(target, "release", "codex-history-repairer.exe"),
+          "history repair helper",
+        );
+        return { status: 0 };
+      }
       assert.equal(args[0], "clean");
-      const target = args[args.indexOf("--target-dir") + 1];
+      assert.equal(args[args.indexOf("--target-dir") + 1], target);
       if (cleanupError) return { status: 4 };
       rmSync(target, { recursive: true, force: true });
       return { status: 0 };
@@ -136,6 +156,62 @@ test("production output defaults and relative overrides resolve against the repo
   );
 });
 
+test("history repair sidecar build uses the isolated target and canonical feature", (t) => {
+  const { root } = fixture(t);
+  const target = mkdtempSync(path.join(os.tmpdir(), "ccsm-sidecar-target-"));
+  t.after(() => rmSync(target, { recursive: true, force: true }));
+  const calls = [];
+  const sidecar = buildHistoryRepairSidecar(root, target, {
+    environment: { CARGO_TARGET_DIR: "caller-owned-target" },
+    run(executable, args, options) {
+      calls.push({ executable, args, options });
+      mkdirSync(path.join(target, "release"), { recursive: true });
+      writeFileSync(
+        path.join(target, "release", "codex-history-repairer.exe"),
+        "history repair helper",
+      );
+      return { status: 0 };
+    },
+  });
+  assert.equal(
+    sidecar,
+    path.join(target, "release", "codex-history-repairer.exe"),
+  );
+  assert.deepEqual(calls, [
+    {
+      executable: "cargo",
+      args: [
+        "build",
+        "--release",
+        "--bin",
+        "codex-history-repairer",
+        "--features",
+        "history-repairer",
+        "--manifest-path",
+        path.join(root, "src-tauri", "Cargo.toml"),
+      ],
+      options: {
+        cwd: root,
+        env: { CARGO_TARGET_DIR: target },
+        stdio: "inherit",
+      },
+    },
+  ]);
+});
+
+test("history repair sidecar build fails closed when Cargo omits the helper", (t) => {
+  const { root } = fixture(t);
+  const target = mkdtempSync(path.join(os.tmpdir(), "ccsm-sidecar-target-"));
+  t.after(() => rmSync(target, { recursive: true, force: true }));
+  assert.throws(
+    () =>
+      buildHistoryRepairSidecar(root, target, {
+        run: () => ({ status: 0 }),
+      }),
+    /codex-history-repairer sidecar was not produced/,
+  );
+});
+
 test("successful isolated build preserves binaries/resources after cleanup and leaves caller environment unchanged", (t) => {
   const { root, output } = fixture(t);
   previousOutput(output);
@@ -183,7 +259,9 @@ test("successful isolated build preserves binaries/resources after cleanup and l
   assert.equal(existsSync(target), false);
   assert.equal(existsSync(config), false);
   assert.equal(environment.CARGO_TARGET_DIR, "caller-owned-target");
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 4);
+  assert.equal(calls[1].executable, "cargo");
+  assert.equal(calls[2].executable, process.execPath);
   assert.equal(
     JSON.parse(readFileSync(path.join(output, "LOCAL-BUILD.json"), "utf8"))
       .generatedBy,
@@ -594,7 +672,17 @@ console.error('successful fixture build progress');`;
   writeFileSync(path.join(cliRoot, "tauri.js"), cli);
   const run = (executable, args, options) => {
     if (executable === "cargo") {
-      rmSync(args.at(-1), { recursive: true, force: true });
+      const target = options.env.CARGO_TARGET_DIR;
+      if (args[0] === "build") {
+        mkdirSync(path.join(target, "release"), { recursive: true });
+        writeFileSync(
+          path.join(target, "release", "codex-history-repairer.exe"),
+          "history repair helper",
+        );
+        return { status: 0 };
+      }
+      assert.equal(args[0], "clean");
+      rmSync(target, { recursive: true, force: true });
       return { status: 0 };
     }
     assert.equal(executable, process.execPath);

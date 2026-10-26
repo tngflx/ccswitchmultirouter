@@ -578,7 +578,7 @@
         "streamRetrySafeDescription": "意味のある出力を送信する前に限り、確定済みの同じリクエストで再接続します。",
         "streamRetryAggressive": "積極的",
         "streamRetryAggressiveDescription": "安全な再接続に加え、ターン中断後に Codex Desktop の継続を制限付きで許可します。",
-        "streamRetryContinuationPrerequisite": "continue の自動送信には、CCSwitchMulti から Codex Desktop を起動する必要があります。実行中の Codex を完全に終了し、「モデルメニューのロック解除」から起動してください。Codex が新しい continue ターンを受け付けると、送信を確認できます。",
+        "streamRetryContinuationPrerequisite": "自動継続には、準備の整った Codex Desktop のデバッグブリッジとローカルリクエストクライアントが必要です。デバッグポートがすでに利用できる場合は、まず「Unlock model picker」で実行中のアプリを修復してください。ポートがない場合に限り、作業を保存して Codex Desktop を完全終了し、同じ操作でデバッグを有効にして再起動してください。Codex が新しい「continue」ターンを受け付けた場合のみ、送信を確認できます。",
         "streamRetryMaxAttempts": "継続試行回数",
         "streamRetryMaxAttemptsDescription": "1 回の Codex Desktop ターンで許可する意味的な継続の最大試行回数です。",
         "running": "実行中",
@@ -3821,8 +3821,30 @@
         "retry_scheduled": "再試行を予定",
         "reconnected": "再接続成功",
         "reconnect_failed": "再接続失敗",
-        "retries_exhausted": "再試行上限"
+        "retries_exhausted": "再試行上限",
+        "continuation_scheduled": "継続を予約済み",
+        "continuation_submitted": "継続を送信済み",
+        "continuation_disabled": "ポリシーにより継続無効",
+        "continuation_not_scheduled": "継続未予約",
+        "continuation_submit_failed": "継続の準備失敗",
+        "continuation_outcome_unknown": "継続の配信未確認",
+        "continuation_cancelled": "継続をキャンセル済み"
+      },
+      "stages": {
+        "desktop_continuation": "失敗チャットの継続"
       }
+    },
+    "continuation": {
+      "disabled": "Safe/Off モードでは失敗したチャットを自動継続しません。出力済みのターンが失敗した後に、ストリーム再接続だけでは「continue」を送信できません。",
+      "enable": "自動継続を有効化（Aggressive）",
+      "bridgeUnavailable": "自動継続はブロックされています。Desktop デバッグブリッジが利用不可、または未注入のため「continue」を送信できません。",
+      "readinessUnknown": "Desktop の継続準備を確認できません。再試行がオンでも自動継続が動作する証拠にはなりません。",
+      "prerequisitesDetected": "Desktop ブリッジの前提条件を検出しました。送信前に失敗した正確なチャット、現在のポリシー、プロバイダー、新しいユーザー操作を確認します。継続成功を示すものではありません。",
+      "launchHelp": "Desktop のデバッグポートを検出できませんでした。CC Switch の「Unlock model picker」を使用してください。Codex Desktop がデバッグ無効の状態で起動している場合は、作業を保存して完全終了してから、この操作で再起動してください。CC Switch だけの再起動では不足した起動フラグを追加できません。",
+      "repairHelp": "Desktop のデバッグポートを検出しました。まず CC Switch の「Unlock model picker」で、実行中のアプリの互換ランタイムを修復してください。注入がないことだけを理由に Codex Desktop を完全終了する必要はありません。",
+      "checkHelp": "まず Desktop のガーディアン状態を確認するか、バックグラウンドの継続検証ツールを実行してください。準備状態が不明でもデバッグポートがないとは限りません。その推測だけで進行中のチャットを再起動しないでください。",
+      "schedule": "Aggressive は回復可能な失敗後に5分、以後10分、20分待機します（保存済みの1～3回の上限内）。ユーザー操作、キャンセル、ポリシーやプロバイダーの変更で待機中の処理を中止します。新しい「continue」ターンを開始し、完了済みツール操作を再送しません。",
+      "waitSeconds": "予定待機：{{seconds}} 秒"
     }
   },
   "pi": {

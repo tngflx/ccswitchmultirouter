@@ -23,6 +23,35 @@ const looksLikeAppServerRequestClient = (value) =>
     codexDeclaredMethod(value, "getCompatibleThreadSortKey") &&
     codexDeclaredMethod(value, "supportsPaginatedThreadHistory"),
   );
+// A declared original-request marker alone is not proof that user actions are
+// observed. Frozen/non-writable clients can silently reject the wrapper while
+// retaining callable methods. Verify the installed function's exact ownership.
+const codexVerifiedAppServerOriginalRequest = (client, expectedVersion) => {
+  try {
+    const original = codexDeclaredMethod(
+      client,
+      "__ccSwitchOriginalSendRequest",
+    );
+    const wrapper = codexDeclaredMethod(client, "sendRequest");
+    if (!original || !wrapper || typeof expectedVersion !== "string")
+      return null;
+    const hook = Object.getOwnPropertyDescriptor(
+      wrapper,
+      "__ccSwitchRequestHook",
+    )?.value;
+    if (!hook || typeof hook !== "object") return null;
+    const fields = Object.getOwnPropertyDescriptors(hook);
+    return fields.client?.value === client &&
+      fields.original?.value === original &&
+      fields.version?.value === expectedVersion &&
+      Object.getOwnPropertyDescriptor(client, "__ccSwitchModelRequestPatch")
+        ?.value === expectedVersion
+      ? original
+      : null;
+  } catch {
+    return null;
+  }
+};
 const codexDeclaredModuleValues = (module) => {
   try {
     return Object.values(Object.getOwnPropertyDescriptors(module || {}))
@@ -155,8 +184,8 @@ const codexScopedRegistryClass = (value) => {
       "prototype",
     )?.value;
     if (
-      !["getForHostId", "getAll", "getDefault", "getImplForHostId"].every(
-        (name) => codexDeclaredMethod(prototype, name),
+      !["getForHostId", "getAll", "getImplForHostId"].every((name) =>
+        codexDeclaredMethod(prototype, name),
       )
     )
       return false;
@@ -176,19 +205,47 @@ const codexScopedRegistryClass = (value) => {
     return false;
   }
 };
+const codexScopedRegistryInstance = (value) => {
+  if (!value || typeof value !== "object") return false;
+  try {
+    const fields = Object.getOwnPropertyDescriptors(value);
+    const scope = fields.scope?.value;
+    const prototype = Object.getPrototypeOf(value);
+    if (
+      !codexDeclaredDependencyScope(scope) ||
+      !codexDeclaredMethod(prototype, "getForHostId") ||
+      !codexDeclaredMethod(prototype, "getImplForHostId")
+    )
+      return false;
+    // Current Desktop bundles keep this read-only registry instance in React
+    // hook state instead of exporting its constructor from app-shared. Accept
+    // the instance only when its declared lookup reads the retained scope.
+    const source = Function.prototype.toString.call(
+      codexDeclaredMethod(prototype, "getForHostId"),
+    );
+    return source.includes("this.scope.get(") && !source.includes(".set(");
+  } catch {
+    return false;
+  }
+};
 const codexScopeQueryClient = (scope) => scope?.queryClient || null;
 const codexRendererScopeCandidates = async () => {
   if (!codexClientDiscoveryIsCurrent()) return [];
   const retained = Array.from(
     state.scopedAppServerScopeCandidates || state.scopedAppServerScopes || [],
   ).filter(codexDeclaredDependencyScope);
+  const retainedRegistries = Array.from(
+    state.scopedAppServerRegistryInstances || [],
+  ).filter(codexScopedRegistryInstance);
   const scanStartedAt = Date.now();
   if (
     retained.length &&
     state.scopedAppServerScopesScannedAt != null &&
     scanStartedAt - state.scopedAppServerScopesScannedAt < 30000
-  )
+  ) {
+    state.scopedAppServerRegistryInstances = new Set(retainedRegistries);
     return retained;
+  }
   const roots = [window.__codexRoot?._internalRoot?.current];
   const root = document.getElementById("root");
   for (const key of Object.keys(root || {})) {
@@ -197,9 +254,13 @@ const codexRendererScopeCandidates = async () => {
     roots.push(fiber?.stateNode?.current || fiber);
   }
   const fibers = roots.filter(Boolean);
-  if (!fibers.length) return retained;
+  if (!fibers.length) {
+    state.scopedAppServerRegistryInstances = new Set(retainedRegistries);
+    return retained;
+  }
   const seenFibers = new Set();
   const scopes = new Set();
+  const registryInstances = new Set();
   let cursor = 0;
   for (; cursor < fibers.length && seenFibers.size < 25000;) {
     if (!codexClientDiscoveryIsCurrent()) return [];
@@ -237,6 +298,15 @@ const codexRendererScopeCandidates = async () => {
         )
           continue;
         seenValues.add(value);
+        if (codexScopedRegistryInstance(value)) {
+          registryInstances.add(value);
+          const registryScope = Object.getOwnPropertyDescriptor(
+            value,
+            "scope",
+          )?.value;
+          if (codexDeclaredDependencyScope(registryScope))
+            scopes.add(registryScope);
+        }
         if (codexDeclaredDependencyScope(value)) {
           scopes.add(value);
           continue;
@@ -277,7 +347,11 @@ const codexRendererScopeCandidates = async () => {
   const current = scanWasCapped
     ? Array.from(new Set([...retained, ...scopes]))
     : Array.from(scopes);
+  const currentRegistries = scanWasCapped
+    ? Array.from(new Set([...retainedRegistries, ...registryInstances]))
+    : Array.from(registryInstances);
   state.scopedAppServerScopeCandidates = new Set(current);
+  state.scopedAppServerRegistryInstances = new Set(currentRegistries);
   state.scopedAppServerScopesScannedAt = scanStartedAt;
   return current;
 };
@@ -345,6 +419,30 @@ const refreshCodexScopedAppServerClients = (
         if (host !== "local" || !looksLikeAppServerRequestClient(requestClient))
           continue;
         seenManagers.add(manager);
+        retainedScopes.add(scope);
+        if (seenRequestClients.has(requestClient)) continue;
+        seenRequestClients.add(requestClient);
+        if (patchRequestClient(requestClient)) patched += 1;
+      } catch (error) {
+        recordFailure(error);
+      }
+    }
+    for (const registry of state.scopedAppServerRegistryInstances || []) {
+      if (Object.getOwnPropertyDescriptor(registry, "scope")?.value !== scope)
+        continue;
+      try {
+        const lookup = codexDeclaredMethod(registry, "getForHostId");
+        const manager = lookup.call(registry, "local");
+        const requestClient = Object.getOwnPropertyDescriptor(
+          manager || {},
+          "requestClient",
+        )?.value;
+        const host = Object.getOwnPropertyDescriptor(
+          requestClient || {},
+          "hostId",
+        )?.value;
+        if (host !== "local" || !looksLikeAppServerRequestClient(requestClient))
+          continue;
         retainedScopes.add(scope);
         if (seenRequestClients.has(requestClient)) continue;
         seenRequestClients.add(requestClient);

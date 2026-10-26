@@ -674,8 +674,17 @@ pub(crate) fn forward_error_is_recoverable(error: &super::error::ProxyError) -> 
 
 pub(crate) fn schedule_turn_recovery(context: TurnRecoveryContext, reason: &'static str) {
     let Some(next_attempt) = reserve_recovery(&context) else {
-        if context.desktop_eligible && context.max_recoveries > 0 {
-            log_recovery_event(&context, "not_scheduled", reason, None);
+        if context.desktop_eligible {
+            log_recovery_event(
+                &context,
+                if context.max_recoveries == 0 {
+                    "disabled"
+                } else {
+                    "not_scheduled"
+                },
+                reason,
+                None,
+            );
         }
         return;
     };
@@ -705,6 +714,64 @@ pub(crate) fn schedule_turn_recovery(context: TurnRecoveryContext, reason: &'sta
     ));
 }
 
+/// Logical failed-chat continuation has its own backoff. It never replays the
+/// completed tool calls/text of the failed request. The attempt budget stays in
+/// the existing per-thread ledger, not in a second timer-owned state store.
+fn continuation_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(300 * (1u64 << attempt.saturating_sub(1).min(2)))
+}
+
+async fn wait_for_continuation_backoff(
+    context: &TurnRecoveryContext,
+    next_attempt: u32,
+    binding_is_current: &impl Fn(&TurnRecoveryContext, u32) -> bool,
+) -> bool {
+    let until = tokio::time::Instant::now() + continuation_backoff(next_attempt);
+    loop {
+        if !recovery_is_active(context) {
+            // A new user turn or another owner may clear the reservation while
+            // this task is asleep. Surface that cancellation to the activity
+            // feed instead of making the scheduled retry look like it vanished.
+            log_recovery_event(
+                context,
+                "cancelled",
+                "turn_activity_changed",
+                Some(next_attempt),
+            );
+            return false;
+        }
+        if !binding_is_current(context, next_attempt) {
+            cancel_reserved_recovery(context);
+            log_recovery_event(
+                context,
+                "cancelled",
+                "recovery_settings_or_provider_changed",
+                Some(next_attempt),
+            );
+            return false;
+        }
+        // Refresh the canonical lease during a long wait. Otherwise unrelated
+        // thread activity could prune a third (20-minute) wait at the 15m TTL.
+        if let Ok(mut states) = recovery_states().lock() {
+            if let Some(state) = states.get_mut(&context.desktop_thread_id) {
+                if state
+                    .tracked
+                    .as_ref()
+                    .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
+                {
+                    state.updated_at = Instant::now();
+                    persist_states(&states);
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= until {
+            return true;
+        }
+        tokio::time::sleep_until(until.min(tokio::time::Instant::now() + Duration::from_secs(5)))
+            .await;
+    }
+}
+
 async fn run_turn_recovery<Submit, SubmitFuture, Binding>(
     context: TurnRecoveryContext,
     reason: &'static str,
@@ -717,6 +784,9 @@ async fn run_turn_recovery<Submit, SubmitFuture, Binding>(
         std::future::Future<Output = Result<crate::codex_desktop::CodexContinuationResult, String>>,
     Binding: Fn(&TurnRecoveryContext, u32) -> bool,
 {
+    if !wait_for_continuation_backoff(&context, next_attempt, &binding_is_current).await {
+        return;
+    }
     run_turn_recovery_with_deadline_reporter(
         context,
         reason,
@@ -816,6 +886,15 @@ async fn run_turn_recovery_with_deadline_reporter<Submit, SubmitFuture, Binding,
     let deadline = tokio::time::Instant::now() + DESKTOP_READY_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
         if !recovery_is_active(&context) {
+            // Readiness preparation is still read-only. A manual turn that
+            // supersedes this reservation must remain untouched, but the
+            // previously scheduled activity needs a terminal explanation.
+            log_recovery_event(
+                &context,
+                "cancelled",
+                "turn_activity_changed",
+                Some(next_attempt),
+            );
             return;
         }
         if !binding_is_current(&context, next_attempt) {
@@ -930,6 +1009,29 @@ fn log_recovery_event_with_blocker(
     attempt: Option<u32>,
     readiness_blocker: Option<&'static str>,
 ) {
+    use super::providers::streaming_retry::sanitize_diagnostic_token;
+    crate::usage_events::notify_stream_retry_activity(crate::usage_events::StreamRetryActivity {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        stage: "desktop_continuation".into(),
+        event: format!("continuation_{}", sanitize_diagnostic_token(status)),
+        attempt: attempt.unwrap_or(0),
+        max_attempts: Some(context.max_recoveries),
+        session_id: sanitize_diagnostic_token(&context.session_id),
+        model: sanitize_diagnostic_token(&context.model),
+        provider_id: sanitize_diagnostic_token(&context.provider_id),
+        reason_class: Some(sanitize_diagnostic_token(readiness_blocker.unwrap_or(
+            if status == "disabled" {
+                "continuation_policy_disabled"
+            } else {
+                reason
+            },
+        ))),
+        retry_after_seconds: if status == "scheduled" {
+            attempt.map(|attempt| continuation_backoff(attempt).as_secs())
+        } else {
+            None
+        },
+    });
     let mut fields = vec![
         ("session", context.session_id.clone()),
         ("model", context.model.clone()),
@@ -1155,6 +1257,184 @@ mod tests {
         context.recovery_id.push_str("-next");
         context.observed_at_ms += 1;
         track_turn(context)
+    }
+
+    #[test]
+    fn disabled_continuation_is_reported_in_the_activity_feed() {
+        crate::usage_events::take_test_stream_activities();
+        let context = context("policy-disabled-activity", 0);
+        schedule_turn_recovery(context, "response_failed");
+        let events = crate::usage_events::take_test_stream_activities();
+        assert_eq!(
+            events.len(),
+            1,
+            "Safe/Off must explain why no continue was attempted"
+        );
+        assert_eq!(events[0].stage, "desktop_continuation");
+        assert_eq!(events[0].event, "continuation_disabled");
+        assert_eq!(
+            events[0].reason_class.as_deref(),
+            Some("continuation_policy_disabled")
+        );
+    }
+
+    #[test]
+    fn continuation_deadline_blocker_reaches_activity_not_only_a_log() {
+        crate::usage_events::take_test_stream_activities();
+        let context = context("blocked-activity", 3);
+        log_recovery_event_with_blocker(
+            &context,
+            "submit_failed",
+            "desktop_ready_deadline",
+            Some(1),
+            Some("desktop_cdp_discovery_failed"),
+        );
+        let events = crate::usage_events::take_test_stream_activities();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "continuation_submit_failed");
+        assert_eq!(
+            events[0].reason_class.as_deref(),
+            Some("desktop_cdp_discovery_failed")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_chat_continuation_waits_five_minutes_before_preparing() {
+        let context = context("five-minute-continuation", 3);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        let started = tokio::time::Instant::now();
+        run_turn_recovery(
+            context.clone(),
+            "response_failed",
+            1,
+            |context, _| {
+                assert_eq!(started.elapsed(), Duration::from_secs(300));
+                assert!(authorize_reserved_recovery(&context));
+                std::future::ready(Ok(crate::codex_desktop::CodexContinuationResult {
+                    submitted: true,
+                    mutation_attempted: true,
+                    debug_port: Some(9229),
+                    target_id: None,
+                    message: String::new(),
+                }))
+            },
+            |_, _| true,
+        )
+        .await;
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[test]
+    fn logical_continuation_has_an_independent_bounded_exponential_wait() {
+        assert_eq!(continuation_backoff(1), Duration::from_secs(300));
+        assert_eq!(continuation_backoff(2), Duration::from_secs(600));
+        assert_eq!(continuation_backoff(3), Duration::from_secs(1200));
+        assert_eq!(continuation_backoff(u32::MAX), Duration::from_secs(1200));
+        crate::usage_events::take_test_stream_activities();
+        let context = context("scheduled-activity", 3);
+        log_recovery_event(&context, "scheduled", "response_failed", Some(2));
+        let events = crate::usage_events::take_test_stream_activities();
+        assert_eq!(events[0].retry_after_seconds, Some(600));
+        assert_eq!(events[0].event, "continuation_scheduled");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn third_backoff_heartbeats_the_canonical_lease_before_unrelated_pruning() {
+        let mut pending = context("third-backoff-lease", 3);
+        for attempt in 1..=2 {
+            assert_eq!(reserve_recovery(&pending), Some(attempt));
+            assert!(authorize_reserved_recovery(&pending));
+            assert_eq!(finish_reserved_recovery(&pending, true), attempt);
+            observe_next_continuation(&mut pending).hand_off_to_stream();
+        }
+        assert_eq!(reserve_recovery(&pending), Some(3));
+        assert!(continuation_backoff(3) > RECOVERY_STATE_TTL);
+        {
+            let mut states = recovery_states().lock().unwrap();
+            // Tokio's paused clock does not advance std::time::Instant. Age
+            // only this test's lease, without exposing expired global state
+            // that a parallel test's unrelated reservation could prune.
+            states
+                .get_mut(&pending.desktop_thread_id)
+                .unwrap()
+                .updated_at = Instant::now() - (RECOVERY_STATE_TTL - Duration::from_secs(60));
+        }
+        let beat_started = Instant::now();
+        let binding_is_current = |_: &TurnRecoveryContext, _: u32| true;
+        let mut wait = Box::pin(wait_for_continuation_backoff(
+            &pending,
+            3,
+            &binding_is_current,
+        ));
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        {
+            let states = recovery_states().lock().unwrap();
+            let state = states.get(&pending.desktop_thread_id).unwrap();
+            assert_eq!(state.phase, RecoveryPhase::ReservedRecovery);
+            assert_eq!(state.submitted, 2);
+            assert!(state.updated_at >= beat_started);
+        }
+        let unrelated = context("third-backoff-unrelated-reservation", 1);
+        assert_eq!(reserve_recovery(&unrelated), Some(1));
+        assert!(recovery_is_active(&pending));
+        drop(wait);
+        mark_turn_completed(&pending.desktop_thread_id);
+        mark_turn_completed(&unrelated.desktop_thread_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn policy_change_during_backoff_cancels_without_preparing_a_message() {
+        let context = context("backoff-policy-change", 3);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        let started = tokio::time::Instant::now();
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        run_turn_recovery(
+            context.clone(),
+            "response_failed",
+            1,
+            |_, _| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Err("must not run".into()))
+            },
+            |_, _| started.elapsed() < Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!recovery_is_active(&context));
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_turn_during_backoff_cancels_the_old_reservation() {
+        crate::usage_events::take_test_stream_activities();
+        let context = context("backoff-manual-turn", 3);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let wait = run_turn_recovery(
+            context.clone(),
+            "response_failed",
+            1,
+            |_, _| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Err("must not run".into()))
+            },
+            |_, _| true,
+        );
+        let cancel = async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            begin_turn(&context.desktop_thread_id, false);
+        };
+        tokio::join!(wait, cancel);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!recovery_is_active(&context));
+        let events = crate::usage_events::take_test_stream_activities();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "continuation_cancelled");
+        assert_eq!(
+            events[0].reason_class.as_deref(),
+            Some("turn_activity_changed")
+        );
     }
 
     #[test]
@@ -1539,10 +1819,68 @@ mod tests {
             |_, _| true,
         )
         .await;
-        assert_eq!(started.elapsed(), DESKTOP_READY_TIMEOUT);
+        assert_eq!(
+            started.elapsed(),
+            continuation_backoff(1) + DESKTOP_READY_TIMEOUT
+        );
         assert!(!recovery_is_active(&context));
         assert_eq!(reserve_recovery(&context), None);
         mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_turn_during_readiness_reports_cancellation_and_preserves_the_newer_turn() {
+        crate::usage_events::take_test_stream_activities();
+        let context = context("readiness-manual-turn", 3);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        let mut newer = context.clone();
+        newer.recovery_id = "readiness-newer-user-turn".into();
+        newer.observed_at_ms += 1;
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let prepare = run_turn_recovery_with_deadline_reporter(
+            context.clone(),
+            "response_failed",
+            1,
+            |_, _| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok(crate::codex_desktop::CodexContinuationResult {
+                    submitted: false,
+                    mutation_attempted: false,
+                    debug_port: None,
+                    target_id: None,
+                    message: "Codex Desktop request client was not found".into(),
+                }))
+            },
+            |_, _| true,
+            |_, _, _, _| panic!("a newer user turn is a cancellation, not a readiness deadline"),
+        );
+        let manual_turn = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            begin_turn(&newer.desktop_thread_id, false);
+            track_turn(&newer).hand_off_to_stream();
+        };
+        tokio::join!(prepare, manual_turn);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!recovery_is_active(&context));
+        {
+            let states = recovery_states().lock().unwrap();
+            let state = states.get(&newer.desktop_thread_id).unwrap();
+            assert_eq!(state.phase, RecoveryPhase::ActiveRequest);
+            assert_eq!(state.submitted, 0);
+            assert_eq!(
+                state.tracked.as_ref().unwrap().recovery_id,
+                newer.recovery_id
+            );
+        }
+        let events = crate::usage_events::take_test_stream_activities();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "continuation_cancelled");
+        assert_eq!(events[0].attempt, 1);
+        assert_eq!(
+            events[0].reason_class.as_deref(),
+            Some("turn_activity_changed")
+        );
+        mark_turn_completed(&newer.desktop_thread_id);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1699,7 +2037,10 @@ mod tests {
             |_, _| true,
         )
         .await;
-        assert_eq!(started.elapsed(), DESKTOP_READY_TIMEOUT);
+        assert_eq!(
+            started.elapsed(),
+            continuation_backoff(1) + DESKTOP_READY_TIMEOUT
+        );
         assert!(!recovery_is_active(&context));
         assert_eq!(reserve_recovery(&context), Some(1));
         mark_turn_completed(&context.desktop_thread_id);
@@ -2103,7 +2444,10 @@ mod tests {
             old_stream.collect::<Vec<_>>().await;
             let states = recovery_states().lock().unwrap();
             let state = states.get(&newer.desktop_thread_id).unwrap();
-            assert_eq!(state.tracked.as_ref().unwrap().recovery_id, newer.recovery_id);
+            assert_eq!(
+                state.tracked.as_ref().unwrap().recovery_id,
+                newer.recovery_id
+            );
             assert_eq!(state.phase, RecoveryPhase::ActiveRequest);
             drop(states);
             drop(tracked);
