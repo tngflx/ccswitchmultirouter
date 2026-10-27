@@ -66,6 +66,7 @@ const createHarness = (
     pauseDiscovery?: boolean;
     pauseInstallation?: boolean;
     retainClient?: boolean;
+    requestHook?: "verified" | "unverified" | "stale-version";
   } = {},
 ) => {
   const state = {} as ContinuationState;
@@ -137,13 +138,35 @@ const createHarness = (
     () => {},
     () => currentInstallation,
   ) as {
-    rememberCodexUserTurnAction: (method: string, params: object) => void;
+    rememberCodexUserTurnAction: (method: string, params: unknown) => void;
     readCodexContinuationMarkers: () => object;
     codexContinuationTerminalErrorCode: (
       event: string,
       payload: unknown,
     ) => string | null;
   };
+  if (discoveryOptions.requestHook !== "unverified") {
+    // Model the production wrapper's activity tracking and ownership metadata
+    // without installing the unrelated renderer discovery/normalization stack.
+    // The real discovery predicate must still verify every retained client.
+    const original = client.sendRequest.bind(client);
+    const version =
+      discoveryOptions.requestHook === "stale-version"
+        ? "stale-continuation-fixture"
+        : "standalone";
+    const wrapper: typeof client.sendRequest = async (method, params) => {
+      api.rememberCodexUserTurnAction(method, params);
+      return original(method, params);
+    };
+    Object.defineProperty(wrapper, "__ccSwitchRequestHook", {
+      value: Object.freeze({ client, original, version }),
+    });
+    Object.assign(client, {
+      __ccSwitchOriginalSendRequest: original,
+      sendRequest: wrapper,
+      __ccSwitchModelRequestPatch: version,
+    });
+  }
   state.appServerClients =
     (discoveryOptions.pauseDiscovery || discoveryOptions.pauseInstallation) &&
     !discoveryOptions.retainClient
@@ -423,6 +446,29 @@ describe("Codex Desktop continuation authorization", () => {
       vi.useRealTimers();
     }
   });
+
+  it.each(["unverified", "stale-version"] as const)(
+    "rejects a %s request client without reading or mutating the thread",
+    async (requestHook) => {
+      const harness = createHarness(false, undefined, "failed", {
+        requestHook,
+      });
+      harness.start();
+      await flushJobs();
+
+      expect(harness.job()).toMatchObject({
+        status: "completed",
+        submitted: false,
+        mutationAttempted: false,
+        reason: "Codex Desktop request client was not found",
+      });
+      expect(harness.readCount()).toBe(0);
+      harness.state.commitCodexContinuation("recovery-id");
+      await flushJobs();
+      expect(harness.startTurn).not.toHaveBeenCalled();
+      expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+    },
+  );
 
   it("reports a proven readiness failure when there is no local client or discovery", async () => {
     const harness = createHarness();
