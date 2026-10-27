@@ -78,13 +78,15 @@ pub fn requires_max_completion_tokens(model: &str) -> bool {
 /// Supported families:
 /// - o-series: o1, o3, o4-mini, etc.
 /// - GPT-5+: gpt-5, gpt-5.1, gpt-5.4, gpt-5-codex, etc.
-/// - xAI Grok Build models. `grok-4.5` is the current documented Grok Build
-///   model; retain the previous `grok-build-*` family for saved providers.
+/// - xAI Grok 4.x with numeric minor >= 5; retain `grok-build-*` for saved providers.
 pub fn supports_reasoning_effort(model: &str) -> bool {
     let normalized = model.to_lowercase();
     requires_max_completion_tokens(&normalized)
-        || normalized == "grok-4.5"
-        || normalized.starts_with("grok-4.5-")
+        || normalized
+            .strip_prefix("grok-4.")
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|minor| minor.parse::<u32>().ok())
+            .is_some_and(|minor| minor >= 5)
         || normalized.starts_with("grok-build-")
 }
 
@@ -117,7 +119,13 @@ pub fn resolve_reasoning_effort(body: &Value) -> Option<&'static str> {
             "max"
                 if matches!(
                     model.to_ascii_lowercase().as_str(),
-                    "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-6-astra"
+                    "gpt-5.6"
+                        | "gpt-5.6-sol"
+                        | "gpt-5.6-terra"
+                        | "gpt-5.6-luna"
+                        | "gpt-6-astra"
+                        | "gpt-6-sol"
+                        | "gpt-6-luna"
                 ) =>
             {
                 Some("max")
@@ -1783,6 +1791,59 @@ mod tests {
     fn test_output_config_max_preserved_for_gpt_6_astra() {
         let body = json!({"model": "gpt-6-astra", "output_config": {"effort": "max"}});
         assert_eq!(resolve_reasoning_effort(&body), Some("max"));
+    }
+
+    #[test]
+    fn upstream_sync_preserves_max_effort_for_gpt6_sol_and_luna() {
+        for model in ["gpt-6-sol", "gpt-6-luna", "GPT-6-SOL", "GPT-6-LUNA"] {
+            let body = json!({"model": model, "output_config": {"effort": "max"}});
+            assert_eq!(resolve_reasoning_effort(&body), Some("max"), "{model}");
+            let chat = anthropic_to_openai_with_reasoning_content(
+                json!({"model": model, "messages": [], "output_config": {"effort": "max"}}),
+                false,
+            )
+            .unwrap();
+            assert_eq!(chat["reasoning_effort"], "max", "{model}");
+        }
+        for model in [
+            "gpt-5.4",
+            "gpt-6-other",
+            "gpt-6-sol-custom",
+            "gpt-6-luna-custom",
+            "",
+        ] {
+            let body = json!({"model": model, "output_config": {"effort": "max"}});
+            assert_eq!(resolve_reasoning_effort(&body), Some("xhigh"), "{model}");
+        }
+    }
+
+    #[test]
+    fn upstream_sync_grok_reasoning_effort_covers_numeric_minor_versions() {
+        for model in [
+            "grok-4.5",
+            "grok-4.6",
+            "grok-4.7",
+            "grok-4.10-build",
+            "GROK-4.10",
+            "grok-build-0.1",
+        ] {
+            assert!(supports_reasoning_effort(model), "{model}");
+            let result = anthropic_to_openai_with_reasoning_content(
+                json!({"model": model, "messages": [], "output_config": {"effort": "high"}}),
+                false,
+            )
+            .unwrap();
+            assert_eq!(result["reasoning_effort"], "high", "{model}");
+        }
+        for model in [
+            "grok-4",
+            "grok-4.4",
+            "grok-4.",
+            "grok-4.build",
+            "grok-4.4294967296",
+        ] {
+            assert!(!supports_reasoning_effort(model), "{model}");
+        }
     }
 
     #[test]

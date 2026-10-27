@@ -30,6 +30,25 @@ const PORT_OWNERSHIP_GUARD_PREFIX: &str = "PORT_OWNERSHIP_GUARD";
 /// Codex 接管时暴露给官方客户端的本地代理入口名称。
 const CODEX_LOCAL_PROXY_PROVIDER_NAME: &str = "CCSwitch MultiRouter";
 
+fn codex_remote_compaction_capability_for_provider(provider: Option<&Provider>) -> Option<Item> {
+    let config = provider?
+        .settings_config
+        .get("config")?
+        .as_str()?
+        .parse::<DocumentMut>()
+        .ok()?;
+    let active_provider_id = config.get("model_provider")?.as_str()?;
+    config
+        .get("model_providers")?
+        .as_table_like()?
+        .get(active_provider_id)?
+        .as_table_like()?
+        .get("capabilities")?
+        .as_table_like()?
+        .get("remote_compaction")
+        .cloned()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LiveRestorePolicy {
     RestoreBackup,
@@ -4777,6 +4796,8 @@ impl ProxyService {
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or(CODEX_LOCAL_PROXY_PROVIDER_NAME)
         };
+        let remote_compaction_capability =
+            codex_remote_compaction_capability_for_provider(provider);
 
         doc["model_provider"] = toml_edit::value(proxy_provider_id);
         doc.as_table_mut().remove("base_url");
@@ -4800,6 +4821,11 @@ impl ProxyService {
             toml_edit::value(crate::codex_config::CODEX_MANAGED_REQUEST_MAX_RETRIES as i64);
         doc["model_providers"][proxy_provider_id]["stream_max_retries"] =
             toml_edit::value(crate::codex_config::CODEX_MANAGED_STREAM_MAX_RETRIES as i64);
+        if let Some(capability) = remote_compaction_capability {
+            doc["model_providers"][proxy_provider_id]["capabilities"] = toml_edit::table();
+            doc["model_providers"][proxy_provider_id]["capabilities"]["remote_compaction"] =
+                capability;
+        }
 
         if is_multirouter {
             // 自定义 provider 不继承 Codex 内建 openai 的 capability defaults。
@@ -9385,6 +9411,164 @@ experimental_bearer_token = "PROXY_MANAGED"
 
         assert_eq!(route["requires_openai_auth"].as_bool(), Some(true));
         assert!(route.get("experimental_bearer_token").is_none());
+    }
+
+    #[test]
+    fn codex_proxy_projection_preserves_only_active_remote_compaction_capability() {
+        let cases = [
+            (
+                "Relay",
+                Some("v2"),
+                Some("unsupported"),
+                "Relay",
+                Some("v2"),
+            ),
+            (
+                "OpenAI",
+                Some("unsupported"),
+                Some("v2"),
+                "OpenAI",
+                Some("unsupported"),
+            ),
+            ("Relay", None, Some("v2"), "Relay", None),
+        ];
+
+        for (
+            active_name,
+            active_capability,
+            other_capability,
+            expected_name,
+            expected_capability,
+        ) in cases
+        {
+            let active_capability = active_capability
+                .map(|value| format!("remote_compaction = \"{value}\"\n"))
+                .unwrap_or_default();
+            let other_capability = other_capability
+                .map(|value| format!("remote_compaction = \"{value}\"\n"))
+                .unwrap_or_default();
+            let provider = Provider::with_id(
+                "relay".to_string(),
+                "Relay".to_string(),
+                json!({
+                    "config": format!(
+                        "model_provider = \"active\"\n\
+                [model_providers.active]\nname = \"{active_name}\"\n\
+                [model_providers.active.capabilities]\n{active_capability}external_web_access = true\n\
+                [model_providers.other]\nname = \"Other\"\n\
+                [model_providers.other.capabilities]\n{other_capability}"
+                    )
+                }),
+                None,
+            );
+            let first = ProxyService::apply_codex_proxy_toml_config_for_provider(
+                "",
+                "http://127.0.0.1:5000/v1",
+                Some(&provider),
+            )
+            .expect("project provider capability");
+            let repeated = ProxyService::apply_codex_proxy_toml_config_for_provider(
+                &first,
+                "http://127.0.0.1:5000/v1",
+                Some(&provider),
+            )
+            .expect("repeat provider projection");
+            let parsed: toml::Value = toml::from_str(&first).expect("valid projected TOML");
+            let repeated: toml::Value =
+                toml::from_str(&repeated).expect("valid repeated projected TOML");
+            let route_id = crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID;
+            let route = &parsed["model_providers"][route_id];
+            let repeated_route = &repeated["model_providers"][route_id];
+
+            assert_eq!(route, repeated_route, "projection must be idempotent");
+            assert_eq!(route["name"].as_str(), Some(expected_name));
+            assert_eq!(route["base_url"].as_str(), Some("http://127.0.0.1:5000/v1"));
+            assert_eq!(route["requires_openai_auth"].as_bool(), Some(true));
+            assert_eq!(
+                route["experimental_bearer_token"].as_str(),
+                Some(PROXY_TOKEN_PLACEHOLDER)
+            );
+            assert_eq!(
+                route
+                    .get("capabilities")
+                    .and_then(|capabilities| capabilities.get("remote_compaction"))
+                    .and_then(toml::Value::as_str),
+                expected_capability
+            );
+            assert!(
+                route
+                    .get("capabilities")
+                    .and_then(toml::Value::as_table)
+                    .is_none_or(|capabilities| capabilities.len()
+                        == usize::from(expected_capability.is_some())),
+                "only remote_compaction may be copied from provider capabilities"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_proxy_source_switch_clears_previous_compaction_capability() {
+        let previous = Provider::with_id(
+            "previous".to_string(),
+            "Previous".to_string(),
+            json!({
+                "config": r#"model_provider = "previous"
+[model_providers.previous]
+name = "Previous"
+[model_providers.previous.capabilities]
+remote_compaction = "v2"
+"#
+            }),
+            None,
+        );
+        let first = ProxyService::apply_codex_proxy_toml_config_for_provider(
+            "",
+            "http://127.0.0.1:5000/v1",
+            Some(&previous),
+        )
+        .expect("project previous provider");
+        let next = Provider::with_id(
+            "next".to_string(),
+            "Next".to_string(),
+            json!({
+                "config": r#"model_provider = "next"
+[model_providers.next]
+name = "Next"
+[model_providers.next.capabilities]
+external_web_access = true
+"#
+            }),
+            None,
+        );
+        let switched = ProxyService::apply_codex_proxy_toml_config_for_provider(
+            &first,
+            "http://127.0.0.1:5000/v1",
+            Some(&next),
+        )
+        .expect("project next provider");
+        let repeated = ProxyService::apply_codex_proxy_toml_config_for_provider(
+            &switched,
+            "http://127.0.0.1:5000/v1",
+            Some(&next),
+        )
+        .expect("repeat next provider projection");
+        let parsed: toml::Value = toml::from_str(&switched).expect("valid switched TOML");
+        let repeated: toml::Value = toml::from_str(&repeated).expect("valid repeated TOML");
+        let route_id = crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID;
+        let route = &parsed["model_providers"][route_id];
+
+        assert_eq!(
+            route, &repeated["model_providers"][route_id],
+            "switch projection must stay stable when reapplied"
+        );
+        assert_eq!(route["name"].as_str(), Some("Next"));
+        assert_eq!(route["base_url"].as_str(), Some("http://127.0.0.1:5000/v1"));
+        assert_eq!(route["requires_openai_auth"].as_bool(), Some(true));
+        assert_eq!(
+            route["experimental_bearer_token"].as_str(),
+            Some(PROXY_TOKEN_PLACEHOLDER)
+        );
+        assert!(route.get("capabilities").is_none());
     }
 
     #[test]
