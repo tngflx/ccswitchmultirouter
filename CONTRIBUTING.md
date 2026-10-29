@@ -87,6 +87,47 @@ configured attempt limit. Known active turns are saved for recovery after an
 app crash, and resumed after the proxy is restored. Normal completion, user
 cancellation, and a clean app quit clear that recovery state.
 
+### This fork's Git remotes
+
+This checkout pushes to `tngflx/ccswitchmultirouter`, not the upstream projects.
+After cloning, install the repository-local safeguards once:
+
+```bash
+pnpm git:remotes:install
+pnpm git:remotes:check
+```
+
+The installer keeps the current branch checked out, binds existing branches to
+same-name `origin` branches, and sets `origin` as the default push remote.
+Other remotes keep their fetch URLs but receive disabled push URLs. New local
+branches inherit the safe defaults and same-name tracking on first push.
+No fetch, branch creation, push, build, or global Git configuration change is
+performed by installation.
+
+The local pre-push hook checks the actual destination, all effective `origin`
+push URLs (including Git URL rewrites), and branch overrides. HTTPS and standard
+GitHub SSH forms of this repository are accepted; credentials embedded in URLs,
+other repositories, mirror mode, and custom default push refspecs are rejected.
+Ref updates must publish a same-name `refs/heads/*` branch (or `HEAD` resolving to
+the current branch); tags, deletions, cross-branch refspecs, detached `HEAD`, and
+non-fast-forward updates are rejected. The guard cannot tell whether a
+fast-forward update was requested with `--force`, so do not force-push.
+It uses the installed Node executable directly, so VSCode does not need `node`
+on its Git process's PATH. Existing hooks or a configured `core.hooksPath` are
+preserved; the installer refuses to overwrite them. Compose this guard with
+that setup explicitly rather than disabling existing hooks.
+
+Run `pnpm test:git-remotes` for isolated Git regressions (no GitHub requests).
+`pnpm upstream:check` rejects the protected name `origin` and refuses to rewrite
+existing remote URLs. New upstream-analysis remotes are fetch-only.
+
+Hooks are local and are **not transferred by cloning**; repeat installation in
+new checkouts. This is accidental-push protection, not a server-side security
+boundary: changing/removing hooks or using `--no-verify` can bypass local hooks.
+Git may connect to a destination before the pre-push hook rejects it, but the
+hook rejects the update before any refs are sent. Never bypass the guard just
+to make a push succeed.
+
 ### Local Production Build (Windows)
 
 ```powershell
@@ -278,6 +319,38 @@ PowerShell 7 命令。
 模式还会在配置的次数限制内向发生失败的 Codex Desktop 对话发送 `continue`。
 已知的活动轮次会保存到本地，应用崩溃后在代理恢复就绪时继续运行。
 正常完成、用户取消或正常退出应用都会清理恢复状态。
+
+### 此分支的 Git 远程仓库
+
+此仓库只能推送到 `tngflx/ccswitchmultirouter`，不能推送到上游项目。
+克隆后安装一次本地保护：
+
+```bash
+pnpm git:remotes:install
+pnpm git:remotes:check
+```
+
+安装不会切换或创建分支、拉取、推送、构建，也不会修改全局 Git 配置。
+现有本地分支绑定到 `origin` 同名分支；新分支首次推送时沿用安全默认值。
+其他远程保留拉取地址，但推送地址被禁用。
+
+`pre-push` 钩子检查实际目标、Git URL 重写后的所有 `origin` 推送地址及
+分支覆盖配置。允许此仓库的 HTTPS 和标准 GitHub SSH 地址；拒绝其他仓库、
+URL 内嵌凭据、镜像推送和自定义默认推送 refspec。引用更新必须发布同名的
+`refs/heads/*` 分支（或解析到当前分支的 `HEAD`）；标签、删除、跨分支
+refspec、分离的 `HEAD` 和非快进更新都会被拒绝。钩子无法判断快进更新是否
+带有 `--force`，因此不要强制推送。钩子直接使用安装时的 Node 可执行文件，
+因此不依赖 VSCode Git 进程的 PATH。已有钩子或 `core.hooksPath` 不会被覆盖；
+需要显式集成，不能为安装此保护而禁用原有钩子。
+
+`pnpm test:git-remotes` 使用隔离的本地 Git 仓库测试，不访问 GitHub。
+`pnpm upstream:check` 禁止使用 `origin` 名称，并拒绝悄悄修改已有远程地址；
+新建的上游分析远程只允许拉取。
+
+钩子不会随克隆自动安装，新工作区须重新运行安装命令。这是防误操作保护，
+不是服务端权限边界；删除或修改钩子、使用 `--no-verify` 仍可绕过本地保护。
+Git 可能在执行钩子前连接目标，但被拒绝的推送不会更新远程引用。
+不要为让推送通过而绕过保护。
 
 ### Windows 本地生产构建
 

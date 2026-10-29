@@ -113,6 +113,55 @@ jobs:
         if: needs.scope.outputs.scope != 'docs'
         run: python -m unittest discover -s scripts/tests -p test_hosted_web_search_canary.py
 
+  git-remotes:
+    name: Git Remote Safety (${{ matrix.os }})
+    needs: scope
+    if: ${{ always() }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Require successful change classification
+        shell: bash
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          CHANGE_SCOPE: ${{ needs.scope.outputs.scope }}
+        run: |
+          test "$SCOPE_RESULT" = success
+          if [ "$CHANGE_SCOPE" = docs ]; then
+            echo "Documentation-only change: Git remote safety is satisfied without runtime setup."
+          fi
+
+      - name: Checkout
+        if: needs.scope.outputs.scope != 'docs'
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        if: needs.scope.outputs.scope != 'docs'
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+
+      - name: Require PowerShell 7 and Git
+        if: needs.scope.outputs.scope != 'docs'
+        shell: pwsh
+        run: |
+          if ($PSVersionTable.PSEdition -ne "Core" -or $PSVersionTable.PSVersion.Major -lt 7) {
+            throw "PowerShell 7 is required for Git remote safety regression checks."
+          }
+          Get-Command pwsh -ErrorAction Stop | Out-Null
+          Get-Command git -ErrorAction Stop | Out-Null
+          $PSVersionTable.PSVersion.ToString()
+          git --version
+          if ($LASTEXITCODE -ne 0) { throw "Git must be available for remote safety regression checks." }
+
+      - name: Git remote safety regression checks
+        if: needs.scope.outputs.scope != 'docs'
+        run: node --test scripts/git-remote-safety.node-test.mjs scripts/check-upstream-updates.node-test.mjs
+
   rustfmt:
     name: Rust Formatting
     needs: scope

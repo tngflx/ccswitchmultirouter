@@ -5,6 +5,25 @@ covers general contribution style, branching, and i18n; do not duplicate those
 rules here. A more-specific nested `AGENTS.md` may add constraints for its
 subtree, but must not silently weaken these repository invariants.
 
+## Git Remote Ownership
+
+- This checkout belongs to `tngflx/ccswitchmultirouter`. `origin` is the only
+  writable named remote; BigStrongSun and other upstream remotes are fetch-only.
+  Never repoint `origin` while checking or assimilating upstream work.
+- Stay on the user's current branch (`main` by default here). Do not create a
+  feature branch/worktree or switch branches unless the user explicitly asks.
+- Before any push, run `pnpm git:remotes:check` and verify the intended same-name
+  `origin` branch. Use an explicit `git push origin <branch>:<branch>`; do not
+  force-push, publish to another remote, or silently change tracking targets.
+- Install the local safeguard with `pnpm git:remotes:install` after cloning.
+  It pins push defaults/tracking and installs a fail-closed pre-push guard.
+  Never bypass it with `--no-verify`, replace existing hooks, or disable it to
+  make a push succeed. If another hook setup exists, preserve it and report the
+  integration requirement rather than overwriting it.
+- `pnpm upstream:check` is read-only with respect to existing remote ownership:
+  a mismatching remote must fail, not be silently rewritten. Upstream updates
+  do not authorize changing this repository's push destination.
+
 ## Change Discipline
 
 - Inspect `git status --short`, the relevant implementation, and existing
