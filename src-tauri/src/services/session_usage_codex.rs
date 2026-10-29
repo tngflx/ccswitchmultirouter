@@ -16,6 +16,14 @@
 #[path = "session_usage_codex_discovery.rs"]
 mod discovery;
 
+#[path = "session_usage_codex_fork.rs"]
+mod fork_proof;
+use fork_proof::{certify_copied_rollout, CopiedForkProof};
+
+#[cfg(test)]
+#[path = "session_usage_codex_fork_tests.rs"]
+mod fork_replay_tests;
+
 use crate::codex_config::get_codex_config_dir;
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
@@ -295,13 +303,6 @@ struct CachedParentTimeline {
     timeline: Arc<ParentTokenTimeline>,
 }
 
-#[derive(Debug)]
-struct CachedReplayPrefix {
-    modified: i64,
-    size: u64,
-    prefix: usize,
-}
-
 #[derive(Debug, Clone)]
 struct ParsedTokenEvent {
     line_offset: i64,
@@ -319,6 +320,15 @@ enum ParentResolution {
     Deferred(String),
 }
 
+/// Durable authority for parent replay; only ordinal- and content-proven forks may
+/// append without resolving their parent again. Old checkpoints deserialize to
+/// None and are re-certified before their next append.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum CodexReplayVerification {
+    Legacy { prefix: usize },
+    Copied { first_live_line: i64 },
+}
+
 /// Persisted semantic parser state for append-only Codex JSONL files.  This is
 /// deliberately a bounded state machine, never an event cache: a restart can
 /// resume at a byte cursor without re-reading the historical rollout.
@@ -331,6 +341,8 @@ struct CodexParserState {
     root_timestamp: Option<DateTime<Utc>>,
     parent: ParentResolution,
     is_subagent: bool,
+    #[serde(default)]
+    replay_verification: Option<CodexReplayVerification>,
     current_model: String,
     total_high_water: Option<CumulativeTokens>,
     // JSON object keys cannot be Option<String>; the empty string is the
@@ -353,6 +365,7 @@ impl CodexParserState {
             root_timestamp: None,
             parent: ParentResolution::None,
             is_subagent: false,
+            replay_verification: None,
             current_model: "unknown".to_string(),
             total_high_water: None,
             last_signature_by_source: HashMap::new(),
@@ -365,7 +378,28 @@ impl CodexParserState {
     }
 
     fn valid(&self) -> bool {
-        self.version == 1 && self.last_signature_by_source.len() <= 64
+        self.version == 1
+            && self.last_signature_by_source.len() <= 64
+            && !matches!(self.replay_verification, Some(CodexReplayVerification::Copied { first_live_line }) if first_live_line < 2)
+    }
+
+    fn replay_contract_current(&self) -> bool {
+        self.root_meta_seen
+            && match &self.parent {
+                ParentResolution::None => true,
+                ParentResolution::Parent(_) => self.replay_verification.is_some(),
+                ParentResolution::Deferred(_) => false,
+            }
+    }
+
+    fn append_authorized(&self) -> bool {
+        self.root_meta_seen
+            && (matches!(self.parent, ParentResolution::None)
+                || (matches!(self.parent, ParentResolution::Parent(_))
+                    && matches!(
+                        self.replay_verification,
+                        Some(CodexReplayVerification::Copied { .. })
+                    )))
     }
 }
 
@@ -392,6 +426,7 @@ struct CodexParseSnapshot {
     head_window_len: i64,
     head_fingerprint: i64,
     tail_fingerprint: i64,
+    file_stamp: Option<ParentFileStamp>,
 }
 
 impl CodexParseSnapshot {
@@ -426,26 +461,22 @@ pub(crate) struct VerifiedCodexRolloutUsageEvent {
 /// 解析失败、父 replay 无法验证、或某个可计费用量缺少时间戳时返回 `None`。
 /// 这让读侧把它表示成未知，而不是把累计快照猜成真实用量。
 ///
-/// 生产读路径已改为 DB-only；此整文件解析链仅作为测试面固定 parent-replay 语义。
+/// 生产读路径已改为 DB-only；此测试读侧复用生产的完整行 snapshot 与 replay 判定。
 #[cfg(test)]
 pub(crate) fn read_verified_codex_rollout_usage(
     file_path: &Path,
     rollout_index: &RolloutIndex,
 ) -> Result<Option<Vec<VerifiedCodexRolloutUsageEvent>>, AppError> {
-    let parsed = parse_codex_file(file_path, thread_id_from_filename(file_path))?;
-    let replay_prefix = match &parsed.parent {
-        ParentResolution::None => 0,
-        ParentResolution::Deferred(_) => return Ok(None),
-        ParentResolution::Parent(parent_id) => {
-            let Some(cutoff) = parsed.root_timestamp else {
-                return Ok(None);
-            };
-            let Ok(parent_signatures) = resolve_parent_signatures(parent_id, cutoff, rollout_index)
-            else {
-                return Ok(None);
-            };
-            matching_replay_prefix(&parsed.token_events, &parent_signatures)
-        }
+    let snapshot = parse_codex_snapshot(file_path)?;
+    let parsed = snapshot.parsed;
+    let Ok((replay_prefix, _)) = resolve_codex_replay(
+        file_path,
+        snapshot.complete_bytes,
+        &parsed,
+        rollout_index,
+        snapshot.file_stamp,
+    ) else {
+        return Ok(None);
     };
     let mut events = Vec::new();
     for event in parsed.token_events.iter().skip(replay_prefix) {
@@ -487,7 +518,6 @@ struct PendingEntry {
 #[derive(Debug, Default)]
 struct CodexReplayCaches {
     parent_timelines: HashMap<PathBuf, CachedParentTimeline>,
-    replay_prefixes: HashMap<PathBuf, CachedReplayPrefix>,
     pending: HashMap<PathBuf, PendingEntry>,
 }
 
@@ -1220,7 +1250,10 @@ fn parse_codex_file(
         if !is_event_msg && !is_turn_context && !is_session_meta {
             continue;
         }
-        if is_event_msg && !line.contains("\"token_count\"") {
+        if is_event_msg
+            && !line.contains("\"token_count\"")
+            && !line.contains("\"thread_settings_applied\"")
+        {
             continue;
         }
 
@@ -1287,6 +1320,18 @@ fn parse_codex_file(
                     {
                         current_model = normalize_codex_model(model);
                     }
+                }
+            }
+            "event_msg"
+                if value
+                    .pointer("/payload/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("thread_settings_applied") =>
+            {
+                if let Some(model) = value.get("payload").and_then(|payload| {
+                    owned_codex_settings_model(payload, meta_thread_id.as_deref())
+                }) {
+                    current_model = normalize_codex_model(model);
                 }
             }
             "event_msg" => {
@@ -1398,6 +1443,26 @@ fn parse_codex_file(
     })
 }
 
+fn owned_codex_settings_model<'a>(
+    payload: &'a serde_json::Value,
+    thread_id: Option<&str>,
+) -> Option<&'a str> {
+    if payload.get("type").and_then(serde_json::Value::as_str) != Some("thread_settings_applied") {
+        return None;
+    }
+    let owner = payload
+        .get("thread_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())?;
+    let expected = uuid::Uuid::parse_str(thread_id?).ok()?;
+    (owner == expected).then_some(())?;
+    payload
+        .get("thread_settings")?
+        .get("model")?
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+}
+
 /// Parse one already-complete JSONL record with the same accounting rules as
 /// `parse_codex_file`.  The append reader calls this only after a newline was
 /// observed, so an incomplete UTF-8/JSON tail never mutates persisted state.
@@ -1414,7 +1479,9 @@ fn parse_codex_incremental_line(
     let is_turn_context = line.contains("\"turn_context\"");
     let is_session_meta = line.contains("\"session_meta\"");
     if (!is_event_msg && !is_turn_context && !is_session_meta)
-        || (is_event_msg && !line.contains("\"token_count\""))
+        || (is_event_msg
+            && !line.contains("\"token_count\"")
+            && !line.contains("\"thread_settings_applied\""))
     {
         return None;
     }
@@ -1486,6 +1553,19 @@ fn parse_codex_incremental_line(
                 })
                 .and_then(serde_json::Value::as_str)
             {
+                state.current_model = normalize_codex_model(model);
+            }
+            None
+        }
+        "event_msg"
+            if value
+                .pointer("/payload/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("thread_settings_applied") =>
+        {
+            if let Some(model) = value.get("payload").and_then(|payload| {
+                owned_codex_settings_model(payload, state.meta_thread_id.as_deref())
+            }) {
                 state.current_model = normalize_codex_model(model);
             }
             None
@@ -1606,6 +1686,17 @@ fn parse_codex_snapshot(file_path: &Path) -> Result<CodexParseSnapshot, AppError
     let file_modified = metadata_modified_nanos(&metadata);
     let mut file = fs::File::open(file_path)
         .map_err(|e| AppError::Config(format!("打开 Codex snapshot 失败: {e}")))?;
+    let file_stamp = ParentFileStamp::from_file(&file);
+    let opened_metadata = file
+        .metadata()
+        .map_err(|e| AppError::Config(format!("读取 Codex snapshot handle 元数据失败: {e}")))?;
+    if opened_metadata.len() as i64 != file_size
+        || metadata_modified_nanos(&opened_metadata) != file_modified
+    {
+        return Err(AppError::Config(
+            "Codex snapshot 文件在打开时变化；下轮重试".to_string(),
+        ));
+    }
     let head_window_len = codex_head_window_len(file_size);
     let head_fingerprint = codex_head_before(&mut file, head_window_len)?;
     file.seek(SeekFrom::Start(0))
@@ -1634,6 +1725,12 @@ fn parse_codex_snapshot(file_path: &Path) -> Result<CodexParseSnapshot, AppError
             }
         }
     }
+    if file_stamp.is_some() && ParentFileStamp::from_file(reader.get_ref().get_ref()) != file_stamp
+    {
+        return Err(AppError::Config(
+            "Codex snapshot 在解析期间变化；下轮重试".to_string(),
+        ));
+    }
     let parsed = ParsedCodexFile {
         root_thread_id: state.root_thread_id.clone(),
         meta_thread_id: state.meta_thread_id.clone(),
@@ -1646,6 +1743,11 @@ fn parse_codex_snapshot(file_path: &Path) -> Result<CodexParseSnapshot, AppError
     };
     let mut fingerprint_file = fs::File::open(file_path)
         .map_err(|e| AppError::Config(format!("打开 Codex snapshot prefix 指纹失败: {e}")))?;
+    if file_stamp.is_some() && ParentFileStamp::from_file(&fingerprint_file) != file_stamp {
+        return Err(AppError::Config(
+            "Codex snapshot 在指纹读取前被替换；下轮重试".to_string(),
+        ));
+    }
     let tail_fingerprint = codex_tail_before(&mut fingerprint_file, complete_bytes)?;
     Ok(CodexParseSnapshot {
         parsed,
@@ -1656,6 +1758,7 @@ fn parse_codex_snapshot(file_path: &Path) -> Result<CodexParseSnapshot, AppError
         head_window_len,
         head_fingerprint,
         tail_fingerprint,
+        file_stamp,
     })
 }
 
@@ -1783,6 +1886,111 @@ fn matching_replay_prefix(child: &[ParsedTokenEvent], parent: &[TokenUsageSignat
     matched
 }
 
+/// Resolve inherited usage from an explicit fork boundary plus exact content.
+/// Copied layouts without authoritative ordinals stay deferred, even if a
+/// later resume marker and token payloads match. Truly legacy layouts without
+/// copied metadata retain timestamp/signature checks, never append authority.
+fn resolve_codex_replay(
+    file_path: &Path,
+    complete_bytes: i64,
+    parsed: &ParsedCodexFile,
+    rollout_index: &RolloutIndex,
+    expected_stamp: Option<ParentFileStamp>,
+) -> Result<(usize, Option<CodexReplayVerification>), PendingReason> {
+    let parent_id = match &parsed.parent {
+        ParentResolution::None => return Ok((0, None)),
+        ParentResolution::Deferred(reason) => return Err(PendingReason::Stable(reason.clone())),
+        ParentResolution::Parent(parent_id) => parent_id,
+    };
+    let Some(cutoff) = parsed.root_timestamp else {
+        return Err(PendingReason::Stable(
+            "parented rollout 的 root meta 缺少有效 timestamp".to_string(),
+        ));
+    };
+    let child_id = parsed
+        .meta_thread_id
+        .as_deref()
+        .or(parsed.root_thread_id.as_deref())
+        .ok_or_else(|| {
+            PendingReason::Stable("parented rollout 缺少有效 child identity".to_string())
+        })?;
+    let classify_error = |reason: String| {
+        if rollout_index.contains_key(parent_id) {
+            PendingReason::Retryable(reason)
+        } else {
+            PendingReason::MissingParent(parent_id.clone())
+        }
+    };
+    let proof = certify_copied_rollout(
+        file_path,
+        complete_bytes,
+        child_id,
+        parent_id,
+        rollout_index,
+        expected_stamp,
+    )
+    .map_err(|_| {
+        PendingReason::Retryable("无法验证 copied rollout 的稳定内容边界；下轮重试".to_string())
+    })?;
+    match proof {
+        CopiedForkProof::Verified { first_live_line } => {
+            let prefix = parsed
+                .token_events
+                .iter()
+                .take_while(|event| event.line_offset < first_live_line)
+                .count();
+            Ok((
+                prefix,
+                Some(CodexReplayVerification::Copied { first_live_line }),
+            ))
+        }
+        CopiedForkProof::Deferred(reason) => Err(classify_error(reason)),
+        CopiedForkProof::Unavailable => {
+            let signatures = resolve_parent_signatures(parent_id, cutoff, rollout_index)
+                .map_err(classify_error)?;
+            let prefix = matching_replay_prefix(&parsed.token_events, &signatures);
+            Ok((prefix, Some(CodexReplayVerification::Legacy { prefix })))
+        }
+    }
+}
+
+fn reset_codex_live_activity(
+    state: &mut CodexParserState,
+    events: &[ParsedTokenEvent],
+    replay_prefix: usize,
+) {
+    state.first_activity_at = None;
+    state.last_activity_at = None;
+    for event in events
+        .iter()
+        .skip(replay_prefix)
+        .filter(|event| event.event_index.is_some())
+    {
+        if let Some(timestamp) = event
+            .timestamp
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        {
+            let activity = timestamp.timestamp();
+            state.first_activity_at = Some(
+                state
+                    .first_activity_at
+                    .map_or(activity, |current| current.min(activity)),
+            );
+            state.last_activity_at = Some(
+                state
+                    .last_activity_at
+                    .map_or(activity, |current| current.max(activity)),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CODEX_PENDING_WARNING_PATHS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn mark_deferred(
     file_path: &Path,
     modified: i64,
@@ -1809,6 +2017,8 @@ fn mark_deferred(
             PendingReason::MissingParent(parent) => format!("找不到父 rollout {parent}"),
             PendingReason::Stable(reason) | PendingReason::Retryable(reason) => reason.clone(),
         };
+        #[cfg(test)]
+        CODEX_PENDING_WARNING_PATHS.with(|paths| paths.borrow_mut().push(file_path.to_path_buf()));
         log::warn!("[CODEX-SYNC] deferred {}: {reason}", file_path.display());
     }
     CodexFileSyncResult {
@@ -1872,6 +2082,11 @@ fn sync_codex_append(
         .map_err(|e| AppError::Config(format!("定位 Codex append cursor 失败: {e}")))?;
     let remaining = file_size.saturating_sub(checkpoint.last_byte_offset).max(0) as u64;
     let mut reader = BufReader::new(file.take(remaining));
+    if !checkpoint.state.append_authorized() {
+        return Err(AppError::Config(
+            "Codex append 缺少已验证的 parent replay authority".to_string(),
+        ));
+    }
     let mut state = checkpoint.state;
     let head_window_len = checkpoint.head_window_len.unwrap_or(0);
     let mut offset = checkpoint.last_byte_offset;
@@ -1998,7 +2213,6 @@ fn sync_single_codex_file(
     // collector never claims absolute detection for that adversarial race and
     // exposes no compensating full-hash scan here.
     let checkpoint = load_codex_checkpoint(db, file_path)?;
-    let has_checkpoint = checkpoint.is_some();
     if let Some(checkpoint) = checkpoint {
         let Some(head_window_len) = checkpoint.head_window_len else {
             return Ok(mark_deferred(
@@ -2016,11 +2230,14 @@ fn sync_single_codex_file(
         let old_tail = codex_tail_before(&mut fingerprint_file, checkpoint.last_byte_offset)?;
         let prefix_matches = checkpoint.head_fingerprint == Some(head_fingerprint)
             && checkpoint.tail_fingerprint == Some(old_tail);
-        if file_size as i64 == checkpoint.file_size && prefix_matches {
+        if file_size as i64 == checkpoint.file_size
+            && prefix_matches
+            && checkpoint.state.replay_contract_current()
+        {
             return Ok(CodexFileSyncResult::default());
         }
         let append_safe = file_size as i64 > checkpoint.file_size && prefix_matches;
-        if append_safe {
+        if append_safe && checkpoint.state.append_authorized() {
             return sync_codex_append(
                 db,
                 file_path,
@@ -2031,26 +2248,23 @@ fn sync_single_codex_file(
                 pass,
             );
         }
-        return Ok(mark_deferred(
-            file_path,
-            file_modified,
-            file_size,
-            PendingReason::Stable(
-                "rollout 非追加式重写/截断；保留已验证账本，需受控 Codex 重建".to_string(),
-            ),
-        ));
+        if !prefix_matches || (file_size as i64) < checkpoint.file_size {
+            return Ok(mark_deferred(
+                file_path,
+                file_modified,
+                file_size,
+                PendingReason::Stable(
+                    "rollout 非追加式重写/截断；保留已验证账本，需受控 Codex 重建".to_string(),
+                ),
+            ));
+        }
+        // Legacy parented checkpoints (including metadata-only v1 states)
+        // cannot authorize appends. Reparse the same verified physical prefix
+        // and certify it without deleting facts or renumbering event IDs.
     }
 
     // 检查同步状态
-    let (last_modified, last_offset) = get_codex_sync_state(db, file_path, &pass.cursors)?;
-
-    // 文件未变化则跳过
-    // A pre-v24 line cursor has no parser state. Re-read it once to construct
-    // state (the old event offset still suppresses duplicate inserts), then
-    // persist the byte checkpoint atomically with the final cursor advance.
-    if has_checkpoint && file_modified <= last_modified {
-        return Ok(CodexFileSyncResult::default());
-    }
+    let (_, last_offset) = get_codex_sync_state(db, file_path, &pass.cursors)?;
 
     if let Ok(mut caches) = replay_caches().lock() {
         if let Some(pending) = caches.pending.get(file_path).cloned() {
@@ -2069,7 +2283,9 @@ fn sync_single_codex_file(
                         });
                     }
                     PendingReason::Retryable(_) => {
-                        caches.pending.remove(file_path);
+                        // Recheck the parent without erasing the prior reason:
+                        // mark_deferred needs it to suppress an unchanged warning.
+                        // Successful reconciliation clears the entry below.
                     }
                     _ => {
                         caches.pending.remove(file_path);
@@ -2079,7 +2295,7 @@ fn sync_single_codex_file(
         }
     }
 
-    let snapshot = parse_codex_snapshot(file_path)?;
+    let mut snapshot = parse_codex_snapshot(file_path)?;
     if snapshot.file_size != file_size as i64 || snapshot.file_modified != file_modified {
         return Err(AppError::Config(
             "Codex rollout 在读取 snapshot 期间变化；下轮重试".to_string(),
@@ -2087,6 +2303,23 @@ fn sync_single_codex_file(
     }
     let checkpoint_facts = snapshot.checkpoint_facts();
     let parsed = snapshot.parsed;
+    // Parent ownership must be resolved even for a metadata-only initial
+    // snapshot. Otherwise its checkpoint could later bill inherited appends.
+    let (replay_prefix, verification) = match resolve_codex_replay(
+        file_path,
+        snapshot.complete_bytes,
+        &parsed,
+        rollout_index,
+        snapshot.file_stamp,
+    ) {
+        Ok(resolution) => resolution,
+        Err(reason) => return Ok(mark_deferred(file_path, file_modified, file_size, reason)),
+    };
+    snapshot.state.replay_verification = verification;
+    reset_codex_live_activity(&mut snapshot.state, &parsed.token_events, replay_prefix);
+    if let Ok(mut caches) = replay_caches().lock() {
+        caches.pending.remove(file_path);
+    }
     if !parsed.has_billable_tokens {
         let conn = lock_conn!(db.conn);
         let tx = conn.unchecked_transaction().map_err(|e| {
@@ -2121,79 +2354,6 @@ fn sync_single_codex_file(
             file_size,
             PendingReason::Stable("含计费 token 但尚无 session_meta".to_string()),
         ));
-    }
-
-    let replay_prefix = match &parsed.parent {
-        ParentResolution::None => 0,
-        ParentResolution::Deferred(reason) => {
-            return Ok(mark_deferred(
-                file_path,
-                file_modified,
-                file_size,
-                PendingReason::Stable(reason.clone()),
-            ));
-        }
-        ParentResolution::Parent(parent_id) => {
-            let Some(cutoff) = parsed.root_timestamp else {
-                return Ok(mark_deferred(
-                    file_path,
-                    file_modified,
-                    file_size,
-                    PendingReason::Stable(
-                        "parented rollout 的 root meta 缺少有效 timestamp".to_string(),
-                    ),
-                ));
-            };
-            if let Ok(caches) = replay_caches().lock() {
-                if let Some(prefix) = caches
-                    .replay_prefixes
-                    .get(file_path)
-                    .filter(|cached| cached.modified == file_modified && cached.size == file_size)
-                    .map(|cached| cached.prefix)
-                {
-                    prefix
-                } else {
-                    drop(caches);
-                    let parent_signatures =
-                        match resolve_parent_signatures(parent_id, cutoff, rollout_index) {
-                            Ok(signatures) => signatures,
-                            Err(reason) => {
-                                let pending_reason = if rollout_index.contains_key(parent_id) {
-                                    PendingReason::Retryable(reason)
-                                } else {
-                                    PendingReason::MissingParent(parent_id.clone())
-                                };
-                                return Ok(mark_deferred(
-                                    file_path,
-                                    file_modified,
-                                    file_size,
-                                    pending_reason,
-                                ));
-                            }
-                        };
-                    let prefix = matching_replay_prefix(&parsed.token_events, &parent_signatures);
-                    if let Ok(mut caches) = replay_caches().lock() {
-                        caches.replay_prefixes.insert(
-                            file_path.to_path_buf(),
-                            CachedReplayPrefix {
-                                modified: file_modified,
-                                size: file_size,
-                                prefix,
-                            },
-                        );
-                    }
-                    prefix
-                }
-            } else {
-                let parent_signatures = resolve_parent_signatures(parent_id, cutoff, rollout_index)
-                    .map_err(AppError::Config)?;
-                matching_replay_prefix(&parsed.token_events, &parent_signatures)
-            }
-        }
-    };
-
-    if let Ok(mut caches) = replay_caches().lock() {
-        caches.pending.remove(file_path);
     }
 
     let mut result = CodexFileSyncResult::default();
@@ -2480,6 +2640,93 @@ mod tests {
                 reason: PendingReason::Retryable("父 rollout 已更新但仍无法验证".to_string()),
             }
         ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retryable_parent_defer_warns_once_through_real_sync_and_clears_after_recovery(
+    ) -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let parent = rollout_path(temp.path(), PARENT_ID);
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, Some(PARENT_ID), None, "2026-07-10T03:00:05Z"),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:06Z"),
+                token_count_at(150, 70, 20, "2026-07-10T03:00:07Z"),
+            ],
+        );
+        let take_warnings = || {
+            CODEX_PENDING_WARNING_PATHS.with(|paths| {
+                let mut paths = paths.borrow_mut();
+                let count = paths.iter().filter(|path| *path == &child).count();
+                paths.retain(|path| path != &child);
+                count
+            })
+        };
+
+        let first = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert!(first.deferred);
+        assert_eq!(take_warnings(), 1, "the first unresolved parent must warn");
+        for _ in 0..2 {
+            let repeated = sync_test_file(&db, &child, &[&parent, &child])?;
+            assert!(repeated.deferred);
+            assert_eq!(repeated.imported, 0);
+            assert_eq!(get_sync_state(&db, &child.to_string_lossy())?, (0, 0));
+            assert_eq!(
+                take_warnings(),
+                0,
+                "an unchanged retryable parent reason must not warn again"
+            );
+        }
+
+        // A genuinely changed reason still warns; this fix must not mute all
+        // deferred cases or stop checking whether the parent becomes usable.
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": { "total_token_usage": { "input_tokens": 100 } }
+                    }
+                }),
+            ],
+        );
+        let changed = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert!(changed.deferred);
+        assert_eq!(take_warnings(), 1, "a changed pending reason must warn");
+
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+                turn_context_at("2026-07-10T03:00:10Z"),
+            ],
+        );
+        let recovered = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert_eq!(
+            (recovered.imported, recovered.skipped, recovered.deferred),
+            (1, 1, false)
+        );
+        assert_eq!(take_warnings(), 0);
+        assert!(!replay_caches().lock().unwrap().pending.contains_key(&child));
+        assert!(get_sync_state(&db, &child.to_string_lossy())?.1 > 0);
+        assert_eq!(sync_test_file(&db, &child, &[&parent, &child])?.imported, 0);
+        Ok(())
     }
 
     fn write_jsonl(path: &Path, values: &[serde_json::Value]) {

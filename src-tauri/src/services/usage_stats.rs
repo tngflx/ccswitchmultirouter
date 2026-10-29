@@ -4226,7 +4226,9 @@ mod tests {
             })
             .to_string(),
         ];
-        std::fs::write(&rollout_path, lines.join("\n"))
+        // Complete rollout fixtures must publish the final JSONL newline, just
+        // like the collector; an unterminated tail is intentionally uncommitted.
+        std::fs::write(&rollout_path, lines.join("\n") + "\n")
             .map_err(|e| AppError::Config(e.to_string()))?;
 
         let ts = local_ts(2026, 6, 28, 15, 18, 0);
@@ -4317,7 +4319,9 @@ mod tests {
             })
             .to_string(),
         ];
-        std::fs::write(&rollout_path, lines.join("\n"))
+        // Complete rollout fixtures must publish the final JSONL newline, just
+        // like the collector; an unterminated tail is intentionally uncommitted.
+        std::fs::write(&rollout_path, lines.join("\n") + "\n")
             .map_err(|e| AppError::Config(e.to_string()))?;
 
         let ts = local_ts(2026, 7, 8, 12, 0, 0);
@@ -4402,7 +4406,9 @@ mod tests {
             })
             .to_string(),
         ];
-        std::fs::write(&rollout_path, lines.join("\n"))
+        // Complete rollout fixtures must publish the final JSONL newline, just
+        // like the collector; an unterminated tail is intentionally uncommitted.
+        std::fs::write(&rollout_path, lines.join("\n") + "\n")
             .map_err(|e| AppError::Config(e.to_string()))?;
 
         let ts = local_ts(2026, 6, 28, 16, 0, 0);
