@@ -30,6 +30,10 @@ import {
   devRecoveryLogPath,
   spawnDevRecoveryProcess,
 } from "./dev-recovery-output.mjs";
+import {
+  launchIndependentWindowsProcess,
+  stopIndependentWindowsProcess,
+} from "./dev-independent-watchdog.mjs";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
@@ -2482,6 +2486,26 @@ export async function cleanRecordedDevWorker(
   );
 }
 
+export function persistIndependentWatchdog({
+  launch,
+  persist,
+  stop,
+  onCleanupFailure = () => {},
+}) {
+  const identity = launch();
+  try {
+    persist(identity);
+    return identity;
+  } catch (error) {
+    try {
+      stop(identity);
+    } catch (cleanupError) {
+      onCleanupFailure(cleanupError);
+    }
+    throw error;
+  }
+}
+
 async function runDevSupervisor(launchArgs) {
   const launch = parseDevSupervisorLaunchArgs(launchArgs);
   const { args } = launch;
@@ -2688,22 +2712,59 @@ async function runDevSupervisor(launchArgs) {
         `[dev watchdog] Launcher recovery output: ${outputPath}. Follow it with Get-Content -LiteralPath '${outputPath.replaceAll("'", "''")}' -Tail 60 -Wait.`,
       );
       try {
-        const { child: detachedWatchdog } = await spawnDevRecoveryProcess({
-          executable: process.execPath,
-          markerPath,
-          args: [
-            fileURLToPath(import.meta.url),
-            DEV_WATCHDOG_FLAG,
-            String(process.pid),
-          ],
-          options: { cwd: REPO_ROOT, env: process.env },
-        });
-        detachedWatchdog.unref();
-        detachedWatchdog.once("error", (error) =>
-          writeDevWatchdogEvent("dev-watchdog-spawn-failed", {
-            error: error.message,
-          }),
-        );
+        const watchdogArgs = [
+          fileURLToPath(import.meta.url),
+          DEV_WATCHDOG_FLAG,
+          String(process.pid),
+        ];
+        if (process.platform === "win32") {
+          // A detached child still inherits pnpm's ancestor job. An independent
+          // native launch is required for recovery after pnpm itself exits.
+          session.watchdogIdentity = persistIndependentWatchdog({
+            launch: () =>
+              launchIndependentWindowsProcess({
+                executable: process.execPath,
+                args: watchdogArgs,
+                cwd: REPO_ROOT,
+                env: process.env,
+              }),
+            persist: (identity) => {
+              session.watchdogIdentity = identity;
+              saveSession();
+            },
+            stop: (identity) => {
+              const result = stopIndependentWindowsProcess(identity);
+              delete session.watchdogIdentity;
+              return result;
+            },
+            onCleanupFailure: (cleanupError) =>
+              writeDevWatchdogEvent("dev-watchdog-cleanup-failed", {
+                error: cleanupError.message,
+              }),
+          });
+          appendFileSync(
+            outputPath,
+            `${JSON.stringify({
+              timestamp: new Date().toISOString(),
+              event: "dev-independent-watchdog-started",
+              pid: process.pid,
+              watchdogPid: session.watchdogIdentity.ProcessId,
+            })}\n`,
+          );
+        } else {
+          const { child: detachedWatchdog } = await spawnDevRecoveryProcess({
+            executable: process.execPath,
+            markerPath,
+            args: watchdogArgs,
+            options: { cwd: REPO_ROOT, env: process.env },
+          });
+          detachedWatchdog.unref();
+          detachedWatchdog.once("error", (error) =>
+            writeDevWatchdogEvent("dev-watchdog-spawn-failed", {
+              error: error.message,
+            }),
+          );
+        }
       } catch (error) {
         writeDevWatchdogEvent("dev-watchdog-spawn-failed", {
           error: error.message,

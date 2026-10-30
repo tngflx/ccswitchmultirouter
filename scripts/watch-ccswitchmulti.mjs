@@ -4,6 +4,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { DEV_RECOVERY_POLICY } from "./dev-watchdog-policy.mjs";
+import { inspectCanonicalDevWatchdog } from "./dev-watchdog-identity.mjs";
 import { spawnDevRecoveryProcess } from "./dev-recovery-output.mjs";
 import {
   devSessionEnvironment,
@@ -309,6 +310,16 @@ function escapeRegex(value) {
 }
 
 export function inspectDevWatchdogProcesses(plan, processes) {
+  const canonical = inspectCanonicalDevWatchdog(plan.Session, processes, {
+    executable: plan.Executable,
+    scriptPath: plan.ScriptPath,
+    supervisorPid: plan.SupervisorPid,
+  });
+  if (canonical.canonical)
+    return {
+      Active: canonical.identity !== null,
+      Unknown: canonical.unknown,
+    };
   const ownership = { Active: false, Unknown: false };
   const executable = escapeRegex(plan.Executable.replaceAll("/", "\\"));
   const script = escapeRegex(plan.ScriptPath.replaceAll("/", "\\"));

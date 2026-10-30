@@ -1,0 +1,120 @@
+{
+  "verified": true,
+  "reviewedAtUtc": "2026-10-27T03:20:07.741Z",
+  "scope": "independent_read_only_review_after_actual_development_supervisor_crash",
+  "runtimeReceipt": "2026-10-27-development-recovery-console-runtime.json",
+  "runtimeReceiptSha256": "82c64af4a5d821f21ad8646605d6a027b2f22767421af4b3ef22149c485b463a",
+  "observedNativeAtUtc": "2026-10-27T03:18:24.0440343Z",
+  "recoveredNativeIdentities": [
+    {
+      "pid": 4748,
+      "parentPid": 57084,
+      "filetime": "134375442876151990",
+      "executablePath": "C:\\Program Files\\nodejs\\node.exe"
+    },
+    {
+      "pid": 28880,
+      "parentPid": 4748,
+      "filetime": "134375443025279956",
+      "executablePath": "C:\\Program Files\\nodejs\\node.exe"
+    },
+    {
+      "pid": 61812,
+      "parentPid": 35664,
+      "filetime": "134375443018215139",
+      "executablePath": "C:\\Program Files\\nodejs\\node.exe"
+    },
+    {
+      "pid": 8704,
+      "parentPid": 28860,
+      "filetime": "134375443095677543",
+      "executablePath": "D:\\repos\\ccswitchmultirouter\\src-tauri\\target\\debug\\cc-switch.exe"
+    }
+  ],
+  "sameRecoveredProcessesStillRunning": true,
+  "oldActivationIdentitiesGone": [
+    {
+      "role": "supervisor",
+      "oldIdentityGone": true
+    },
+    {
+      "role": "worker",
+      "oldIdentityGone": true
+    },
+    {
+      "role": "watchdog",
+      "oldIdentityGone": true
+    },
+    {
+      "role": "app",
+      "oldIdentityGone": true
+    }
+  ],
+  "uniqueProxyOwnerPid": 8704,
+  "uniqueFrontendOwnerPid": 43648,
+  "healthStatus": 200,
+  "canonicalAppMarkerMatchesNativeIdentity": true,
+  "exactRecoveryInvocationTargetsCrashPid": true,
+  "restartBudgetCount": 1,
+  "independentWatchdogNativeParentPid": 35664,
+  "canonicalReader": {
+    "canonical": true,
+    "unknown": false,
+    "watchdogPid": 61812,
+    "exactNativeFiletime": "134375443018215139"
+  },
+  "externalGuardianReader": {
+    "Active": true,
+    "Unknown": false
+  },
+  "recordedRuntimeSourceHashesMatchCurrent": [
+    {
+      "path": "scripts/dev-tauri-delayed.mjs",
+      "matches": true
+    },
+    {
+      "path": "scripts/dev-recovery-output.mjs",
+      "matches": true
+    },
+    {
+      "path": "scripts/dev-independent-watchdog.mjs",
+      "matches": true
+    },
+    {
+      "path": "scripts/dev-session-launch.mjs",
+      "matches": true
+    },
+    {
+      "path": "scripts/dev-watchdog-policy.mjs",
+      "matches": true
+    },
+    {
+      "path": "scripts/windows-json-query.mjs",
+      "matches": true
+    }
+  ],
+  "supplementalCurrentSourceSha256": {
+    "scripts/dev-watchdog-identity.mjs": "74aa015815fda02e5c45bf2c63642f5ca3e608057470b75d09f8989cc822b191"
+  },
+  "sourceScopeNote": "The canonical reader helper was omitted from the original runtime receipt. Its quoted-flag fix and current hash are verified by this later read-only inspection; this does not retroactively add that helper to the runtime receipt source hash set.",
+  "recoveryOutput": {
+    "freshWindowBytes": 12262,
+    "freshWindowSha256": "16861bbd01f13ba669e5a8b740b77fc70983de3e1c280abf3a4a4572baf8e1f2",
+    "freshWindowFlags": {
+      "viteStdout": true,
+      "cargoStderr": true,
+      "applicationStarted": true
+    },
+    "followerBytes": 12323,
+    "followerSha256": "2d3b36dab5ff82ca8387cf7dde56a4fe66971a70ded3454d15f1797b1bc41352",
+    "followerFlags": {
+      "viteStdout": true,
+      "cargoStderr": true,
+      "applicationStarted": true
+    },
+    "restartEventCount": 1
+  },
+  "sameConsoleWindowReopened": false,
+  "desktopContinueDeliveryVerified": false,
+  "mutationsDuringThisReview": false
+}

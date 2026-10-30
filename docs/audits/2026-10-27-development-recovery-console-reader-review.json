@@ -1,0 +1,21 @@
+{
+  "verifiedAtUtc": "2026-10-27T03:16:59.764Z",
+  "scope": "read_only_native_current_watchdog_reader_validation",
+  "supervisorPid": 4748,
+  "watchdogPid": 61812,
+  "quotedFlagObserved": true,
+  "guardian": {
+    "Active": true,
+    "Unknown": false
+  },
+  "manualTakeoverSelectedExactCanonicalIdentity": true,
+  "mutationAttempted": false,
+  "supervisorRemainsRunning": true,
+  "sourceSha256": {
+    "scripts/dev-watchdog-identity.mjs": "74aa015815fda02e5c45bf2c63642f5ca3e608057470b75d09f8989cc822b191",
+    "scripts/dev-session-launch.mjs": "16f586e788c34dbed73e3df17a8d8e58532a4b27d2c2291dd28f4a7afade797c",
+    "scripts/watch-ccswitchmulti.mjs": "3b6bcba5bbea7e0fe0fe0022a8f4a4e06c863d7180ca3c1bd82a9194d116afce",
+    "scripts/dev-independent-watchdog.mjs": "bcb0e6a268066954b6d7b83ec00a8f197f2dffec17ed141affc277b04412d9d0"
+  },
+  "priorRuntimeReceiptAppliesToEarlierReaderRevision": true
+}

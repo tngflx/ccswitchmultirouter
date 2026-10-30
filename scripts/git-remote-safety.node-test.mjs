@@ -87,7 +87,9 @@ function fixture(t) {
       encoding: "utf8",
       input: "",
       windowsHide: true,
-      timeout: 15000,
+      // The installer starts many Git processes. On Windows, the full child
+      // can exceed 15 seconds under normal process and antivirus load.
+      timeout: 60_000,
     });
   const cliWithInput = (input, ...args) =>
     spawnSync(process.execPath, [script, ...args], {
@@ -95,7 +97,7 @@ function fixture(t) {
       encoding: "utf8",
       input,
       windowsHide: true,
-      timeout: 15000,
+      timeout: 60_000,
     });
   const install = () => {
     const result = cli("--install");

@@ -51,6 +51,7 @@ import {
   resolveDevRunMarkerPath,
   resolveDevSettingsPath,
   parseWindowsListeners,
+  persistIndependentWatchdog,
   resolveRepoRootBackendInput,
   resolveTauriRootBackendInput,
   runCargoTargetMaintenance,
@@ -74,6 +75,29 @@ import {
   windowsProcessObservationCrashed,
   windowsProcessStartedAtUtc,
 } from "./dev-tauri-delayed.mjs";
+
+test("failed watchdog marker publication retires the newly launched independent watchdog", () => {
+  const identity = { ProcessId: 4242 };
+  const actions = [];
+  assert.throws(
+    () =>
+      persistIndependentWatchdog({
+        launch: () => {
+          actions.push("launch");
+          return identity;
+        },
+        persist: () => {
+          actions.push("persist");
+          throw new Error("marker write failed");
+        },
+        stop: (current) => {
+          actions.push(["stop", current]);
+        },
+      }),
+    /marker write failed/,
+  );
+  assert.deepEqual(actions, ["launch", "persist", ["stop", identity]]);
+});
 
 test("CLI normalization removes pnpm's leading argument separator", () => {
   assert.deepEqual(normalizeCliArgs(["--", "--delay", "0"]), ["--delay", "0"]);

@@ -1,11 +1,20 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { utcTicks } from "./ccswitchmulti-guardian-core.mjs";
+import { quoteWindowsProcessArgument } from "./dev-independent-watchdog.mjs";
 import test from "node:test";
 import {
   DEV_RECOVERY_FLAG,
   parseDevSupervisorLaunchArgs,
   prepareDevSessionLaunch,
+  stopOwnedWindowsDevSession,
 } from "./dev-session-launch.mjs";
+import {
+  runWindowsJsonQuery,
+  windowsJsonQueryCommand,
+} from "./windows-json-query.mjs";
 
 function fixture(overrides = {}) {
   const repoRoot = path.resolve("fixture-repository");
@@ -91,6 +100,217 @@ test("manual launch starts a fresh restart budget after a dead owned session", a
   const prepared = await prepareDevSessionLaunch(f.options);
   assert.deepEqual(prepared.restartTimesMs, []);
   assert.equal(prepared.previous, f.session);
+  assert.deepEqual(f.actions, []);
+});
+
+function independentWatchdogFixture() {
+  const f = fixture();
+  const watchdog = {
+    ProcessId: 5500,
+    ParentProcessId: 7000,
+    ExecutablePath: f.options.executable,
+    CommandLine: `"${f.options.executable}" "${f.options.scriptPath}" --ccsm-dev-watchdog ${f.session.supervisorPid}`,
+    CreationDate: "2026-10-21T23:59:01.123456Z",
+  };
+  f.session.watchdogIdentity = watchdog;
+  return { ...f, watchdog };
+}
+
+test("manual takeover stops its exact canonical independent watchdog without requiring supervisor parentage", async () => {
+  const f = independentWatchdogFixture();
+  let stopped = false;
+  let selected;
+  await prepareDevSessionLaunch({
+    ...f.options,
+    queryProcesses: () => (stopped ? [] : [f.identity, f.watchdog]),
+    stopOwnedSession: ({ watchdogs }) => {
+      selected = watchdogs;
+      stopped = true;
+    },
+  });
+  assert.deepEqual(selected, [f.watchdog]);
+});
+
+test("manual takeover recognizes the exact fully quoted command produced by the independent launcher", async () => {
+  const f = independentWatchdogFixture();
+  const watchdog = {
+    ...f.watchdog,
+    CommandLine: [
+      f.options.executable,
+      f.options.scriptPath,
+      "--ccsm-dev-watchdog",
+      String(f.session.supervisorPid),
+    ]
+      .map(quoteWindowsProcessArgument)
+      .join(" "),
+  };
+  f.session.watchdogIdentity = watchdog;
+  let stopped = false;
+  await prepareDevSessionLaunch({
+    ...f.options,
+    queryProcesses: () => (stopped ? [] : [f.identity, watchdog]),
+    stopOwnedSession: ({ watchdogs }) => {
+      assert.deepEqual(watchdogs, [watchdog]);
+      stopped = true;
+    },
+  });
+  assert.equal(stopped, true);
+});
+
+test("canonical watchdog identity is authoritative and ambiguous or reused identities cannot authorize takeover", async () => {
+  for (const changed of [
+    null,
+    { CommandLine: undefined },
+    { ParentProcessId: 8000 },
+    { CreationDate: "2026-10-21T23:59:01.1234561Z" },
+    { ExecutablePath: path.resolve("foreign", "node.exe") },
+    { CommandLine: "foreign --ccsm-dev-watchdog 4242" },
+  ]) {
+    const f = independentWatchdogFixture();
+    const current = changed === null ? null : { ...f.watchdog, ...changed };
+    if (changed === null) f.session.watchdogIdentity = null;
+    await assert.rejects(
+      prepareDevSessionLaunch({
+        ...f.options,
+        queryProcesses: () => [f.identity, current ?? f.watchdog],
+      }),
+      /watchdog ownership/,
+    );
+    assert.deepEqual(f.actions, []);
+  }
+});
+
+test("a missing canonical independent watchdog does not block exact manual takeover", async () => {
+  const f = independentWatchdogFixture();
+  let stopped = false;
+  let selected;
+  await prepareDevSessionLaunch({
+    ...f.options,
+    queryProcesses: () => (stopped ? [] : [f.identity]),
+    stopOwnedSession: ({ watchdogs }) => {
+      selected = watchdogs;
+      stopped = true;
+    },
+  });
+  assert.deepEqual(selected, []);
+});
+
+test("canonical watchdog cannot be silently replaced by a competing legacy child", async () => {
+  const f = independentWatchdogFixture();
+  await assert.rejects(
+    prepareDevSessionLaunch({
+      ...f.options,
+      queryProcesses: () => [
+        f.identity,
+        f.watchdog,
+        { ...f.watchdog, ProcessId: 5501, ParentProcessId: 4242 },
+      ],
+    }),
+    /watchdog ownership/,
+  );
+  assert.deepEqual(f.actions, []);
+});
+
+test("canonical watchdog refuses a competing exact command with an unknown executable path", async () => {
+  for (const pathOverride of [undefined, path.resolve("foreign", "node.exe")]) {
+    const f = independentWatchdogFixture();
+    const competing = {
+      ...f.watchdog,
+      ProcessId: 5501,
+      ...(pathOverride === undefined
+        ? { ExecutablePath: undefined }
+        : { ExecutablePath: pathOverride }),
+    };
+    await assert.rejects(
+      prepareDevSessionLaunch({
+        ...f.options,
+        queryProcesses: () => [f.identity, f.watchdog, competing],
+      }),
+      /watchdog ownership/,
+    );
+    assert.deepEqual(f.actions, []);
+  }
+});
+
+test("canonical watchdog native ticks are exact strings consistent with its CIM creation and malformed ticks block takeover", async () => {
+  for (const ticks of [
+    null,
+    134371007411234560,
+    "bad",
+    "-1",
+    "1",
+    "999999999999999999999999",
+  ]) {
+    const f = independentWatchdogFixture();
+    f.session.watchdogIdentity = {
+      ...f.watchdog,
+      ProcessStartedAtTicks: ticks,
+    };
+    await assert.rejects(
+      prepareDevSessionLaunch({
+        ...f.options,
+        queryProcesses: () => [f.identity, f.watchdog],
+      }),
+      /watchdog ownership/,
+    );
+    assert.deepEqual(f.actions, []);
+  }
+  const f = independentWatchdogFixture();
+  const ticks = (
+    utcTicks(f.watchdog.CreationDate) +
+    116444736000000000n +
+    9n
+  ).toString();
+  f.session.watchdogIdentity = { ...f.watchdog, ProcessStartedAtTicks: ticks };
+  let stopped = false;
+  await prepareDevSessionLaunch({
+    ...f.options,
+    queryProcesses: () => (stopped ? [] : [f.identity, f.watchdog]),
+    stopOwnedSession: ({ watchdogs }) => {
+      assert.deepEqual(watchdogs, [f.session.watchdogIdentity]);
+      stopped = true;
+    },
+  });
+  assert.equal(stopped, true);
+});
+
+test("an unreadable direct child still blocks takeover when an independent watchdog is canonical", async () => {
+  const f = independentWatchdogFixture();
+  await assert.rejects(
+    prepareDevSessionLaunch({
+      ...f.options,
+      queryProcesses: () => [
+        f.identity,
+        f.watchdog,
+        {
+          ProcessId: 5501,
+          ParentProcessId: 4242,
+          ExecutablePath: f.options.executable,
+        },
+      ],
+    }),
+    /watchdog ownership/,
+  );
+  assert.deepEqual(f.actions, []);
+});
+
+test("a replaced canonical watchdog during marker reread cannot authorize termination", async () => {
+  const f = independentWatchdogFixture();
+  let reads = 0;
+  await assert.rejects(
+    prepareDevSessionLaunch({
+      ...f.options,
+      queryProcesses: () => [f.identity, f.watchdog],
+      readSession: () =>
+        ++reads === 1
+          ? f.session
+          : {
+              ...f.session,
+              watchdogIdentity: { ...f.watchdog, ProcessId: 5501 },
+            },
+    }),
+    /ownership changed/,
+  );
   assert.deepEqual(f.actions, []);
 });
 
@@ -418,3 +638,69 @@ test("a marker changed during verification cannot authorize termination", async 
   );
   assert.deepEqual(f.actions, []);
 });
+
+test(
+  "native preparation checks an exact retained FILETIME before mutating its disposable marker",
+  { skip: process.platform !== "win32" },
+  (context) => {
+    const directory = mkdtempSync(
+      path.join(os.tmpdir(), "ccsm-native-owner-ticks-"),
+    );
+    context.after(() => rmSync(directory, { recursive: true, force: true }));
+    const markerPath = path.join(directory, "dev-session.json");
+    const identity = JSON.parse(
+      runWindowsJsonQuery(
+        windowsJsonQueryCommand(`
+$h = Get-Process -Id ${process.pid} -ErrorAction Stop
+try {
+  $null = $h.Handle
+  $cim = Get-CimInstance Win32_Process -Filter 'ProcessId=${process.pid}' -ErrorAction Stop
+  [pscustomobject]@{ProcessId=$h.Id;ParentProcessId=$cim.ParentProcessId;ExecutablePath=$h.Path;CommandLine=$cim.CommandLine;CreationDate=$cim.CreationDate.ToUniversalTime().ToString('o');ProcessStartedAtTicks=$h.StartTime.ToFileTimeUtc().ToString()} | ConvertTo-Json -Compress
+} finally { $h.Dispose() }
+`),
+        "test exact native owner",
+      ),
+    );
+    const session = {
+      supervisorPid: process.pid,
+      supervisorStartedAtUtc: identity.CreationDate,
+      repoRoot: directory,
+      scriptPath: path.join(directory, "fixture.mjs"),
+      state: "running",
+    };
+    const original = JSON.stringify(session);
+    writeFileSync(markerPath, original);
+    assert.throws(
+      () =>
+        stopOwnedWindowsDevSession({
+          markerPath,
+          session,
+          supervisor: {
+            ...identity,
+            ProcessStartedAtTicks: (
+              BigInt(identity.ProcessStartedAtTicks) + 1n
+            ).toString(),
+          },
+          watchdogs: [],
+          phase: "prepare",
+        }),
+      /development replacement/,
+    );
+    assert.equal(readFileSync(markerPath, "utf8"), original);
+    assert.deepEqual(
+      stopOwnedWindowsDevSession({
+        markerPath,
+        session,
+        supervisor: identity,
+        watchdogs: [],
+        phase: "prepare",
+      }),
+      { prepared: true },
+    );
+    assert.equal(
+      JSON.parse(readFileSync(markerPath, "utf8")).state,
+      "stopping",
+    );
+    assert.doesNotThrow(() => process.kill(process.pid, 0));
+  },
+);

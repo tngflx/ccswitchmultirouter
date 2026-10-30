@@ -1,3 +1,38 @@
+## 2026-10-27 - Verify recovery through the real pnpm process ancestry
+
+The first real supervisor-crash test failed even though direct Node fixtures
+passed. Native pnpm owns an ancestor Windows job; terminating its supervisor
+causes pnpm to exit, which also kills the detached watchdog. The new isolated
+pnpm regression reproduced that failure and passed after independent WMI
+creation with explicit job breakaway. Do not treat detached stdout tests as
+proof of survival through package-manager ancestry.
+
+Windows development sessions persist one canonical `watchdogIdentity` from a
+retained native handle and CIM probe. Manual takeover and external development
+guardian inspection use the shared identity reader; direct-parent detection is
+legacy-only when the field is absent. Native termination validates exact
+FILETIME when supplied. The fully quoted command from the independent launcher
+also needs exact optional-quote matching for its watchdog flag.
+
+Actual verification passed on October 27 at 11:12 Singapore time: supervisor
+62176 was deliberately terminated, watchdog 57084 survived, replacement
+supervisor 4748 started automatically, and app 8704 recovered with healthy
+ports 15721 and 3000. Generation advanced from 76 to 77 and the restart budget
+increased exactly once. All old identities retired and exactly one new
+watchdog remained. Fresh recovery output contained 12,262 bytes with actual
+Vite, Cargo, and Tauri startup, also received by a real PowerShell follow
+command. This verifies development recovery and log delivery; it does not
+reopen the old console or establish Codex continuation delivery. See the
+[live audit](../audits/2026-10-27-development-recovery-console.md) and linked
+sanitized runtime receipt.
+
+Final checks after the quoted-argument correction passed 222 development
+recovery tests, 134 lifecycle tests, TypeScript, repository formatting,
+targeted Prettier, syntax, and diff checks. An independent read-only review
+confirmed that the same recovered processes remained healthy, all recorded
+runtime source hashes matched, and the final canonical reader selected the
+actual fully quoted watchdog correctly without mutating the session.
+
 ## 2026-10-23 - Preserve development recovery output after launcher exit
 
 Detached watchdog and replacement launches discarded stdout and stderr, so a

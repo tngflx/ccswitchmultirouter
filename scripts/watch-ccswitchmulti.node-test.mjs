@@ -14,6 +14,7 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import * as guardianCore from "./ccswitchmulti-guardian-core.mjs";
+import { quoteWindowsProcessArgument } from "./dev-independent-watchdog.mjs";
 import {
   acquireGuardianLock,
   createGuardianRuntime,
@@ -391,6 +392,99 @@ test("dev watchdog identity requires exact script, supervisor parent and creatio
     inspectDevWatchdogProcesses(plan, [{ ...item, CommandLine: null }]),
     { Active: false, Unknown: true },
   );
+});
+
+test("guardian recognizes only the canonical independent watchdog regardless of WMI parent", (t) => {
+  const f = fixture(t);
+  const watchdog = {
+    ProcessId: 5500,
+    ParentProcessId: 7000,
+    ExecutablePath: f.node,
+    CommandLine: `"${f.node}" "${f.script}" --ccsm-dev-watchdog 4242`,
+    CreationDate: "2026-10-13T00:00:01.123456Z",
+  };
+  const plan = {
+    Executable: f.node,
+    ScriptPath: f.script,
+    SupervisorPid: 4242,
+    Session: { ...f.session, watchdogIdentity: watchdog },
+  };
+  assert.deepEqual(inspectDevWatchdogProcesses(plan, [watchdog]), {
+    Active: true,
+    Unknown: false,
+  });
+  assert.deepEqual(inspectDevWatchdogProcesses(plan, []), {
+    Active: false,
+    Unknown: false,
+  });
+  for (const changed of [
+    { CommandLine: undefined },
+    { ParentProcessId: 7001 },
+    { CreationDate: "2026-10-13T00:00:01.1234561Z" },
+    { ExecutablePath: path.resolve("foreign", "node.exe") },
+    { CommandLine: `${watchdog.CommandLine} --foreign` },
+  ])
+    assert.deepEqual(
+      inspectDevWatchdogProcesses(plan, [{ ...watchdog, ...changed }]),
+      { Active: false, Unknown: true },
+    );
+  for (const invalid of [null, {}, { ...watchdog, CreationDate: "invalid" }])
+    assert.deepEqual(
+      inspectDevWatchdogProcesses(
+        { ...plan, Session: { ...plan.Session, watchdogIdentity: invalid } },
+        [watchdog],
+      ),
+      { Active: false, Unknown: true },
+    );
+  assert.deepEqual(
+    inspectDevWatchdogProcesses(plan, [
+      watchdog,
+      { ...watchdog, ProcessId: 5501, ParentProcessId: 4242 },
+    ]),
+    { Active: false, Unknown: true },
+  );
+});
+
+test("guardian accepts the exact quoted watchdog flag from the native launcher and rejects malformed token boundaries", (t) => {
+  const f = fixture(t);
+  const watchdog = {
+    ProcessId: 5500,
+    ParentProcessId: 7000,
+    ExecutablePath: f.node,
+    CommandLine: [f.node, f.script, "--ccsm-dev-watchdog", "4242"]
+      .map(quoteWindowsProcessArgument)
+      .join(" "),
+    CreationDate: "2026-10-13T00:00:01.123456Z",
+  };
+  const plan = {
+    Executable: f.node,
+    ScriptPath: f.script,
+    SupervisorPid: 4242,
+    Session: { ...f.session, watchdogIdentity: watchdog },
+  };
+  assert.deepEqual(inspectDevWatchdogProcesses(plan, [watchdog]), {
+    Active: true,
+    Unknown: false,
+  });
+  for (const suffix of [
+    '"--ccsm-dev-watchdog 4242"',
+    '"--ccsm-dev-watchdog"x "4242"',
+    "--ccsm-dev-watchdog=4242",
+    '"--ccsm-dev-watchdog" "4242" --foreign',
+    '"--ccsm-dev-watchdog "4242"',
+  ]) {
+    const malformed = {
+      ...watchdog,
+      CommandLine: `${[f.node, f.script].map(quoteWindowsProcessArgument).join(" ")} ${suffix}`,
+    };
+    assert.deepEqual(
+      inspectDevWatchdogProcesses(
+        { ...plan, Session: { ...f.session, watchdogIdentity: malformed } },
+        [malformed],
+      ),
+      { Active: false, Unknown: true },
+    );
+  }
 });
 
 test("native process query retains handle before reading CIM and checks creation identity", () => {

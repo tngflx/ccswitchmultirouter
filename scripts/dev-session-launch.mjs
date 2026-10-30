@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { inspectCanonicalDevWatchdog } from "./dev-watchdog-identity.mjs";
 import {
   DEV_RECOVERY_POLICY,
   recentDevRestartTimesMs,
@@ -74,7 +75,20 @@ function supervisorMatches(identity, session, ownership) {
   );
 }
 
-function ownedWatchdogs(processes, supervisor, { scriptPath, executable }) {
+function ownedWatchdogs(processes, supervisor, ownership, session) {
+  const { scriptPath, executable } = ownership;
+  const canonical = inspectCanonicalDevWatchdog(session, processes, {
+    supervisorPid: supervisor.ProcessId,
+    scriptPath,
+    executable,
+  });
+  if (canonical.canonical) {
+    if (canonical.unknown)
+      throw new Error(
+        "Development watchdog ownership is uncertain; replacement was refused.",
+      );
+    return canonical.identity ? [canonical.identity] : [];
+  }
   const script = escapeRegex(scriptPath.replaceAll("/", "\\"));
   const exe = escapeRegex(executable.replaceAll("/", "\\"));
   const pattern = new RegExp(
@@ -220,13 +234,22 @@ export async function prepareDevSessionLaunch({
       throw new Error(
         "An existing development supervisor owns this configuration; safe replacement requires Windows process handles.",
       );
-    const watchdogs = ownedWatchdogs(processes, supervisor, ownership);
+    const watchdogs = ownedWatchdogs(
+      processes,
+      supervisor,
+      ownership,
+      previous,
+    );
     // Stop and await every old writer before publishing a replacement marker.
     const current = readSession();
     if (
       !markerMatches(current, ownership) ||
       current.supervisorPid !== previous.supervisorPid ||
-      current.supervisorStartedAtUtc !== previous.supervisorStartedAtUtc
+      current.supervisorStartedAtUtc !== previous.supervisorStartedAtUtc ||
+      Object.hasOwn(current, "watchdogIdentity") !==
+        Object.hasOwn(previous, "watchdogIdentity") ||
+      JSON.stringify(current.watchdogIdentity) !==
+        JSON.stringify(previous.watchdogIdentity)
     ) {
       throw new Error(
         "Development session ownership changed before replacement.",
@@ -362,12 +385,25 @@ try {
         $handle.Path -ine $identity.ExecutablePath) {
       throw 'The retained development owner identity changed.'
     }
+    if ($identity.PSObject.Properties['ProcessStartedAtTicks'] -and
+        ($identity.ProcessStartedAtTicks -isnot [string] -or
+         $identity.ProcessStartedAtTicks -cnotmatch '^[0-9]+$' -or
+         $handle.StartTime.ToFileTimeUtc().ToString() -cne $identity.ProcessStartedAtTicks)) {
+      throw 'The retained development owner exact native identity changed.'
+    }
   }
   $marker = [IO.File]::ReadAllText($proof.markerPath) | ConvertFrom-Json -DateKind String
   if ($marker.supervisorPid -ne $proof.session.supervisorPid -or
       $marker.supervisorStartedAtUtc -ne $proof.session.supervisorStartedAtUtc -or
       $marker.repoRoot -ine $proof.session.repoRoot -or $marker.scriptPath -ine $proof.session.scriptPath -or
       $marker.state -cnotin @('running', 'stopping')) { throw 'Development marker ownership changed before stopping.' }
+  $expectedWatchdogProperty = $proof.session.PSObject.Properties['watchdogIdentity']
+  $currentWatchdogProperty = $marker.PSObject.Properties['watchdogIdentity']
+  if ([bool]$expectedWatchdogProperty -ne [bool]$currentWatchdogProperty -or
+      ($marker.watchdogIdentity | ConvertTo-Json -Depth 15 -Compress) -cne
+        ($proof.session.watchdogIdentity | ConvertTo-Json -Depth 15 -Compress)) {
+    throw 'Development watchdog ownership changed before stopping.'
+  }
   if ($proof.requireRunning -and $marker.state -cne 'running') {
     throw 'Development handoff refresh was superseded by an intentional stop.'
   }

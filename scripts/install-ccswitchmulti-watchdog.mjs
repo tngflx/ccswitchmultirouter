@@ -29,6 +29,7 @@ export const GUARDIAN_RUNTIME_FILES = Object.freeze([
   "windows-json-query.mjs",
   "dev-watchdog-policy.mjs",
   "dev-recovery-output.mjs",
+  "dev-watchdog-identity.mjs",
   "dev-recovery-policy.json",
 ]);
 

@@ -1,5 +1,10 @@
 # Development recovery console investigation
 
+The subsequent [October 27 live verification](2026-10-27-development-recovery-console.md)
+supersedes the runtime limitation recorded below. It found and fixed an
+additional pnpm ancestor-job issue, then verified actual supervisor crash
+recovery, a healthy replacement app, and real log output through PowerShell.
+
 ## Cause and supported behavior
 
 The development watchdog previously discarded its output and the replacement

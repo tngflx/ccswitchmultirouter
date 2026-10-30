@@ -18,10 +18,15 @@ const helperUrl = new URL("./dev-recovery-output.mjs", import.meta.url).href;
 
 function fixture(context) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "ccsm-dev-output-"));
-  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const cleanupWaiters = [];
+  context.after(async () => {
+    for (const waiter of cleanupWaiters) await waiter();
+    rmSync(directory, { recursive: true, force: true });
+  });
   return {
     directory,
     markerPath: path.join(directory, "logs", "dev-session.json"),
+    waitForCleanup: (waiter) => cleanupWaiters.push(waiter),
   };
 }
 
@@ -187,6 +192,24 @@ async function waitForFile(file, timeoutMs = 10_000) {
   }
 }
 
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function waitForProcessExit(pid, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (processExists(pid)) {
+    assert.ok(Date.now() < deadline, "fixture child must exit promptly");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 test(
   "native headless recovery preserves stdout and stderr written after the launcher exits",
   { timeout: 20_000 },
@@ -241,6 +264,7 @@ process.stdout.write(JSON.stringify({ pid: process.pid, childPid: child.pid, out
     });
     assert.equal(code, 0, stderr);
     const result = JSON.parse(stdout);
+    f.waitForCleanup(() => waitForProcessExit(result.childPid));
     assert.equal(result.pid, parent.pid);
     assert.notEqual(result.childPid, parent.pid);
     writeFileSync(releasePath, JSON.stringify({ parentExited: true }));

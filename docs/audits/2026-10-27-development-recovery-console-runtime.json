@@ -1,0 +1,124 @@
+{
+  "verified": true,
+  "verifiedAtUtc": "2026-10-27T03:12:01.061Z",
+  "elapsedSeconds": 145.463,
+  "developmentOnly": true,
+  "sourceSha256": {
+    "scripts/dev-tauri-delayed.mjs": "dd45132cb8116ce248f94240366fffc2ef5ab4a9fec48c01f1c2176a9f65dbdb",
+    "scripts/dev-recovery-output.mjs": "1673f930a6fd327ad41c1e3846554b789345ff2d183832ed73a11b26403e19b5",
+    "scripts/dev-independent-watchdog.mjs": "bcb0e6a268066954b6d7b83ec00a8f197f2dffec17ed141affc277b04412d9d0",
+    "scripts/dev-session-launch.mjs": "16f586e788c34dbed73e3df17a8d8e58532a4b27d2c2291dd28f4a7afade797c",
+    "scripts/dev-watchdog-policy.mjs": "c3de8305ae23650674a1e7098f591ed447fcb3537ba2f3889c26fda96bc21f32",
+    "scripts/windows-json-query.mjs": "7ac7908e7cd711a808e223982b1c1df47a38822352254870a8c1120f72b0b51b"
+  },
+  "baselineGeneration": 75,
+  "activationGeneration": 76,
+  "recoveredGeneration": 77,
+  "normalTakeoverVerified": true,
+  "activation": {
+    "supervisor": {
+      "pid": 62176,
+      "executablePath": "C:\\Program Files\\nodejs\\node.exe",
+      "createdAtUtc": "2026-10-27T03:09:45.5870401Z",
+      "filetime": "134375441855870401"
+    },
+    "worker": {
+      "pid": 59460,
+      "executablePath": "C:\\Program Files\\nodejs\\node.exe",
+      "createdAtUtc": "2026-10-27T03:10:50.9335759Z",
+      "filetime": "134375442509335759"
+    },
+    "watchdog": {
+      "pid": 57084,
+      "executablePath": "C:\\Program Files\\nodejs\\node.exe",
+      "createdAtUtc": "2026-10-27T03:10:49.5752188Z",
+      "filetime": "134375442495752188"
+    },
+    "app": {
+      "pid": 16064,
+      "executablePath": "D:\\repos\\ccswitchmultirouter\\src-tauri\\target\\debug\\cc-switch.exe",
+      "createdAtUtc": "2026-10-27T03:11:02.0103869Z",
+      "filetime": "134375442620103869"
+    },
+    "canonicalWatchdogIdentityVerified": true,
+    "watchdogNativeParentPid": 35664,
+    "oldIdentitiesGone": {
+      "supervisor": true,
+      "worker": true,
+      "watchdog": true,
+      "app": true
+    }
+  },
+  "crashAtUtc": "2026-10-27T03:11:24.269Z",
+  "crash": {
+    "exactHandleKilled": true,
+    "pid": 62176,
+    "filetime": "134375441855870401",
+    "entireProcessTree": false
+  },
+  "recovered": {
+    "supervisor": {
+      "pid": 4748,
+      "executablePath": "C:\\Program Files\\nodejs\\node.exe",
+      "createdAtUtc": "2026-10-27T03:11:27.6151990Z",
+      "filetime": "134375442876151990"
+    },
+    "worker": {
+      "pid": 28880,
+      "executablePath": "C:\\Program Files\\nodejs\\node.exe",
+      "createdAtUtc": "2026-10-27T03:11:42.5279956Z",
+      "filetime": "134375443025279956"
+    },
+    "watchdog": {
+      "pid": 61812,
+      "executablePath": "C:\\Program Files\\nodejs\\node.exe",
+      "createdAtUtc": "2026-10-27T03:11:41.8215139Z",
+      "filetime": "134375443018215139"
+    },
+    "app": {
+      "pid": 8704,
+      "executablePath": "D:\\repos\\ccswitchmultirouter\\src-tauri\\target\\debug\\cc-switch.exe",
+      "createdAtUtc": "2026-10-27T03:11:49.5677543Z",
+      "filetime": "134375443095677543"
+    },
+    "oldIdentitiesGone": {
+      "supervisor": true,
+      "worker": true,
+      "watchdog": true,
+      "app": true
+    },
+    "recoveryFlagTargetsCrashedPid": true,
+    "anchoredWatchdogCount": 1,
+    "uniqueProxyPortOwner": true,
+    "uniqueFrontendPortOwner": true,
+    "appMarkerFiletime": "134375443095677543",
+    "canonicalWatchdogIdentityVerified": true,
+    "watchdogNativeParentPid": 35664,
+    "binaryWriteAtUtc": "2026-10-27T01:29:13.4041109Z"
+  },
+  "restartBudgetBefore": 0,
+  "restartBudgetAfter": 1,
+  "recoveryLog": "C:\\Users\\felix\\.cc-switch\\logs\\dev-recovery.log",
+  "recoveryLogFreshOffset": 779,
+  "recoveryLogFreshBytes": 12262,
+  "actualStartupOutput": {
+    "viteStdout": true,
+    "cargoStderr": true,
+    "applicationStarted": true
+  },
+  "literalGetContentFollowVerified": true,
+  "followerOutputBytes": 12323,
+  "followerOutputFlags": {
+    "viteStdout": true,
+    "cargoStderr": true,
+    "applicationStarted": true
+  },
+  "sameConsoleWindowReopened": false,
+  "ephemeralDiagnostics": {
+    "launcherStdout": "C:\\Users\\felix\\AppData\\Local\\Temp\\ccswitch-console-live-launch-1793070584247.out.log",
+    "launcherStderr": "C:\\Users\\felix\\AppData\\Local\\Temp\\ccswitch-console-live-launch-1793070584247.err.log",
+    "followerOutput": "C:\\Users\\felix\\AppData\\Local\\Temp\\ccswitch-console-live-tail-1793070584247.log",
+    "followerErrors": "C:\\Users\\felix\\AppData\\Local\\Temp\\ccswitch-console-live-tail-1793070584247.err.log"
+  },
+  "desktopContinueDeliveryVerified": false
+}
