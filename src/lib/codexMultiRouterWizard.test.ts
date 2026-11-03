@@ -626,7 +626,7 @@ describe("buildCodexMultiRouterWizardPlan subagent profile rekey", () => {
     };
   }
 
-  it("rekeys a stale profile and spawn candidate to the rebuilt visible alias", () => {
+  it("preserves a stale profile while keeping the current route alias authoritative", () => {
     const legacyProfile = {
       model: legacyAlias,
       enabled: true,
@@ -648,13 +648,13 @@ describe("buildCodexMultiRouterWizardPlan subagent profile rekey", () => {
       any
     >;
 
-    expect(routing.subagentV2.profiles[nextAlias]).toMatchObject({
-      model: nextAlias,
+    expect(routing.subagentV2.profiles[legacyAlias]).toMatchObject({
+      model: legacyAlias,
       enabled: true,
       reasoning: { policy: "fixed", effort: "high" },
     });
-    expect(routing.subagentV2.profiles[legacyAlias]).toBeUndefined();
-    expect(routing.spawnAgentModels).toContain(nextAlias);
+    expect(routing.subagentV2.profiles[nextAlias]).toBeUndefined();
+    expect(routing.spawnAgentModels).toContain(legacyAlias);
   });
 
   it("preserves both profiles when the rebuilt alias is already occupied", () => {

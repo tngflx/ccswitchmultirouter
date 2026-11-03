@@ -4762,9 +4762,11 @@ impl RequestForwarder {
         };
 
         let send_once = || {
-            send_upstream_request_with_transport_retry(adapter.name(), || {
-                send_upstream_request(ordered_headers.clone(), payload.replay_body())
-            })
+            send_upstream_request_with_transport_retry(
+                adapter.name(),
+                !matches!(app_type, AppType::Codex) || stream_retry_budget > 0,
+                || send_upstream_request(ordered_headers.clone(), payload.replay_body()),
+            )
         };
         let mut response = if matches!(app_type, AppType::Codex) {
             send_codex_request_with_rate_limit_retry(
@@ -4912,9 +4914,16 @@ impl RequestForwarder {
                     );
                 }
                 let retry_send_once = || {
-                    send_upstream_request_with_transport_retry(adapter.name(), || {
-                        send_upstream_request(retry_headers.clone(), retry_payload.replay_body())
-                    })
+                    send_upstream_request_with_transport_retry(
+                        adapter.name(),
+                        !matches!(app_type, AppType::Codex) || stream_retry_budget > 0,
+                        || {
+                            send_upstream_request(
+                                retry_headers.clone(),
+                                retry_payload.replay_body(),
+                            )
+                        },
+                    )
                 };
                 response = send_codex_request_with_rate_limit_retry(
                     adapter.name(),
@@ -5681,38 +5690,46 @@ impl RequestForwarder {
             endpoint,
             request_model_for_log
         );
-        let response = send_upstream_request_with_transport_retry(adapter.name(), || {
-            let method = method.clone();
-            let url = url.clone();
-            let target_for_log = target_for_log.clone();
-            let ordered_headers = ordered_headers.clone();
-            let extensions = extensions.clone();
-            let body_bytes = body_bytes.clone();
-            let upstream_proxy_url = upstream_proxy_url.clone();
-            let managed_replay_auth = managed_replay_auth.clone();
-            async move {
-                let ordered_headers =
-                    refresh_managed_replay_headers(ordered_headers, managed_replay_auth.as_ref())
-                        .await
-                        .map_err(|error| ProxyError::AuthError(error.to_string()))?;
-                send_forwarder_upstream_request(
-                    method,
-                    url,
-                    target_for_log,
-                    ordered_headers,
-                    extensions,
-                    body_bytes,
-                    timeout,
-                    request_is_streaming,
-                    self.non_streaming_timeout,
-                    self.streaming_first_byte_timeout,
-                    is_socks_proxy,
-                    preserve_exact_header_case,
-                    upstream_proxy_url.as_deref(),
-                )
-                .await
-            }
-        })
+        let stream_retry_budget = crate::settings::get_settings()
+            .stream_retry_budget(super::providers::streaming_retry::STREAM_MAX_RETRIES);
+        let response = send_upstream_request_with_transport_retry(
+            adapter.name(),
+            !matches!(app_type, AppType::Codex) || stream_retry_budget > 0,
+            || {
+                let method = method.clone();
+                let url = url.clone();
+                let target_for_log = target_for_log.clone();
+                let ordered_headers = ordered_headers.clone();
+                let extensions = extensions.clone();
+                let body_bytes = body_bytes.clone();
+                let upstream_proxy_url = upstream_proxy_url.clone();
+                let managed_replay_auth = managed_replay_auth.clone();
+                async move {
+                    let ordered_headers = refresh_managed_replay_headers(
+                        ordered_headers,
+                        managed_replay_auth.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| ProxyError::AuthError(error.to_string()))?;
+                    send_forwarder_upstream_request(
+                        method,
+                        url,
+                        target_for_log,
+                        ordered_headers,
+                        extensions,
+                        body_bytes,
+                        timeout,
+                        request_is_streaming,
+                        self.non_streaming_timeout,
+                        self.streaming_first_byte_timeout,
+                        is_socks_proxy,
+                        preserve_exact_header_case,
+                        upstream_proxy_url.as_deref(),
+                    )
+                    .await
+                }
+            },
+        )
         .await
         .inspect_err(|err| {
             if let Some(trace_id) = codex_trace_id.as_deref() {
@@ -7964,6 +7981,7 @@ async fn send_forwarder_upstream_request_inner(
 /// 每个 attempt 都重新执行传入的发送闭包，因此重试使用的是同一份已经转换好的 headers/body。
 async fn send_upstream_request_with_transport_retry<F, Fut>(
     app_tag: &str,
+    transport_retry_enabled: bool,
     mut send: F,
 ) -> Result<ProxyResponse, ProxyError>
 where
@@ -7974,7 +7992,7 @@ where
     loop {
         match send().await {
             Ok(response) => return Ok(response),
-            Err(error) if attempt < UPSTREAM_TRANSPORT_RETRY_LIMIT => {
+            Err(error) if transport_retry_enabled && attempt < UPSTREAM_TRANSPORT_RETRY_LIMIT => {
                 if !matches!(error, ProxyError::ForwardFailed(_)) {
                     return Err(error);
                 }
@@ -15761,7 +15779,7 @@ mod tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_upstream_request_with_transport_retry("test", || {
+        let result = send_upstream_request_with_transport_retry("test", true, || {
             let attempts = attempts_for_send.clone();
             async move {
                 if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -15788,7 +15806,7 @@ mod tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_upstream_request_with_transport_retry("test", || {
+        let result = send_upstream_request_with_transport_retry("test", true, || {
             let attempts = attempts_for_send.clone();
             async move {
                 if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -15811,11 +15829,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_transport_retry_disabled_sends_once() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let result = send_upstream_request_with_transport_retry("test", false, || {
+            let attempts = attempts_for_send.clone();
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(ProxyError::ForwardFailed(
+                    "disabled transport retry".to_string(),
+                ))
+            }
+        })
+        .await;
+        assert!(matches!(result, Err(ProxyError::ForwardFailed(_))));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn upstream_transport_retry_stops_after_bounded_attempts() {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_upstream_request_with_transport_retry("test", || {
+        let result = send_upstream_request_with_transport_retry("test", true, || {
             let attempts = attempts_for_send.clone();
             async move {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -15838,7 +15874,7 @@ mod tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
 
-        let result = send_upstream_request_with_transport_retry("test", || {
+        let result = send_upstream_request_with_transport_retry("test", true, || {
             let attempts = attempts_for_send.clone();
             async move {
                 if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 5 {

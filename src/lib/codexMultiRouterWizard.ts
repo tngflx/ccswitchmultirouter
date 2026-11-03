@@ -27,15 +27,16 @@ import {
   isCodexVolcengineAgentPlanModelFetch,
 } from "@/utils/codexPlanModelFetch";
 import { normalizeCodexSubagentVersion } from "@/utils/codexSubagentVersion";
-import {
-  modelBindingIdentityValues,
-  modelIdentityValues,
-} from "@/lib/modelIdentities";
+import { modelBindingIdentityValues } from "@/lib/modelIdentities";
 import {
   isCompleteCodexCatalogFetch,
   reconcileFetchedCodexCatalogRows,
 } from "@/lib/codexCatalogReconciliation";
 import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
+import {
+  buildCodexModelReferenceIndex,
+  resolveCodexRouteModelReference,
+} from "@/lib/codexConfigSanitizer";
 
 export const CODEX_MULTI_ROUTER_WIZARD_DISMISSED_KEY =
   "ccswitchmulti.codexMultiRouterWizard.dismissed";
@@ -515,21 +516,38 @@ function aliasModelName(provider: Provider, modelName: string): string {
   return `${modelName}-${providerNameSuffix(provider)}`;
 }
 
-// 从已处理别名的模型目录生成 route 级模型映射；后端物化 targetProviderId
-// 时只读取原 provider 配置，必须靠这里把可见别名改回真实上游模型名。
+type WizardSourceModelId = (
+  provider: Provider,
+  model: CodexCatalogModel,
+) => string;
+
+function isGeneratedWizardGroupModel(model: CodexCatalogModel): boolean {
+  return (
+    model.apiKeyGroupGenerated === true ||
+    model.api_key_group_generated === true ||
+    Boolean(model.apiKeyGroupId || model.api_key_group_id) ||
+    model.model.toLowerCase().includes("--ccg-")
+  );
+}
+
+const defaultWizardSourceModelId: WizardSourceModelId = (_provider, model) =>
+  (isGeneratedWizardGroupModel(model)
+    ? model.model
+    : (model.upstreamModel ?? model.upstream_model ?? model.model)
+  ).trim();
+
+// Map draft-visible aliases to the original provider's public row IDs. The
+// provider catalog, not a route alias, owns the wire model and credential group.
 function buildWizardRouteModelMap(
   provider: Provider,
+  sourceModelId: WizardSourceModelId,
 ): Record<string, string> | undefined {
   const entries = readIncludedWizardModelCatalog(provider)
     .map((model) => {
       const visibleModel = model.model?.trim();
-      const upstreamModel = (
-        model.upstreamModel ??
-        model.upstream_model ??
-        model.model
-      )?.trim();
-      return visibleModel && upstreamModel && visibleModel !== upstreamModel
-        ? [visibleModel, upstreamModel]
+      const canonicalModel = sourceModelId(provider, model);
+      return visibleModel && canonicalModel && visibleModel !== canonicalModel
+        ? [visibleModel, canonicalModel]
         : null;
     })
     .filter((entry): entry is [string, string] => Boolean(entry));
@@ -556,14 +574,20 @@ function hasOpenAiResponsesNativeModels(provider: Provider): boolean {
 export function resolveWizardModelNameCollisions(
   providers: Provider[],
 ): Provider[] {
-  const ownersByUpstream = new Map<string, Provider[]>();
+  const collisionKeyFor = (model: CodexCatalogModel): string =>
+    isGeneratedWizardGroupModel(model)
+      ? model.model.trim().toLowerCase()
+      : modelBindingIdentityValues(model)[0];
+  const ownersByCollisionKey = new Map<string, Provider[]>();
   for (const provider of providers) {
     for (const model of readIncludedWizardModelCatalog(provider)) {
-      const upstream = modelBindingIdentityValues(model)[0];
-      if (!upstream) continue;
-      const owners = ownersByUpstream.get(upstream) ?? [];
-      owners.push(provider);
-      ownersByUpstream.set(upstream, owners);
+      const collisionKey = collisionKeyFor(model);
+      if (!collisionKey) continue;
+      const owners = ownersByCollisionKey.get(collisionKey) ?? [];
+      if (!owners.some((owner) => owner.id === provider.id)) {
+        owners.push(provider);
+      }
+      ownersByCollisionKey.set(collisionKey, owners);
     }
   }
 
@@ -572,7 +596,18 @@ export function resolveWizardModelNameCollisions(
       if (model.enabled === false) return model;
       const upstream =
         model.upstreamModel ?? model.upstream_model ?? model.model;
-      const owners = ownersByUpstream.get(upstream) ?? [];
+      const generated = isGeneratedWizardGroupModel(model);
+      const owners = ownersByCollisionKey.get(collisionKeyFor(model)) ?? [];
+      if (generated) {
+        if (owners.length <= 1) return { ...model, upstreamModel: upstream };
+        const visible = aliasModelName(provider, model.model);
+        return {
+          ...model,
+          model: visible,
+          displayName: model.displayName ?? visible,
+          upstreamModel: upstream,
+        };
+      }
       if (owners.length <= 1 || isCanonicalModelSource(provider)) {
         return { ...model, upstreamModel: upstream };
       }
@@ -594,6 +629,28 @@ export function resolveWizardModelNameCollisions(
       },
     };
   });
+}
+
+function resolveWizardSourceModelContext(sourceProviders: Provider[]): {
+  sources: Provider[];
+  sourceModelId: WizardSourceModelId;
+} {
+  const sources = resolveWizardModelNameCollisions(sourceProviders);
+  // Collision resolution changes draft picker names only. Keep the original
+  // provider row ID as the persisted selection/alias target, never its shared
+  // upstream wire name. This map is transient and cannot become another source
+  // of persisted catalog truth. Reuse it when restoring saved draft choices.
+  const sourceIdByResolvedModel = new Map<CodexCatalogModel, string>();
+  sources.forEach((provider, providerIndex) => {
+    const originals = readWizardModelCatalog(sourceProviders[providerIndex]);
+    readWizardModelCatalog(provider).forEach((model, modelIndex) => {
+      sourceIdByResolvedModel.set(model, originals[modelIndex].model.trim());
+    });
+  });
+  const sourceModelId: WizardSourceModelId = (provider, model) =>
+    sourceIdByResolvedModel.get(model) ??
+    defaultWizardSourceModelId(provider, model);
+  return { sources, sourceModelId };
 }
 
 // 按 provider 名称和模型名推断默认前缀；这些前缀只作为向导初始规则，后续可在工作台细调。
@@ -931,13 +988,14 @@ export function filterWizardProvidersByModelOrder(
     .filter((provider) => readWizardModelCatalog(provider).length > 0);
 }
 
-function canonicalWizardModelIds(provider: Provider): string[] {
+function canonicalWizardModelIds(
+  provider: Provider,
+  sourceModelId: WizardSourceModelId = defaultWizardSourceModelId,
+): string[] {
   return Array.from(
     new Set(
       readIncludedWizardModelCatalog(provider)
-        .map((model) =>
-          (model.upstreamModel ?? model.upstream_model ?? model.model).trim(),
-        )
+        .map((model) => sourceModelId(provider, model))
         .filter(Boolean),
     ),
   );
@@ -981,23 +1039,28 @@ export function collectWizardRouteAliasSelectionIssues(
     const provider = providersById.get(route.targetProviderId);
     if (!provider) continue;
     const routeLabel = wizardRouteDisplayLabel(route, provider.name);
-    const canonicalIds = canonicalWizardModelIds(provider);
-    const canonicalSet = new Set(
-      canonicalIds.map((model) => model.toLowerCase()),
+    const sourceIndex = buildCodexModelReferenceIndex(
+      readIncludedWizardModelCatalog(provider),
     );
     const selectedSet =
       route.modelSelection?.mode === "all"
-        ? canonicalSet
+        ? null
         : new Set(
-            (route.modelSelection?.models ?? []).map((model) =>
-              model.trim().toLowerCase(),
-            ),
+            (route.modelSelection?.models ?? [])
+              .map((model) =>
+                resolveCodexRouteModelReference(
+                  model,
+                  sourceIndex,
+                  route.aliases,
+                ),
+              )
+              .filter((model): model is string => Boolean(model)),
           );
     for (const [alias, target] of Object.entries(route.aliases ?? {})) {
       const canonicalModel = target.trim();
       if (!canonicalModel) continue;
-      const canonicalKey = canonicalModel.toLowerCase();
-      if (!canonicalSet.has(canonicalKey)) {
+      const canonical = sourceIndex.resolve(canonicalModel);
+      if (!canonical) {
         issues.push({
           routeId: route.id,
           routeLabel,
@@ -1009,7 +1072,7 @@ export function collectWizardRouteAliasSelectionIssues(
               "The alias target was removed or renamed in the provider model catalog.",
           }),
         });
-      } else if (!selectedSet.has(canonicalKey)) {
+      } else if (selectedSet && !selectedSet.has(canonical)) {
         issues.push({
           routeId: route.id,
           routeLabel,
@@ -1031,20 +1094,32 @@ export function collectWizardRouteAliasSelectionIssues(
 export function buildWizardRoutesFromSources(
   providers: Provider[],
   existingRoutes: CodexRoutingRouteV2[] = [],
+  sourceModelId: WizardSourceModelId = defaultWizardSourceModelId,
 ): CodexRoutingRouteV2[] {
   return providers.filter(hasWizardModelCatalog).map((provider) => {
-    const modelMap = buildWizardRouteModelMap(provider);
+    const modelMap = buildWizardRouteModelMap(provider, sourceModelId);
     const existingRoute = existingRoutes.find(
       (route) => route.targetProviderId === provider.id,
     );
-    const canonicalModels = new Set(canonicalWizardModelIds(provider));
+    const canonicalModels = new Set(
+      canonicalWizardModelIds(provider, sourceModelId),
+    );
+    const sourceIndex = buildCodexModelReferenceIndex(
+      readIncludedWizardModelCatalog(provider).map((model) => ({
+        model: sourceModelId(provider, model),
+        upstreamModel: model.upstreamModel ?? model.upstream_model,
+        ...(isGeneratedWizardGroupModel(model)
+          ? { apiKeyGroupGenerated: true }
+          : {}),
+      })),
+    );
     const aliases = { ...(modelMap ?? {}) };
     // A generated collision alias becomes part of the route contract on first
     // save. Keep that persisted spelling when the Provider is renamed later.
     for (const [visible, canonical] of Object.entries(
       existingRoute?.aliases ?? {},
     )) {
-      const target = canonical.trim();
+      const target = sourceIndex.resolve(canonical);
       if (!target || !canonicalModels.has(target)) continue;
       for (const [generatedVisible, generatedTarget] of Object.entries(
         aliases,
@@ -1232,7 +1307,7 @@ export function initialWizardCatalogModelOrder(
   const selectedSourceIds = new Set(
     initialWizardSelectedSourceIds(existingPlan, sourceProviders),
   );
-  const sources = resolveWizardModelNameCollisions(
+  const { sources, sourceModelId } = resolveWizardSourceModelContext(
     sourceProviders.filter((source) => selectedSourceIds.has(source.id)),
   );
   const sourceById = new Map(
@@ -1243,19 +1318,31 @@ export function initialWizardCatalogModelOrder(
     if (route.enabled === false) continue;
     const source = sourceById.get(route.targetProviderId);
     if (!source) continue;
+    const sourceIndex = buildCodexModelReferenceIndex(
+      readIncludedWizardModelCatalog(source).map((model) => ({
+        ...model,
+        model: sourceModelId(source, model),
+        ...(isGeneratedWizardGroupModel(model)
+          ? { apiKeyGroupGenerated: true }
+          : {}),
+      })),
+    );
     const selected =
       route.modelSelection?.mode === "include"
         ? new Set(
-            route.modelSelection.models.map((model) =>
-              model.trim().toLowerCase(),
-            ),
+            route.modelSelection.models
+              .map((model) =>
+                resolveCodexRouteModelReference(
+                  model,
+                  sourceIndex,
+                  route.aliases,
+                ),
+              )
+              .filter((model): model is string => Boolean(model)),
           )
         : null;
     for (const model of readIncludedWizardModelCatalog(source)) {
-      const identities = modelIdentityValues(model);
-      if (selected && !identities.some((identity) => selected.has(identity))) {
-        continue;
-      }
+      if (selected && !selected.has(sourceModelId(source, model))) continue;
       if (!ordered.includes(model.model)) ordered.push(model.model);
     }
   }
@@ -1263,64 +1350,160 @@ export function initialWizardCatalogModelOrder(
 }
 
 // 向导重建路由/目录后，为既有 subagentV2 生成“旧可见名 → 新可见名”的重定向器。
-// 旧 profile 是可见名快照；重名消歧发生变化时必须先经旧 aliases 找回 upstream
-// 身份，再映射到新目录，否则会产生无法被路由命中的孤儿 profile。
+//
+// A visible model name is only unique inside its route/provider scope.  Mapping
+// every historical alias through one global upstream map is unsafe: two
+// providers may intentionally expose the same wire model while carrying
+// different credentials, capabilities, and Sub-Agent roles.  Keep aliases
+// provider-scoped, preserve an alias that is still present, and fail closed
+// when the owning source or model is gone.
 function buildSubagentNameRedirector(
   oldRoutes: CodexRoutingRouteV2[],
   newRoutes: CodexRoutingRouteV2[],
   resolvedSources: Provider[],
+  sourceModelId: WizardSourceModelId,
 ) {
-  const oldVisibleToUpstream = new Map<string, string>();
+  type RouteScope = {
+    providerId: string;
+    oldAliasToCanonical: Map<string, string | null>;
+    newCanonicalToVisible: Map<string, string | null>;
+    newVisibleByKey: Map<string, string>;
+  };
+
+  const scopesByProvider = new Map<string, RouteScope>();
+  const scopeFor = (providerId: string): RouteScope => {
+    const existing = scopesByProvider.get(providerId);
+    if (existing) return existing;
+    const scope: RouteScope = {
+      providerId,
+      oldAliasToCanonical: new Map(),
+      newCanonicalToVisible: new Map(),
+      newVisibleByKey: new Map(),
+    };
+    scopesByProvider.set(providerId, scope);
+    return scope;
+  };
+  const normalized = (value: string): string => value.trim().toLowerCase();
+  const addCanonicalVisible = (
+    scope: RouteScope,
+    canonical: string,
+    visible: string,
+  ): void => {
+    const canonicalKey = normalized(canonical);
+    const visibleKey = normalized(visible);
+    if (!canonicalKey || !visibleKey) return;
+    scope.newVisibleByKey.set(visibleKey, visible);
+    const previous = scope.newCanonicalToVisible.get(canonicalKey);
+    if (previous === undefined) {
+      scope.newCanonicalToVisible.set(canonicalKey, visible);
+    } else if (previous !== visible) {
+      // Ambiguous aliases fail closed instead of selecting the first owner.
+      scope.newCanonicalToVisible.set(canonicalKey, null);
+    }
+  };
+
   for (const route of oldRoutes) {
+    if (!route.targetProviderId) continue;
+    const scope = scopeFor(route.targetProviderId);
     for (const [visible, canonical] of Object.entries(route.aliases ?? {})) {
-      if (visible.trim() && canonical.trim()) {
-        oldVisibleToUpstream.set(
-          visible.trim().toLowerCase(),
-          canonical.trim(),
-        );
+      const visibleKey = normalized(visible);
+      const canonicalValue = canonical.trim();
+      if (visibleKey && canonicalValue) {
+        const previous = scope.oldAliasToCanonical.get(visibleKey);
+        if (previous === undefined) {
+          scope.oldAliasToCanonical.set(visibleKey, canonicalValue);
+        } else if (previous !== canonicalValue) {
+          // Conflicting historical aliases are not evidence for either target.
+          scope.oldAliasToCanonical.set(visibleKey, null);
+        }
       }
     }
   }
 
-  const identityToNewVisible = new Map<string, string>();
-  for (const source of resolvedSources) {
+  // Route aliases replace source-visible names, not augment them. Build the
+  // exact selected projection so a regenerated draft alias cannot remain a
+  // candidate after a persisted spelling has taken its place.
+  for (const route of newRoutes) {
+    if (!route.targetProviderId || route.enabled === false) continue;
+    const source = resolvedSources.find(
+      (provider) => provider.id === route.targetProviderId,
+    );
+    if (!source) continue;
+    const scope = scopeFor(source.id);
+    const selected =
+      route.modelSelection.mode === "include"
+        ? new Set(route.modelSelection.models.map(normalized))
+        : null;
     for (const model of readIncludedWizardModelCatalog(source)) {
-      const upstream = (
+      const canonical = sourceModelId(source, model);
+      if (selected && !selected.has(normalized(canonical))) continue;
+      const wire = (
         model.upstreamModel ??
         model.upstream_model ??
-        model.model ??
-        ""
+        canonical
       ).trim();
-      const visible = (model.model ?? "").trim();
-      const identity = upstream.toLowerCase();
-      if (identity && visible && !identityToNewVisible.has(identity)) {
-        identityToNewVisible.set(identity, visible);
+      const visibleAliases = Object.entries(route.aliases ?? {})
+        .filter(([, target]) => normalized(target) === normalized(canonical))
+        .map(([visible]) => visible.trim())
+        .filter(Boolean);
+      const visibleNames = visibleAliases.length ? visibleAliases : [canonical];
+      for (const visible of visibleNames) {
+        addCanonicalVisible(scope, canonical, visible);
+        // Historical ordinary routes may have stored their unambiguous wire
+        // target. Shared-wire siblings deliberately make that redirect closed.
+        if (normalized(wire) !== normalized(canonical)) {
+          addCanonicalVisible(scope, wire, visible);
+        }
       }
     }
   }
-  for (const route of newRoutes) {
-    for (const [visible, canonical] of Object.entries(route.aliases ?? {})) {
-      const identity = canonical.trim().toLowerCase();
-      if (identity && visible.trim() && !identityToNewVisible.has(identity)) {
-        identityToNewVisible.set(identity, visible.trim());
+
+  const currentVisibleByKey = new Map<string, string>();
+  const ambiguousVisibleKeys = new Set<string>();
+  for (const scope of scopesByProvider.values()) {
+    for (const [key, visible] of scope.newVisibleByKey) {
+      const previous = currentVisibleByKey.get(key);
+      // A collision-resolved catalog should not have duplicate visible names,
+      // but preserve the fail-closed behavior if a stale draft does.
+      if (previous && previous !== visible) {
+        currentVisibleByKey.delete(key);
+        ambiguousVisibleKeys.add(key);
+      } else if (
+        !currentVisibleByKey.has(key) &&
+        !ambiguousVisibleKeys.has(key)
+      ) {
+        currentVisibleByKey.set(key, visible);
       }
     }
+  }
+  function isCurrentVisibleName(value: string): boolean {
+    const key = normalized(value);
+    return Boolean(
+      key && currentVisibleByKey.has(key) && !ambiguousVisibleKeys.has(key),
+    );
   }
 
   function redirectVisibleName(oldVisible: string): string | null {
     const trimmed = oldVisible.trim();
-    if (!trimmed) return null;
-    const identities = [
-      oldVisibleToUpstream.get(trimmed.toLowerCase()),
-      trimmed,
-    ]
-      .filter((identity): identity is string => Boolean(identity))
-      .map((identity) => identity.toLowerCase());
-    for (const identity of identities) {
-      const mapped = identityToNewVisible.get(identity);
-      if (mapped) return mapped;
+    const oldKey = normalized(trimmed);
+    if (!oldKey) return null;
+
+    // Exact materialized public IDs and aliases outrank another source's wire
+    // identity. A bare wire that has no current visible row is absent from this
+    // map and still cannot steal a profile from its owning route.
+    const stable = currentVisibleByKey.get(oldKey);
+    if (stable && isCurrentVisibleName(trimmed)) return stable;
+
+    const owners: Array<{ scope: RouteScope; canonical: string }> = [];
+    for (const scope of scopesByProvider.values()) {
+      const canonical = scope.oldAliasToCanonical.get(oldKey);
+      if (canonical) owners.push({ scope, canonical });
     }
-    return null;
+    if (owners.length !== 1) return null;
+
+    const { scope, canonical } = owners[0];
+    const next = scope.newCanonicalToVisible.get(normalized(canonical));
+    return next ?? null;
   }
 
   function remapSubagentV2(
@@ -1364,7 +1547,7 @@ function buildSubagentNameRedirector(
     return { ...current, profiles: next };
   }
 
-  return { redirectVisibleName, remapSubagentV2 };
+  return { redirectVisibleName, isCurrentVisibleName, remapSubagentV2 };
 }
 
 // 创建或更新 MultiRouter provider；草稿只在用户点击保存发布时写入数据库。
@@ -1374,8 +1557,8 @@ export function buildCodexMultiRouterWizardPlan(
   existingPlan?: Provider | null,
   options: WizardPlanBuildOptions = {},
 ): WizardPlanBuildResult {
-  const collisionResolvedSources =
-    resolveWizardModelNameCollisions(sourceProviders);
+  const { sources: collisionResolvedSources, sourceModelId } =
+    resolveWizardSourceModelContext(sourceProviders);
   const resolvedSources = filterWizardProvidersByModelOrder(
     collisionResolvedSources,
     options.catalogModelOrder,
@@ -1383,7 +1566,7 @@ export function buildCodexMultiRouterWizardPlan(
   const selectedCanonicalByProvider = new Map(
     resolvedSources.map((provider) => [
       provider.id,
-      new Set(canonicalWizardModelIds(provider)),
+      new Set(canonicalWizardModelIds(provider, sourceModelId)),
     ]),
   );
   const canonicalSourceProviders = sourceProviders
@@ -1391,14 +1574,14 @@ export function buildCodexMultiRouterWizardPlan(
     .map((provider) => {
       const selected = selectedCanonicalByProvider.get(provider.id)!;
       const models = readIncludedWizardModelCatalog(provider).filter((model) =>
-        selected.has(
-          (model.upstreamModel ?? model.upstream_model ?? model.model).trim(),
-        ),
+        selected.has(model.model.trim()),
       );
+      const settingsConfig = { ...provider.settingsConfig };
+      delete settingsConfig.model_catalog;
       return {
         ...provider,
         settingsConfig: {
-          ...provider.settingsConfig,
+          ...settingsConfig,
           modelCatalog: {
             ...(readWizardModelCatalogConfig(provider) ?? {}),
             models,
@@ -1420,6 +1603,7 @@ export function buildCodexMultiRouterWizardPlan(
   const routes: CodexRoutingRouteV2[] = buildWizardRoutesFromSources(
     resolvedSources,
     existingRoutingV2?.routes ?? [],
+    sourceModelId,
   ).map((route) => {
     if (!options.catalogModelOrder) return route;
     const selectedSource = resolvedSources.find(
@@ -1429,8 +1613,11 @@ export function buildCodexMultiRouterWizardPlan(
       (provider) => provider.id === route.targetProviderId,
     );
     if (!selectedSource || !fullSource) return route;
-    const selectedModels = canonicalWizardModelIds(selectedSource);
-    const fullModels = canonicalWizardModelIds(fullSource);
+    const selectedModels = canonicalWizardModelIds(
+      selectedSource,
+      sourceModelId,
+    );
+    const fullModels = canonicalWizardModelIds(fullSource, sourceModelId);
     const selectedSet = new Set(selectedModels);
     const includesEveryProviderModel =
       selectedSet.size === fullModels.length &&
@@ -1442,11 +1629,6 @@ export function buildCodexMultiRouterWizardPlan(
         : ({ mode: "include", models: selectedModels } as const),
     };
   });
-  const selectedVisibleModels = new Set(
-    resolvedSources.flatMap((provider) =>
-      readIncludedWizardModelCatalog(provider).map((model) => model.model),
-    ),
-  );
   const requestedSpawnAgentModels: string[] =
     options.spawnAgentModels ?? initialWizardSpawnAgentModels(existingPlan);
   const subagentVersion = normalizeCodexSubagentVersion(
@@ -1456,6 +1638,7 @@ export function buildCodexMultiRouterWizardPlan(
     existingRoutingV2?.routes ?? [],
     routes,
     resolvedSources,
+    sourceModelId,
   );
   const routing: CodexRoutingConfigV2 = {
     ...(existingRoutingV2 ?? {}),
@@ -1466,10 +1649,14 @@ export function buildCodexMultiRouterWizardPlan(
       existingRouting?.subagentV2,
     ),
     spawnAgentModels: requestedSpawnAgentModels
-      .map(
-        (model) => subagentNameRedirector.redirectVisibleName(model) ?? model,
-      )
-      .filter((model) => selectedVisibleModels.has(model)),
+      .map((model) => {
+        const redirected = subagentNameRedirector.redirectVisibleName(model);
+        if (redirected) return redirected;
+        return subagentNameRedirector.isCurrentVisibleName(model)
+          ? model
+          : null;
+      })
+      .filter((model): model is string => Boolean(model)),
     routes,
   };
   const existingIds = new Set(allProviders.map((provider) => provider.id));

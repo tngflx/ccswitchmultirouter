@@ -86,7 +86,7 @@ function hasValue(value: unknown): boolean {
 function missingCapabilityPatch(
   row: CodexCatalogRowLike,
   fetched: FetchedCodexCatalogModel,
-  refreshModalities = false,
+  refreshCapabilities = false,
 ): Partial<CodexCatalogRowLike> {
   const patch: Partial<CodexCatalogRowLike> = {};
   const fetchedModalities = fetched.inputModalities?.length
@@ -105,7 +105,7 @@ function missingCapabilityPatch(
       : fetchedModalities?.some((value) => value.toLowerCase() === "image");
   if (
     fetchedModalities &&
-    (refreshModalities ||
+    (refreshCapabilities ||
       (!Array.isArray(currentModalities) &&
         (typeof currentImage !== "boolean" ||
           currentImage ===
@@ -117,7 +117,7 @@ function missingCapabilityPatch(
   }
   if (
     typeof fetchedImage === "boolean" &&
-    (refreshModalities ||
+    (refreshCapabilities ||
       (typeof currentImage !== "boolean" &&
         (!Array.isArray(currentModalities) ||
           fetchedImage ===
@@ -129,9 +129,10 @@ function missingCapabilityPatch(
   }
   if (
     typeof fetched.supportsParallelToolCalls === "boolean" &&
-    typeof (
-      row.supportsParallelToolCalls ?? row.supports_parallel_tool_calls
-    ) !== "boolean"
+    (refreshCapabilities ||
+      typeof (
+        row.supportsParallelToolCalls ?? row.supports_parallel_tool_calls
+      ) !== "boolean")
   ) {
     patch.supportsParallelToolCalls = fetched.supportsParallelToolCalls;
   }

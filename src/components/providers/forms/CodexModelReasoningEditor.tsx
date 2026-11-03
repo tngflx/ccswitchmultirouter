@@ -48,8 +48,31 @@ export function CodexModelReasoningEditor({
     (effort) => !capability.supportedEfforts.includes(effort),
   );
 
-  const update = (next: CodexModelReasoningCapability) =>
-    onChange({ ...next, schemaVersion: 2, source: "user" });
+  const update = (next: CodexModelReasoningCapability) => {
+    // Read legacy evidence once, but write only the canonical v2 support state.
+    // Keeping both fields makes a later control-mode edit contradict itself.
+    const canonical = {
+      ...next,
+      supportStatus:
+        next.supportStatus ??
+        (next.supported === true
+          ? "confirmed_supported"
+          : next.supported === false
+            ? "confirmed_unsupported"
+            : "unknown"),
+    } satisfies CodexModelReasoningCapability;
+    delete canonical.supported;
+    const maxTarget = canonical.upstream.effortMap?.max;
+    if (
+      canonical.codexUltraOrchestration?.enabled &&
+      (!maxTarget || !canonical.supportedEfforts.includes(maxTarget))
+    ) {
+      // A control-mode or native-level edit can remove the verified max path.
+      // Do not retain an orchestration declaration the backend must reject.
+      delete canonical.codexUltraOrchestration;
+    }
+    onChange({ ...canonical, schemaVersion: 2, source: "user" });
+  };
 
   const updateControlKind = (controlKind: CodexReasoningControlKind) => {
     const graded = controlKind === "graded";
@@ -59,7 +82,9 @@ export function CodexModelReasoningEditor({
       supportStatus:
         controlKind === "none"
           ? "confirmed_unsupported"
-          : "confirmed_supported",
+          : controlKind === "unknown"
+            ? "unknown"
+            : "confirmed_supported",
       controlKind,
       supportedEfforts: graded ? capability.supportedEfforts : [],
       defaultEffort: graded ? capability.defaultEffort : undefined,

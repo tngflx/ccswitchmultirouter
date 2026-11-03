@@ -12,6 +12,7 @@ import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { providersApi } from "@/lib/api";
 import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
+import { readIncludedCodexModelCatalog } from "@/utils/codexSpawnAgentCandidates";
 import {
   fetchCodexOfficialFallbackModels,
   fetchCodexOauthModels,
@@ -24,6 +25,7 @@ import { proxyApi } from "@/lib/api/proxy";
 import { usageApi } from "@/lib/api/usage";
 import type {
   CodexCatalogModel,
+  CodexReasoningEffort,
   CodexRoutingAuthPolicy,
   Provider,
 } from "@/types";
@@ -275,8 +277,8 @@ function createDeferred<T>(): Deferred<T> {
 
 function modelReasoningResolution(
   model: string,
-  efforts: Array<"none" | "low" | "medium" | "high" | "xhigh"> = [],
-  defaultEffort: "low" | "medium" | "high" | "xhigh" = "medium",
+  efforts: CodexReasoningEffort[] = [],
+  defaultEffort: CodexReasoningEffort = "medium",
 ): CodexModelReasoningResolution {
   return {
     model,
@@ -286,7 +288,7 @@ function modelReasoningResolution(
     resolved: {
       supportKind: efforts.length ? "effort_levels" : "unknown",
       confidence: efforts.length ? "confirmed" : "unverified",
-      codexSelectableEfforts: efforts,
+      codexSelectableEfforts: efforts.filter((effort) => effort !== "none"),
       providerAcceptedEfforts: efforts,
       providerDefaultEffort: efforts.length ? defaultEffort : null,
       disableAllowed: efforts.includes("none"),
@@ -339,9 +341,20 @@ function renderWorkspace(ui: React.ReactElement) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  return render(
+  const result = render(
     React.createElement(QueryClientProvider, { client: queryClient }, ui),
   );
+  return {
+    ...result,
+    rerenderWorkspace: (nextUi: React.ReactElement) =>
+      result.rerender(
+        React.createElement(
+          QueryClientProvider,
+          { client: queryClient },
+          nextUi,
+        ),
+      ),
+  };
 }
 
 /// 构造状态页所需的最小代理日志；测试只关心 Codex 最近一次真实转发是否成功。
@@ -386,9 +399,16 @@ beforeEach(() => {
   vi.mocked(codexSubagentV2Api.resolveModelReasoningCapability).mockReset();
   vi.mocked(
     codexSubagentV2Api.resolveModelReasoningCapability,
-  ).mockImplementation(async (_settings, _provider, model) =>
-    modelReasoningResolution(model),
-  );
+  ).mockImplementation(async (settings, _provider, model) => {
+    const declared = readIncludedCodexModelCatalog({
+      settingsConfig: settings,
+    }).models.find((entry) => entry.model === model)?.reasoning;
+    return modelReasoningResolution(
+      model,
+      declared?.supportedEfforts ?? [],
+      declared?.defaultEffort ?? "medium",
+    );
+  });
   vi.mocked(fetchCodexOfficialFallbackModels).mockReset();
   vi.mocked(fetchCodexOauthModels).mockReset();
   vi.mocked(fetchModelsForConfig).mockReset();
@@ -521,14 +541,17 @@ describe("Model order real drag sensors", () => {
       models?: CodexCatalogModel[];
       routing?: Record<string, unknown>;
       config?: string;
+      sourceSettings?: Record<string, unknown>;
+      sourceName?: string;
     } = {},
   ) {
     const source: Provider = {
       id: "drag-source",
-      name: "Drag Source",
+      name: options.sourceName ?? "Drag Source",
       category: "custom",
       settingsConfig: {
         auth: { OPENAI_API_KEY: "test-only-credential" },
+        ...options.sourceSettings,
         modelCatalog: {
           spawnAgentModels: ["order-c", "order-a"],
           models: options.models ?? [
@@ -594,7 +617,7 @@ describe("Model order real drag sensors", () => {
     };
   }
 
-  it("top-aligns all model-order controls independently of the wrapped effort hint", () => {
+  it("top-aligns all model-order controls independently of the wrapped effort hint", async () => {
     renderModelOrder({
       models: [
         {
@@ -624,7 +647,7 @@ describe("Model order real drag sensors", () => {
     expect(screen.getByText(/Used by new threads when/)).toHaveClass(
       "break-words",
     );
-    expect(effort).toHaveValue("xhigh");
+    await waitFor(() => expect(effort).toHaveValue("xhigh"));
   });
 
   async function pointerMoveFirstToSecond() {
@@ -1069,8 +1092,8 @@ describe("Model order real drag sensors", () => {
   });
 
   const reasoning = (
-    efforts: Array<"low" | "high">,
-    defaultEffort: "low" | "high",
+    efforts: CodexReasoningEffort[],
+    defaultEffort: CodexReasoningEffort,
   ) => ({
     schemaVersion: 2 as const,
     supportStatus: "confirmed_supported" as const,
@@ -1428,9 +1451,11 @@ describe("Model order real drag sensors", () => {
     expect(screen.getByRole("combobox", { name: "Sort models" })).toHaveValue(
       "custom",
     );
-    expect(
-      screen.getByRole("combobox", { name: "Top model default effort" }),
-    ).toHaveValue("low");
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Top model default effort" }),
+      ).toHaveValue("low"),
+    );
     await user.click(screen.getByRole("button", { name: "Save order" }));
     await screen.findByText(/Saved the display order for 10 models/);
     expect(providersApi.update).toHaveBeenCalledTimes(1);
@@ -1448,9 +1473,11 @@ describe("Model order real drag sensors", () => {
     rendered.unmount();
     renderWorkspace(elementFor([source, saved]));
     expect(modelOrder()).toEqual(expectedOrder);
-    expect(
-      screen.getByRole("combobox", { name: "Top model default effort" }),
-    ).toHaveValue("low");
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Top model default effort" }),
+      ).toHaveValue("low"),
+    );
     expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
     expect(providersApi.update).toHaveBeenCalledTimes(1);
   });
@@ -1470,11 +1497,13 @@ describe("Model order real drag sensors", () => {
     const effort = screen.getByRole("combobox", {
       name: "Top model default effort",
     });
-    expect(
-      within(effort)
-        .getAllByRole("option")
-        .map((option) => option.textContent),
-    ).toEqual(["high"]);
+    await waitFor(() =>
+      expect(
+        within(effort)
+          .getAllByRole("option")
+          .map((option) => option.textContent),
+      ).toEqual(["high"]),
+    );
     expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
     await userEvent.click(
       screen.getByRole("button", { name: "Restore default" }),
@@ -1492,9 +1521,11 @@ describe("Model order real drag sensors", () => {
     );
     rendered.unmount();
     renderWorkspace(elementFor([source, saved]));
-    expect(
-      screen.getByRole("combobox", { name: "Top model default effort" }),
-    ).toHaveValue("low");
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Top model default effort" }),
+      ).toHaveValue("low"),
+    );
     expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
   });
 
@@ -1506,6 +1537,11 @@ describe("Model order real drag sensors", () => {
       config: 'model = "order-a"\n',
     });
     const user = userEvent.setup();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Top model default effort" }),
+      ).toBeEnabled(),
+    );
     await user.selectOptions(
       screen.getByRole("combobox", { name: "Top model default effort" }),
       "high",
@@ -1519,6 +1555,609 @@ describe("Model order real drag sensors", () => {
     );
     expect(saved.settingsConfig.codexRouting.modelOrder).toBeUndefined();
   });
+
+  it.each([
+    "catalog product setting",
+    "capability orchestration",
+    "resolved metadata",
+  ] as const)(
+    "uses canonical selectable efforts including Ultra from %s and persists it on save/reload",
+    async (kind) => {
+      const nativeEfforts: CodexReasoningEffort[] = [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ];
+      const declared = {
+        ...reasoning(nativeEfforts, "high"),
+        ...(kind === "capability orchestration"
+          ? { codexUltraOrchestration: { enabled: true } }
+          : {}),
+      };
+      const selectableEfforts: CodexReasoningEffort[] = [
+        ...nativeEfforts,
+        "ultra",
+      ];
+      vi.mocked(
+        codexSubagentV2Api.resolveModelReasoningCapability,
+      ).mockImplementation(async (_settings, _provider, model) => {
+        const resolution = modelReasoningResolution(
+          model,
+          selectableEfforts,
+          "high",
+        );
+        return {
+          ...resolution,
+          capability: declared,
+          resolved: {
+            ...resolution.resolved,
+            providerAcceptedEfforts: nativeEfforts,
+            codexUltraOrchestrationEnabled: true,
+            effortMap: { ultra: "max" },
+          },
+        };
+      });
+      const { source, plan, snapshot, rendered, elementFor } = renderModelOrder(
+        {
+          models: [
+            {
+              model: "order-a",
+              ...(kind !== "resolved metadata" ? { reasoning: declared } : {}),
+              ...(kind === "catalog product setting"
+                ? {
+                    codexUltra: {
+                      enabled: true,
+                      providerEffort: "max" as const,
+                    },
+                  }
+                : {}),
+            },
+          ],
+          routing: { defaultReasoningEffort: "high" },
+          config: 'model = "order-a"\n',
+        },
+      );
+      const effort = screen.getByRole("combobox", {
+        name: "Top model default effort",
+      });
+      await waitFor(() =>
+        expect(
+          within(effort).queryByRole("option", { name: "ultra" }),
+        ).toBeInTheDocument(),
+      );
+      expect(
+        within(effort)
+          .getAllByRole("option")
+          .map((option) => option.getAttribute("value")),
+      ).toEqual(selectableEfforts);
+      expect(
+        codexSubagentV2Api.resolveModelReasoningCapability,
+      ).toHaveBeenCalledWith(
+        { ...source.settingsConfig, providerName: source.name },
+        source.id,
+        "order-a",
+      );
+      expect(effort).toHaveValue("high");
+      const user = userEvent.setup();
+      await user.selectOptions(effort, "ultra");
+      await user.click(screen.getByRole("button", { name: "Save order" }));
+      await screen.findByText(/Saved the display order for 1 models/);
+      const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+      expect(saved.settingsConfig.codexRouting.defaultReasoningEffort).toBe(
+        "ultra",
+      );
+      expect(saved.settingsConfig.config).toBe(plan.settingsConfig.config);
+      expect(saved.settingsConfig.modelCatalog).toBeUndefined();
+      expect(JSON.stringify({ source, plan })).toBe(snapshot);
+      rendered.unmount();
+      renderWorkspace(elementFor([source, saved]));
+      await waitFor(() =>
+        expect(
+          screen.getByRole("combobox", { name: "Top model default effort" }),
+        ).toHaveValue("ultra"),
+      );
+      expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+    },
+  );
+
+  it("keeps the main-model native none disable path selectable and preserves it on save/reload", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, _provider, model) => {
+      const resolution = modelReasoningResolution(
+        model,
+        ["minimal", "high", "max"],
+        "high",
+      );
+      return {
+        ...resolution,
+        resolved: {
+          ...resolution.resolved,
+          providerAcceptedEfforts: ["none", "minimal", "high", "max"],
+          disableAllowed: true,
+        },
+      };
+    });
+    const { source, plan, rendered, elementFor } = renderModelOrder({
+      models: [
+        {
+          model: "order-a",
+          reasoning: {
+            ...reasoning(["none", "minimal", "high", "max"], "high"),
+            disableAllowed: true,
+          },
+        },
+      ],
+      config: 'model = "order-a"\n',
+    });
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() => expect(effort).toHaveValue("high"));
+    expect(
+      within(effort)
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("value")),
+    ).toEqual(["none", "minimal", "high", "max"]);
+    const user = userEvent.setup();
+    await user.selectOptions(effort, "none");
+    await user.click(screen.getByRole("button", { name: "Save order" }));
+    await screen.findByText(/Saved the display order for 1 models/);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.settingsConfig.codexRouting.defaultReasoningEffort).toBe(
+      "none",
+    );
+    expect(saved.settingsConfig.config).toBe(plan.settingsConfig.config);
+    rendered.unmount();
+    renderWorkspace(elementFor([source, saved]));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Top model default effort" }),
+      ).toHaveValue("none"),
+    );
+    expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+  });
+
+  it.each([
+    "disable flag without native none",
+    "native none without disable flag",
+  ] as const)(
+    "does not invent the main-model none option for %s",
+    async (kind) => {
+      vi.mocked(
+        codexSubagentV2Api.resolveModelReasoningCapability,
+      ).mockImplementation(async (_settings, _provider, model) => {
+        const resolution = modelReasoningResolution(
+          model,
+          ["high", "max"],
+          "high",
+        );
+        return {
+          ...resolution,
+          resolved: {
+            ...resolution.resolved,
+            providerAcceptedEfforts:
+              kind === "native none without disable flag"
+                ? ["none", "high", "max"]
+                : ["high", "max"],
+            disableAllowed: kind === "disable flag without native none",
+          },
+        };
+      });
+      renderModelOrder({ models: [{ model: "order-a" }] });
+      const effort = screen.getByRole("combobox", {
+        name: "Top model default effort",
+      });
+      await waitFor(() => expect(effort).toHaveValue("high"));
+      expect(
+        within(effort).queryByRole("option", { name: "none" }),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("gates Ultra to Sub-Agent v2 and refreshes the selectable levels when the plan version changes", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, _provider, model) =>
+      modelReasoningResolution(model, ["high", "max", "ultra"], "high"),
+    );
+    const { source, plan, rendered, elementFor } = renderModelOrder({
+      models: [
+        {
+          model: "order-a",
+          reasoning: reasoning(["high", "max"], "high"),
+          codexUltra: { enabled: true, providerEffort: "max" },
+        },
+      ],
+      routing: { subagentVersion: "v1" },
+    });
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() => expect(effort).toHaveValue("high"));
+    expect(
+      within(effort)
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("value")),
+    ).toEqual(["high", "max"]);
+    const nextPlan = {
+      ...plan,
+      settingsConfig: {
+        ...plan.settingsConfig,
+        codexRouting: {
+          ...plan.settingsConfig.codexRouting,
+          subagentVersion: "v2",
+        },
+      },
+    };
+    rendered.rerenderWorkspace(elementFor([source, nextPlan]));
+    await waitFor(() =>
+      expect(
+        within(effort).queryByRole("option", { name: "ultra" }),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes reasoning from current source settings instead of retaining a stale declared snapshot", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (settings, _provider, model) => {
+      const ultraEnabled = readIncludedCodexModelCatalog({
+        settingsConfig: settings,
+      }).models.find((entry) => entry.model === model)?.codexUltra?.enabled;
+      return modelReasoningResolution(
+        model,
+        ultraEnabled ? ["high", "max", "ultra"] : ["high", "max"],
+        "high",
+      );
+    });
+    const { source, plan, rendered, elementFor } = renderModelOrder({
+      models: [
+        {
+          model: "order-a",
+          reasoning: reasoning(["high", "max"], "high"),
+          codexUltra: { enabled: false },
+        },
+      ],
+    });
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() => expect(effort).toHaveValue("high"));
+    expect(
+      within(effort).queryByRole("option", { name: "ultra" }),
+    ).not.toBeInTheDocument();
+    const nextSource = {
+      ...source,
+      settingsConfig: {
+        ...source.settingsConfig,
+        modelCatalog: {
+          ...source.settingsConfig.modelCatalog,
+          models: [
+            {
+              ...source.settingsConfig.modelCatalog.models[0],
+              codexUltra: { enabled: true, providerEffort: "max" },
+            },
+          ],
+        },
+      },
+    };
+    rendered.rerenderWorkspace(elementFor([nextSource, plan]));
+    await waitFor(() =>
+      expect(
+        within(effort).queryByRole("option", { name: "ultra" }),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).toHaveBeenLastCalledWith(
+      { ...nextSource.settingsConfig, providerName: nextSource.name },
+      nextSource.id,
+      "order-a",
+    );
+    const disabledSource = {
+      ...nextSource,
+      settingsConfig: {
+        ...nextSource.settingsConfig,
+        modelCatalog: {
+          ...nextSource.settingsConfig.modelCatalog,
+          models: [
+            {
+              ...nextSource.settingsConfig.modelCatalog.models[0],
+              codexUltra: { enabled: false },
+            },
+          ],
+        },
+      },
+    };
+    rendered.rerenderWorkspace(elementFor([disabledSource, plan]));
+    await waitFor(() =>
+      expect(
+        within(effort).queryByRole("option", { name: "ultra" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(
+      within(effort).getByRole("option", { name: "max" }),
+    ).toBeInTheDocument();
+  });
+
+  it("uses the route's canonical public source row instead of borrowing a shared wire identity from an earlier provider", async () => {
+    const first: Provider = {
+      id: "first-source",
+      name: "First Source",
+      settingsConfig: { modelCatalog: { models: [{ model: "shared-wire" }] } },
+    };
+    const second: Provider = {
+      id: "second-source",
+      name: "Second Source",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            {
+              model: "public-sol",
+              upstreamModel: "shared-wire",
+              codexUltra: { enabled: true, providerEffort: "max" },
+            },
+          ],
+        },
+      },
+    };
+    const providers = [first, second];
+    const draft = createDraftRoutingPlan(providers, providers);
+    const plan = {
+      ...draft,
+      settingsConfig: {
+        ...draft.settingsConfig,
+        codexRouting: {
+          ...draft.settingsConfig.codexRouting,
+          modelOrder: ["sol-relay", "shared-wire"],
+          routes: providers.map((provider, index) =>
+            serializeCodexRouteV2(
+              normalizeCodexRouteForSave(
+                {
+                  label: provider.name,
+                  enabled: true,
+                  targetProviderId: provider.id,
+                  modelSelection: { mode: "all" },
+                  ...(provider.id === second.id
+                    ? { aliases: { "sol-relay": "public-sol" } }
+                    : {}),
+                  upstream: { auth: { source: "provider_config" } },
+                },
+                index,
+                new Set<string>(),
+              ),
+              index,
+            ),
+          ),
+        },
+      },
+    };
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, providerId, model) =>
+      modelReasoningResolution(
+        model,
+        providerId === second.id && model === "public-sol"
+          ? ["high", "max", "ultra"]
+          : ["low"],
+        providerId === second.id && model === "public-sol" ? "high" : "low",
+      ),
+    );
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [...providers, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "model-order",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+    expect(modelOrder()[0]).toBe("sol-relay");
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() =>
+      expect(
+        within(effort).queryByRole("option", { name: "ultra" }),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).toHaveBeenCalledWith(
+      { ...second.settingsConfig, providerName: second.name },
+      second.id,
+      "public-sol",
+    );
+    expect(
+      within(effort).queryByRole("option", { name: "low" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("uses the canonical provider-wide legacy capability result without inferring tiers locally", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, _provider, model) => ({
+      ...modelReasoningResolution(model, ["high", "max"], "high"),
+      source: "provider",
+    }));
+    const { source } = renderModelOrder({
+      models: [{ model: "custom-model" }],
+      sourceSettings: { reasoning: reasoning(["high", "max"], "high") },
+    });
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() => expect(effort).toHaveValue("high"));
+    expect(
+      within(effort)
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("value")),
+    ).toEqual(["high", "max"]);
+    expect(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).toHaveBeenCalledWith(
+      { ...source.settingsConfig, providerName: source.name },
+      source.id,
+      "custom-model",
+    );
+  });
+
+  it("does not expose unvalidated raw declared levels when canonical capability resolution is unknown", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, _provider, model) =>
+      modelReasoningResolution(model),
+    );
+    renderModelOrder({
+      models: [
+        { model: "order-a", reasoning: reasoning(["high", "max"], "high") },
+      ],
+    });
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() =>
+      expect(
+        within(effort).getByRole("option", { selected: true }),
+      ).toHaveTextContent("Unknown until provider metadata is available"),
+    );
+    expect(effort).toBeDisabled();
+    expect(
+      within(effort).queryByRole("option", { name: "max" }),
+    ).not.toBeInTheDocument();
+    expect(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses resolved levels rather than unioning stale native tiers or inventing an unusable Ultra path", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, _provider, model) =>
+      modelReasoningResolution(model, ["high"], "high"),
+    );
+    renderModelOrder({
+      models: [
+        {
+          model: "order-a",
+          reasoning: reasoning(["high", "max"], "max"),
+          codexUltra: { enabled: true, providerEffort: "max" },
+        },
+      ],
+    });
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() => expect(effort).toHaveValue("high"));
+    expect(
+      within(effort)
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("value")),
+    ).toEqual(["high"]);
+  });
+
+  it("passes name-only provider platform context to the canonical resolver without persisting it", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (settings, _provider, model) =>
+      modelReasoningResolution(
+        model,
+        settings.providerName === "OpenRouter"
+          ? ["medium", "high"]
+          : ["max", "ultra"],
+        settings.providerName === "OpenRouter" ? "medium" : "max",
+      ),
+    );
+    const { source, plan, snapshot, rendered, elementFor } = renderModelOrder({
+      sourceName: "OpenRouter",
+      models: [{ model: "gpt-6.1-sol" }],
+    });
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() => expect(effort).toHaveValue("medium"));
+    expect(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).toHaveBeenCalledWith(
+      { ...source.settingsConfig, providerName: "OpenRouter" },
+      source.id,
+      "gpt-6.1-sol",
+    );
+    expect(
+      within(effort).queryByRole("option", { name: "ultra" }),
+    ).not.toBeInTheDocument();
+    expect(JSON.stringify({ source, plan })).toBe(snapshot);
+    const renamedSource = { ...source, name: "Unknown Platform" };
+    rendered.rerenderWorkspace(elementFor([renamedSource, plan]));
+    await waitFor(() => expect(effort).toHaveValue("max"));
+    expect(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).toHaveBeenLastCalledWith(
+      { ...source.settingsConfig, providerName: "Unknown Platform" },
+      source.id,
+      "gpt-6.1-sol",
+    );
+  });
+
+  it.each([
+    "legacy transport metadata",
+    "inherited negative fallback",
+  ] as const)(
+    "resolves %s without crashing or suppressing canonical model capability",
+    async (kind) => {
+      const expectedEfforts: CodexReasoningEffort[] =
+        kind === "inherited negative fallback" ? ["medium", "high"] : [];
+      vi.mocked(
+        codexSubagentV2Api.resolveModelReasoningCapability,
+      ).mockImplementation(async (_settings, _provider, model) =>
+        modelReasoningResolution(model, expectedEfforts, "medium"),
+      );
+      renderModelOrder({
+        models: [{ model: "custom-model" }],
+        sourceSettings:
+          kind === "inherited negative fallback"
+            ? {
+                reasoning: {
+                  ...reasoning([], "high"),
+                  supportStatus: "confirmed_unsupported",
+                  controlKind: "none",
+                },
+              }
+            : { codexChatReasoning: { enabled: true, effort: "high" } },
+      });
+      const effort = screen.getByRole("combobox", {
+        name: "Top model default effort",
+      });
+      if (expectedEfforts.length) {
+        await waitFor(() => expect(effort).toHaveValue("medium"));
+        expect(
+          within(effort)
+            .getAllByRole("option")
+            .map((option) => option.getAttribute("value")),
+        ).toEqual(expectedEfforts);
+      } else {
+        await waitFor(() =>
+          expect(
+            within(effort).getByRole("option", { selected: true }),
+          ).toHaveTextContent("Unknown until provider metadata is available"),
+        );
+        expect(effort).toBeDisabled();
+      }
+      expect(
+        codexSubagentV2Api.resolveModelReasoningCapability,
+      ).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("shows a selected placeholder instead of a blank value for unknown reasoning", async () => {
     renderModelOrder({ models: [{ model: "order-a" }] });
@@ -1569,7 +2208,11 @@ describe("Model order real drag sensors", () => {
     ).toHaveValue("xhigh");
     expect(
       codexSubagentV2Api.resolveModelReasoningCapability,
-    ).toHaveBeenCalledWith(source.settingsConfig, source.id, "gpt-6.1-sol");
+    ).toHaveBeenCalledWith(
+      { ...source.settingsConfig, providerName: source.name },
+      source.id,
+      "gpt-6.1-sol",
+    );
     expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
     const user = userEvent.setup();
     await user.selectOptions(effort, "xhigh");
@@ -5407,6 +6050,144 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     ]);
   });
 
+  it("maps generated key-group aliases to their exact source rows instead of cloning shared-wire metadata", () => {
+    const source: Provider = {
+      id: "grouped-route-source",
+      name: "Grouped Route Source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            {
+              model: "wire--ccg-a",
+              upstreamModel: "wire",
+              apiKeyGroupId: "a",
+              apiKeyGroupGenerated: true,
+            },
+            {
+              model: "wire--ccg-b",
+              upstreamModel: "wire",
+              apiKeyGroupId: "b",
+              apiKeyGroupGenerated: true,
+            },
+          ],
+        },
+      },
+    };
+    const plan: Provider = {
+      ...createDraftRoutingPlan([source], [source]),
+      settingsConfig: {
+        ...createDraftRoutingPlan([source], [source]).settingsConfig,
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          routes: [
+            {
+              id: "grouped-route",
+              enabled: true,
+              targetProviderId: source.id,
+              modelSelection: { mode: "all" },
+              aliases: {
+                "wire--ccg-a": "wire",
+                "wire--ccg-b": "wire",
+              },
+            },
+          ],
+        },
+      },
+    };
+    const catalog = buildModelCatalogForRoutes(
+      plan,
+      readCodexRouting(plan)?.routes ?? [],
+      new Map([[source.id, source]]),
+    );
+    expect(catalog.models).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          model: "wire--ccg-a",
+          upstreamModel: "wire",
+          apiKeyGroupId: "a",
+          apiKeyGroupGenerated: true,
+        }),
+        expect.objectContaining({
+          model: "wire--ccg-b",
+          upstreamModel: "wire",
+          apiKeyGroupId: "b",
+          apiKeyGroupGenerated: true,
+        }),
+      ]),
+    );
+  });
+
+  it.each(["disabled", "outside include"] as const)(
+    "does not resurrect a generated key-group alias from its shared-wire sibling when its public row is %s",
+    (unavailable) => {
+      const source: Provider = {
+        id: "grouped-route-source",
+        name: "Grouped Route Source",
+        category: "custom",
+        settingsConfig: {
+          modelCatalog: {
+            models: [
+              {
+                model: "wire--ccg-a",
+                upstreamModel: "wire",
+                apiKeyGroupId: "a",
+                apiKeyGroupGenerated: true,
+                ...(unavailable === "disabled" ? { enabled: false } : {}),
+              },
+              {
+                model: "wire--ccg-b",
+                upstreamModel: "wire",
+                apiKeyGroupId: "b",
+                apiKeyGroupGenerated: true,
+              },
+            ],
+          },
+        },
+      };
+      const draft = createDraftRoutingPlan([source], [source]);
+      const plan: Provider = {
+        ...draft,
+        settingsConfig: {
+          ...draft.settingsConfig,
+          codexRouting: {
+            schemaVersion: 2,
+            enabled: true,
+            routes: [
+              {
+                id: "grouped-route",
+                enabled: true,
+                targetProviderId: source.id,
+                modelSelection:
+                  unavailable === "disabled"
+                    ? { mode: "all" }
+                    : { mode: "include", models: ["wire--ccg-b"] },
+                aliases: {
+                  "wire--ccg-a": "wire",
+                  "wire--ccg-b": "wire",
+                },
+              },
+            ],
+          },
+        },
+      };
+      const catalog = buildModelCatalogForRoutes(
+        plan,
+        readCodexRouting(plan)?.routes ?? [],
+        new Map([[source.id, source]]),
+      );
+
+      expect(catalog.models).toEqual([
+        expect.objectContaining({
+          model: "wire--ccg-b",
+          upstreamModel: "wire",
+          apiKeyGroupId: "b",
+          apiKeyGroupGenerated: true,
+        }),
+      ]);
+    },
+  );
   it("does not use a stale Router catalog to rewrite schema v2 route policy", () => {
     const source: Provider = {
       id: "relay",

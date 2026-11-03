@@ -484,7 +484,7 @@ fn copied_root_v1_metadata_checkpoint_recertifies_before_inherited_append() -> R
     write_parent_records(&parent, &history);
     let complete = complete_child(&history, true);
     write_child_records(&child, &complete[..4]);
-    let snapshot = parse_codex_snapshot(&child)?;
+    let snapshot = parse_codex_snapshot(&child, None)?;
     {
         let conn = lock_conn!(db.conn);
         save_codex_checkpoint_on_conn(

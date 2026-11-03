@@ -252,6 +252,236 @@ describe("official provider context discovery", () => {
     expect(fetchModelsForConfig).not.toHaveBeenCalled();
   });
 
+  it("refreshes official discovery capabilities on an existing alias without replacing user context or model choices", async () => {
+    const oldReasoning: NonNullable<CodexCatalogModel["reasoning"]> = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: ["high"],
+      defaultEffort: "high",
+      disableAllowed: false,
+      upstream: {
+        format: "reasoning_object",
+        parameter: "reasoning.effort",
+        effortMap: { high: "high" },
+      },
+      source: "official",
+    };
+    const discoveredReasoning: NonNullable<CodexCatalogModel["reasoning"]> = {
+      ...oldReasoning,
+      supportedEfforts: ["low", "high", "max"],
+      defaultEffort: "max",
+      upstream: {
+        ...oldReasoning.upstream,
+        effortMap: { low: "low", high: "high", max: "max" },
+      },
+    };
+    const discoveredProtocol: NonNullable<
+      CodexCatalogModel["protocolCapability"]
+    > = {
+      schemaVersion: 1,
+      source: "provider_api",
+      baseUrl: "https://official.example.invalid/v1",
+      upstreamModel: "upstream-a",
+      supportedEndpoints: ["openai_responses"],
+      supportsTools: false,
+      supportsStreaming: true,
+      supportsToolContinuation: false,
+    };
+    const catalog: CodexCatalogModel[] = [
+      {
+        model: "custom-label",
+        upstreamModel: "upstream-a",
+        displayName: "My preferred model label",
+        contextWindow: "128000",
+        enabled: false,
+        sortIndex: 7,
+        aliases: ["my-preserved-alias"],
+        canonicalSlug: "old-canonical",
+        slug: "old-slug",
+        name: "Old upstream name",
+        inputModalities: ["text", "image"],
+        input_modalities: ["text", "image"],
+        supportsImage: true,
+        supports_image: true,
+        vision: true,
+        textOnly: false,
+        text_only: false,
+        supportsParallelToolCalls: true,
+        supports_parallel_tool_calls: true,
+        reasoning: oldReasoning,
+        codexUltra: { enabled: true, providerEffort: "high" },
+      },
+      { model: "local-only", contextWindow: "64000", enabled: true },
+    ];
+    const snapshot = JSON.stringify(catalog);
+    vi.mocked(fetchCodexOauthModels).mockResolvedValue([
+      {
+        id: "upstream-a",
+        ownedBy: "openai",
+        displayName: "Changed upstream display name",
+        contextWindow: 256000,
+        maxContextWindow: 900000,
+        canonicalSlug: "current-canonical",
+        slug: "current-slug",
+        name: "Current upstream name",
+        aliases: ["new-upstream-alias"],
+        inputModalities: ["text"],
+        supportsImage: false,
+        supportsParallelToolCalls: false,
+        reasoning: discoveredReasoning,
+        protocolCapability: discoveredProtocol,
+      },
+    ]);
+    const view = renderOfficial(catalog);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Discover official models" }),
+    );
+    await waitFor(() =>
+      expect(view.latest()[0].reasoning).toEqual(discoveredReasoning),
+    );
+    expect(view.latest()[0]).toMatchObject({
+      model: "custom-label",
+      upstreamModel: "upstream-a",
+      displayName: "My preferred model label",
+      contextWindow: "128000",
+      enabled: false,
+      sortIndex: 7,
+      aliases: ["my-preserved-alias"],
+      canonicalSlug: "current-canonical",
+      slug: "current-slug",
+      name: "Current upstream name",
+      inputModalities: ["text"],
+      supportsImage: false,
+      textOnly: true,
+      supportsParallelToolCalls: false,
+      protocolCapability: discoveredProtocol,
+      codexUltra: { enabled: true, providerEffort: "high" },
+    });
+    expect(view.latest().map((row) => row.model)).toEqual([
+      "custom-label",
+      "local-only",
+    ]);
+    expect(view.latest()[1]).toMatchObject(catalog[1]);
+    expect(screen.getByLabelText("custom-label Context window")).toHaveValue(
+      "128000",
+    );
+    expect(
+      within(screen.getByRole("group", { name: "custom-label" })).getByRole(
+        "option",
+        { name: "Use maximum · 900,000" },
+      ),
+    ).toHaveValue("900000");
+    expect(JSON.stringify(catalog)).toBe(snapshot);
+  });
+
+  it("hydrates new official capabilities while keeping user reasoning and the last usable discovery after a later failure", async () => {
+    const userReasoning: NonNullable<CodexCatalogModel["reasoning"]> = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: ["high"],
+      defaultEffort: "high",
+      disableAllowed: false,
+      upstream: {
+        format: "reasoning_object",
+        parameter: "reasoning.effort",
+        effortMap: { high: "high" },
+      },
+      source: "user",
+    };
+    const discoveredReasoning: NonNullable<CodexCatalogModel["reasoning"]> = {
+      ...userReasoning,
+      supportedEfforts: ["high", "max"],
+      defaultEffort: "max",
+      upstream: {
+        ...userReasoning.upstream,
+        effortMap: { high: "high", max: "max" },
+      },
+      source: "official",
+    };
+    const discoveredProtocol: NonNullable<
+      CodexCatalogModel["protocolCapability"]
+    > = {
+      schemaVersion: 1,
+      source: "provider_api",
+      baseUrl: "https://official.example.invalid/v1",
+      upstreamModel: "new-model",
+      supportedEndpoints: ["openai_responses"],
+      supportsTools: true,
+    };
+    vi.mocked(fetchCodexOauthModels)
+      .mockResolvedValueOnce([
+        {
+          id: "user-wire",
+          ownedBy: "openai",
+          contextWindow: 256000,
+          maxContextWindow: 900000,
+          inputModalities: ["text", "image"],
+          supportsImage: true,
+          supportsParallelToolCalls: true,
+          reasoning: discoveredReasoning,
+        },
+        {
+          id: "new-model",
+          ownedBy: "openai",
+          contextWindow: 512000,
+          maxContextWindow: 1050000,
+          inputModalities: ["text", "image"],
+          supportsImage: true,
+          supportsParallelToolCalls: true,
+          reasoning: discoveredReasoning,
+          protocolCapability: discoveredProtocol,
+        },
+      ])
+      .mockRejectedValueOnce(new Error("account temporarily unavailable"));
+    const view = renderOfficial([
+      {
+        model: "user-alias",
+        upstreamModel: "user-wire",
+        contextWindow: "64000",
+        enabled: false,
+        reasoning: userReasoning,
+      },
+    ]);
+    const discover = () =>
+      screen.getByRole("button", { name: "Discover official models" });
+    fireEvent.click(discover());
+    await waitFor(() =>
+      expect(
+        view.latest().find((row) => row.model === "new-model")?.reasoning,
+      ).toEqual(discoveredReasoning),
+    );
+    expect(view.latest()[0]).toMatchObject({
+      model: "user-alias",
+      upstreamModel: "user-wire",
+      contextWindow: "64000",
+      enabled: false,
+      inputModalities: ["text", "image"],
+      supportsImage: true,
+      supportsParallelToolCalls: true,
+      reasoning: userReasoning,
+    });
+    const added = view.latest().find((row) => row.model === "new-model");
+    expect(added).toMatchObject({
+      model: "new-model",
+      upstreamModel: "new-model",
+      inputModalities: ["text", "image"],
+      supportsImage: true,
+      supportsParallelToolCalls: true,
+      reasoning: discoveredReasoning,
+      protocolCapability: discoveredProtocol,
+    });
+    expect(added?.contextWindow ?? "").toBe("");
+    const lastUsable = JSON.stringify(view.latest());
+    await waitFor(() => expect(discover()).toBeEnabled());
+    fireEvent.click(discover());
+    await waitFor(() => expect(fetchCodexOauthModels).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(discover()).toBeEnabled());
+    expect(JSON.stringify(view.latest())).toBe(lastUsable);
+    expect(fetchCodexOfficialFallbackModels).not.toHaveBeenCalled();
+  });
+
   it("uses an explicit public catalog for native or pooled authentication", async () => {
     vi.mocked(fetchCodexOfficialFallbackModels).mockResolvedValue([
       {

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { Provider } from "@/types";
 import {
+  buildModelCatalogForRoutes,
+  readCodexRouting,
+} from "@/components/codex/CodexRouterWorkspacePage";
+import {
   applyWizardConnectivityApiFormatOverrides,
   buildCodexMultiRouterWizardPlan,
   buildWizardModelCatalog,
@@ -36,6 +40,16 @@ function provider(overrides: Partial<Provider>): Provider {
     settingsConfig: overrides.settingsConfig ?? {},
     meta: overrides.meta,
   };
+}
+
+function projectedWizardModels(
+  result: ReturnType<typeof buildCodexMultiRouterWizardPlan>,
+) {
+  return buildModelCatalogForRoutes(
+    result.plan,
+    readCodexRouting(result.plan)?.routes ?? [],
+    new Map(result.sourceProviders.map((source) => [source.id, source])),
+  ).models;
 }
 
 describe("codexMultiRouterWizard helpers", () => {
@@ -219,7 +233,7 @@ wire_api = "responses"
     expect(result.plan.settingsConfig.codexRouting.routes).toEqual([
       expect.objectContaining({
         targetProviderId: source.id,
-        aliases: { kept: "wire-kept" },
+        aliases: {},
       }),
     ]);
     expect(result.plan.settingsConfig.codexRouting.spawnAgentModels).toEqual([
@@ -539,6 +553,265 @@ wire_api = "responses"
         supports_image: true,
       },
     ]);
+  });
+
+  it("preserves independent generated API-key-group aliases that share one upstream model", () => {
+    const grouped = provider({
+      id: "grouped-source",
+      name: "Grouped Source",
+      settingsConfig: {
+        codexApiKeyGroups: [
+          { id: "a", apiKeys: ["key-a"], models: ["wire"] },
+          { id: "b", apiKeys: ["key-b"], models: ["wire"] },
+        ],
+        modelCatalog: {
+          models: [
+            {
+              model: "wire--ccg-a",
+              upstreamModel: "wire",
+              apiKeyGroupId: "a",
+              apiKeyGroupGenerated: true,
+            },
+            {
+              model: "wire--ccg-b",
+              upstreamModel: "wire",
+              apiKeyGroupId: "b",
+              apiKeyGroupGenerated: true,
+            },
+          ],
+        },
+      },
+    });
+    const result = buildCodexMultiRouterWizardPlan([grouped], [grouped], null);
+    const route = result.plan.settingsConfig.codexRouting.routes[0];
+    // Public row IDs already distinguish the groups; mapping both aliases to
+    // the shared wire would fan each alias out over both credential groups.
+    expect(route.aliases).toEqual({});
+    expect(projectedWizardModels(result)).toEqual([
+      expect.objectContaining({
+        model: "wire--ccg-a",
+        upstreamModel: "wire",
+        apiKeyGroupId: "a",
+      }),
+      expect.objectContaining({
+        model: "wire--ccg-b",
+        upstreamModel: "wire",
+        apiKeyGroupId: "b",
+      }),
+    ]);
+    expect(route.modelSelection).toEqual({ mode: "all" });
+    expect(
+      result.sourceProviders[0].settingsConfig.modelCatalog.models,
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          model: "wire--ccg-a",
+          upstreamModel: "wire",
+          apiKeyGroupId: "a",
+        }),
+        expect.objectContaining({
+          model: "wire--ccg-b",
+          upstreamModel: "wire",
+          apiKeyGroupId: "b",
+        }),
+      ]),
+    );
+  });
+
+  it("keeps a single generated API-key-group selection closed instead of widening to its wire siblings", () => {
+    const grouped = provider({
+      id: "grouped-source",
+      name: "Grouped Source",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            {
+              model: "wire--ccg-a",
+              upstreamModel: "wire",
+              apiKeyGroupId: "a",
+              apiKeyGroupGenerated: true,
+            },
+            {
+              model: "wire--ccg-b",
+              upstreamModel: "wire",
+              apiKeyGroupId: "b",
+              apiKeyGroupGenerated: true,
+            },
+          ],
+        },
+      },
+    });
+    const result = buildCodexMultiRouterWizardPlan([grouped], [grouped], null, {
+      catalogModelOrder: ["wire--ccg-a"],
+      spawnAgentModels: ["wire--ccg-a", "wire--ccg-b"],
+    });
+    const route = result.plan.settingsConfig.codexRouting.routes[0];
+    expect(route.modelSelection).toEqual({
+      mode: "include",
+      models: ["wire--ccg-a"],
+    });
+    expect(
+      result.sourceProviders[0].settingsConfig.modelCatalog.models,
+    ).toEqual([
+      expect.objectContaining({
+        model: "wire--ccg-a",
+        upstreamModel: "wire",
+        apiKeyGroupId: "a",
+      }),
+    ]);
+    expect(result.plan.settingsConfig.codexRouting.spawnAgentModels).toEqual([
+      "wire--ccg-a",
+    ]);
+    expect(route.aliases).toEqual({});
+    expect(projectedWizardModels(result)).toEqual([
+      expect.objectContaining({
+        model: "wire--ccg-a",
+        upstreamModel: "wire",
+        apiKeyGroupId: "a",
+      }),
+    ]);
+  });
+
+  it("targets the original public group row when a collision alias is selected", () => {
+    const models = ["a", "b"].map((group) => ({
+      model: `wire--ccg-${group}`,
+      upstreamModel: "wire",
+      apiKeyGroupId: group,
+      apiKeyGroupGenerated: true,
+    }));
+    const first = provider({
+      id: "first",
+      name: "First Source",
+      settingsConfig: { modelCatalog: { models } },
+    });
+    const second = provider({
+      id: "second",
+      name: "Second Source",
+      settingsConfig: { modelCatalog: { models } },
+    });
+    const visible = "wire--ccg-a-first-source";
+    const result = buildCodexMultiRouterWizardPlan(
+      [first, second],
+      [first, second],
+      null,
+      {
+        catalogModelOrder: [visible],
+        spawnAgentModels: [visible, "wire--ccg-b-first-source"],
+      },
+    );
+    const routes = result.plan.settingsConfig.codexRouting.routes;
+    expect(routes).toEqual([
+      expect.objectContaining({
+        targetProviderId: "first",
+        modelSelection: { mode: "include", models: ["wire--ccg-a"] },
+        aliases: { [visible]: "wire--ccg-a" },
+      }),
+    ]);
+    expect(
+      collectWizardRouteAliasSelectionIssues(routes, result.sourceProviders),
+    ).toEqual([]);
+    expect(result.plan.settingsConfig.codexRouting.spawnAgentModels).toEqual([
+      visible,
+    ]);
+    expect(projectedWizardModels(result)).toEqual([
+      expect.objectContaining({
+        model: visible,
+        upstreamModel: "wire",
+        apiKeyGroupId: "a",
+      }),
+    ]);
+    expect(readWizardModelCatalog(result.sourceProviders[0])).toEqual([
+      models[0],
+    ]);
+  });
+
+  it("restores original public group selections after collision aliases are saved across providers", () => {
+    const models = ["a", "b"].map((group) => ({
+      model: `wire--ccg-${group}`,
+      upstreamModel: "wire",
+      apiKeyGroupId: group,
+      apiKeyGroupGenerated: true,
+    }));
+    const sources = ["First", "Second"].map((name) =>
+      provider({
+        id: name.toLowerCase(),
+        name: `${name} Source`,
+        settingsConfig: { modelCatalog: { models } },
+      }),
+    );
+    const selected = ["wire--ccg-a-first-source", "wire--ccg-a-second-source"];
+    const saved = buildCodexMultiRouterWizardPlan(sources, sources, null, {
+      catalogModelOrder: selected,
+      spawnAgentModels: selected,
+    });
+    expect(
+      saved.plan.settingsConfig.codexRouting.routes.map(
+        (route: { modelSelection: unknown }) => route.modelSelection,
+      ),
+    ).toEqual([
+      { mode: "include", models: ["wire--ccg-a"] },
+      { mode: "include", models: ["wire--ccg-a"] },
+    ]);
+    const restored = initialWizardCatalogModelOrder(saved.plan, sources);
+    expect(restored).toEqual(selected);
+    const rebuilt = buildCodexMultiRouterWizardPlan(
+      [...sources, saved.plan],
+      sources,
+      saved.plan,
+      { catalogModelOrder: restored ?? undefined },
+    );
+    expect(rebuilt.plan.settingsConfig.codexRouting.routes).toEqual(
+      saved.plan.settingsConfig.codexRouting.routes,
+    );
+    expect(projectedWizardModels(rebuilt)).toEqual([
+      expect.objectContaining({
+        model: selected[0],
+        upstreamModel: "wire",
+        apiKeyGroupId: "a",
+      }),
+      expect.objectContaining({
+        model: selected[1],
+        upstreamModel: "wire",
+        apiKeyGroupId: "a",
+      }),
+    ]);
+    expect(rebuilt.plan.settingsConfig.codexRouting.spawnAgentModels).toEqual(
+      selected,
+    );
+  });
+
+  it("writes only the canonical catalog and keeps ordinary shared-wire public row selections closed", () => {
+    const first = { model: "public-a", upstreamModel: "wire" };
+    const source = provider({
+      settingsConfig: {
+        modelCatalog: {
+          models: [first, { model: "public-b", upstreamModel: "wire" }],
+        },
+        model_catalog: { models: [{ model: "stale-legacy" }] },
+      },
+    });
+    const snapshot = JSON.stringify(source);
+    const result = buildCodexMultiRouterWizardPlan([source], [source], null, {
+      catalogModelOrder: ["public-a"],
+      spawnAgentModels: ["public-a", "public-b", "stale-legacy"],
+    });
+    expect(result.sourceProviders[0].settingsConfig).not.toHaveProperty(
+      "model_catalog",
+    );
+    expect(readWizardModelCatalog(result.sourceProviders[0])).toEqual([first]);
+    expect(result.plan.settingsConfig.codexRouting.routes).toEqual([
+      expect.objectContaining({
+        modelSelection: { mode: "include", models: ["public-a"] },
+        aliases: {},
+      }),
+    ]);
+    expect(result.plan.settingsConfig.codexRouting.spawnAgentModels).toEqual([
+      "public-a",
+    ]);
+    expect(projectedWizardModels(result)).toEqual([
+      expect.objectContaining(first),
+    ]);
+    expect(JSON.stringify(source)).toBe(snapshot);
   });
 
   it("aliases third-party duplicate models while preserving upstreamModel", () => {
@@ -1508,4 +1781,249 @@ wire_api = "responses"
     expect(routes[0]).not.toHaveProperty("upstream");
     expect(routes[0]).not.toHaveProperty("capabilities");
   });
+});
+
+describe("wizard Sub-Agent provider ownership", () => {
+  const wire = "shared-model";
+  const relayAlias = "shared-model-old-relay";
+  const profile = {
+    model: relayAlias,
+    enabled: true,
+    questionnaire: {
+      taskStrengths: ["testing"],
+      optimization: "quality",
+      writeScope: "bounded_changes",
+      preference: "preferred",
+    },
+    reasoning: { policy: "fixed", effort: "high" },
+    overrides: { roleName: "relay-reviewer" },
+  };
+  const unrelated = { model: "removed-unrelated", enabled: false };
+
+  function sources(relayModels = [{ model: wire }]) {
+    return [
+      provider({
+        id: "canonical-owner",
+        name: "Canonical Owner",
+        category: "official",
+        settingsConfig: { modelCatalog: { models: [{ model: wire }] } },
+      }),
+      provider({
+        id: "relay-owner",
+        name: "Renamed Relay",
+        settingsConfig: { modelCatalog: { models: relayModels } },
+      }),
+    ];
+  }
+
+  function existing(target = wire) {
+    return provider({
+      id: "router-owned-profiles",
+      name: "Router",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          subagentVersion: "v2",
+          routes: [
+            {
+              id: "canonical-route",
+              enabled: true,
+              targetProviderId: "canonical-owner",
+              modelSelection: { mode: "all" },
+              aliases: {},
+            },
+            {
+              id: "relay-route",
+              enabled: true,
+              targetProviderId: "relay-owner",
+              modelSelection: { mode: "include", models: [target] },
+              aliases: { [relayAlias]: target },
+            },
+          ],
+          subagentV2: {
+            schemaVersion: 2,
+            selectionPolicy: "balanced",
+            profiles: { [relayAlias]: profile, unrelated },
+          },
+          spawnAgentModels: [relayAlias],
+        },
+      },
+    });
+  }
+
+  it("keeps both exact public candidates when an official model shares the relay alias's wire identity", () => {
+    const providers = sources();
+    providers[1].settingsConfig.modelCatalog.models = [
+      {
+        model: relayAlias,
+        upstreamModel: wire,
+      },
+    ];
+    const plan = existing();
+    const result = buildCodexMultiRouterWizardPlan(
+      [...providers, plan],
+      providers,
+      plan,
+      { spawnAgentModels: [wire, relayAlias] },
+    );
+    const routing = result.plan.settingsConfig.codexRouting;
+    expect(
+      routing.routes.find(
+        (route: { targetProviderId: string }) =>
+          route.targetProviderId === "canonical-owner",
+      ).aliases,
+    ).toEqual({});
+    expect(
+      routing.routes.find(
+        (route: { targetProviderId: string }) =>
+          route.targetProviderId === "relay-owner",
+      ).aliases,
+    ).toEqual({});
+    expect(projectedWizardModels(result).map((model) => model.model)).toEqual([
+      wire,
+      relayAlias,
+    ]);
+    expect(routing.spawnAgentModels).toEqual([wire, relayAlias]);
+    expect(routing.subagentV2.profiles).toEqual({
+      [relayAlias]: profile,
+      unrelated,
+    });
+  });
+
+  it("does not accept a generated draft alias after a persisted route alias replaces its visible name", () => {
+    const providers = sources();
+    const plan = existing();
+    const generatedDraftAlias = `${wire}-renamed-relay`;
+    const result = buildCodexMultiRouterWizardPlan(
+      [...providers, plan],
+      providers,
+      plan,
+      { spawnAgentModels: [generatedDraftAlias, relayAlias] },
+    );
+    const routing = result.plan.settingsConfig.codexRouting;
+    expect(
+      routing.routes.find(
+        (route: { targetProviderId: string }) =>
+          route.targetProviderId === "relay-owner",
+      ).aliases,
+    ).toEqual({ [relayAlias]: wire });
+    expect(routing.spawnAgentModels).toEqual([relayAlias]);
+    expect(projectedWizardModels(result).map((model) => model.model)).toEqual([
+      wire,
+      relayAlias,
+    ]);
+    expect(routing.subagentV2.profiles).toEqual({
+      [relayAlias]: profile,
+      unrelated,
+    });
+  });
+
+  it("does not select an unmaterialized bare wire shared by two aliased providers", () => {
+    const providers = sources();
+    providers[0] = {
+      ...providers[0],
+      name: "First Relay",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: { models: [{ model: wire }] },
+      },
+    };
+    const result = buildCodexMultiRouterWizardPlan(providers, providers, null, {
+      spawnAgentModels: [wire],
+    });
+    const routing = result.plan.settingsConfig.codexRouting;
+    expect(
+      routing.routes.map((route: { aliases: Record<string, string> }) =>
+        Object.keys(route.aliases),
+      ),
+    ).toEqual([[`${wire}-first-relay`], [`${wire}-renamed-relay`]]);
+    expect(routing.spawnAgentModels).toEqual([]);
+  });
+
+  it("keeps a stable relay profile and candidate on its current route alias, not the first owner's shared wire", () => {
+    const providers = sources();
+    const plan = existing();
+    const snapshot = JSON.stringify({ providers, plan });
+    const result = buildCodexMultiRouterWizardPlan(
+      [...providers, plan],
+      providers,
+      plan,
+    );
+    const routing = result.plan.settingsConfig.codexRouting;
+    expect(
+      routing.routes.find(
+        (route: { targetProviderId: string }) =>
+          route.targetProviderId === "relay-owner",
+      ).aliases,
+    ).toEqual({ [relayAlias]: wire });
+    expect(routing.subagentV2.profiles).toEqual({
+      [relayAlias]: profile,
+      unrelated,
+    });
+    expect(routing.spawnAgentModels).toEqual([relayAlias]);
+    expect(result.plan.settingsConfig).not.toHaveProperty("modelCatalog");
+    expect(JSON.stringify({ providers, plan })).toBe(snapshot);
+  });
+
+  it("fails closed for a renamed source model instead of borrowing another wire owner", () => {
+    const providers = sources();
+    providers[1].settingsConfig.modelCatalog.models = [
+      {
+        model: "renamed-public",
+        upstreamModel: wire,
+        aliases: ["previous-public"],
+      },
+    ];
+    const plan = existing("previous-public");
+    const result = buildCodexMultiRouterWizardPlan(
+      [...providers, plan],
+      providers,
+      plan,
+    );
+    const routing = result.plan.settingsConfig.codexRouting;
+    const nextAlias = `${wire}-renamed-relay`;
+    expect(
+      routing.routes.find(
+        (route: { targetProviderId: string }) =>
+          route.targetProviderId === "relay-owner",
+      ).aliases,
+    ).toEqual({ [nextAlias]: "renamed-public" });
+    expect(routing.subagentV2.profiles).toEqual({
+      [relayAlias]: profile,
+      unrelated,
+    });
+    expect(routing.spawnAgentModels).toEqual([]);
+  });
+
+  it.each(["removed", "excluded", "unselected"] as const)(
+    "does not reassign a %s relay profile or candidate to another provider with the same wire",
+    (kind) => {
+      const providers = sources();
+      if (kind === "removed")
+        providers[1].settingsConfig.modelCatalog.models = [];
+      if (kind === "excluded")
+        providers[1].settingsConfig.modelCatalog.models = [
+          { model: wire, enabled: false },
+        ];
+      const plan = existing();
+      const result = buildCodexMultiRouterWizardPlan(
+        [...providers, plan],
+        providers,
+        plan,
+        kind === "unselected" ? { catalogModelOrder: [wire] } : {},
+      );
+      const routing = result.plan.settingsConfig.codexRouting;
+      expect(
+        routing.routes.map(
+          (route: { targetProviderId: string }) => route.targetProviderId,
+        ),
+      ).toEqual(["canonical-owner"]);
+      expect(routing.subagentV2.profiles).toEqual({
+        [relayAlias]: profile,
+        unrelated,
+      });
+      expect(routing.spawnAgentModels).toEqual([]);
+    },
+  );
 });

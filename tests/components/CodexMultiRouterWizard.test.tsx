@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { ReactElement } from "react";
 import type { Provider } from "@/types";
+import type { CodexModelReasoningResolution } from "@/types/codexSubagentV2";
 import { CodexMultiRouterWizard } from "@/components/codex/CodexMultiRouterWizard";
 import { CODEX_MULTI_ROUTER_WIZARD_DISMISSED_KEY } from "@/lib/codexMultiRouterWizard";
 import { providersApi } from "@/lib/api/providers";
@@ -29,6 +30,7 @@ vi.mock("@/lib/api/providers", () => ({
 vi.mock("@/lib/api/codexSubagentV2", () => ({
   codexSubagentV2Api: {
     initializeProviderConfig: vi.fn(),
+    resolveModelReasoningCapability: vi.fn(),
   },
 }));
 
@@ -73,6 +75,31 @@ function provider(overrides: Partial<Provider> = {}): Provider {
       modelCatalog: { models: [{ model: "deepseek-chat" }] },
     },
     meta: overrides.meta,
+  };
+}
+
+function resolvedReasoning(
+  model: string,
+  efforts: Array<"low" | "high" | "max" | "ultra">,
+  defaultEffort: "low" | "high" | "max" | "ultra" = "high",
+): CodexModelReasoningResolution {
+  return {
+    model,
+    capability: null,
+    source: "user_config",
+    fingerprint: `fingerprint:${model}`,
+    resolved: {
+      supportKind: "effort_levels",
+      confidence: "confirmed",
+      codexSelectableEfforts: efforts,
+      providerAcceptedEfforts: efforts.filter((effort) => effort !== "ultra"),
+      providerDefaultEffort: defaultEffort,
+      disableAllowed: false,
+      effortMap: { ultra: "max" },
+      codexUltraOrchestrationEnabled: efforts.includes("ultra"),
+    },
+    hasDetectionCandidate: false,
+    detection: null,
   };
 }
 
@@ -585,6 +612,111 @@ describe("CodexMultiRouterWizard", () => {
     ]) {
       expect(screen.getByRole("button", { name: pageName })).toBeVisible();
     }
+  });
+
+  it("shows canonical resolved efforts, including product Ultra, instead of raw provider tiers", async () => {
+    const source = provider({
+      settingsConfig: {
+        base_url: "https://relay.example/v1",
+        auth: { OPENAI_API_KEY: "sk-test" },
+        modelCatalog: {
+          models: [
+            {
+              model: "sol-relay",
+              upstreamModel: "gpt-6.1-sol",
+              reasoning: {
+                supportedEfforts: ["low", "high", "max"],
+                defaultEffort: "high",
+              } as never,
+              codexUltra: { enabled: true, providerEffort: "max" },
+            },
+          ],
+        },
+      },
+    });
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockResolvedValue(
+      resolvedReasoning("sol-relay", ["low", "high", "max", "ultra"]),
+    );
+    renderWithQueryClient(
+      <CodexMultiRouterWizard
+        open
+        providers={[source]}
+        onOpenChange={vi.fn()}
+        onCreateProvider={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+        onEnablePlan={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Reasoning settings" }));
+    expect(
+      await screen.findByText("Available efforts:low / high / max / ultra"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Default effort:high")).toBeInTheDocument();
+    expect(
+      vi.mocked(codexSubagentV2Api.resolveModelReasoningCapability),
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({ providerName: source.name }),
+      source.id,
+      "sol-relay",
+    );
+  });
+
+  it("hides resolved Ultra for an existing V1 router while retaining other canonical efforts", async () => {
+    const source = provider({
+      id: "source-v1",
+      settingsConfig: {
+        base_url: "https://relay.example/v1",
+        auth: { OPENAI_API_KEY: "sk-test" },
+        modelCatalog: { models: [{ model: "sol-relay" }] },
+      },
+    });
+    const plan = provider({
+      id: "plan-v1",
+      name: "Existing V1 Plan",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          subagentVersion: "v1",
+          routes: [
+            {
+              id: "route-v1",
+              enabled: true,
+              targetProviderId: source.id,
+              modelSelection: { mode: "all" },
+            },
+          ],
+        },
+      },
+    });
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockResolvedValue(
+      resolvedReasoning("sol-relay", ["low", "high", "max", "ultra"]),
+    );
+    renderWithQueryClient(
+      <CodexMultiRouterWizard
+        open
+        mode="edit"
+        planId={plan.id}
+        providers={[source, plan]}
+        onOpenChange={vi.fn()}
+        onCreateProvider={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+        onEnablePlan={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Reasoning settings" }));
+    expect(
+      await screen.findByText("Available efforts:low / high / max"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Available efforts:low / high / max / ultra"),
+    ).not.toBeInTheDocument();
   });
 
   it("initializes a new default V2 plan before handing it to enable", async () => {

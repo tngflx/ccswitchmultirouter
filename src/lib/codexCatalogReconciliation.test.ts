@@ -92,15 +92,76 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     ]);
   });
 
-  it("preserves an explicit false parallel-tool declaration through catalog refresh", () => {
-    const result = reconcileFetchedCodexCatalogRows(
-      [createRow({ model: "wire-model", supportsParallelToolCalls: true })],
-      [{ id: "wire-model", supportsParallelToolCalls: false }],
-      {},
-      { appendNew: true, createRow, existingMetadataMode: "refresh" },
-    );
-    expect(result.rows[0].supportsParallelToolCalls).toBe(true);
+  it.each([false, true])(
+    "refreshes all parallel-tool capability aliases to %s without re-enabling excluded inventory",
+    (supportsParallelToolCalls) => {
+      const previous = !supportsParallelToolCalls;
+      const rows = [
+        createRow({
+          model: "alias-one",
+          upstreamModel: "wire-model",
+          supportsParallelToolCalls: previous,
+          supports_parallel_tool_calls: previous,
+        }),
+        createRow({
+          model: "alias-two",
+          upstreamModel: "wire-model",
+          supports_parallel_tool_calls: previous,
+          enabled: false,
+        }),
+      ];
+      const snapshot = JSON.stringify(rows);
+      const result = reconcileFetchedCodexCatalogRows(
+        rows,
+        [{ id: "wire-model", supportsParallelToolCalls }],
+        {},
+        { appendNew: true, createRow, existingMetadataMode: "refresh" },
+      );
+      expect(result.rows).toHaveLength(2);
+      expect(result.added).toBe(0);
+      expect(result.hydrated).toBe(2);
+      for (const row of result.rows) {
+        expect(row.supportsParallelToolCalls).toBe(supportsParallelToolCalls);
+        expect(row.supports_parallel_tool_calls).toBe(
+          supportsParallelToolCalls,
+        );
+      }
+      expect(result.rows[1].enabled).toBe(false);
+      expect(JSON.stringify(rows)).toBe(snapshot);
+    },
+  );
 
+  it.each([false, true])(
+    "preserves an explicit parallel-tool capability of %s while filling missing metadata",
+    (supportsParallelToolCalls) => {
+      const result = reconcileFetchedCodexCatalogRows(
+        [
+          createRow({
+            model: "wire-model",
+            supportsParallelToolCalls,
+            supports_parallel_tool_calls: supportsParallelToolCalls,
+          }),
+        ],
+        [
+          {
+            id: "wire-model",
+            supportsParallelToolCalls: !supportsParallelToolCalls,
+          },
+        ],
+        {},
+        { appendNew: true, createRow, existingMetadataMode: "fill-missing" },
+      );
+      expect(result.rows[0].supportsParallelToolCalls).toBe(
+        supportsParallelToolCalls,
+      );
+      expect(result.rows[0].supports_parallel_tool_calls).toBe(
+        supportsParallelToolCalls,
+      );
+      expect(result.hydrated).toBe(0);
+    },
+  );
+
+  it("hydrates a missing false parallel-tool declaration and preserves it when later metadata omits the field", () => {
     const missing = reconcileFetchedCodexCatalogRows(
       [createRow({ model: "wire-model" })],
       [{ id: "wire-model", supportsParallelToolCalls: false }],
@@ -109,6 +170,14 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     );
     expect(missing.rows[0].supportsParallelToolCalls).toBe(false);
     expect(missing.rows[0].supports_parallel_tool_calls).toBe(false);
+    const omitted = reconcileFetchedCodexCatalogRows(
+      missing.rows,
+      [{ id: "wire-model" }],
+      {},
+      { appendNew: true, createRow, existingMetadataMode: "refresh" },
+    );
+    expect(omitted.rows).toEqual(missing.rows);
+    expect(omitted.hydrated).toBe(0);
   });
 
   it.each([

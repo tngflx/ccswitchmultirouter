@@ -99,6 +99,241 @@ describe("CodexModelReasoningEditor", () => {
     );
   });
 
+  it("keeps an explicitly unconfirmed control mode unknown instead of claiming support", () => {
+    const onChange = vi.fn();
+    render(
+      <CodexModelReasoningEditor
+        model="qwen3.8"
+        capability={qwenCapability}
+        readOnly={false}
+        onChange={onChange}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("qwen3.8 reasoning control"), {
+      target: { value: "unknown" },
+    });
+
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        schemaVersion: 2,
+        supportStatus: "unknown",
+        controlKind: "unknown",
+        supportedEfforts: [],
+        defaultEffort: undefined,
+        disableAllowed: false,
+        upstream: { format: "none", parameter: "none", effortMap: {} },
+        source: "user",
+      }),
+    );
+  });
+
+  it.each([
+    [true, "none", "confirmed_unsupported"],
+    [false, "boolean", "confirmed_supported"],
+    [true, "unknown", "unknown"],
+  ] as const)(
+    "migrates legacy supported=%s when changing control mode to %s",
+    (supported, controlKind, supportStatus) => {
+      const onChange = vi.fn();
+      render(
+        <CodexModelReasoningEditor
+          model="legacy-model"
+          capability={{
+            ...qwenCapability,
+            schemaVersion: undefined,
+            supportStatus: undefined,
+            supported,
+            ...(supported
+              ? {}
+              : {
+                  controlKind: "none",
+                  supportedEfforts: [],
+                  defaultEffort: undefined,
+                  upstream: { format: "none", parameter: "none" },
+                }),
+          }}
+          readOnly={false}
+          onChange={onChange}
+        />,
+      );
+
+      fireEvent.change(
+        screen.getByLabelText("legacy-model reasoning control"),
+        {
+          target: { value: controlKind },
+        },
+      );
+
+      const next = onChange.mock.calls[0][0];
+      expect(next).toMatchObject({
+        schemaVersion: 2,
+        supportStatus,
+        controlKind,
+      });
+      expect(next).not.toHaveProperty("supported");
+    },
+  );
+
+  it("preserves legacy support evidence when editing a field while writing only canonical support state", () => {
+    const onChange = vi.fn();
+    render(
+      <CodexModelReasoningEditor
+        model="legacy-model"
+        capability={{
+          ...qwenCapability,
+          schemaVersion: undefined,
+          supportStatus: undefined,
+          supported: true,
+        }}
+        readOnly={false}
+        onChange={onChange}
+      />,
+    );
+
+    fireEvent.change(
+      screen.getByLabelText("legacy-model provider default effort"),
+      {
+        target: { value: "high" },
+      },
+    );
+
+    const next = onChange.mock.calls[0][0];
+    expect(next).toMatchObject({
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      defaultEffort: "high",
+      source: "user",
+    });
+    expect(next).not.toHaveProperty("supported");
+  });
+  it.each(["boolean", "budget", "none", "unknown"] as const)(
+    "clears stale orchestration when switching to %s without an effort mapping",
+    (controlKind) => {
+      const onChange = vi.fn();
+      render(
+        <CodexModelReasoningEditor
+          model="orchestrated-model"
+          capability={{
+            ...qwenCapability,
+            codexUltraOrchestration: { enabled: true },
+            upstream: {
+              ...qwenCapability.upstream,
+              effortMap: {
+                low: "low",
+                medium: "medium",
+                high: "high",
+                max: "high",
+              },
+            },
+          }}
+          readOnly={false}
+          onChange={onChange}
+        />,
+      );
+
+      fireEvent.change(
+        screen.getByLabelText("orchestrated-model reasoning control"),
+        {
+          target: { value: controlKind },
+        },
+      );
+
+      const next = onChange.mock.calls[0][0];
+      expect(next.supportedEfforts).toEqual([]);
+      expect(next.upstream.effortMap).toEqual({});
+      expect(next).not.toHaveProperty("codexUltraOrchestration");
+    },
+  );
+
+  it.each([
+    ["high", false],
+    ["medium", true],
+  ] as const)(
+    "reconciles the orchestration max path when removing native provider effort %s",
+    (effort, preservesOrchestration) => {
+      const onChange = vi.fn();
+      const capability: CodexModelReasoningCapability = {
+        ...qwenCapability,
+        codexUltraOrchestration: { enabled: true },
+        upstream: {
+          ...qwenCapability.upstream,
+          effortMap: {
+            low: "low",
+            medium: "medium",
+            high: "high",
+            max: "high",
+          },
+        },
+      };
+      const snapshot = JSON.stringify(capability);
+      render(
+        <CodexModelReasoningEditor
+          model="orchestrated-model"
+          capability={capability}
+          readOnly={false}
+          onChange={onChange}
+        />,
+      );
+
+      fireEvent.click(
+        screen.getByLabelText(`Provider-native effort ${effort}`),
+      );
+
+      const next = onChange.mock.calls[0][0];
+      expect(next.supportedEfforts).not.toContain(effort);
+      expect(Object.values(next.upstream.effortMap)).not.toContain(effort);
+      if (preservesOrchestration) {
+        expect(next.codexUltraOrchestration).toEqual({ enabled: true });
+        expect(next.upstream.effortMap.max).toBe("high");
+      } else {
+        expect(next).not.toHaveProperty("codexUltraOrchestration");
+        expect(next.upstream.effortMap).not.toHaveProperty("max");
+      }
+      expect(JSON.stringify(capability)).toBe(snapshot);
+    },
+  );
+
+  it("keeps a valid orchestration path when editing the provider default", () => {
+    const onChange = vi.fn();
+    render(
+      <CodexModelReasoningEditor
+        model="orchestrated-model"
+        capability={{
+          ...qwenCapability,
+          codexUltraOrchestration: { enabled: true },
+          upstream: {
+            ...qwenCapability.upstream,
+            effortMap: {
+              low: "low",
+              medium: "medium",
+              high: "high",
+              max: "high",
+            },
+          },
+        }}
+        readOnly={false}
+        onChange={onChange}
+      />,
+    );
+
+    fireEvent.change(
+      screen.getByLabelText("orchestrated-model provider default effort"),
+      {
+        target: { value: "high" },
+      },
+    );
+
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        defaultEffort: "high",
+        codexUltraOrchestration: { enabled: true },
+        upstream: expect.objectContaining({
+          effortMap: expect.objectContaining({ max: "high" }),
+        }),
+      }),
+    );
+  });
   it("keeps Ultra out of the Provider capability editor", () => {
     render(
       <CodexModelReasoningEditor

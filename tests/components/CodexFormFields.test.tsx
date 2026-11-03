@@ -28,6 +28,7 @@ import type {
   CodexProtocolMode,
   CodexProtocolOverride,
   CodexReasoningProjection,
+  CodexReasoningEffort,
   CodexRoutingConfig,
   CodexToolSchemaDialect,
   PromptCacheRoutingMode,
@@ -125,6 +126,38 @@ function createUnknownReasoningResolution(
     },
     hasDetectionCandidate: false,
     detection: null,
+  };
+}
+
+function createSupportedReasoningResolution(
+  model: string,
+  efforts: CodexReasoningEffort[],
+  defaultEffort: CodexReasoningEffort,
+  ultra = false,
+): CodexModelReasoningResolution {
+  return {
+    ...createUnknownReasoningResolution(model),
+    source: "user",
+    fingerprint: `declared-${model}`,
+    capability: {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: efforts,
+      defaultEffort,
+      disableAllowed: false,
+      upstream: { format: "string", parameter: "reasoning_effort" },
+    },
+    resolved: {
+      supportKind: "effort_levels",
+      confidence: "declared",
+      codexSelectableEfforts: ultra ? [...efforts, "ultra"] : efforts,
+      providerAcceptedEfforts: efforts,
+      providerDefaultEffort: defaultEffort,
+      disableAllowed: false,
+      effortMap: ultra ? { ultra: "max" } : {},
+      codexUltraOrchestrationEnabled: ultra,
+    },
   };
 }
 
@@ -991,7 +1024,7 @@ describe("CodexFormFields local model routing", () => {
     expect(
       reasoningApiMocks.resolve.mock.calls.every(
         ([settings, , model]) =>
-          model === "wire-kept" &&
+          model === "kept" &&
           settings.modelCatalog.models.every(
             (row: CodexCatalogModel) => row.enabled !== false,
           ),
@@ -1367,6 +1400,229 @@ describe("CodexFormFields local model routing", () => {
         }),
       );
     });
+  });
+
+  it("resolves distinct public catalog rows instead of borrowing their shared upstream sibling's reasoning and Ultra", async () => {
+    const models: CodexCatalogModel[] = [
+      { model: "shared-wire" },
+      {
+        model: "public-a",
+        upstreamModel: "shared-wire",
+        codexUltra: { enabled: true, providerEffort: "max" },
+      },
+      { model: "public-b", upstreamModel: "shared-wire" },
+      {
+        model: "excluded-public",
+        upstreamModel: "shared-wire",
+        enabled: false,
+      },
+    ];
+    const snapshot = JSON.stringify(models);
+    reasoningApiMocks.resolve.mockImplementation(
+      async (_settings, _provider, model) =>
+        model === "public-a"
+          ? createSupportedReasoningResolution(
+              model,
+              ["high", "max"],
+              "max",
+              true,
+            )
+          : model === "public-b"
+            ? createSupportedReasoningResolution(model, ["medium"], "medium")
+            : createSupportedReasoningResolution(model, ["low"], "low"),
+    );
+    const { latestCatalog } = renderCatalogHarness(models);
+    const summaryFor = (model: string) =>
+      within(
+        screen
+          .getByRole("button", {
+            name: `Configure reasoning capabilities for ${model}`,
+          })
+          .closest("article")!,
+      );
+    await waitFor(() =>
+      expect(
+        summaryFor("public-a").getByText("Codex levels: high / max / ultra"),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      summaryFor("public-b").getByText("Codex levels: medium"),
+    ).toBeInTheDocument();
+    expect(
+      summaryFor("shared-wire").getByText("Codex levels: low"),
+    ).toBeInTheDocument();
+    expect(
+      summaryFor("public-a").getByText("Default: max"),
+    ).toBeInTheDocument();
+    expect(
+      summaryFor("public-b").getByText("Default: medium"),
+    ).toBeInTheDocument();
+    expect(
+      summaryFor("public-a").getByLabelText(
+        "Provider reasoning effort used by public-a Ultra",
+      ),
+    ).toHaveValue("max");
+    expect(
+      within(
+        summaryFor("public-a").getByLabelText(
+          "Provider reasoning effort used by public-a Ultra",
+        ),
+      )
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("value")),
+    ).toEqual(["", "high", "max"]);
+    expect(
+      reasoningApiMocks.resolve.mock.calls.map(([, , model]) => model),
+    ).toEqual(expect.arrayContaining(["shared-wire", "public-a", "public-b"]));
+    expect(
+      reasoningApiMocks.resolve.mock.calls.some(
+        ([, , model]) => model === "excluded-public",
+      ),
+    ).toBe(false);
+    expect(latestCatalog()).toEqual(models);
+    expect(JSON.stringify(models)).toBe(snapshot);
+  });
+
+  it("detects the wire model but resolves the canonical public row after detection", async () => {
+    let redetected = false;
+    reasoningApiMocks.resolve.mockImplementation(
+      async (_settings, _provider, model) =>
+        redetected
+          ? createSupportedReasoningResolution(
+              model,
+              model === "public-a" ? ["high", "max"] : ["low"],
+              model === "public-a" ? "max" : "low",
+              model === "public-a",
+            )
+          : createUnknownReasoningResolution(model),
+    );
+    reasoningApiMocks.trigger.mockImplementation(async () => {
+      redetected = true;
+      return createDetectedReasoningOutcome("shared-wire");
+    });
+    const { latestCatalog, onCatalogChange } = renderCatalogHarness([
+      { model: "public-a", upstreamModel: "shared-wire" },
+    ]);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Configure reasoning capabilities for public-a",
+      }),
+    );
+    await screen.findByRole("button", { name: "Detect again" });
+    fireEvent.click(screen.getByRole("button", { name: "Detect again" }));
+    await waitFor(() =>
+      expect(
+        screen.getByText("Codex levels: high / max / ultra"),
+      ).toBeInTheDocument(),
+    );
+    expect(reasoningApiMocks.trigger).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "codex-thirdparty" }),
+      "shared-wire",
+    );
+    expect(reasoningApiMocks.resolve).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        modelCatalog: expect.objectContaining({
+          models: expect.arrayContaining([
+            expect.objectContaining({
+              model: "public-a",
+              upstreamModel: "shared-wire",
+            }),
+          ]),
+        }),
+      }),
+      "codex-thirdparty",
+      "public-a",
+    );
+    expect(onCatalogChange).not.toHaveBeenCalled();
+    expect(latestCatalog()).toEqual([
+      { model: "public-a", upstreamModel: "shared-wire" },
+    ]);
+  });
+
+  it("does not let an old provider reasoning detection overwrite the refreshed current source", async () => {
+    const oldDetection = deferred<CodexReasoningDiscoveryOutcome>();
+    reasoningApiMocks.trigger.mockReturnValue(oldDetection.promise);
+    reasoningApiMocks.resolve.mockImplementation(
+      async (settings, _provider, model) =>
+        settings.base_url === "https://current.example/v1"
+          ? createSupportedReasoningResolution(
+              model,
+              ["high", "max"],
+              "max",
+              true,
+            )
+          : createUnknownReasoningResolution(model),
+    );
+    const { updateIdentity } = renderReadinessIdentityHarness({
+      catalog: [{ model: "public-a", upstreamModel: "shared-wire" }],
+    });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Configure reasoning capabilities for public-a",
+      }),
+    );
+    await screen.findByRole("button", { name: "Detect again" });
+    fireEvent.click(screen.getByRole("button", { name: "Detect again" }));
+    await waitFor(() =>
+      expect(reasoningApiMocks.trigger).toHaveBeenCalledTimes(1),
+    );
+    updateIdentity({ baseUrl: "https://current.example/v1" });
+    await screen.findByText("Codex levels: high / max / ultra");
+    const currentCalls = reasoningApiMocks.resolve.mock.calls.length;
+    await act(async () =>
+      oldDetection.resolve(createDetectedReasoningOutcome("shared-wire")),
+    );
+    expect(
+      screen.getByText("Codex levels: high / max / ultra"),
+    ).toBeInTheDocument();
+    expect(reasoningApiMocks.resolve).toHaveBeenCalledTimes(currentCalls);
+  });
+
+  it("hides stale reasoning actions while the current provider capability request is pending", async () => {
+    const currentResolution = deferred<CodexModelReasoningResolution>();
+    reasoningApiMocks.resolve.mockImplementation(
+      async (settings, _provider, model) =>
+        settings.base_url === "https://current.example/v1"
+          ? currentResolution.promise
+          : createSupportedReasoningResolution(
+              model,
+              ["high", "max"],
+              "max",
+              true,
+            ),
+    );
+    const { updateIdentity } = renderReadinessIdentityHarness({
+      catalog: [{ model: "public-a", upstreamModel: "shared-wire" }],
+    });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Configure reasoning capabilities for public-a",
+      }),
+    );
+    await screen.findByRole("button", {
+      name: "Customize from current result",
+    });
+    expect(
+      screen.getByText("Codex levels: high / max / ultra"),
+    ).toBeInTheDocument();
+    updateIdentity({ baseUrl: "https://current.example/v1" });
+    expect(
+      screen.queryByRole("button", { name: "Customize from current result" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Codex levels: high / max / ultra"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Reading the unified reasoning capability result for this model…",
+      ),
+    ).toBeInTheDocument();
+    await act(async () =>
+      currentResolution.resolve(
+        createSupportedReasoningResolution("public-a", ["low"], "low"),
+      ),
+    );
+    expect(screen.getByText("Codex levels: low")).toBeInTheDocument();
   });
 
   it("keeps Ultra independent from automatic reasoning discovery", async () => {

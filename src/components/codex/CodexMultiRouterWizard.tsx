@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import type { CodexCatalogModel, CodexRoutingRouteV2, Provider } from "@/types";
+import type { CodexModelReasoningResolution } from "@/types/codexSubagentV2";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -36,6 +37,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { providersApi } from "@/lib/api/providers";
+import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
 import { restoreCodexProviderProtocolEvidence } from "@/lib/api/protocol-compatibility";
 import type { CodexMultiRouterMigrationPreview } from "@/lib/api/providers";
 import {
@@ -94,6 +96,7 @@ import {
   readCodexModelProtocolCapability,
 } from "@/lib/codexProtocolCapability";
 import { normalizeCodexPublicModelKey } from "@/lib/protocol-lab/codex-overrides";
+import { normalizeCodexSubagentVersion } from "@/utils/codexSubagentVersion";
 import i18n from "@/i18n";
 import {
   DEFAULT_HOSTED_TOOLS_CONFIG,
@@ -1095,6 +1098,11 @@ export function CodexMultiRouterWizard({
   const [migrationError, setMigrationError] = useState<string | null>(null);
   const [isLoadingMigration, setIsLoadingMigration] = useState(false);
   const [isApplyingMigration, setIsApplyingMigration] = useState(false);
+  const [reasoningResolutionState, setReasoningResolutionState] = useState<{
+    contextKey: string;
+    models: Record<string, CodexModelReasoningResolution>;
+  }>({ contextKey: "", models: {} });
+  const reasoningResolutionRequestRef = useRef(0);
   const initializedOpenRef = useRef(false);
   const initializedTargetRef = useRef<string | null>(null);
   const draftGenerationRef = useRef(0);
@@ -1129,6 +1137,28 @@ export function CodexMultiRouterWizard({
       ? (migratedPlanOverride ?? storedExistingPlan)
       : storedExistingPlan;
   const activePlan = savedPlan ?? existingPlan;
+  const wizardSubagentVersion = normalizeCodexSubagentVersion(
+    activePlan?.settingsConfig?.codexRouting?.subagentVersion,
+  );
+  const reasoningContextKey = JSON.stringify({
+    subagentVersion: wizardSubagentVersion,
+    sources: draftSources.map((provider) => ({
+      id: provider.id,
+      name: provider.name,
+      settingsConfig: provider.settingsConfig,
+      models: readIncludedWizardModelCatalog(provider).map((model) => ({
+        model: model.model,
+        upstreamModel: model.upstreamModel ?? model.upstream_model,
+        enabled: model.enabled,
+        reasoning: model.reasoning,
+        codexUltra: model.codexUltra,
+      })),
+    })),
+  });
+  const reasoningResolutions =
+    reasoningResolutionState.contextKey === reasoningContextKey
+      ? reasoningResolutionState.models
+      : {};
   const editingTargetMissing = resolvedMode === "edit" && !existingPlan;
   const providerModelSources = useMemo(
     () => defaultWizardModelSources(providers),
@@ -1283,6 +1313,61 @@ export function CodexMultiRouterWizard({
   const isProbingConnectivity = batchProtocolLab.state.phase === "probing";
   const isSavingPlan = flowState.status === "savingPlan";
   const isEnablingPlan = flowState.status === "enabling";
+
+  useEffect(() => {
+    const requestId = ++reasoningResolutionRequestRef.current;
+    const models = draftSources.flatMap((provider) =>
+      readIncludedWizardModelCatalog(provider).map((model) => ({
+        provider,
+        model,
+      })),
+    );
+    if (models.length === 0) {
+      setReasoningResolutionState({
+        contextKey: reasoningContextKey,
+        models: {},
+      });
+      return;
+    }
+    let cancelled = false;
+    const resolve = async () => {
+      const entries = await Promise.all(
+        models.map(async ({ provider, model }) => {
+          const settingsConfig = {
+            ...provider.settingsConfig,
+            providerName: provider.name,
+          };
+          try {
+            const resolution =
+              await codexSubagentV2Api.resolveModelReasoningCapability(
+                settingsConfig,
+                provider.id,
+                model.model,
+              );
+            return [`${provider.id}\u0000${model.model}`, resolution] as [
+              string,
+              CodexModelReasoningResolution,
+            ];
+          } catch {
+            return null;
+          }
+        }),
+      );
+      if (cancelled || requestId !== reasoningResolutionRequestRef.current)
+        return;
+      const resolvedEntries = entries.filter(
+        (entry) => entry !== null,
+      ) as Array<[string, CodexModelReasoningResolution]>;
+      setReasoningResolutionState({
+        contextKey: reasoningContextKey,
+        models: Object.fromEntries(resolvedEntries),
+      });
+    };
+    void resolve();
+    return () => {
+      cancelled = true;
+    };
+  }, [draftSources, reasoningContextKey]);
 
   useEffect(() => {
     if (!open) {
@@ -3184,12 +3269,35 @@ export function CodexMultiRouterWizard({
                       <div className="grid gap-2 md:grid-cols-2">
                         {readIncludedWizardModelCatalog(provider).map(
                           (model) => {
-                            const reasoning = model.reasoning;
+                            const resolution =
+                              reasoningResolutions[
+                                `${provider.id}\u0000${model.model}`
+                              ];
+                            const resolved = resolution?.resolved;
+                            const efforts =
+                              resolved?.supportKind === "effort_levels"
+                                ? [
+                                    ...(resolved.disableAllowed &&
+                                    resolved.providerAcceptedEfforts.includes(
+                                      "none",
+                                    )
+                                      ? ["none"]
+                                      : []),
+                                    ...resolved.codexSelectableEfforts.filter(
+                                      (effort) =>
+                                        effort !== "ultra" ||
+                                        wizardSubagentVersion !== "v1",
+                                    ),
+                                  ].filter(
+                                    (effort, index, values) =>
+                                      values.indexOf(effort) === index,
+                                  )
+                                : [];
                             const support =
-                              reasoning?.supportStatus === "confirmed_supported"
+                              resolved?.supportKind === "effort_levels"
                                 ? "Reasoning support confirmed"
-                                : reasoning?.supportStatus ===
-                                    "confirmed_unsupported"
+                                : resolved?.supportKind === "unsupported" ||
+                                    resolved?.supportKind === "boolean_only"
                                   ? "Reasoning support not confirmed"
                                   : "Capability unknown; use server default";
                             return (
@@ -3204,12 +3312,14 @@ export function CodexMultiRouterWizard({
                                   <div>{support}</div>
                                   <div>
                                     Available efforts:
-                                    {reasoning?.supportedEfforts?.join(" / ") ||
-                                      "Not declared"}
+                                    {efforts.join(" / ") || "Not declared"}
                                   </div>
                                   <div>
                                     Default effort:
-                                    {reasoning?.defaultEffort ??
+                                    {(resolved?.providerDefaultEffort ===
+                                      "ultra" && wizardSubagentVersion === "v1"
+                                      ? undefined
+                                      : resolved?.providerDefaultEffort) ??
                                       "Model default"}
                                   </div>
                                 </div>

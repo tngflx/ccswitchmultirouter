@@ -21,10 +21,10 @@ pub mod provider_metadata;
 use crate::provider::Provider;
 use crate::proxy::providers::codex_reasoning::{
     builtin_reasoning_capability_for_model, capability_fingerprint,
-    official_reasoning_capability_for_model, reasoning_capability_from_provider_model_entry,
-    resolve_reasoning_capability_from_settings, CapabilityConfidence,
-    CodexModelReasoningCapability, CodexModelReasoningUpstream, ReasoningControlKind,
-    ReasoningSupportStatus,
+    official_reasoning_capability_for_model, reasoning_capability_from_model_entry,
+    reasoning_capability_from_provider_model_entry, resolve_reasoning_capability_from_settings,
+    CapabilityConfidence, CodexModelReasoningCapability, CodexModelReasoningUpstream,
+    ReasoningControlKind, ReasoningSupportStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -49,6 +49,9 @@ pub enum CapabilitySource {
     Builtin,
     /// Codex 官方模型缓存（仅未知平台生效；OpenRouter/vLLM 等聚合平台不套用）。
     Official,
+    /// Validated provider-wide capability, only after model and wire evidence miss.
+    #[serde(rename = "provider")]
+    ProviderFallback,
     /// 无来源命中，fail-closed unknown。
     Unknown,
 }
@@ -62,6 +65,7 @@ impl CapabilitySource {
             Self::Library => "library",
             Self::Builtin => "builtin",
             Self::Official => "official",
+            Self::ProviderFallback => "provider",
             Self::Unknown => "unknown",
         }
     }
@@ -200,13 +204,19 @@ pub fn resolve_codex_model_capability(
 ) -> ResolvedModelCapability {
     let platform = provider_metadata::detect_platform(provider);
     let official_models = crate::codex_config::codex_official_models_cache().unwrap_or_default();
-    resolve_codex_model_capability_core(
+    resolve_codex_model_capability_for_settings(
         &provider.settings_config,
         platform,
         model,
-        detection,
         catalog::global_library().as_ref(),
         &official_models,
+        |candidate| {
+            if candidate.eq_ignore_ascii_case(model) {
+                detection.cloned()
+            } else {
+                current_detection(&provider.id, candidate)
+            }
+        },
     )
 }
 
@@ -220,14 +230,137 @@ pub fn resolve_codex_model_capability_with_library(
     library: Option<&catalog::CapabilityLibrary>,
 ) -> ResolvedModelCapability {
     let platform = provider_metadata::detect_platform(provider);
-    resolve_codex_model_capability_core(
+    resolve_codex_model_capability_for_settings(
         &provider.settings_config,
         platform,
         model,
-        detection,
         library,
         &[],
+        |candidate| {
+            if candidate.eq_ignore_ascii_case(model) {
+                detection.cloned()
+            } else {
+                None
+            }
+        },
     )
+}
+
+/// Resolve a catalog model without promoting provider defaults above model evidence.
+///
+/// Every consumer follows the same chain: the canonical model's complete core
+/// evidence, then its declared wire model's complete core evidence, then a
+/// validated provider-wide capability. The detector is injected so static
+/// projections can deliberately remain independent of the TTL cache.
+/// Legacy provider transport settings are not model capabilities and remain
+/// the responsibility of their existing transport adapters.
+pub(crate) fn resolve_codex_model_capability_for_settings(
+    settings: &Value,
+    platform: Option<&str>,
+    model: &str,
+    library: Option<&catalog::CapabilityLibrary>,
+    official_models: &[Value],
+    detection_for_model: impl Fn(&str) -> Option<ProviderCapabilitySnapshot>,
+) -> ResolvedModelCapability {
+    use crate::codex_multirouter::catalog::{lookup_catalog_model, CatalogModelLookup};
+
+    let lookup = lookup_catalog_model(settings, model);
+    if matches!(lookup, CatalogModelLookup::Ambiguous)
+        || matches!(lookup, CatalogModelLookup::Found(entry)
+            if entry.get("enabled").and_then(Value::as_bool) == Some(false))
+    {
+        // Excluded or ambiguous identities must not be revived by a provider
+        // fallback or by a recognized upstream name.
+        return ResolvedModelCapability {
+            capability: None,
+            source: CapabilitySource::Unknown,
+            fingerprint: String::new(),
+        };
+    }
+    let row = match lookup {
+        CatalogModelLookup::Found(entry) => Some(entry),
+        _ => None,
+    };
+    let canonical_model = row
+        .and_then(|entry| {
+            ["model", "id", "slug"]
+                .iter()
+                .find_map(|key| entry.get(*key))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(model);
+    let upstream_model = row
+        .and_then(|entry| {
+            ["upstreamModel", "upstream_model"]
+                .iter()
+                .find_map(|key| entry.get(*key))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(canonical_model);
+    // A non-wire alias names this canonical row too. Preserve a snapshot
+    // explicitly supplied for that alias before consulting the canonical key;
+    // a wire snapshot must remain on the later upstream-evidence step.
+    let canonical_detection_model = if !model.eq_ignore_ascii_case(canonical_model)
+        && !model.eq_ignore_ascii_case(upstream_model)
+    {
+        model
+    } else {
+        canonical_model
+    };
+    let detection = detection_for_model(canonical_detection_model).or_else(|| {
+        (!canonical_detection_model.eq_ignore_ascii_case(canonical_model))
+            .then(|| detection_for_model(canonical_model))
+            .flatten()
+    });
+    let mut resolved = resolve_codex_model_capability_core(
+        settings,
+        platform,
+        canonical_model,
+        detection.as_ref(),
+        library,
+        official_models,
+    );
+    if resolved.capability.is_none() && !canonical_model.eq_ignore_ascii_case(upstream_model) {
+        let detection = detection_for_model(upstream_model);
+        resolved = resolve_codex_model_capability_core(
+            settings,
+            platform,
+            upstream_model,
+            detection.as_ref(),
+            library,
+            official_models,
+        );
+    }
+    if let Some(capability) = resolved.capability.take() {
+        // The public row owns product-level settings even when its
+        // reasoning evidence came from the wire identity.
+        return resolved_with_catalog_ultra_setting(
+            settings,
+            canonical_model,
+            resolved.source,
+            capability,
+        );
+    }
+    let provider_reasoning = ["reasoning", "codexChatReasoning", "codex_chat_reasoning"]
+        .iter()
+        .find_map(|key| settings.get(*key))
+        .and_then(|reasoning| {
+            reasoning_capability_from_model_entry(&serde_json::json!({
+                "reasoning": reasoning,
+            }))
+        });
+    provider_reasoning.map_or(resolved, |capability| {
+        resolved_with_catalog_ultra_setting(
+            settings,
+            canonical_model,
+            CapabilitySource::ProviderFallback,
+            capability,
+        )
+    })
 }
 
 /// Apply the model's product-level Ultra setting after the capability source
@@ -629,6 +762,249 @@ mod tests {
             "upstream": {"format": "string", "parameter": "reasoning_effort"},
             "source": "user"
         })
+    }
+
+    #[test]
+    fn provider_fallback_accepts_valid_modern_provider_declarations() {
+        for field in ["reasoning", "codexChatReasoning", "codex_chat_reasoning"] {
+            let mut provider = provider_with_catalog("provider-fallback-custom", None);
+            provider.settings_config[field] = user_declared_reasoning();
+            let resolved = resolve_codex_model_capability_with_library(
+                &provider,
+                "provider-fallback-custom",
+                None,
+                None,
+            );
+            assert_eq!(resolved.source.as_str(), "provider", "{field}");
+            assert_eq!(serde_json::to_value(resolved.source).unwrap(), "provider");
+            let capability = resolved.capability.expect("validated provider fallback");
+            assert_eq!(capability.supported_efforts, vec!["low", "high"]);
+            assert_eq!(resolved.fingerprint, capability_fingerprint(&capability));
+        }
+    }
+
+    #[test]
+    fn provider_fallback_follows_canonical_then_upstream_evidence() {
+        let mut provider = provider_with_catalog("provider-fallback-public", None);
+        provider.settings_config["modelCatalog"]["models"][0]["upstreamModel"] =
+            json!("deepseek-v4-pro");
+        provider.settings_config["reasoning"] = user_declared_reasoning();
+        let mut detection = openrouter_detection_snapshot();
+        detection.model = "provider-fallback-public".into();
+        detection.reasoning.as_mut().unwrap().supported_efforts = vec!["low".into()];
+        detection.reasoning.as_mut().unwrap().default_effort = Some("low".into());
+
+        let canonical = resolve_codex_model_capability_with_library(
+            &provider,
+            "provider-fallback-public",
+            Some(&detection),
+            None,
+        );
+        assert_eq!(canonical.source, CapabilitySource::Detection);
+        assert_eq!(canonical.capability.unwrap().supported_efforts, vec!["low"]);
+
+        let upstream = resolve_codex_model_capability_with_library(
+            &provider,
+            "provider-fallback-public",
+            None,
+            None,
+        );
+        assert_eq!(upstream.source, CapabilitySource::Builtin);
+        assert_eq!(
+            upstream.capability.unwrap().supported_efforts,
+            vec!["low", "high", "max"]
+        );
+
+        provider.settings_config["modelCatalog"]["models"][0]["reasoning"] =
+            user_declared_reasoning();
+        let declared = resolve_codex_model_capability_with_library(
+            &provider,
+            "provider-fallback-public",
+            Some(&detection),
+            None,
+        );
+        assert_eq!(declared.source, CapabilitySource::UserConfig);
+        assert_eq!(
+            declared.capability.unwrap().supported_efforts,
+            vec!["low", "high"]
+        );
+    }
+
+    #[test]
+    fn provider_fallback_applies_the_canonical_rows_ultra_setting() {
+        let mut provider = provider_with_catalog("provider-fallback-ultra", None);
+        provider.settings_config["reasoning"] = user_declared_reasoning();
+        provider.settings_config["modelCatalog"]["models"][0]["codexUltra"] =
+            json!({"enabled": true, "providerEffort": "high"});
+        let resolved = resolve_codex_model_capability_with_library(
+            &provider,
+            "provider-fallback-ultra",
+            None,
+            None,
+        );
+        assert_eq!(resolved.source.as_str(), "provider");
+        let capability = resolved
+            .capability
+            .expect("provider fallback with row Ultra");
+        let projected =
+            crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(Some(
+                &capability,
+            ));
+        assert_eq!(capability.supported_efforts, vec!["low", "high"]);
+        assert!(projected
+            .codex_selectable_efforts
+            .contains(&crate::proxy::providers::codex_reasoning::CodexReasoningEffort::Ultra,));
+        assert_eq!(resolved.fingerprint, capability_fingerprint(&capability));
+    }
+
+    #[test]
+    fn provider_fallback_preserves_supplied_alias_detection_without_promoting_wire_detection() {
+        let mut provider = provider_with_catalog("provider-fallback-detection-public", None);
+        provider.settings_config["modelCatalog"]["models"][0]["aliases"] =
+            json!(["provider-fallback-detection-alias"]);
+        provider.settings_config["modelCatalog"]["models"][0]["upstreamModel"] =
+            json!("provider-fallback-detection-wire");
+        provider.settings_config["reasoning"] = user_declared_reasoning();
+        let mut detection = openrouter_detection_snapshot();
+        detection.model = "provider-fallback-detection-alias".into();
+        detection.reasoning.as_mut().unwrap().supported_efforts = vec!["low".into()];
+        detection.reasoning.as_mut().unwrap().default_effort = Some("low".into());
+        let alias = resolve_codex_model_capability_with_library(
+            &provider,
+            "provider-fallback-detection-alias",
+            Some(&detection),
+            None,
+        );
+        assert_eq!(alias.source, CapabilitySource::Detection);
+        assert_eq!(alias.capability.unwrap().supported_efforts, vec!["low"]);
+        let runtime_alias = resolve_codex_model_capability(
+            &provider,
+            "provider-fallback-detection-alias",
+            Some(&detection),
+        );
+        assert_eq!(runtime_alias.source, CapabilitySource::Detection);
+        assert_eq!(runtime_alias.fingerprint, alias.fingerprint);
+
+        // Resolving a wire identity still checks its public row's stronger
+        // canonical evidence before using the wire-only snapshot.
+        provider.settings_config["modelCatalog"]["models"][0]["model"] = json!("deepseek-v4-pro");
+        detection.model = "provider-fallback-detection-wire".into();
+        let wire = resolve_codex_model_capability_with_library(
+            &provider,
+            "provider-fallback-detection-wire",
+            Some(&detection),
+            None,
+        );
+        assert_eq!(wire.source, CapabilitySource::Builtin);
+        assert_eq!(
+            wire.capability.unwrap().supported_efforts,
+            vec!["low", "high", "max"]
+        );
+    }
+
+    #[test]
+    fn provider_fallback_wire_detection_keeps_the_canonical_rows_ultra_setting() {
+        let mut provider = provider_with_catalog("provider-fallback-wire-public", None);
+        provider.settings_config["reasoning"] = user_declared_reasoning();
+        provider.settings_config["modelCatalog"]["models"][0]["upstreamModel"] =
+            json!("provider-fallback-wire");
+        provider.settings_config["modelCatalog"]["models"][0]["codexUltra"] =
+            json!({"enabled": true, "providerEffort": "max"});
+        let mut detection = openrouter_detection_snapshot();
+        detection.model = "provider-fallback-wire".into();
+        let resolved = resolve_codex_model_capability_for_settings(
+            &provider.settings_config,
+            None,
+            "provider-fallback-wire-public",
+            None,
+            &[],
+            |model| (model == "provider-fallback-wire").then(|| detection.clone()),
+        );
+        assert_eq!(resolved.source, CapabilitySource::Detection);
+        let capability = resolved.capability.unwrap();
+        assert_eq!(capability.supported_efforts, vec!["max", "high", "low"]);
+        assert!(capability
+            .codex_ultra_orchestration
+            .as_ref()
+            .is_some_and(|ultra| ultra.enabled));
+        assert_eq!(
+            capability.upstream.effort_map.get("max"),
+            Some(&"max".into())
+        );
+        assert_eq!(resolved.fingerprint, capability_fingerprint(&capability));
+    }
+
+    #[test]
+    fn provider_fallback_rejects_malformed_modern_or_legacy_transport_declarations() {
+        for reasoning in [
+            json!({"supportsThinking": true, "supportsEffort": true}),
+            json!({"supportedEfforts": ["ultra"], "defaultEffort": "ultra"}),
+            json!({"supportedEfforts": ["low"], "defaultEffort": "high"}),
+        ] {
+            let mut provider = provider_with_catalog("provider-fallback-invalid", None);
+            provider.settings_config["reasoning"] = reasoning;
+            let resolved = resolve_codex_model_capability_with_library(
+                &provider,
+                "provider-fallback-invalid",
+                None,
+                None,
+            );
+            assert!(resolved.capability.is_none());
+        }
+    }
+
+    #[test]
+    fn provider_fallback_does_not_revive_excluded_or_ambiguous_catalog_rows() {
+        let mut provider = provider_with_catalog("provider-fallback-excluded", None);
+        provider.settings_config["reasoning"] = user_declared_reasoning();
+        provider.settings_config["modelCatalog"]["models"][0]["enabled"] = json!(false);
+        provider.settings_config["modelCatalog"]["models"][0]["upstreamModel"] =
+            json!("deepseek-v4-pro");
+        for model in ["provider-fallback-excluded", "deepseek-v4-pro"] {
+            let resolved =
+                resolve_codex_model_capability_with_library(&provider, model, None, None);
+            assert!(resolved.capability.is_none(), "{model}");
+            assert_eq!(resolved.source, CapabilitySource::Unknown);
+        }
+        provider.settings_config["modelCatalog"]["models"] = json!([
+            {"model": "first", "upstreamModel": "provider-fallback-ambiguous"},
+            {"model": "second", "upstreamModel": "provider-fallback-ambiguous"}
+        ]);
+        let resolved = resolve_codex_model_capability_with_library(
+            &provider,
+            "provider-fallback-ambiguous",
+            None,
+            None,
+        );
+        assert!(resolved.capability.is_none());
+    }
+
+    #[test]
+    fn provider_fallback_never_replaces_a_valid_empty_model_capability() {
+        for status in ["unknown", "confirmed_unsupported"] {
+            let mut provider = provider_with_catalog(
+                "provider-fallback-empty",
+                Some(json!({
+                    "schemaVersion": 2,
+                    "supportStatus": status,
+                    "controlKind": if status == "unknown" {"unknown"} else {"none"},
+                    "supportedEfforts": [],
+                    "defaultEffort": null,
+                    "disableAllowed": false,
+                    "upstream": {"format": "none", "parameter": "none", "effortMap": {}},
+                    "source": "user"
+                })),
+            );
+            provider.settings_config["reasoning"] = user_declared_reasoning();
+            let resolved = resolve_codex_model_capability_with_library(
+                &provider,
+                "provider-fallback-empty",
+                None,
+                None,
+            );
+            assert_eq!(resolved.source, CapabilitySource::UserConfig, "{status}");
+            assert!(resolved.capability.unwrap().supported_efforts.is_empty());
+        }
     }
 
     fn openrouter_detection_snapshot() -> ProviderCapabilitySnapshot {

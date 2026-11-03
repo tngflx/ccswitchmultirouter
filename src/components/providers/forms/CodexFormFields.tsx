@@ -796,13 +796,15 @@ export function CodexFormFields({
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
-  const [reasoningResolutions, setReasoningResolutions] = useState<
-    Record<string, CodexModelReasoningResolution>
-  >({});
+  const [reasoningResolutionState, setReasoningResolutionState] = useState<{
+    contextKey: string;
+    models: Record<string, CodexModelReasoningResolution>;
+  }>({ contextKey: "", models: {} });
   const [redetectingReasoningModel, setRedetectingReasoningModel] = useState<
     string | null
   >(null);
   const reasoningResolutionRequestRef = useRef(0);
+  const reasoningDetectionRequestRef = useRef(0);
   const [isProtocolProbeConfirmOpen, setIsProtocolProbeConfirmOpen] =
     useState(false);
   const [isProbingProtocol, setIsProbingProtocol] = useState(false);
@@ -1016,14 +1018,42 @@ export function CodexFormFields({
     [providerId, providerName, codexBaseUrl, category],
   );
 
+  // Product-level Ultra is a UI overlay on a provider capability. It may
+  // trigger a fresh resolver call, but must not evict the native capability
+  // snapshot between the checkbox and its provider-effort selection.
+  const reasoningContextKey = JSON.stringify(
+    {
+      providerId: providerId ?? "codex-draft",
+      settings: reasoningSettingsConfig,
+    },
+    (key, value) => (key === "codexUltra" ? undefined : value),
+  );
+  const reasoningContextKeyRef = useRef(reasoningContextKey);
+  reasoningContextKeyRef.current = reasoningContextKey;
+  const reasoningResolutions =
+    reasoningResolutionState.contextKey === reasoningContextKey
+      ? reasoningResolutionState.models
+      : {};
+
+  useEffect(() => {
+    reasoningDetectionRequestRef.current += 1;
+    setRedetectingReasoningModel(null);
+    return () => {
+      reasoningDetectionRequestRef.current += 1;
+    };
+  }, [reasoningContextKey]);
+
   useEffect(() => {
     const visibleModelSet = new Set(visibleReasoningModels);
     const models = catalogRows
       .filter((row) => row.enabled !== false)
-      .map((row) => catalogRowUpstreamModel(row) || row.model.trim())
+      .map((row) => row.model.trim())
       .filter((model) => model && visibleModelSet.has(model));
     if (models.length === 0) {
-      setReasoningResolutions({});
+      setReasoningResolutionState({
+        contextKey: reasoningContextKey,
+        models: {},
+      });
       return;
     }
     const requestId = ++reasoningResolutionRequestRef.current;
@@ -1039,10 +1069,9 @@ export function CodexFormFields({
               model,
             ),
           ] as const;
-        } catch (error) {
+        } catch {
           console.warn("[CodexFormFields] reasoning resolution failed", {
             model,
-            error,
           });
           return [model, unknownReasoningResolution(model)] as const;
         }
@@ -1055,7 +1084,10 @@ export function CodexFormFields({
       for (const result of results) {
         if (result) next[result[0]] = result[1];
       }
-      setReasoningResolutions(next);
+      setReasoningResolutionState({
+        contextKey: reasoningContextKey,
+        models: next,
+      });
     });
     return () => {
       cancelled = true;
@@ -1064,17 +1096,14 @@ export function CodexFormFields({
     catalogRows,
     providerId,
     reasoningSettingsConfig,
+    reasoningContextKey,
     visibleReasoningModels,
   ]);
 
   const handleVisibleReasoningItemsChange = useCallback(
     (items: { row: CodexCatalogRow; index: number }[]) => {
       const next = Array.from(
-        new Set(
-          items
-            .map(({ row }) => catalogRowUpstreamModel(row) || row.model.trim())
-            .filter(Boolean),
-        ),
+        new Set(items.map(({ row }) => row.model.trim()).filter(Boolean)),
       );
       setVisibleReasoningModels((current) =>
         current.length === next.length &&
@@ -1337,47 +1366,42 @@ export function CodexFormFields({
         .then((models) => {
           if (seq !== fetchModelsSeqRef.current) return;
           setFetchedModels(models);
-          const rows = [...catalogRowsRef.current];
-          for (const fetched of models) {
-            const model = fetched.id.trim();
-            if (!model) continue;
-            const upstreamKey = model.toLowerCase();
-            if (
-              rows.some(
-                (row) =>
-                  catalogRowUpstreamModel(row).toLowerCase() === upstreamKey,
-              )
-            ) {
-              // Discovery is metadata, not a user context override. Keep
-              // explicit windows, aliases, disabled rows, and row choices.
-              continue;
-            }
-            if (
-              rows.some((row) => row.model.trim().toLowerCase() === upstreamKey)
-            ) {
-              continue;
-            }
-            rows.push(
-              createCatalogRow({
-                model,
-                upstreamModel: model,
-                displayName: fetched.displayName?.trim() || model,
-                ...normalizeModelIdentityMetadata(fetched),
-                ...(Array.isArray(fetched.inputModalities)
-                  ? { inputModalities: [...fetched.inputModalities] }
-                  : {}),
-                ...(typeof fetched.supportsImage === "boolean"
-                  ? { supportsImage: fetched.supportsImage }
-                  : {}),
-                ...(typeof fetched.supportsParallelToolCalls === "boolean"
-                  ? {
-                      supportsParallelToolCalls:
-                        fetched.supportsParallelToolCalls,
-                    }
-                  : {}),
-              }),
-            );
-          }
+          // Official account/default/max context values remain discovery-only
+          // UI metadata, not persisted overrides. Refresh all other explicit
+          // capability metadata through the same canonical reconciliation as
+          // other provider catalogs while retaining existing inclusion choices.
+          const metadataModels = models
+            .filter((fetched) => {
+              const fetchedId = fetched.id.trim().toLowerCase();
+              if (!fetchedId) return false;
+              // A user-visible alias with an unrelated explicit upstream binding
+              // remains the same row; do not append a second row merely because
+              // the account directory also lists the visible alias as an ID.
+              const existing = catalogRowsRef.current.find(
+                (row) => row.model.trim().toLowerCase() === fetchedId,
+              );
+              if (!existing) return true;
+              const upstream = catalogRowUpstreamModel(existing).toLowerCase();
+              if (!upstream || upstream === fetchedId) return true;
+              return modelIdentityValues(fetched).includes(upstream);
+            })
+            .map((fetched) => ({
+              ...fetched,
+              contextWindow: undefined,
+            }));
+          const { rows } = reconcileFetchedCodexCatalogRows(
+            catalogRowsRef.current,
+            metadataModels,
+            { providerId, providerName, baseUrl: codexBaseUrl, websiteUrl },
+            {
+              appendNew: true,
+              createRow: (seed) => createCatalogRow(seed),
+              existingMetadataMode: "refresh",
+              removeMissingRemote: false,
+              newRowEnabled: true,
+              inferContextWindow: false,
+            },
+          );
           catalogRowsRef.current = rows;
           setCatalogRows(rows);
           if (models.length === 0) {
@@ -1870,8 +1894,8 @@ export function CodexFormFields({
           ),
         );
       }
-      setCatalogRows((current) =>
-        current.map((row, i) => {
+      setCatalogRows((current) => {
+        const nextRows = current.map((row, i) => {
           if (i !== index) return row;
           const next = { ...row, ...patch };
           if (
@@ -1890,8 +1914,12 @@ export function CodexFormFields({
             }
           }
           return next;
-        }),
-      );
+        });
+        // Keep asynchronous catalog refreshes and rapid successive UI patches
+        // anchored to the same latest canonical draft, before React commits.
+        catalogRowsRef.current = nextRows;
+        return nextRows;
+      });
     },
     [onProtocolOverridesChange, protocolOverrides],
   );
@@ -2529,7 +2557,7 @@ export function CodexFormFields({
                 {({ row, index }) => {
                   const model = row.model.trim();
                   const probeModel = catalogRowUpstreamModel(row) || model;
-                  const reasoningResolution = reasoningResolutions[probeModel];
+                  const reasoningResolution = reasoningResolutions[model];
                   const presetReasoning =
                     presetReasoningByModel.get(model) ??
                     presetReasoningByModel.get(catalogRowUpstreamModel(row));
@@ -2565,12 +2593,10 @@ export function CodexFormFields({
                                   ? "Maintained capability catalog"
                                   : "Automatic discovery or server default";
                   const selectableEfforts =
-                    reasoningResolution?.resolved.codexSelectableEfforts ??
-                    row.reasoning?.supportedEfforts ??
-                    [];
+                    reasoningResolution?.resolved.codexSelectableEfforts ?? [];
                   const defaultEffort =
                     reasoningResolution?.resolved.providerDefaultEffort ??
-                    row.reasoning?.defaultEffort;
+                    undefined;
                   const discoveredReasoning = reasoningResolution?.capability
                     ? (reasoningResolution.capability as unknown as CodexModelReasoningCapability)
                     : undefined;
@@ -2659,17 +2685,23 @@ export function CodexFormFields({
                             <CodexModelReasoningCard
                               resolution={reasoningResolution}
                               hasBuiltinPreset={Boolean(presetReasoning)}
-                              redetecting={
-                                redetectingReasoningModel === probeModel
-                              }
+                              redetecting={redetectingReasoningModel === model}
                               onRedetect={async () => {
-                                setRedetectingReasoningModel(probeModel);
+                                const requestId =
+                                  ++reasoningDetectionRequestRef.current;
+                                const contextKey = reasoningContextKey;
+                                const ownsCurrentContext = () =>
+                                  requestId ===
+                                    reasoningDetectionRequestRef.current &&
+                                  reasoningContextKeyRef.current === contextKey;
+                                setRedetectingReasoningModel(model);
                                 try {
                                   const outcome =
                                     await codexSubagentV2Api.triggerModelReasoningDetection(
                                       reasoningDetectionProvider,
                                       probeModel,
                                     );
+                                  if (!ownsCurrentContext()) return;
                                   if (
                                     typeof outcome === "object" &&
                                     "found" in outcome
@@ -2678,11 +2710,17 @@ export function CodexFormFields({
                                       await codexSubagentV2Api.resolveModelReasoningCapability(
                                         reasoningSettingsConfig,
                                         providerId ?? "codex-draft",
-                                        probeModel,
+                                        model,
                                       );
-                                    setReasoningResolutions((current) => ({
-                                      ...current,
-                                      [probeModel]: next,
+                                    if (!ownsCurrentContext()) return;
+                                    setReasoningResolutionState((current) => ({
+                                      contextKey,
+                                      models: {
+                                        ...(current.contextKey === contextKey
+                                          ? current.models
+                                          : {}),
+                                        [model]: next,
+                                      },
                                     }));
                                     toast.success(
                                       "Updated model reasoning capability detection result",
@@ -2692,16 +2730,18 @@ export function CodexFormFields({
                                       "No usable model reasoning declaration was found; continuing with the server default.",
                                     );
                                   }
-                                } catch (error) {
+                                } catch {
+                                  if (!ownsCurrentContext()) return;
                                   console.error(
                                     "[CodexFormFields] reasoning detection failed",
-                                    error,
+                                    { model },
                                   );
                                   toast.error(
                                     "Model reasoning capability detection failed",
                                   );
                                 } finally {
-                                  setRedetectingReasoningModel(null);
+                                  if (ownsCurrentContext())
+                                    setRedetectingReasoningModel(null);
                                 }
                               }}
                               onAdoptDetection={() => {

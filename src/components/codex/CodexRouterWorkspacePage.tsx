@@ -715,6 +715,10 @@ type CodexCatalogModelDraft = {
   enabled?: boolean;
   reasoning?: CodexCatalogModel["reasoning"];
   codexUltra?: CodexCatalogModel["codexUltra"];
+  apiKeyGroupId?: string;
+  api_key_group_id?: string;
+  apiKeyGroupGenerated?: boolean;
+  api_key_group_generated?: boolean;
   capabilities?: CodexRouteCapabilities;
 };
 
@@ -1719,6 +1723,16 @@ function catalogDraftFromSourceModel(
     ...(apiFormat ? { apiFormat } : {}),
     ...(codexCache ? { codexCache } : {}),
     ...(source?.codexUltra ? { codexUltra: source.codexUltra } : {}),
+    ...(source?.apiKeyGroupId
+      ? { apiKeyGroupId: source.apiKeyGroupId }
+      : source?.api_key_group_id
+        ? { api_key_group_id: source.api_key_group_id }
+        : {}),
+    ...(source?.apiKeyGroupGenerated !== undefined
+      ? { apiKeyGroupGenerated: source.apiKeyGroupGenerated }
+      : source?.api_key_group_generated !== undefined
+        ? { api_key_group_generated: source.api_key_group_generated }
+        : {}),
     ...(source?.sortIndex !== undefined ? { sortIndex: source.sortIndex } : {}),
     ...(capabilities ? { capabilities } : {}),
   };
@@ -2269,9 +2283,12 @@ export function buildModelCatalogForRoutes(
       : undefined;
     const targetProviderId = routeTargetProviderId(route);
     const hasTargetCatalog = providerHasCodexModelCatalog(targetProvider);
-    const targetCatalogModels = targetProvider
-      ? readIncludedCodexModelCatalog(targetProvider).models
+    const targetCatalogInventory = targetProvider
+      ? readCodexModelCatalog(targetProvider).models
       : [];
+    const targetCatalogModels = targetCatalogInventory.filter(
+      (model) => model.enabled !== false,
+    );
     const aliases = Object.entries(
       route.aliases ?? route.upstream?.modelMap ?? {},
     );
@@ -2323,17 +2340,54 @@ export function buildModelCatalogForRoutes(
                 : routeCanMatchVisibleCatalogModel(route, catalogModel)),
           );
     // The v2 compiler replaces a selected row's visible name with its explicit
-    // aliases. Alias targets may use either its picker ID or its upstream ID.
+    // aliases. Resolve each alias to one source row before projecting it: a
+    // generated key-group row may share an upstream wire ID with its siblings,
+    // so a broad upstream match would clone the first group's credentials into
+    // every visible alias. Upstream fallback is allowed only when unique.
+    const resolveAliasSourceModel = (
+      visible: string,
+      target: string,
+    ): CodexCatalogModelDraft | undefined => {
+      const visibleKey = normalizedModelIdentity(visible);
+      const targetKey = normalizedModelIdentity(target);
+      // A public identity remains authoritative even when its row is disabled
+      // or outside this route's include selection. It must not be revived by
+      // borrowing a selected sibling that happens to share its wire identity.
+      const exactVisible = targetCatalogInventory.find(
+        (candidate) => normalizedModelIdentity(candidate.model) === visibleKey,
+      );
+      if (exactVisible)
+        return selectedCatalogModels.includes(exactVisible)
+          ? exactVisible
+          : undefined;
+      const exactTarget = targetCatalogInventory.find(
+        (candidate) => normalizedModelIdentity(candidate.model) === targetKey,
+      );
+      if (exactTarget)
+        return selectedCatalogModels.includes(exactTarget)
+          ? exactTarget
+          : undefined;
+      const upstreamMatches = selectedCatalogModels.filter(
+        (candidate) =>
+          normalizedModelIdentity(catalogDraftUpstreamModel(candidate)) ===
+          targetKey,
+      );
+      return upstreamMatches.length === 1 ? upstreamMatches[0] : undefined;
+    };
+    const aliasSourceByVisible = new Map<string, CodexCatalogModelDraft>();
+    for (const [visible, target] of aliases) {
+      if (!visible.trim()) continue;
+      const source = resolveAliasSourceModel(visible, target);
+      if (source)
+        aliasSourceByVisible.set(normalizedModelIdentity(visible), source);
+    }
     const routableCatalogModels = isSchemaV2
       ? selectedCatalogModels.flatMap((model) => {
           const upstream = catalogDraftUpstreamModel(model);
           const visibleAliases = aliases.filter(
-            ([visible, target]) =>
-              visible.trim() &&
-              (normalizedModelIdentity(target) ===
-                normalizedModelIdentity(model.model) ||
-                normalizedModelIdentity(target) ===
-                  normalizedModelIdentity(upstream)),
+            ([visible]) =>
+              aliasSourceByVisible.get(normalizedModelIdentity(visible)) ===
+              model,
           );
           return visibleAliases.length > 0
             ? visibleAliases.map(([visible]) => ({
@@ -4900,7 +4954,7 @@ type ModelOrderReasoning = {
 
 const UNKNOWN_MODEL_ORDER_REASONING: ModelOrderReasoning = { efforts: [] };
 
-function declaredModelOrderReasoning(
+function unselectableModelOrderReasoning(
   model?: CodexCatalogModel,
 ): ModelOrderReasoning | undefined {
   const reasoning = model?.reasoning;
@@ -4909,87 +4963,128 @@ function declaredModelOrderReasoning(
     reasoning.supportStatus === "confirmed_unsupported" ||
     reasoning.supported === false ||
     reasoning.controlKind === "boolean" ||
-    reasoning.controlKind === "none"
+    reasoning.controlKind === "none" ||
+    (Array.isArray(reasoning.supportedEfforts) &&
+      reasoning.supportedEfforts.length === 0)
   ) {
     return UNKNOWN_MODEL_ORDER_REASONING;
   }
-  return {
-    efforts: reasoning.supportedEfforts.filter((effort) => effort !== "ultra"),
-    defaultEffort: reasoning.defaultEffort,
-  };
+  // Native declarations are not Codex selectable levels. The canonical
+  // resolver also validates them and applies the model's product Ultra setting.
+  return undefined;
 }
 
 function modelOrderReasoningQueryOptions(
   model: CodexCatalogModel | undefined,
+  selectedPlan: Provider | null,
   selectedRoutes: RouteEntry[],
   providersById: Map<string, Provider>,
 ) {
   let source: Provider | undefined;
-  let upstream = model ? catalogDraftUpstreamModel(model) : "";
-  if (model) {
-    const identities = modelIdentityValues(model);
+  let sourceModelRow: CodexCatalogModel | undefined;
+  let resolutionModels: string[] = [];
+  const subagentVersion =
+    readCodexRouting(selectedPlan)?.subagentVersion ?? "v2";
+  if (model && selectedPlan) {
     for (const { route } of selectedRoutes) {
       if (route.enabled === false) continue;
       const provider = providersById.get(routeTargetProviderId(route) ?? "");
       if (!provider) continue;
-      const sourceModel = readIncludedCodexModelCatalog(provider).models.find(
-        (entry) =>
-          modelIdentityValues(entry).some((identity) =>
-            identities.includes(identity),
-          ),
+      // Match the current route's projected visible ID, not a shared upstream
+      // identity which can belong to a different provider or source row.
+      const projectedModel = buildModelCatalogForRoutes(
+        selectedPlan,
+        [route],
+        providersById,
+      ).models.find((entry) => entry.model.trim() === model.model.trim());
+      if (!projectedModel) continue;
+      const sourceModels = readIncludedCodexModelCatalog(provider).models;
+      const sourceIndex = buildCodexModelReferenceIndex(sourceModels);
+      const sourceModel = resolveCodexRouteModelReference(
+        model.model,
+        sourceIndex,
+        route.aliases ?? route.upstream?.modelMap,
       );
-      // An explicit catalog is authoritative, including an empty catalog.
-      // Do not resolve stale router models against legacy route fields when
-      // the target provider no longer exposes that model.
-      if (providerHasCodexModelCatalog(provider) && !sourceModel) {
-        continue;
-      }
-      if (
-        !routeCanMatchVisibleCatalogModel(route, model) &&
-        !(route.modelSelection?.mode === "all" && sourceModel)
-      ) {
-        continue;
-      }
+      // An explicit catalog is authoritative, including empty or ambiguous
+      // identities. Never resolve a removed source model through stale routes.
+      if (providerHasCodexModelCatalog(provider) && !sourceModel) continue;
       source = provider;
-      upstream =
-        (route.aliases ?? route.upstream?.modelMap)?.[model.model] ??
-        (sourceModel ? catalogDraftUpstreamModel(sourceModel) : upstream);
+      sourceModelRow = sourceModels.find(
+        (entry) => entry.model === sourceModel,
+      );
+      resolutionModels = [
+        ...new Set([
+          sourceModel ?? model.model,
+          sourceIndex.upstreamFor(sourceModel) ??
+            catalogDraftUpstreamModel(projectedModel),
+        ]),
+      ];
       break;
     }
   }
+  // Only an explicit source-row declaration may suppress inference. A projected
+  // model can inherit provider-wide fallback metadata, which is lower priority
+  // than the canonical library/builtin result.
+  const unselectableReasoning = unselectableModelOrderReasoning(sourceModelRow);
+  // Pass the same provider identity the persisted runtime uses. Like the
+  // provider form, this is transient resolver context, never a persisted field.
+  const configuredName = source
+    ? ["providerName", "provider_name", "name"].find(
+        (key) => key in source.settingsConfig,
+      )
+    : undefined;
+  const sourceName = configuredName
+    ? source?.settingsConfig[configuredName]
+    : undefined;
+  const reasoningSettingsConfig = source
+    ? {
+        ...source.settingsConfig,
+        providerName: typeof sourceName === "string" ? sourceName : source.name,
+      }
+    : undefined;
   return {
     queryKey: [
       "codexModelOrderReasoning",
-      model?.model,
-      upstream,
+      resolutionModels,
       source?.id,
-      source?.settingsConfig,
+      reasoningSettingsConfig,
+      subagentVersion,
     ],
     retry: false,
     staleTime: 60_000,
+    initialData: unselectableReasoning,
+    enabled: Boolean(source && model) && !unselectableReasoning,
     queryFn: async (): Promise<ModelOrderReasoning> => {
-      if (!source || !model) return UNKNOWN_MODEL_ORDER_REASONING;
-      let resolution = await codexSubagentV2Api.resolveModelReasoningCapability(
-        source.settingsConfig,
-        source.id,
-        model.model,
-      );
-      // Preserve visible-model overrides before falling back to the wire identity.
-      if (resolution.source === "unknown" && upstream !== model.model) {
+      if (unselectableReasoning) return unselectableReasoning;
+      if (!source || !model || !reasoningSettingsConfig)
+        return UNKNOWN_MODEL_ORDER_REASONING;
+      let resolution;
+      for (const candidate of resolutionModels) {
         resolution = await codexSubagentV2Api.resolveModelReasoningCapability(
-          source.settingsConfig,
+          reasoningSettingsConfig,
           source.id,
-          upstream,
+          candidate,
         );
+        // Match the compiler: resolve the exact source row (including its
+        // overrides) before falling back to the wire identity's metadata.
+        if (resolution.source !== "unknown") break;
       }
+      if (!resolution || resolution.resolved.supportKind !== "effort_levels")
+        return UNKNOWN_MODEL_ORDER_REASONING;
+      const resolved = resolution.resolved;
       return {
-        efforts:
-          resolution.resolved.supportKind === "effort_levels"
-            ? resolution.resolved.codexSelectableEfforts.filter(
-                (effort) => effort !== "ultra",
-              )
-            : [],
-        defaultEffort: resolution.resolved.providerDefaultEffort,
+        efforts: [
+          ...new Set([
+            // Main-model defaults can explicitly disable reasoning. Sub-Agent
+            // selectable levels intentionally omit this separate disable path.
+            ...(resolved.disableAllowed &&
+            resolved.providerAcceptedEfforts.includes("none")
+              ? ["none" as const]
+              : []),
+            ...resolved.codexSelectableEfforts,
+          ]),
+        ].filter((effort) => effort !== "ultra" || subagentVersion !== "v1"),
+        defaultEffort: resolved.providerDefaultEffort,
       };
     },
   };
@@ -5148,15 +5243,15 @@ export function ModelOrderTab({
     [orderedDraftModels, providersById, selectedRoutes, recommendationUsage],
   );
   const topModel = orderedDraftModels[0];
-  const declaredTopReasoning = declaredModelOrderReasoning(topModel);
-  const topReasoningQuery = useQuery({
-    ...modelOrderReasoningQueryOptions(topModel, selectedRoutes, providersById),
-    enabled: Boolean(topModel) && !declaredTopReasoning,
-  });
-  const topReasoning =
-    declaredTopReasoning ??
-    topReasoningQuery.data ??
-    UNKNOWN_MODEL_ORDER_REASONING;
+  const topReasoningQuery = useQuery(
+    modelOrderReasoningQueryOptions(
+      topModel,
+      selectedPlan,
+      selectedRoutes,
+      providersById,
+    ),
+  );
+  const topReasoning = topReasoningQuery.data ?? UNKNOWN_MODEL_ORDER_REASONING;
   const topReasoningEfforts = topReasoning.efforts;
   const topDefaultReasoningEffort =
     topReasoning.defaultEffort &&
@@ -5393,15 +5488,14 @@ export function ModelOrderTab({
       const persistOrder = reset || orderChanged;
       const currentRouting = selectedPlan.settingsConfig?.codexRouting;
       const currentConfig = selectedPlan.settingsConfig?.config;
-      const reasoning =
-        declaredModelOrderReasoning(models[0]) ??
-        (await queryClient.fetchQuery<ModelOrderReasoning>(
-          modelOrderReasoningQueryOptions(
-            models[0],
-            selectedRoutes,
-            providersById,
-          ),
-        ));
+      const reasoning = await queryClient.fetchQuery<ModelOrderReasoning>(
+        modelOrderReasoningQueryOptions(
+          models[0],
+          selectedPlan,
+          selectedRoutes,
+          providersById,
+        ),
+      );
       const declaredEfforts = reasoning.efforts;
       const declaredDefault = reasoning.defaultEffort;
       const sameTopModel =
@@ -5868,7 +5962,7 @@ export function ModelOrderTab({
               ))
             ) : (
               <option value="" disabled>
-                {!declaredTopReasoning && topReasoningQuery.isFetching
+                {topReasoningQuery.isFetching
                   ? tr("common.loading", { defaultValue: "Loading..." })
                   : tr("codexRouterWorkspace.reasoningUnknown", {
                       defaultValue:

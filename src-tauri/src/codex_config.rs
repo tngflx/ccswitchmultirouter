@@ -2092,30 +2092,14 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
             crate::reasoning_capabilities::provider_metadata::detect_platform_from_settings(
                 &resolver_settings,
             );
-        let mut resolved = crate::reasoning_capabilities::resolve_codex_model_capability_core(
+        let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_for_settings(
             &resolver_settings,
             platform,
             model,
-            None,
             library.as_ref(),
             &official_models,
+            |_| None,
         );
-        if resolved.capability.is_none() {
-            if let Some(upstream) = upstream_model.as_deref() {
-                let upstream_resolved =
-                    crate::reasoning_capabilities::resolve_codex_model_capability_core(
-                        &resolver_settings,
-                        platform,
-                        upstream,
-                        None,
-                        library.as_ref(),
-                        &official_models,
-                    );
-                if upstream_resolved.capability.is_some() {
-                    resolved = upstream_resolved;
-                }
-            }
-        }
         let reasoning = resolved.capability;
         let reasoning_fingerprint = resolved.fingerprint;
         let reasoning_source = resolved.source.as_str().to_string();
@@ -5408,13 +5392,13 @@ fn resolve_codex_model_reasoning_capability_value(
     let platform = crate::reasoning_capabilities::provider_metadata::detect_platform_from_settings(
         settings_config,
     );
-    let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_core(
+    let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_for_settings(
         settings_config,
         platform,
         &model,
-        detection.as_ref(),
         library.as_ref(),
         &official_models,
+        |candidate| crate::reasoning_capabilities::current_detection(provider_id, candidate),
     );
     let resolved_capability =
         crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(
@@ -10135,6 +10119,87 @@ wire_api = "responses"
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn provider_fallback_model_api_preserves_detection_cached_under_a_public_alias() {
+        let settings = json!({
+            "modelCatalog": {"models": [{
+                "model": "provider-fallback-api-alias-public",
+                "upstreamModel": "provider-fallback-api-alias-wire",
+                "aliases": ["provider-fallback-api-alias"]
+            }]}
+        });
+        crate::reasoning_capabilities::detection_cache()
+            .lock()
+            .unwrap()
+            .insert(crate::reasoning_capabilities::ProviderCapabilitySnapshot {
+                provider_key: "provider-fallback-api-alias-source".into(),
+                model: "provider-fallback-api-alias".into(),
+                reasoning: Some(crate::reasoning_capabilities::ReasoningCapabilitySnapshot {
+                    supported_efforts: vec!["max".into()],
+                    default_effort: Some("max".into()),
+                    upstream_format: Some("string".into()),
+                    upstream_parameter: Some("reasoning_effort".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let alias = resolve_codex_model_reasoning_capability_value(
+            &settings,
+            "provider-fallback-api-alias-source",
+            "provider-fallback-api-alias",
+        );
+        assert_eq!(alias.source, "detection");
+        assert_eq!(alias.capability.unwrap().supported_efforts, vec!["max"]);
+        assert!(alias.has_detection_candidate);
+        assert_eq!(
+            alias.detection.unwrap().model,
+            "provider-fallback-api-alias"
+        );
+        // Static catalog projection intentionally does not consume TTL data.
+        assert!(codex_catalog_model_specs(&settings, "")[0]
+            .reasoning
+            .is_none());
+    }
+
+    #[test]
+    fn provider_fallback_matches_model_api_static_catalog_and_subagent_capabilities() {
+        let settings = json!({
+            "reasoning": {
+                "schemaVersion": 2,
+                "supportStatus": "confirmed_supported",
+                "controlKind": "graded",
+                "supportedEfforts": ["low", "high"],
+                "defaultEffort": "high",
+                "disableAllowed": false,
+                "upstream": {"format": "string", "parameter": "reasoning_effort"},
+                "source": "user"
+            },
+            "modelCatalog": {"models": [{
+                "model": "provider-fallback-api",
+                "codexUltra": {"enabled": true, "providerEffort": "high"}
+            }]}
+        });
+        let resolution = resolve_codex_model_reasoning_capability_value(
+            &settings,
+            "provider-fallback-api-source",
+            "provider-fallback-api",
+        );
+        let specs = codex_catalog_model_specs(&settings, "");
+        let subagent = get_codex_subagent_reasoning_capabilities_from_settings(&settings);
+        assert_eq!(resolution.source, "provider");
+        assert_eq!(specs[0].reasoning, resolution.capability);
+        assert_eq!(specs[0].reasoning_fingerprint, resolution.fingerprint);
+        assert_eq!(specs[0].reasoning_source, resolution.source);
+        assert_eq!(
+            serde_json::to_value(&subagent["provider-fallback-api"]).unwrap(),
+            serde_json::to_value(&resolution.resolved).unwrap()
+        );
+        assert!(resolution
+            .resolved
+            .codex_selectable_efforts
+            .contains(&crate::proxy::providers::codex_reasoning::CodexReasoningEffort::Ultra,));
     }
 
     #[test]
