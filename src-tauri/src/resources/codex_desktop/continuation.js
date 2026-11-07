@@ -115,6 +115,10 @@ const codexContinuationHasNewerUserAction = (threadId, observedAtMs) => {
 const continuationStatus = (value) =>
   String(value?.type || value || "").toLowerCase();
 const classifyCodexContinuationThread = (thread, threadId, expectedModel) => {
+  const requestedModel = String(expectedModel || "").trim();
+  if (!requestedModel || requestedModel.toLowerCase() === "unknown") {
+    return { ready: false, reason: "The interrupted Codex model is required" };
+  }
   if (String(thread?.id || "").trim() !== threadId) {
     return { ready: false, reason: "Codex returned a different thread" };
   }
@@ -168,8 +172,22 @@ const classifyCodexContinuationThread = (thread, threadId, expectedModel) => {
         "The latest Codex turn was interrupted without a recoverable error",
     };
   }
-  const model = String(thread?.model || turn?.model || "").trim();
-  if (model && expectedModel && model !== expectedModel) {
+  const threadModel = String(thread?.model || "").trim();
+  const turnModel = String(turn?.model || "").trim();
+  if (!threadModel && !turnModel) {
+    return {
+      ready: false,
+      reason: "Codex did not identify the interrupted model",
+    };
+  }
+  if (threadModel && turnModel && threadModel !== turnModel) {
+    return {
+      ready: false,
+      reason: "The interrupted Codex thread returned conflicting models",
+    };
+  }
+  const model = threadModel || turnModel;
+  if (model !== requestedModel) {
     return {
       ready: false,
       reason: "The interrupted Codex thread changed model",
@@ -209,7 +227,6 @@ const isCodexContinuationRequestClient = (client) =>
   );
 // Readiness and mutation share this pure predicate; no Desktop RPC is needed
 // to reject a retained client whose activity hook is absent or replaced.
-state.isCodexContinuationRequestClient = isCodexContinuationRequestClient;
 const readExactCodexContinuationThread = async (client, threadId) => {
   // The compatibility wrapper deliberately changes thread/resume providers.
   // Recovery uses the original client and never resumes or changes providers.
@@ -217,7 +234,7 @@ const readExactCodexContinuationThread = async (client, threadId) => {
     client,
     codexContinuationRequestPatchVersion,
   );
-  if (!isCodexContinuationRequestClient(client) || !request)
+  if (!codexContinuationClientIsCurrent(client) || !request)
     throw new Error(
       "Codex Desktop request client was not found with its guarded activity hook",
     );
@@ -246,9 +263,22 @@ const continuationInstallationIsCurrent = () =>
 const codexContinuationLocalClients = () =>
   (Array.isArray(state.appServerClients) ? state.appServerClients : []).filter(
     (client, index, array) =>
-      isCodexContinuationRequestClient(client) &&
+      codexContinuationClientIsCurrent(client) &&
       array.indexOf(client) === index,
   );
+const codexContinuationClientIsCurrent = (client) => {
+  if (!isCodexContinuationRequestClient(client)) return false;
+  if (
+    !Array.isArray(state.appServerClients) ||
+    !state.appServerClients.includes(client)
+  )
+    return false;
+  if (!codexAppServerClientHasCurrentOwner(client)) return false;
+  return true;
+};
+// Readiness and mutation require current discovery ownership, not merely a
+// hook still attached to an object retained from a previous manager.
+state.isCodexContinuationRequestClient = codexContinuationClientIsCurrent;
 const prepareCodexContinuation = async (
   threadId,
   recoveryId,
@@ -361,7 +391,7 @@ const prepareCodexContinuation = async (
               "The user changed or stopped the Codex thread before continuation",
           };
         if (
-          !isCodexContinuationRequestClient(client) ||
+          !codexContinuationClientIsCurrent(client) ||
           codexVerifiedAppServerOriginalRequest(
             client,
             codexContinuationRequestPatchVersion,
@@ -372,6 +402,49 @@ const prepareCodexContinuation = async (
             mutationAttempted: false,
             reason:
               "Codex Desktop request client was not found with its guarded activity hook",
+          };
+        // Preparation may be separated from authorization by an arbitrary
+        // backend round trip. Re-read the exact thread immediately before the
+        // mutation so a newer failure/turn cannot inherit the old commit
+        // closure merely because the client and thread id still match.
+        let latest;
+        try {
+          latest = await readExactCodexContinuationThread(client, threadId);
+        } catch (error) {
+          return {
+            submitted: false,
+            mutationAttempted: false,
+            reason: String(error?.message || error),
+          };
+        }
+        if (
+          !continuationInstallationIsCurrent() ||
+          codexContinuationHasNewerUserAction(threadId, observedAtMs) ||
+          !codexContinuationClientIsCurrent(client) ||
+          latest.request !== preparedRequest ||
+          codexVerifiedAppServerOriginalRequest(
+            client,
+            codexContinuationRequestPatchVersion,
+          ) !== preparedRequest
+        )
+          return {
+            submitted: false,
+            mutationAttempted: false,
+            reason:
+              "Codex continuation authorization changed while reading the thread",
+          };
+        const latestReady = classifyCodexContinuationThread(
+          latest.thread,
+          threadId,
+          expectedModel,
+        );
+        if (!latestReady.ready || latestReady.turnId !== failedTurnId)
+          return {
+            submitted: false,
+            mutationAttempted: false,
+            reason:
+              latestReady.reason ||
+              "The latest Codex turn changed before continuation",
           };
         const markerKey = `${threadId}:${failedTurnId}`;
         const previous = readCodexContinuationMarkers()[markerKey];
@@ -461,6 +534,11 @@ state.startCodexContinuation = (
     return {
       started: false,
       reason: "An exact Codex thread and recovery id are required",
+    };
+  if (!model || model.toLowerCase() === "unknown")
+    return {
+      started: false,
+      reason: "The interrupted Codex model is required",
     };
   if (!Number.isFinite(observedAtMs) || observedAtMs <= 0)
     return {

@@ -235,6 +235,20 @@ impl ToolLifecycleCoordinator {
 static TOOL_LIFECYCLE: Lazy<ToolLifecycleCoordinator> =
     Lazy::new(ToolLifecycleCoordinator::default);
 
+/// Read-only native-host install snippets. The renderer must use this projection
+/// instead of keeping a second package/installer table. Loading or copying these
+/// commands never runs an installer and does not select a Codex runtime version.
+#[tauri::command]
+pub fn get_tool_install_commands() -> Result<String, String> {
+    let shell = if cfg!(target_os = "windows") {
+        LifecycleCommandShell::WindowsBatch
+    } else {
+        LifecycleCommandShell::Posix
+    };
+    manual_install_commands_for_shell(shell)
+        .ok_or_else(|| "Cannot generate native tool install commands".to_string())
+}
+
 #[tauri::command]
 pub async fn run_tool_lifecycle_action(
     tools: Vec<String>,
@@ -774,6 +788,41 @@ fn npm_install_command_for(tool: &str) -> Option<&'static str> {
         "pi" => Some("npm i -g @earendil-works/pi-coding-agent@latest"),
         _ => None,
     }
+}
+
+fn manual_install_command_line(command: &str, shell: LifecycleCommandShell) -> String {
+    match shell {
+        LifecycleCommandShell::Posix => command.to_string(),
+        // The copied block is pasted into PowerShell, not an existing .bat file.
+        // Keep batch-only `call` and `||` inside cmd so PowerShell 5/7 do not
+        // reinterpret them. Canonical installers encode their PowerShell bodies.
+        LifecycleCommandShell::WindowsBatch => {
+            format!("cmd.exe /d /s /c \"call {command}\"")
+        }
+    }
+}
+
+fn manual_install_commands_for_shell(shell: LifecycleCommandShell) -> Option<String> {
+    VALID_TOOLS
+        .iter()
+        .map(|tool| {
+            let command = match shell {
+                LifecycleCommandShell::Posix => posix_install_command_for(tool),
+                LifecycleCommandShell::WindowsBatch => {
+                    tool_action_shell_command_for_shell(tool, ToolLifecycleAction::Install, shell)?
+                }
+            };
+            if command.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "# {}\n{}",
+                tool_display_name(tool),
+                manual_install_command_line(&command, shell),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|commands| commands.join("\n"))
 }
 
 fn official_update_args(tool: &str) -> Option<&'static str> {
@@ -5278,6 +5327,97 @@ mod tests {
             )
             .as_deref(),
             Some("npm i -g @xai-official/grok@latest")
+        );
+    }
+
+    #[test]
+    fn manual_install_commands_share_posix_lifecycle_authority() {
+        // Both Linux and macOS use this projection, as do Windows-hosted WSL
+        // lifecycle installs. In particular Grok must retain its native installer.
+        let commands = manual_install_commands_for_shell(LifecycleCommandShell::Posix)
+            .expect("all supported tools have POSIX install commands");
+        let expected = VALID_TOOLS
+            .iter()
+            .map(|tool| {
+                format!(
+                    "# {}\n{}",
+                    tool_display_name(tool),
+                    posix_install_command_for(tool)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(commands, expected);
+        assert!(commands.contains(GROK_INSTALL_UNIX));
+        assert!(commands.contains(" || npm i -g @xai-official/grok@latest"));
+        assert!(!commands.contains("hermes update"));
+        assert!(!commands.contains("cmd.exe"));
+    }
+
+    #[test]
+    fn manual_install_commands_native_projection_is_read_only_and_complete() {
+        let commands = get_tool_install_commands().expect("native projection should be available");
+        assert_eq!(
+            commands
+                .lines()
+                .filter(|line| line.starts_with("# "))
+                .count(),
+            VALID_TOOLS.len()
+        );
+        for tool in VALID_TOOLS {
+            assert!(commands.contains(&format!("# {}\n", tool_display_name(tool))));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn manual_install_commands_share_windows_lifecycle_authority() {
+        let commands = manual_install_commands_for_shell(LifecycleCommandShell::WindowsBatch)
+            .expect("all supported tools have Windows install commands");
+        for tool in VALID_TOOLS {
+            let install = tool_action_shell_command_for_shell(
+                tool,
+                ToolLifecycleAction::Install,
+                LifecycleCommandShell::WindowsBatch,
+            )
+            .expect("supported Windows install command");
+            assert!(commands.contains(&format!(
+                "# {}\ncmd.exe /d /s /c \"call {install}\"",
+                tool_display_name(tool)
+            )));
+        }
+        assert!(commands.contains(&grok_install_windows_command()));
+        assert!(commands.contains(" || call npm i -g @xai-official/grok@latest"));
+        assert!(commands.contains(&hermes_install_windows_command()));
+        assert!(!commands.contains("powershell.exe"));
+        assert!(!commands.contains("curl -fsSL"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn manual_install_command_windows_wrapper_is_powershell_pasteable() {
+        // Execute only inert echo/exit commands. No CLI/package/network action.
+        // This proves cmd's batch fallback remains inside cmd when PowerShell
+        // parses the exact same wrapper used by the manual-command projection.
+        let command = manual_install_command_line(
+            "cmd.exe /d /c exit 1 || call echo cc-switch-manual-fallback-ok",
+            LifecycleCommandShell::WindowsBatch,
+        );
+        let output = std::process::Command::new(crate::powershell::POWERSHELL7_EXECUTABLE)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &command,
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .expect("PowerShell 7 should run the inert manual-command fixture");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "cc-switch-manual-fallback-ok"
         );
     }
 

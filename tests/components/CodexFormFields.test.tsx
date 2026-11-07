@@ -1148,6 +1148,83 @@ describe("CodexFormFields local model routing", () => {
     expect(latestCatalog().every((model) => model.enabled !== false)).toBe(
       true,
     );
+    expect(
+      screen.queryByRole("button", { name: /Enable only synced models/ }),
+    ).not.toBeInTheDocument();
+    await waitForReasoningResolution();
+  });
+
+  it("can switch a complete sync to API-only enabled models without deleting inventory", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "primary", ownedBy: null },
+      { id: "fresh", ownedBy: null },
+    ]);
+    const { latestCatalog, latestDefaultModel } = renderCatalogHarness(
+      [{ model: "primary" }, { model: "other-key-model" }],
+      { defaultModel: "other-key-model" },
+    );
+    await waitForReasoningResolution();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /Enable only synced models/ }),
+      ).toBeVisible(),
+    );
+    expect(latestCatalog()).toEqual([
+      expect.objectContaining({ model: "primary" }),
+      expect.objectContaining({ model: "other-key-model", enabled: false }),
+      expect.objectContaining({ model: "fresh", enabled: false }),
+    ]);
+    expect(latestCatalog()[0].enabled).not.toBe(false);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Enable only synced models/ }),
+    );
+    await waitFor(() => {
+      expect(latestCatalog()).toEqual([
+        expect.objectContaining({ model: "primary", enabled: true }),
+        expect.objectContaining({ model: "other-key-model", enabled: false }),
+        expect.objectContaining({ model: "fresh", enabled: true }),
+      ]);
+    });
+    expect(latestDefaultModel()).toBe("primary");
+    await waitForReasoningResolution();
+  });
+
+  it("can explicitly replace the catalog from a complete sync", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "fresh", ownedBy: null, contextWindow: 256000 },
+      { id: "new", ownedBy: null },
+    ]);
+    const { latestCatalog } = renderCatalogHarness([
+      { model: "old", displayName: "Old custom label" },
+      { model: "kept", enabled: false },
+    ]);
+    await waitForReasoningResolution();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /^Replace catalog/ }),
+      ).toBeVisible(),
+    );
+    expect(latestCatalog().some((model) => model.model === "old")).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Replace catalog/ }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Replace catalog" }),
+    );
+    await waitFor(() => {
+      expect(latestCatalog().map((model) => model.model)).toEqual([
+        "fresh",
+        "new",
+      ]);
+      expect(latestCatalog().every((model) => model.enabled !== false)).toBe(
+        true,
+      );
+    });
     await waitForReasoningResolution();
   });
 

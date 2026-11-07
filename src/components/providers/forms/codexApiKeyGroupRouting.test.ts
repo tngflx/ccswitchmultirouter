@@ -28,6 +28,28 @@ describe("Codex API key group routing", () => {
     expect(baseCodexCatalogModels(projected)).toEqual(catalog);
   });
 
+  it("replaces legacy marker-only projections with the current group rows", () => {
+    const legacyCatalog = [
+      ...catalog,
+      { ...catalog[0], model: "gpt-5.6-sol--CCG-legacy" },
+    ];
+    const before = structuredClone(legacyCatalog);
+    const group = { id: "astra", apiKeys: ["key"], models: ["gpt-5.6-sol"] };
+
+    const projected = buildCodexApiKeyGroupCatalog(
+      legacyCatalog,
+      [group],
+      "isolated",
+    );
+
+    expect(projected.map((model) => model.model)).toEqual([
+      "gpt-5.6-sol",
+      "gpt-5.6-sol--ccg-astra",
+    ]);
+    expect(baseCodexCatalogModels(legacyCatalog)).toEqual(catalog);
+    expect(legacyCatalog).toEqual(before);
+  });
+
   it("does not project aliases for pooled mode or disabled groups", () => {
     const group = { id: "astra", apiKeys: ["key"], models: ["gpt-5.6-sol"] };
     expect(

@@ -1,16 +1,18 @@
-import type { Ref } from "react";
+import { useState, type Ref } from "react";
 import {
   BadgeDollarSign,
   CheckCircle2,
   Download,
   Eye,
   Loader2,
+  ListChecks,
   Route,
   Server,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { readCodexModelProtocolCapability } from "@/lib/codexProtocolCapability";
 import { normalizeCodexPublicModelKey } from "@/lib/protocol-lab/codex-overrides";
 import { cn } from "@/lib/utils";
@@ -42,6 +44,11 @@ interface CodexProviderReadinessSectionProps {
   confirmedFreeModelCount?: number;
   canUseFreeModelsOnly?: boolean;
   onUseFreeModelsOnly?: () => void;
+  discoveredModelCount?: number;
+  canUseOnlyDiscoveredModels?: boolean;
+  onUseOnlyDiscoveredModels?: () => void;
+  canReplaceCatalog?: boolean;
+  onReplaceCatalog?: () => void;
   onValidateConnection: () => void;
   onViewCompatibilityDetails?: () => void;
 }
@@ -75,10 +82,16 @@ export function CodexProviderReadinessSection({
   confirmedFreeModelCount = 0,
   canUseFreeModelsOnly = false,
   onUseFreeModelsOnly,
+  discoveredModelCount = 0,
+  canUseOnlyDiscoveredModels = false,
+  onUseOnlyDiscoveredModels,
+  canReplaceCatalog = false,
+  onReplaceCatalog,
   onValidateConnection,
   onViewCompatibilityDetails,
 }: CodexProviderReadinessSectionProps) {
   const { t } = useTranslation();
+  const [replaceConfirmOpen, setReplaceConfirmOpen] = useState(false);
   const configuredModels = models.filter((model) => model.model.trim());
   const enabledModels = configuredModels.filter(
     (model) => model.enabled !== false,
@@ -315,6 +328,54 @@ export function CodexProviderReadinessSection({
                 </span>
               </Button>
             )}
+          {canUseOnlyDiscoveredModels &&
+            onUseOnlyDiscoveredModels &&
+            discoveredModelCount > 0 && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1"
+                onClick={onUseOnlyDiscoveredModels}
+                disabled={isSyncingModels}
+                title={t("codexConfig.useOnlyDiscoveredModelsHint", {
+                  defaultValue:
+                    "Enable only models returned by the most recent API sync; older rows stay in the catalog as excluded inventory for editing.",
+                })}
+              >
+                <ListChecks className="h-3.5 w-3.5" />
+                {t("codexConfig.useOnlyDiscoveredModels", {
+                  defaultValue: "Enable only synced models",
+                })}
+                <span className="text-[11px] opacity-75">
+                  ({discoveredModelCount})
+                </span>
+              </Button>
+            )}
+          {canReplaceCatalog &&
+            onReplaceCatalog &&
+            discoveredModelCount > 0 && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1 border-destructive/50 text-destructive hover:bg-destructive/10"
+                onClick={() => setReplaceConfirmOpen(true)}
+                disabled={isSyncingModels}
+                title={t("codexConfig.replaceCatalogHint", {
+                  defaultValue:
+                    "Discard the current catalog and rebuild it from the latest complete API sync.",
+                })}
+              >
+                <Download className="h-3.5 w-3.5" />
+                {t("codexConfig.replaceCatalog", {
+                  defaultValue: "Replace catalog",
+                })}
+                <span className="text-[11px] opacity-75">
+                  ({discoveredModelCount})
+                </span>
+              </Button>
+            )}
           <Button
             type="button"
             variant="outline"
@@ -349,6 +410,32 @@ export function CodexProviderReadinessSection({
           )}
         </div>
       </div>
+
+      {isSyncingModels && (
+        <div
+          className="space-y-1.5 rounded-md border border-blue-500/30 bg-blue-500/5 p-3"
+          role="status"
+          aria-live="polite"
+        >
+          <div className="flex items-center justify-between gap-2 text-xs text-blue-700 dark:text-blue-300">
+            <span>
+              {t("codexConfig.catalogSyncInProgress", {
+                defaultValue: "Fetching and reconciling the model catalog…",
+              })}
+            </span>
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          </div>
+          <div
+            className="h-1.5 overflow-hidden rounded-full bg-blue-500/15"
+            role="progressbar"
+            aria-label={t("codexConfig.catalogSyncProgress", {
+              defaultValue: "Model catalog sync in progress",
+            })}
+          >
+            <div className="h-full w-1/3 animate-pulse rounded-full bg-blue-500" />
+          </div>
+        </div>
+      )}
 
       <div className="grid gap-3 sm:grid-cols-4">
         <div className="rounded-md border border-border-default bg-background/70 p-3">
@@ -485,6 +572,25 @@ export function CodexProviderReadinessSection({
           </p>
         )}
       </div>
+
+      <ConfirmDialog
+        isOpen={replaceConfirmOpen}
+        title={t("codexConfig.replaceCatalogConfirmTitle", {
+          defaultValue: "Replace the model catalog?",
+        })}
+        message={t("codexConfig.replaceCatalogConfirmMessage", {
+          defaultValue:
+            "This removes every existing catalog row and rebuilds it from the latest complete API response. Manual display names, aliases, context overrides, and excluded inventory will be discarded.",
+        })}
+        confirmText={t("codexConfig.replaceCatalogConfirm", {
+          defaultValue: "Replace catalog",
+        })}
+        onCancel={() => setReplaceConfirmOpen(false)}
+        onConfirm={() => {
+          setReplaceConfirmOpen(false);
+          onReplaceCatalog?.();
+        }}
+      />
     </section>
   );
 }

@@ -16,6 +16,7 @@ use super::{
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{
         actionable_upstream_error_message, get_error_message, map_proxy_error_to_status,
+        upstream_html_error_message,
     },
     external_openai_api::{
         self, ExternalOpenAiApiAuthError, ExternalOpenAiApiBackendType, ExternalOpenAiApiProfile,
@@ -2633,7 +2634,14 @@ fn resolve_external_openai_compatible_provider(
     profile: &ExternalOpenAiApiProfile,
 ) -> Result<Option<crate::provider::Provider>, ProxyError> {
     match profile.backend_type {
-        ExternalOpenAiApiBackendType::Provider => resolve_external_provider_target(state, profile),
+        ExternalOpenAiApiBackendType::Provider => {
+            let provider = resolve_external_provider_target(state, profile)?;
+            if provider.as_ref().is_some_and(is_codex_router_provider) {
+                resolve_external_codex_router_target(state, body, profile)
+            } else {
+                Ok(provider)
+            }
+        }
         ExternalOpenAiApiBackendType::CodexRouterRoute => {
             resolve_external_codex_router_target(state, body, profile)
         }
@@ -3551,8 +3559,14 @@ async fn handle_codex_responses_error_response(
         };
     let (mut response_headers, _status, body_bytes) =
         read_decoded_body(response, ctx.tag, body_timeout).await?;
-    let parsed_value: Value = serde_json::from_slice(&body_bytes)
-        .unwrap_or_else(|_| json!(String::from_utf8_lossy(&body_bytes).to_string()));
+    let parsed_value: Value = serde_json::from_slice(&body_bytes).unwrap_or_else(|_| {
+        let text = String::from_utf8_lossy(&body_bytes);
+        if let Some(message) = upstream_html_error_message(status.as_u16(), Some(&text)) {
+            json!({"error": {"message": message, "type": "upstream_error"}})
+        } else {
+            json!(text.into_owned())
+        }
+    });
     let chat_error = openai_compat::responses_error_to_chat_error(Some(&parsed_value));
     strip_entity_headers_for_rebuilt_body(&mut response_headers);
     strip_hop_by_hop_response_headers(&mut response_headers);
@@ -5828,24 +5842,26 @@ async fn handle_codex_chat_error_response(
     let (mut response_headers, _status, body_bytes) =
         read_decoded_body(response, ctx.tag, body_timeout).await?;
 
-    // 非 JSON 上游错误体（Cloudflare HTML、纯文本 "Unauthorized" 等）若丢成 None，
-    // 客户端就看不到原始诊断信息；包成 Value::String 走转换函数的字符串分支。
+    // 非 JSON 纯文本错误仍保留可读摘要；HTML 网关错误改成安全的上游说明，
+    // 不把 Cloudflare 等网关的整页文档回显给 API 客户端。
     let parsed_value: Value = match serde_json::from_slice::<Value>(&body_bytes) {
         Ok(value) => value,
         Err(_) => {
             const MAX_RAW_ERROR_BYTES: usize = 1024;
             let lossy = String::from_utf8_lossy(&body_bytes);
-            let truncated = if lossy.len() > MAX_RAW_ERROR_BYTES {
+            let text = upstream_html_error_message(status.as_u16(), Some(&lossy))
+                .unwrap_or_else(|| lossy.into_owned());
+            let truncated = if text.len() > MAX_RAW_ERROR_BYTES {
                 let mut end = MAX_RAW_ERROR_BYTES;
-                while end > 0 && !lossy.is_char_boundary(end) {
+                while end > 0 && !text.is_char_boundary(end) {
                     end -= 1;
                 }
-                format!("{}…(truncated)", &lossy[..end])
+                format!("{}…(truncated)", &text[..end])
             } else {
-                lossy.into_owned()
+                text
             };
             log::warn!(
-                "[Codex] Chat 错误响应不是合法 JSON，按文本透传: body_bytes={} (content omitted)",
+                "[Codex] Chat 错误响应不是合法 JSON，规整为错误摘要: body_bytes={} (content omitted)",
                 body_bytes.len()
             );
             Value::String(truncated)
@@ -9665,6 +9681,47 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
     }
 
     #[tokio::test]
+    async fn codex_converted_html_error_keeps_status_and_retry_after_without_markup() {
+        for status_code in [502, 520, 524] {
+            for to_responses in [false, true] {
+                let ctx = codex_error_test_context().await;
+                let status = StatusCode::from_u16(status_code).unwrap();
+                let mut headers = HeaderMap::new();
+                headers.insert("content-type", "text/html; charset=UTF-8".parse().unwrap());
+                headers.insert("retry-after", "120".parse().unwrap());
+                headers.insert("cf-ray", "redacted-ray-KUL".parse().unwrap());
+                let html = Bytes::from_static(
+                    b"<!DOCTYPE html><html><body>redacted diagnostic marker</body></html>",
+                );
+                headers.insert("content-length", html.len().to_string().parse().unwrap());
+                let upstream =
+                    crate::proxy::hyper_client::ProxyResponse::buffered(status, headers, html);
+                let response = if to_responses {
+                    super::handle_codex_chat_error_response(upstream, &ctx, status).await
+                } else {
+                    super::handle_codex_responses_error_response(upstream, &ctx, status).await
+                }
+                .expect("converted error response");
+                assert_eq!(response.status(), status);
+                assert_eq!(response.headers()["content-type"], "application/json");
+                assert_eq!(response.headers()["retry-after"], "120");
+                assert_eq!(response.headers()["cf-ray"], "redacted-ray-KUL");
+                assert!(!response.headers().contains_key("content-length"));
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let body: Value = serde_json::from_slice(&bytes).expect("JSON error");
+                let message = body["error"]["message"].as_str().unwrap();
+                assert!(message.contains("HTML error page"), "{message}");
+                assert!(
+                    message.contains(&format!("HTTP {status_code}")),
+                    "{message}"
+                );
+                assert!(!message.contains("<!DOCTYPE"), "{message}");
+                assert!(!message.contains("redacted diagnostic marker"), "{message}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn codex_upstream_http_502_keeps_upstream_identity() {
         let ctx = codex_error_test_context().await;
         let response = build_codex_proxy_error_response(
@@ -9832,6 +9889,37 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
         assert!(message.contains("upstream gateway failed"));
         assert_eq!(body["error"]["code"], 2013);
         assert_eq!(body["error"]["upstream_status"], 502);
+    }
+
+    #[test]
+    fn codex_proxy_html_error_is_upstream_guidance_not_a_local_proxy_failure() {
+        for status in [502, 520, 524] {
+            let body = codex_proxy_error_json(
+                "Gateway Provider",
+                "test-model",
+                "/responses",
+                &ProxyError::UpstreamError {
+                    status,
+                    body: Some(
+                        "<!DOCTYPE html><html><body>redacted diagnostic marker</body></html>"
+                            .to_string(),
+                    ),
+                },
+            );
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(message.contains("HTML error page"), "{message}");
+            assert!(message.contains(&format!("HTTP {status}")), "{message}");
+            assert!(
+                !message.contains("CC Switch local proxy failed"),
+                "{message}"
+            );
+            assert!(!message.contains("<!DOCTYPE"), "{message}");
+            assert!(!message.contains("redacted diagnostic marker"), "{message}");
+            assert_eq!(body["error"]["upstream_status"], status);
+            assert_eq!(body["error"]["provider"], "Gateway Provider");
+            assert_eq!(body["error"]["model"], "test-model");
+            assert_eq!(body["error"]["endpoint"], "/responses");
+        }
     }
 
     #[test]
@@ -10896,6 +10984,224 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
             &resolved,
             "/v1/responses"
         ));
+    }
+
+    fn external_provider_backend_profile(provider_id: &str) -> ExternalOpenAiApiProfile {
+        ExternalOpenAiApiProfile {
+            enabled: true,
+            backend_type: ExternalOpenAiApiBackendType::Provider,
+            app_type: Some("codex".to_string()),
+            provider_id: Some(provider_id.to_string()),
+            route_id: None,
+            default_model: Some("gpt-test".to_string()),
+            listen_address: None,
+            listen_port: None,
+            api_key_hash: None,
+            api_key_prefix: None,
+            api_keys: Vec::new(),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn external_provider_backend_resolves_codex_router_before_protocol_selection() {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        db.save_provider(
+            "codex",
+            &Provider::with_id(
+                "codex-router".to_string(),
+                "Codex Router".to_string(),
+                json!({
+                    "codexRouting": {
+                        "enabled": true,
+                        "defaultRouteId": "official",
+                        "routes": [
+                            {
+                                "id": "official",
+                                "targetProviderId": "codex-official",
+                                "match": { "prefixes": ["gpt-"] },
+                                "upstream": {
+                                    "apiFormat": "openai_responses",
+                                    "auth": { "source": "managed_codex_oauth" }
+                                }
+                            },
+                            {
+                                "id": "local-chat",
+                                "targetProviderId": "codex-local-chat",
+                                "match": { "models": ["qwen-test"] },
+                                "upstream": {
+                                    "apiFormat": "openai_chat",
+                                    "auth": { "source": "provider_config" }
+                                }
+                            }
+                        ]
+                    }
+                }),
+                None,
+            ),
+        )
+        .expect("save router");
+        let mut official_target = Provider::with_id(
+            "codex-official".to_string(),
+            "OpenAI Official".to_string(),
+            json!({ "auth": {} }),
+            None,
+        );
+        official_target.category = Some("official".to_string());
+        db.save_provider("codex", &official_target)
+            .expect("save official target");
+        db.save_provider(
+            "codex",
+            &Provider::with_id(
+                "codex-local-chat".to_string(),
+                "Local Chat".to_string(),
+                json!({ "base_url": "https://chat.example.invalid/v1" }),
+                None,
+            ),
+        )
+        .expect("save chat target");
+        let state = build_state(db);
+        let profile = external_provider_backend_profile("codex-router");
+
+        let official = super::resolve_external_openai_compatible_provider(
+            &state,
+            &json!({ "model": "gpt-test" }),
+            &profile,
+        )
+        .expect("resolve official")
+        .expect("official provider");
+        assert!(official.is_codex_oauth());
+        assert_eq!(official.settings_config["codexResolvedRouteId"], "official");
+
+        let local_chat = super::resolve_external_openai_compatible_provider(
+            &state,
+            &json!({ "model": "qwen-test" }),
+            &profile,
+        )
+        .expect("resolve local chat")
+        .expect("local chat provider");
+        assert!(!local_chat.is_codex_oauth());
+        assert_eq!(
+            local_chat.settings_config["codexResolvedRouteId"],
+            "local-chat"
+        );
+        assert!(should_convert_codex_responses_to_chat(
+            &local_chat,
+            "/v1/responses"
+        ));
+    }
+
+    #[test]
+    fn external_provider_backend_v2_resolves_current_target_and_preserves_empty_catalog() {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        db.save_provider(
+            "codex",
+            &Provider::with_id(
+                "codex-router".to_string(),
+                "Codex Router".to_string(),
+                json!({
+                    "modelCatalog": {"models": [{"model": "stale-router-model"}]},
+                    "codexRouting": {
+                        "schemaVersion": 2,
+                        "enabled": true,
+                        "defaultRouteId": "target-route",
+                        "routes": [{
+                            "id": "target-route",
+                            "enabled": true,
+                            "targetProviderId": "target",
+                            "modelSelection": {"mode": "all"},
+                            "authPolicy": {"source": "provider_config"}
+                        }]
+                    }
+                }),
+                None,
+            ),
+        )
+        .expect("save v2 router");
+        let mut target = Provider::with_id(
+            "target".to_string(),
+            "Target".to_string(),
+            json!({
+                "base_url": "https://chat.example.invalid/v1",
+                "modelCatalog": {"models": [{"model": "qwen-test"}]}
+            }),
+            None,
+        );
+        target.meta = Some(ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+        db.save_provider("codex", &target)
+            .expect("save chat target");
+        let state = build_state(db.clone());
+        let profile = external_provider_backend_profile("codex-router");
+        let body = json!({"model": "qwen-test"});
+        let resolved = super::resolve_external_openai_compatible_provider(&state, &body, &profile)
+            .expect("resolve v2 chat")
+            .expect("compiled target");
+        assert_eq!(
+            resolved.settings_config["codexResolvedRouteId"],
+            "target-route"
+        );
+        assert_eq!(
+            resolved.settings_config["base_url"],
+            "https://chat.example.invalid/v1"
+        );
+        assert!(should_convert_codex_responses_to_chat(
+            &resolved,
+            "/v1/responses"
+        ));
+
+        target.settings_config["base_url"] = json!("https://responses.example.invalid/v1");
+        target.meta.as_mut().expect("target metadata").api_format =
+            Some("openai_responses".to_string());
+        db.save_provider("codex", &target).expect("update target");
+        let refreshed = super::resolve_external_openai_compatible_provider(&state, &body, &profile)
+            .expect("resolve updated v2 target")
+            .expect("updated target");
+        assert_eq!(
+            refreshed.settings_config["base_url"],
+            "https://responses.example.invalid/v1"
+        );
+        assert!(!should_convert_codex_responses_to_chat(
+            &refreshed,
+            "/v1/responses"
+        ));
+
+        target.settings_config["modelCatalog"] = json!({"models": []});
+        target.settings_config["model_catalog"] = json!({"models": [{"model": "qwen-test"}]});
+        db.save_provider("codex", &target)
+            .expect("exclude all models");
+        let empty = super::resolve_external_openai_compatible_provider(&state, &body, &profile)
+            .expect("an authoritative empty target remains a valid empty catalog");
+        assert!(
+            empty.is_none(),
+            "an authoritative empty target must not fall back to the router shell or legacy catalog"
+        );
+    }
+
+    #[test]
+    fn external_provider_backend_preserves_non_router_and_disabled_router() {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let state = build_state(db.clone());
+        for routing in [json!(null), json!({"enabled": false, "routes": []})] {
+            let provider = Provider::with_id(
+                "plain-provider".to_string(),
+                "Plain Provider".to_string(),
+                json!({"base_url": "https://plain.example.invalid/v1", "codexRouting": routing}),
+                None,
+            );
+            db.save_provider("codex", &provider).expect("save provider");
+            let resolved = super::resolve_external_openai_compatible_provider(
+                &state,
+                &json!({"model": "model-test"}),
+                &external_provider_backend_profile("plain-provider"),
+            )
+            .expect("resolve plain provider")
+            .expect("plain provider");
+            assert_eq!(resolved.id, provider.id);
+            assert_eq!(resolved.settings_config, provider.settings_config);
+        }
     }
 
     fn build_state(db: Arc<Database>) -> ProxyState {

@@ -63,30 +63,26 @@ fn detect_platform_from_settings_parts(
         return Some(platform);
     }
 
-    // Persisted Codex providers commonly keep the endpoint only in their TOML
-    // `config` string. Inspect model_providers metadata as the same logical
-    // provider identity, without reading credentials or logging the config.
+    // Only the active TOML provider establishes identity. Inactive entries may
+    // retain unrelated official hosts and must never lend their capabilities
+    // to the selected gateway, or substitute for a missing selection.
     let config = settings.get("config").and_then(Value::as_str)?;
     let config = toml::from_str::<toml::Value>(config).ok()?;
-    let providers = config.get("model_providers")?.as_table()?;
-    for provider in providers.values() {
-        let config_name = provider
-            .get("name")
-            .or_else(|| provider.get("providerName"))
-            .or_else(|| provider.get("provider_name"))
-            .and_then(toml::Value::as_str)
-            .unwrap_or("");
-        let config_base_url = provider
-            .get("base_url")
-            .or_else(|| provider.get("baseURL"))
-            .or_else(|| provider.get("baseUrl"))
-            .and_then(toml::Value::as_str)
-            .unwrap_or("");
-        if let Some(platform) = detect_platform_from_identity(config_name, config_base_url) {
-            return Some(platform);
-        }
-    }
-    None
+    let selected = config.get("model_provider")?.as_str()?.trim();
+    let provider = config.get("model_providers")?.get(selected)?;
+    let config_name = provider
+        .get("name")
+        .or_else(|| provider.get("providerName"))
+        .or_else(|| provider.get("provider_name"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("");
+    let config_base_url = provider
+        .get("base_url")
+        .or_else(|| provider.get("baseURL"))
+        .or_else(|| provider.get("baseUrl"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("");
+    detect_platform_from_identity(config_name, config_base_url)
 }
 
 fn detect_platform_from_identity(name: &str, base_url: &str) -> Option<&'static str> {
@@ -95,8 +91,31 @@ fn detect_platform_from_identity(name: &str, base_url: &str) -> Option<&'static 
         Some("openrouter")
     } else if platform.contains("vllm") {
         Some("vllm")
+    } else if reqwest::Url::parse(base_url).ok().is_some_and(|url| {
+        matches!(url.scheme(), "https" | "http")
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("api.deepseek.com"))
+    }) {
+        // Only the official host establishes vendor identity, never a model or display name.
+        Some("deepseek")
     } else {
-        None
+        let host = reqwest::Url::parse(base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+        match host.as_deref() {
+            // Match only exact official vendor hosts; model names and arbitrary
+            // gateways must never inherit a maintained capability library.
+            Some("api.z.ai" | "open.bigmodel.cn") => Some("zhipu"),
+            Some(host)
+                if host == "dashscope.aliyuncs.com"
+                    || host == "dashscope-intl.aliyuncs.com"
+                    || host.ends_with(".maas.aliyuncs.com") =>
+            {
+                Some("dashscope")
+            }
+            _ => None,
+        }
     }
 }
 
@@ -363,6 +382,8 @@ pub fn provider_reasoning_capability_from_model_entry(
             &[
                 "default_effort",
                 "defaultEffort",
+                "default_level",
+                "defaultLevel",
                 "default_reasoning_level",
                 "defaultReasoningLevel",
                 "default_reasoning_effort",
@@ -474,6 +495,7 @@ fn metadata_scopes(
     const MAX_METADATA_SCOPE_DEPTH: u8 = 8;
     let envelope_keys = [
         "metadata",
+        "effort",
         "capability",
         "capabilities",
         "protocolCapability",
@@ -578,6 +600,8 @@ fn collect_effort_declaration(
     let keys = [
         "supported_efforts",
         "supportedEfforts",
+        "supported_levels",
+        "supportedLevels",
         "efforts",
         "supported_reasoning_levels",
         "supportedReasoningLevels",
@@ -647,6 +671,8 @@ fn has_null_effort_declaration(scopes: &[&serde_json::Map<String, Value>]) -> bo
     [
         "supported_efforts",
         "supportedEfforts",
+        "supported_levels",
+        "supportedLevels",
         "efforts",
         "supported_reasoning_levels",
         "supportedReasoningLevels",
@@ -864,6 +890,8 @@ fn build_reasoning_capability(
         &[
             "default_effort",
             "defaultEffort",
+            "default_level",
+            "defaultLevel",
             "default_reasoning_level",
             "defaultReasoningLevel",
             "default_reasoning_effort",
@@ -1187,6 +1215,82 @@ mod tests {
             ..provider("Saved custom provider", "https://gateway.example/v1")
         };
         assert_eq!(detect_platform(&persisted), Some("openrouter"));
+    }
+
+    #[test]
+    fn upstream_metadata_active_toml_provider_owns_platform() {
+        for selection in [
+            "model_provider = \"active\"\n",
+            "model_provider = \"missing\"\n",
+            "",
+        ] {
+            let config = format!("{selection}[model_providers.active]\nbase_url = \"https://gateway.example/v1\"\n[model_providers.inactive]\nbase_url = \"https://api.deepseek.com/v1\"\n");
+            let mut draft = provider("Gateway", "");
+            draft.settings_config = json!({"config": config});
+            assert_eq!(
+                detect_platform(&draft),
+                None,
+                "inactive provider metadata is never active vendor identity"
+            );
+            assert_eq!(detect_platform_from_settings(&draft.settings_config), None);
+        }
+    }
+
+    #[test]
+    fn upstream_metadata_matches_exact_zhipu_and_dashscope_hosts() {
+        for (name, base_url, expected) in [
+            ("Z.AI", "https://api.z.ai/api/paas/v4", Some("zhipu")),
+            (
+                "BigModel",
+                "https://open.bigmodel.cn/api/paas/v4",
+                Some("zhipu"),
+            ),
+            (
+                "DashScope",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                Some("dashscope"),
+            ),
+            (
+                "DashScope Intl",
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+                Some("dashscope"),
+            ),
+            (
+                "DashScope MaaS",
+                "https://model-123.maas.aliyuncs.com/v1",
+                Some("dashscope"),
+            ),
+            ("Lookalike", "https://api.z.ai.example/v1", None),
+            ("Gateway", "https://dashscope.aliyuncs.com.example/v1", None),
+        ] {
+            assert_eq!(
+                detect_platform(&provider(name, base_url)),
+                expected,
+                "unexpected platform for {base_url}"
+            );
+        }
+    }
+    #[test]
+    fn upstream_metadata_deepseek_platform_requires_exact_official_host() {
+        assert_eq!(
+            detect_platform(&provider(
+                "DeepSeek Official",
+                "https://api.deepseek.com/v1"
+            )),
+            Some("deepseek")
+        );
+        assert_eq!(
+            detect_platform(&provider("DeepSeek Gateway", "https://gateway.example/v1")),
+            None
+        );
+        assert_eq!(
+            detect_platform(&provider("Gateway", "https://api.deepseek.com.example/v1")),
+            None
+        );
+        let toml_provider = provider("Official", "");
+        let mut toml_provider = toml_provider;
+        toml_provider.settings_config = serde_json::json!({"config": "model_provider = \"deepseek\"\n[model_providers.deepseek]\nbase_url = \"https://api.deepseek.com/v1\"\n"});
+        assert_eq!(detect_platform(&toml_provider), Some("deepseek"));
     }
 
     #[test]

@@ -78,6 +78,66 @@ pub(crate) struct ProviderSetDatabaseTransaction {
     pub official_seed_current_after: Option<(String, String)>,
 }
 
+/// Compare only fields persisted by a Provider mutation. Custom endpoints have
+/// their own DAO rows and are not overwritten by an existing Provider update.
+fn provider_persisted_snapshot(
+    app_type: &str,
+    provider: &Provider,
+) -> Result<serde_json::Value, AppError> {
+    let mut snapshot = provider.clone();
+    snapshot.settings_config = normalize_settings_for_app(app_type, snapshot.settings_config);
+    let mut meta = snapshot.meta.unwrap_or_default();
+    meta.custom_endpoints.clear();
+    snapshot.meta = Some(meta);
+    serde_json::to_value(snapshot).map_err(|_| {
+        AppError::Database("Failed to serialize provider ownership snapshot".to_string())
+    })
+}
+
+fn assert_provider_unchanged_in_transaction(
+    tx: &Transaction<'_>,
+    app_type: &str,
+    expected: &Provider,
+) -> Result<(), AppError> {
+    let current = tx
+        .query_row(
+            "SELECT name, settings_config, website_url, category, created_at, sort_index, notes,
+                    icon, icon_color, meta, in_failover_queue
+             FROM providers WHERE id = ?1 AND app_type = ?2",
+            params![expected.id, app_type],
+            |row| {
+                let settings: String = row.get(1)?;
+                let meta: String = row.get(9)?;
+                Ok(Provider {
+                    id: expected.id.clone(),
+                    name: row.get(0)?,
+                    settings_config: parse_provider_settings_config_for_app(app_type, &settings),
+                    website_url: row.get(2)?,
+                    category: row.get(3)?,
+                    created_at: row.get(4)?,
+                    sort_index: row.get(5)?,
+                    notes: row.get(6)?,
+                    icon: row.get(7)?,
+                    icon_color: row.get(8)?,
+                    meta: Some(serde_json::from_str::<ProviderMeta>(&meta).unwrap_or_default()),
+                    in_failover_queue: row.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| AppError::Database(error.to_string()))?;
+    let current = current
+        .as_ref()
+        .map(|provider| provider_persisted_snapshot(app_type, provider))
+        .transpose()?;
+    let expected = provider_persisted_snapshot(app_type, expected)?;
+    if current.as_ref() != Some(&expected) {
+        // Never include snapshots: settings and metadata may contain credentials.
+        return Err(AppError::Message("provider_update_conflict".to_string()));
+    }
+    Ok(())
+}
+
 fn ensure_official_seed_in_transaction(
     tx: &Transaction<'_>,
     app_type: &str,
@@ -530,6 +590,17 @@ impl Database {
         &self,
         mutation: ProviderSetDatabaseTransaction,
     ) -> Result<(), AppError> {
+        self.apply_provider_set_database_transaction_if_unchanged(mutation, None)
+    }
+
+    /// The ownership comparison and every Provider Set write share one IMMEDIATE
+    /// transaction. A refresh must not overwrite an edit committed after discovery
+    /// began, nor recreate a provider deleted while discovery was in flight.
+    pub(crate) fn apply_provider_set_database_transaction_if_unchanged(
+        &self,
+        mutation: ProviderSetDatabaseTransaction,
+        expected_provider: Option<(&str, &Provider)>,
+    ) -> Result<(), AppError> {
         if mutation.current_provider_after.is_some()
             && mutation.official_seed_current_after.is_some()
         {
@@ -582,6 +653,9 @@ impl Database {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| AppError::Database(error.to_string()))?;
+        if let Some((app_type, expected)) = expected_provider {
+            assert_provider_unchanged_in_transaction(&tx, app_type, expected)?;
+        }
         if let Some(provider) = mutation.universal_provider.as_ref() {
             super::universal_providers::save_universal_provider_in_transaction(&tx, provider)?;
         }
@@ -1290,6 +1364,83 @@ mod tests {
             current_provider_after: None,
             official_seed_current_after: None,
         }
+    }
+
+    #[test]
+    fn background_refresh_rejects_stale_provider_snapshot_without_committing_any_mutations() {
+        let db = Database::memory().expect("memory db");
+        let original = provider("source", "original");
+        db.save_provider("codex", &original).expect("seed source");
+        let expected = db.get_provider_by_id("source", "codex").unwrap().unwrap();
+        let mut latest = expected.clone();
+        latest.name = "User-edited provider".to_string();
+        latest.settings_config = json!({
+            "state": "user-edited",
+            "modelCatalog": {"models": [{"model": "kept-model", "enabled": false}]},
+            "futureSettings": {"keep": true}
+        });
+        db.save_provider("codex", &latest).expect("save newer edit");
+        let candidate = provider("source", "stale-refresh");
+        let transaction = database_transaction(vec![
+            upsert(candidate),
+            upsert(provider("unrelated-leaf", "must-not-commit")),
+        ]);
+
+        let error = db
+            .apply_provider_set_database_transaction_if_unchanged(
+                transaction,
+                Some(("codex", &expected)),
+            )
+            .expect_err("stale background refresh must not overwrite a newer edit");
+
+        assert_eq!(error.to_string(), "provider_update_conflict");
+        let saved = db.get_provider_by_id("source", "codex").unwrap().unwrap();
+        assert_eq!(saved.name, latest.name);
+        assert_eq!(saved.settings_config, latest.settings_config);
+        assert!(db
+            .get_provider_by_id("unrelated-leaf", "codex")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn background_refresh_cannot_recreate_a_deleted_provider() {
+        let db = Database::memory().expect("memory db");
+        db.save_provider("codex", &provider("source", "original"))
+            .unwrap();
+        let expected = db.get_provider_by_id("source", "codex").unwrap().unwrap();
+        db.delete_provider("codex", "source").unwrap();
+        let error = db
+            .apply_provider_set_database_transaction_if_unchanged(
+                database_transaction(vec![upsert(provider("source", "stale-refresh"))]),
+                Some(("codex", &expected)),
+            )
+            .expect_err("deleted provider must not be revived by stale background work");
+        assert_eq!(error.to_string(), "provider_update_conflict");
+        assert!(db.get_provider_by_id("source", "codex").unwrap().is_none());
+    }
+
+    #[test]
+    fn background_refresh_accepts_the_current_canonical_provider_snapshot() {
+        let db = Database::memory().expect("memory db");
+        let mut original = provider("source", "original");
+        original.settings_config = json!({"model_catalog": {"models": []}});
+        db.save_provider("codex", &original).unwrap();
+        let expected = db.get_all_providers("codex").unwrap()["source"].clone();
+        assert!(expected.settings_config.get("modelCatalog").is_some());
+        let candidate = provider("source", "fresh-refresh");
+        db.apply_provider_set_database_transaction_if_unchanged(
+            database_transaction(vec![upsert(candidate)]),
+            Some(("codex", &expected)),
+        )
+        .expect("unchanged canonical snapshot may commit");
+        assert_eq!(
+            db.get_provider_by_id("source", "codex")
+                .unwrap()
+                .unwrap()
+                .settings_config,
+            json!({"state": "fresh-refresh"})
+        );
     }
 
     #[test]

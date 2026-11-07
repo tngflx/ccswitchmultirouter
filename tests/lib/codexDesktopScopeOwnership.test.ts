@@ -136,6 +136,7 @@ const createHarness = (
     "yieldReactDiscovery",
     "installationIsCurrent",
     "loadAppModule",
+    "discoverCodexWebpackModelPicker",
     "installReactRootObserver",
     "patchReactAppServerClients",
     "initialReactNodes",
@@ -158,6 +159,7 @@ const createHarness = (
     () => true,
     async (name: string) =>
       name === "app-shared-" ? (options.module ?? {}) : {},
+    async () => [],
     () => {},
     async () => 0,
     () => [],
@@ -182,6 +184,32 @@ const createHarness = (
 
 describe("Codex Desktop scope ownership and production heartbeat", () => {
   afterEach(() => vi.useRealTimers());
+
+  it("binds a function-valued node through its own queryClient slot without invoking the scope getter", async () => {
+    const client = new QueryClient();
+    const node = Object.assign(() => {}, { queryClient: client });
+    const getter = vi.fn(() => {
+      throw new Error("The legacy scope getter must not run");
+    });
+    const scope = {
+      chain: {},
+      node,
+      get() {},
+      set() {},
+      watch() {},
+    };
+    Object.defineProperty(scope, "queryClient", { get: getter });
+    const harness = createHarness({ dependencies: { scope } });
+    try {
+      await harness.api.patchCodexScopedAppServerClients({});
+      expect(harness.patchCache).toHaveBeenCalledTimes(1);
+      expect(getter).not.toHaveBeenCalled();
+      expect(harness.recordFailure).not.toHaveBeenCalled();
+    } finally {
+      harness.dispose();
+      client.clear();
+    }
+  });
 
   it.each([false, true])(
     "observes independent manager replacement when request clients initially share identity: %s",
@@ -332,10 +360,9 @@ describe("Codex Desktop scope ownership and production heartbeat", () => {
       fiber.child = {};
       fiber = fiber.child as Record<string, unknown>;
     }
-    const harness = createHarness(
-      root,
-      { state: { scopedAppServerScopes: new Set(scopes) } },
-    );
+    const harness = createHarness(root, {
+      state: { scopedAppServerScopes: new Set(scopes) },
+    });
     try {
       await harness.api.patchCodexScopedAppServerClients({});
       expect(harness.state.scopedAppServerScopes?.size).toBe(1);
@@ -440,7 +467,9 @@ describe("Codex Desktop scope ownership and production heartbeat", () => {
     });
     try {
       await harness.api.patchCodexScopedAppServerClients({});
-      expect(harness.state.scopedAppServerScopeCandidates).toEqual(new Set([scope]));
+      expect(harness.state.scopedAppServerScopeCandidates).toEqual(
+        new Set([scope]),
+      );
       expect(harness.state.scopedAppServerScopes).toEqual(new Set([scope]));
       expect(harness.patchCache).toHaveBeenCalledTimes(1);
     } finally {
@@ -466,7 +495,9 @@ describe("Codex Desktop scope ownership and production heartbeat", () => {
     });
     try {
       await harness.api.patchCodexScopedAppServerClients({});
-      expect(harness.state.scopedAppServerScopeCandidates).toEqual(new Set([unseen, visible]));
+      expect(harness.state.scopedAppServerScopeCandidates).toEqual(
+        new Set([unseen, visible]),
+      );
       expect(harness.patchCache).toHaveBeenCalledTimes(2);
       expect(harness.recordFailure).not.toHaveBeenCalled();
     } finally {

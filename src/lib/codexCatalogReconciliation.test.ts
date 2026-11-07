@@ -6,6 +6,7 @@ import {
 } from "./codexCatalogReconciliation";
 import type { CodexCatalogRowLike } from "./codexCatalogReconciliation";
 import type { CodexModelReasoningCapability } from "@/types";
+import type { FetchedModel } from "@/lib/api/model-fetch";
 
 const createRow = (seed: Record<string, unknown>): CodexCatalogRowLike =>
   ({
@@ -16,6 +17,144 @@ const createRow = (seed: Record<string, unknown>): CodexCatalogRowLike =>
   }) as CodexCatalogRowLike;
 
 describe("reconcileFetchedCodexCatalogRows", () => {
+  it("keeps input/output token budgets separate from total context during refresh", () => {
+    const fetched: FetchedModel[] = [
+      {
+        id: "provider-existing-input-budget-only",
+        ownedBy: null,
+        contextWindow: null,
+        maxInputTokens: 1_048_576,
+        maxOutputTokens: 8_192,
+      },
+      {
+        id: "provider-new-input-budget-only",
+        ownedBy: null,
+        contextWindow: null,
+        maxInputTokens: 200_000,
+        maxOutputTokens: 64_000,
+      },
+      {
+        id: "provider-explicit-total-context",
+        ownedBy: null,
+        contextWindow: 262_144,
+        maxInputTokens: 200_000,
+        maxOutputTokens: 64_000,
+      },
+    ];
+    const before = structuredClone(fetched);
+    const result = reconcileFetchedCodexCatalogRows(
+      [
+        createRow({
+          model: "Visible alias",
+          upstreamModel: fetched[0].id,
+          contextWindow: "128000",
+          enabled: false,
+        }),
+      ],
+      fetched,
+      {},
+      { appendNew: true, createRow, existingMetadataMode: "refresh" },
+    );
+
+    expect(result.rows).toHaveLength(3);
+    expect(result.rows[0]).toMatchObject({
+      model: "Visible alias",
+      upstreamModel: fetched[0].id,
+      contextWindow: "128000",
+      enabled: false,
+    });
+    expect(result.rows[1].contextWindow).toBeUndefined();
+    expect(result.rows[1].enabled).toBe(false);
+    expect(result.rows[2].contextWindow).toBe("262144");
+    // These are discovery limit references, not an inferred total-context sum
+    // or a request output budget. Keep the wire snapshot intact for its caller.
+    expect(fetched).toEqual(before);
+    for (const row of result.rows) {
+      expect(row).not.toHaveProperty("maxInputTokens");
+      expect(row).not.toHaveProperty("maxOutputTokens");
+    }
+  });
+
+  it("uses canonical reasoning instead of opaque effort/output metadata while preserving user authority", () => {
+    const reasoning: CodexModelReasoningCapability = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: ["low", "high"],
+      defaultEffort: "high",
+      disableAllowed: false,
+      upstream: {
+        format: "reasoning_object",
+        parameter: "reasoning.effort",
+        effortMap: { low: "low", high: "high" },
+      },
+      source: "provider",
+    };
+    const userReasoning: CodexModelReasoningCapability = {
+      ...reasoning,
+      supportedEfforts: ["low"],
+      defaultEffort: "low",
+      upstream: {
+        ...reasoning.upstream,
+        effortMap: { low: "low" },
+      },
+      source: "user",
+    };
+    const fetched: FetchedModel[] = [
+      {
+        id: "provider-canonical-metadata",
+        ownedBy: null,
+        outputModalities: ["text", "image"],
+        effort: {
+          supported_levels: ["private-provider-level", "ultra"],
+          default_level: "private-provider-level",
+        },
+        reasoning,
+      },
+      {
+        id: "provider-opaque-effort-only",
+        ownedBy: null,
+        outputModalities: ["text", "image"],
+        effort: {
+          supported_levels: ["high", "private-provider-level"],
+          default_level: "private-provider-level",
+        },
+      },
+    ];
+    const before = structuredClone(fetched);
+    const result = reconcileFetchedCodexCatalogRows(
+      [
+        createRow({
+          model: "Automatic alias",
+          upstreamModel: fetched[0].id,
+          enabled: false,
+        }),
+        createRow({
+          model: "User alias",
+          upstreamModel: fetched[0].id,
+          reasoning: userReasoning,
+        }),
+      ],
+      fetched,
+      {},
+      { appendNew: true, createRow, existingMetadataMode: "refresh" },
+    );
+
+    expect(result.rows).toHaveLength(3);
+    expect(result.rows[0].reasoning).toEqual(reasoning);
+    expect(result.rows[0].enabled).toBe(false);
+    expect(result.rows[1].reasoning).toEqual(userReasoning);
+    expect(result.rows[2].reasoning).toBeUndefined();
+    expect(result.rows[2].enabled).toBe(false);
+    for (const row of result.rows) {
+      expect(row.inputModalities).toBeUndefined();
+      expect(row.supportsImage).toBeUndefined();
+      expect(row).not.toHaveProperty("effort");
+      expect(row).not.toHaveProperty("outputModalities");
+    }
+    expect(fetched).toEqual(before);
+  });
+
   it("matches aliases and preserves an explicit disabled choice", () => {
     const result = reconcileFetchedCodexCatalogRows(
       [

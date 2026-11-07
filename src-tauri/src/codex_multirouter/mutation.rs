@@ -251,6 +251,7 @@ pub(crate) fn apply_codex_official_auth_provider_mutation_with_protocol_state(
         profiles,
         observations,
         true,
+        None,
         |artifact| {
             crate::codex_config::publish_codex_multirouter_projection_for_database(
                 db,
@@ -297,9 +298,31 @@ pub(crate) fn apply_codex_provider_set_mutation_with_observations_and_publisher<
 where
     F: FnMut(&CodexRoutingProjectionArtifact) -> Result<ProjectionReadBack, String>,
 {
+    apply_codex_provider_set_mutation_with_observations_and_publisher_if_unchanged(
+        db,
+        prepared,
+        observations,
+        None,
+        publish,
+    )
+}
+
+pub(crate) fn apply_codex_provider_set_mutation_with_observations_and_publisher_if_unchanged<F>(
+    db: &Database,
+    prepared: PreparedCodexProviderSetMutation,
+    observations: Vec<ProtocolCompatibilityRecord>,
+    expected_provider: Option<&Provider>,
+    publish: F,
+) -> Result<CodexProviderMutationOutcome, AppError>
+where
+    F: FnMut(&CodexRoutingProjectionArtifact) -> Result<ProjectionReadBack, String>,
+{
     let mut commit = prepare_codex_provider_set_commit(db, prepared)?;
     commit.transaction.observations = observations;
-    db.apply_provider_set_database_transaction(commit.transaction)?;
+    db.apply_provider_set_database_transaction_if_unchanged(
+        commit.transaction,
+        expected_provider.map(|provider| ("codex", provider)),
+    )?;
     finalize_codex_provider_set_projections_with_publisher(
         db,
         commit.projection_router_ids,
@@ -717,7 +740,33 @@ where
         profiles,
         observations,
         false,
+        None,
         publish,
+    )
+}
+
+pub(crate) fn apply_codex_provider_mutation_with_protocol_state_if_unchanged(
+    db: &Database,
+    provider: Provider,
+    profiles: &[ProtocolCompatibilityRecord],
+    observations: &[ProtocolCompatibilityRecord],
+    cleanup_legacy_official_auth: bool,
+    expected_provider: Option<&Provider>,
+) -> Result<CodexProviderMutationOutcome, AppError> {
+    apply_codex_provider_mutation_with_profiles_and_publisher_and_auth_cleanup(
+        db,
+        provider,
+        profiles,
+        observations,
+        cleanup_legacy_official_auth,
+        expected_provider,
+        |artifact| {
+            crate::codex_config::publish_codex_multirouter_projection_for_database(
+                db,
+                &artifact.projection_settings,
+            )
+            .map_err(|error| error.to_string())
+        },
     )
 }
 
@@ -727,6 +776,7 @@ fn apply_codex_provider_mutation_with_profiles_and_publisher_and_auth_cleanup<F>
     profiles: &[ProtocolCompatibilityRecord],
     observations: &[ProtocolCompatibilityRecord],
     cleanup_legacy_official_auth: bool,
+    expected_provider: Option<&Provider>,
     mut publish: F,
 ) -> Result<CodexProviderMutationOutcome, AppError>
 where
@@ -753,14 +803,42 @@ where
     }
     let mut mutations = Vec::with_capacity(1 + prepared.router_updates.len());
     prepared.append_provider_mutations(&mut mutations);
-    db.apply_provider_set_with_protocol_state_and_setting_cleanup(
-        &mutations,
-        Some(prepared.provider.id.as_str()),
-        &prepared.profiles,
-        observations,
-        &prepared.related_provider_ids,
-        &[],
-    )?;
+    if let Some(expected) = expected_provider {
+        let mut profile_owner_ids = prepared.related_provider_ids.clone();
+        profile_owner_ids.insert(prepared.provider.id.clone());
+        db.apply_provider_set_database_transaction_if_unchanged(
+            ProviderSetDatabaseTransaction {
+                mutations: mutations
+                    .into_iter()
+                    .map(
+                        |(app_type, provider_id, provider)| ProviderSetDatabaseMutation {
+                            app_type: app_type.to_string(),
+                            provider_id: provider_id.to_string(),
+                            provider: provider.cloned(),
+                        },
+                    )
+                    .collect(),
+                profile_owner_ids,
+                records: prepared.profiles.clone(),
+                observations: observations.to_vec(),
+                replace_profile_provider_ids: HashSet::new(),
+                setting_keys_to_delete: Vec::new(),
+                universal_provider: None,
+                current_provider_after: None,
+                official_seed_current_after: None,
+            },
+            Some(("codex", expected)),
+        )?;
+    } else {
+        db.apply_provider_set_with_protocol_state_and_setting_cleanup(
+            &mutations,
+            Some(prepared.provider.id.as_str()),
+            &prepared.profiles,
+            observations,
+            &prepared.related_provider_ids,
+            &[],
+        )?;
+    }
 
     finalize_codex_provider_mutation(db, &prepared, |artifact| publish(artifact))
 }

@@ -997,6 +997,28 @@ pub async fn update_provider(
         .map_err(|e| e.to_string())
 }
 
+/// Background refreshes use a distinct required-snapshot IPC contract so an
+/// older native binary cannot silently ignore the compare-and-set precondition.
+#[tauri::command]
+pub async fn update_provider_if_unchanged(
+    state: State<'_, AppState>,
+    app: String,
+    provider: Provider,
+    #[allow(non_snake_case)] originalId: Option<String>,
+    #[allow(non_snake_case)] expectedProvider: Provider,
+) -> Result<bool, String> {
+    let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    update_provider_internal_if_unchanged(
+        state.inner(),
+        app_type,
+        originalId.as_deref(),
+        provider,
+        Some(&expectedProvider),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 async fn add_provider_internal(
     state: &AppState,
     app_type: AppType,
@@ -1015,7 +1037,17 @@ async fn update_provider_internal(
     original_id: Option<&str>,
     provider: Provider,
 ) -> Result<bool, AppError> {
-    update_provider_internal_with_probe(state, app_type, original_id, provider, |provider| {
+    update_provider_internal_if_unchanged(state, app_type, original_id, provider, None).await
+}
+
+async fn update_provider_internal_if_unchanged(
+    state: &AppState,
+    app_type: AppType,
+    original_id: Option<&str>,
+    provider: Provider,
+    expected_provider: Option<&Provider>,
+) -> Result<bool, AppError> {
+    let probe = |provider: Provider| {
         std::future::ready((|| {
             // A route edit does not authorize requests to its upstream sources.
             // Source mutations keep their normal Provider Set validation below.
@@ -1033,8 +1065,20 @@ async fn update_provider_internal(
                 .ok_or_else(|| "codex_provider_set_probe_required".to_string())?;
             Ok((restored.provider, restored.records, restored.observations))
         })())
-    })
-    .await
+    };
+    if expected_provider.is_some() {
+        update_provider_internal_with_probe_and_expected_provider(
+            state,
+            app_type,
+            original_id,
+            provider,
+            expected_provider,
+            probe,
+        )
+        .await
+    } else {
+        update_provider_internal_with_probe(state, app_type, original_id, provider, probe).await
+    }
 }
 
 async fn add_provider_internal_with_probe<F, Fut>(
@@ -1094,6 +1138,46 @@ where
         >,
     >,
 {
+    update_provider_internal_with_probe_and_expected_provider(
+        state,
+        app_type,
+        original_id,
+        provider,
+        None,
+        probe,
+    )
+    .await
+}
+
+async fn update_provider_internal_with_probe_and_expected_provider<F, Fut>(
+    state: &AppState,
+    app_type: AppType,
+    original_id: Option<&str>,
+    provider: Provider,
+    expected_provider: Option<&Provider>,
+    probe: F,
+) -> Result<bool, AppError>
+where
+    F: FnOnce(Provider) -> Fut,
+    Fut: Future<
+        Output = Result<
+            (
+                Provider,
+                Vec<crate::protocol_compatibility::ProtocolCompatibilityRecord>,
+                Vec<crate::protocol_compatibility::ProtocolCompatibilityRecord>,
+            ),
+            String,
+        >,
+    >,
+{
+    if let Some(expected) = expected_provider {
+        ProviderService::validate_background_provider_refresh(
+            &app_type,
+            original_id,
+            &provider,
+            expected,
+        )?;
+    }
     if app_type != AppType::Codex {
         return ProviderService::update(state, app_type, original_id, provider);
     }
@@ -1106,13 +1190,14 @@ where
     }
     let (provider, records, observations) =
         resolve_automatic_probe_outcome(provider, probe).await?;
-    ProviderService::update_with_protocol_state(
+    ProviderService::update_with_protocol_state_if_unchanged(
         state,
         app_type,
         original_id,
         provider,
         &records,
         &observations,
+        expected_provider,
     )
 }
 
@@ -3365,6 +3450,162 @@ mod codex_protocol_preflight_save_tests {
                 .list_protocol_probe_observations(&provider.id)
                 .unwrap()
                 .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn background_refresh_command_rejects_stale_source_without_changing_protocol_state() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let original = api_declared_codex_provider("openai_responses");
+        db.save_provider("codex", &original).unwrap();
+        let expected = db.get_all_providers("codex").unwrap()[&original.id].clone();
+        let mut latest = expected.clone();
+        latest.notes = Some("newer user edit".to_string());
+        latest.settings_config["modelCatalog"]["models"][0]["enabled"] = json!(false);
+        latest.settings_config["futureSetting"] = json!({"keep": true});
+        db.save_provider("codex", &latest).unwrap();
+        let mut stale = expected.clone();
+        stale.notes = Some("background refresh".to_string());
+
+        let error = super::update_provider_internal_if_unchanged(
+            &state,
+            AppType::Codex,
+            None,
+            stale,
+            Some(&expected),
+        )
+        .await
+        .expect_err("stale Provider Set refresh must be conditional at commit");
+        assert_eq!(error.to_string(), "provider_update_conflict");
+        let saved = db
+            .get_provider_by_id(&original.id, "codex")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.settings_config, latest.settings_config);
+        assert_eq!(saved.notes, latest.notes);
+        assert!(db
+            .list_protocol_compatibility_profiles(&original.id)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .list_protocol_probe_observations(&original.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn background_refresh_command_accepts_an_unchanged_source_snapshot() {
+        let db = Arc::new(Database::memory().unwrap());
+        let state = AppState::new(db.clone());
+        let original = api_declared_codex_provider("openai_responses");
+        db.save_provider("codex", &original).unwrap();
+        let expected = db.get_all_providers("codex").unwrap()[&original.id].clone();
+        let mut refreshed = expected.clone();
+        refreshed.notes = Some("background refresh".to_string());
+        super::update_provider_internal_if_unchanged(
+            &state,
+            AppType::Codex,
+            None,
+            refreshed,
+            Some(&expected),
+        )
+        .await
+        .expect("unchanged snapshot keeps the existing Provider Set validation path");
+        let saved = db
+            .get_provider_by_id(&original.id, "codex")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.notes.as_deref(), Some("background refresh"));
+        assert_eq!(
+            saved.settings_config["modelCatalog"],
+            expected.settings_config["modelCatalog"]
+        );
+    }
+
+    #[tokio::test]
+    async fn background_refresh_command_rejects_router_snapshots_before_any_mutation() {
+        for expected_is_router in [false, true] {
+            let db = Arc::new(Database::memory().unwrap());
+            let state = AppState::new(db.clone());
+            let mut original = api_declared_codex_provider("openai_responses");
+            original.id = "source-only-guard".to_string();
+            if expected_is_router {
+                original.settings_config = json!({
+                    "auth": {},
+                    "codexRouting": {
+                        "schemaVersion": 2,
+                        "enabled": true,
+                        "routes": [{"id": "route", "targetProviderId": "source"}]
+                    }
+                });
+            }
+            db.save_provider("codex", &original).unwrap();
+            let expected = db.get_all_providers("codex").unwrap()[&original.id].clone();
+            let mut candidate = expected.clone();
+            candidate.notes = Some("must not be persisted".to_string());
+            if !expected_is_router {
+                candidate.settings_config["codexRouting"] = json!({
+                    "schemaVersion": 2,
+                    "enabled": true,
+                    "routes": [{"id": "route", "targetProviderId": "source"}]
+                });
+            } else {
+                candidate.settings_config =
+                    api_declared_codex_provider("openai_responses").settings_config;
+            }
+            assert!(db.get_all_profiles().unwrap().is_empty());
+
+            let error = super::update_provider_internal_if_unchanged(
+                &state,
+                AppType::Codex,
+                None,
+                candidate,
+                Some(&expected),
+            )
+            .await
+            .expect_err("conditional background refresh is source-only");
+            assert_eq!(error.to_string(), "provider_update_conflict");
+            assert_eq!(
+                serde_json::to_value(db.get_all_providers("codex").unwrap()[&original.id].clone())
+                    .unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert!(db.get_all_profiles().unwrap().is_empty());
+            assert!(
+                crate::codex_multirouter::projection::read_projection_status(&db, &original.id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(db
+                .list_protocol_compatibility_profiles(&original.id)
+                .unwrap()
+                .is_empty());
+            assert!(db
+                .list_protocol_probe_observations(&original.id)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn background_refresh_accepts_inactive_or_null_routing_metadata_as_source() {
+        for routing in [
+            serde_json::Value::Null,
+            json!({"schemaVersion": 2, "enabled": false, "routes": []}),
+        ] {
+            let mut provider = api_declared_codex_provider("openai_responses");
+            provider.settings_config["codexRouting"] = routing;
+            let expected = provider.clone();
+            let mut candidate = expected.clone();
+            candidate.notes = Some("source refresh".to_string());
+            super::ProviderService::validate_background_provider_refresh(
+                &AppType::Codex,
+                None,
+                &candidate,
+                &expected,
+            )
+            .expect("inactive routing metadata is not a user routing plan");
         }
     }
 

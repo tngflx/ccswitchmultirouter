@@ -4,12 +4,14 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AboutSection } from "@/components/settings/AboutSection";
 import { emitTauriEvent } from "../msw/tauriMocks";
 
 const getToolVersionsMock = vi.hoisted(() => vi.fn());
+const getToolInstallCommandsMock = vi.hoisted(() => vi.fn());
 const checkUpdateMock = vi.hoisted(() => vi.fn());
 const toastErrorMock = vi.hoisted(() => vi.fn());
 const getToolAutoUpdateSettingsMock = vi.hoisted(() => vi.fn());
@@ -35,6 +37,7 @@ vi.mock("@/contexts/UpdateContext", () => ({
 vi.mock("@/lib/api", () => ({
   settingsApi: {
     getToolVersions: getToolVersionsMock,
+    getToolInstallCommands: getToolInstallCommandsMock,
     openExternal: vi.fn(),
     checkUpdates: vi.fn(),
     installUpdateAndRestart: vi.fn(),
@@ -68,6 +71,9 @@ describe("AboutSection", () => {
     checkUpdateMock.mockReset().mockResolvedValue(false);
     toastErrorMock.mockReset();
     getToolVersionsMock.mockReset();
+    getToolInstallCommandsMock
+      .mockReset()
+      .mockResolvedValue("# Claude Code\nbackend-owned install command");
     getToolAutoUpdateSettingsMock.mockReset().mockResolvedValue({
       codex: true,
       gemini: false,
@@ -272,7 +278,129 @@ describe("AboutSection", () => {
     expect(getToolVersionsMock).toHaveBeenCalledTimes(1);
   });
 
-  it("shows the Windows Hermes installer through PowerShell 7", async () => {
+  it("displays and copies only the backend-owned native install commands", async () => {
+    const commands =
+      "# Grok Build\nbackend-native-installer || backend-npm-fallback";
+    getToolInstallCommandsMock.mockResolvedValueOnce(commands);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    render(<AboutSection isPortable={false} />);
+    expect(getToolInstallCommandsMock).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "settings.manualInstallCommands" }),
+    );
+    expect(
+      await screen.findByText(commands, { normalizer: (value) => value }),
+    ).toBeVisible();
+    expect(getToolInstallCommandsMock).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "common.copy" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(commands));
+  });
+
+  it("does not offer stale snippets while native install commands are loading", async () => {
+    let resolveCommands!: (commands: string) => void;
+    getToolInstallCommandsMock.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        resolveCommands = resolve;
+      }),
+    );
+    render(<AboutSection isPortable={false} />);
+    fireEvent.click(
+      screen.getByRole("button", { name: "settings.manualInstallCommands" }),
+    );
+    expect(screen.getByRole("button", { name: "common.copy" })).toBeDisabled();
+    expect(screen.queryByText(/# Claude Code/)).not.toBeInTheDocument();
+
+    await act(async () => resolveCommands("# Codex\nbackend-owned command"));
+    expect(
+      screen.getByRole("button", { name: "common.copy" }),
+    ).not.toBeDisabled();
+  });
+
+  it("fails closed on a command lookup error and retries without a static fallback", async () => {
+    getToolInstallCommandsMock.mockRejectedValueOnce(
+      new Error("IPC unavailable"),
+    );
+    render(<AboutSection isPortable={false} />);
+    fireEvent.click(
+      screen.getByRole("button", { name: "settings.manualInstallCommands" }),
+    );
+    expect(
+      await screen.findByText("settings.installCommandsLoadFailed"),
+    ).toBeVisible();
+    expect(screen.queryByText(/# Claude Code/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "common.copy" })).toBeDisabled();
+    getToolInstallCommandsMock.mockResolvedValueOnce(
+      "# Codex\nrecovered backend command",
+    );
+    fireEvent.click(
+      within(screen.getByRole("alert")).getByRole("button", {
+        name: "common.refresh",
+      }),
+    );
+    expect(
+      await screen.findByText("# Codex\nrecovered backend command", {
+        normalizer: (value) => value,
+      }),
+    ).toBeVisible();
+    expect(getToolInstallCommandsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["", "   ", null, {}])(
+    "rejects an empty or malformed command projection (%j)",
+    async (value) => {
+      getToolInstallCommandsMock.mockResolvedValueOnce(value);
+      render(<AboutSection isPortable={false} />);
+      fireEvent.click(
+        screen.getByRole("button", { name: "settings.manualInstallCommands" }),
+      );
+      expect(
+        await screen.findByText("settings.installCommandsLoadFailed"),
+      ).toBeVisible();
+      expect(
+        screen.getByRole("button", { name: "common.copy" }),
+      ).toBeDisabled();
+    },
+  );
+
+  it("ignores a late command response after the section was closed and reopened", async () => {
+    let resolveOldCommands!: (commands: string) => void;
+    getToolInstallCommandsMock.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        resolveOldCommands = resolve;
+      }),
+    );
+    getToolInstallCommandsMock.mockResolvedValueOnce(
+      "# Codex\ncurrent backend command",
+    );
+    render(<AboutSection isPortable={false} />);
+    const toggle = screen.getByRole("button", {
+      name: "settings.manualInstallCommands",
+    });
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    expect(
+      await screen.findByText("# Codex\ncurrent backend command", {
+        normalizer: (value) => value,
+      }),
+    ).toBeVisible();
+    await act(async () => resolveOldCommands("# Codex\nstale response"));
+    expect(screen.queryByText(/stale response/)).not.toBeInTheDocument();
+    expect(getToolInstallCommandsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows the backend's Windows Hermes installer through PowerShell 7", async () => {
+    const script =
+      "irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex";
+    const encodedScript = Buffer.from(script, "utf16le").toString("base64");
+    getToolInstallCommandsMock.mockResolvedValueOnce(
+      `# Claude Code\n# Hermes\ncmd.exe /d /s /c "call pwsh.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encodedScript}"`,
+    );
     render(<AboutSection isPortable={false} />);
     await waitFor(() =>
       expect(screen.getAllByRole("switch")[0]).not.toBeDisabled(),
@@ -280,7 +408,8 @@ describe("AboutSection", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "settings.manualInstallCommands" }),
     );
-    const commands = screen.getByText(/# Claude Code/).textContent ?? "";
+    const commands =
+      (await screen.findByText(/# Claude Code/)).textContent ?? "";
     expect(commands).toContain(
       "pwsh.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ",
     );

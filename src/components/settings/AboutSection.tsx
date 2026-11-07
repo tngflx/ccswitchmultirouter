@@ -40,7 +40,6 @@ import appIcon from "@/assets/icons/app-icon.png";
 import { APP_ICON_MAP } from "@/config/appConfig";
 import type { AppId } from "@/lib/api/types";
 import { extractErrorMessage } from "@/utils/errorUtils";
-import { isWindows } from "@/lib/platform";
 import { isUpdateAvailable } from "@/lib/version";
 import { ToolUpgradeConfirmDialog } from "./ToolUpgradeConfirmDialog";
 import { ToolInstallRow } from "./ToolInstallRow";
@@ -77,6 +76,10 @@ const TOOL_NAMES = [
 ] as const;
 type ToolName = (typeof TOOL_NAMES)[number];
 type ToolLifecycleAction = "install" | "update";
+type InstallCommandsState =
+  | { status: "loading" }
+  | { status: "error" }
+  | { status: "ready"; commands: string };
 
 type WslShellPreference = {
   wslShell?: string | null;
@@ -111,63 +114,6 @@ const ENV_BADGE_CONFIG: Record<
       "bg-green-500/10 text-green-600 dark:text-green-400 border-green-500/20",
   },
 };
-
-const posixScriptInstallCommand = (url: string) =>
-  `bash -c 'tmp=$(mktemp) && curl -fsSL ${url} -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'`;
-
-const HERMES_WINDOWS_INSTALL_SCRIPT =
-  "irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex";
-
-const powershellEncodedCommand = (script: string): string => {
-  let binary = "";
-  for (let i = 0; i < script.length; i += 1) {
-    const code = script.charCodeAt(i);
-    binary += String.fromCharCode(code & 0xff, code >> 8);
-  }
-  return btoa(binary);
-};
-
-const HERMES_WINDOWS_INSTALL_COMMAND = `pwsh.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${powershellEncodedCommand(
-  HERMES_WINDOWS_INSTALL_SCRIPT,
-)}`;
-
-const POSIX_ONE_CLICK_INSTALL_COMMANDS = `# Claude Code
-${posixScriptInstallCommand("https://claude.ai/install.sh")} || npm i -g @anthropic-ai/claude-code@latest
-# Codex
-npm i -g @openai/codex@latest
-# Gemini CLI
-npm i -g @google/gemini-cli@latest
-# Grok Build
-npm i -g @xai-official/grok@latest
-# OpenCode
-${posixScriptInstallCommand("https://opencode.ai/install")} || npm i -g opencode-ai@latest
-# OpenClaw
-npm i -g openclaw@latest
-# Hermes
-${posixScriptInstallCommand("https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh")}
-# Pi
-npm i -g @earendil-works/pi-coding-agent@latest`;
-
-const WINDOWS_ONE_CLICK_INSTALL_COMMANDS = `# Claude Code
-npm i -g @anthropic-ai/claude-code@latest
-# Codex
-npm i -g @openai/codex@latest
-# Gemini CLI
-npm i -g @google/gemini-cli@latest
-# Grok Build
-npm i -g @xai-official/grok@latest
-# OpenCode
-npm i -g opencode-ai@latest
-# OpenClaw
-npm i -g openclaw@latest
-# Hermes
-${HERMES_WINDOWS_INSTALL_COMMAND}
-# Pi
-npm i -g @earendil-works/pi-coding-agent@latest`;
-
-const ONE_CLICK_INSTALL_COMMANDS = isWindows()
-  ? WINDOWS_ONE_CLICK_INSTALL_COMMANDS
-  : POSIX_ONE_CLICK_INSTALL_COMMANDS;
 
 const TOOL_DISPLAY_NAMES: Record<ToolName, string> = {
   claude: "Claude Code",
@@ -249,6 +195,31 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
     null,
   );
   const [showInstallCommands, setShowInstallCommands] = useState(false);
+  const [installCommands, setInstallCommands] = useState<InstallCommandsState>({
+    status: "loading",
+  });
+  const [installCommandsAttempt, setInstallCommandsAttempt] = useState(0);
+  useEffect(() => {
+    if (!showInstallCommands) return;
+    let active = true;
+    setInstallCommands({ status: "loading" });
+    settingsApi
+      .getToolInstallCommands()
+      .then((commands) => {
+        if (!active) return;
+        setInstallCommands(
+          typeof commands === "string" && commands.trim()
+            ? { status: "ready", commands }
+            : { status: "error" },
+        );
+      })
+      .catch(() => {
+        if (active) setInstallCommands({ status: "error" });
+      });
+    return () => {
+      active = false;
+    };
+  }, [showInstallCommands, installCommandsAttempt]);
   const [toolAutoUpdate, setToolAutoUpdate] = useState<Record<
     string,
     boolean
@@ -598,14 +569,15 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
   }, [checkUpdate, hasUpdate, isPortable, resetDismiss, t]);
 
   const handleCopyInstallCommands = useCallback(async () => {
+    if (installCommands.status !== "ready") return;
     try {
-      await navigator.clipboard.writeText(ONE_CLICK_INSTALL_COMMANDS);
+      await navigator.clipboard.writeText(installCommands.commands);
       toast.success(t("settings.installCommandsCopied"), { closeButton: true });
     } catch (error) {
       console.error("[AboutSection] Failed to copy install commands", error);
       toast.error(t("settings.installCommandsCopyFailed"));
     }
-  }, [t]);
+  }, [installCommands, t]);
 
   // 升级后自动补诊单个工具：静默后台执行。有冲突写入结果；无冲突则清掉该工具可能残留
   // 的过期冲突展示（外部卸载/修复后冲突可能已消失，不清会一直显示旧列表）。不弹 toast、
@@ -1357,7 +1329,10 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
       >
         <button
           type="button"
-          onClick={() => setShowInstallCommands((v) => !v)}
+          onClick={() => {
+            setInstallCommands({ status: "loading" });
+            setShowInstallCommands((v) => !v);
+          }}
           aria-expanded={showInstallCommands}
           className="flex w-full items-center gap-1.5 px-1 text-sm font-medium text-foreground transition-colors hover:text-primary"
         >
@@ -1378,15 +1353,39 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
                 size="sm"
                 variant="outline"
                 onClick={handleCopyInstallCommands}
+                disabled={installCommands.status !== "ready"}
                 className="h-7 gap-1.5 text-xs"
               >
                 <Copy className="h-3.5 w-3.5" />
                 {t("common.copy")}
               </Button>
             </div>
-            <pre className="text-xs font-mono bg-background/80 px-3 py-2.5 rounded-lg border border-border/60 overflow-x-auto">
-              {ONE_CLICK_INSTALL_COMMANDS}
-            </pre>
+            {installCommands.status === "ready" ? (
+              <pre className="text-xs font-mono bg-background/80 px-3 py-2.5 rounded-lg border border-border/60 overflow-x-auto">
+                {installCommands.commands}
+              </pre>
+            ) : installCommands.status === "loading" ? (
+              <p role="status" className="text-xs text-muted-foreground">
+                {t("common.loading")}
+              </p>
+            ) : (
+              <div
+                role="alert"
+                className="flex items-center justify-between gap-2 text-xs"
+              >
+                <p>{t("settings.installCommandsLoadFailed")}</p>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    setInstallCommands({ status: "loading" });
+                    setInstallCommandsAttempt((attempt) => attempt + 1);
+                  }}
+                >
+                  {t("common.refresh")}
+                </Button>
+              </div>
+            )}
           </div>
         )}
       </motion.div>

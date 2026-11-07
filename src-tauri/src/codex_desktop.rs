@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output};
 use std::process::{Command, Stdio};
@@ -217,15 +218,36 @@ pub(crate) struct CodexModelCatalogDiagnostics {
     ultra_effort_model_count: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-enum CodexModelPickerReadiness {
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexModelPickerReadiness {
     Ready,
     #[default]
     Pending,
     Error,
     Mismatch,
     Unverified,
+    NotRequired,
+}
+
+/// Fresh renderer observation. Installation currentness remains independent of
+/// picker readiness so a pending query never cancels asynchronous discovery.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexRendererCompatibilityObservation {
+    pub(crate) current: bool,
+    pub(crate) picker_status: CodexModelPickerReadiness,
+    pub(crate) app_server_ready: bool,
+}
+
+impl Default for CodexRendererCompatibilityObservation {
+    fn default() -> Self {
+        Self {
+            current: false,
+            picker_status: CodexModelPickerReadiness::Unverified,
+            app_server_ready: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -861,7 +883,18 @@ async fn try_inject_on_candidate_ports_with_state(
             } else if !compatibility_evidence.app_server_patch_installed
                 && !catalog.model_names.is_empty()
             {
-                "Codex App compatibility layer ran, but no local app-server request client was discovered; the renderer may require a fresh Codex reload before model visibility updates.".to_string()
+                "Codex App compatibility layer was installed; local app-server discovery and model picker verification are still pending. The guardian will continue checking without restarting Codex.".to_string()
+            } else if !compatibility_evidence
+                .picker_diagnostics
+                .as_ref()
+                .is_some_and(|diagnostics| {
+                    matches!(
+                        diagnostics.status,
+                        CodexModelPickerReadiness::Ready | CodexModelPickerReadiness::NotRequired
+                    )
+                })
+            {
+                "Codex App compatibility layer was installed, but live model picker readiness has not been verified. Installation alone does not prove that Max and Ultra are visible; the guardian will continue checking.".to_string()
             } else if compatibility_evidence.all_provider_history_patched {
                 "Codex App compatibility layer was injected; all-provider history queries were restored and the native history catalog was refreshed without rewriting history data.".to_string()
             } else if compatibility_evidence.history_sync_requested {
@@ -913,6 +946,24 @@ pub(crate) async fn list_cdp_targets(debug_port: u16) -> Result<Vec<CdpTarget>, 
 ///
 /// CDP ports can belong to another application, including the default port.
 /// Wait for a positive Codex marker before injecting into any renderer.
+fn cdp_websocket_url_is_local(websocket_url: &str, debug_port: u16) -> bool {
+    let Ok(url) = url::Url::parse(websocket_url) else {
+        return false;
+    };
+    if url.scheme() != "ws"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.port() != Some(debug_port)
+    {
+        return false;
+    }
+    url.host_str()
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback())
+}
+
 pub(crate) fn pick_codex_page_targets(
     targets: &[CdpTarget],
     debug_port: u16,
@@ -928,11 +979,12 @@ pub(crate) fn pick_codex_page_targets(
     });
     let verified_listener =
         needs_listener_identity && codex_debug_port_has_verified_desktop_listener(debug_port);
-    pick_codex_page_targets_with_listener_identity(targets, verified_listener)
+    pick_codex_page_targets_with_listener_identity(targets, debug_port, verified_listener)
 }
 
 fn pick_codex_page_targets_with_listener_identity(
     targets: &[CdpTarget],
+    debug_port: u16,
     verified_listener: bool,
 ) -> Result<Vec<CdpTarget>, String> {
     let pages = targets.iter().filter(|target| {
@@ -940,7 +992,7 @@ fn pick_codex_page_targets_with_listener_identity(
             && target
                 .web_socket_debugger_url
                 .as_deref()
-                .is_some_and(|url| !url.is_empty())
+                .is_some_and(|url| cdp_websocket_url_is_local(url, debug_port))
     });
     let mut codex_pages = Vec::new();
     for target in pages {
@@ -965,8 +1017,8 @@ fn target_matches_codex_desktop(target: &CdpTarget, verified_listener: bool) -> 
     // The current packaged Desktop shell serves its renderer from the
     // scheme-relative `app://-/index.html` URL. Its document title is the
     // active task title, so it does not contain a stable "Codex" marker.
-    let haystack = format!("{} {}", target.title, target.url).to_ascii_lowercase();
-    haystack.contains("codex")
+    let title = target.title.to_ascii_lowercase();
+    title.contains("codex")
         || (verified_listener
             && url.scheme() == "app"
             && url.host_str() == Some("-")
@@ -1122,32 +1174,61 @@ fn codex_renderer_compatibility_probe_script(catalog: &CodexModelCatalogProjecti
     let catalog_payload_selection_core = catalog_payload_selection_core_script();
     format!(
         r#"(() => {{
+          const unavailable = {{current: false, pickerStatus: "unverified", appServerReady: false}};
           const state = window[{MODEL_PICKER_PATCH_KEY:?}];
           if (!state || state.rendererRuntimeFingerprint !== {runtime_fingerprint:?}
-              || !state.interval || !state.messagePatchInstalled) return false;
+              || !state.interval || !state.messagePatchInstalled) return unavailable;
           {catalog_payload_selection_core}
           const expected = selectCatalogPayload(state.payload, {payload});
-          return JSON.stringify(state.payload) === JSON.stringify(expected);
+          if (JSON.stringify(state.payload) !== JSON.stringify(expected)) return unavailable;
+          const appServerReady = state.appServerPatchInstalled === true;
+          if (state.payload?.catalogAvailable !== true)
+            return {{current: true, pickerStatus: "unverified", appServerReady}};
+          let pickerStatus = appServerReady ? "unverified" : "pending";
+          if (typeof state.readCodexModelPickerDiagnostics === "function") {{
+            try {{
+              const observed = state.readCodexModelPickerDiagnostics()?.status;
+              pickerStatus = ["ready", "pending", "error", "mismatch", "unverified", "not_required"].includes(observed)
+                ? observed : "unverified";
+            }} catch {{
+              pickerStatus = "unverified";
+            }}
+          }}
+          if (pickerStatus === "not_required" &&
+              (!Array.isArray(state.payload.modelNames) || state.payload.modelNames.length !== 0))
+            pickerStatus = "unverified";
+          // The model picker can bind directly to its initialized query cache.
+          // Fresh observer diagnostics prove its projection independently of
+          // the separately authorized continuation/request-client hook.
+          return {{current: true, pickerStatus, appServerReady}};
         }})()"#
     )
 }
 
-pub(crate) async fn codex_renderer_compatibility_is_current(
+pub(crate) async fn inspect_codex_renderer_compatibility(
     websocket_url: &str,
     catalog: &CodexModelCatalogProjection,
-) -> Result<bool, String> {
+) -> Result<CodexRendererCompatibilityObservation, String> {
     let evaluation = evaluate_cdp_expression(
         websocket_url,
         &codex_renderer_compatibility_probe_script(catalog),
     )
     .await?;
     if evaluation.pointer("/result/exceptionDetails").is_some() {
-        return Ok(false);
+        return Ok(CodexRendererCompatibilityObservation::default());
     }
-    Ok(evaluation
-        .pointer("/result/result/value")
-        .and_then(Value::as_bool)
-        .unwrap_or(false))
+    let Some(value) = evaluation.pointer("/result/result/value") else {
+        return Ok(CodexRendererCompatibilityObservation::default());
+    };
+    let observation: CodexRendererCompatibilityObservation = serde_json::from_value(value.clone())
+        .map_err(|_| "Codex renderer returned an invalid compatibility observation".to_string())?;
+    if !observation.current {
+        return Ok(CodexRendererCompatibilityObservation::default());
+    }
+    // Currentness and strict status/field decoding remain fail-closed. A fresh
+    // picker observation may be ready via its query cache even when no request
+    // client is authorized; app_server_ready is independent telemetry only.
+    Ok(observation)
 }
 
 fn codex_model_picker_release_script(model_provider: Option<&str>) -> String {
@@ -1800,6 +1881,9 @@ pub(crate) async fn submit_codex_continuation(
     if thread_id.trim().is_empty() || recovery_id.trim().is_empty() {
         return Err("An exact Codex thread and recovery id are required".to_string());
     }
+    if expected_model.trim().is_empty() || expected_model.trim().eq_ignore_ascii_case("unknown") {
+        return Err("The interrupted Codex model is required".to_string());
+    }
     if observed_at_ms <= 0 {
         return Err("The interrupted turn observation time is required".to_string());
     }
@@ -2136,6 +2220,9 @@ fn assemble_codex_renderer_runtime_script(
     let request_normalization_core = app_server_request_normalization_core_script();
     let history_lineage_hydration_core = history_lineage_hydration_core_script();
     let module_client_discovery_core = app_server_module_client_discovery_core_script();
+    let webpack_discovery_core = include_str!("resources/codex_desktop/webpack_discovery.js");
+    let native_reasoning_visibility_core =
+        include_str!("resources/codex_desktop/native_reasoning_visibility.js");
     let request_health_warning_core =
         request_health_warning_core_script(request_health_warning_suppressed);
     let summary_handoff_core = summary_handoff_core_script();
@@ -2171,6 +2258,14 @@ fn assemble_codex_renderer_runtime_script(
         .replace(
             "/*__CCSWITCH_MODULE_CLIENT_DISCOVERY_CORE__*/",
             module_client_discovery_core,
+        )
+        .replace(
+            "/*__CCSWITCH_WEBPACK_DISCOVERY_CORE__*/",
+            webpack_discovery_core,
+        )
+        .replace(
+            "/*__CCSWITCH_NATIVE_REASONING_VISIBILITY_CORE__*/",
+            native_reasoning_visibility_core,
         )
         .replace(
             "/*__CCSWITCH_MODEL_PICKER_DIAGNOSTICS_CORE__*/",
@@ -3391,54 +3486,6 @@ fn version_tuple_from_package_name(name: &str) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-/// 探测已安装 Codex Desktop 的版本（MSIX 包版本，如 26.915.4065.0）。
-///
-/// 先扫 WindowsApps 包目录（纯 fs，快）；目录扫描拿不到版本时才回退
-/// `Get-AppxPackage`。探测不到版本时返回 `None`；调用方必须按"版本未知"
-/// 回落旧行为，不得当作旧版本处理。
-#[cfg(target_os = "windows")]
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn installed_codex_desktop_version() -> Option<Vec<u32>> {
-    let mut candidates = Vec::new();
-    collect_windowsapps_codex_executable_candidates(&mut candidates);
-    if let Some(version) = candidates
-        .iter()
-        .filter(|(version, _)| !version.is_empty())
-        .map(|(version, _)| version.clone())
-        .max()
-    {
-        return Some(version);
-    }
-    let mut appx_candidates = Vec::new();
-    collect_appx_codex_executable_candidates(&mut appx_candidates);
-    appx_candidates
-        .iter()
-        .filter(|(version, _)| !version.is_empty())
-        .map(|(version, _)| version.clone())
-        .max()
-}
-
-/// 探测已安装 Codex Desktop 的版本（Info.plist `CFBundleShortVersionString`）。
-#[cfg(target_os = "macos")]
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn installed_codex_desktop_version() -> Option<Vec<u32>> {
-    macos_codex_common_bundle_candidates()
-        .iter()
-        .find_map(|bundle| {
-            macos_bundle_info_value(bundle, "CFBundleShortVersionString").and_then(|version| {
-                let version = version_tuple_from_text(&version);
-                (!version.is_empty()).then_some(version)
-            })
-        })
-}
-
-/// 其他平台没有可靠的 Desktop 版本探测通道，返回 `None`（按版本未知处理）。
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn installed_codex_desktop_version() -> Option<Vec<u32>> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4469,6 +4516,22 @@ globalThis.__codexContinuationResult = JSON.stringify(cases.map((testCase) => {{
         }
     }
 
+    #[tokio::test]
+    async fn codex_continuation_requires_exact_model_before_cdp_discovery() {
+        for model in ["", "  ", "unknown", " UNKNOWN "] {
+            let result = submit_codex_continuation(
+                "exact-thread",
+                "model-binding-regression",
+                model,
+                1000,
+                |_| panic!("invalid models must be rejected before authorization or CDP discovery"),
+            )
+            .await
+            .expect_err("missing model must fail closed");
+            assert_eq!(result, "The interrupted Codex model is required");
+        }
+    }
+
     #[test]
     fn codex_continuation_targets_only_the_exact_failed_thread_without_picker_overrides() {
         let result = run_codex_continuation_probe(
@@ -4494,6 +4557,7 @@ void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.no
         assert_eq!(
             result["calls"],
             json!([
+                { "method": "thread/read", "params": { "threadId": "exact-thread", "includeTurns": true } },
                 { "method": "thread/read", "params": { "threadId": "exact-thread", "includeTurns": true } },
                 { "method": "thread/read", "params": { "threadId": "exact-thread", "includeTurns": true } },
                 { "method": "turn/start", "params": { "threadId": "exact-thread", "input": [{ "type": "text", "text": "continue" }] } },
@@ -5291,7 +5355,7 @@ state.clients = [proxy, verifiedProbeClient({
   supportsPaginatedThreadHistory() {},
   sendRequest: async (method) => {
     if (method === "turn/start") { starts += 1; return { turn: { id: "continue-turn" } }; }
-    return { thread: { id: "exact-thread", turns: [{ id: "failed-turn", status: "failed" }] } };
+    return { thread: { id: "exact-thread", model: "request-model", turns: [{ id: "failed-turn", model: "request-model", status: "failed" }] } };
   },
 })];
 void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.now()).then((result) => {
@@ -5317,7 +5381,7 @@ state.appServerClients = [
   { sendRequest: () => new Promise(() => {}) },
   { sendRequest: async (method) => {
     if (method === "turn/start") { starts += 1; return { turn: { id: "continue-turn" } }; }
-    return { thread: { id: "exact-thread", turns: [{ id: "failed-turn", status: "failed" }] } };
+    return { thread: { id: "exact-thread", model: "request-model", turns: [{ id: "failed-turn", model: "request-model", status: "failed" }] } };
   } },
 ];
 void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.now()).then((result) => {
@@ -5381,7 +5445,7 @@ void (async () => {{
     fn codex_continuation_refuses_user_cancellation_completed_turns_and_changed_models() {
         let result = run_codex_continuation_probe(
             r#"
-const thread = (turn, extra = {}) => ({ id: "exact-thread", turns: [{ id: "older-failure", status: "failed" }, { id: "latest-turn", ...turn }], ...extra });
+const thread = (turn, extra = {}) => ({ id: "exact-thread", model: "request-model", turns: [{ id: "older-failure", model: "request-model", status: "failed" }, { id: "latest-turn", model: "request-model", ...turn }], ...extra });
 const cases = [
   thread({ status: "completed" }),
   thread({ status: "inProgress" }),
@@ -5411,7 +5475,7 @@ let starts = 0;
 state.appServerClients = [{ sendRequest: async (method) => {
   if (method === "turn/start") { starts += 1; return { turn: { id: "continued" } }; }
   reads += 1;
-  return { thread: { id: "exact-thread", turns: [{ id: reads === 1 ? "failed-turn" : "new-user-turn", status: reads === 1 ? "failed" : "inProgress" }] } };
+  return { thread: { id: "exact-thread", model: "request-model", turns: [{ id: reads === 1 ? "failed-turn" : "new-user-turn", model: "request-model", status: reads === 1 ? "failed" : "inProgress" }] } };
 } }];
 void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.now()).then((result) => {
   globalThis.__codexContinuationResult = JSON.stringify({ result, reads, starts });
@@ -5429,7 +5493,7 @@ void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.no
             r#"
 let starts = 0;
 let secondClientCalls = 0;
-const failed = { id: "exact-thread", turns: [{ id: "failed-turn", status: "failed" }] };
+const failed = { id: "exact-thread", model: "request-model", turns: [{ id: "failed-turn", model: "request-model", status: "failed" }] };
 state.appServerClients = [
   { sendRequest: async (method) => {
     if (method === "thread/read") return { thread: failed };
@@ -5495,7 +5559,7 @@ const observedAtMs = Date.now() - 1000;
 let calls = 0;
 state.appServerClients = [{ sendRequest: async () => {
   calls += 1;
-  return { thread: { id: "exact-thread", turns: [{ id: "newer-failed-turn", status: "failed" }] } };
+  return { thread: { id: "exact-thread", model: "request-model", turns: [{ id: "newer-failed-turn", model: "request-model", status: "failed" }] } };
 } }];
 rememberCodexUserTurnAction("send-cli-request-for-host", { method: "turn/start", params: { threadId: "exact-thread" } });
 // The persisted action still protects recovery after compatibility reinjection.
@@ -5520,7 +5584,7 @@ state.appServerClients = [{ sendRequest: async (method) => {
   if (method === "turn/start") { starts += 1; return { turn: { id: "continued" } }; }
   reads += 1;
   if (reads === 2) rememberCodexUserTurnAction("turn/interrupt", { threadId: "exact-thread", turnId: "failed-turn" });
-  return { thread: { id: "exact-thread", turns: [{ id: "failed-turn", status: "failed" }] } };
+  return { thread: { id: "exact-thread", model: "request-model", turns: [{ id: "failed-turn", model: "request-model", status: "failed" }] } };
 } }];
 void runCodexContinuation("exact-thread", "recovery-1", "request-model", observedAtMs).then((result) => {
   globalThis.__codexContinuationResult = JSON.stringify({ result, reads, starts });
@@ -6701,7 +6765,13 @@ JSON.stringify({
         assert!(script.contains("document.getElementById(\"root\")"));
         assert!(!script.contains("document.querySelectorAll(\"*\")"));
         assert!(script.contains("module?.appServices?.localThreadCatalog"));
-        assert!(script.contains("fetch(url)"));
+        assert!(script.contains(".filter((script) => script.type === \"module\")"));
+        assert!(script.contains(".map(sameOriginJavascriptAssetUrl)"));
+        assert!(script.contains("const url = await assetUrl(namePart)"));
+        assert!(script.contains("return await import(url)"));
+        assert!(!script.contains("fetch(url)"));
+        assert!(!script.contains("source.matchAll("));
+        assert!(!script.contains("document.querySelectorAll(\"link[href]\")"));
         assert!(!script.contains("await state.historyQueryRefreshPromise"));
         assert!(!script.contains("await state.historyLineageHydrationPromise"));
         assert!(!script.contains("await state.historySyncPromise"));
@@ -6858,7 +6928,7 @@ void installation.then(async () => {{
                 assert_eq!(
                     result,
                     if mode == "mutable_inherited" || mode == "legacy_hook" {
-                        json!({"retainedBeforeProbe": true, "reads": 2, "starts": 1, "legacyCalls": 0, "submitted": true, "mutationAttempted": true})
+                        json!({"retainedBeforeProbe": true, "reads": 3, "starts": 1, "legacyCalls": 0, "submitted": true, "mutationAttempted": true})
                     } else {
                         json!({"retainedBeforeProbe": false, "reads": 0, "starts": 1, "legacyCalls": 0, "submitted": false, "mutationAttempted": false})
                     },
@@ -7141,6 +7211,7 @@ JSON.stringify({{first, refreshed: efforts(), caches: state.reasoningQueryCaches
         let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
         let script = format!(
             r#"
+const state = {{}};
 const patched = [];
 const patchRequestClient = (client) => {{
   if (!client || typeof client.sendRequest !== "function") return false;
@@ -7151,9 +7222,12 @@ const patchRequestClient = (client) => {{
 let current = {{ id: "first", sendRequest() {{}}, getCompatibleThreadSortKey() {{}}, supportsPaginatedThreadHistory() {{}} }};
 const module = {{ signal: {{ get: () => current }} }};
 const firstCount = patchAppServerModuleClients(module);
+const firstClient = current;
+const firstOwnerBeforeReplacement = codexAppServerClientHasCurrentOwner(firstClient);
 current = {{ id: "second", sendRequest() {{}}, getCompatibleThreadSortKey() {{}}, supportsPaginatedThreadHistory() {{}} }};
+const firstOwnerAfterReplacement = codexAppServerClientHasCurrentOwner(firstClient);
 const secondCount = patchAppServerModuleClients(module);
-JSON.stringify({{ firstCount, secondCount, patched }});
+JSON.stringify({{ firstCount, secondCount, patched, firstOwnerBeforeReplacement, firstOwnerAfterReplacement, retained: state.appServerClients.map(client => client.id) }});
 "#,
             app_server_module_client_discovery_core_script()
         );
@@ -7165,6 +7239,9 @@ JSON.stringify({{ firstCount, secondCount, patched }});
             assert_eq!(result["firstCount"], 1);
             assert_eq!(result["secondCount"], 1);
             assert_eq!(result["patched"], json!(["first", "second"]));
+            assert_eq!(result["firstOwnerBeforeReplacement"], true);
+            assert_eq!(result["firstOwnerAfterReplacement"], false);
+            assert_eq!(result["retained"], json!(["second"]));
         });
     }
 
@@ -7174,6 +7251,7 @@ JSON.stringify({{ firstCount, secondCount, patched }});
         let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
         let script = format!(
             r#"
+const state = {{}};
 let propertyReads = 0;
 let patched = 0;
 const patchRequestClient = () => {{ patched += 1; return true; }};
@@ -7205,11 +7283,12 @@ const patched = [];
 let registryMutations = 0;
 let queryClientReads = 0;
 let scopeScans = 0;
+let rootIdentityReads = 0;
 const patchRequestClient = (client) => {{ patched.push(client.id); return true; }};
 const monotonicNow = () => 1;
 const yieldReactDiscovery = async () => {{}};
 const recordFailure = (error) => {{ throw error; }};
-const document = {{ getElementById() {{ scopeScans += 1; return null; }} }};
+const document = {{ getElementById(id) {{ rootIdentityReads += 1; return id === "root" ? root : null; }} }};
 class Client {{
   constructor(id) {{ this.id = id; this.hostId = "local"; }}
   sendRequest() {{}}
@@ -7221,7 +7300,13 @@ const scope = {{ chain: {{}}, node: {{}}, get queryClient() {{ queryClientReads 
 const current = {{}};
 let leaf = current;
 for (let index = 0; index < 40; index += 1) {{ leaf.child = {{}}; leaf = leaf.child; }}
-leaf.memoizedState = {{ memoizedState: {{ current: scope }} }};
+// Count deep Fiber traversal separately from mandatory cheap root-identity
+// checks, so the stable-root fast path must still avoid another tree walk.
+Object.defineProperty(leaf, "memoizedState", {{ get() {{
+  scopeScans += 1;
+  return {{ memoizedState: {{ current: scope }} }};
+}} }});
+const root = {{ childNodes: [], __reactContainerTest: {{ stateNode: {{ current }} }} }};
 const window = {{ __codexRoot: {{ _internalRoot: {{ current }} }} }};
 class Registry {{
   constructor(scope) {{ this.scope = scope; }}
@@ -7245,7 +7330,7 @@ void (async () => {{
   const secondCount = await patchCodexScopedAppServerClients(module);
   manager = {{ requestClient: {{ ...new Client("remote"), hostId: "remote" }} }};
   const remoteCount = await patchCodexScopedAppServerClients(module);
-  globalThis.__scopedClientDiscoveryResult = JSON.stringify({{ firstCount, secondCount, remoteCount, patched, registryMutations, scopeScans, queryClientReads }});
+  globalThis.__scopedClientDiscoveryResult = JSON.stringify({{ firstCount, secondCount, remoteCount, patched, registryMutations, scopeScans, rootIdentityReads, queryClientReads }});
 }})();
 "#,
             app_server_module_client_discovery_core_script()
@@ -7261,7 +7346,7 @@ void (async () => {{
         context.with(|ctx| {
             let result: String = ctx.eval("globalThis.__scopedClientDiscoveryResult").expect("read scoped discovery result");
             let result: Value = serde_json::from_str(&result).expect("parse scoped discovery result");
-            assert_eq!(result, json!({ "firstCount": 1, "secondCount": 1, "remoteCount": 0, "patched": ["first", "second"], "registryMutations": 0, "scopeScans": 1, "queryClientReads": 3 }));
+            assert_eq!(result, json!({ "firstCount": 1, "secondCount": 1, "remoteCount": 0, "patched": ["first", "second"], "registryMutations": 0, "scopeScans": 1, "rootIdentityReads": 3, "queryClientReads": 3 }));
         });
     }
 
@@ -7333,7 +7418,7 @@ void (async () => {{
             payload,
             false,
             true,
-            "app-initial-fallback-test",
+            "app-server-manager-hooks-test",
         );
         let setup = renderer_lifecycle_test_setup();
         context.with(|ctx| {
@@ -7356,7 +7441,15 @@ class AppServerRegistry {{
   getImplForHostId(host) {{ return this.scope.get(host); }}
   getAll() {{ return []; }}
 }}
+// Model initialized imports owned by this exact current runtime. A mismatched
+// fingerprint must still invalidate them (covered by reinjection tests).
+document.baseURI = "https://codex.test/index.html";
+document.scripts = [
+  {{src: "https://codex.test/assets/app-shared-fixture.js", type: "module"}},
+  {{src: "https://codex.test/assets/app-server-manager-hooks-fixture.js", type: "module"}},
+];
 window[{MODEL_PICKER_PATCH_KEY:?}] = {{
+  rendererRuntimeFingerprint: "app-server-manager-hooks-test",
   modulePromises: new Map([
     ["app-shared-", Promise.resolve({{}})],
     ["app-server-manager-hooks-", Promise.resolve({{AppServerRegistry}})],
@@ -7381,6 +7474,7 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
                           error: globalThis.__fallbackInstallationError || null,
                           appServerPatchInstalled: window[{MODEL_PICKER_PATCH_KEY:?}]?.appServerPatchInstalled || false,
                           clientCount: window[{MODEL_PICKER_PATCH_KEY:?}]?.scopedAppServerDiscovery?.clientCount || 0,
+                          initializedRegistry: window[{MODEL_PICKER_PATCH_KEY:?}]?.scopedAppServerRegistryClasses?.includes(AppServerRegistry) || false,
                         }})"#
                     ))
                     .expect("read app-server-manager-hooks result"),
@@ -7390,6 +7484,7 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
             assert_eq!(result["error"], Value::Null);
             assert_eq!(result["appServerPatchInstalled"], true);
             assert_eq!(result["clientCount"], 1);
+            assert_eq!(result["initializedRegistry"], true);
         });
     }
 
@@ -7425,7 +7520,15 @@ class AppServerRegistry {{
   getImplForHostId(host) {{ return this.scope.get(host); }}
   getAll() {{ return []; }}
 }}
+// Model initialized imports owned by this exact current runtime. A mismatched
+// fingerprint must still invalidate them (covered by reinjection tests).
+document.baseURI = "https://codex.test/index.html";
+document.scripts = [
+  {{src: "https://codex.test/assets/app-shared-fixture.js", type: "module"}},
+  {{src: "https://codex.test/assets/app-initial-fixture.js", type: "module"}},
+];
 window[{MODEL_PICKER_PATCH_KEY:?}] = {{
+  rendererRuntimeFingerprint: "app-initial-fallback-test",
   modulePromises: new Map([
     ["app-shared-", Promise.resolve({{}})],
     ["app-initial-", Promise.resolve({{AppServerRegistry}})],
@@ -7450,6 +7553,7 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
                           error: globalThis.__fallbackInstallationError || null,
                           appServerPatchInstalled: window[{MODEL_PICKER_PATCH_KEY:?}]?.appServerPatchInstalled || false,
                           clientCount: window[{MODEL_PICKER_PATCH_KEY:?}]?.scopedAppServerDiscovery?.clientCount || 0,
+                          initializedRegistry: window[{MODEL_PICKER_PATCH_KEY:?}]?.scopedAppServerRegistryClasses?.includes(AppServerRegistry) || false,
                         }})"#
                     ))
                     .expect("read app-initial fallback result"),
@@ -7459,6 +7563,7 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
             assert_eq!(result["error"], Value::Null);
             assert_eq!(result["appServerPatchInstalled"], true);
             assert_eq!(result["clientCount"], 1);
+            assert_eq!(result["initializedRegistry"], true);
         });
     }
 
@@ -7518,6 +7623,12 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
         assert!(!template.contains("__CCSWITCH_"));
         assert!(template.contains("const rendererRuntimeFingerprint ="));
         assert!(template.contains("__ccswitch_runtime_fingerprint_slot__"));
+        assert!(
+            template.contains(include_str!("resources/codex_desktop/webpack_discovery.js").trim())
+        );
+        assert!(template.contains(
+            include_str!("resources/codex_desktop/native_reasoning_visibility.js").trim()
+        ));
 
         let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
         assert!(!script.contains("rendererSchedulerVersion"));
@@ -7543,6 +7654,8 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
             "/*__CCSWITCH_REQUEST_NORMALIZATION_CORE__*/",
             "/*__CCSWITCH_HISTORY_LINEAGE_HYDRATION_CORE__*/",
             "/*__CCSWITCH_MODULE_CLIENT_DISCOVERY_CORE__*/",
+            "/*__CCSWITCH_WEBPACK_DISCOVERY_CORE__*/",
+            "/*__CCSWITCH_NATIVE_REASONING_VISIBILITY_CORE__*/",
             "/*__CCSWITCH_MODEL_PICKER_DIAGNOSTICS_CORE__*/",
             "/*__CCSWITCH_REQUEST_HEALTH_WARNING_CORE__*/",
             "/*__CCSWITCH_SUMMARY_HANDOFF_CORE__*/",
@@ -7598,6 +7711,259 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
     }
 
     #[test]
+    fn renderer_compatibility_observation_accepts_cache_only_picker_proof() {
+        let catalog = CodexModelCatalogProjection {
+            default_model: Some("relay".to_string()),
+            model_provider: Some("codex_model_router_v2".to_string()),
+            catalog_available: true,
+            model_names: vec!["relay".to_string()],
+            models: vec![json!({
+                "model": "relay",
+                "supported_reasoning_levels": ["high", "max", "ultra"]
+            })],
+        };
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let payload = serde_json::to_string(&catalog).expect("serialize catalog");
+        let runtime_fingerprint = codex_renderer_runtime_fingerprint();
+        let probe = codex_renderer_compatibility_probe_script(&catalog);
+        let picker_core = model_picker_patch_core_script();
+        let discovery_core = app_server_module_client_discovery_core_script();
+        let diagnostics_core = include_str!("resources/codex_desktop/model_picker_diagnostics.js");
+        let script = format!(
+            r#"
+const state = {{payload: {payload}, rendererRuntimeFingerprint: {runtime_fingerprint:?}, interval: 1, messagePatchInstalled: true}};
+const window = {{[{MODEL_PICKER_PATCH_KEY:?}]: state}};
+{picker_core}
+{discovery_core}
+{diagnostics_core}
+const key = ["models", "list", "local", "chatgpt", 100, "codex_model_router_v2"];
+const selected = {{models: [{{model: "relay", supportedReasoningEfforts: ["high", "max", "ultra"].map(reasoningEffort => ({{reasoningEffort}}))}}], hasModelSupportingMaxReasoningEffort: true, hasModelSupportingUltraReasoningEffort: true}};
+const observer = {{options: {{queryKey: key}}, getCurrentResult() {{ return {{status: "success", data: selected}}; }} }};
+const cache = {{getAll() {{ return [{{queryKey: key, observers: [observer]}}]; }} }};
+state.reasoningQueryCaches = new Map([[cache, {{}}]]);
+state.readCodexModelPickerDiagnostics = codexModelPickerDiagnostics;
+const diagnostic = state.readCodexModelPickerDiagnostics();
+const ready = {probe};
+selected.models[0].supportedReasoningEfforts = selected.models[0].supportedReasoningEfforts.filter(level => level.reasoningEffort !== "max");
+const mismatch = {probe};
+const requestHookInvented = state.appServerPatchInstalled === true;
+JSON.stringify({{diagnostic, ready, mismatch, requestHookInvented}});
+"#
+        );
+        context.with(|ctx| {
+            let result: String = ctx.eval(script).expect("execute cache-only observation");
+            let result: Value =
+                serde_json::from_str(&result).expect("parse cache-only observation");
+            assert_eq!(result["diagnostic"]["status"], "ready");
+            assert_eq!(result["diagnostic"]["successObserverCount"], 1);
+            assert_eq!(result["diagnostic"]["selectedMaxModelCount"], 1);
+            assert_eq!(result["diagnostic"]["selectedUltraModelCount"], 1);
+            assert_eq!(
+                result["ready"],
+                json!({"current": true, "pickerStatus": "ready", "appServerReady": false})
+            );
+            assert_eq!(result["mismatch"]["pickerStatus"], "mismatch");
+            assert_eq!(result["mismatch"]["appServerReady"], false);
+            assert_eq!(result["requestHookInvented"], false);
+        });
+    }
+
+    #[tokio::test]
+    async fn renderer_compatibility_observation_preserves_cache_only_proof_at_rpc_boundary() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind simulated compatibility listener");
+        let address = listener.local_addr().expect("read compatibility address");
+        let responses = vec![
+            json!({"current": true, "pickerStatus": "ready", "appServerReady": false}),
+            json!({"current": false, "pickerStatus": "ready", "appServerReady": false}),
+            json!({"current": true, "pickerStatus": "future_status", "appServerReady": false}),
+            json!({"current": true, "pickerStatus": "ready"}),
+        ];
+        let server = tokio::spawn(async move {
+            for value in responses {
+                let (socket, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept compatibility connection");
+                let mut socket = tokio_tungstenite::accept_async(socket)
+                    .await
+                    .expect("accept compatibility websocket");
+                loop {
+                    let message = socket
+                        .next()
+                        .await
+                        .expect("read compatibility command")
+                        .expect("valid compatibility command");
+                    let command: Value = serde_json::from_str(message.to_text().unwrap())
+                        .expect("parse compatibility command");
+                    let evaluating = command["method"] == "Runtime.evaluate";
+                    let result = if evaluating {
+                        json!({"result": {"value": value}})
+                    } else {
+                        json!({})
+                    };
+                    socket
+                        .send(Message::Text(
+                            json!({"id": command["id"], "result": result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .expect("reply to compatibility command");
+                    if evaluating {
+                        break;
+                    }
+                }
+            }
+        });
+        let url = format!("ws://{address}");
+        let catalog = CodexModelCatalogProjection::empty();
+        let ready = inspect_codex_renderer_compatibility(&url, &catalog)
+            .await
+            .expect("read cache-only picker proof");
+        let stale = inspect_codex_renderer_compatibility(&url, &catalog)
+            .await
+            .expect("read stale picker proof");
+        let unknown = inspect_codex_renderer_compatibility(&url, &catalog).await;
+        let incomplete = inspect_codex_renderer_compatibility(&url, &catalog).await;
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("compatibility fixture must complete")
+            .expect("finish compatibility fixture");
+        assert!(ready.current);
+        assert_eq!(ready.picker_status, CodexModelPickerReadiness::Ready);
+        assert!(!ready.app_server_ready);
+        assert_eq!(stale, CodexRendererCompatibilityObservation::default());
+        assert!(unknown.is_err(), "unknown readiness must stay fail-closed");
+        assert!(
+            incomplete.is_err(),
+            "missing telemetry must stay fail-closed"
+        );
+    }
+
+    #[test]
+    fn renderer_compatibility_observation_separates_bootstrap_from_picker_readiness() {
+        let catalog = CodexModelCatalogProjection {
+            default_model: Some("relay".to_string()),
+            model_provider: Some("codex_model_router_v2".to_string()),
+            catalog_available: true,
+            model_names: vec!["relay".to_string()],
+            models: vec![json!({"model": "relay"})],
+        };
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let payload = serde_json::to_string(&catalog).expect("serialize catalog");
+        let runtime_fingerprint = codex_renderer_runtime_fingerprint();
+        let probe = codex_renderer_compatibility_probe_script(&catalog);
+        let script = format!(
+            r#"
+const state = {{payload: {payload}, rendererRuntimeFingerprint: {runtime_fingerprint:?}, interval: 1, messagePatchInstalled: true}};
+const window = {{[{MODEL_PICKER_PATCH_KEY:?}]: state}};
+const probe = () => {probe};
+const pending = probe();
+state.readCodexModelPickerDiagnostics = () => ({{status: "ready"}});
+const cacheOnlyReady = probe();
+state.appServerPatchInstalled = true;
+const ready = probe();
+state.readCodexModelPickerDiagnostics = () => ({{status: "mismatch"}});
+const mismatch = probe();
+state.readCodexModelPickerDiagnostics = () => ({{status: "error"}});
+const error = probe();
+state.readCodexModelPickerDiagnostics = () => ({{status: "unrecognized"}});
+const unknown = probe();
+state.readCodexModelPickerDiagnostics = () => ({{}});
+const missingStatus = probe();
+state.readCodexModelPickerDiagnostics = () => ({{status: "not_required"}});
+const noncanonical = probe();
+state.readCodexModelPickerDiagnostics = () => {{ throw new Error("redacted diagnostic failure"); }};
+const unreadable = probe();
+state.interval = null;
+const stopped = probe();
+JSON.stringify({{pending, cacheOnlyReady, ready, mismatch, error, unknown, missingStatus, noncanonical, unreadable, stopped}});
+"#
+        );
+        context.with(|ctx| {
+            let result: String = ctx.eval(script).expect("execute renderer observation");
+            let result: Value = serde_json::from_str(&result).expect("parse renderer observation");
+            assert_eq!(
+                result["pending"],
+                json!({"current": true, "pickerStatus": "pending", "appServerReady": false})
+            );
+            assert_eq!(
+                result["cacheOnlyReady"],
+                json!({"current": true, "pickerStatus": "ready", "appServerReady": false})
+            );
+            assert_eq!(
+                result["ready"],
+                json!({"current": true, "pickerStatus": "ready", "appServerReady": true})
+            );
+            assert_eq!(result["mismatch"]["pickerStatus"], "mismatch");
+            assert_eq!(result["error"]["pickerStatus"], "error");
+            for label in ["unknown", "missingStatus", "noncanonical", "unreadable"] {
+                assert_eq!(result[label]["current"], true);
+                assert_eq!(result[label]["pickerStatus"], "unverified");
+            }
+            assert_eq!(
+                result["stopped"],
+                json!({"current": false, "pickerStatus": "unverified", "appServerReady": false})
+            );
+        });
+    }
+
+    #[test]
+    fn renderer_compatibility_observation_distinguishes_empty_from_unavailable_catalog() {
+        let empty = CodexModelCatalogProjection {
+            model_provider: Some("codex_model_router_v2".to_string()),
+            catalog_available: true,
+            ..CodexModelCatalogProjection::empty()
+        };
+        let unavailable = CodexModelCatalogProjection {
+            catalog_available: false,
+            ..empty.clone()
+        };
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let empty_payload = serde_json::to_string(&empty).expect("serialize empty catalog");
+        let unavailable_payload =
+            serde_json::to_string(&unavailable).expect("serialize unavailable catalog");
+        let runtime_fingerprint = codex_renderer_runtime_fingerprint();
+        let empty_probe = codex_renderer_compatibility_probe_script(&empty);
+        let unavailable_probe = codex_renderer_compatibility_probe_script(&unavailable);
+        let script = format!(
+            r#"
+const window = {{}};
+const state = {{payload: {empty_payload}, rendererRuntimeFingerprint: {runtime_fingerprint:?}, interval: 1, messagePatchInstalled: true,
+  readCodexModelPickerDiagnostics: () => ({{status: "not_required"}})}};
+window[{MODEL_PICKER_PATCH_KEY:?}] = state;
+const empty = {empty_probe};
+state.payload = {unavailable_payload};
+const unavailable = {unavailable_probe};
+state.payload = {{...{empty_payload}, modelNames: ["stale"], models: [{{model: "stale"}}]}};
+const staleAfterEmpty = {empty_probe};
+JSON.stringify({{empty, unavailable, staleAfterEmpty}});
+"#
+        );
+        context.with(|ctx| {
+            let result: String = ctx
+                .eval(script)
+                .expect("execute empty/unavailable observation");
+            let result: Value =
+                serde_json::from_str(&result).expect("parse empty/unavailable observation");
+            assert_eq!(
+                result["empty"],
+                json!({"current": true, "pickerStatus": "not_required", "appServerReady": false})
+            );
+            assert_eq!(
+                result["unavailable"],
+                json!({"current": true, "pickerStatus": "unverified", "appServerReady": false})
+            );
+            assert_eq!(result["staleAfterEmpty"]["current"], false);
+        });
+    }
+
+    #[test]
     fn renderer_compatibility_probe_rejects_reloads_stale_versions_and_changed_metadata() {
         let catalog = CodexModelCatalogProjection {
             default_model: Some("relay".to_string()),
@@ -7614,7 +7980,7 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
         let script = format!(
             r#"
 const window = {{}};
-const probe = () => {probe};
+const probe = () => ({probe}).current;
 const reloaded = probe();
 const state = {{payload: {payload}, rendererRuntimeFingerprint: {runtime_fingerprint:?}, interval: 1, messagePatchInstalled: true}};
 window[{MODEL_PICKER_PATCH_KEY:?}] = state;
@@ -7870,6 +8236,45 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
         }];
 
         assert!(pick_codex_page_targets(&targets, 9222).is_err());
+    }
+
+    #[test]
+    fn cdp_port_rejects_spoofed_codex_url_without_codex_title() {
+        let targets = vec![CdpTarget {
+            id: "spoofed-codex".to_string(),
+            target_type: "page".to_string(),
+            title: "Other Electron App".to_string(),
+            url: "app://codex/index.html".to_string(),
+            web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
+        }];
+
+        assert!(pick_codex_page_targets(&targets, DEFAULT_CODEX_DEBUG_PORT).is_err());
+    }
+
+    #[test]
+    fn cdp_port_rejects_non_local_or_mismatched_websocket_target() {
+        for websocket_url in [
+            "ws://192.0.2.10:9229/devtools/page/1",
+            "ws://127.0.0.1:9228/devtools/page/1",
+            "wss://127.0.0.1:9229/devtools/page/1",
+            "ws://localhost:9229/devtools/page/1",
+            "ws://user:pass@127.0.0.1:9229/devtools/page/1",
+            "ws://127.0.0.1:9229/devtools/page/1?token=unexpected",
+            "ws://127.0.0.1:9229/devtools/page/1#fragment",
+        ] {
+            let targets = vec![CdpTarget {
+                id: "codex-page".to_string(),
+                target_type: "page".to_string(),
+                title: "Codex".to_string(),
+                url: "app://codex/index.html".to_string(),
+                web_socket_debugger_url: Some(websocket_url.to_string()),
+            }];
+
+            assert!(
+                pick_codex_page_targets(&targets, DEFAULT_CODEX_DEBUG_PORT).is_err(),
+                "unexpectedly accepted websocket URL {websocket_url}"
+            );
+        }
     }
 
     #[test]
@@ -8163,9 +8568,18 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
             web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
         }];
 
-        assert!(pick_codex_page_targets_with_listener_identity(&targets, false).is_err());
-        let picked = pick_codex_page_targets_with_listener_identity(&targets, true)
-            .expect("the packaged Codex renderer target should be recognized");
+        assert!(pick_codex_page_targets_with_listener_identity(
+            &targets,
+            DEFAULT_CODEX_DEBUG_PORT,
+            false
+        )
+        .is_err());
+        let picked = pick_codex_page_targets_with_listener_identity(
+            &targets,
+            DEFAULT_CODEX_DEBUG_PORT,
+            true,
+        )
+        .expect("the packaged Codex renderer target should be recognized");
         assert_eq!(picked[0].id, "codex-task");
     }
 

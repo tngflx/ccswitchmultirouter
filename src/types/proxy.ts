@@ -264,12 +264,19 @@ export interface StreamRetryActivity {
   retryAfterSeconds?: number;
 }
 
+export type CodexModelPickerReadiness =
+  "ready" | "pending" | "error" | "mismatch" | "unverified" | "not_required";
+
 export interface CodexGuardianStatus {
   active: boolean;
   codexRunning: boolean;
   cdpAvailable: boolean;
   injectedTargetCount: number;
   injected: boolean;
+  // A running older native build may only report installation currentness.
+  // Missing readiness evidence must never be treated as picker-ready.
+  pickerReadyTargetCount?: number;
+  pickerStatus?: CodexModelPickerReadiness;
   lastEvent: string;
   message: string;
 }

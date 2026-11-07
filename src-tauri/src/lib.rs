@@ -1557,6 +1557,7 @@ pub fn run() {
             commands::list_codex_provider_adaptation_summaries,
             commands::add_provider,
             commands::update_provider,
+            commands::update_provider_if_unchanged,
             commands::update_codex_subagent_v2,
             commands::initialize_codex_subagent_v2,
             commands::reconcile_codex_subagent_v2_profiles,
@@ -1902,6 +1903,7 @@ pub fn run() {
             commands::get_tool_auto_update_settings,
             commands::set_tool_auto_update,
             commands::run_tool_lifecycle_action,
+            commands::get_tool_install_commands,
             commands::probe_tool_installations,
             // Provider terminal
             commands::open_provider_terminal,

@@ -31,7 +31,6 @@ use crate::proxy::providers::{
 };
 use crate::services::ProviderService;
 use crate::store::AppState;
-use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
@@ -69,15 +68,50 @@ const CC_SWITCH_CODEX_MODELS_CACHE_ETAG: &str = "cc-switch-model-catalog";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-// Generating a ProxyChat catalog only needs one stable Codex model template per
-// process. Without this cache every provider switch/takeover can start the
-// Codex CLI again, which is especially expensive for npm-installed `codex.cmd`
-// on Windows. Tests deliberately bypass the global cache because they isolate
-// CODEX_HOME and seed different model templates.
+// Cache only the expensive, selected-consumer probe. Template assembly and
+// declared Desktop compatibility are cheap projections of current inputs and
+// must not be frozen for the lifetime of this process.
 #[cfg(not(test))]
-static CODEX_MODEL_CATALOG_TEMPLATE_CACHE: OnceCell<Value> = OnceCell::new();
-#[cfg(not(test))]
-static CODEX_BUNDLED_MODELS_CACHE: OnceCell<Option<Vec<Value>>> = OnceCell::new();
+static CODEX_CONSUMER_PROFILE_CACHE: Mutex<Option<CachedCodexConsumerProfile>> = Mutex::new(None);
+const CODEX_CONSUMER_FAILURE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexExecutableStamp {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexConsumerKey {
+    executable: PathBuf,
+    executable_stamp: CodexExecutableStamp,
+    package_stamps: Vec<(PathBuf, Option<CodexExecutableStamp>)>,
+    home: PathBuf,
+    codex_home: PathBuf,
+    environment_codex_home: Option<PathBuf>,
+    declared_desktop_version: Option<Vec<u32>>,
+}
+
+#[derive(Debug, Clone)]
+struct DeclaredCodexRuntime {
+    executable: PathBuf,
+    desktop_version: Option<Vec<u32>>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexConsumerContext {
+    key: Option<CodexConsumerKey>,
+    // An unusable explicit declaration is not permission to borrow another
+    // installation's executable or shared-cache parser shape.
+    explicitly_declared: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedCodexConsumerProfile {
+    key: CodexConsumerKey,
+    bundled_models: Option<Vec<Value>>,
+    attempted_at: std::time::Instant,
+}
 
 /// Top-level `config.toml` key that controls Codex's built-in web-search tool.
 pub(crate) const CODEX_WEB_SEARCH_FIELD: &str = "web_search";
@@ -2320,7 +2354,7 @@ fn push_env_codex_cli_candidates(candidates: &mut Vec<PathBuf>, seen: &mut HashS
     }
 }
 
-pub(crate) fn codex_cli_candidates() -> Vec<PathBuf> {
+fn discovered_codex_cli_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
 
@@ -2332,6 +2366,279 @@ pub(crate) fn codex_cli_candidates() -> Vec<PathBuf> {
     push_home_codex_cli_candidates(&mut candidates, &mut seen, &get_home_dir());
 
     candidates
+}
+
+/// The app's runtime declaration wins over an unrelated terminal installation.
+/// Invalid declarations yield no candidate, including for other CLI consumers
+/// (plugin health and session coordination), instead of executing a relative
+/// command or falling through to an unrelated installation.
+pub(crate) fn codex_cli_candidates() -> Vec<PathBuf> {
+    let explicit = std::env::var_os("CODEX_CLI_PATH")
+        .map(PathBuf::from)
+        .or_else(|| {
+            fs::read_to_string(get_codex_config_path())
+                .ok()
+                .as_deref()
+                .and_then(declared_codex_runtime)
+                .map(|declared| declared.executable)
+        });
+    match explicit {
+        Some(path) => resolve_codex_cli_candidate(&path, true)
+            .into_iter()
+            .collect(),
+        None => discovered_codex_cli_candidates(),
+    }
+}
+
+fn parse_codex_desktop_version(version: &str) -> Option<Vec<u32>> {
+    let components = version
+        .trim()
+        .split('.')
+        .map(str::parse)
+        .collect::<Result<Vec<u32>, _>>()
+        .ok()?;
+    // Desktop release trains use YY.MDD.build[.revision], not CLI semver.
+    (matches!(components.len(), 3 | 4) && (26..100).contains(&components[0])).then_some(components)
+}
+
+fn declared_codex_runtime(config_text: &str) -> Option<DeclaredCodexRuntime> {
+    let config = config_text.parse::<toml::Value>().ok()?;
+    let env = config.get("mcp_servers")?.get("node_repl")?.get("env")?;
+    let executable = env.get("CODEX_CLI_PATH")?;
+    Some(DeclaredCodexRuntime {
+        executable: executable.as_str().map(PathBuf::from).unwrap_or_default(),
+        desktop_version: env
+            .get("BROWSER_USE_CODEX_APP_VERSION")
+            .and_then(toml::Value::as_str)
+            .and_then(parse_codex_desktop_version),
+    })
+}
+
+fn codex_executable_stamp(path: &Path) -> Option<CodexExecutableStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    metadata.is_file().then(|| CodexExecutableStamp {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn codex_cli_candidate_is_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn resolve_codex_cli_on_paths(
+    candidate: &Path,
+    directories: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let extensions = ["exe", "cmd", "bat", "com"];
+    for directory in directories
+        .into_iter()
+        .filter(|directory| directory.is_absolute())
+    {
+        let joined = directory.join(candidate);
+        #[cfg(target_os = "windows")]
+        if candidate.extension().is_none() {
+            for extension in extensions {
+                let executable = joined.with_extension(extension);
+                if codex_cli_candidate_is_executable(&executable) {
+                    return fs::canonicalize(executable).ok();
+                }
+            }
+        }
+        if codex_cli_candidate_is_executable(&joined) {
+            return fs::canonicalize(joined).ok();
+        }
+    }
+    None
+}
+
+fn resolve_codex_cli_candidate(candidate: &Path, explicit: bool) -> Option<PathBuf> {
+    if candidate.is_absolute() {
+        return codex_cli_candidate_is_executable(candidate)
+            .then(|| fs::canonicalize(candidate).ok())
+            .flatten();
+    }
+    // Explicit declarations must name an absolute executable file, not a PATH
+    // command or a path whose meaning changes with the working directory.
+    if explicit || candidate.components().count() != 1 {
+        return None;
+    }
+    let path = std::env::var_os("PATH")?;
+    resolve_codex_cli_on_paths(candidate, std::env::split_paths(&path))
+}
+
+fn codex_executable_paths_match(left: &Path, right: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        left == right
+    }
+}
+
+fn codex_package_stamps(executable: &Path) -> Vec<(PathBuf, Option<CodexExecutableStamp>)> {
+    let Some(directory) = executable.parent() else {
+        return Vec::new();
+    };
+    // npm's .cmd/JS wrapper can remain unchanged when its package is replaced.
+    // Stamp both present and absent conventional manifests so installing or
+    // removing the package at the same wrapper path invalidates the profile.
+    let mut manifests = vec![directory.join("node_modules/@openai/codex/package.json")];
+    if let Some(parent) = directory.parent() {
+        manifests.push(parent.join("lib/node_modules/@openai/codex/package.json"));
+    }
+    // POSIX npm shims canonicalize into @openai/codex/bin/codex.js. Native
+    // platform packages can live a few levels below @openai/codex-<target>.
+    // Inspect only bounded conventional ancestors, never a recursive scan.
+    for ancestor in directory.ancestors().take(6) {
+        let package_name = ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let scope = ancestor
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str());
+        if scope == Some("@openai")
+            && (package_name == "codex" || package_name.starts_with("codex-"))
+        {
+            let manifest = ancestor.join("package.json");
+            if !manifests.contains(&manifest) {
+                manifests.push(manifest);
+            }
+        }
+    }
+    manifests
+        .into_iter()
+        .map(|path| {
+            let stamp = codex_executable_stamp(&path);
+            (path, stamp)
+        })
+        .collect()
+}
+
+fn codex_consumer_context_from_inputs(
+    explicit: Option<PathBuf>,
+    declared: Option<DeclaredCodexRuntime>,
+    candidates: &[PathBuf],
+    home: PathBuf,
+    codex_home: PathBuf,
+) -> CodexConsumerContext {
+    let explicitly_declared = explicit.is_some() || declared.is_some();
+    let requested = explicit
+        .as_ref()
+        .or_else(|| declared.as_ref().map(|hint| &hint.executable));
+    let executable = match requested {
+        Some(path) => resolve_codex_cli_candidate(path, true),
+        None => candidates
+            .iter()
+            .find_map(|path| resolve_codex_cli_candidate(path, false)),
+    };
+    let key = executable.and_then(|executable| {
+        let declared_desktop_version = declared.and_then(|hint| {
+            let declared_executable = resolve_codex_cli_candidate(&hint.executable, true)?;
+            codex_executable_paths_match(&executable, &declared_executable)
+                .then_some(hint.desktop_version)
+                .flatten()
+        });
+        Some(CodexConsumerKey {
+            executable_stamp: codex_executable_stamp(&executable)?,
+            package_stamps: codex_package_stamps(&executable),
+            executable,
+            home,
+            codex_home,
+            environment_codex_home: None,
+            declared_desktop_version,
+        })
+    });
+    CodexConsumerContext {
+        key,
+        explicitly_declared,
+    }
+}
+
+fn codex_consumer_context(config_text: &str) -> CodexConsumerContext {
+    let explicit = std::env::var_os("CODEX_CLI_PATH").map(PathBuf::from);
+    let declared = declared_codex_runtime(config_text);
+    let candidates = if explicit.is_none() && declared.is_none() {
+        discovered_codex_cli_candidates()
+    } else {
+        Vec::new()
+    };
+    let mut consumer = codex_consumer_context_from_inputs(
+        explicit,
+        declared,
+        &candidates,
+        get_home_dir(),
+        get_codex_config_dir(),
+    );
+    if let Some(key) = consumer.key.as_mut() {
+        // The CLI inherits this independently of CC Switch's target directory.
+        key.environment_codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
+    }
+    consumer
+}
+
+fn get_or_load_codex_consumer_profile<F>(
+    cache: &Mutex<Option<CachedCodexConsumerProfile>>,
+    key: &CodexConsumerKey,
+    now: std::time::Instant,
+    loader: F,
+) -> Result<Option<Vec<Value>>, AppError>
+where
+    F: FnOnce() -> Result<Option<Vec<Value>>, AppError>,
+{
+    let mut entry = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = entry.as_ref().filter(|cached| &cached.key == key) {
+        if cached.bundled_models.is_some()
+            || now.saturating_duration_since(cached.attempted_at)
+                < CODEX_CONSUMER_FAILURE_RETRY_DELAY
+        {
+            return Ok(cached.bundled_models.clone());
+        }
+    }
+    let bundled_models = loader()?.filter(|models| !models.is_empty());
+    *entry = Some(CachedCodexConsumerProfile {
+        key: key.clone(),
+        bundled_models: bundled_models.clone(),
+        attempted_at: now,
+    });
+    Ok(bundled_models)
+}
+
+fn load_codex_consumer_profile_with<F>(
+    consumer: &CodexConsumerContext,
+    cache: &Mutex<Option<CachedCodexConsumerProfile>>,
+    now: std::time::Instant,
+    loader: F,
+) -> Result<Option<Vec<Value>>, AppError>
+where
+    F: FnOnce(&Path) -> Result<Option<Vec<Value>>, AppError>,
+{
+    let Some(key) = consumer.key.as_ref() else {
+        return Ok(None);
+    };
+    get_or_load_codex_consumer_profile(cache, key, now, || loader(&key.executable))
 }
 
 fn codex_bundled_models_command(candidate: &Path) -> Command {
@@ -2353,66 +2660,70 @@ fn codex_bundled_models_command(candidate: &Path) -> Command {
 }
 
 #[cfg(not(test))]
-fn load_codex_bundled_models_uncached() -> Option<Vec<Value>> {
-    let deadline = std::time::Instant::now().checked_add(std::time::Duration::from_secs(5))?;
-    for candidate in codex_cli_candidates() {
-        let candidate_label = candidate.to_string_lossy();
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            log::warn!("Codex bundled 模型探测超时，使用已有目录和静态模板");
-            break;
-        }
-        let output = match crate::codex_desktop::command_output_with_timeout(
-            &mut codex_bundled_models_command(&candidate),
-            remaining,
-        ) {
-            Some(output) => output,
-            None => continue,
-        };
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log::debug!("`{candidate_label} debug models --bundled` failed: {stderr}");
-            continue;
-        }
-
-        let catalog: Value = match serde_json::from_slice(&output.stdout) {
-            Ok(catalog) => catalog,
-            Err(e) => {
-                log::debug!(
-                    "Failed to parse `{candidate_label} debug models --bundled` output: {e}"
-                );
-                continue;
-            }
-        };
-        let models = catalog
-            .get("models")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if !models.is_empty() {
-            return Some(models);
-        }
+fn load_codex_bundled_models_uncached(executable: &Path) -> Option<Vec<Value>> {
+    // Probe exactly the selected consumer. A failed/old explicit runtime must
+    // never silently borrow metadata from another installed Codex binary.
+    let output = crate::codex_desktop::command_output_with_timeout(
+        &mut codex_bundled_models_command(executable),
+        std::time::Duration::from_secs(5),
+    )?;
+    if !output.status.success() {
+        // Do not log arbitrary subprocess stderr: wrappers may print secrets.
+        log::debug!("Selected Codex runtime did not return bundled model metadata");
+        return None;
     }
-
-    None
+    let catalog: Value = serde_json::from_slice(&output.stdout).ok()?;
+    catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .cloned()
+        .filter(|models| codex_consumer_model_template(models).is_some())
 }
 
-#[cfg(not(test))]
+fn load_codex_bundled_models_for_consumer(consumer: &CodexConsumerContext) -> Option<Vec<Value>> {
+    #[cfg(test)]
+    {
+        // Tests inject profiles below, never execute a machine's CLI.
+        let _ = consumer;
+        None
+    }
+    #[cfg(not(test))]
+    {
+        load_codex_consumer_profile_with(
+            consumer,
+            &CODEX_CONSUMER_PROFILE_CACHE,
+            std::time::Instant::now(),
+            |executable| Ok(load_codex_bundled_models_uncached(executable)),
+        )
+        .ok()
+        .flatten()
+    }
+}
+
 fn load_codex_bundled_models() -> Option<Vec<Value>> {
-    CODEX_BUNDLED_MODELS_CACHE
-        .get_or_init(load_codex_bundled_models_uncached)
-        .clone()
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        let config = fs::read_to_string(get_codex_config_path()).unwrap_or_default();
+        load_codex_bundled_models_for_consumer(&codex_consumer_context(&config))
+    }
 }
 
-#[cfg(test)]
-fn load_codex_bundled_models() -> Option<Vec<Value>> {
-    None
-}
-
-fn load_codex_model_template_from_bundled() -> Result<Option<Value>, AppError> {
-    let models = load_codex_bundled_models();
-    Ok(models.and_then(|models| find_codex_model_template(&json!({ "models": models }))))
+fn codex_consumer_model_template(models: &[Value]) -> Option<Value> {
+    // Old runtimes may not ship the current preferred slug. Their own native
+    // ModelInfo still provides a safer parser shape than a newer static model.
+    let usable = |model: &&Value| model.is_object() && codex_catalog_has_instruction_source(model);
+    models
+        .iter()
+        .filter(usable)
+        .find(|model| {
+            model.get("slug").and_then(Value::as_str) == Some(CODEX_MODEL_CATALOG_TEMPLATE_SLUG)
+        })
+        .or_else(|| models.iter().find(usable))
+        .cloned()
 }
 
 fn load_codex_model_template_static() -> Option<Value> {
@@ -2641,48 +2952,61 @@ fn backfill_codex_cache_instruction_sources(cache: &mut Value) -> bool {
     changed
 }
 
-fn load_codex_model_catalog_template_uncached() -> Result<Value, AppError> {
-    // ① models_cache.json (created by Codex when it connects to OpenAI)
-    if let Some(mut template) = load_codex_model_template_from_cache()? {
-        fill_template_fields_from_static(&mut template);
-        return Ok(template);
-    }
-    // ② codex CLI (PATH + platform-specific common paths)
-    if let Some(mut template) = load_codex_model_template_from_bundled()? {
-        fill_template_fields_from_static(&mut template);
-        return Ok(template);
-    }
-    // ③ Static fallback bundled at compile time
-    if let Some(template) = load_codex_model_template_static() {
-        return Ok(template);
-    }
-
-    Err(AppError::Message(format!(
-        "Codex model catalog template `{CODEX_MODEL_CATALOG_TEMPLATE_SLUG}` not found. Please start Codex once so models_cache.json is available, or ensure the `codex` CLI is on PATH."
-    )))
-}
-
-fn get_or_load_codex_model_catalog_template<F>(
-    cache: &OnceCell<Value>,
-    loader: F,
-) -> Result<Value, AppError>
+fn preferred_codex_model_template<F>(
+    cached: Option<Value>,
+    bundled: F,
+) -> Result<Option<Value>, AppError>
 where
-    F: FnOnce() -> Result<Value, AppError>,
+    F: FnOnce() -> Result<Option<Value>, AppError>,
 {
-    cache.get_or_try_init(loader).cloned()
+    Ok(bundled()?.or(cached))
 }
 
-#[cfg(not(test))]
-fn load_codex_model_catalog_template() -> Result<Value, AppError> {
-    get_or_load_codex_model_catalog_template(
-        &CODEX_MODEL_CATALOG_TEMPLATE_CACHE,
-        load_codex_model_catalog_template_uncached,
-    )
+fn codex_consumer_allows_shared_cache_template(consumer: &CodexConsumerContext) -> bool {
+    // models_cache.json is shared by terminal/desktop installations and may be
+    // CC Switch's own projection. client_version alone proves neither its
+    // author nor parser shape. Use it only for the legacy, unknown-consumer case.
+    consumer.key.is_none() && !consumer.explicitly_declared
 }
 
-#[cfg(test)]
-fn load_codex_model_catalog_template() -> Result<Value, AppError> {
-    load_codex_model_catalog_template_uncached()
+fn assemble_codex_model_catalog_template(
+    cached: Option<Value>,
+    bundled: Option<Value>,
+) -> Result<Value, AppError> {
+    if let Some(mut template) = preferred_codex_model_template(cached, || Ok(bundled))? {
+        fill_template_fields_from_static(&mut template);
+        return Ok(template);
+    }
+    // This fallback is best-effort compatibility, not evidence that a selected
+    // runtime supports every field or a reason to demand the latest CLI.
+    load_codex_model_template_static().ok_or_else(|| {
+        AppError::Message(format!(
+            "Codex model catalog template `{CODEX_MODEL_CATALOG_TEMPLATE_SLUG}` not found."
+        ))
+    })
+}
+
+fn load_codex_model_catalog_template(config_text: &str) -> Result<Value, AppError> {
+    #[cfg(test)]
+    let consumer = CodexConsumerContext {
+        key: None,
+        explicitly_declared: false,
+    };
+    #[cfg(not(test))]
+    let consumer = codex_consumer_context(config_text);
+    #[cfg(test)]
+    let _ = config_text;
+    let bundled = load_codex_bundled_models_for_consumer(&consumer)
+        .as_deref()
+        .and_then(codex_consumer_model_template);
+    let cached = if codex_consumer_allows_shared_cache_template(&consumer) {
+        load_codex_model_template_from_cache()?
+    } else {
+        None
+    };
+    // Do not cache assembled/static templates: shared sources, HOME, and the
+    // selected runtime can change, including recovery after a failed probe.
+    assemble_codex_model_catalog_template(cached, bundled)
 }
 
 fn codex_model_catalog_from_specs(
@@ -2807,7 +3131,7 @@ fn codex_model_catalog_from_settings(
         CodexCatalogToolProfile::NativeResponses | CodexCatalogToolProfile::Anthropic => {
             load_codex_native_responses_template()
         }
-        CodexCatalogToolProfile::ProxyChat => load_codex_model_catalog_template()?,
+        CodexCatalogToolProfile::ProxyChat => load_codex_model_catalog_template(config_text)?,
     };
     Ok(Some(codex_model_catalog_from_specs(
         &specs,
@@ -3072,21 +3396,21 @@ fn set_codex_model_catalog_json_field(
 /// Desktop 包版本作为门控信号。
 const CODEX_DESKTOP_STRICT_CONFIG_MIN_VERSION: [u32; 3] = [26, 912, 0];
 
-/// 进程内缓存探测到的 Desktop 版本，避免每次配置写入都跑 PowerShell。
-#[cfg(not(test))]
-static CODEX_DESKTOP_VERSION_CACHE: OnceCell<Option<Vec<u32>>> = OnceCell::new();
-
 /// 给定版本是否会触发 "unrecognized configuration settings" 警告。
 ///
-/// 只信 26.MDD 包版本体系（首组件为 26），避免把其他版本体系误读成 Desktop 版本。
+/// 只信 YY.MDD.build[.revision] 的 Desktop 版本形状，不把 CLI semver 当作包版本。
 fn codex_desktop_warns_on_unrecognized_settings(version: &[u32]) -> bool {
-    version.first() == Some(&26)
+    matches!(version.len(), 3 | 4)
+        && (26..100).contains(&version[0])
         && desktop_version_is_at_least(version, CODEX_DESKTOP_STRICT_CONFIG_MIN_VERSION)
 }
 
 /// 版本逐位比较，缺位按 0 补齐。
 fn desktop_version_is_at_least(version: &[u32], minimum: [u32; 3]) -> bool {
-    (0..minimum.len()).all(|index| version.get(index).copied().unwrap_or(0) >= minimum[index])
+    (0..minimum.len())
+        .map(|index| version.get(index).copied().unwrap_or(0))
+        .cmp(minimum)
+        .is_ge()
 }
 
 /// 已知 Desktop 版本下，是否应写入 provider 内联 `models` 投影。
@@ -3138,72 +3462,39 @@ fn schedule_codex_public_official_catalog_refresh() {
     }
 }
 
-/// 在接管锁之外预热版本和 bundled 模型，并调度一次官方目录刷新。其他投影入口仍可按需探测
-/// bundled 模型，但子进程有整体截止时间，不能无限占用写配置线程。
+/// 在接管锁之外预热当前 consumer 的 bundled 模型，并调度官方目录刷新。
 pub(crate) async fn prewarm_codex_projection_processes() {
     #[cfg(not(test))]
     {
-        let desktop = async {
-            if CODEX_DESKTOP_VERSION_CACHE.get().is_some() {
-                return;
-            }
-            let detection = tauri::async_runtime::spawn_blocking(|| {
-                CODEX_DESKTOP_VERSION_CACHE
-                    .get_or_init(crate::codex_desktop::installed_codex_desktop_version)
-                    .clone()
-            });
-            match tokio::time::timeout(std::time::Duration::from_secs(8), detection).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => log::warn!("Codex Desktop 版本探测任务失败: {error}"),
-                Err(_) => log::warn!("Codex Desktop 版本探测超时，按版本未知继续接管"),
-            }
-        };
-        let bundled = async {
-            if CODEX_BUNDLED_MODELS_CACHE.get().is_some() {
-                return;
-            }
-            let detection = tauri::async_runtime::spawn_blocking(|| {
-                CODEX_BUNDLED_MODELS_CACHE
-                    .get_or_init(load_codex_bundled_models_uncached)
-                    .clone()
-            });
-            match tokio::time::timeout(std::time::Duration::from_secs(8), detection).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => log::warn!("Codex bundled 模型探测任务失败: {error}"),
-                Err(_) => log::warn!("Codex bundled 模型探测超时，使用已有目录和静态模板"),
-            }
-        };
-        // 官方目录刷新按后台任务调度：它不参与接管写入，也不需要调用方等待。
         schedule_codex_public_official_catalog_refresh();
-        tokio::join!(desktop, bundled);
+        let detection = tauri::async_runtime::spawn_blocking(load_codex_bundled_models);
+        match tokio::time::timeout(std::time::Duration::from_secs(8), detection).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => log::warn!("Codex bundled 模型探测任务失败: {error}"),
+            Err(_) => log::warn!("Codex bundled 模型探测超时，使用已有目录和静态模板"),
+        }
     }
 }
 
-fn cached_codex_desktop_version(cache: &OnceCell<Option<Vec<u32>>>) -> Option<Vec<u32>> {
-    cache.get().cloned().flatten()
+/// Read compatibility from the same declared runtime/config snapshot being
+/// projected, never the highest unrelated installed Desktop version. No process
+/// detection is permitted in this write-path lookup. The paired app version is
+/// a declared runtime hint, not proof of all concurrently running consumers.
+fn codex_desktop_version_for_consumer(consumer: &CodexConsumerContext) -> Option<Vec<u32>> {
+    consumer.key.as_ref()?.declared_desktop_version.clone()
 }
 
-/// 返回已缓存的 Codex Desktop 版本；未完成或失败时按版本未知处理。
-///
-/// 测试构建不跑真实探测（结果依赖机器环境，会让投影测试变成机器相关）：
-/// 直接返回 `None`，全部测试走"版本未知"的旧行为。
-fn codex_desktop_version_for_projection() -> Option<Vec<u32>> {
-    #[cfg(test)]
-    {
-        return None;
-    }
-    #[cfg(not(test))]
-    {
-        cached_codex_desktop_version(&CODEX_DESKTOP_VERSION_CACHE)
-    }
+fn codex_desktop_version_for_projection(config_text: &str) -> Option<Vec<u32>> {
+    codex_desktop_version_for_consumer(&codex_consumer_context(config_text))
 }
 
-/// 是否应写入 provider 内联 `models` 投影。
-///
-/// 严格诊断生效的 Desktop 只写顶层 `model_catalog_json` 并清理内联模型；旧
-/// Desktop 或探测失败时保留旧行为，避免回归。
-fn projection_write_inline_provider_models() -> bool {
-    projection_write_inline_provider_models_for(codex_desktop_version_for_projection().as_deref())
+/// Known matching Desktop runtimes omit private inline `models`; unknown or
+/// malformed compatibility preserves the legacy behavior. CLI help flags and
+/// fallback/static catalogs are deliberately not used as capability evidence.
+fn projection_write_inline_provider_models(config_text: &str) -> bool {
+    projection_write_inline_provider_models_for(
+        codex_desktop_version_for_projection(config_text).as_deref(),
+    )
 }
 
 /// 同步 Codex Desktop 需要的 catalog 指针和 provider 内联模型。
@@ -7068,9 +7359,9 @@ fn prepare_codex_config_text_with_model_catalog_impl(
     };
     let has_catalog_inventory = catalog_models(settings).is_some();
 
-    // 是否写入 provider 内联模型取决于已安装 Desktop 版本；严格诊断生效的
-    // Desktop 只保留 catalog 指针。
-    let write_inline_provider_models = projection_write_inline_provider_models();
+    // 只使用与本次配置匹配的 runtime 声明；不借用其他已安装 Desktop 的版本。
+    // 已知严格诊断生效时只保留 catalog 指针。
+    let write_inline_provider_models = projection_write_inline_provider_models(config_text);
 
     // An explicitly empty included list must replace stale picker models, not
     // restore official models. Only an absent/malformed inventory relinquishes ownership.
@@ -7281,7 +7572,7 @@ fn read_back_codex_multirouter_projection_impl(
                 return false;
             }
             let mut expected_document = document.clone();
-            if projection_write_inline_provider_models() {
+            if projection_write_inline_provider_models(&live_after) {
                 set_active_codex_provider_models(
                     &mut expected_document,
                     &specs,
@@ -16657,12 +16948,29 @@ base_url = "http://127.0.0.1:15721/v1"
             .find(|spec| spec.model == "deepseek/deepseek-v4-pro")
             .expect("OpenRouter model spec");
         assert_eq!(spec.reasoning_source, "library");
-        assert_eq!(
-            spec.reasoning
-                .as_ref()
-                .map(|capability| capability.supported_efforts.clone()),
-            Some(vec!["xhigh".to_string(), "high".to_string()])
-        );
+        let capability = spec
+            .reasoning
+            .as_ref()
+            .expect("OpenRouter library capability");
+        // OpenRouter's maintained platform contract is not the official
+        // DeepSeek string-wire fallback or its former xhigh-only projection.
+        assert_eq!(capability.supported_efforts, vec!["max", "high", "low"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("high"));
+        assert!(!capability.disable_allowed);
+        assert_eq!(capability.upstream.format, "object");
+        assert_eq!(capability.upstream.parameter, "reasoning.effort");
+        for effort in ["max", "high", "low"] {
+            assert_eq!(
+                capability
+                    .upstream
+                    .effort_map
+                    .get(effort)
+                    .map(String::as_str),
+                Some(effort)
+            );
+        }
+        assert!(!capability.upstream.effort_map.contains_key("xhigh"));
+        assert!(!spec.reasoning_fingerprint.is_empty());
     }
 
     #[test]
@@ -16839,6 +17147,22 @@ base_url = "http://127.0.0.1:15721/v1"
 
     /// 严格诊断版本门控：只有 26.MDD 包版本体系且 >= 26.912.0 才视为触发警告。
     #[test]
+    fn consumer_compatibility_version_comparison_is_lexicographic() {
+        assert!(desktop_version_is_at_least(&[26, 1100, 0], [26, 1007, 1]));
+        assert!(!desktop_version_is_at_least(
+            &[26, 1006, 999],
+            [26, 1007, 1]
+        ));
+        assert!(desktop_version_is_at_least(&[26, 1007, 1], [26, 1007, 1]));
+    }
+
+    #[test]
+    fn consumer_compatibility_recognizes_later_desktop_trains() {
+        assert!(codex_desktop_warns_on_unrecognized_settings(&[27, 101, 0]));
+        assert!(!codex_desktop_warns_on_unrecognized_settings(&[123]));
+    }
+
+    #[test]
     fn strict_config_version_gate_matrix() {
         let versions = [
             Vec::<u32>::new(),
@@ -16892,15 +17216,23 @@ base_url = "http://127.0.0.1:15721/v1"
 
     #[test]
     fn projection_version_lookup_never_starts_detection_in_the_write_path() {
-        let cache = OnceCell::new();
-        assert_eq!(cached_codex_desktop_version(&cache), None);
-        assert!(cache.get().is_none(), "只读投影不能初始化版本探测");
-
-        cache.set(Some(vec![26, 915, 4065, 0])).unwrap();
+        let mut key = test_codex_consumer_key("declared-runtime");
+        let unknown = CodexConsumerContext {
+            key: None,
+            explicitly_declared: false,
+        };
+        assert_eq!(codex_desktop_version_for_consumer(&unknown), None);
+        key.declared_desktop_version = Some(vec![26, 915, 4065, 0]);
+        let consumer = CodexConsumerContext {
+            key: Some(key),
+            explicitly_declared: true,
+        };
         assert_eq!(
-            cached_codex_desktop_version(&cache),
+            codex_desktop_version_for_consumer(&consumer),
             Some(vec![26, 915, 4065, 0])
         );
+        // This lookup takes a value-only descriptor and cannot invoke a loader
+        // or installed-package detector, including from the projection lock.
     }
 
     /// 严格诊断生效的 Desktop：不写内联模型，并清理旧版本残留的内联模型；
@@ -18620,7 +18952,7 @@ trust_level = "trusted"
 
     #[test]
     fn codex_cli_candidates_are_non_empty() {
-        let candidates = codex_cli_candidates();
+        let candidates = discovered_codex_cli_candidates();
         assert!(
             candidates
                 .iter()
@@ -18643,47 +18975,551 @@ trust_level = "trusted"
     }
 
     #[test]
-    fn successful_model_catalog_template_load_is_cached() {
-        use std::cell::Cell;
-
-        let cache = OnceCell::new();
-        let calls = Cell::new(0);
-        let first = get_or_load_codex_model_catalog_template(&cache, || {
-            calls.set(calls.get() + 1);
-            Ok(json!({ "slug": "first" }))
-        })
-        .expect("first template load");
-        let second = get_or_load_codex_model_catalog_template(&cache, || {
-            calls.set(calls.get() + 1);
-            Ok(json!({ "slug": "second" }))
-        })
-        .expect("cached template load");
-
-        assert_eq!(first, json!({ "slug": "first" }));
-        assert_eq!(second, first);
-        assert_eq!(calls.get(), 1, "successful template should load only once");
+    fn consumer_compatibility_bundle_beats_another_client_cache() {
+        let template = preferred_codex_model_template(
+            Some(json!({"slug": "gpt-5.5", "source": "other-client-cache"})),
+            || {
+                Ok(Some(
+                    json!({"slug": "gpt-5.5", "source": "selected-consumer"}),
+                ))
+            },
+        )
+        .expect("select template")
+        .expect("template");
+        assert_eq!(template["source"], "selected-consumer");
     }
 
     #[test]
-    fn failed_model_catalog_template_load_can_retry() {
-        use std::cell::Cell;
+    fn consumer_compatibility_template_observes_changed_source() {
+        let first = assemble_codex_model_catalog_template(
+            None,
+            Some(json!({"slug": "gpt-5.5", "source": "consumer-a"})),
+        )
+        .expect("first template");
+        let second = assemble_codex_model_catalog_template(
+            None,
+            Some(json!({"slug": "gpt-5.5", "source": "consumer-b"})),
+        )
+        .expect("changed consumer template");
+        assert_ne!(
+            first, second,
+            "a process-lifetime template must not hide a changed consumer/source"
+        );
+    }
 
-        let cache = OnceCell::new();
+    #[test]
+    #[serial]
+    fn consumer_compatibility_explicit_cli_blocks_unrelated_discovery() {
+        let _home = TestHomeGuard::new();
+        let path = get_home_dir().join("missing-runtime").join("codex.exe");
+        let _restore = TestCodexCliPathGuard::new(Some(&path));
+        assert!(
+            codex_cli_candidates().is_empty(),
+            "invalid explicit runtime must not expose a relative or unrelated candidate"
+        );
+    }
+
+    struct TestCodexCliPathGuard(Option<std::ffi::OsString>);
+
+    impl TestCodexCliPathGuard {
+        fn new(path: Option<&Path>) -> Self {
+            let previous = Self(std::env::var_os("CODEX_CLI_PATH"));
+            match path {
+                Some(path) => std::env::set_var("CODEX_CLI_PATH", path),
+                None => std::env::remove_var("CODEX_CLI_PATH"),
+            }
+            previous
+        }
+    }
+
+    impl Drop for TestCodexCliPathGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("CODEX_CLI_PATH", value),
+                None => std::env::remove_var("CODEX_CLI_PATH"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn consumer_compatibility_snapshot_gate_controls_actual_projection_writer() {
+        let _home = TestHomeGuard::new();
+        let _cli = TestCodexCliPathGuard::new(None);
+        let executable = get_home_dir().join("declared-runtime/codex.exe");
+        write_test_codex_executable(&executable, "offline-fixture-never-executed");
+        let config_for = |version: &str| {
+            toml::to_string(&json!({
+                "model": "private-model",
+                "model_provider": "custom",
+                "model_providers": {"custom": {
+                    "base_url": "https://example.invalid/v1",
+                    "models": [{"model": "stale-model"}]
+                }},
+                "mcp_servers": {"node_repl": {"env": {
+                    "CODEX_CLI_PATH": executable.to_string_lossy(),
+                    "BROWSER_USE_CODEX_APP_VERSION": version
+                }}}
+            }))
+            .unwrap()
+        };
+        let legacy = config_for("26.911.0");
+        fs::create_dir_all(get_codex_config_dir()).unwrap();
+        fs::write(get_codex_config_path(), &legacy).unwrap();
+        let settings = json!({"modelCatalog": {"models": [{"model": "private-model"}]}});
+        // The in-flight snapshot differs from the active file. A current
+        // strict runtime must clean stale inline models without a CLI probe.
+        let strict = prepare_codex_config_text_with_model_catalog_without_provider_context(
+            &settings,
+            &config_for("26.1029.61003"),
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .unwrap();
+        let strict: toml::Value = toml::from_str(&strict).unwrap();
+        assert!(
+            strict["model_providers"]["custom"].get("models").is_none(),
+            "matching strict runtime must not retain private inline models"
+        );
+        assert!(strict.get("model_catalog_json").is_some());
+        assert_eq!(
+            strict["model_providers"]["custom"]["base_url"].as_str(),
+            Some("https://example.invalid/v1")
+        );
+        let legacy_projected =
+            prepare_codex_config_text_with_model_catalog_without_provider_context(
+                &settings,
+                &legacy,
+                CodexCatalogToolProfile::NativeResponses,
+            )
+            .unwrap();
+        let legacy_projected: toml::Value = toml::from_str(&legacy_projected).unwrap();
+        assert!(
+            legacy_projected["model_providers"]["custom"]["models"]
+                .as_array()
+                .is_some(),
+            "legacy matching runtime must keep the inline projection"
+        );
+        let override_executable = get_home_dir().join("terminal-runtime/codex.exe");
+        write_test_codex_executable(&override_executable, "another-offline-runtime");
+        std::env::set_var("CODEX_CLI_PATH", &override_executable);
+        let overridden = prepare_codex_config_text_with_model_catalog_without_provider_context(
+            &settings,
+            &config_for("26.1029.61003"),
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .unwrap();
+        let overridden: toml::Value = toml::from_str(&overridden).unwrap();
+        assert!(
+            overridden["model_providers"]["custom"]["models"]
+                .as_array()
+                .is_some(),
+            "a different explicit CLI must not inherit Desktop's strict gate"
+        );
+    }
+
+    fn write_test_codex_executable(path: &Path, content: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn test_codex_consumer_key(name: &str) -> CodexConsumerKey {
+        CodexConsumerKey {
+            executable: PathBuf::from(name),
+            executable_stamp: CodexExecutableStamp {
+                length: 1,
+                modified: Some(std::time::SystemTime::UNIX_EPOCH),
+            },
+            package_stamps: Vec::new(),
+            home: PathBuf::from("test-home"),
+            codex_home: PathBuf::from("test-codex-home"),
+            environment_codex_home: None,
+            declared_desktop_version: None,
+        }
+    }
+
+    #[test]
+    fn consumer_compatibility_successful_profile_is_cached_for_unchanged_key() {
+        use std::cell::Cell;
+        let cache = Mutex::new(None);
         let calls = Cell::new(0);
-        let first = get_or_load_codex_model_catalog_template(&cache, || {
+        let key = test_codex_consumer_key("consumer-a");
+        let now = std::time::Instant::now();
+        let first = get_or_load_codex_consumer_profile(&cache, &key, now, || {
+            calls.set(calls.get() + 1);
+            Ok(Some(vec![json!({ "slug": "first" })]))
+        })
+        .expect("first profile load");
+        let second = get_or_load_codex_consumer_profile(&cache, &key, now, || {
+            calls.set(calls.get() + 1);
+            Ok(Some(vec![json!({ "slug": "second" })]))
+        })
+        .expect("cached profile load");
+        assert_eq!(first, Some(vec![json!({ "slug": "first" })]));
+        assert_eq!(second, first);
+        assert_eq!(calls.get(), 1, "unchanged consumer should load only once");
+    }
+
+    #[test]
+    fn consumer_compatibility_failed_profile_load_can_retry() {
+        use std::cell::Cell;
+        let cache = Mutex::new(None);
+        let calls = Cell::new(0);
+        let key = test_codex_consumer_key("consumer-a");
+        let now = std::time::Instant::now();
+        let first = get_or_load_codex_consumer_profile(&cache, &key, now, || {
             calls.set(calls.get() + 1);
             Err(AppError::Message("temporary failure".to_string()))
         });
         assert!(first.is_err());
-
-        let second = get_or_load_codex_model_catalog_template(&cache, || {
+        let second = get_or_load_codex_consumer_profile(&cache, &key, now, || {
             calls.set(calls.get() + 1);
-            Ok(json!({ "slug": "recovered" }))
+            Ok(Some(vec![json!({ "slug": "recovered" })]))
         })
-        .expect("retry template load");
-
-        assert_eq!(second, json!({ "slug": "recovered" }));
+        .expect("retry profile load");
+        assert_eq!(second, Some(vec![json!({ "slug": "recovered" })]));
         assert_eq!(calls.get(), 2, "failed loads must not poison the cache");
+    }
+
+    #[test]
+    fn consumer_compatibility_profile_changes_with_consumer_and_home() {
+        let cache = Mutex::new(None);
+        let now = std::time::Instant::now();
+        let mut key = test_codex_consumer_key("consumer-a");
+        for (index, change) in [
+            "first",
+            "path",
+            "binary",
+            "home",
+            "codex-home",
+            "environment-codex-home",
+            "app-hint",
+        ]
+        .iter()
+        .enumerate()
+        {
+            match *change {
+                "path" => key.executable = PathBuf::from("consumer-b"),
+                "binary" => key.executable_stamp.length += 1,
+                "home" => key.home = PathBuf::from("another-home"),
+                "codex-home" => key.codex_home = PathBuf::from("another-codex-home"),
+                "environment-codex-home" => {
+                    key.environment_codex_home = Some(PathBuf::from("process-codex-home"))
+                }
+                "app-hint" => key.declared_desktop_version = Some(vec![27, 101, 0]),
+                _ => {}
+            }
+            let profile = get_or_load_codex_consumer_profile(&cache, &key, now, || {
+                Ok(Some(vec![json!({"source": index})]))
+            })
+            .expect("changed source")
+            .expect("profile");
+            assert_eq!(
+                profile[0]["source"], index,
+                "{change} must invalidate the profile"
+            );
+        }
+    }
+
+    #[test]
+    fn consumer_compatibility_failed_bundle_does_not_pin_static_template() {
+        let cache = Mutex::new(None);
+        let key = test_codex_consumer_key("consumer-a");
+        let now = std::time::Instant::now();
+        let failed = get_or_load_codex_consumer_profile(&cache, &key, now, || Ok(None)).unwrap();
+        let fallback = assemble_codex_model_catalog_template(
+            None,
+            failed.as_deref().and_then(codex_consumer_model_template),
+        )
+        .unwrap();
+        let recovered = get_or_load_codex_consumer_profile(
+            &cache,
+            &key,
+            now + CODEX_CONSUMER_FAILURE_RETRY_DELAY,
+            || {
+                Ok(Some(vec![
+                    json!({"slug": "gpt-5.5", "base_instructions": "Native runtime instructions", "source": "recovered-runtime"}),
+                ]))
+            },
+        )
+        .unwrap();
+        let template = assemble_codex_model_catalog_template(
+            None,
+            recovered.as_deref().and_then(codex_consumer_model_template),
+        )
+        .unwrap();
+        assert_ne!(template, fallback);
+        assert_eq!(template["source"], "recovered-runtime");
+    }
+
+    #[test]
+    fn consumer_compatibility_negative_probe_has_bounded_cooldown() {
+        let cache = Mutex::new(None);
+        let key = test_codex_consumer_key("consumer-a");
+        let now = std::time::Instant::now();
+        assert_eq!(
+            get_or_load_codex_consumer_profile(&cache, &key, now, || Ok(None)).unwrap(),
+            None
+        );
+        let repeated = get_or_load_codex_consumer_profile(&cache, &key, now, || {
+            panic!("cooldown must avoid a repeated subprocess")
+        });
+        assert_eq!(repeated.unwrap(), None);
+        let mut changed = key.clone();
+        changed.executable_stamp.length += 1;
+        let updated = get_or_load_codex_consumer_profile(&cache, &changed, now, || {
+            Ok(Some(vec![json!({"source": "updated"})]))
+        })
+        .unwrap();
+        assert_eq!(
+            updated.unwrap()[0]["source"],
+            "updated",
+            "same-path upgrades invalidate negative entries too"
+        );
+    }
+
+    #[test]
+    fn consumer_compatibility_explicit_selection_is_fail_closed_and_paired() {
+        let directory = tempfile::tempdir().unwrap();
+        let desktop = directory.path().join("desktop-codex.exe");
+        let terminal = directory.path().join("terminal-codex.exe");
+        write_test_codex_executable(&desktop, "desktop-runtime");
+        write_test_codex_executable(&terminal, "terminal-runtime");
+        let hint = DeclaredCodexRuntime {
+            executable: desktop.clone(),
+            desktop_version: Some(vec![26, 1029, 61003]),
+        };
+        let context = |explicit, declared| {
+            codex_consumer_context_from_inputs(
+                explicit,
+                declared,
+                std::slice::from_ref(&terminal),
+                directory.path().to_path_buf(),
+                directory.path().join("codex-home"),
+            )
+        };
+        let selected = context(None, Some(hint.clone()));
+        assert_eq!(
+            selected.key.as_ref().unwrap().executable,
+            fs::canonicalize(&desktop).unwrap()
+        );
+        assert_eq!(
+            codex_desktop_version_for_consumer(&selected),
+            hint.desktop_version
+        );
+        let same_override = context(Some(desktop.clone()), Some(hint.clone()));
+        assert_eq!(
+            codex_desktop_version_for_consumer(&same_override),
+            hint.desktop_version
+        );
+        let terminal_override = context(Some(terminal.clone()), Some(hint.clone()));
+        assert_eq!(
+            codex_desktop_version_for_consumer(&terminal_override),
+            None,
+            "another terminal CLI cannot inherit Desktop compatibility"
+        );
+        for invalid in [
+            directory.path().join("missing.exe"),
+            PathBuf::from("codex"),
+            PathBuf::new(),
+        ] {
+            let rejected = context(Some(invalid), Some(hint.clone()));
+            assert!(rejected.explicitly_declared);
+            assert!(
+                rejected.key.is_none(),
+                "invalid explicit declaration must not use the discovered terminal"
+            );
+            assert!(!codex_consumer_allows_shared_cache_template(&rejected));
+        }
+        // Even an existing selected file whose metadata probe fails cannot use
+        // another installation's shared-cache shape or a second executable.
+        assert!(!codex_consumer_allows_shared_cache_template(&selected));
+        assert_eq!(
+            selected.key.unwrap().executable,
+            fs::canonicalize(desktop).unwrap()
+        );
+    }
+
+    #[test]
+    fn consumer_compatibility_same_path_and_npm_package_replacement_invalidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("codex.cmd");
+        write_test_codex_executable(&executable, "old");
+        let context = || {
+            codex_consumer_context_from_inputs(
+                Some(executable.clone()),
+                None,
+                &[],
+                directory.path().to_path_buf(),
+                directory.path().join("codex-home"),
+            )
+        };
+        let first = context().key.unwrap();
+        fs::write(&executable, "new-consumer").unwrap();
+        let replaced = context().key.unwrap();
+        assert_ne!(
+            first, replaced,
+            "same-path binary replacement must change the key"
+        );
+        let manifest = directory
+            .path()
+            .join("node_modules/@openai/codex/package.json");
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(&manifest, r#"{"version":"0.166.0"}"#).unwrap();
+        let installed = context().key.unwrap();
+        assert_ne!(
+            replaced, installed,
+            "npm package installation must invalidate an unchanged wrapper"
+        );
+        fs::write(&manifest, r#"{"version":"0.167.0-alpha.1"}"#).unwrap();
+        assert_ne!(
+            installed,
+            context().key.unwrap(),
+            "npm package update must invalidate an unchanged wrapper"
+        );
+    }
+
+    #[test]
+    fn consumer_compatibility_canonical_npm_bin_package_replacement_invalidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("lib/node_modules/@openai/codex");
+        let executable = package.join("bin/codex.js");
+        write_test_codex_executable(&executable, "unchanged-npm-wrapper");
+        let manifest = package.join("package.json");
+        fs::write(&manifest, r#"{"version":"0.166.0"}"#).unwrap();
+        let context = || {
+            codex_consumer_context_from_inputs(
+                Some(executable.clone()),
+                None,
+                &[],
+                directory.path().to_path_buf(),
+                directory.path().join("codex-home"),
+            )
+        };
+        let before = context().key.unwrap();
+        assert!(before
+            .package_stamps
+            .iter()
+            .any(|(path, stamp)| path == &fs::canonicalize(&manifest).unwrap() && stamp.is_some()));
+        fs::write(&manifest, r#"{"version":"0.167.0-alpha.1"}"#).unwrap();
+        assert_ne!(
+            before,
+            context().key.unwrap(),
+            "canonical POSIX npm bin layout must stamp its actual ancestor manifest"
+        );
+    }
+
+    #[test]
+    fn consumer_compatibility_failed_explicit_probe_never_tries_another_binary() {
+        let directory = tempfile::tempdir().unwrap();
+        let explicit = directory.path().join("declared-codex.exe");
+        let unrelated = directory.path().join("other-codex.exe");
+        write_test_codex_executable(&explicit, "declared-runtime");
+        write_test_codex_executable(&unrelated, "unrelated-runtime");
+        let context = codex_consumer_context_from_inputs(
+            Some(explicit.clone()),
+            None,
+            &[unrelated],
+            directory.path().to_path_buf(),
+            directory.path().join("codex-home"),
+        );
+        let cache = Mutex::new(None);
+        let mut probed = Vec::new();
+        let result = load_codex_consumer_profile_with(
+            &context,
+            &cache,
+            std::time::Instant::now(),
+            |executable| {
+                probed.push(executable.to_path_buf());
+                Ok(None)
+            },
+        )
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(probed, vec![fs::canonicalize(&explicit).unwrap()]);
+        assert!(!codex_consumer_allows_shared_cache_template(&context));
+        let missing = codex_consumer_context_from_inputs(
+            Some(directory.path().join("missing.exe")),
+            None,
+            &[],
+            directory.path().to_path_buf(),
+            directory.path().join("codex-home"),
+        );
+        assert_eq!(
+            load_codex_consumer_profile_with(
+                &missing,
+                &cache,
+                std::time::Instant::now(),
+                |_| panic!("missing explicit paths must never execute")
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn consumer_compatibility_path_skips_non_executable_codex_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let stale = directory.path().join("stale/codex");
+        let executable = directory.path().join("actual/codex");
+        write_test_codex_executable(&stale, "not-executable");
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).unwrap();
+        write_test_codex_executable(&executable, "actual-runtime");
+        assert_eq!(
+            resolve_codex_cli_on_paths(
+                Path::new("codex"),
+                [
+                    stale.parent().unwrap().to_path_buf(),
+                    executable.parent().unwrap().to_path_buf()
+                ]
+            ),
+            Some(fs::canonicalize(&executable).unwrap())
+        );
+        assert!(resolve_codex_cli_candidate(&stale, true).is_none());
+    }
+
+    #[test]
+    fn consumer_compatibility_declaration_does_not_confuse_cli_and_app_versions() {
+        let parsed = declared_codex_runtime(
+            r#"
+[mcp_servers.node_repl.env]
+CODEX_CLI_PATH = 'C:\runtime\codex.exe'
+BROWSER_USE_CODEX_APP_VERSION = '26.1029.61003'
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.desktop_version, Some(vec![26, 1029, 61003]));
+        for unknown in [
+            "0.166.0",
+            "26",
+            "123",
+            "26.1029",
+            "26.1029.61003-alpha.1",
+            "malformed",
+        ] {
+            assert_eq!(parse_codex_desktop_version(unknown), None, "{unknown}");
+        }
+        assert_eq!(
+            parse_codex_desktop_version("27.101.0"),
+            Some(vec![27, 101, 0])
+        );
+    }
+
+    #[test]
+    fn consumer_compatibility_older_bundle_supplies_its_own_template_shape() {
+        let models = vec![
+            json!({"slug": "gpt-5.4", "base_instructions": "Native older runtime instructions", "source": "older-consumer"}),
+        ];
+        let template = codex_consumer_model_template(&models).unwrap();
+        assert_eq!(template["source"], "older-consumer");
+        assert_eq!(template["slug"], "gpt-5.4");
+        assert!(codex_consumer_model_template(&[json!({"slug": "invalid"})]).is_none());
     }
 
     #[test]

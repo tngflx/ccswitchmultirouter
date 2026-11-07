@@ -4296,6 +4296,417 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
   });
 
+  it("reconciles an in-flight refresh against the latest same-key provider without reverting saved edits", async () => {
+    const refresh = createDeferred<FetchedModel[]>();
+    vi.mocked(fetchModelsForConfig).mockReturnValueOnce(refresh.promise);
+    const source: Provider = {
+      id: "same-key-refresh-source",
+      name: "Original Source",
+      category: "custom",
+      settingsConfig: {
+        baseUrl: "https://same-key.example.invalid/v1",
+        auth: { OPENAI_API_KEY: "redacted-test-credential" },
+        modelCatalog: {
+          models: [{ model: "visible-alias", upstreamModel: "wire-model" }],
+        },
+        sourceSetting: "original",
+      },
+      notes: "original",
+      meta: { customUserAgent: "unchanged-agent", costMultiplier: "1" },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([source], [source]),
+      source,
+    );
+    const props = {
+      providers: [source, plan],
+      isProxyRunning: true,
+      isCodexTakeoverActive: true,
+      activeProviderId: plan.id,
+      initialProviderId: plan.id,
+      initialTab: "routes" as const,
+      onEditProvider: vi.fn(),
+      onDeletePlan: vi.fn(),
+      onCreateProvider: vi.fn(),
+    };
+    const { rerenderWorkspace } = renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, props),
+    );
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledOnce());
+
+    const editedSource: Provider = {
+      ...source,
+      name: "Saved Source Name",
+      settingsConfig: {
+        ...source.settingsConfig,
+        sourceSetting: "saved",
+        modelCatalog: {
+          models: [
+            {
+              model: "visible-alias",
+              upstreamModel: "wire-model",
+              displayName: "Saved model label",
+              enabled: false,
+            },
+          ],
+        },
+      },
+      notes: "saved",
+      meta: { ...source.meta, costMultiplier: "2" },
+    };
+    rerenderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        ...props,
+        providers: [editedSource, plan],
+      }),
+    );
+    expect(fetchModelsForConfig).toHaveBeenCalledOnce();
+
+    refresh.resolve([
+      { id: "wire-model", ownedBy: null, contextWindow: 131072 },
+    ]);
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+    const savedSource = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(savedSource).toMatchObject({
+      id: source.id,
+      name: "Saved Source Name",
+      settingsConfig: {
+        sourceSetting: "saved",
+        modelCatalog: {
+          models: [
+            {
+              model: "visible-alias",
+              upstreamModel: "wire-model",
+              displayName: "Saved model label",
+              enabled: false,
+              contextWindow: 131072,
+            },
+          ],
+        },
+      },
+      notes: "saved",
+      meta: { costMultiplier: "2" },
+    });
+    expect(providersApi.update).toHaveBeenCalledWith(
+      savedSource,
+      "codex",
+      undefined,
+      editedSource,
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText("Read and updated 0 models."),
+      ).toBeInTheDocument(),
+    );
+    expect(fetchModelsForConfig).toHaveBeenCalledOnce();
+  });
+
+  it("releases a refreshed catalog overlay when a newer same-key provider is received", async () => {
+    const refresh = createDeferred<FetchedModel[]>();
+    vi.mocked(fetchModelsForConfig).mockReturnValueOnce(refresh.promise);
+    const source: Provider = {
+      id: "overlay-refresh-source",
+      name: "Overlay Source",
+      category: "custom",
+      settingsConfig: {
+        baseUrl: "https://overlay.example.invalid/v1",
+        auth: { OPENAI_API_KEY: "redacted-test-credential" },
+        modelCatalog: { models: [] },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([source], [source]),
+      source,
+    );
+    const props = {
+      providers: [source, plan],
+      isProxyRunning: true,
+      isCodexTakeoverActive: true,
+      activeProviderId: plan.id,
+      initialProviderId: plan.id,
+      initialTab: "routes" as const,
+      onEditProvider: vi.fn(),
+      onDeletePlan: vi.fn(),
+      onCreateProvider: vi.fn(),
+    };
+    const { rerenderWorkspace } = renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, props),
+    );
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledOnce());
+    refresh.resolve([{ id: "fetched-model", ownedBy: null }]);
+    await waitFor(() =>
+      expect(
+        screen.getByText("Read and updated 1 models."),
+      ).toBeInTheDocument(),
+    );
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "Edit matching rules" }));
+    expect(screen.getByText("fetched-model")).toBeInTheDocument();
+
+    const editedSource: Provider = {
+      ...source,
+      settingsConfig: {
+        ...source.settingsConfig,
+        modelCatalog: {
+          models: [
+            { model: "fetched-model", enabled: false },
+            { model: "saved-after-refresh", enabled: true },
+          ],
+        },
+      },
+    };
+    rerenderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        ...props,
+        providers: [editedSource, plan],
+      }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText("saved-after-refresh")).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("fetched-model")).not.toBeInTheDocument();
+    expect(fetchModelsForConfig).toHaveBeenCalledOnce();
+    expect(providersApi.update).toHaveBeenCalledOnce();
+  });
+
+  it("does not publish a refresh after a newer provider arrives while its guarded save is pending", async () => {
+    const save = createDeferred<boolean>();
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "fetched-model", ownedBy: null },
+    ]);
+    vi.mocked(providersApi.update).mockReturnValueOnce(save.promise);
+    const source: Provider = {
+      id: "pending-save-source",
+      name: "Pending Save Source",
+      category: "custom",
+      settingsConfig: {
+        baseUrl: "https://pending-save.example.invalid/v1",
+        auth: { OPENAI_API_KEY: "redacted-test-credential" },
+        modelCatalog: { models: [] },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([source], [source]),
+      source,
+    );
+    const props = {
+      providers: [source, plan],
+      isProxyRunning: true,
+      isCodexTakeoverActive: true,
+      activeProviderId: plan.id,
+      initialProviderId: plan.id,
+      initialTab: "routes" as const,
+      onEditProvider: vi.fn(),
+      onDeletePlan: vi.fn(),
+      onCreateProvider: vi.fn(),
+    };
+    const { rerenderWorkspace } = renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, props),
+    );
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+    const editedSource: Provider = {
+      ...source,
+      settingsConfig: {
+        ...source.settingsConfig,
+        modelCatalog: { models: [{ model: "saved-after-refresh" }] },
+      },
+    };
+    rerenderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        ...props,
+        providers: [editedSource, plan],
+      }),
+    );
+    await act(async () => save.resolve(true));
+    await waitFor(() =>
+      expect(
+        screen.queryByText(
+          "Read 1 models; writing them to local configuration...",
+        ),
+      ).not.toBeInTheDocument(),
+    );
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "Edit matching rules" }));
+    expect(screen.getByText("saved-after-refresh")).toBeInTheDocument();
+    expect(screen.queryByText("fetched-model")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Read and updated 1 models."),
+    ).not.toBeInTheDocument();
+    expect(fetchModelsForConfig).toHaveBeenCalledOnce();
+    expect(providersApi.update).toHaveBeenCalledOnce();
+  });
+
+  it("reports a guarded refresh conflict without publishing or retrying its stale catalog", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "conflicting-model", ownedBy: null },
+    ]);
+    vi.mocked(providersApi.update).mockRejectedValueOnce(
+      new Error("provider_update_conflict"),
+    );
+    const source: Provider = {
+      id: "conflicting-refresh-source",
+      name: "Conflicting Refresh Source",
+      category: "custom",
+      settingsConfig: {
+        baseUrl: "https://conflict.example.invalid/v1",
+        auth: { OPENAI_API_KEY: "redacted-test-credential" },
+        modelCatalog: { models: [] },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([source], [source]),
+      source,
+    );
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [source, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "routes",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "The configuration changed while syncing models. Your newer settings were kept; sync again to refresh the model list.",
+        ),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByText(/provider_update_conflict/),
+    ).not.toBeInTheDocument();
+    expect(providersApi.update).toHaveBeenCalledWith(
+      expect.any(Object),
+      "codex",
+      undefined,
+      source,
+    );
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "Edit matching rules" }));
+    expect(screen.queryByText("conflicting-model")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Read and updated 1 models."),
+    ).not.toBeInTheDocument();
+    expect(fetchModelsForConfig).toHaveBeenCalledOnce();
+    expect(providersApi.update).toHaveBeenCalledOnce();
+  });
+
+  it("explains that safe model sync requires an updated and restarted native backend", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
+      { id: "unsaved-model", ownedBy: null },
+    ]);
+    vi.mocked(providersApi.update).mockRejectedValueOnce(
+      new Error("provider_refresh_backend_update_required"),
+    );
+    const source: Provider = {
+      id: "old-backend-refresh-source",
+      name: "Old Backend Refresh Source",
+      category: "custom",
+      settingsConfig: {
+        baseUrl: "https://old-backend.example.invalid/v1",
+        auth: { OPENAI_API_KEY: "redacted-test-credential" },
+        modelCatalog: { models: [] },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([source], [source]),
+      source,
+    );
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [source, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "routes",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "Safe model sync requires the updated CCSwitch backend. Rebuild or update CCSwitch, then fully quit and restart it before syncing again. Your provider settings were not changed.",
+        ),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByText(/provider_refresh_backend_update_required/),
+    ).not.toBeInTheDocument();
+    expect(providersApi.update).toHaveBeenCalledWith(
+      expect.any(Object),
+      "codex",
+      undefined,
+      source,
+    );
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "Edit matching rules" }));
+    expect(screen.queryByText("unsaved-model")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Read and updated 1 models."),
+    ).not.toBeInTheDocument();
+    expect(fetchModelsForConfig).toHaveBeenCalledOnce();
+    expect(providersApi.update).toHaveBeenCalledOnce();
+  });
+
+  it("does not recreate a removed provider when its model refresh finishes", async () => {
+    const refresh = createDeferred<FetchedModel[]>();
+    vi.mocked(fetchModelsForConfig).mockReturnValueOnce(refresh.promise);
+    const source: Provider = {
+      id: "removed-refresh-source",
+      name: "Removed Refresh Source",
+      category: "custom",
+      settingsConfig: {
+        baseUrl: "https://removed.example.invalid/v1",
+        auth: { OPENAI_API_KEY: "redacted-test-credential" },
+        modelCatalog: { models: [{ model: "old-model" }] },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([source], [source]),
+      source,
+    );
+    const props = {
+      providers: [source, plan],
+      isProxyRunning: true,
+      isCodexTakeoverActive: true,
+      activeProviderId: plan.id,
+      initialProviderId: plan.id,
+      initialTab: "routes" as const,
+      onEditProvider: vi.fn(),
+      onDeletePlan: vi.fn(),
+      onCreateProvider: vi.fn(),
+    };
+    const { rerenderWorkspace } = renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, props),
+    );
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledOnce());
+    rerenderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        ...props,
+        providers: [plan],
+      }),
+    );
+    await act(async () =>
+      refresh.resolve([{ id: "late-model", ownedBy: null }]),
+    );
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(screen.queryByText("late-model")).not.toBeInTheDocument();
+    expect(screen.queryByText("Reading model list...")).not.toBeInTheDocument();
+  });
+
   it("restarts provider refresh when the api key changes and ignores the stale request", async () => {
     const staleRefresh = createDeferred<FetchedModel[]>();
     const currentRefresh = createDeferred<FetchedModel[]>();

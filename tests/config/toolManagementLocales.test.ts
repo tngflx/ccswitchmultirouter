@@ -6,6 +6,8 @@ import zh from "@/i18n/locales/zh.json";
 
 const requiredKeys = [
   "manualInstallCommands",
+  "oneClickInstallHint",
+  "installCommandsLoadFailed",
   "updateAllTools",
   "currentVersion",
   "latestVersion",

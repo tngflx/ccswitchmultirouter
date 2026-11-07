@@ -1037,6 +1037,13 @@ async fn image_generations_external_marker_keeps_authentication_ahead_of_fallbac
 #[serial_test::serial]
 async fn image_edits_handler_reaches_official_auth_instead_of_router_self_loop() {
     let _home = IsolatedHome::new();
+    // Keep this self-loop fixture hermetic: the effective upstream and the
+    // in-process loop guard must use the same dynamically reserved port, never
+    // the machine-wide takeover port used by a running CCSwitch instance.
+    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let test_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    crate::proxy::http_client::set_proxy_port(test_port);
     let db = Arc::new(Database::memory().unwrap());
     let mut router = v2_router(
         json!([v2_route(
@@ -1047,7 +1054,7 @@ async fn image_edits_handler_reaches_official_auth_instead_of_router_self_loop()
         )]),
         "official",
     );
-    router.settings_config["base_url"] = json!("http://127.0.0.1:15721/v1");
+    router.settings_config["base_url"] = json!(format!("http://127.0.0.1:{test_port}/v1"));
     db.save_provider("codex", &router).unwrap();
     db.save_provider(
         "codex",
@@ -1056,6 +1063,7 @@ async fn image_edits_handler_reaches_official_auth_instead_of_router_self_loop()
     .unwrap();
     db.set_current_provider("codex", &router.id).unwrap();
     let state = build_state(db);
+    state.config.write().await.listen_port = test_port;
     for endpoint in [
         "/v1/images/edits",
         "/codex/v1/images/edits",

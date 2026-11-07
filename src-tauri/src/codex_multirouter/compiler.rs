@@ -1992,6 +1992,74 @@ mod tests {
     }
 
     #[test]
+    fn follow_all_keeps_new_included_source_rows_beyond_persisted_route_aliases() {
+        let aliases = [
+            ("gpt-5.6-luna-sublyx", "gpt-5.6-luna"),
+            ("gpt-5.6-sol-sublyx", "gpt-5.6-sol"),
+            ("gpt-5.6-terra-sublyx", "gpt-5.6-terra"),
+            ("gpt-6-astra-sublyx", "gpt-6-astra"),
+            ("gpt-6-luna-sublyx", "gpt-6-luna"),
+            ("gpt-6-sol-sublyx", "gpt-6-sol"),
+            ("gpt-6.1-sol-sublyx", "gpt-6.1-sol"),
+        ];
+        let mut rows = aliases
+            .iter()
+            .map(|(visible, upstream)| {
+                json!({"model": visible, "upstreamModel": upstream, "enabled": true})
+            })
+            .collect::<Vec<_>>();
+        let newly_included = ["gpt-6", "gpt-5.6", "gpt-6.1-terra"];
+        rows.extend(
+            newly_included
+                .iter()
+                .map(|model| json!({"model": model, "enabled": false})),
+        );
+        rows.push(json!({"model": "gpt-excluded", "enabled": false}));
+        let mut source = provider("sublyx", "Sublyx", "openai_responses", json!(rows));
+        let mut source_route = route("router-sublyx", &source.id, CodexModelSelection::All);
+        source_route.match_prefixes = vec!["gpt".to_string()];
+        source_route.aliases = aliases
+            .iter()
+            .map(|(visible, upstream)| (visible.to_string(), upstream.to_string()))
+            .collect();
+        let routing = plan(vec![source_route]);
+        let before = compile(&routing, [source.clone()]);
+        let mut expected = aliases
+            .iter()
+            .map(|(visible, _)| visible.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(before.visible_models, expected);
+
+        // The route's persisted aliases are presentation mappings, not a saved
+        // include list. Keeping them unchanged must not freeze an All route at
+        // the previous seven-model projection when the source includes more.
+        for row in source.settings_config["modelCatalog"]["models"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if newly_included.contains(&row["model"].as_str().unwrap()) {
+                row["enabled"] = json!(true);
+            }
+        }
+        let after = compile(&routing, [source]);
+        expected.extend(newly_included.iter().map(|model| model.to_string()));
+        assert_eq!(after.visible_models, expected);
+        assert_eq!(after.routes[0].visible_models, expected);
+        assert_eq!(after.model_catalog.len(), 10);
+        assert_ne!(before.dependency_fingerprint, after.dependency_fingerprint);
+        assert!(after.warnings.is_empty());
+        for model in newly_included {
+            let compiled = after
+                .model_catalog
+                .iter()
+                .find(|candidate| candidate.visible_model == model)
+                .expect("newly included source model must be projected");
+            assert_eq!(compiled.canonical_model, model);
+            assert_eq!(compiled.upstream_model, model);
+        }
+    }
+
+    #[test]
     fn explicit_aliases_are_preserved_and_collisions_get_stable_provider_aliases() {
         let official = provider(
             "codex-official",
@@ -2496,7 +2564,7 @@ mod tests {
                 .reasoning
                 .as_ref()
                 .and_then(|value| value.get("supportedEfforts")),
-            Some(&json!(["xhigh", "high"]))
+            Some(&json!(["max", "high", "low"]))
         );
     }
 

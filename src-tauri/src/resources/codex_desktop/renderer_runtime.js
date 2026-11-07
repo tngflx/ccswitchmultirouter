@@ -14,6 +14,10 @@
     payload !== incomingPayload && payload?.catalogAvailable === true;
   const installationGeneration = (state.runtimeGeneration || 0) + 1;
   state.runtimeGeneration = installationGeneration;
+  // Continuation commit closures capture installationIsCurrent. Any new
+  // injection (including same-fingerprint reinjection) invalidates those
+  // closures, so never let a prepared job survive into a newer generation.
+  state.codexContinuationJobs = {};
   const installationIsCurrent = () =>
     state.runtimeGeneration === installationGeneration;
   state.runPromise = null;
@@ -55,6 +59,7 @@
     state.rendererRuntimeFingerprint !== rendererRuntimeFingerprint ||
     previousPayload?.catalogReleased === true
   ) {
+    state.nativeReasoningVisibilityRestore?.();
     if (state.interval) clearInterval(state.interval);
     try {
       state.reactRootObserver?.disconnect();
@@ -67,14 +72,31 @@
     // Older discovery admitted dynamic RPC stubs before patching failed. Drop
     // that registry so continuation can use only declared request clients.
     state.appServerClients = [];
+    state.scopedAppServerClientSet = new Set();
+    state.scopedAppServerClientOwners = new Map();
+    state.moduleAppServerClientOwners = new Map();
+    state.reactAppServerClientOwners = new Map();
     state.requestIds = new Map();
     state.modelListRequestScopes = new Map();
     state.appServerModuleRetryAt = 0;
+    // Semantic module URLs can resolve to different renderer chunks after a
+    // reinjection/navigation. Drop in-flight and fulfilled discovery promises
+    // so the new fingerprint cannot reuse a stale module namespace or scope.
+    state.modulePromises = new Map();
     state.scopedAppServerScopes = new Set();
     state.scopedAppServerScopeCandidates = new Set();
     state.scopedAppServerRegistryClasses = [];
     state.scopedAppServerRegistryInstances = new Set();
     state.scopedAppServerScopesScannedAt = null;
+    state.scopedAppServerScopeScanComplete = false;
+    state.scopedAppServerRootIdentities = [];
+    state.webpackPickerDiscovery = null;
+    // Architecture evidence belongs to this window, not to an old closure.
+    // If script tags disappear during reinjection, unknown visibility must not
+    // become optional. A true page reload naturally creates a fresh state.
+    state.nativeReasoningVisibilityRequired =
+      state.nativeReasoningVisibilityRequired === true;
+    state.nativeReasoningVisibilityAtoms = [];
     state.pendingReactNodes = new Set();
     state.lastReactFullScanAt = 0;
     state.lastReactIncrementalScanAt = 0;
@@ -114,6 +136,8 @@
   /*__CCSWITCH_REQUEST_NORMALIZATION_CORE__*/
   /*__CCSWITCH_HISTORY_LINEAGE_HYDRATION_CORE__*/
   /*__CCSWITCH_MODULE_CLIENT_DISCOVERY_CORE__*/
+  /*__CCSWITCH_WEBPACK_DISCOVERY_CORE__*/
+  /*__CCSWITCH_NATIVE_REASONING_VISIBILITY_CORE__*/
   /*__CCSWITCH_MODEL_PICKER_DIAGNOSTICS_CORE__*/
   state.readCodexModelPickerDiagnostics = codexModelPickerDiagnostics;
   /*__CCSWITCH_REQUEST_HEALTH_WARNING_CORE__*/
@@ -219,14 +243,43 @@
       } catch {}
     }
   };
+  const sameOriginJavascriptAssetUrl = (raw) => {
+    try {
+      const base = new URL(
+        document.baseURI || window.location?.href || globalThis.location?.href,
+      );
+      const url = new URL(raw, base);
+      // Opaque custom-scheme origins are all "null": protocol and host must
+      // match too. Performance/link entries are not import authorization for
+      // foreign assets, even when they contain an expected semantic filename.
+      if (
+        (!base.host && base.protocol !== "file:") ||
+        url.protocol !== base.protocol ||
+        url.host !== base.host ||
+        url.origin !== base.origin ||
+        url.username ||
+        url.password ||
+        !url.pathname.includes("/assets/") ||
+        !url.pathname.endsWith(".js")
+      )
+        return "";
+      return url.href;
+    } catch {
+      return "";
+    }
+  };
   const visibleAssetUrls = () =>
-    [
-      ...Array.from(document.scripts || []).map((script) => script.src),
-      ...Array.from(document.querySelectorAll("link[href]") || []).map(
-        (link) => link.href,
-      ),
-      ...performance.getEntriesByType("resource").map((entry) => entry.name),
-    ].filter((url, index, urls) => Boolean(url) && urls.indexOf(url) === index);
+    // Only executed script elements authorize the legacy semantic fallback.
+    // Link-preload and PerformanceResourceTiming entries can describe fetched
+    // async chunks that were never executed; importing those would let a
+    // downloaded-but-untrusted module become an application entry point.
+    Array.from(document.scripts || [])
+      .filter((script) => script.type === "module")
+      .map((script) => script.currentSrc || script.src)
+      .map(sameOriginJavascriptAssetUrl)
+      .filter(
+        (url, index, urls) => Boolean(url) && urls.indexOf(url) === index,
+      );
   const assetUrl = async (namePart) => {
     const urls = visibleAssetUrls();
     const direct = urls.find(
@@ -237,27 +290,11 @@
     );
     if (direct) return direct;
 
-    // Newer Codex builds keep only index-*.js visible and reference rpc/app chunks
-    // from the Vite dependency table. Follow those same-origin module references
-    // instead of depending on one hashed filename or Performance API behavior.
-    const inspected = new Set();
-    for (let index = 0; index < urls.length && index < 32; index += 1) {
-      const url = urls[index];
-      if (!url || inspected.has(url) || !url.split("?")[0].endsWith(".js"))
-        continue;
-      inspected.add(url);
-      let source = "";
-      try {
-        source = await fetch(url).then((response) =>
-          response.ok ? response.text() : "",
-        );
-      } catch {}
-      for (const match of source.matchAll(/["'](\.\/[^"']+\.js)["']/g)) {
-        const candidate = new URL(match[1], url).href;
-        if (candidate.includes(namePart)) return candidate;
-        if (!urls.includes(candidate)) urls.push(candidate);
-      }
-    }
+    // A source-file dependency table or quoted lazy-import path does not prove
+    // that the referenced module has executed. Never fetch/traverse a module
+    // graph to authorize a new import. Numeric initialized-cache discovery and
+    // renderer scope discovery cover modern bundles; unsupported legacy graphs
+    // remain unverified instead of executing an unused application chunk.
     return "";
   };
   const loadAppModule = async (namePart) => {
@@ -277,6 +314,93 @@
       );
     }
     return await state.modulePromises.get(namePart);
+  };
+  // Current Desktop uses numeric Rspack ESM entrypoints instead of the old
+  // semantic Vite chunk names. Re-import only exact loaded same-origin entry
+  // URLs (an ESM cache hit), then inspect initialized exports without invoking
+  // the runtime, factories, export getters, or application constructors.
+  const discoverCodexWebpackModelPicker = async (patchedCaches) => {
+    const entryUrls = codexLoadedWebpackEntryUrls(
+      Array.from(document.scripts || []).map((script) => ({
+        src: script.src,
+        type: script.type,
+      })),
+      document.baseURI || window.location?.href || globalThis.location?.href,
+    );
+    // The final native menu has a separate preference filter. A failed import
+    // cannot make that visibility contract disappear or reuse a stale atom.
+    state.nativeReasoningVisibilityRequired =
+      state.nativeReasoningVisibilityRequired === true || entryUrls.length > 0;
+    state.nativeReasoningVisibilityAtoms = [];
+    const namespaces = [];
+    for (const url of entryUrls) {
+      if (!installationIsCurrent()) return [];
+      const key = `webpack-entry:${url}`;
+      if (!state.modulePromises.has(key)) {
+        state.modulePromises.set(
+          key,
+          import(url).catch((error) => {
+            state.modulePromises.delete(key);
+            throw error;
+          }),
+        );
+      }
+      try {
+        namespaces.push(await state.modulePromises.get(key));
+      } catch (error) {
+        recordFailure(error);
+      }
+    }
+    if (!installationIsCurrent()) return [];
+    const candidates = codexInitializedWebpackPickerCandidates(namespaces);
+    state.nativeReasoningVisibilityRequired =
+      state.nativeReasoningVisibilityRequired === true ||
+      candidates.nativeReasoningVisibilityRequired === true;
+    state.nativeReasoningVisibilityAtoms =
+      candidates.nativeReasoningVisibilityAtoms;
+    for (const prototype of candidates.queryObserverPrototypes) {
+      try {
+        patchCodexModelReasoningQueryObserverPrototype(prototype);
+      } catch (error) {
+        recordFailure(error);
+      }
+    }
+    let queryClientCount = 0;
+    for (const client of candidates.queryClients) {
+      if (patchCodexModelReasoningQueryClient(client, patchedCaches))
+        queryClientCount += 1;
+    }
+    // An initialized export can keep an unmounted scope alive. It may expose
+    // a cache to patch, but only a completed current React scan establishes
+    // ownership for native visibility or continuation authorization.
+    for (const scope of candidates.scopes) {
+      try {
+        if (
+          patchCodexModelReasoningQueryClient(
+            codexScopeQueryClient(scope),
+            patchedCaches,
+          )
+        )
+          queryClientCount += 1;
+      } catch (error) {
+        recordFailure(error);
+      }
+    }
+    state.webpackPickerDiscovery = {
+      entryCount: entryUrls.length,
+      runtimeCount: candidates.runtimeCount,
+      moduleCount: candidates.moduleCount,
+      candidateCount: candidates.candidateCount,
+      queryClientCount,
+      observerPrototypeCount: candidates.queryObserverPrototypes.length,
+      nativeVisibilityRequired: state.nativeReasoningVisibilityRequired,
+      nativeVisibilityAtomCount:
+        candidates.nativeReasoningVisibilityAtoms.length,
+      truncated: candidates.truncated,
+    };
+    // Picker cache discovery is deliberately NOT continuation authorization.
+    // A cache or an export with sendRequest is never admitted as an RPC client.
+    return candidates.scopes;
   };
   const localCatalogFromModule = (module) => {
     // 26.825+ exports both an unresolved RpcPromise (`appHost`) and the
@@ -585,9 +709,13 @@
         hops += 1;
       }
     } catch {}
-    return current || value;
+    const active = Object.getOwnPropertyDescriptor(
+      current?.stateNode || {},
+      "current",
+    )?.value;
+    return active || current || value;
   };
-  const appendReactRootsFromNode = (node, values, seen) => {
+  const appendReactRootsFromNode = (node, values, seen, owners) => {
     for (const key of Object.keys(node || {})) {
       if (
         !key.startsWith("__reactContainer") &&
@@ -595,7 +723,28 @@
         !key.startsWith("__reactInternalInstance")
       )
         continue;
-      const value = reactRootValue(node[key]);
+      const field = Object.getOwnPropertyDescriptor(node, key);
+      if (!field || !("value" in field)) continue;
+      const value = reactRootValue(field.value);
+      if (value && owners) {
+        if (!owners.has(value)) owners.set(value, []);
+        owners.get(value).push(() => {
+          const attached =
+            node === document.getElementById("root") ||
+            node === document.body ||
+            node === document.documentElement ||
+            (typeof Node !== "undefined" &&
+              node instanceof Node &&
+              node.isConnected);
+          const current = Object.getOwnPropertyDescriptor(node, key);
+          return (
+            attached &&
+            current &&
+            "value" in current &&
+            reactRootValue(current.value) === value
+          );
+        });
+      }
       if (value && !seen.has(value)) {
         seen.add(value);
         values.push(value);
@@ -667,6 +816,35 @@
     const discovery = (async () => {
       const roots = [];
       const rootSeen = new Set();
+      const rootOwners = new Map();
+      const clientOwners = new Map();
+      const fullScan = startingNodes.some(
+        (node) =>
+          node &&
+          (node === document.getElementById("root") ||
+            node === document.body ||
+            node === document.documentElement),
+      );
+      const retainClient = (client, path) => {
+        if (!clientOwners.has(client)) clientOwners.set(client, []);
+        clientOwners.get(client).push(() => {
+          let entry = path;
+          for (let depth = 0; entry && depth <= 16; depth += 1) {
+            if (!entry.parent)
+              return (rootOwners.get(entry.value) || []).some((current) =>
+                current(),
+              );
+            const field = Object.getOwnPropertyDescriptor(
+              entry.parent.value,
+              entry.key,
+            );
+            if (!field || !("value" in field) || field.value !== entry.value)
+              return false;
+            entry = entry.parent;
+          }
+          return false;
+        });
+      };
       const nodeQueue = startingNodes.filter(Boolean);
       let nodeCursor = 0;
       while (nodeCursor < nodeQueue.length) {
@@ -680,7 +858,7 @@
         ) {
           sliceCount += 1;
           const node = nodeQueue[nodeCursor++];
-          appendReactRootsFromNode(node, roots, rootSeen);
+          appendReactRootsFromNode(node, roots, rootSeen, rootOwners);
           try {
             for (const child of Array.from(node?.childNodes || []))
               nodeQueue.push(child);
@@ -704,7 +882,8 @@
           monotonicNow() < sliceDeadline
         ) {
           sliceCount += 1;
-          const { value, depth } = queue[cursor++];
+          const entry = queue[cursor++];
+          const { value, depth } = entry;
           if (
             !value ||
             (typeof value !== "object" && typeof value !== "function") ||
@@ -717,13 +896,23 @@
           if (
             looksLikeAppServerRequestClient(value) &&
             patchRequestClient(value)
-          )
+          ) {
+            retainClient(value, entry);
             patched += 1;
-          const nestedClient = value?.requestClient;
+          }
+          const nestedClient = Object.getOwnPropertyDescriptor(
+            value,
+            "requestClient",
+          )?.value;
           if (
             looksLikeAppServerRequestClient(nestedClient) &&
             patchRequestClient(nestedClient)
           ) {
+            retainClient(nestedClient, {
+              value: nestedClient,
+              parent: entry,
+              key: "requestClient",
+            });
             patched += 1;
             if (
               state.historyManagerCandidates.size >= 8 &&
@@ -764,6 +953,8 @@
             if (
               ![
                 "window",
+                "alternate",
+                "return",
                 "ownerDocument",
                 "parentNode",
                 "parentElement",
@@ -779,7 +970,12 @@
                   !(typeof Node !== "undefined" && child instanceof Node)) ||
                   typeof child === "function")
               ) {
-                queue.push({ value: child, depth: depth + 1 });
+                queue.push({
+                  value: child,
+                  depth: depth + 1,
+                  parent: entry,
+                  key,
+                });
               }
             }
           }
@@ -787,6 +983,20 @@
         if (cursor < queue.length && seen.size < 140000)
           await yieldReactDiscovery();
       }
+      if (!installationIsCurrent()) return 0;
+      const previousOwners =
+        state.reactAppServerClientOwners instanceof Map
+          ? state.reactAppServerClientOwners
+          : new Map();
+      const complete = cursor >= queue.length && nodeCursor >= nodeQueue.length;
+      const currentOwners =
+        fullScan && complete ? new Map() : new Map(previousOwners);
+      for (const [client, checks] of clientOwners)
+        currentOwners.set(client, checks);
+      state.reactAppServerClientOwners = currentOwners;
+      state.appServerClients = (state.appServerClients || []).filter((client) =>
+        codexAppServerClientHasCurrentOwner(client),
+      );
       state.reactRequestClientPatched =
         state.reactRequestClientPatched || patched > 0;
       state.historyQueryPatch = {
@@ -844,6 +1054,25 @@
         // Discover the explicit hook chunk first, then retain both fallbacks.
         const discoverScopedModules = async () => {
           let scopedPatched = 0;
+          try {
+            await discoverCodexWebpackModelPicker(patchedCaches);
+          } catch (error) {
+            recordFailure(error);
+          }
+          // Scope/cache discovery must not depend on finding an obsolete named
+          // bundle. The current React provider retains the initialized scope
+          // even when every semantic Vite import is unavailable.
+          const rendererScopes = await codexRendererScopeCandidates();
+          if (!installationIsCurrent()) return 0;
+          // Module cache inventory is not mounted scope ownership. Keep the
+          // exact current React snapshot canonical for all readiness/mutation
+          // consumers; orphaned export scopes remain cache-only candidates.
+          state.scopedAppServerScopeCandidates = new Set(rendererScopes);
+          scopedPatched = refreshCodexScopedAppServerClients(
+            rendererScopes,
+            undefined,
+            patchedCaches,
+          );
           const discover = async (module) => {
             if (!installationIsCurrent()) return 0;
             const result = await patchCodexScopedAppServerClients(
@@ -951,6 +1180,16 @@
         } catch (error) {
           recordFailure(error);
         }
+      }
+    }
+    if (typeof reconcileCodexNativeReasoningVisibility === "function") {
+      try {
+        state.nativeReasoningVisibilityReconciliation =
+          reconcileCodexNativeReasoningVisibility(
+            codexNativeReasoningManagedEfforts(),
+          );
+      } catch (error) {
+        recordFailure(error);
       }
     }
     state.appServerPatchInstalled = patched > 0;

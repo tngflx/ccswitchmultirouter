@@ -50,6 +50,28 @@ describe("CodexOfficialContextRow", () => {
     vi.mocked(getCodexOfficialModelSpec).mockReset();
   });
 
+  it("lets the user include or exclude a discovered official model", () => {
+    const onEnabledChange = vi.fn();
+    render(
+      <CodexOfficialContextRow
+        model="Visible model"
+        value=""
+        discovered={{ ...discovered }}
+        enabled
+        onEnabledChange={onEnabledChange}
+        onChange={vi.fn()}
+      />,
+    );
+
+    const row = screen.getByRole("group", { name: "Visible model" });
+    const checkbox = within(row).getByRole("checkbox", {
+      name: "Enable Visible model",
+    });
+    expect(checkbox).toBeChecked();
+    fireEvent.click(checkbox);
+    expect(onEnabledChange).toHaveBeenCalledWith(false);
+  });
+
   it("bounds presets by the discovered maximum and preserves custom overrides", () => {
     const { onChange } = renderRow({}, "700000");
     expect(presetValues()).toEqual([

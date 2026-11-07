@@ -1,0 +1,99 @@
+{
+  "baseModel": {
+    "model": "new-model",
+    "upstreamModel": "wire-new",
+    "canonicalSlug": "new-model",
+    "slug": "base-slug",
+    "aliases": ["old-model"],
+    "name": "Base model"
+  },
+  "bareReferences": [
+    "new-model",
+    "wire-new",
+    "base-slug",
+    "old-model",
+    "Base model"
+  ],
+  "cases": [
+    {
+      "name": "camel-case generated flag",
+      "row": { "model": "new-model-generated", "apiKeyGroupGenerated": true },
+      "generated": true
+    },
+    {
+      "name": "snake-case generated flag",
+      "row": {
+        "model": "new-model-generated",
+        "api_key_group_generated": true
+      },
+      "generated": true
+    },
+    {
+      "name": "camel-case group id",
+      "row": { "model": "new-model-generated", "apiKeyGroupId": "group" },
+      "generated": true
+    },
+    {
+      "name": "snake-case group id",
+      "row": { "model": "new-model-generated", "api_key_group_id": "group" },
+      "generated": true
+    },
+    {
+      "name": "legacy alias marker",
+      "row": { "model": "new-model--ccg-legacy" },
+      "generated": true
+    },
+    {
+      "name": "case-insensitive legacy alias marker",
+      "row": { "model": "new-model--CCG-legacy" },
+      "generated": true
+    },
+    {
+      "name": "group id despite false generated flag",
+      "row": {
+        "model": "new-model-generated",
+        "apiKeyGroupGenerated": false,
+        "apiKeyGroupId": "group"
+      },
+      "generated": true
+    },
+    {
+      "name": "legacy true flag despite canonical false flag",
+      "row": {
+        "model": "new-model-generated",
+        "apiKeyGroupGenerated": false,
+        "api_key_group_generated": true
+      },
+      "generated": true
+    },
+    {
+      "name": "ordinary model",
+      "row": { "model": "ordinary" },
+      "generated": false
+    },
+    {
+      "name": "false camel-case generated flag",
+      "row": { "model": "ordinary", "apiKeyGroupGenerated": false },
+      "generated": false
+    },
+    {
+      "name": "false snake-case generated flag",
+      "row": { "model": "ordinary", "api_key_group_generated": false },
+      "generated": false
+    },
+    {
+      "name": "empty group ids",
+      "row": {
+        "model": "ordinary",
+        "apiKeyGroupId": "",
+        "api_key_group_id": ""
+      },
+      "generated": false
+    },
+    {
+      "name": "nonreserved marker",
+      "row": { "model": "ordinary-ccg-legacy" },
+      "generated": false
+    }
+  ]
+}

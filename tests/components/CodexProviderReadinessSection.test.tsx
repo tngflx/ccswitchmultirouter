@@ -135,6 +135,96 @@ describe("CodexProviderReadinessSection", () => {
     expect(onValidateConnection).toHaveBeenCalledTimes(1);
   });
 
+  it("shows indeterminate progress while syncing the catalog", () => {
+    render(
+      <CodexProviderReadinessSection
+        models={[]}
+        apiFormat="openai_chat"
+        isMaintainedPreset={false}
+        isSyncingModels
+        isValidatingConnection={false}
+        onSyncModels={vi.fn()}
+        onValidateConnection={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("progressbar")).toBeVisible();
+    expect(
+      screen.getByText("Fetching and reconciling the model catalog…"),
+    ).toBeVisible();
+  });
+
+  it("offers an explicit API-only selection after discovery", () => {
+    const onUseOnlyDiscoveredModels = vi.fn();
+    render(
+      <CodexProviderReadinessSection
+        models={[{ model: "old-model", enabled: false }]}
+        apiFormat="openai_chat"
+        isMaintainedPreset={false}
+        isSyncingModels={false}
+        isValidatingConnection={false}
+        discoveredModelCount={2}
+        canUseOnlyDiscoveredModels
+        onUseOnlyDiscoveredModels={onUseOnlyDiscoveredModels}
+        onSyncModels={vi.fn()}
+        onValidateConnection={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Enable only synced models/ }),
+    );
+    expect(onUseOnlyDiscoveredModels).toHaveBeenCalledOnce();
+  });
+
+  it("requires confirmation before replacing the catalog", () => {
+    const onReplaceCatalog = vi.fn();
+    render(
+      <CodexProviderReadinessSection
+        models={[{ model: "old-model" }]}
+        apiFormat="openai_chat"
+        isMaintainedPreset={false}
+        isSyncingModels={false}
+        isValidatingConnection={false}
+        discoveredModelCount={2}
+        canReplaceCatalog
+        onReplaceCatalog={onReplaceCatalog}
+        onSyncModels={vi.fn()}
+        onValidateConnection={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^Replace catalog/ }));
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveTextContent("Replace the model catalog?");
+    expect(onReplaceCatalog).not.toHaveBeenCalled();
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Replace catalog" }),
+    );
+    expect(onReplaceCatalog).toHaveBeenCalledOnce();
+  });
+
+  it("hides the API-only selection for partial grouped-key discovery", () => {
+    render(
+      <CodexProviderReadinessSection
+        models={[{ model: "old-model", enabled: true }]}
+        apiFormat="openai_chat"
+        isMaintainedPreset={false}
+        isSyncingModels={false}
+        isValidatingConnection={false}
+        discoveredModelCount={2}
+        canUseOnlyDiscoveredModels={false}
+        onUseOnlyDiscoveredModels={vi.fn()}
+        onSyncModels={vi.fn()}
+        onValidateConnection={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: /Enable only synced models/ }),
+    ).not.toBeInTheDocument();
+  });
+
   it("offers the confirmed-free catalog action after a live fetch", () => {
     const onUseFreeModelsOnly = vi.fn();
     render(

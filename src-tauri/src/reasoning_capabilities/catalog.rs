@@ -288,6 +288,32 @@ mod tests {
     }
 
     #[test]
+    fn packaged_openrouter_deepseek_contract_includes_max_low_and_object_wire() {
+        let library =
+            load_library_from_str(include_str!("../../resources/reasoning-capabilities.json"))
+                .expect("packaged reasoning capability library should validate");
+
+        for model in ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash"] {
+            let capability = library
+                .lookup(Some("openrouter"), None, model, None)
+                .unwrap_or_else(|| panic!("missing packaged capability for {model}"));
+            assert_eq!(
+                capability.supported_efforts,
+                vec!["max", "high", "low"],
+                "{model}"
+            );
+            assert!(!capability.disable_allowed, "{model}");
+            assert_eq!(capability.upstream.format, "object", "{model}");
+            assert_eq!(capability.upstream.parameter, "reasoning.effort", "{model}");
+            assert_eq!(
+                capability.upstream.effort_map.get("max"),
+                Some(&"max".to_string()),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
     fn lookup_platform_specific_beats_any() {
         let mut any_entry = entry("any", "model-x", &["high"]);
         any_entry.reasoning.default_effort = Some("high".into());

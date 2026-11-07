@@ -130,6 +130,106 @@ beforeEach(async () => {
 });
 
 describe("official provider context discovery", () => {
+  it("persists manual official model inclusion without changing its identity or overrides", async () => {
+    const row: CodexCatalogModel = {
+      model: "Visible alias",
+      upstreamModel: "wire-model",
+      aliases: ["preserved-alias"],
+      displayName: "My label",
+      contextWindow: "64000",
+      enabled: true,
+      sortIndex: 7,
+      codexUltra: { enabled: true, providerEffort: "max" },
+    };
+    const view = renderOfficial([row]);
+    const checkbox = screen.getByRole("checkbox", {
+      name: "Enable Visible alias",
+    });
+    expect(checkbox).toBeChecked();
+    fireEvent.click(checkbox);
+    await waitFor(() =>
+      expect(view.latest()).toEqual([{ ...row, enabled: false }]),
+    );
+    fireEvent.click(checkbox);
+    await waitFor(() =>
+      expect(view.latest()).toEqual([{ ...row, enabled: true }]),
+    );
+    expect(fetchCodexOauthModels).not.toHaveBeenCalled();
+  });
+
+  it("selects only the current discovery without deleting rows or reviving a mismatched visible alias", async () => {
+    const includedAlias: CodexCatalogModel = {
+      model: "Visible alias",
+      upstreamModel: "wire-model",
+      aliases: ["preserved-alias"],
+      displayName: "My alias",
+      contextWindow: "64000",
+      enabled: false,
+      sortIndex: 4,
+      codexUltra: { enabled: true, providerEffort: "max" },
+    };
+    const mismatchedAlias: CodexCatalogModel = {
+      model: "other-wire",
+      upstreamModel: "unrelated-binding",
+      displayName: "My other alias",
+      contextWindow: "32000",
+      enabled: true,
+    };
+    vi.mocked(fetchCodexOauthModels).mockResolvedValue([
+      { id: "wire-model", ownedBy: "openai", contextWindow: 128000 },
+      { id: "other-wire", ownedBy: "openai", contextWindow: 128000 },
+    ]);
+    const view = renderOfficial([includedAlias, mismatchedAlias]);
+    const selectDiscovered = screen.getByRole("button", {
+      name: "Enable only models found in this discovery",
+    });
+    expect(selectDiscovered).toBeDisabled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Discover official models" }),
+    );
+    await waitFor(() => expect(selectDiscovered).toBeEnabled());
+    const retainedAlias = view
+      .latest()
+      .find((row) => row.model === "Visible alias");
+    const retainedMismatch = view
+      .latest()
+      .find((row) => row.model === "other-wire");
+    expect(screen.getAllByText("Found in this discovery")).toHaveLength(1);
+    fireEvent.click(selectDiscovered);
+    await waitFor(() =>
+      expect(view.latest()).toEqual([
+        { ...retainedAlias, enabled: true },
+        { ...retainedMismatch, enabled: false },
+      ]),
+    );
+    expect(view.latest()).toHaveLength(2);
+    expect(view.latest()[0]).toMatchObject({ ...includedAlias, enabled: true });
+    expect(view.latest()[1]).toMatchObject({
+      ...mismatchedAlias,
+      enabled: false,
+    });
+  });
+
+  it("does not offer bulk selection for empty, in-flight, or foreign-account discovery", async () => {
+    const pending = deferred<FetchedModel[]>();
+    vi.mocked(fetchCodexOauthModels).mockReturnValue(pending.promise);
+    const row: CodexCatalogModel = { model: "retained", enabled: true };
+    const view = renderOfficial([row]);
+    const selectDiscovered = screen.getByRole("button", {
+      name: "Enable only models found in this discovery",
+    });
+    expect(selectDiscovered).toBeDisabled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Discover official models" }),
+    );
+    expect(selectDiscovered).toBeDisabled();
+    view.changeSource({ accountId: "account-b" });
+    await act(async () =>
+      pending.resolve([{ id: "retained", ownedBy: "openai" }]),
+    );
+    expect(selectDiscovered).toBeDisabled();
+    expect(view.latest()).toEqual([row]);
+  });
   it("waits for a resolved managed account instead of discovering an implicit backend default", () => {
     renderOfficial([{ model: "retained" }], { accountId: null });
     expect(

@@ -3,8 +3,10 @@ import type {
   CodexApiKeyGroupMode,
   CodexCatalogModel,
 } from "@/types";
-
-const GROUP_ALIAS_MARKER = "--ccg-";
+import {
+  CODEX_API_KEY_GROUP_ALIAS_MARKER,
+  isGeneratedCodexApiKeyGroupModel,
+} from "@/lib/codexApiKeyGroup";
 
 const normalized = (value: string | undefined) =>
   value?.trim().toLowerCase() ?? "";
@@ -25,12 +27,6 @@ const groupMatchesModel = (group: CodexApiKeyGroup, model: string) => {
   });
 };
 
-const isGeneratedGroupModel = (model: CodexCatalogModel) =>
-  model.apiKeyGroupGenerated === true ||
-  model.api_key_group_generated === true ||
-  Boolean(model.apiKeyGroupId || model.api_key_group_id) ||
-  model.model.toLowerCase().includes(GROUP_ALIAS_MARKER);
-
 export function normalizeCodexApiKeyGroupMode(
   value: unknown,
 ): CodexApiKeyGroupMode {
@@ -38,7 +34,7 @@ export function normalizeCodexApiKeyGroupMode(
 }
 
 export function baseCodexCatalogModels(models: CodexCatalogModel[]) {
-  return models.filter((model) => !isGeneratedGroupModel(model));
+  return models.filter((model) => !isGeneratedCodexApiKeyGroupModel(model));
 }
 
 export function buildCodexApiKeyGroupCatalog(
@@ -58,7 +54,7 @@ export function buildCodexApiKeyGroupCatalog(
     baseModels.forEach((baseModel) => {
       const upstreamModel = modelUpstreamName(baseModel);
       if (!groupMatchesModel(group, upstreamModel)) return;
-      const alias = `${baseModel.model.trim()}${GROUP_ALIAS_MARKER}${group.id.trim()}`;
+      const alias = `${baseModel.model.trim()}${CODEX_API_KEY_GROUP_ALIAS_MARKER}${group.id.trim()}`;
       const identity = normalized(alias);
       if (!identity || seen.has(identity)) return;
       seen.add(identity);

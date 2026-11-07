@@ -40,9 +40,13 @@ pub struct FetchedModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
     pub input_modalities: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<String>>,
     pub supports_image: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_capability: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,8 +103,63 @@ struct ModelsResponse {
     pagination: Option<serde_json::Value>,
     #[serde(default)]
     links: Option<serde_json::Value>,
+    /// DashScope Model Studio returns `output.models` with explicit paging.
+    #[serde(default)]
+    output: Option<ModelListOutput>,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelListOutput {
+    #[serde(default, deserialize_with = "deserialize_directory_models")]
+    models: Option<Vec<ModelEntry>>,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    page_no: Option<u64>,
+}
+
+fn deserialize_directory_models<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ModelEntry>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(entries) =
+        Option::<Vec<serde_json::Map<String, serde_json::Value>>>::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    entries
+        .into_iter()
+        .map(|mut object| {
+            let has_id = ["id", "slug", "model"].iter().any(|key| {
+                object
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| !id.trim().is_empty())
+            });
+            if !has_id {
+                let id = ["key", "baseModelId", "base_model_id"]
+                    .iter()
+                    .find_map(|key| {
+                        object
+                            .get(*key)
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty())
+                    })
+                    .map(str::to_string);
+                if let Some(id) = id {
+                    object.insert("id".to_string(), serde_json::Value::String(id));
+                }
+            }
+            serde_json::from_value(serde_json::Value::Object(object))
+                .map_err(serde::de::Error::custom)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +215,12 @@ impl ModelsResponse {
         }
         pagination_incomplete || pagination_total.is_some_and(|total| total > returned as u64)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModelListPagination {
+    total: u64,
+    page_no: u64,
 }
 
 #[derive(Debug)]
@@ -238,14 +303,21 @@ impl OpperModelEntry {
             .or(self.model_id)
             .or(self.model)
             .or_else(|| {
-                ["slug", "canonical_slug", "canonicalSlug"]
-                    .iter()
-                    .find_map(|key| {
-                        extra
-                            .get(*key)
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    })
+                [
+                    "slug",
+                    "canonical_slug",
+                    "canonicalSlug",
+                    "key",
+                    "baseModelId",
+                    "base_model_id",
+                ]
+                .iter()
+                .find_map(|key| {
+                    extra
+                        .get(*key)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
             })
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())?;
@@ -325,6 +397,7 @@ const PRICING_CHARGE_KEYS: &[&str] = &[
 ];
 
 const FETCH_TIMEOUT_SECS: u64 = 15;
+const MAX_MODEL_LIST_PAGES: u64 = 100;
 const MAX_REQUEST_HEADERS: usize = 64;
 const MAX_HEADER_NAME_BYTES: usize = 256;
 const MAX_HEADER_VALUE_BYTES: usize = 16 * 1024;
@@ -444,7 +517,7 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
         options.is_full_url,
         options.models_url_override,
     )?;
-    let client = crate::proxy::http_client::get();
+    let client = crate::proxy::http_client::build_model_discovery_client()?;
     let mut last_err: Option<String> = None;
     let headers = build_model_fetch_headers(
         options.api_key,
@@ -469,7 +542,8 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
         let response = match request_builder.send().await {
             Ok(r) => r,
             Err(e) => {
-                return Err(format!("Request failed: {e}"));
+                let detail = format!("Request failed: {}", e.without_url());
+                return Err(crate::redact_known_secrets(&detail, &log_secrets));
             }
         };
 
@@ -477,15 +551,122 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
 
         if status.is_success() {
             let resolved_models_url = response.url().clone();
+            if reqwest::Url::parse(url)
+                .ok()
+                .is_none_or(|initial| initial.origin() != resolved_models_url.origin())
+            {
+                return Err("Model discovery response origin is not authorized".to_string());
+            }
             let body = response.text().await.unwrap_or_default();
-            let mut models = parse_provider_models_response(
+            let mut parsed = parse_provider_models_response_with_pagination(
                 &body,
                 &log_secrets,
                 options.base_url,
                 resolved_models_url.as_str(),
             )?;
+            if parsed.pagination.is_some_and(|page| page.page_no != 1) {
+                return Err("Model list pagination must start at page 1".to_string());
+            }
+            let expected_total = parsed.pagination.map(|page| page.total);
+            let mut page_count = 1_u64;
+            let mut next_page = parsed
+                .pagination
+                .filter(|page| (parsed.models.len() as u64) < page.total)
+                .map(|page| page.page_no + 1);
+            let mut seen_model_ids = parsed
+                .models
+                .iter()
+                .map(|model| normalize_model_identity(&model.id))
+                .collect::<HashSet<_>>();
+            while let Some(page_no) = next_page {
+                if page_count >= MAX_MODEL_LIST_PAGES {
+                    return Err(format!("Model list exceeds the maximum supported page count ({MAX_MODEL_LIST_PAGES})"));
+                }
+                let mut page_url = resolved_models_url.clone();
+                let mut query = page_url
+                    .query_pairs()
+                    .filter(|(key, _)| key != "page_no")
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect::<Vec<_>>();
+                query.push(("page_no".to_string(), page_no.to_string()));
+                page_url.set_query(None);
+                page_url.query_pairs_mut().extend_pairs(query);
+                let page_response = client
+                    .get(page_url.as_str())
+                    .headers(headers.clone())
+                    .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        let detail = format!(
+                            "Request failed while fetching model page {page_no}: {}",
+                            error.without_url()
+                        );
+                        crate::redact_known_secrets(&detail, &log_secrets)
+                    })?;
+                if !page_response.status().is_success() {
+                    let page_status = page_response.status();
+                    let page_body = redact_model_fetch_error_body(
+                        page_response.text().await.unwrap_or_default(),
+                        &log_secrets,
+                    );
+                    return Err(format!(
+                        "HTTP {page_status} fetching model page {page_no}: {page_body}"
+                    ));
+                }
+                let page_models_url = page_response.url().clone();
+                if page_models_url.origin() != resolved_models_url.origin() {
+                    return Err("Model list page response origin is not authorized".to_string());
+                }
+                let page_body = page_response.text().await.unwrap_or_default();
+                let page = parse_provider_models_response_with_pagination(
+                    &page_body,
+                    &log_secrets,
+                    options.base_url,
+                    page_models_url.as_str(),
+                )?;
+                let pagination = page.pagination.ok_or_else(|| {
+                    format!(
+                        "Model list page {page_no} omitted pagination metadata before completion"
+                    )
+                })?;
+                if pagination.page_no != page_no || Some(pagination.total) != expected_total {
+                    return Err(format!(
+                        "Model list page {page_no} changed its page identity or reported total"
+                    ));
+                }
+                if page.models.is_empty() {
+                    return Err(format!(
+                        "Model list page {page_no} was empty before reaching the reported total"
+                    ));
+                }
+                let previous_count = parsed.models.len();
+                for model in page.models {
+                    if seen_model_ids.insert(normalize_model_identity(&model.id)) {
+                        parsed.models.push(model);
+                    }
+                }
+                if parsed.models.len() == previous_count {
+                    return Err(format!(
+                        "Model list page {page_no} repeated only previously returned models"
+                    ));
+                }
+                if (parsed.models.len() as u64) > pagination.total {
+                    return Err(format!(
+                        "Model list page {page_no} exceeded the reported total"
+                    ));
+                }
+                parsed.pagination = Some(pagination);
+                next_page =
+                    ((parsed.models.len() as u64) < pagination.total).then_some(page_no + 1);
+                page_count += 1;
+            }
 
-            enrich_missing_context_windows(&client, url, &mut models).await;
+            let mut models = parsed.models;
+            // Supplemental public metadata carries no provider credentials and
+            // retains the shared client's existing redirect behavior.
+            enrich_missing_context_windows(&crate::proxy::http_client::get(), url, &mut models)
+                .await;
             models.sort_by(|a, b| a.id.cmp(&b.id));
             return Ok(models);
         }
@@ -518,12 +699,28 @@ fn parse_models_response(
     parse_provider_models_response(body, known_secrets, "", "")
 }
 
+#[cfg(test)]
 fn parse_provider_models_response(
     body: &str,
     known_secrets: &[String],
     base_url: &str,
     models_url: &str,
 ) -> Result<Vec<FetchedModel>, String> {
+    parse_provider_models_response_with_pagination(body, known_secrets, base_url, models_url)
+        .map(|parsed| parsed.models)
+}
+
+struct ParsedProviderModels {
+    models: Vec<FetchedModel>,
+    pagination: Option<ModelListPagination>,
+}
+
+fn parse_provider_models_response_with_pagination(
+    body: &str,
+    known_secrets: &[String],
+    base_url: &str,
+    models_url: &str,
+) -> Result<ParsedProviderModels, String> {
     let response: ModelsResponse = serde_json::from_str(body).map_err(|error| {
         let detail = format!("Failed to parse response: {error}");
         crate::redact_known_secrets(&detail, known_secrets)
@@ -539,12 +736,37 @@ fn parse_provider_models_response(
         .error_message()
         .map(|message| crate::redact_known_secrets(message, known_secrets))
         .unwrap_or_else(|| redact_model_fetch_error_body(body.to_string(), known_secrets));
+    let output_pagination =
+        match response.output.as_ref() {
+            Some(output) if output.total.is_some() || output.page_no.is_some() => {
+                match (output.total, output.page_no, output.models.as_ref()) {
+                    (Some(total), Some(page_no), Some(models))
+                        if page_no > 0 && total >= models.len() as u64 =>
+                    {
+                        Some(ModelListPagination { total, page_no })
+                    }
+                    _ => return Err(
+                        "Model fetch response contained incomplete or invalid pagination metadata"
+                            .to_string(),
+                    ),
+                }
+            }
+            _ => None,
+        };
     let inventory_size = response
         .data
         .as_ref()
         .map(Vec::len)
         .or_else(|| response.models.as_ref().map(rich_model_count))
+        .or_else(|| {
+            response
+                .output
+                .as_ref()
+                .and_then(|output| output.models.as_ref().map(Vec::len))
+        })
         .unwrap_or_default();
+    // DashScope output paging is completed by the caller. Independently
+    // advertised truncation in any other envelope still fails closed.
     if response.incomplete_inventory(inventory_size) {
         return Err(
             "Model fetch response is incomplete; pagination must be resolved first".to_string(),
@@ -552,9 +774,10 @@ fn parse_provider_models_response(
     }
     let data = response.data;
     let rich_models = response.models;
+    let output_models = response.output.and_then(|output| output.models);
     let native_google_models = is_native_google_models_discovery(base_url, models_url);
-    let entries = match (data, rich_models) {
-        (Some(mut data), Some(rich)) => {
+    let entries = match (data, rich_models, output_models) {
+        (Some(mut data), Some(rich), None) => {
             let rich = normalize_rich_model_entries(rich, native_google_models)?;
             validate_rich_model_entries(&rich)?;
             if data.is_empty() && !rich.is_empty() {
@@ -566,17 +789,23 @@ fn parse_provider_models_response(
             enrich_data_model_entries(&mut data, &rich)?;
             data
         }
-        (Some(data), None) => data,
-        (None, Some(rich)) => {
+        (Some(data), None, None) => data,
+        (None, Some(rich), None) => {
             let rich = normalize_rich_model_entries(rich, native_google_models)?;
             validate_rich_model_entries(&rich)?;
             rich
         }
-        (None, None) => return Err(format!("Model fetch failed: {error_detail}")),
+        (None, None, Some(output)) => output,
+        (Some(_), Some(_), Some(_)) | (Some(_), None, Some(_)) | (None, Some(_), Some(_)) => {
+            return Err(
+                "Model fetch response contained contradictory model inventories".to_string(),
+            )
+        }
+        (None, None, None) => return Err(format!("Model fetch failed: {error_detail}")),
     };
     validate_model_entries(&entries)?;
 
-    Ok(entries
+    let models = entries
         .into_iter()
         .map(|entry| {
             let is_free = classify_model_free_status(&entry.id, &entry.extra);
@@ -591,12 +820,22 @@ fn parse_provider_models_response(
                 });
             FetchedModel {
                 context_window: extract_context_window(&entry.extra),
-                max_context_window: explicit_positive_model_limit(&entry.extra, &["max_context_window", "maxContextWindow"]),
-                max_input_tokens: explicit_positive_model_limit(&entry.extra, &["max_input_tokens", "maxInputTokens"]),
-                max_output_tokens: explicit_positive_model_limit(&entry.extra, &["max_output_tokens", "maxOutputTokens"]),
+                max_context_window: explicit_positive_model_limit(
+                    &entry.extra,
+                    &["max_context_window", "maxContextWindow"],
+                ),
+                max_input_tokens: extract_max_input_tokens(&entry.extra),
+                max_output_tokens: extract_max_output_tokens(&entry.extra),
                 id: entry.id,
                 input_modalities: extract_input_modalities(&entry.extra),
-                owned_by: entry.owned_by,
+                output_modalities: extract_output_modalities(&entry.extra),
+                owned_by: entry.owned_by.or_else(|| {
+                    ["publisher", "ownedBy", "provider", "inference_provider"]
+                        .iter()
+                        .filter_map(|key| entry.extra.get(*key))
+                        .find_map(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                }),
                 supports_image: extract_supports_image(&entry.extra),
                 display_name: identity.display_name,
                 canonical_slug: identity.canonical_slug,
@@ -611,11 +850,20 @@ fn parse_provider_models_response(
                         is_openrouter_models_discovery(base_url, models_url),
                     )
                     .and_then(|capability| serde_json::to_value(capability).ok()),
+                effort: entry
+                    .extra
+                    .get("effort")
+                    .filter(|value| !value.is_null())
+                    .cloned(),
                 protocol_capability,
                 is_free,
             }
         })
-        .collect())
+        .collect();
+    Ok(ParsedProviderModels {
+        models,
+        pagination: output_pagination,
+    })
 }
 
 fn normalize_rich_model_entries(
@@ -648,7 +896,15 @@ fn normalize_rich_model_entries(
                 .get("slug")
                 .and_then(serde_json::Value::as_str)
                 .is_none()
-            && !["canonical_slug", "canonicalSlug"].iter().any(|key| {
+            && ![
+                "canonical_slug",
+                "canonicalSlug",
+                "key",
+                "baseModelId",
+                "base_model_id",
+            ]
+            .iter()
+            .any(|key| {
                 entry
                     .extra
                     .get(*key)
@@ -765,10 +1021,28 @@ fn model_metadata_field(key: &str) -> Option<&'static str> {
         "context" | "context_window" | "context_length" | "contextLength" | "ContextWindow"
         | "ContextLength" | "max_context_window" | "max_context_length" | "contextWindow"
         | "maxContextWindow" | "maxContextLength" | "max_model_len" | "maxModelLen"
-        | "max_input_tokens" | "maxInputTokens" | "max_prompt_tokens" | "maxPromptTokens"
-        | "input_token_limit" | "inputTokenLimit" => Some("context"),
+        | "max_context_tokens" | "maxContextTokens" | "n_ctx" => Some("context"),
+        "max_input_tokens" | "maxInputTokens" | "max_prompt_tokens" | "maxPromptTokens"
+        | "input_token_limit" | "inputTokenLimit" => Some("input_limit"),
+        "max_output_tokens"
+        | "maxOutputTokens"
+        | "output_token_limit"
+        | "outputTokenLimit"
+        | "max_tokens"
+        | "maxTokens"
+        | "max_completion_tokens"
+        | "maxCompletionTokens" => Some("output_limit"),
+        "output_modalities"
+        | "outputModalities"
+        | "output"
+        | "outputs"
+        | "response_modality"
+        | "responseModality"
+        | "response_modalities" => Some("output"),
         "input_modalities"
         | "inputModalities"
+        | "request_modality"
+        | "requestModality"
         | "modalities"
         | "input"
         | "inputs"
@@ -787,6 +1061,11 @@ fn model_metadata_field(key: &str) -> Option<&'static str> {
         "aliases" | "alias" | "model_aliases" | "modelAliases" => Some("aliases"),
         "is_free" | "isFree" | "pricing" | "cost" => Some("pricing"),
         "reasoning"
+        | "effort"
+        | "supported_levels"
+        | "supportedLevels"
+        | "default_level"
+        | "defaultLevel"
         | "supportsReasoning"
         | "supports_reasoning"
         | "reasoningSupported"
@@ -864,6 +1143,10 @@ fn collect_declared_model_metadata_fields(
             }
         } else if [
             "architecture",
+            "model_info",
+            "meta",
+            "inference_metadata",
+            "top_provider",
             "metadata",
             "capability",
             "capabilities",
@@ -893,6 +1176,10 @@ fn merge_missing_model_metadata(
             }
         } else if [
             "architecture",
+            "model_info",
+            "meta",
+            "inference_metadata",
+            "top_provider",
             "metadata",
             "capability",
             "capabilities",
@@ -1136,6 +1423,8 @@ fn collect_model_metadata_scopes<'a>(
         "protocol_capability",
         "limit",
         "limits",
+        "inference_metadata",
+        "model_info",
     ] {
         let Some(nested) = object.get(key).and_then(serde_json::Value::as_object) else {
             continue;
@@ -1781,12 +2070,8 @@ fn extract_context_window(obj: &serde_json::Map<String, serde_json::Value>) -> O
         "maxContextLength",
         "max_model_len",
         "maxModelLen",
-        "max_input_tokens",
-        "maxInputTokens",
-        "max_prompt_tokens",
-        "maxPromptTokens",
-        "input_token_limit",
-        "inputTokenLimit",
+        "max_context_tokens",
+        "maxContextTokens",
     ];
 
     let direct = KEYS
@@ -1797,6 +2082,14 @@ fn extract_context_window(obj: &serde_json::Map<String, serde_json::Value>) -> O
         return direct;
     }
 
+    if let Some(context) = obj
+        .get("meta")
+        .and_then(|meta| meta.get("n_ctx"))
+        .and_then(parse_positive_u64)
+    {
+        return Some(context);
+    }
+
     [
         "limit",
         "limits",
@@ -1805,6 +2098,9 @@ fn extract_context_window(obj: &serde_json::Map<String, serde_json::Value>) -> O
         "protocolCapability",
         "protocol_capability",
         "metadata",
+        "model_info",
+        "inference_metadata",
+        "meta",
     ]
     .iter()
     .filter_map(|key| obj.get(*key).and_then(|value| value.as_object()))
@@ -1817,10 +2113,66 @@ pub(crate) fn explicit_positive_model_limit(
     obj: &serde_json::Map<String, serde_json::Value>,
     fields: &[&str],
 ) -> Option<u64> {
-    fields
+    let direct = fields
         .iter()
         .filter_map(|field| obj.get(*field))
+        .find_map(parse_positive_u64);
+    direct.or_else(|| {
+        obj.get("model_info")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|info| {
+                fields
+                    .iter()
+                    .filter_map(|field| info.get(*field))
+                    .find_map(parse_positive_u64)
+            })
+    })
+}
+
+fn extract_max_input_tokens(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    explicit_positive_model_limit(
+        obj,
+        &[
+            "max_input_tokens",
+            "maxInputTokens",
+            "input_token_limit",
+            "inputTokenLimit",
+            "max_prompt_tokens",
+            "maxPromptTokens",
+        ],
+    )
+}
+
+fn extract_max_output_tokens(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    let fields = [
+        "max_output_tokens",
+        "maxOutputTokens",
+        "output_token_limit",
+        "outputTokenLimit",
+        "max_tokens",
+        "maxTokens",
+        "max_completion_tokens",
+        "maxCompletionTokens",
+    ];
+    fields
+        .iter()
+        .filter_map(|key| obj.get(*key))
         .find_map(parse_positive_u64)
+        .or_else(|| {
+            obj.get("top_provider")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|provider| {
+                    explicit_positive_model_limit(
+                        provider,
+                        &["max_completion_tokens", "maxCompletionTokens"],
+                    )
+                })
+        })
+        .or_else(|| {
+            obj.get("model_info")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|info| explicit_positive_model_limit(info, &fields))
+        })
 }
 
 /// 从 OpenAI-compatible `/models` 的供应商扩展字段中读取输入模态。
@@ -1836,11 +2188,18 @@ pub(crate) fn extract_input_modalities(
         "architecture",
         "capabilities",
         "metadata",
+        "inference_metadata",
+        "model_info",
     ]
     .iter()
-    .filter_map(|key| obj.get(*key))
-    .find_map(parse_input_modalities)
-    {
+    .filter_map(|key| obj.get(*key).map(|value| (*key, value)))
+    .find_map(|(key, value)| {
+        if key == "capabilities" && value.is_array() {
+            parse_output_modalities(value).filter(|modalities| !modalities.is_empty())
+        } else {
+            parse_input_modalities(value)
+        }
+    }) {
         return Some(modalities);
     }
 
@@ -1881,6 +2240,8 @@ fn parse_input_modalities(value: &serde_json::Value) -> Option<Vec<String>> {
                 .or_else(|| obj.get("inputs"))
                 .or_else(|| obj.get("input_modalities"))
                 .or_else(|| obj.get("inputModalities"))
+                .or_else(|| obj.get("request_modality"))
+                .or_else(|| obj.get("requestModality"))
                 .or_else(|| obj.get("modalities"))
             {
                 parse_input_modalities(input)?
@@ -1892,6 +2253,53 @@ fn parse_input_modalities(value: &serde_json::Value) -> Option<Vec<String>> {
     };
 
     Some(values)
+}
+
+/// Parse explicitly declared response modalities. Provider capability labels
+/// such as DashScope `TG`/`Reasoning` are not output modalities.
+pub(crate) fn extract_output_modalities(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<String>> {
+    [
+        "output_modalities",
+        "outputModalities",
+        "inference_metadata",
+        "metadata",
+        "architecture",
+        "model_info",
+    ]
+    .iter()
+    .filter_map(|key| obj.get(*key))
+    .find_map(parse_output_modalities)
+}
+
+fn parse_output_modalities(value: &serde_json::Value) -> Option<Vec<String>> {
+    let value = if let Some(object) = value.as_object() {
+        object
+            .get("output")
+            .or_else(|| object.get("outputs"))
+            .or_else(|| object.get("output_modalities"))
+            .or_else(|| object.get("outputModalities"))
+            .or_else(|| object.get("response_modality"))
+            .or_else(|| object.get("responseModality"))
+            .or_else(|| object.get("response_modalities"))?
+    } else {
+        value
+    };
+    let values = value
+        .as_array()?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|item| {
+            matches!(
+                item.to_ascii_lowercase().as_str(),
+                "text" | "image" | "audio" | "video"
+            )
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    (value.as_array()?.is_empty() || !values.is_empty()).then_some(values)
 }
 
 pub(crate) fn extract_supports_image(
@@ -1913,6 +2321,14 @@ pub(crate) fn extract_supports_image(
         return explicit;
     }
 
+    if obj
+        .get("capabilities")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("VU")))
+    {
+        return Some(true);
+    }
+
     for key in [
         "metadata",
         "capability",
@@ -1921,6 +2337,8 @@ pub(crate) fn extract_supports_image(
         "protocol_capability",
         "limit",
         "limits",
+        "inference_metadata",
+        "model_info",
     ] {
         if let Some(nested) = obj
             .get(key)
@@ -2013,14 +2431,8 @@ fn parse_volcengine_plan_model_entry(entry: &serde_json::Value) -> Option<Fetche
             obj,
             &["max_context_window", "maxContextWindow"],
         ),
-        max_input_tokens: explicit_positive_model_limit(
-            obj,
-            &["max_input_tokens", "maxInputTokens"],
-        ),
-        max_output_tokens: explicit_positive_model_limit(
-            obj,
-            &["max_output_tokens", "maxOutputTokens"],
-        ),
+        max_input_tokens: extract_max_input_tokens(obj),
+        max_output_tokens: extract_max_output_tokens(obj),
         input_modalities: extract_input_modalities(obj),
         supports_image: extract_supports_image(obj),
         reasoning: None,
@@ -2033,7 +2445,7 @@ fn parse_volcengine_plan_model_entry(entry: &serde_json::Value) -> Option<Fetche
 /// 为缺失模型目录事实执行分层补齐。
 ///
 /// 顺序保持保守：`/models` 显式 metadata 已在调用前解析完成；这里仅对仍为空的模型
-/// 先查本地预设表（离线可用、WebDAV 同步），再尝试 provider 官方来源，
+/// 先查 provider 官方来源，再查本地预设表（离线可用、WebDAV 同步），
 /// 最后尝试能按 API 前缀匹配的公共目录。
 async fn enrich_missing_context_windows(
     client: &reqwest::Client,
@@ -2042,14 +2454,17 @@ async fn enrich_missing_context_windows(
 ) {
     if !models.iter().any(|model| {
         model.context_window.is_none()
+            || model.max_output_tokens.is_none()
             || model.input_modalities.is_none()
+            || model.output_modalities.is_none()
             || model.supports_image.is_none()
     }) {
         return;
     }
 
-    enrich_preset_catalog_context_windows(endpoint_url, models);
+    // Provider-owned documentation outranks local/general catalogs.
     enrich_zhipu_context_windows(client, endpoint_url, models).await;
+    enrich_preset_catalog_context_windows(endpoint_url, models);
     enrich_models_dev_context_windows(client, endpoint_url, models).await;
 }
 
@@ -2062,7 +2477,9 @@ async fn enrich_missing_context_windows(
 fn enrich_preset_catalog_context_windows(endpoint_url: &str, models: &mut [FetchedModel]) {
     if !models.iter().any(|model| {
         model.context_window.is_none()
+            || model.max_output_tokens.is_none()
             || model.input_modalities.is_none()
+            || model.output_modalities.is_none()
             || model.supports_image.is_none()
     }) {
         return;
@@ -2129,20 +2546,46 @@ async fn enrich_zhipu_context_windows(
     models: &mut [FetchedModel],
 ) {
     if !is_zhipu_models_endpoint(endpoint_url)
-        || !models
-            .iter()
-            .any(|model| model.context_window.is_none() && is_glm_model_id(&model.id))
+        || !models.iter().any(|model| {
+            is_glm_model_id(&model.id)
+                && (model.context_window.is_none()
+                    || model.max_output_tokens.is_none()
+                    || model.input_modalities.is_none()
+                    || model.output_modalities.is_none()
+                    || model.supports_image.is_none())
+        })
     {
         return;
     }
 
-    let mut contexts = fetch_zhipu_model_overview_contexts(client).await;
-    enrich_missing_zhipu_detail_contexts(client, models, &mut contexts).await;
+    let mut metadata = fetch_zhipu_model_overview_metadata(client).await;
+    enrich_missing_zhipu_detail_contexts(client, models, &mut metadata).await;
 
-    apply_missing_context_windows(models, |model_id| {
-        let key = normalize_zhipu_model_id(model_id);
-        contexts.get(&key).copied()
-    });
+    for model in models.iter_mut().filter(|model| is_glm_model_id(&model.id)) {
+        let key = normalize_zhipu_model_id(&model.id);
+        let Some(facts) = metadata.get(&key) else {
+            continue;
+        };
+        if model.context_window.is_none() {
+            model.context_window = facts.context_window;
+        }
+        if model.max_output_tokens.is_none() {
+            model.max_output_tokens = facts.max_output_tokens;
+        }
+        if model.input_modalities.is_none() {
+            model.input_modalities = facts.input_modalities.clone();
+        }
+        if model.output_modalities.is_none() {
+            model.output_modalities = facts.output_modalities.clone();
+        }
+        if model.supports_image.is_none() {
+            model.supports_image = model.input_modalities.as_ref().map(|modalities| {
+                modalities
+                    .iter()
+                    .any(|modality| modality.eq_ignore_ascii_case("image"))
+            });
+        }
+    }
 }
 
 /// 通过 models.dev 的 `limit.context` 补齐上下文窗口。
@@ -2359,8 +2802,15 @@ fn normalize_models_dev_model_id(value: &str) -> String {
 
 /// 判断当前成功的 `/models` endpoint 是否属于智谱/Z.AI。
 fn is_zhipu_models_endpoint(endpoint_url: &str) -> bool {
-    let lower = endpoint_url.to_ascii_lowercase();
-    lower.contains("open.bigmodel.cn") || lower.contains("api.z.ai")
+    reqwest::Url::parse(endpoint_url).ok().is_some_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.host_str().is_some_and(|host| {
+                host.eq_ignore_ascii_case("open.bigmodel.cn")
+                    || host.eq_ignore_ascii_case("api.z.ai")
+            })
+    })
 }
 
 /// 判断模型 id 是否是 GLM 文本/视觉模型。
@@ -2369,10 +2819,9 @@ fn is_glm_model_id(model_id: &str) -> bool {
     normalized.starts_with("glm-") || normalized.contains("/glm-")
 }
 
-/// 拉取智谱模型概览表，并解析模型上下文列。
-///
-/// 网络或文档格式异常只会导致补充 metadata 缺失，不阻断 `/models` 本身成功返回。
-async fn fetch_zhipu_model_overview_contexts(client: &reqwest::Client) -> HashMap<String, u64> {
+async fn fetch_zhipu_model_overview_metadata(
+    client: &reqwest::Client,
+) -> HashMap<String, ZhipuModelMetadata> {
     let text = match client
         .get(ZHIPU_MODEL_OVERVIEW_MD_URL)
         .timeout(Duration::from_secs(5))
@@ -2384,7 +2833,7 @@ async fn fetch_zhipu_model_overview_contexts(client: &reqwest::Client) -> HashMa
     };
 
     text.as_deref()
-        .map(parse_zhipu_model_overview_contexts)
+        .map(parse_zhipu_model_overview_metadata)
         .unwrap_or_default()
 }
 
@@ -2395,21 +2844,34 @@ async fn fetch_zhipu_model_overview_contexts(client: &reqwest::Client) -> HashMa
 async fn enrich_missing_zhipu_detail_contexts(
     client: &reqwest::Client,
     models: &[FetchedModel],
-    contexts: &mut HashMap<String, u64>,
+    metadata: &mut HashMap<String, ZhipuModelMetadata>,
 ) {
     for model in models {
-        if model.context_window.is_some() {
+        if model.context_window.is_some() && model.max_output_tokens.is_some() {
             continue;
         }
         let key = normalize_zhipu_model_id(&model.id);
-        if contexts.contains_key(&key) {
+        let existing = metadata.get(&key).cloned().unwrap_or_default();
+        if existing.context_window.is_some() && existing.max_output_tokens.is_some() {
             continue;
         }
         let Some(slug) = zhipu_docs_slug_for_model_id(&model.id) else {
             continue;
         };
-        if let Some(context) = fetch_zhipu_detail_context(client, &slug).await {
-            contexts.insert(key, context);
+        if let Some(facts) = fetch_zhipu_detail_metadata(client, &slug).await {
+            let merged = metadata.entry(key).or_default();
+            if merged.context_window.is_none() {
+                merged.context_window = facts.context_window;
+            }
+            if merged.max_output_tokens.is_none() {
+                merged.max_output_tokens = facts.max_output_tokens;
+            }
+            if merged.input_modalities.is_none() {
+                merged.input_modalities = facts.input_modalities;
+            }
+            if merged.output_modalities.is_none() {
+                merged.output_modalities = facts.output_modalities;
+            }
         }
     }
 }
@@ -2426,8 +2888,11 @@ fn zhipu_docs_slug_for_model_id(model_id: &str) -> Option<String> {
     Some(normalized)
 }
 
-/// 拉取单模型 markdown 页面，并解析“上下文窗口”卡片。
-async fn fetch_zhipu_detail_context(client: &reqwest::Client, slug: &str) -> Option<u64> {
+/// 拉取单模型 markdown 页面并解析官方模型卡片中的 token 限制与输入/输出模态。
+async fn fetch_zhipu_detail_metadata(
+    client: &reqwest::Client,
+    slug: &str,
+) -> Option<ZhipuModelMetadata> {
     let url = format!("https://docs.bigmodel.cn/cn/guide/models/text/{slug}.md");
     let response = client
         .get(url)
@@ -2439,12 +2904,20 @@ async fn fetch_zhipu_detail_context(client: &reqwest::Client, slug: &str) -> Opt
         return None;
     }
     let text = response.text().await.ok()?;
-    parse_zhipu_detail_context(&text)
+    Some(parse_zhipu_detail_metadata(&text))
 }
 
-/// 解析智谱模型概览 markdown 表格中的“模型 / 上下文”列。
-fn parse_zhipu_model_overview_contexts(markdown: &str) -> HashMap<String, u64> {
-    let mut contexts = HashMap::new();
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ZhipuModelMetadata {
+    context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
+    input_modalities: Option<Vec<String>>,
+    output_modalities: Option<Vec<String>>,
+}
+
+/// 解析智谱官方模型概览 markdown 表格中的模型、上下文窗口和最大输出列。
+fn parse_zhipu_model_overview_metadata(markdown: &str) -> HashMap<String, ZhipuModelMetadata> {
+    let mut metadata = HashMap::new();
     let mut pending_row = String::new();
 
     for line in markdown.lines() {
@@ -2463,17 +2936,17 @@ fn parse_zhipu_model_overview_contexts(markdown: &str) -> HashMap<String, u64> {
             continue;
         }
 
-        if let Some((model, context)) = parse_zhipu_overview_table_row(&pending_row) {
-            contexts.insert(model, context);
+        if let Some((model, facts)) = parse_zhipu_overview_table_row(&pending_row) {
+            metadata.insert(model, facts);
         }
         pending_row.clear();
     }
 
-    contexts
+    metadata
 }
 
 /// 解析单行智谱模型表格。
-fn parse_zhipu_overview_table_row(row: &str) -> Option<(String, u64)> {
+fn parse_zhipu_overview_table_row(row: &str) -> Option<(String, ZhipuModelMetadata)> {
     let columns = row
         .split('|')
         .map(str::trim)
@@ -2484,8 +2957,15 @@ fn parse_zhipu_overview_table_row(row: &str) -> Option<(String, u64)> {
     }
 
     let model = extract_markdown_link_label(columns[0]).unwrap_or(columns[0]);
-    let context = parse_context_tokens(columns[2])?;
-    Some((normalize_zhipu_model_id(model), context))
+    let facts = ZhipuModelMetadata {
+        context_window: parse_context_tokens(columns[2]),
+        max_output_tokens: parse_context_tokens(columns[3]),
+        ..ZhipuModelMetadata::default()
+    };
+    if facts.context_window.is_none() && facts.max_output_tokens.is_none() {
+        return None;
+    }
+    Some((normalize_zhipu_model_id(model), facts))
 }
 
 /// 从 markdown 链接 `[label](url)` 中取 label；非链接返回 `None`。
@@ -2495,32 +2975,105 @@ fn extract_markdown_link_label(value: &str) -> Option<&str> {
     Some(&value[start..end])
 }
 
-/// 解析单模型页概览卡片中的“上下文窗口”值。
-fn parse_zhipu_detail_context(markdown: &str) -> Option<u64> {
-    let mut seen_context_card = false;
-    let mut waiting_for_value = false;
+/// 解析官方 Mintlify Markdown 卡片和旧 HTML Card 里的值。
+fn parse_zhipu_detail_metadata(markdown: &str) -> ZhipuModelMetadata {
+    #[derive(Clone, Copy)]
+    enum DetailField {
+        ContextWindow,
+        MaxOutputTokens,
+        InputModalities,
+        OutputModalities,
+    }
 
-    for line in markdown.lines() {
-        let trimmed = line.trim();
-        if trimmed.contains("title=\"上下文窗口\"") {
-            seen_context_card = true;
-            waiting_for_value = trimmed.contains("}>");
-            continue;
-        }
-        if seen_context_card && trimmed.contains("}>") {
-            waiting_for_value = true;
-            continue;
-        }
-        if waiting_for_value
-            && !trimmed.is_empty()
-            && !trimmed.starts_with('<')
-            && !trimmed.starts_with('}')
-        {
-            return parse_context_tokens(trimmed);
+    fn detail_field(title: &str) -> Option<DetailField> {
+        let title = title.trim().trim_start_matches("[card]").trim();
+        match title {
+            "上下文窗口" => Some(DetailField::ContextWindow),
+            "最大输出 Tokens" | "最大输出Token" | "最大输出 tokens" => {
+                Some(DetailField::MaxOutputTokens)
+            }
+            "输入模态" => Some(DetailField::InputModalities),
+            "输出模态" => Some(DetailField::OutputModalities),
+            _ => None,
         }
     }
 
-    None
+    let mut result = ZhipuModelMetadata::default();
+    let mut active_field = None;
+
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        let card_text = trimmed.trim_start_matches('>').trim();
+        let html_title = trimmed
+            .split("title=\"")
+            .nth(1)
+            .and_then(|value| value.split('\"').next());
+        if let Some(field) = html_title.and_then(detail_field) {
+            active_field = Some(field);
+            if !trimmed.contains("}>") {
+                continue;
+            }
+            continue;
+        }
+        if let Some(field) = detail_field(card_text) {
+            active_field = Some(field);
+            continue;
+        }
+        let Some(field) = active_field else {
+            continue;
+        };
+        let value = card_text.trim_matches('`').trim();
+        if value.is_empty()
+            || value.starts_with("[card]")
+            || value.starts_with('<')
+            || value.starts_with('}')
+            || value.starts_with("icon=")
+        {
+            continue;
+        }
+        match field {
+            DetailField::ContextWindow => result.context_window = parse_context_tokens(value),
+            DetailField::MaxOutputTokens => result.max_output_tokens = parse_context_tokens(value),
+            DetailField::InputModalities => result.input_modalities = parse_zhipu_modalities(value),
+            DetailField::OutputModalities => {
+                result.output_modalities = parse_zhipu_modalities(value)
+            }
+        }
+        active_field = None;
+    }
+
+    result
+}
+
+fn parse_zhipu_modalities(value: &str) -> Option<Vec<String>> {
+    let lower = value.to_ascii_lowercase();
+    let mut modalities = Vec::new();
+    for (labels, modality) in [
+        (&["文本", "text"][..], "text"),
+        (&["图像", "图片", "image"][..], "image"),
+        (&["音频", "语音", "audio"][..], "audio"),
+        (&["视频", "video"][..], "video"),
+    ] {
+        if labels.iter().any(|label| lower.contains(label)) {
+            modalities.push(modality.to_string());
+        }
+    }
+    (!modalities.is_empty()).then_some(modalities)
+}
+
+/// Compatibility projection retained for the existing context-only tests.
+#[cfg(test)]
+fn parse_zhipu_model_overview_contexts(markdown: &str) -> HashMap<String, u64> {
+    parse_zhipu_model_overview_metadata(markdown)
+        .into_iter()
+        .filter_map(|(model, facts)| facts.context_window.map(|context| (model, context)))
+        .collect()
+}
+
+/// Compatibility projection retained for callers that only need context.
+#[cfg(test)]
+fn parse_zhipu_detail_context(markdown: &str) -> Option<u64> {
+    parse_zhipu_detail_metadata(markdown).context_window
 }
 
 /// 统一模型 id：大小写、空格、`ZhipuAI/` 命名空间和 `[1m]` 后缀都不影响匹配。
@@ -2817,6 +3370,724 @@ fn ends_with_version_segment(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn upstream_metadata_card(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "context_window": 262144,
+            "max_output_tokens": 8192,
+            "input_modalities": ["text"],
+            "output_modalities": ["text"],
+            "supports_image": false,
+        })
+    }
+
+    fn upstream_metadata_page(total: u64, page_no: u64, ids: &[&str]) -> serde_json::Value {
+        serde_json::json!({"output": {
+            "models": ids.iter().map(|id| upstream_metadata_card(id)).collect::<Vec<_>>(),
+            "total": total,
+            "page_no": page_no,
+        }})
+    }
+
+    struct UpstreamMetadataServer {
+        url: String,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, bool)>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for UpstreamMetadataServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn upstream_metadata_server(
+        pages: Vec<(axum::http::StatusCode, serde_json::Value)>,
+    ) -> UpstreamMetadataServer {
+        use axum::{extract::OriginalUri, routing::get, Json, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local model-list fixture");
+        let address = listener.local_addr().expect("model-list fixture address");
+        let pages = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            pages,
+        )));
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_requests = std::sync::Arc::clone(&requests);
+        let app = Router::new().route(
+            "/models",
+            get(
+                move |OriginalUri(uri): OriginalUri, headers: axum::http::HeaderMap| {
+                    let pages = std::sync::Arc::clone(&pages);
+                    let requests = std::sync::Arc::clone(&captured_requests);
+                    async move {
+                        requests.lock().unwrap().push((
+                            uri.query().unwrap_or_default().to_string(),
+                            headers
+                                .get("authorization")
+                                .is_some_and(|value| value == "Bearer fixture-redacted-model-key"),
+                        ));
+                        let (status, body) = pages.lock().unwrap().pop_front().unwrap_or_else(|| {
+                        (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            serde_json::json!({"error": {"message": "unexpected fixture page"}}),
+                        )
+                    });
+                        (status, Json(body))
+                    }
+                },
+            ),
+        );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve local model-list fixture");
+        });
+        UpstreamMetadataServer {
+            url: format!("http://{address}/models?page_size=1&marker=fixture&page_no=1"),
+            requests,
+            task,
+        }
+    }
+
+    async fn upstream_metadata_fetch(url: &str) -> Result<Vec<FetchedModel>, String> {
+        fetch_models(FetchModelsRequest {
+            base_url: url,
+            api_key: "fixture-redacted-model-key",
+            is_full_url: false,
+            models_url_override: Some(url),
+            user_agent: None,
+            api_format: None,
+            request_headers: None,
+            volcengine: VolcengineModelListRequest::default(),
+        })
+        .await
+    }
+
+    #[test]
+    fn upstream_metadata_context_limits_do_not_confuse_input_budget_with_total_context() {
+        for entry in [
+            serde_json::json!({"id": "budget", "max_input_tokens": 200000, "max_output_tokens": 64000}),
+            serde_json::json!({"id": "budget", "inputTokenLimit": 200000, "outputTokenLimit": 64000}),
+            serde_json::json!({"id": "budget", "model_info": {"max_input_tokens": 200000, "max_output_tokens": 64000}}),
+        ] {
+            let models =
+                parse_models_response(&serde_json::json!({"data": [entry]}).to_string(), &[])
+                    .unwrap();
+            assert_eq!(
+                models[0].context_window, None,
+                "an input-only budget does not declare total context"
+            );
+            assert_eq!(models[0].max_input_tokens, Some(200000));
+            assert_eq!(models[0].max_output_tokens, Some(64000));
+        }
+    }
+
+    #[test]
+    fn upstream_metadata_context_standard_total_and_engine_evidence_precede_generic_metadata() {
+        for (entry, expected) in [
+            (
+                serde_json::json!({"id": "engine", "context_window": 32768, "meta": {"n_ctx": 1048576}}),
+                32768,
+            ),
+            (
+                serde_json::json!({"id": "engine", "meta": {"n_ctx": 1048576}, "metadata": {"context_window": 65536}}),
+                1048576,
+            ),
+            (
+                serde_json::json!({"id": "engine", "max_context_tokens": 262144}),
+                262144,
+            ),
+        ] {
+            let models =
+                parse_models_response(&serde_json::json!({"data": [entry]}).to_string(), &[])
+                    .unwrap();
+            assert_eq!(models[0].context_window, Some(expected));
+        }
+    }
+
+    #[test]
+    fn upstream_metadata_provider_model_cards_keep_precise_fields() {
+        let models = parse_models_response(
+            r#"{"output":{"total":1,"page_no":1,"models":[{"model":"qwen3.8-max","provider":"qwen","capabilities":["TG","Reasoning"],"inference_metadata":{"request_modality":["Text","Image"],"response_modality":["Text"]},"model_info":{"context_window":131072,"max_input_tokens":130048,"max_output_tokens":16384}}]}}"#,
+            &[],
+        ).expect("documented DashScope metadata shape");
+        assert_eq!(models[0].context_window, Some(131072));
+        assert_eq!(models[0].max_input_tokens, Some(130048));
+        assert_eq!(models[0].max_output_tokens, Some(16384));
+        assert_eq!(
+            models[0].input_modalities,
+            Some(vec!["Text".to_string(), "Image".to_string()])
+        );
+        assert_eq!(models[0].output_modalities, Some(vec!["Text".to_string()]));
+        assert_eq!(models[0].supports_image, Some(true));
+
+        let openrouter = parse_models_response(
+            r#"{"data":[{"id":"provider/model","context_length":262144,"top_provider":{"max_completion_tokens":32768}}]}"#,
+            &[],
+        ).unwrap();
+        assert_eq!(openrouter[0].max_output_tokens, Some(32768));
+    }
+
+    #[test]
+    fn upstream_metadata_descriptor_identifiers_do_not_weaken_data_inventory() {
+        let models = parse_models_response(
+            r#"{"models":[{"key":"qwen/qwen3.8","publisher":"Qwen","max_context_length":1048576,"capabilities":{"vision":true}}]}"#,
+            &[],
+        ).expect("LM Studio descriptor key");
+        assert_eq!(models[0].id, "qwen/qwen3.8");
+        assert_eq!(models[0].owned_by.as_deref(), Some("Qwen"));
+        assert_eq!(models[0].context_window, Some(1048576));
+        for (key, id) in [
+            ("key", "qwen3.8-max"),
+            ("baseModelId", "qwen3.8-plus"),
+            ("base_model_id", "qwen3.8-flash"),
+        ] {
+            let entry = serde_json::json!({key: id});
+            let models = parse_models_response(
+                &serde_json::json!({"output": {"models": [entry.clone()]}}).to_string(),
+                &[],
+            )
+            .expect("declared directory model identifier");
+            assert_eq!(models[0].id, id);
+            assert!(
+                parse_models_response(&serde_json::json!({"data": [entry]}).to_string(), &[])
+                    .is_err(),
+                "the authoritative OpenAI inventory keeps its strict identifier contract"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_metadata_raw_effort_never_overrides_canonical_or_invents_efforts() {
+        for entry in [
+            serde_json::json!({"id":"invalid", "effort":{"supported_levels":["quantum"], "default_level":"quantum"}}),
+            serde_json::json!({"id":"invalid", "reasoning":false, "effort":{"supported_levels":["low"]}}),
+            serde_json::json!({"id":"invalid", "reasoning":{"schemaVersion":2}, "effort":{"supported_levels":["low"]}}),
+        ] {
+            let models =
+                parse_models_response(&serde_json::json!({"data":[entry]}).to_string(), &[])
+                    .unwrap();
+            assert!(models[0].reasoning.is_none());
+            assert!(
+                models[0].effort.is_some(),
+                "raw provider metadata remains ephemeral evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_metadata_discovery_scope_zhipu_requires_an_authorized_http_host() {
+        for endpoint in [
+            "https://open.bigmodel.cn/api/coding/paas/v4/models",
+            "https://api.z.ai/api/paas/v4/models",
+            "https://API.Z.AI/api/paas/v4/models?limit=20",
+            "http://open.bigmodel.cn/api/paas/v4/models",
+        ] {
+            assert!(
+                is_zhipu_models_endpoint(endpoint),
+                "genuine official endpoint remains supported"
+            );
+        }
+        for endpoint in [
+            "https://open.bigmodel.cn.attacker.example/models",
+            "https://api.z.ai.attacker.example/models",
+            "https://attacker.example/path/open.bigmodel.cn",
+            "https://attacker.example/models?next=https://api.z.ai/models",
+            "https://open.bigmodel.cn@attacker.example/models",
+            "https://untrusted@api.z.ai/models",
+            "ftp://api.z.ai/models",
+            "file:///open.bigmodel.cn/models",
+            "api.z.ai/models",
+        ] {
+            assert!(
+                !is_zhipu_models_endpoint(endpoint),
+                "only a parsed HTTP(S) official host may authorize documentation enrichment"
+            );
+        }
+    }
+
+    struct UpstreamMetadataDiscoveryRequest {
+        path: String,
+        had_credentials: bool,
+        had_all_credentials: bool,
+    }
+
+    struct UpstreamMetadataRedirectServer {
+        url: String,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<UpstreamMetadataDiscoveryRequest>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for UpstreamMetadataRedirectServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn upstream_metadata_capture_discovery_request(
+        uri: &axum::http::Uri,
+        headers: &axum::http::HeaderMap,
+    ) -> UpstreamMetadataDiscoveryRequest {
+        let credentials = [
+            "authorization",
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "x-custom-model-secret",
+        ]
+        .map(|name| headers.contains_key(name));
+        UpstreamMetadataDiscoveryRequest {
+            path: uri.to_string(),
+            had_credentials: credentials.iter().any(|present| *present),
+            had_all_credentials: credentials.iter().all(|present| *present),
+        }
+    }
+
+    async fn upstream_metadata_redirect_server(
+        location: Option<String>,
+    ) -> UpstreamMetadataRedirectServer {
+        upstream_metadata_redirect_server_with_page_redirect(location, None).await
+    }
+
+    async fn upstream_metadata_redirect_server_with_page_redirect(
+        location: Option<String>,
+        page_two_location: Option<String>,
+    ) -> UpstreamMetadataRedirectServer {
+        use axum::{
+            extract::OriginalUri,
+            response::{IntoResponse, Redirect},
+            routing::get,
+            Json, Router,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect fixture");
+        let address = listener.local_addr().unwrap();
+        let location = location.unwrap_or_else(|| "/directory?tenant=fixture".to_string());
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let redirect_requests = std::sync::Arc::clone(&requests);
+        let directory_requests = std::sync::Arc::clone(&requests);
+        let app = Router::new()
+            .route(
+                "/models",
+                get(
+                    move |OriginalUri(uri): OriginalUri, headers: axum::http::HeaderMap| {
+                        redirect_requests
+                            .lock()
+                            .unwrap()
+                            .push(upstream_metadata_capture_discovery_request(&uri, &headers));
+                        let location = location.clone();
+                        async move { Redirect::temporary(&location) }
+                    },
+                ),
+            )
+            .route(
+                "/directory",
+                get(
+                    move |OriginalUri(uri): OriginalUri, headers: axum::http::HeaderMap| {
+                        directory_requests
+                            .lock()
+                            .unwrap()
+                            .push(upstream_metadata_capture_discovery_request(&uri, &headers));
+                        let page_no = uri
+                            .query()
+                            .and_then(|query| {
+                                query
+                                    .split('&')
+                                    .find_map(|part| part.strip_prefix("page_no="))
+                            })
+                            .and_then(|page| page.parse::<u64>().ok())
+                            .unwrap_or(1);
+                        let page_two_location = page_two_location.clone();
+                        async move {
+                            if page_no == 2 {
+                                if let Some(location) = page_two_location {
+                                    return Redirect::temporary(&location).into_response();
+                                }
+                            }
+                            Json(upstream_metadata_page(
+                                2,
+                                page_no,
+                                if page_no == 1 { &["a"] } else { &["b"] },
+                            ))
+                            .into_response()
+                        }
+                    },
+                ),
+            );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve redirect fixture")
+        });
+        UpstreamMetadataRedirectServer {
+            url: format!("http://{address}/models"),
+            requests,
+            task,
+        }
+    }
+
+    async fn upstream_metadata_fetch_with_all_auth_headers(
+        url: &str,
+    ) -> Result<Vec<FetchedModel>, String> {
+        let headers = [
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "x-custom-model-secret",
+        ]
+        .into_iter()
+        .map(|name| (name.to_string(), "fixture-redacted-custom-key".to_string()))
+        .collect::<BTreeMap<_, _>>();
+        fetch_models(FetchModelsRequest {
+            base_url: url,
+            api_key: "fixture-redacted-model-key",
+            is_full_url: false,
+            models_url_override: Some(url),
+            user_agent: None,
+            api_format: None,
+            request_headers: Some(&headers),
+            volcengine: VolcengineModelListRequest::default(),
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn upstream_metadata_discovery_scope_cross_origin_redirect_never_receives_any_auth() {
+        let target = upstream_metadata_redirect_server(None).await;
+        let target_directory = target.url.replace("/models", "/directory?tenant=fixture");
+        let source = upstream_metadata_redirect_server(Some(target_directory)).await;
+        let result = upstream_metadata_fetch_with_all_auth_headers(&source.url).await;
+        let source_requests = source.requests.lock().unwrap();
+        assert_eq!(source_requests.len(), 1);
+        assert!(
+            source_requests[0].had_all_credentials,
+            "original authorized origin receives configured credentials"
+        );
+        let target_requests = target.requests.lock().unwrap();
+        assert!(
+            !target_requests
+                .iter()
+                .any(|request| request.had_credentials),
+            "foreign-origin model discovery received request credentials"
+        );
+        assert!(
+            target_requests.is_empty(),
+            "unapproved redirected origin is never queried"
+        );
+        let error = result.expect_err("redirected partial inventory cannot certify a refresh");
+        assert!(!error.contains("fixture-redacted-model-key"));
+        assert!(!error.contains("fixture-redacted-custom-key"));
+    }
+
+    #[tokio::test]
+    async fn upstream_metadata_discovery_scope_page_two_redirect_never_receives_any_auth() {
+        let target = upstream_metadata_redirect_server(None).await;
+        let target_directory = target
+            .url
+            .replace("/models", "/directory?tenant=fixture&page_no=2");
+        let source =
+            upstream_metadata_redirect_server_with_page_redirect(None, Some(target_directory))
+                .await;
+        let result = upstream_metadata_fetch_with_all_auth_headers(&source.url).await;
+        let source_requests = source.requests.lock().unwrap();
+        assert_eq!(
+            source_requests.len(),
+            3,
+            "original discovery and first page complete before the later redirect"
+        );
+        assert!(source_requests
+            .iter()
+            .all(|request| request.had_all_credentials));
+        assert_eq!(
+            source_requests[2].path,
+            "/directory?tenant=fixture&page_no=2"
+        );
+        let target_requests = target.requests.lock().unwrap();
+        assert!(
+            !target_requests
+                .iter()
+                .any(|request| request.had_credentials),
+            "later model-list redirect leaked request credentials"
+        );
+        assert!(
+            target_requests.is_empty(),
+            "later pages do not authorize a new origin"
+        );
+        let error = result.expect_err("partial paginated discovery never certifies a refresh");
+        assert!(!error.contains("fixture-redacted-model-key"));
+        assert!(!error.contains("fixture-redacted-custom-key"));
+    }
+
+    #[tokio::test]
+    async fn upstream_metadata_discovery_scope_same_origin_redirect_keeps_pagination_and_auth() {
+        let server = upstream_metadata_redirect_server(None).await;
+        let models = upstream_metadata_fetch_with_all_auth_headers(&server.url)
+            .await
+            .expect("same-origin discovery redirects are supported");
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request.had_all_credentials));
+        assert_eq!(requests[1].path, "/directory?tenant=fixture");
+        assert_eq!(requests[2].path, "/directory?tenant=fixture&page_no=2");
+    }
+
+    #[test]
+    fn upstream_metadata_effort_uses_shared_reasoning_normalizer() {
+        let models = parse_models_response(
+            &serde_json::json!({"data": [{
+                "id": "deepseek-flash",
+                "effort": {"supported_levels": ["low", "high", "max"], "default_level": "high"},
+            }]})
+            .to_string(),
+            &[],
+        )
+        .expect("parse provider effort metadata");
+        let reasoning = models[0].reasoning.as_ref().expect("canonical capability");
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["low", "high", "max"])
+        );
+        assert_eq!(reasoning["defaultEffort"], "high");
+        assert_eq!(reasoning["upstream"]["parameter"], "reasoning_effort");
+        assert_eq!(models[0].effort.as_ref().unwrap()["default_level"], "high");
+    }
+
+    #[test]
+    fn upstream_metadata_new_fields_preserve_authoritative_data_over_descriptors() {
+        let models = parse_models_response(
+            &serde_json::json!({
+                "data": [{
+                    "id": "public-model",
+                    "meta": {"n_ctx": 262144},
+                    "output_modalities": [],
+                    "effort": {"supported_levels": ["low"], "default_level": "low"},
+                }],
+                "models": [{
+                    "id": "public-model",
+                    "context_window": 128,
+                    "architecture": {"output_modalities": ["image"]},
+                    "reasoning": {"supported_efforts": ["high"], "default_effort": "high"},
+                }],
+            })
+            .to_string(),
+            &[],
+        )
+        .expect("data inventory is authoritative");
+        assert_eq!(models[0].context_window, Some(262144));
+        assert_eq!(models[0].output_modalities, Some(Vec::new()));
+        assert_eq!(
+            models[0].reasoning.as_ref().unwrap()["supportedEfforts"],
+            serde_json::json!(["low"])
+        );
+    }
+
+    #[test]
+    fn upstream_metadata_dashscope_incomplete_or_contradictory_paging_fails_closed() {
+        for output in [
+            serde_json::json!({"models": [upstream_metadata_card("a")], "total": 2}),
+            serde_json::json!({"models": [upstream_metadata_card("a")], "page_no": 1}),
+            serde_json::json!({"models": [upstream_metadata_card("a")], "total": 1, "page_no": 0}),
+            serde_json::json!({"models": [upstream_metadata_card("a")], "total": 0, "page_no": 1}),
+        ] {
+            assert!(
+                parse_provider_models_response_with_pagination(
+                    &serde_json::json!({"output": output}).to_string(),
+                    &[],
+                    "",
+                    "",
+                )
+                .is_err(),
+                "invalid paging must not look complete: {output}"
+            );
+        }
+        let body = serde_json::json!({
+            "output": {"models": [upstream_metadata_card("a")], "total": 1, "page_no": 1},
+            "has_more": true,
+        });
+        assert!(
+            parse_provider_models_response_with_pagination(&body.to_string(), &[], "", "").is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_metadata_dashscope_complete_http_pages_preserve_query_auth_and_inventory() {
+        let server = upstream_metadata_server(vec![
+            (
+                axum::http::StatusCode::OK,
+                upstream_metadata_page(3, 1, &["c", "b"]),
+            ),
+            (
+                axum::http::StatusCode::OK,
+                upstream_metadata_page(3, 2, &["b", "a"]),
+            ),
+        ])
+        .await;
+        let models = upstream_metadata_fetch(&server.url)
+            .await
+            .expect("complete paginated model inventory");
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0],
+            ("page_size=1&marker=fixture&page_no=1".to_string(), true)
+        );
+        assert_eq!(
+            requests[1],
+            ("page_size=1&marker=fixture&page_no=2".to_string(), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_metadata_dashscope_http_partial_failure_returns_no_inventory_and_redacts() {
+        let server = upstream_metadata_server(vec![
+            (
+                axum::http::StatusCode::OK,
+                upstream_metadata_page(2, 1, &["a"]),
+            ),
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": {"message": "fixture-redacted-model-key"}}),
+            ),
+        ])
+        .await;
+        let error = upstream_metadata_fetch(&server.url)
+            .await
+            .expect_err("partial fetch is not a refresh");
+        assert!(error.contains("502"));
+        assert!(!error.contains("fixture-redacted-model-key"));
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn upstream_metadata_dashscope_rejects_total_drift_and_wrong_page_identity() {
+        for second in [
+            upstream_metadata_page(1, 2, &["b"]),
+            upstream_metadata_page(2, 1, &["b"]),
+            serde_json::json!({"output": {"models": [upstream_metadata_card("b")]}}),
+        ] {
+            let server = upstream_metadata_server(vec![
+                (
+                    axum::http::StatusCode::OK,
+                    upstream_metadata_page(2, 1, &["a"]),
+                ),
+                (axum::http::StatusCode::OK, second),
+            ])
+            .await;
+            assert!(
+                upstream_metadata_fetch(&server.url).await.is_err(),
+                "drifted or unidentified page cannot certify a complete inventory"
+            );
+            assert_eq!(server.requests.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_metadata_dashscope_rejects_first_page_after_inventory_start() {
+        let server = upstream_metadata_server(vec![(
+            axum::http::StatusCode::OK,
+            upstream_metadata_page(1, 2, &["a"]),
+        )])
+        .await;
+        assert!(upstream_metadata_fetch(&server.url).await.is_err());
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upstream_metadata_dashscope_case_collisions_cannot_certify_completion() {
+        let server = upstream_metadata_server(vec![
+            (
+                axum::http::StatusCode::OK,
+                upstream_metadata_page(2, 1, &["model-a"]),
+            ),
+            (
+                axum::http::StatusCode::OK,
+                upstream_metadata_page(2, 2, &["MODEL-A"]),
+            ),
+        ])
+        .await;
+        let error = upstream_metadata_fetch(&server.url)
+            .await
+            .expect_err("case aliases are not distinct inventory rows");
+        assert!(error.contains("previously returned"), "{error}");
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+
+        let server = upstream_metadata_server(vec![
+            (
+                axum::http::StatusCode::OK,
+                upstream_metadata_page(3, 1, &["c", "b"]),
+            ),
+            (
+                axum::http::StatusCode::OK,
+                upstream_metadata_page(3, 2, &["B", "a"]),
+            ),
+        ])
+        .await;
+        let models = upstream_metadata_fetch(&server.url)
+            .await
+            .expect("overlapping pages retain new identities");
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn upstream_metadata_dashscope_repeated_page_fails_without_extra_requests() {
+        let server = upstream_metadata_server(vec![
+            (
+                axum::http::StatusCode::OK,
+                upstream_metadata_page(2, 1, &["a"]),
+            ),
+            (
+                axum::http::StatusCode::OK,
+                upstream_metadata_page(2, 2, &["a"]),
+            ),
+        ])
+        .await;
+        let error = upstream_metadata_fetch(&server.url)
+            .await
+            .expect_err("repeated page is not progress");
+        assert!(error.contains("previously returned"), "{error}");
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn upstream_metadata_zhipu_current_and_multiline_html_cards() {
+        let facts = parse_zhipu_detail_metadata(
+            r#"
+<Card title="上下文窗口"
+    icon={<svg viewBox="0 0 24 24" />}>
+  1M
+</Card>
+<Card title="最大输出 Tokens" icon={<svg />}>
+  128K
+</Card>
+"#,
+        );
+        assert_eq!(facts.context_window, Some(1_000_000));
+        assert_eq!(facts.max_output_tokens, Some(128_000));
+    }
 
     #[test]
     fn upstream_v3202_anthropic_model_directory_uses_vendor_openai_path() {
@@ -3322,6 +4593,89 @@ mod tests {
     }
 
     #[test]
+    fn parse_vllm_model_card_max_model_len() {
+        let models = parse_models_response(
+            r#"{"object":"list","data":[{"id":"Qwen/Qwen3.8","object":"model","owned_by":"vllm","root":"Qwen/Qwen3.8","max_model_len":262144,"permission":[]}]}"#,
+            &[],
+        )
+        .expect("parse vLLM ModelList and ModelCard response");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "Qwen/Qwen3.8");
+        assert_eq!(models[0].owned_by.as_deref(), Some("vllm"));
+        assert_eq!(models[0].context_window, Some(262_144));
+    }
+
+    #[test]
+    fn parse_strata_vllm_compatible_model_card_with_engine_metadata() {
+        let models = parse_models_response(
+            r#"{"object":"list","data":[{"id":"qwen3.8","object":"model","owned_by":"strata","status":"loaded","meta":{"n_ctx":1048576},"architecture":{"input_modalities":["text","image"],"output_modalities":["text"]}}]}"#,
+            &[],
+        )
+        .expect("parse Strata model card");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "qwen3.8");
+        assert_eq!(models[0].owned_by.as_deref(), Some("strata"));
+        assert_eq!(models[0].context_window, Some(1_048_576));
+        assert_eq!(
+            models[0].input_modalities,
+            Some(vec!["text".to_string(), "image".to_string()])
+        );
+        assert_eq!(models[0].supports_image, Some(true));
+        assert_eq!(models[0].output_modalities, Some(vec!["text".to_string()]));
+    }
+
+    #[test]
+    fn parse_dashscope_output_models_envelope_exposes_pagination() {
+        let parsed = parse_provider_models_response_with_pagination(
+            r#"{"output":{"models":[{"id":"qwen-max","owned_by":"dashscope"}],"total":3,"page_no":1}}"#,
+            &[],
+            "https://dashscope.aliyuncs.com",
+            "https://dashscope.aliyuncs.com/v1/models",
+        )
+        .expect("parse DashScope output.models envelope");
+
+        assert_eq!(parsed.models.len(), 1);
+        assert_eq!(parsed.models[0].id, "qwen-max");
+        assert_eq!(
+            parsed.pagination.map(|page| (page.total, page.page_no)),
+            Some((3, 1))
+        );
+    }
+
+    #[test]
+    fn parse_zhipu_current_mintlify_model_cards_preserves_full_metadata() {
+        let markdown = r#"
+> [card] 输入模态
+>
+> 文本、图像
+
+> [card] 输出模态
+>
+> 文本
+
+> [card] 上下文窗口
+>
+> 200K
+
+> [card] 最大输出 Tokens
+>
+> 64K
+"#;
+
+        assert_eq!(
+            parse_zhipu_detail_metadata(markdown),
+            ZhipuModelMetadata {
+                context_window: Some(200_000),
+                max_output_tokens: Some(64_000),
+                input_modalities: Some(vec!["text".to_string(), "image".to_string()]),
+                output_modalities: Some(vec!["text".to_string()]),
+            }
+        );
+    }
+
+    #[test]
     fn metadata_audit_openrouter_architecture_preserves_modalities_and_explicit_empty_inputs() {
         let models = parse_provider_models_response(
             &serde_json::json!({
@@ -3476,7 +4830,9 @@ mod tests {
         .expect("native Gemini uses a resource name as its requestable model identity");
         assert_eq!(models[0].id, "models/gemini-2.5-pro");
         assert_eq!(models[0].display_name.as_deref(), Some("Gemini 2.5 Pro"));
-        assert_eq!(models[0].context_window, Some(1_048_576));
+        assert_eq!(models[0].context_window, None);
+        assert_eq!(models[0].max_input_tokens, Some(1_048_576));
+        assert_eq!(models[0].max_output_tokens, Some(65_536));
         assert!(models[0].reasoning.is_none());
         assert!(models[0].protocol_capability.is_none());
         let serialized = serde_json::to_string(&models[0]).unwrap();
@@ -4674,6 +6030,7 @@ mod tests {
             .into_iter()
             .map(|entry| FetchedModel {
                 context_window: extract_context_window(&entry.extra),
+                max_input_tokens: extract_max_input_tokens(&entry.extra),
                 id: entry.id,
                 input_modalities: None,
                 owned_by: entry.owned_by,
@@ -4692,7 +6049,8 @@ mod tests {
         assert_eq!(data[4].context_window, None);
         assert_eq!(data[5].context_window, Some(200_000));
         assert_eq!(data[6].context_window, Some(204_800));
-        assert_eq!(data[7].context_window, Some(1_000_000));
+        assert_eq!(data[7].context_window, None);
+        assert_eq!(data[7].max_input_tokens, Some(1_000_000));
         assert_eq!(data[8].context_window, Some(262_144));
         assert_eq!(data[9].context_window, Some(32_768));
         assert_eq!(data[10].context_window, Some(65_536));

@@ -400,6 +400,11 @@ export const settingsApi = {
     return await invoke("set_tool_auto_update", { tool, enabled });
   },
 
+  /** Read-only projection of the backend's native-host install authority. */
+  async getToolInstallCommands(): Promise<string> {
+    return await invoke("get_tool_install_commands");
+  },
+
   async runToolLifecycleAction(
     tools: string[],
     action: "install" | "update",

@@ -33,6 +33,7 @@ import {
   reconcileFetchedCodexCatalogRows,
 } from "@/lib/codexCatalogReconciliation";
 import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
+import { isGeneratedCodexApiKeyGroupModel } from "@/lib/codexApiKeyGroup";
 import {
   buildCodexModelReferenceIndex,
   resolveCodexRouteModelReference,
@@ -521,17 +522,8 @@ type WizardSourceModelId = (
   model: CodexCatalogModel,
 ) => string;
 
-function isGeneratedWizardGroupModel(model: CodexCatalogModel): boolean {
-  return (
-    model.apiKeyGroupGenerated === true ||
-    model.api_key_group_generated === true ||
-    Boolean(model.apiKeyGroupId || model.api_key_group_id) ||
-    model.model.toLowerCase().includes("--ccg-")
-  );
-}
-
 const defaultWizardSourceModelId: WizardSourceModelId = (_provider, model) =>
-  (isGeneratedWizardGroupModel(model)
+  (isGeneratedCodexApiKeyGroupModel(model)
     ? model.model
     : (model.upstreamModel ?? model.upstream_model ?? model.model)
   ).trim();
@@ -575,7 +567,7 @@ export function resolveWizardModelNameCollisions(
   providers: Provider[],
 ): Provider[] {
   const collisionKeyFor = (model: CodexCatalogModel): string =>
-    isGeneratedWizardGroupModel(model)
+    isGeneratedCodexApiKeyGroupModel(model)
       ? model.model.trim().toLowerCase()
       : modelBindingIdentityValues(model)[0];
   const ownersByCollisionKey = new Map<string, Provider[]>();
@@ -596,7 +588,7 @@ export function resolveWizardModelNameCollisions(
       if (model.enabled === false) return model;
       const upstream =
         model.upstreamModel ?? model.upstream_model ?? model.model;
-      const generated = isGeneratedWizardGroupModel(model);
+      const generated = isGeneratedCodexApiKeyGroupModel(model);
       const owners = ownersByCollisionKey.get(collisionKeyFor(model)) ?? [];
       if (generated) {
         if (owners.length <= 1) return { ...model, upstreamModel: upstream };
@@ -1108,7 +1100,7 @@ export function buildWizardRoutesFromSources(
       readIncludedWizardModelCatalog(provider).map((model) => ({
         model: sourceModelId(provider, model),
         upstreamModel: model.upstreamModel ?? model.upstream_model,
-        ...(isGeneratedWizardGroupModel(model)
+        ...(isGeneratedCodexApiKeyGroupModel(model)
           ? { apiKeyGroupGenerated: true }
           : {}),
       })),
@@ -1322,7 +1314,7 @@ export function initialWizardCatalogModelOrder(
       readIncludedWizardModelCatalog(source).map((model) => ({
         ...model,
         model: sourceModelId(source, model),
-        ...(isGeneratedWizardGroupModel(model)
+        ...(isGeneratedCodexApiKeyGroupModel(model)
           ? { apiKeyGroupGenerated: true }
           : {}),
       })),

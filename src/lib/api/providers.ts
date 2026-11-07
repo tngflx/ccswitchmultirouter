@@ -277,7 +277,38 @@ export const providersApi = {
     provider: Provider,
     appId: AppId,
     originalId?: string,
+    expectedProvider?: Provider,
   ): Promise<boolean> {
+    if (expectedProvider) {
+      // A distinct command fails closed on older native builds. Never fall back
+      // to the unconditional writer when a refresh asks for compare-and-set.
+      try {
+        return await invoke("update_provider_if_unchanged", {
+          provider,
+          app: appId,
+          originalId,
+          expectedProvider,
+        });
+      } catch (error) {
+        const message =
+          typeof error === "string"
+            ? error
+            : error instanceof Error
+              ? error.message
+              : "";
+        if (
+          /^Command ["'`]?update_provider_if_unchanged["'`]? not found$/i.test(
+            message,
+          ) ||
+          /^unknown command ["'`]?update_provider_if_unchanged["'`]?$/i.test(
+            message,
+          )
+        ) {
+          throw new Error("provider_refresh_backend_update_required");
+        }
+        throw error;
+      }
+    }
     return await invoke("update_provider", {
       provider,
       app: appId,

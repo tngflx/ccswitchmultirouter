@@ -69,14 +69,17 @@ const codexQueryObserverPrototype = (value) => {
       "prototype",
     )?.value;
     if (!prototype) return null;
-    const methods = Object.getOwnPropertyDescriptors(prototype);
     return [
       "createResult",
       "getCurrentResult",
       "getOptimisticResult",
       "getCurrentQuery",
       "setOptions",
-    ].every((name) => typeof methods[name]?.value === "function")
+    ].every(
+      (name) =>
+        typeof Object.getOwnPropertyDescriptor(prototype, name)?.value ===
+        "function",
+    )
       ? prototype
       : null;
   } catch {
@@ -130,20 +133,96 @@ const patchCodexModelReasoningQueryClient = (value, patchedCaches) => {
     return false;
   }
 };
+// Ownership checks are separate from hook installation: a historical hook can
+// remain attached for restoration without authorizing another continuation.
+const codexAppServerClientHasCurrentOwner = (client) => {
+  let tracked = false;
+  const scoped = state.scopedAppServerClientSet;
+  if (scoped instanceof Set && scoped.has(client)) {
+    tracked = true;
+    if (
+      state.scopedAppServerScopeScanComplete === true &&
+      codexRendererScopeSnapshotIsCurrent()
+    ) {
+      const owners = state.scopedAppServerClientOwners;
+      if (!(owners instanceof Map)) return true;
+      for (const current of owners.get(client) || []) {
+        try {
+          if (current()) return true;
+        } catch {}
+      }
+    }
+  }
+  const modules = state.moduleAppServerClientOwners;
+  if (modules instanceof Map) {
+    tracked = true;
+    for (const bindings of modules.values()) {
+      for (const binding of bindings instanceof Map
+        ? bindings.get(client) || []
+        : []) {
+        try {
+          const field = Object.getOwnPropertyDescriptor(
+            binding.module,
+            binding.key,
+          );
+          if (!field || !("value" in field) || field.value !== binding.source)
+            continue;
+          if (!binding.get) {
+            if (binding.source === client) return true;
+          } else if (
+            codexDeclaredMethod(binding.source, "get") === binding.get &&
+            binding.get.length === 0 &&
+            binding.get.call(binding.source) === client
+          )
+            return true;
+        } catch {}
+      }
+    }
+  }
+  const react = state.reactAppServerClientOwners;
+  if (react instanceof Map) {
+    tracked = true;
+    for (const current of react.get(client) || []) {
+      try {
+        if (current()) return true;
+      } catch {}
+    }
+  }
+  // Standalone compatibility probes supply verified clients explicitly. The
+  // renderer always initializes source registries, so unowned live clients
+  // never enter this compatibility path.
+  return !tracked;
+};
 const patchAppServerModuleClients = (module, patchedCaches = new Set()) => {
   if (!codexClientDiscoveryIsCurrent()) return 0;
   patchCodexModelReasoningQueryObserverModule(module);
   let patched = 0;
-  for (const candidate of codexDeclaredModuleValues(module).filter(
-    (item) => item && typeof item === "object",
-  )) {
+  const owners =
+    state.moduleAppServerClientOwners instanceof Map
+      ? state.moduleAppServerClientOwners
+      : new Map();
+  const previous = owners.get(module) || new Map();
+  const current = new Map();
+  const retain = (client, key, source, get = null) => {
+    if (!current.has(client)) current.set(client, []);
+    current.get(client).push({ module, key, source, get });
+    patched += 1;
+  };
+  let entries = [];
+  try {
+    entries = Object.entries(Object.getOwnPropertyDescriptors(module || {}));
+  } catch {}
+  for (const [key, field] of entries) {
+    if (!("value" in field)) continue;
+    const candidate = field.value;
+    if (!candidate || typeof candidate !== "object") continue;
     patchCodexModelReasoningQueryClient(candidate, patchedCaches);
     if (looksLikeAppServerRequestClient(candidate)) {
-      if (patchRequestClient(candidate)) patched += 1;
+      if (patchRequestClient(candidate)) retain(candidate, key, candidate);
       continue;
     }
-    // The legacy signal has a declared, zero-argument get method. Maps and RPC
-    // proxies are excluded; the signal can replace its client on any heartbeat.
+    // Revalidate the same declared signal and its exact value at continuation
+    // boundaries too, not only when the next discovery heartbeat runs.
     const get = codexDeclaredMethod(candidate, "get");
     if (get && get.length === 0) {
       try {
@@ -153,24 +232,47 @@ const patchAppServerModuleClients = (module, patchedCaches = new Set()) => {
           looksLikeAppServerRequestClient(client) &&
           patchRequestClient(client)
         )
-          patched += 1;
+          retain(client, key, candidate, get);
       } catch {}
     }
   }
+  owners.set(module, current);
+  state.moduleAppServerClientOwners = owners;
+  const owned = new Set();
+  for (const clients of owners.values())
+    for (const client of clients.keys()) owned.add(client);
+  state.appServerClients = Array.from(
+    new Set([
+      ...(Array.isArray(state.appServerClients)
+        ? state.appServerClients
+        : []
+      ).filter(
+        (client) =>
+          !previous.has(client) || codexAppServerClientHasCurrentOwner(client),
+      ),
+      ...owned,
+    ]),
+  );
   return patched;
 };
 const codexDeclaredDependencyScope = (value) => {
   if (!value || typeof value !== "object") return false;
   try {
-    const fields = Object.getOwnPropertyDescriptors(value);
+    // Discovery may inspect many export candidates. Probe only the scope
+    // contract, not every unrelated key or descriptor on the candidate.
+    const client = Object.getOwnPropertyDescriptor(value, "queryClient");
     return (
       ["get", "set", "watch"].every(
-        (key) => typeof fields[key]?.value === "function",
+        (key) =>
+          typeof Object.getOwnPropertyDescriptor(value, key)?.value ===
+          "function",
       ) &&
-      ["chain", "node"].every((key) => fields[key] && "value" in fields[key]) &&
-      fields.queryClient &&
-      ("value" in fields.queryClient ||
-        typeof fields.queryClient.get === "function")
+      ["chain", "node"].every((key) => {
+        const field = Object.getOwnPropertyDescriptor(value, key);
+        return field && "value" in field;
+      }) &&
+      client &&
+      ("value" in client || typeof client.get === "function")
     );
   } catch {
     return false;
@@ -228,24 +330,26 @@ const codexScopedRegistryInstance = (value) => {
     return false;
   }
 };
-const codexScopeQueryClient = (scope) => scope?.queryClient || null;
-const codexRendererScopeCandidates = async () => {
-  if (!codexClientDiscoveryIsCurrent()) return [];
-  const retained = Array.from(
-    state.scopedAppServerScopeCandidates || state.scopedAppServerScopes || [],
-  ).filter(codexDeclaredDependencyScope);
-  const retainedRegistries = Array.from(
-    state.scopedAppServerRegistryInstances || [],
-  ).filter(codexScopedRegistryInstance);
-  const scanStartedAt = Date.now();
-  if (
-    retained.length &&
-    state.scopedAppServerScopesScannedAt != null &&
-    scanStartedAt - state.scopedAppServerScopesScannedAt < 30000
-  ) {
-    state.scopedAppServerRegistryInstances = new Set(retainedRegistries);
-    return retained;
+const codexScopeQueryClient = (scope) => {
+  if (!codexDeclaredDependencyScope(scope)) return null;
+  const node = Object.getOwnPropertyDescriptor(scope, "node")?.value;
+  if (node && (typeof node === "object" || typeof node === "function")) {
+    // Current Desktop's declared scope accessor only returns node.queryClient.
+    // Read that initialized own data slot directly: a missing/null client is
+    // not permission to invoke an unrelated getter or borrow a stale owner.
+    const client = Object.getOwnPropertyDescriptor(node, "queryClient");
+    if (client) return "value" in client ? client.value || null : null;
   }
+  // Older validated dependency scopes expose the client only through their
+  // own queryClient field/accessor. Preserve that established compatibility
+  // path only when the modern node slot is absent, never for module exports.
+  const client = Object.getOwnPropertyDescriptor(scope, "queryClient");
+  if (!client) return null;
+  return "value" in client
+    ? client.value || null
+    : client.get.call(scope) || null;
+};
+const codexRendererScopeRootIdentities = () => {
   const roots = [window.__codexRoot?._internalRoot?.current];
   const root = document.getElementById("root");
   for (const key of Object.keys(root || {})) {
@@ -253,7 +357,55 @@ const codexRendererScopeCandidates = async () => {
     const fiber = Object.getOwnPropertyDescriptor(root, key)?.value;
     roots.push(fiber?.stateNode?.current || fiber);
   }
-  const fibers = roots.filter(Boolean);
+  return roots.filter(Boolean);
+};
+const codexRendererScopeSnapshotIsCurrent = (
+  roots = codexRendererScopeRootIdentities(),
+) => {
+  if (state.scopedAppServerScopeScanComplete !== true) return false;
+  const previous = state.scopedAppServerRootIdentities;
+  if (
+    !Array.isArray(previous) ||
+    roots.length === 0 ||
+    roots.length !== previous.length ||
+    !roots.every((identity, index) => identity === previous[index])
+  )
+    return false;
+  // DOM changes can mount new dependency providers before the retained root
+  // identity changes. Re-prove ownership before native visibility/continuation.
+  return !(state.pendingReactNodes?.size > 0);
+};
+const codexRendererScopeCandidates = async () => {
+  if (!codexClientDiscoveryIsCurrent()) return [];
+  // A retained scope set is only authoritative after a complete React scan.
+  // We invalidate the snapshot immediately before a real traversal, while
+  // preserving the fast path for a recently completed scan.
+  const retained = Array.from(
+    state.scopedAppServerScopeCandidates || state.scopedAppServerScopes || [],
+  ).filter(codexDeclaredDependencyScope);
+  const retainedRegistries = Array.from(
+    state.scopedAppServerRegistryInstances || [],
+  ).filter(codexScopedRegistryInstance);
+  const scanStartedAt = Date.now();
+  // A retained scope snapshot is usable only while the React root identities
+  // that produced it are still current. React may replace the current Fiber
+  // during navigation without changing the DOM container, so compare the
+  // exact root objects before taking the bounded fast path. Pending DOM
+  // mutations are also a conservative signal that a new provider may have
+  // mounted and require a fresh walk.
+  const currentRootIdentities = codexRendererScopeRootIdentities();
+  if (
+    retained.length &&
+    state.scopedAppServerScopesScannedAt != null &&
+    codexRendererScopeSnapshotIsCurrent(currentRootIdentities) &&
+    scanStartedAt - state.scopedAppServerScopesScannedAt < 30000
+  ) {
+    state.scopedAppServerScopeScanComplete = true;
+    state.scopedAppServerRegistryInstances = new Set(retainedRegistries);
+    return retained;
+  }
+  state.scopedAppServerScopeScanComplete = false;
+  const fibers = currentRootIdentities.slice();
   if (!fibers.length) {
     state.scopedAppServerRegistryInstances = new Set(retainedRegistries);
     return retained;
@@ -353,6 +505,8 @@ const codexRendererScopeCandidates = async () => {
   state.scopedAppServerScopeCandidates = new Set(current);
   state.scopedAppServerRegistryInstances = new Set(currentRegistries);
   state.scopedAppServerScopesScannedAt = scanStartedAt;
+  state.scopedAppServerScopeScanComplete = !scanWasCapped;
+  state.scopedAppServerRootIdentities = currentRootIdentities;
   return current;
 };
 const refreshCodexScopedAppServerClients = (
@@ -372,6 +526,26 @@ const refreshCodexScopedAppServerClients = (
   const seenCaches = new Set();
   const seenManagers = new Set();
   const seenRequestClients = new Set();
+  const verifiedRequestClients = new Set();
+  const verifiedOwners = new Map();
+  const retainOwner = (client, scope, registry, lookup) => {
+    if (!verifiedOwners.has(client)) verifiedOwners.set(client, []);
+    const scopeGet = Object.getOwnPropertyDescriptor(scope, "get")?.value;
+    verifiedOwners.get(client).push(() => {
+      if (
+        !Set.prototype.has.call(state.scopedAppServerScopeCandidates, scope) ||
+        Object.getOwnPropertyDescriptor(scope, "get")?.value !== scopeGet ||
+        Object.getOwnPropertyDescriptor(registry, "scope")?.value !== scope ||
+        codexDeclaredMethod(registry, "getForHostId") !== lookup
+      )
+        return false;
+      const current = lookup.call(registry, "local");
+      return (
+        Object.getOwnPropertyDescriptor(current || {}, "requestClient")
+          ?.value === client
+      );
+    });
+  };
   const retainedScopes = new Set();
   for (const scope of scopes) {
     let client = null;
@@ -422,7 +596,11 @@ const refreshCodexScopedAppServerClients = (
         retainedScopes.add(scope);
         if (seenRequestClients.has(requestClient)) continue;
         seenRequestClients.add(requestClient);
-        if (patchRequestClient(requestClient)) patched += 1;
+        if (patchRequestClient(requestClient)) {
+          verifiedRequestClients.add(requestClient);
+          retainOwner(requestClient, scope, registry, lookup);
+          patched += 1;
+        }
       } catch (error) {
         recordFailure(error);
       }
@@ -446,11 +624,59 @@ const refreshCodexScopedAppServerClients = (
         retainedScopes.add(scope);
         if (seenRequestClients.has(requestClient)) continue;
         seenRequestClients.add(requestClient);
-        if (patchRequestClient(requestClient)) patched += 1;
+        if (patchRequestClient(requestClient)) {
+          verifiedRequestClients.add(requestClient);
+          retainOwner(requestClient, scope, registry, lookup);
+          patched += 1;
+        }
       } catch (error) {
         recordFailure(error);
       }
     }
+  }
+  // Scope discovery is the ownership boundary for continuation clients.
+  // Once a complete React snapshot is available, replace the previous scoped
+  // projection instead of appending forever; preserve only clients discovered
+  // by legacy module-level fallback paths. During an incomplete scan, retain
+  // the previous projection fail-closed until a complete snapshot is published.
+  const previousScopedClients =
+    state.scopedAppServerClientSet instanceof Set
+      ? state.scopedAppServerClientSet
+      : new Set();
+  if (state.scopedAppServerScopeScanComplete === true) {
+    const unscopedClients = (
+      Array.isArray(state.appServerClients) ? state.appServerClients : []
+    ).filter(
+      (client) =>
+        !previousScopedClients.has(client) ||
+        Array.from(state.moduleAppServerClientOwners?.values() || []).some(
+          (clients) => clients.has(client),
+        ),
+    );
+    state.appServerClients = Array.from(
+      new Set([...unscopedClients, ...verifiedRequestClients]),
+    );
+    state.scopedAppServerClientSet = new Set(verifiedRequestClients);
+    state.scopedAppServerClientOwners = verifiedOwners;
+  } else if (verifiedRequestClients.size) {
+    state.appServerClients = Array.from(
+      new Set([
+        ...(Array.isArray(state.appServerClients)
+          ? state.appServerClients
+          : []),
+        ...verifiedRequestClients,
+      ]),
+    );
+    state.scopedAppServerClientSet = new Set([
+      ...previousScopedClients,
+      ...verifiedRequestClients,
+    ]);
+    const owners =
+      state.scopedAppServerClientOwners instanceof Map
+        ? new Map(state.scopedAppServerClientOwners)
+        : new Map();
+    for (const [client, checks] of verifiedOwners) owners.set(client, checks);
+    state.scopedAppServerClientOwners = owners;
   }
   state.scopedAppServerScopes = retainedScopes;
   state.scopedAppServerDiscovery = {

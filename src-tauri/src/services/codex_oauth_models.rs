@@ -5,7 +5,8 @@
 
 use crate::proxy::providers::CODEX_OAUTH_ORIGINATOR;
 use crate::services::model_fetch::{
-    explicit_positive_model_limit, extract_model_identity_fields, FetchedModel,
+    explicit_positive_model_limit, extract_model_identity_fields, extract_output_modalities,
+    FetchedModel,
 };
 use once_cell::sync::Lazy;
 use serde::Serialize;
@@ -665,6 +666,7 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
         ),
         id,
         input_modalities,
+        output_modalities: extract_output_modalities(obj),
         owned_by,
         supports_image,
         display_name: identity.display_name,
@@ -675,6 +677,7 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
         upstream_model: None,
         supports_parallel_tool_calls: identity.supports_parallel_tool_calls,
         reasoning,
+        effort: None,
         protocol_capability: None,
         is_free: None,
     });

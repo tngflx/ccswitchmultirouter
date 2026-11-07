@@ -58,6 +58,30 @@ const harness = <T>(
 };
 
 describe("Codex Desktop picker observer diagnostics", () => {
+  it("treats an authoritative empty catalog as not required without certifying an unavailable catalog", () => {
+    const empty = {
+      ...payload(),
+      catalogAvailable: true,
+      modelNames: [],
+      models: [],
+    };
+    expect(
+      loadDiagnostics({ payload: empty, reasoningQueryCaches: new Map() })(),
+    ).toMatchObject({
+      status: "not_required",
+      pickerObserverCount: 0,
+    });
+    expect(
+      loadDiagnostics({
+        payload: { ...empty, catalogAvailable: false },
+        reasoningQueryCaches: new Map(),
+      })(),
+    ).toMatchObject({
+      status: "unverified",
+      pickerObserverCount: 0,
+    });
+  });
+
   it("reports selector errors even when raw query data succeeded", () => {
     const h = harness(() => {
       throw new TypeError("redacted selector failure");

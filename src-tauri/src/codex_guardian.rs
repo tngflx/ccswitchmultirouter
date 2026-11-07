@@ -4,11 +4,11 @@ use std::time::Duration;
 use tokio::sync::{watch, Mutex};
 
 use crate::codex_desktop::{
-    candidate_debug_ports, codex_renderer_compatibility_is_current, deactivate_codex_model_picker,
-    detect_running_codex_main_process, list_cdp_targets,
+    candidate_debug_ports, deactivate_codex_model_picker, detect_running_codex_main_process,
+    inspect_codex_renderer_compatibility, list_cdp_targets,
     load_cc_switch_model_catalog_projection_outcome, pick_codex_page_targets,
     try_inject_on_candidate_ports, CodexModelCatalogLoadOutcome, CodexModelCatalogProjection,
-    DEFAULT_CODEX_DEBUG_PORT,
+    CodexModelPickerReadiness, CodexRendererCompatibilityObservation, DEFAULT_CODEX_DEBUG_PORT,
 };
 
 const GUARDIAN_CHECK_INTERVAL: Duration = Duration::from_secs(3);
@@ -22,6 +22,8 @@ pub struct CodexGuardianStatus {
     pub cdp_available: bool,
     pub injected_target_count: usize,
     pub injected: bool,
+    pub picker_ready_target_count: usize,
+    pub picker_status: CodexModelPickerReadiness,
     pub last_event: String,
     pub message: String,
 }
@@ -52,6 +54,8 @@ pub(crate) fn start_codex_guardian() -> GuardianHandle {
         cdp_available: false,
         injected_target_count: 0,
         injected: false,
+        picker_ready_target_count: 0,
+        picker_status: CodexModelPickerReadiness::Unverified,
         last_event: "守护已启动".into(),
         message: "守护已启动，等待 Codex Desktop...".into(),
     }));
@@ -89,6 +93,8 @@ async fn guardian_loop(
         if *shutdown.borrow() {
             let mut s = status.lock().await;
             s.active = false;
+            s.picker_ready_target_count = 0;
+            s.picker_status = CodexModelPickerReadiness::Unverified;
             s.last_event = "守护已停止".into();
             s.message = "守护已停止".into();
             return;
@@ -101,6 +107,8 @@ async fn guardian_loop(
             _ = shutdown.changed() => {
                 let mut s = status.lock().await;
                 s.active = false;
+                s.picker_ready_target_count = 0;
+                s.picker_status = CodexModelPickerReadiness::Unverified;
                 s.last_event = "守护已停止".into();
                 s.message = "守护已停止".into();
                 return;
@@ -121,6 +129,8 @@ async fn run_guardian_cycle(
         s.cdp_available = false;
         s.injected = false;
         s.injected_target_count = 0;
+        s.picker_ready_target_count = 0;
+        s.picker_status = CodexModelPickerReadiness::Unverified;
         s.last_event = "Codex 未运行".into();
         s.message = "Codex Desktop 未运行，等待用户启动...".into();
         // 进程消失时清理已知 target，下次启动不会跳过新 target。
@@ -162,6 +172,8 @@ async fn run_guardian_cycle(
         s.cdp_available = false;
         s.injected = false;
         s.injected_target_count = 0;
+        s.picker_ready_target_count = 0;
+        s.picker_status = CodexModelPickerReadiness::Unverified;
         s.last_event = "Codex 运行中但无 CDP".into();
         s.message = "Codex Desktop 正在运行但未开放 CDP 调试端口；CCSM 不会静默终止 Codex，请退出后从 CCSM 启动或等待下次 CCSM 启动 Codex 时自动注入。".into();
         let mut guard = inner.lock().await;
@@ -183,6 +195,8 @@ async fn run_guardian_cycle(
             let mut s = status.lock().await;
             s.codex_running = true;
             s.cdp_available = true;
+            s.picker_ready_target_count = 0;
+            s.picker_status = CodexModelPickerReadiness::Unverified;
             s.last_event = "模型目录加载失败".into();
             s.message = format!("无法加载 CCSM 模型目录: {error}");
             log::warn!("Codex 守护: 模型目录加载失败: {error}");
@@ -209,12 +223,12 @@ async fn run_guardian_cycle(
     // New-document CDP scripts belong to the installing connection. Its socket
     // is short-lived, so an unchanged target ID cannot prove a reloaded page is
     // still patched. Check every current renderer before reporting it healthy.
-    let verified_target_ids = if new_ids.is_empty() && !catalog_changed {
-        current_renderer_target_ids(&current_targets, &catalog).await
+    let observations = if new_ids.is_empty() && !catalog_changed {
+        current_renderer_targets(&current_targets, &catalog).await
     } else {
-        Vec::new()
+        RendererTargetsObservation::default()
     };
-    let renderers_current = verified_target_ids.len() == current_targets.len();
+    let renderers_current = observations.installed_target_ids.len() == current_targets.len();
 
     if !guardian_should_inject(
         &new_ids,
@@ -223,21 +237,13 @@ async fn run_guardian_cycle(
         renderers_current,
     ) {
         let mut guard = inner.lock().await;
-        guard.injected_target_ids = verified_target_ids;
+        guard.injected_target_ids = observations.installed_target_ids.clone();
         let s = &mut *status.lock().await;
         s.codex_running = true;
         s.cdp_available = true;
-        s.injected = !guard.injected_target_ids.is_empty();
-        s.injected_target_count = guard.injected_target_ids.len();
-        s.last_event = "CDP renderer 与模型目录已核验".into();
-        if s.injected {
-            s.message = format!(
-                "已守护 {} 个 CDP renderer target；模型菜单注入有效。",
-                guard.injected_target_ids.len()
-            );
-        } else {
-            s.message = "CDP 可用但尚未注入（可能 target 启动中）".into();
-        }
+        apply_renderer_observation(s, &observations);
+        s.last_event = "CDP renderer 安装状态与模型选择器就绪状态已核验".into();
+        s.message = renderer_observation_message(&observations);
         return;
     }
 
@@ -252,8 +258,7 @@ async fn run_guardian_cycle(
         let mut s = status.lock().await;
         s.codex_running = true;
         s.cdp_available = true;
-        s.injected = !verified_target_ids.is_empty();
-        s.injected_target_count = verified_target_ids.len();
+        apply_renderer_observation(&mut s, &observations);
         s.last_event = if catalog_changed {
             format!("检测到模型目录变化，发起注入 (gen {gen})")
         } else if new_ids.is_empty() {
@@ -281,13 +286,13 @@ async fn run_guardian_cycle(
             }
         }
     }
-    let verified_target_ids = current_renderer_target_ids(&current_targets, &catalog).await;
-    let injected_target_count = verified_target_ids.len();
+    let observations = current_renderer_targets(&current_targets, &catalog).await;
+    let injected_target_count = observations.installed_target_ids.len();
     {
         let mut guard = inner.lock().await;
         // A successful port-level attempt does not prove every discovered
         // target was injected. Unconfirmed targets must be retried next cycle.
-        guard.injected_target_ids = verified_target_ids;
+        guard.injected_target_ids = observations.installed_target_ids.clone();
         guard.injected_catalog_fingerprint =
             (injected_target_count > 0).then_some(catalog_fingerprint);
     }
@@ -295,18 +300,14 @@ async fn run_guardian_cycle(
         let mut s = status.lock().await;
         s.codex_running = true;
         s.cdp_available = true;
-        s.injected = injected_target_count > 0;
-        s.injected_target_count = injected_target_count;
+        apply_renderer_observation(&mut s, &observations);
     }
     match injection {
         Some(result) if result.injected => {
             let mut s = status.lock().await;
             if injected_target_count == current_targets.len() {
-                s.last_event = format!("注入成功 (gen {gen})");
-                s.message = format!(
-                    "已核验 {} 个 renderer target 的模型菜单兼容层 (gen {gen})。",
-                    injected_target_count
-                );
+                s.last_event = format!("兼容层安装已核验 (gen {gen})");
+                s.message = renderer_observation_message(&observations);
             } else {
                 s.last_event = format!("注入核验未完成 (gen {gen})");
                 s.message = format!(
@@ -367,6 +368,12 @@ async fn release_unmanaged_picker(
     s.cdp_available = true;
     s.injected = false;
     s.injected_target_count = 0;
+    s.picker_ready_target_count = 0;
+    s.picker_status = if failed == 0 {
+        CodexModelPickerReadiness::NotRequired
+    } else {
+        CodexModelPickerReadiness::Unverified
+    };
     if failed == 0 {
         s.last_event = "已退出模型菜单托管".into();
         s.message = "当前 Codex 配置不由 CCSM 托管，已释放模型菜单兼容层。".into();
@@ -378,19 +385,112 @@ async fn release_unmanaged_picker(
     }
 }
 
-async fn current_renderer_target_ids(
-    targets: &[(String, String)],
-    catalog: &CodexModelCatalogProjection,
-) -> Vec<String> {
-    let mut verified = Vec::new();
-    for (id, websocket_url) in targets {
-        match codex_renderer_compatibility_is_current(websocket_url, catalog).await {
-            Ok(true) => verified.push(id.clone()),
-            Ok(false) => {}
-            Err(error) => log::debug!("Codex guardian renderer verification failed: {error}"),
+/// Readiness is a projection of this cycle's live diagnostics, not another
+/// persisted flag or a reason to reinstall an otherwise current runtime.
+struct RendererTargetsObservation {
+    installed_target_ids: Vec<String>,
+    picker_ready_target_count: usize,
+    picker_status: CodexModelPickerReadiness,
+}
+
+impl Default for RendererTargetsObservation {
+    fn default() -> Self {
+        Self {
+            installed_target_ids: Vec::new(),
+            picker_ready_target_count: 0,
+            picker_status: CodexModelPickerReadiness::Unverified,
         }
     }
-    verified
+}
+
+fn summarize_renderer_observations(
+    observations: Vec<(String, CodexRendererCompatibilityObservation)>,
+) -> RendererTargetsObservation {
+    let mut summary = RendererTargetsObservation::default();
+    let mut statuses = Vec::new();
+    for (id, observation) in observations {
+        if observation.current {
+            summary.installed_target_ids.push(id);
+        }
+        let picker_status = if !observation.current {
+            CodexModelPickerReadiness::Unverified
+        } else {
+            // Query-cache observer proof certifies only the model picker.
+            // It neither requires nor grants request-client authorization.
+            observation.picker_status
+        };
+        if picker_status == CodexModelPickerReadiness::Ready {
+            summary.picker_ready_target_count += 1;
+        }
+        statuses.push(picker_status);
+    }
+    if !statuses.is_empty() {
+        summary.picker_status = [
+            CodexModelPickerReadiness::Error,
+            CodexModelPickerReadiness::Mismatch,
+            CodexModelPickerReadiness::Unverified,
+            CodexModelPickerReadiness::Pending,
+        ]
+        .into_iter()
+        .find(|status| statuses.contains(status))
+        .unwrap_or_else(|| {
+            if statuses
+                .iter()
+                .all(|status| *status == CodexModelPickerReadiness::Ready)
+            {
+                CodexModelPickerReadiness::Ready
+            } else if statuses
+                .iter()
+                .all(|status| *status == CodexModelPickerReadiness::NotRequired)
+            {
+                CodexModelPickerReadiness::NotRequired
+            } else {
+                // Mixed applicability is not proof that every picker is ready.
+                CodexModelPickerReadiness::Unverified
+            }
+        });
+    }
+    summary
+}
+
+async fn current_renderer_targets(
+    targets: &[(String, String)],
+    catalog: &CodexModelCatalogProjection,
+) -> RendererTargetsObservation {
+    let mut observations = Vec::new();
+    for (id, websocket_url) in targets {
+        let observation = match inspect_codex_renderer_compatibility(websocket_url, catalog).await {
+            Ok(observation) => observation,
+            Err(error) => {
+                log::debug!("Codex guardian renderer verification failed: {error}");
+                CodexRendererCompatibilityObservation::default()
+            }
+        };
+        observations.push((id.clone(), observation));
+    }
+    summarize_renderer_observations(observations)
+}
+
+fn apply_renderer_observation(
+    status: &mut CodexGuardianStatus,
+    observations: &RendererTargetsObservation,
+) {
+    status.injected_target_count = observations.installed_target_ids.len();
+    status.injected = status.injected_target_count > 0;
+    status.picker_ready_target_count = observations.picker_ready_target_count;
+    status.picker_status = observations.picker_status;
+}
+
+fn renderer_observation_message(observations: &RendererTargetsObservation) -> String {
+    if observations.installed_target_ids.is_empty() {
+        return "CDP 可用但兼容层安装状态尚未核验（可能 target 启动中）".into();
+    }
+    format!(
+        "已安装 {} 个 renderer target 的兼容层；模型选择器已核验就绪 {} 个，状态 {:?}。安装状态不代表模型选择器已就绪；守护将继续检查，不会因查询未就绪而重新注入。",
+        observations.installed_target_ids.len(),
+        observations.picker_ready_target_count,
+        observations.picker_status,
+    )
 }
 
 fn guardian_should_inject(
@@ -425,6 +525,8 @@ mod tests {
             cdp_available: true,
             injected_target_count: 1,
             injected: true,
+            picker_ready_target_count: 1,
+            picker_status: CodexModelPickerReadiness::Ready,
             last_event: "previous injection".to_string(),
             message: "previous managed catalog".to_string(),
         }));
@@ -438,9 +540,129 @@ mod tests {
         let current = status.lock().await;
         assert!(!current.injected);
         assert_eq!(current.injected_target_count, 0);
+        assert_eq!(current.picker_ready_target_count, 0);
+        assert_eq!(
+            current.picker_status,
+            CodexModelPickerReadiness::NotRequired
+        );
+        let serialized = serde_json::to_value(&*current).expect("serialize guardian status");
+        assert_eq!(serialized["pickerReadyTargetCount"], 0);
+        assert_eq!(serialized["pickerStatus"], "not_required");
         assert!(current.active);
         assert!(current.codex_running);
         assert!(current.cdp_available);
+    }
+
+    fn observed_target(
+        id: &str,
+        current: bool,
+        picker_status: CodexModelPickerReadiness,
+        app_server_ready: bool,
+    ) -> (String, CodexRendererCompatibilityObservation) {
+        (
+            id.to_string(),
+            CodexRendererCompatibilityObservation {
+                current,
+                picker_status,
+                app_server_ready,
+            },
+        )
+    }
+
+    #[test]
+    fn guardian_does_not_reinject_current_runtime_while_picker_discovery_is_pending() {
+        let observations = summarize_renderer_observations(vec![
+            observed_target("pending", true, CodexModelPickerReadiness::Pending, false),
+            observed_target("ready", true, CodexModelPickerReadiness::Ready, true),
+        ]);
+        assert_eq!(observations.installed_target_ids, vec!["pending", "ready"]);
+        assert_eq!(observations.picker_ready_target_count, 1);
+        assert_eq!(
+            observations.picker_status,
+            CodexModelPickerReadiness::Pending
+        );
+        assert!(!guardian_should_inject(
+            &[],
+            Some("current-catalog"),
+            "current-catalog",
+            observations.installed_target_ids.len() == 2,
+        ));
+    }
+
+    #[test]
+    fn guardian_aggregate_never_hides_failed_or_stale_targets_behind_a_ready_target() {
+        for (current, picker_status, expected) in [
+            (
+                true,
+                CodexModelPickerReadiness::Error,
+                CodexModelPickerReadiness::Error,
+            ),
+            (
+                true,
+                CodexModelPickerReadiness::Mismatch,
+                CodexModelPickerReadiness::Mismatch,
+            ),
+            (
+                false,
+                CodexModelPickerReadiness::Ready,
+                CodexModelPickerReadiness::Unverified,
+            ),
+        ] {
+            let observations = summarize_renderer_observations(vec![
+                observed_target("ready", true, CodexModelPickerReadiness::Ready, true),
+                observed_target("other", current, picker_status, true),
+            ]);
+            assert_eq!(observations.picker_ready_target_count, 1);
+            assert_eq!(observations.picker_status, expected);
+        }
+    }
+
+    #[test]
+    fn guardian_accepts_current_cache_only_picker_proof() {
+        let observations = summarize_renderer_observations(vec![observed_target(
+            "cache-only",
+            true,
+            CodexModelPickerReadiness::Ready,
+            false,
+        )]);
+        assert_eq!(observations.installed_target_ids, vec!["cache-only"]);
+        assert_eq!(observations.picker_status, CodexModelPickerReadiness::Ready);
+        assert_eq!(observations.picker_ready_target_count, 1);
+    }
+
+    #[test]
+    fn guardian_never_invents_ready_from_pending_or_zero_targets() {
+        let observations = summarize_renderer_observations(vec![observed_target(
+            "pending-cache-discovery",
+            true,
+            CodexModelPickerReadiness::Pending,
+            false,
+        )]);
+        assert_eq!(
+            observations.picker_status,
+            CodexModelPickerReadiness::Pending
+        );
+        assert_eq!(observations.picker_ready_target_count, 0);
+        let no_targets = summarize_renderer_observations(Vec::new());
+        assert_eq!(
+            no_targets.picker_status,
+            CodexModelPickerReadiness::Unverified
+        );
+        assert_eq!(no_targets.picker_ready_target_count, 0);
+        let mixed = summarize_renderer_observations(vec![
+            observed_target("ready", true, CodexModelPickerReadiness::Ready, true),
+            observed_target("empty", true, CodexModelPickerReadiness::NotRequired, false),
+        ]);
+        assert_eq!(mixed.picker_status, CodexModelPickerReadiness::Unverified);
+        assert_eq!(mixed.picker_ready_target_count, 1);
+        let empty = summarize_renderer_observations(vec![observed_target(
+            "empty",
+            true,
+            CodexModelPickerReadiness::NotRequired,
+            false,
+        )]);
+        assert_eq!(empty.picker_status, CodexModelPickerReadiness::NotRequired);
+        assert_eq!(empty.picker_ready_target_count, 0);
     }
 
     #[test]
@@ -523,7 +745,11 @@ mod tests {
                         match current {
                             Some(current) => json!({
                                 "id": request["id"],
-                                "result": {"result": {"type": "boolean", "value": current}}
+                                "result": {"result": {"type": "object", "value": {
+                                    "current": current,
+                                    "pickerStatus": "pending",
+                                    "appServerReady": false
+                                }}}
                             }),
                             None => json!({
                                 "id": request["id"],
@@ -549,18 +775,23 @@ mod tests {
             .collect::<Vec<_>>();
         let catalog = CodexModelCatalogProjection::empty();
 
-        let verified = current_renderer_target_ids(&targets, &catalog).await;
+        let observations = current_renderer_targets(&targets, &catalog).await;
         tokio::time::timeout(Duration::from_secs(10), server)
             .await
             .expect("all renderer probes must finish")
             .expect("complete fake CDP server");
 
-        assert_eq!(verified, vec!["current"]);
+        assert_eq!(observations.installed_target_ids, vec!["current"]);
+        assert_eq!(observations.picker_ready_target_count, 0);
+        assert_eq!(
+            observations.picker_status,
+            CodexModelPickerReadiness::Unverified
+        );
         assert!(guardian_should_inject(
             &[],
             Some("catalog-v2"),
             "catalog-v2",
-            verified.len() == targets.len(),
+            observations.installed_target_ids.len() == targets.len(),
         ));
     }
 }

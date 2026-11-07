@@ -358,6 +358,65 @@ describe("codex config sanitizer", () => {
     ]);
   });
 
+  it("keeps base references when legacy marker-only group rows inherit model identities", () => {
+    const catalog: CodexCatalogModel[] = [
+      ...activeCatalog,
+      {
+        ...activeCatalog[0],
+        model: "new-model--ccg-legacy",
+      },
+    ];
+    const before = JSON.stringify(catalog);
+    const index = buildCodexModelReferenceIndex(catalog);
+    const routing = {
+      schemaVersion: 2,
+      routes: [
+        {
+          id: "source-route",
+          targetProviderId: "source",
+          enabled: true,
+          modelSelection: { mode: "include", models: ["old-model"] },
+          aliases: { fast: "old-model" },
+        },
+      ],
+      spawnAgentModels: ["old-model", "new-model--ccg-legacy"],
+    } as unknown as CodexRoutingConfig;
+
+    const sanitized = sanitizeCodexRoutingConfig(routing, index) as any;
+
+    expect(index.resolve("old-model")).toBe("new-model");
+    expect(index.resolve("wire-new")).toBe("new-model");
+    expect(index.resolve("new-model--ccg-legacy")).toBe(
+      "new-model--ccg-legacy",
+    );
+    expect(sanitized.routes[0]).toEqual({
+      id: "source-route",
+      targetProviderId: "source",
+      enabled: true,
+      modelSelection: { mode: "include", models: ["new-model"] },
+      aliases: { fast: "new-model" },
+    });
+    expect(sanitized.spawnAgentModels).toEqual([
+      "new-model",
+      "new-model--ccg-legacy",
+    ]);
+    expect(JSON.stringify(catalog)).toBe(before);
+  });
+
+  it("does not resolve inherited wire or aliases to a lone legacy marker-only group", () => {
+    const index = buildCodexModelReferenceIndex([
+      { ...activeCatalog[0], model: "new-model--CCG-legacy" },
+    ]);
+
+    expect(index.resolve("new-model--CCG-legacy")).toBe(
+      "new-model--CCG-legacy",
+    );
+    expect(index.upstreamFor("new-model--CCG-legacy")).toBe("wire-new");
+    expect(index.resolve("wire-new")).toBeUndefined();
+    expect(index.resolve("old-model")).toBeUndefined();
+    expect(index.resolve("new-model")).toBeUndefined();
+  });
+
   it("keeps base identities resolvable when grouped picker rows inherit metadata", () => {
     const index = buildCodexModelReferenceIndex([
       ...activeCatalog,

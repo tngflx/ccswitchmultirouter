@@ -24,10 +24,13 @@ export interface FetchedModel {
   maxInputTokens?: number | null;
   maxOutputTokens?: number | null;
   inputModalities?: string[] | null;
+  outputModalities?: string[] | null;
   supportsImage?: boolean | null;
   supportsParallelToolCalls?: boolean | null;
   protocolCapability?: CodexModelProtocolCapability | null;
   reasoning?: CodexModelReasoningCapability | null;
+  /** Raw provider effort metadata; canonical reasoning stays in `reasoning`. */
+  effort?: unknown | null;
 }
 
 export interface VolcengineModelListOptions {

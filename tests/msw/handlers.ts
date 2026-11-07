@@ -258,6 +258,19 @@ export const handlers = [
   http.post(`${TAURI_ENDPOINT}/get_codex_account_pool_policy`, () =>
     success({ enabled: false, entries: [], desktopAccountId: null }),
   ),
+  // The wizard performs this read-only native probe while rendering its reasoning page.
+  // The test harness intentionally exercises the component fallback path rather than
+  // reimplementing Rust capability resolution; keep the command explicit so MSW
+  // does not report a noisy unhandled request (or hide a typo behind a catch-all).
+  http.post(`${TAURI_ENDPOINT}/resolve_codex_model_reasoning_capability`, () =>
+    HttpResponse.json(
+      {
+        error:
+          "reasoning capability resolution is unavailable in the test harness",
+      },
+      { status: 503 },
+    ),
+  ),
   http.post(`${TAURI_ENDPOINT}/restore_codex_provider_protocol_evidence`, () =>
     success(null),
   ),

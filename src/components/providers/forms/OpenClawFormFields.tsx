@@ -16,7 +16,6 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
-import { toast } from "sonner";
 import {
   Download,
   Plus,
@@ -35,11 +34,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ApiKeySection } from "./shared";
-import {
-  fetchModelsForConfig,
-  showFetchModelsError,
-  type FetchedModel,
-} from "@/lib/api/model-fetch";
+import type { FetchedModel } from "@/lib/api/model-fetch";
+import { useProviderModelFetch } from "./shared/useProviderModelFetch";
 import { openclawApiProtocols } from "@/config/openclawProviderPresets";
 import { TeProviderFields } from "./TeProviderFields";
 import type { OpenClawTeProviderSettings } from "@/types";
@@ -102,8 +98,8 @@ export function OpenClawFormFields({
   const [expandedModels, setExpandedModels] = useState<Record<number, boolean>>(
     {},
   );
-  const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
-  const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const { fetchedModels, isFetchingModels, handleFetchModels } =
+    useProviderModelFetch(baseUrl, apiKey, t);
 
   // Stable key tracking for models list
   const modelKeysRef = useRef<string[]>([]);
@@ -150,34 +146,6 @@ export function OpenClawFormFields({
       },
     ]);
   };
-
-  // Fetch models from API
-  const handleFetchModels = useCallback(() => {
-    if (!baseUrl || !apiKey) {
-      showFetchModelsError(null, t, {
-        hasApiKey: !!apiKey,
-        hasBaseUrl: !!baseUrl,
-      });
-      return;
-    }
-    setIsFetchingModels(true);
-    fetchModelsForConfig(baseUrl, apiKey)
-      .then((models) => {
-        setFetchedModels(models);
-        if (models.length === 0) {
-          toast.info(t("providerForm.fetchModelsEmpty"));
-        } else {
-          toast.success(
-            t("providerForm.fetchModelsSuccess", { count: models.length }),
-          );
-        }
-      })
-      .catch((err) => {
-        console.warn("[ModelFetch] Failed:", err);
-        showFetchModelsError(err, t);
-      })
-      .finally(() => setIsFetchingModels(false));
-  }, [baseUrl, apiKey, t]);
 
   // Remove a model entry
   const handleRemoveModel = (index: number) => {

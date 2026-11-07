@@ -1,6 +1,7 @@
 import { isUserCodexRoutingPlan as isRoutingPlan } from "@/lib/codexProviderKind";
 import {
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -103,6 +104,7 @@ import {
   type FetchedModel,
 } from "@/lib/api/model-fetch";
 import type { CodexGuardianStatus } from "@/types/proxy";
+import { ModelPickerGuardianStatus } from "@/components/codex/ModelPickerGuardianStatus";
 import { proxyApi } from "@/lib/api/proxy";
 import {
   isWizardCodexOAuthSource,
@@ -651,6 +653,7 @@ type ProviderModelRefreshResult =
       status: "updated";
       models: FetchedModel[];
       nextProvider: Provider;
+      baselineProvider: Provider;
       usedCodexFallback?: boolean;
       onlineErrorMessage?: string;
     };
@@ -3288,7 +3291,7 @@ export function CodexRouterWorkspacePage({
   const [optimisticRoutingPlan, setOptimisticRoutingPlan] =
     useState<Provider | null>(null);
   const [optimisticModelSourcesById, setOptimisticModelSourcesById] = useState<
-    Record<string, Provider>
+    Record<string, { baseline: Provider; provider: Provider }>
   >({});
   const [providerModelRefreshStates, setProviderModelRefreshStates] = useState<
     Record<string, ProviderModelRefreshState>
@@ -3332,11 +3335,18 @@ export function CodexRouterWorkspacePage({
     const hasOptimisticSources = optimisticSourceEntries.length > 0;
     if (!optimisticRoutingPlan && !hasOptimisticSources) return providers;
 
-    const replaced = providers.map((provider) =>
-      provider.id === optimisticRoutingPlan?.id
-        ? optimisticRoutingPlan
-        : (optimisticModelSourcesById[provider.id] ?? provider),
-    );
+    const replaced = providers.map((provider) => {
+      if (provider.id === optimisticRoutingPlan?.id)
+        return optimisticRoutingPlan;
+      const optimistic = optimisticModelSourcesById[provider.id];
+      // This is a projection over the parent snapshot, not another source of
+      // truth. A newer saved provider must win immediately, including the render
+      // before the cleanup effect removes this temporary overlay.
+      return optimistic &&
+        JSON.stringify(provider) === JSON.stringify(optimistic.baseline)
+        ? optimistic.provider
+        : provider;
+    });
     if (!optimisticRoutingPlan) return replaced;
     const withRoutingPlan = providers.some(
       (provider) => provider.id === optimisticRoutingPlan.id,
@@ -3366,6 +3376,16 @@ export function CodexRouterWorkspacePage({
       new Map(effectiveProviders.map((provider) => [provider.id, provider])),
     [effectiveProviders],
   );
+  const committedModelSourceProvidersRef = useRef(
+    new Map(providers.map((provider) => [provider.id, provider])),
+  );
+  useLayoutEffect(() => {
+    // Promise handlers may finish after a same-key edit has been committed.
+    // Read canonical parent state at completion instead of the launch closure.
+    committedModelSourceProvidersRef.current = new Map(
+      providers.map((provider) => [provider.id, provider]),
+    );
+  }, [providers]);
   const routableProvidersById = useMemo(() => {
     const byId = new Map(
       effectiveProviders.map((provider) => [provider.id, provider]),
@@ -3459,7 +3479,22 @@ export function CodexRouterWorkspacePage({
           };
         }
 
-        const nextProvider = providerWithFetchedModelCatalog(provider, models);
+        const currentProvider = committedModelSourceProvidersRef.current.get(
+          provider.id,
+        );
+        if (
+          !currentProvider ||
+          buildProviderModelRefreshAttemptKey(
+            provider.id,
+            getProviderModelFetchConfig(currentProvider),
+          ) !== attemptKey
+        ) {
+          return { status: "stale" };
+        }
+        const nextProvider = providerWithFetchedModelCatalog(
+          currentProvider,
+          models,
+        );
         setProviderModelRefreshStates((current) => ({
           ...current,
           [provider.id]: {
@@ -3471,7 +3506,14 @@ export function CodexRouterWorkspacePage({
           },
         }));
 
-        await providersApi.update(nextProvider, "codex");
+        // The backend compares this exact snapshot before writing so a save
+        // arriving after the frontend rebase cannot be overwritten either.
+        await providersApi.update(
+          nextProvider,
+          "codex",
+          undefined,
+          currentProvider,
+        );
         if (!isCurrentAttempt()) {
           return { status: "stale" };
         }
@@ -3480,6 +3522,7 @@ export function CodexRouterWorkspacePage({
           status: "updated",
           models,
           nextProvider,
+          baselineProvider: currentProvider,
           usedCodexFallback,
           onlineErrorMessage,
         };
@@ -3504,14 +3547,40 @@ export function CodexRouterWorkspacePage({
             return;
           }
           if (!isCurrentAttempt()) return;
+          const currentProvider = committedModelSourceProvidersRef.current.get(
+            result.nextProvider.id,
+          );
+          if (
+            !currentProvider ||
+            (JSON.stringify(currentProvider) !==
+              JSON.stringify(result.baselineProvider) &&
+              JSON.stringify(currentProvider) !==
+                JSON.stringify(result.nextProvider))
+          ) {
+            // A later canonical save already superseded this completed write.
+            setProviderModelRefreshStates((current) => ({
+              ...current,
+              [provider.id]: {
+                status: "skipped",
+                message: tr("codexRouterWorkspace.modelRefreshSuperseded", {
+                  defaultValue:
+                    "The model source changed after refreshing; the newer saved configuration is shown.",
+                }),
+              },
+            }));
+            return;
+          }
           setOptimisticModelSourcesById((current) => ({
             ...current,
-            [result.nextProvider.id]: result.nextProvider,
+            [result.nextProvider.id]: {
+              baseline: result.baselineProvider,
+              provider: result.nextProvider,
+            },
           }));
           queryClient.setQueryData(["providers", "codex"], (current: any) => ({
             ...(current ?? { currentProviderId: "" }),
             providers: {
-              ...Object.fromEntries(providersById),
+              ...Object.fromEntries(committedModelSourceProvidersRef.current),
               ...(current?.providers ?? {}),
               [result.nextProvider.id]: result.nextProvider,
             },
@@ -3547,7 +3616,19 @@ export function CodexRouterWorkspacePage({
             ...current,
             [provider.id]: {
               status: "error",
-              message: `Model catalog read or write did not complete: ${workspaceErrorMessage(error)}`,
+              message: String(error).includes(
+                "provider_refresh_backend_update_required",
+              )
+                ? tr("codexRouterWorkspace.modelRefreshBackendUpdateRequired", {
+                    defaultValue:
+                      "Safe model sync requires the updated CCSwitch backend. Rebuild or update CCSwitch, then fully quit and restart it before syncing again. Your provider settings were not changed.",
+                  })
+                : String(error).includes("provider_update_conflict")
+                  ? tr("codexRouterWorkspace.modelRefreshConflict", {
+                      defaultValue:
+                        "The configuration changed while syncing models. Your newer settings were kept; sync again to refresh the model list.",
+                    })
+                  : `Model catalog read or write did not complete: ${workspaceErrorMessage(error)}`,
             },
           }));
         });
@@ -3636,7 +3717,7 @@ export function CodexRouterWorkspacePage({
     setOptimisticModelSourcesById((current) => {
       let changed = false;
       const next = { ...current };
-      for (const [providerId, optimisticProvider] of Object.entries(current)) {
+      for (const [providerId, optimistic] of Object.entries(current)) {
         const persistedProvider = providers.find(
           (provider) => provider.id === providerId,
         );
@@ -3646,22 +3727,11 @@ export function CodexRouterWorkspacePage({
           continue;
         }
 
-        const persistedAttemptKey = buildProviderModelRefreshAttemptKey(
-          providerId,
-          getProviderModelFetchConfig(persistedProvider),
-        );
-        const optimisticAttemptKey = buildProviderModelRefreshAttemptKey(
-          providerId,
-          getProviderModelFetchConfig(optimisticProvider),
-        );
-        const catalogPersisted =
-          JSON.stringify(
-            readCodexCatalogSettings(persistedProvider.settingsConfig),
-          ) ===
-          JSON.stringify(
-            readCodexCatalogSettings(optimisticProvider.settingsConfig),
-          );
-        if (persistedAttemptKey !== optimisticAttemptKey || catalogPersisted) {
+        const persistedSnapshot = JSON.stringify(persistedProvider);
+        if (
+          persistedSnapshot !== JSON.stringify(optimistic.baseline) ||
+          persistedSnapshot === JSON.stringify(optimistic.provider)
+        ) {
           delete next[providerId];
           changed = true;
         }
@@ -9188,45 +9258,7 @@ function StatusTab({
               </div>
             ) : null}
             {guardianStatus?.active ? (
-              <div
-                className={cn(
-                  "mt-3 rounded-lg border p-3 text-xs leading-5",
-                  guardianStatus.injected
-                    ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
-                    : guardianStatus.cdpAvailable
-                      ? "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/25 dark:text-amber-100"
-                      : "border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-300",
-                )}
-              >
-                <div className="font-semibold flex items-center gap-2">
-                  <span
-                    className={cn(
-                      "inline-block h-2 w-2 rounded-full",
-                      guardianStatus.injected
-                        ? "bg-emerald-500"
-                        : guardianStatus.cdpAvailable
-                          ? "bg-amber-400"
-                          : "bg-slate-400",
-                    )}
-                  />
-                  Model picker guardian
-                  {guardianStatus.injected
-                    ? " · injected"
-                    : guardianStatus.cdpAvailable
-                      ? " · pending injection"
-                      : " · polling"}
-                </div>
-                <div className="mt-1">{guardianStatus.message}</div>
-                <div className="mt-1 font-mono text-[11px] opacity-80">
-                  codex=
-                  {guardianStatus.codexRunning ? "Running" : "Not running"} cdp=
-                  {guardianStatus.cdpAvailable
-                    ? "Available"
-                    : "Unavailable"}{" "}
-                  targets=
-                  {guardianStatus.injectedTargetCount}
-                </div>
-              </div>
+              <ModelPickerGuardianStatus status={guardianStatus} />
             ) : isCodexTakeoverActive ? (
               <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-600 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-300">
                 Model picker guardian is not running; re-enable Codex takeover
@@ -9337,7 +9369,7 @@ function StatusTab({
                 className={cn(
                   "mt-3 rounded-lg border p-3 text-xs leading-5",
                   modelPickerUnlockResult.injected
-                    ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/25 dark:text-emerald-100"
+                    ? "border-indigo-200 bg-indigo-50 text-indigo-800 dark:border-indigo-700/50 dark:bg-indigo-950/25 dark:text-indigo-100"
                     : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/25 dark:text-amber-100",
                 )}
               >

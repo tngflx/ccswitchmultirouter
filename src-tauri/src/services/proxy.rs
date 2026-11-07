@@ -410,6 +410,8 @@ impl ProxyService {
                 cdp_available: false,
                 injected_target_count: 0,
                 injected: false,
+                picker_ready_target_count: 0,
+                picker_status: crate::codex_desktop::CodexModelPickerReadiness::Unverified,
                 last_event: String::new(),
                 message: String::new(),
             })),

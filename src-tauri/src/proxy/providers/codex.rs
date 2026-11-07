@@ -7946,7 +7946,9 @@ wire_api = "chat"
     }
 
     #[test]
-    fn test_resolve_codex_chat_reasoning_infers_glm_5_2_effort_support() {
+    fn test_resolve_codex_chat_reasoning_prefers_glm_5_2_library_over_inference() {
+        use crate::proxy::providers::transform_codex_chat::map_codex_reasoning_effort;
+
         let provider = create_provider(json!({
             "config": r#"
 model_provider = "zhipu_glm"
@@ -7958,15 +7960,53 @@ base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
 wire_api = "chat"
 "#
         }));
+        let body = json!({ "model": "glm-5.2" });
+        // Keep the original heuristic fallback covered, but the selected
+        // official platform's maintained declaration must outrank it.
+        let inferred = infer_codex_chat_reasoning_config(&provider, &body).unwrap();
+        assert_eq!(inferred.effort_value_mode.as_deref(), Some("deepseek"));
+        let resolved = crate::reasoning_capabilities::resolve_codex_model_capability(
+            &provider, "glm-5.2", None,
+        );
+        assert_eq!(
+            resolved.source,
+            crate::reasoning_capabilities::CapabilitySource::Library
+        );
+        let capability = resolved.capability.expect("maintained Zhipu capability");
+        assert_eq!(capability.supported_efforts, vec!["none", "high", "max"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("max"));
+        assert!(capability.disable_allowed);
+        assert_eq!(capability.upstream.format, "string");
+        assert_eq!(capability.upstream.parameter, "reasoning_effort");
 
-        let config =
-            resolve_codex_chat_reasoning_config(&provider, &json!({ "model": "glm-5.2" })).unwrap();
-
+        let config = resolve_codex_chat_reasoning_config(&provider, &body).unwrap();
         assert_eq!(config.supports_thinking, Some(true));
         assert_eq!(config.thinking_param.as_deref(), Some("thinking"));
         assert_eq!(config.supports_effort, Some(true));
         assert_eq!(config.effort_param.as_deref(), Some("reasoning_effort"));
-        assert_eq!(config.effort_value_mode.as_deref(), Some("deepseek"));
+        assert_eq!(config.output_format.as_deref(), Some("reasoning_content"));
+        assert!(config.disable_contract);
+        assert_eq!(
+            config.effort_value_mode.as_deref(),
+            Some("capability|high,max|none=none,minimal=none,low=high,medium=high,high=high,xhigh=max,max=max,ultra=max")
+        );
+        for (effort, expected) in [
+            ("none", "none"),
+            ("minimal", "none"),
+            ("low", "high"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("xhigh", "max"),
+            ("max", "max"),
+            ("ultra", "max"),
+        ] {
+            assert_eq!(
+                map_codex_reasoning_effort(effort, &config).expect("maintained GLM effort mapping"),
+                Some(expected),
+                "{effort}"
+            );
+        }
+        assert!(map_codex_reasoning_effort("unknown-effort", &config).is_err());
     }
 
     #[test]

@@ -67,12 +67,14 @@ const createHarness = (
     pauseInstallation?: boolean;
     retainClient?: boolean;
     requestHook?: "verified" | "unverified" | "stale-version";
+    pauseCommitRead?: boolean;
   } = {},
 ) => {
   const state = {} as ContinuationState;
   const storage = new Map<string, string>();
   let reads = 0;
   let releaseRead!: () => void;
+  let releaseCommitRead!: () => void;
   let releaseDiscovery!: () => void;
   let releaseInstallation!: () => void;
   let currentInstallation = true;
@@ -104,16 +106,21 @@ const createHarness = (
         await new Promise<void>((resolve) => {
           releaseRead = resolve;
         });
+      if (discoveryOptions.pauseCommitRead && reads === 3)
+        await new Promise<void>((resolve) => {
+          releaseCommitRead = resolve;
+        });
       return { thread: failedThread };
     },
   };
+  const original = client.sendRequest.bind(client);
   const api = new Function(
     "state",
     "localStorage",
     "installAppServerPatch",
     "recordFailure",
     "installationIsCurrent",
-    `${discovery}\n${continuation}\nreturn { rememberCodexUserTurnAction, readCodexContinuationMarkers, codexContinuationTerminalErrorCode };`,
+    `${discovery}\n${continuation}\nreturn { rememberCodexUserTurnAction, readCodexContinuationMarkers, codexContinuationTerminalErrorCode, classifyCodexContinuationThread };`,
   )(
     state,
     {
@@ -140,6 +147,11 @@ const createHarness = (
   ) as {
     rememberCodexUserTurnAction: (method: string, params: unknown) => void;
     readCodexContinuationMarkers: () => object;
+    classifyCodexContinuationThread: (
+      thread: object,
+      threadId: string,
+      model: string,
+    ) => { ready: boolean; reason?: string };
     codexContinuationTerminalErrorCode: (
       event: string,
       payload: unknown,
@@ -149,7 +161,6 @@ const createHarness = (
     // Model the production wrapper's activity tracking and ownership metadata
     // without installing the unrelated renderer discovery/normalization stack.
     // The real discovery predicate must still verify every retained client.
-    const original = client.sendRequest.bind(client);
     const version =
       discoveryOptions.requestHook === "stale-version"
         ? "stale-continuation-fixture"
@@ -178,10 +189,14 @@ const createHarness = (
     startTurn,
     readCount: () => reads,
     releaseRead: () => releaseRead(),
+    releaseCommitRead: () => releaseCommitRead(),
     releaseDiscovery: () => releaseDiscovery(),
     releaseInstallation: () => releaseInstallation(),
     replaceInstallation: () => {
       currentInstallation = false;
+    },
+    replaceHook: () => {
+      client.sendRequest = original;
     },
     start: () =>
       state.startCodexContinuation(
@@ -191,10 +206,79 @@ const createHarness = (
         Date.now() - 1_000,
       ),
     job: () => state.readCodexContinuationJob("recovery-id"),
+    changeFailedTurn: (turnId: string) => {
+      failedThread.turns[0].id = turnId;
+    },
   };
 };
 
 describe("Codex Desktop continuation authorization", () => {
+  it.each([
+    {
+      threadModel: undefined,
+      turnModel: undefined,
+      expectedModel: "request-model",
+    },
+    {
+      threadModel: "request-model",
+      turnModel: "other-model",
+      expectedModel: "request-model",
+    },
+    { threadModel: "request-model", turnModel: undefined, expectedModel: "" },
+    { threadModel: undefined, turnModel: undefined, expectedModel: "unknown" },
+  ])("rejects an unverified model binding: %j", (binding) => {
+    const harness = createHarness();
+    const thread = {
+      id: "exact-thread",
+      model: binding.threadModel,
+      turns: [
+        { id: "failed-turn", status: "failed", model: binding.turnModel },
+      ],
+    };
+    expect(
+      harness.api.classifyCodexContinuationThread(
+        thread,
+        "exact-thread",
+        binding.expectedModel,
+      ).ready,
+    ).toBe(false);
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it.each(["", "unknown", " UNKNOWN "])(
+    "refuses starting continuation without an exact request model: %j",
+    (model) => {
+      const harness = createHarness();
+      expect(
+        harness.state.startCodexContinuation(
+          "exact-thread",
+          "invalid-request",
+          model,
+          Date.now() - 1000,
+        ),
+      ).toMatchObject({ started: false });
+      expect(harness.readCount()).toBe(0);
+      expect(harness.startTurn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not commit a prepared closure after its client loses current discovery ownership", async () => {
+    const harness = createHarness();
+    harness.start();
+    await flushJobs();
+    expect(harness.job().status).toBe("prepared");
+    harness.state.appServerClients = [];
+    harness.state.commitCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+  });
+
   it("bounds hanging installation and ignores its late result after timeout", async () => {
     vi.useFakeTimers();
     try {
@@ -696,6 +780,55 @@ describe("Codex Desktop continuation authorization", () => {
       mutationAttempted: true,
     });
   });
+
+  it("rechecks the exact failed turn immediately before commit", async () => {
+    const harness = createHarness();
+    harness.start();
+    await flushJobs();
+    expect(harness.job().status).toBe("prepared");
+
+    harness.changeFailedTurn("new-failed-turn");
+    harness.state.commitCodexContinuation("recovery-id");
+    await flushJobs();
+
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+  });
+
+  it.each(["user-action", "runtime-replaced", "hook-replaced"] as const)(
+    "fails closed when authorization changes during the final thread read: %s",
+    async (change) => {
+      const harness = createHarness(false, undefined, "failed", {
+        pauseCommitRead: true,
+      });
+      harness.start();
+      await flushJobs();
+      expect(harness.job().status).toBe("prepared");
+      harness.state.commitCodexContinuation("recovery-id");
+      await flushJobs();
+      expect(harness.readCount()).toBe(3);
+      if (change === "user-action")
+        harness.api.rememberCodexUserTurnAction("turn/interrupt", {
+          threadId: "exact-thread",
+        });
+      else if (change === "runtime-replaced") harness.replaceInstallation();
+      else harness.replaceHook();
+      harness.releaseCommitRead();
+      await flushJobs();
+      expect(harness.startTurn).not.toHaveBeenCalled();
+      expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+      expect(harness.job()).toMatchObject({
+        status: "completed",
+        submitted: false,
+        mutationAttempted: false,
+      });
+    },
+  );
 
   it("checks a new user stop again at commit", async () => {
     const harness = createHarness();

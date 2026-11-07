@@ -208,6 +208,7 @@ pub(crate) enum CatalogModelLookup<'a> {
 
 /// Select the same catalog row for exclusion, capability, and product settings.
 /// Public model/id matches outrank aliases; either tier must identify one row.
+/// Generated key-group rows own only their public identities, not inherited base aliases.
 pub(crate) fn lookup_catalog_model<'a>(settings: &'a Value, model: &str) -> CatalogModelLookup<'a> {
     let model = model.trim();
     if model.is_empty() {
@@ -224,11 +225,9 @@ pub(crate) fn lookup_catalog_model<'a>(settings: &'a Value, model: &str) -> Cata
     if !matches!(exact, CatalogModelLookup::Missing) {
         return exact;
     }
-    unique_model_match(
-        models
-            .iter()
-            .filter(|entry| fallback_model_identity_matches(entry, model)),
-    )
+    unique_model_match(models.iter().filter(|entry| {
+        !is_generated_api_key_group_model(entry) && fallback_model_identity_matches(entry, model)
+    }))
 }
 
 fn unique_model_match<'a>(mut entries: impl Iterator<Item = &'a Value>) -> CatalogModelLookup<'a> {
@@ -249,6 +248,22 @@ fn model_identity_matches(entry: &Value, model: &str, fields: &[&str]) -> bool {
         .any(|candidate| candidate.trim().eq_ignore_ascii_case(model))
 }
 
+/// Generated picker rows inherit their base model's metadata but cannot claim
+/// those fallback identities. Keep recognition aligned with the frontend's
+/// shared key-group predicate, including marker-only legacy rows.
+fn is_generated_api_key_group_model(entry: &Value) -> bool {
+    ["apiKeyGroupGenerated", "api_key_group_generated"]
+        .iter()
+        .any(|field| entry.get(*field).and_then(Value::as_bool) == Some(true))
+        || ["apiKeyGroupId", "api_key_group_id"]
+            .iter()
+            .filter_map(|field| entry.get(*field).and_then(Value::as_str))
+            .any(|group_id| !group_id.is_empty())
+        || entry
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| model.to_ascii_lowercase().contains("--ccg-"))
+}
 fn fallback_model_identity_matches(entry: &Value, model: &str) -> bool {
     model_identity_matches(
         entry,
@@ -428,6 +443,138 @@ mod tests {
             assert_eq!(
                 lookup_catalog_model(&settings, "shared"),
                 CatalogModelLookup::Ambiguous
+            );
+        }
+    }
+
+    fn api_key_group_identity_fixture() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../tests/fixtures/codexApiKeyGroupIdentity.json"
+        ))
+        .expect("shared generated key-group identity fixture")
+    }
+
+    #[test]
+    fn model_lookup_keeps_base_identities_unique_beside_generated_key_group_rows() {
+        let fixture = api_key_group_identity_fixture();
+        for enabled in [true, false] {
+            let mut base = fixture["baseModel"].clone();
+            base["enabled"] = json!(enabled);
+            for case in fixture["cases"].as_array().unwrap() {
+                if case["generated"] != true {
+                    continue;
+                }
+                let mut grouped = fixture["baseModel"].clone();
+                grouped
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(case["row"].as_object().unwrap().clone());
+                for rows in [
+                    vec![base.clone(), grouped.clone()],
+                    vec![grouped.clone(), base.clone()],
+                ] {
+                    let settings = json!({"modelCatalog": {"models": rows}});
+                    for reference in fixture["bareReferences"].as_array().unwrap() {
+                        let reference = reference.as_str().unwrap();
+                        assert_eq!(
+                            lookup_catalog_model(
+                                &settings,
+                                &format!(" {} ", reference.to_uppercase())
+                            ),
+                            CatalogModelLookup::Found(&base),
+                            "case={} reference={reference} enabled={enabled}",
+                            case["name"]
+                        );
+                    }
+                    assert_eq!(
+                        lookup_catalog_model(&settings, grouped["model"].as_str().unwrap()),
+                        CatalogModelLookup::Found(&grouped),
+                        "case={}",
+                        case["name"]
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn model_lookup_ignores_inherited_identities_on_lone_generated_key_group_rows() {
+        let fixture = api_key_group_identity_fixture();
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut model = fixture["baseModel"].clone();
+            model
+                .as_object_mut()
+                .unwrap()
+                .extend(case["row"].as_object().unwrap().clone());
+            let settings = json!({"modelCatalog": {"models": [model.clone()]}});
+            for reference in fixture["bareReferences"].as_array().unwrap() {
+                let reference = reference.as_str().unwrap();
+                let expected = if case["generated"] == true {
+                    CatalogModelLookup::Missing
+                } else {
+                    CatalogModelLookup::Found(&model)
+                };
+                assert_eq!(
+                    lookup_catalog_model(&settings, reference),
+                    expected,
+                    "case={} reference={reference}",
+                    case["name"]
+                );
+            }
+            assert_eq!(
+                lookup_catalog_model(&settings, model["model"].as_str().unwrap()),
+                CatalogModelLookup::Found(&model),
+                "case={}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn model_lookup_keeps_excluded_generated_public_model_and_id_authoritative() {
+        let fixture = api_key_group_identity_fixture();
+        for case in fixture["cases"].as_array().unwrap() {
+            if case["generated"] != true {
+                continue;
+            }
+            let mut excluded = fixture["baseModel"].clone();
+            excluded
+                .as_object_mut()
+                .unwrap()
+                .extend(case["row"].as_object().unwrap().clone());
+            excluded["id"] = json!("generated-public-id");
+            excluded["enabled"] = json!(false);
+            let settings = json!({"modelCatalog": {"models": [
+                {"model": "sibling", "upstreamModel": excluded["model"],
+                 "aliases": ["generated-public-id"]},
+                excluded.clone()
+            ]}});
+            for public in [excluded["model"].as_str().unwrap(), "generated-public-id"] {
+                assert_eq!(
+                    lookup_catalog_model(&settings, public),
+                    CatalogModelLookup::Found(&excluded),
+                    "case={} public={public}",
+                    case["name"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_lookup_keeps_canonical_empty_authority_for_generated_key_group_rows() {
+        let fixture = api_key_group_identity_fixture();
+        for case in fixture["cases"].as_array().unwrap() {
+            if case["generated"] != true {
+                continue;
+            }
+            let settings = json!({
+                "modelCatalog": {"models": []},
+                "model_catalog": {"models": [case["row"].clone()]}
+            });
+            assert_eq!(
+                lookup_catalog_model(&settings, case["row"]["model"].as_str().unwrap()),
+                CatalogModelLookup::Missing,
+                "case={}",
+                case["name"]
             );
         }
     }

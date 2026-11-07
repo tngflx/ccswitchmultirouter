@@ -2,6 +2,7 @@ import {
   modelIdentityValues,
   type ModelIdentityShape,
 } from "@/lib/modelIdentities";
+import { isGeneratedCodexApiKeyGroupModel } from "@/lib/codexApiKeyGroup";
 import type {
   CodexApiKeyGroup,
   CodexCatalogModel,
@@ -69,11 +70,7 @@ export function buildCodexModelReferenceIndex(
     // Credential-group rows inherit the base row's slug/alias metadata but
     // have their own generated picker id. Re-indexing inherited identities
     // would make the base model look ambiguous and prune valid references.
-    const isGeneratedGroupModel =
-      model.apiKeyGroupGenerated === true ||
-      model.api_key_group_generated === true ||
-      Boolean(model.apiKeyGroupId || model.api_key_group_id);
-    const identities = isGeneratedGroupModel
+    const identities = isGeneratedCodexApiKeyGroupModel(model)
       ? [canonical]
       : modelIdentityValues(model as ModelIdentityShape);
 

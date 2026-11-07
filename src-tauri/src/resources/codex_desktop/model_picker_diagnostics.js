@@ -52,6 +52,7 @@ const codexModelPickerDiagnostics = () => {
     pendingObserverCount: 0,
     unsupportedObserverCount: 0,
     unreadableObserverCount: 0,
+    nativeVisibilityUnverifiedObserverCount: 0,
     effortMismatchCount: 0,
     flagMismatchCount: 0,
     missingMaxModelCount: 0,
@@ -59,13 +60,33 @@ const codexModelPickerDiagnostics = () => {
     selectedMaxModelCount: 0,
     selectedUltraModelCount: 0,
   };
+  const catalog = currentPayload();
+  // An unavailable catalog cannot establish picker compatibility. In contrast,
+  // an explicit available empty catalog deliberately has no models to select.
+  if (catalog.catalogAvailable !== true) {
+    diagnostics.status = "unverified";
+    return diagnostics;
+  }
+  const authoritativeEmptyCatalog =
+    Array.isArray(catalog.modelNames) && catalog.modelNames.length === 0;
   const seen = new Set();
   const mismatches = new Set();
   const missingMax = new Set();
   const missingUltra = new Set();
   const selectedMax = new Set();
   const selectedUltra = new Set();
+  // Keep old hooks for orderly release, but a complete current owner snapshot
+  // can exclude orphaned cache observers from readiness after navigation. An
+  // incomplete/unloaded snapshot is unknown, never an authoritative empty set.
+  const currentNativeCaches =
+    state.nativeReasoningVisibilityRequired === true &&
+    typeof codexCurrentNativeReasoningQueryCaches === "function"
+      ? codexCurrentNativeReasoningQueryCaches()
+      : null;
   for (const cache of state.reasoningQueryCaches?.keys() || []) {
+    if (currentNativeCaches && !currentNativeCaches.has(cache)) continue;
+    let nativeVisibility = { status: "not_required", missingEfforts: [] };
+    let nativeHiddenEfforts = new Set();
     let queries;
     try {
       const getAll = codexDeclaredMethod(cache, "getAll");
@@ -75,6 +96,41 @@ const codexModelPickerDiagnostics = () => {
     } catch {
       diagnostics.unreadableObserverCount += 1;
       continue;
+    }
+    const hasManagedQuery = queries.some((query) => {
+      try {
+        return isManagedCodexModelQuery(
+          codexPickerDataArray(codexPickerOwnData(query, "queryKey")),
+        );
+      } catch {
+        return false;
+      }
+    });
+    if (
+      hasManagedQuery &&
+      state.nativeReasoningVisibilityRequired === true &&
+      !authoritativeEmptyCatalog
+    ) {
+      // A null current-owner snapshot is unknown, never permission to trust an
+      // older cache. Avoid reading the native signal at all for caches with no
+      // managed local picker query (remote/empty owners remain Pending).
+      if (currentNativeCaches === null) {
+        diagnostics.nativeVisibilityUnverifiedObserverCount += 1;
+      } else if (typeof readCodexNativeReasoningVisibility === "function") {
+        try {
+          const efforts = Array.from(
+            new Set(
+              modelNames().flatMap((model) =>
+                (descriptorFor(model).supportedReasoningEfforts || []).map(
+                  (level) => level.reasoningEffort,
+                ),
+              ),
+            ),
+          );
+          nativeVisibility = readCodexNativeReasoningVisibility(cache, efforts);
+        } catch {}
+      }
+      nativeHiddenEfforts = new Set(nativeVisibility.missingEfforts);
     }
     for (const query of queries) {
       let observers;
@@ -127,6 +183,8 @@ const codexModelPickerDiagnostics = () => {
             diagnostics.pendingObserverCount += 1;
             continue;
           }
+          if (nativeVisibility.status === "unverified")
+            diagnostics.nativeVisibilityUnverifiedObserverCount += 1;
           let hasMax = false;
           let hasUltra = false;
           let unsupported = false;
@@ -158,12 +216,21 @@ const codexModelPickerDiagnostics = () => {
             if (
               invalid ||
               actual.size !== expected.size ||
-              [...expected].some((effort) => !actual.has(effort))
+              [...expected].some(
+                (effort) =>
+                  !actual.has(effort) || nativeHiddenEfforts.has(effort),
+              )
             )
               mismatches.add(row.model);
-            if (expected.has("max") && !actual.has("max"))
+            if (
+              expected.has("max") &&
+              (!actual.has("max") || nativeHiddenEfforts.has("max"))
+            )
               missingMax.add(row.model);
-            if (expected.has("ultra") && !actual.has("ultra"))
+            if (
+              expected.has("ultra") &&
+              (!actual.has("ultra") || nativeHiddenEfforts.has("ultra"))
+            )
               missingUltra.add(row.model);
             if (actual.has("max")) {
               selectedMax.add(row.model);
@@ -201,9 +268,12 @@ const codexModelPickerDiagnostics = () => {
     diagnostics.status = "mismatch";
   else if (
     diagnostics.unreadableObserverCount ||
-    diagnostics.unsupportedObserverCount
+    diagnostics.unsupportedObserverCount ||
+    diagnostics.nativeVisibilityUnverifiedObserverCount
   )
     diagnostics.status = "unverified";
+  else if (authoritativeEmptyCatalog && !diagnostics.successObserverCount)
+    diagnostics.status = "not_required";
   else if (diagnostics.pickerObserverCount && !diagnostics.pendingObserverCount)
     diagnostics.status = "ready";
   return diagnostics;

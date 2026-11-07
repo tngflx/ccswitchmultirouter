@@ -1,6 +1,7 @@
 import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
 import { getCodexOfficialModelSpec } from "@/config/codexOfficialModelSpecs";
 import { getCodexOfficialContextDefault } from "@/config/codexOfficialContextDefaults";
 import type { FetchedModel } from "@/lib/api/model-fetch";
@@ -10,6 +11,8 @@ interface Props {
   upstreamModel?: string;
   value: string;
   discovered?: FetchedModel;
+  enabled?: boolean;
+  onEnabledChange?: (enabled: boolean) => void;
   maximumIsTrusted?: boolean;
   onChange: (value: string) => void;
 }
@@ -27,6 +30,8 @@ export function CodexOfficialContextRow({
   upstreamModel,
   value,
   discovered,
+  enabled = true,
+  onEnabledChange,
   maximumIsTrusted = false,
   onChange,
 }: Props) {
@@ -111,7 +116,26 @@ export function CodexOfficialContextRow({
       role="group"
       aria-label={model}
     >
-      <div className="break-all text-sm font-medium">{model}</div>
+      <div className="flex items-center gap-2">
+        {onEnabledChange && (
+          <Checkbox
+            checked={enabled}
+            onCheckedChange={(checked) => onEnabledChange(checked === true)}
+            aria-label={t("codexConfig.officialModelEnabled", {
+              model,
+              defaultValue: "Enable {{model}}",
+            })}
+          />
+        )}
+        <span className="break-all text-sm font-medium">{model}</span>
+        {discovered && (
+          <span className="shrink-0 rounded border border-border-default px-1.5 py-0.5 text-[10px] text-muted-foreground">
+            {t("codexConfig.officialModelDiscovered", {
+              defaultValue: "Found in this discovery",
+            })}
+          </span>
+        )}
+      </div>
       <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs md:grid-cols-5">
         <div className="min-w-0">
           <dt className="text-muted-foreground">

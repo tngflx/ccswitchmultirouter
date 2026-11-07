@@ -226,6 +226,37 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
     )
 }
 
+/// Model discovery carries arbitrary provider auth headers. Reqwest only
+/// strips a fixed set of standard headers on cross-origin redirects, so pin
+/// every redirect to the original scheme, host, and effective port instead.
+/// This client otherwise shares the configured proxy/transport builder.
+pub(crate) fn build_model_discovery_client() -> Result<Client, String> {
+    let proxy_url = get_current_proxy_url();
+    build_client_with_limits(
+        proxy_url.as_deref(),
+        Duration::from_secs(15),
+        Duration::from_secs(5),
+        Policy::custom(|attempt| {
+            if attempt.previous().len() > 10 {
+                return attempt.error("Model discovery exceeded the redirect limit");
+            }
+            let target = attempt.url();
+            let authorized = matches!(target.scheme(), "http" | "https")
+                && target.username().is_empty()
+                && target.password().is_none()
+                && attempt
+                    .previous()
+                    .first()
+                    .is_some_and(|initial| initial.origin() == target.origin());
+            if authorized {
+                attempt.follow()
+            } else {
+                attempt.error("Model discovery redirect origin is not authorized")
+            }
+        }),
+    )
+}
+
 pub(crate) fn build_protocol_probe_client() -> Result<Client, String> {
     let proxy_url = get_current_proxy_url();
     build_client_with_limits(

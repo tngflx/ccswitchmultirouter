@@ -5832,6 +5832,109 @@ requires_openai_auth = true
 
     #[test]
     #[serial]
+    fn background_refresh_deleted_current_source_does_not_clean_settings_before_conflict() {
+        with_test_home(|state, _| {
+            crate::settings::reload_settings().unwrap();
+            let source = api_declared_codex_source();
+            state.db.save_provider("codex", &source).unwrap();
+            let expected = state.db.get_all_providers("codex").unwrap()[&source.id].clone();
+            crate::settings::set_current_provider(&AppType::Codex, Some(&source.id)).unwrap();
+            let settings_path = crate::settings::AppSettings::settings_path().unwrap();
+            let settings_before = std::fs::read(&settings_path).unwrap();
+            state.db.delete_provider("codex", &source.id).unwrap();
+
+            let error = ProviderService::update_with_protocol_state_if_unchanged(
+                state,
+                AppType::Codex,
+                None,
+                expected.clone(),
+                &[],
+                &[],
+                Some(&expected),
+            )
+            .expect_err("deleted-source refresh must reject before ownership cleanup");
+            assert_eq!(error.to_string(), "provider_update_conflict");
+            assert_eq!(
+                crate::settings::get_current_provider(&AppType::Codex).as_deref(),
+                Some(source.id.as_str())
+            );
+            assert_eq!(std::fs::read(settings_path).unwrap(), settings_before);
+            assert!(state
+                .db
+                .get_provider_by_id(&source.id, "codex")
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn background_refresh_accepts_a_protocol_set_facade_as_a_logical_source() {
+        with_test_home(|state, _| {
+            crate::settings::reload_settings().unwrap();
+            let mut source = api_declared_codex_source();
+            let mut chat_model = source.settings_config["modelCatalog"]["models"][0].clone();
+            chat_model["model"] = json!("chat-model");
+            chat_model["upstreamModel"] = json!("upstream-chat");
+            chat_model["protocolCapability"]["upstreamModel"] = json!("upstream-chat");
+            chat_model["protocolCapability"]["supportedEndpoints"] = json!(["openai_chat"]);
+            source.settings_config["modelCatalog"]["models"]
+                .as_array_mut()
+                .unwrap()
+                .push(chat_model);
+            let prepared = crate::codex_multirouter::provider_set::plan_codex_provider_set(
+                &source,
+                &[],
+                &std::collections::HashMap::new(),
+                chrono::Utc::now().timestamp(),
+            )
+            .expect("prepare an actual mixed-transport Provider Set");
+            let crate::codex_multirouter::provider_set::CodexProviderSetPersistence::Split {
+                facade,
+                responses_provider,
+                chat_provider,
+            } = prepared.persistence
+            else {
+                panic!("mixed declarations must create a facade");
+            };
+            for provider in [&responses_provider, &chat_provider, &facade] {
+                state.db.save_provider("codex", provider).unwrap();
+            }
+            let expected = state.db.get_all_providers("codex").unwrap()[&source.id].clone();
+            let mut refreshed = expected.clone();
+            refreshed.notes = Some("conditional facade refresh".to_string());
+            ProviderService::update_with_protocol_state_if_unchanged(
+                state,
+                AppType::Codex,
+                None,
+                refreshed,
+                &[],
+                &[],
+                Some(&expected),
+            )
+            .expect("a Protocol Set facade is a source, not a user routing plan");
+            let saved = state
+                .db
+                .get_provider_by_id(&source.id, "codex")
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.notes.as_deref(), Some("conditional facade refresh"));
+            assert!(crate::codex_multirouter::provider_set::is_codex_provider_set_facade(&saved));
+            assert!(state
+                .db
+                .get_provider_by_id(&responses_provider.id, "codex")
+                .unwrap()
+                .is_some());
+            assert!(state
+                .db
+                .get_provider_by_id(&chat_provider.id, "codex")
+                .unwrap()
+                .is_some());
+        });
+    }
+
+    #[test]
+    #[serial]
     fn api_declared_current_provider_publishes_its_committed_transport() {
         with_test_home(|state, _| {
             crate::settings::reload_settings().unwrap();
@@ -7417,6 +7520,34 @@ impl ProviderService {
         protocol_profiles: &[ProtocolCompatibilityRecord],
         protocol_observations: &[ProtocolCompatibilityRecord],
     ) -> Result<bool, AppError> {
+        Self::update_with_protocol_state_if_unchanged(
+            state,
+            app_type,
+            original_id,
+            provider,
+            protocol_profiles,
+            protocol_observations,
+            None,
+        )
+    }
+
+    pub(crate) fn update_with_protocol_state_if_unchanged(
+        state: &AppState,
+        app_type: AppType,
+        original_id: Option<&str>,
+        provider: Provider,
+        protocol_profiles: &[ProtocolCompatibilityRecord],
+        protocol_observations: &[ProtocolCompatibilityRecord],
+        expected_provider: Option<&Provider>,
+    ) -> Result<bool, AppError> {
+        if let Some(expected) = expected_provider {
+            Self::validate_background_provider_refresh(
+                &app_type,
+                original_id,
+                &provider,
+                expected,
+            )?;
+        }
         if app_type == AppType::Pi {
             if !protocol_profiles.is_empty() || !protocol_observations.is_empty() {
                 return Err(AppError::InvalidInput(
@@ -7579,21 +7710,25 @@ impl ProviderService {
         // Resolve current ownership before the domain mutation. A stale active-project
         // snapshot otherwise makes the projection publisher reject the current Router,
         // leaving a successful Provider save with a permanently pending live catalog.
-        let effective_current =
-            crate::settings::get_effective_current_provider(&state.db, &app_type)?;
-        let is_current = effective_current.as_deref() == Some(provider.id.as_str());
-        if is_current && Self::is_codex_schema_v2_router(&app_type, &provider) {
-            Self::sync_active_profile_provider_snapshot(state, &app_type, &provider.id)?;
+        let mut is_current = false;
+        if expected_provider.is_none() {
+            let effective_current =
+                crate::settings::get_effective_current_provider(&state.db, &app_type)?;
+            is_current = effective_current.as_deref() == Some(provider.id.as_str());
+            if is_current && Self::is_codex_schema_v2_router(&app_type, &provider) {
+                Self::sync_active_profile_provider_snapshot(state, &app_type, &provider.id)?;
+            }
         }
 
         // Save through the Codex domain mutation so Provider edits, catalog refreshes and
         // MultiRouter plan saves all share the same compiler/projection lifecycle.
-        Self::persist_provider_mutation(
+        Self::persist_provider_mutation_if_unchanged(
             state,
             &app_type,
             &provider,
             protocol_profiles,
             protocol_observations,
+            expected_provider,
         )?;
 
         if app_type == AppType::Codex {
@@ -7603,6 +7738,19 @@ impl ProviderService {
                 .ok_or_else(|| {
                     AppError::InvalidInput("codex_provider_not_found_after_mutation".to_string())
                 })?;
+        }
+
+        if expected_provider.is_some() {
+            // Effective-current lookup can clean stale local settings, and
+            // profile synchronization writes its snapshot. A rejected refresh
+            // must do neither; defer both until the atomic ownership check has
+            // committed. Protocol Set facades remain legitimate model sources.
+            let effective_current =
+                crate::settings::get_effective_current_provider(&state.db, &app_type)?;
+            is_current = effective_current.as_deref() == Some(provider.id.as_str());
+            if is_current && Self::is_codex_schema_v2_router(&app_type, &provider) {
+                Self::sync_active_profile_provider_snapshot(state, &app_type, &provider.id)?;
+            }
         }
 
         if codex_official_auth_changed {
@@ -7652,6 +7800,39 @@ impl ProviderService {
         }
 
         Ok(true)
+    }
+
+    pub(crate) fn validate_background_provider_refresh(
+        app_type: &AppType,
+        original_id: Option<&str>,
+        provider: &Provider,
+        expected: &Provider,
+    ) -> Result<(), AppError> {
+        let is_user_router = |candidate: &Provider| {
+            if crate::codex_multirouter::provider_set::is_codex_provider_set_facade(candidate) {
+                return false;
+            }
+            let Some(routing) = candidate.settings_config.get("codexRouting") else {
+                return false;
+            };
+            let Some(routing) = routing.as_object() else {
+                return false;
+            };
+            routing.get("enabled").and_then(Value::as_bool) != Some(false)
+                || routing
+                    .get("routes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|routes| !routes.is_empty())
+        };
+        if *app_type != AppType::Codex
+            || expected.id != provider.id
+            || original_id.is_some_and(|id| id != expected.id)
+            || is_user_router(expected)
+            || is_user_router(provider)
+        {
+            return Err(AppError::Message("provider_update_conflict".to_string()));
+        }
+        Ok(())
     }
 
     pub(crate) fn prepare_provider_for_mutation(
@@ -8256,6 +8437,24 @@ impl ProviderService {
         protocol_profiles: &[ProtocolCompatibilityRecord],
         protocol_observations: &[ProtocolCompatibilityRecord],
     ) -> Result<(), AppError> {
+        Self::persist_provider_mutation_if_unchanged(
+            state,
+            app_type,
+            provider,
+            protocol_profiles,
+            protocol_observations,
+            None,
+        )
+    }
+
+    fn persist_provider_mutation_if_unchanged(
+        state: &AppState,
+        app_type: &AppType,
+        provider: &Provider,
+        protocol_profiles: &[ProtocolCompatibilityRecord],
+        protocol_observations: &[ProtocolCompatibilityRecord],
+        expected_provider: Option<&Provider>,
+    ) -> Result<(), AppError> {
         if *app_type != AppType::Codex {
             return state.db.save_provider(app_type.as_str(), provider);
         }
@@ -8340,10 +8539,11 @@ impl ProviderService {
                     "codex_provider_set_model_blocked".to_string(),
                 ));
             }
-            let outcome = crate::codex_multirouter::mutation::apply_codex_provider_set_mutation_with_observations_and_publisher(
+            let outcome = crate::codex_multirouter::mutation::apply_codex_provider_set_mutation_with_observations_and_publisher_if_unchanged(
                 state.db.as_ref(),
                 prepared,
                 protocol_observations.to_vec(),
+                expected_provider,
                 |artifact| {
                     crate::codex_config::publish_codex_multirouter_projection_for_database(
                         state.db.as_ref(),
@@ -8419,10 +8619,11 @@ impl ProviderService {
                     ));
                 }
             }
-            let outcome = crate::codex_multirouter::mutation::apply_codex_provider_set_mutation_with_observations_and_publisher(
+            let outcome = crate::codex_multirouter::mutation::apply_codex_provider_set_mutation_with_observations_and_publisher_if_unchanged(
                 state.db.as_ref(),
                 prepared,
                 merged_protocol_observations,
+                expected_provider,
                 |artifact| {
                     crate::codex_config::publish_codex_multirouter_projection_for_database(
                         state.db.as_ref(),
@@ -8456,7 +8657,16 @@ impl ProviderService {
                 .as_ref()
                 .and_then(|meta| meta.codex_official_auth.as_ref())
                 .is_some();
-        let outcome = if persists_explicit_official_auth {
+        let outcome = if expected_provider.is_some() {
+            crate::codex_multirouter::mutation::apply_codex_provider_mutation_with_protocol_state_if_unchanged(
+                state.db.as_ref(),
+                provider.clone(),
+                protocol_profiles,
+                protocol_observations,
+                persists_explicit_official_auth,
+                expected_provider,
+            )?
+        } else if persists_explicit_official_auth {
             crate::codex_multirouter::mutation::apply_codex_official_auth_provider_mutation_with_protocol_state(
                 state.db.as_ref(),
                 provider.clone(),

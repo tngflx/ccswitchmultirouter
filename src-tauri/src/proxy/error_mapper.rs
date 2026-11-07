@@ -11,9 +11,34 @@ const OPENCODE_ZEN_FREE_TIER_GUIDANCE: &str = concat!(
     "API key, or run this free model in the official OpenCode client."
 );
 
+/// Return a safe, non-verbatim explanation for an upstream HTML error page.
+///
+/// Provider gateways sometimes return an HTML 502/524 document where this API
+/// expects JSON. Never echo the document: it can be very large and may contain
+/// request/provider diagnostics. Inspect only a bounded prefix and do not
+/// reclassify JSON error messages that merely mention HTML.
+pub fn upstream_html_error_message(status: u16, body: Option<&str>) -> Option<String> {
+    let body = body?.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let prefix: String = body.chars().take(1024).collect();
+    let normalized = prefix.to_ascii_lowercase();
+    let looks_like_html = normalized.starts_with("<!doctype html")
+        || normalized.starts_with("<html")
+        || normalized.starts_with("<head")
+        || normalized.starts_with("<body")
+        || (normalized.starts_with("<!--") && normalized.contains("<html"));
+    looks_like_html.then(|| {
+        format!(
+            "Upstream HTTP {status} returned an HTML error page instead of JSON. The provider or gateway generated this response; CC Switch preserved the upstream status and did not generate the HTML body."
+        )
+    })
+}
+
 /// Return actionable guidance for upstream errors whose raw text otherwise
 /// encourages users to keep retrying an unsupported client configuration.
 pub fn actionable_upstream_error_message(status: u16, body: Option<&str>) -> Option<String> {
+    if let Some(message) = upstream_html_error_message(status, body) {
+        return Some(message);
+    }
     if status != 403 {
         return None;
     }
@@ -221,6 +246,35 @@ mod tests {
                 "上游错误 (502)"
             );
         }
+    }
+
+    #[test]
+    fn upstream_html_error_message_omits_markup_and_names_the_upstream_gateway() {
+        for status in [403, 502, 520, 524] {
+            let message = get_error_message(&ProxyError::UpstreamError {
+                status,
+                body: Some(
+                    "  <!DOCTYPE html><html><head><title>Gateway error</title></head><body>redacted diagnostic marker</body></html>"
+                        .to_string(),
+                ),
+            });
+            assert!(message.contains(&format!("HTTP {status}")), "{message}");
+            assert!(message.contains("upstream"), "{message}");
+            assert!(message.contains("HTML error page"), "{message}");
+            assert!(!message.contains("<!DOCTYPE"), "{message}");
+            assert!(!message.contains("redacted diagnostic marker"), "{message}");
+        }
+    }
+
+    #[test]
+    fn json_error_that_mentions_html_is_not_reclassified_as_an_html_page() {
+        let body = r#"{"error":{"message":"Invalid input: <html> is not supported"}}"#;
+        assert!(actionable_upstream_error_message(400, Some(body)).is_none());
+        assert!(get_error_message(&ProxyError::UpstreamError {
+            status: 400,
+            body: Some(body.to_string()),
+        })
+        .contains(body));
     }
 
     #[test]

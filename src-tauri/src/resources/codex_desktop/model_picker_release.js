@@ -90,6 +90,7 @@ const refreshReleasedCodexModelQueries = (queries, invalidations = []) => {
 };
 
 const releaseCodexModelPicker = (modelProvider = null) => {
+  state.nativeReasoningVisibilityRestore?.();
   if (state.catalogReleased === true) {
     if (state.payload?.modelProvider !== modelProvider) {
       const pending = cancelCodexModelPickerReleaseRefresh();

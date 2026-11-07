@@ -508,6 +508,25 @@ function catalogRowUpstreamModel(
   );
 }
 
+export function selectOnlyDiscoveredCodexCatalogRows<
+  T extends CodexCatalogModel,
+>(
+  rows: readonly T[],
+  discoveredModelIds: readonly string[],
+): Array<T & { enabled: boolean }> {
+  const discoveredIds = new Set(
+    discoveredModelIds
+      .map((model) => model.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  return rows.map((row) => ({
+    ...row,
+    // An explicit request binding owns the row; matching only its visible alias
+    // must not turn on a model that was not present in this discovery.
+    enabled: discoveredIds.has(catalogRowUpstreamModel(row).toLowerCase()),
+  }));
+}
+
 // Compares rows (with rowId) to incoming models (without) by data fields only,
 // so both sync effects can use the same equality definition. Hidden native-profile
 // fields are included so switching between providers with identical visible fields
@@ -1626,6 +1645,117 @@ export function CodexFormFields({
     );
   }, [codexModel, fetchedModels, onCatalogModelsChange, onModelChange, t]);
 
+  const handleUseOnlyDiscoveredModels = useCallback(() => {
+    if (!onCatalogModelsChange) return;
+    if (!isCompleteCodexCatalogFetch(apiKeyGroupsRef.current)) {
+      toast.info(
+        t("codexConfig.discoveredModelsRequiresCompleteFetch", {
+          defaultValue:
+            "Use this action only after syncing a complete provider catalog; grouped credentials may expose different model lists.",
+        }),
+      );
+      return;
+    }
+    const discoveredIds = fetchedModels
+      .flatMap((model) => modelIdentityValues(model))
+      .filter(Boolean);
+    if (discoveredIds.length === 0) {
+      toast.info(
+        t("codexConfig.noDiscoveredModels", {
+          defaultValue: "Sync a model list first.",
+        }),
+      );
+      return;
+    }
+
+    const nextRows = selectOnlyDiscoveredCodexCatalogRows(
+      catalogRowsRef.current,
+      discoveredIds,
+    );
+    const enabledCount = nextRows.filter((row) => row.enabled !== false).length;
+    catalogRowsRef.current = nextRows;
+    setCatalogRows(nextRows);
+    const currentDefault = codexModel.trim().toLowerCase();
+    const currentDefaultStillEnabled = nextRows.some(
+      (row) =>
+        row.enabled !== false &&
+        modelIdentityValues(row).includes(currentDefault),
+    );
+    if (!currentDefaultStillEnabled && onModelChange) {
+      const nextDefault = nextRows.find((row) => row.enabled !== false);
+      const nextDefaultModel = nextDefault
+        ? nextDefault.model.trim() ||
+          catalogRowUpstreamModel(nextDefault).trim()
+        : "";
+      if (nextDefaultModel) onModelChange(nextDefaultModel);
+    }
+    toast.success(
+      t("codexConfig.useOnlyDiscoveredModelsApplied", {
+        count: enabledCount,
+        defaultValue:
+          "Enabled {{count}} model(s) returned by the latest API sync; older rows remain excluded in the catalog.",
+      }),
+    );
+  }, [codexModel, fetchedModels, onCatalogModelsChange, onModelChange, t]);
+
+  const handleReplaceCatalogFromDiscovery = useCallback(() => {
+    if (!onCatalogModelsChange) return;
+    if (!isCompleteCodexCatalogFetch(apiKeyGroupsRef.current)) {
+      toast.info(
+        t("codexConfig.discoveredModelsRequiresCompleteFetch", {
+          defaultValue:
+            "Use this action only after syncing a complete provider catalog; grouped credentials may expose different model lists.",
+        }),
+      );
+      return;
+    }
+    if (fetchedModels.length === 0) {
+      toast.info(
+        t("codexConfig.noDiscoveredModels", {
+          defaultValue: "Sync a model list first.",
+        }),
+      );
+      return;
+    }
+
+    const result = reconcileFetchedCodexCatalogRows(
+      [],
+      fetchedModels,
+      { providerId, providerName, baseUrl: codexBaseUrl, websiteUrl },
+      {
+        appendNew: true,
+        createRow: (seed) => createCatalogRow(seed),
+        existingMetadataMode: "refresh",
+        removeMissingRemote: true,
+        includeUnboundRemoteRows: true,
+        markMissingRemoteDisabled: false,
+        newRowEnabled: true,
+        contextWindowFormat: "string",
+        inferContextWindow: false,
+      },
+    );
+    const nextRows = result.rows;
+    catalogRowsRef.current = nextRows;
+    setCatalogRows(nextRows);
+    const nextDefault = nextRows[0]?.model.trim() || "";
+    if (nextDefault && onModelChange) onModelChange(nextDefault);
+    toast.success(
+      t("codexConfig.replaceCatalogApplied", {
+        count: nextRows.length,
+        defaultValue: "Rebuilt the catalog from {{count}} synced model(s).",
+      }),
+    );
+  }, [
+    codexBaseUrl,
+    fetchedModels,
+    onCatalogModelsChange,
+    onModelChange,
+    providerId,
+    providerName,
+    t,
+    websiteUrl,
+  ]);
+
   const handleProtocolProbe = useCallback(async () => {
     if (!codexBaseUrl || !codexApiKey) {
       showFetchModelsError(null, t, {
@@ -2206,6 +2336,36 @@ export function CodexFormFields({
           <p className="text-xs text-muted-foreground">
             {t("codexConfig.officialContextTokenBudget")}
           </p>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs text-muted-foreground">
+              {t("codexConfig.officialModelSelectionHint", {
+                count: catalogRows.filter((row) => row.enabled !== false)
+                  .length,
+                defaultValue:
+                  "Select the models to keep in Codex /model ({{count}} enabled). Uncheck old models to remove them from the menu.",
+              })}
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={isFetchingModels || fetchedModels.length === 0}
+              onClick={() => {
+                setCatalogRows((current) => {
+                  const next = selectOnlyDiscoveredCodexCatalogRows(
+                    current,
+                    fetchedModels.map((model) => model.id),
+                  );
+                  catalogRowsRef.current = next;
+                  return next;
+                });
+              }}
+            >
+              {t("codexConfig.officialSelectDiscovered", {
+                defaultValue: "Enable only models found in this discovery",
+              })}
+            </Button>
+          </div>
           <div className="flex items-center justify-between gap-3">
             <span className="text-sm">
               {t("codexConfig.officialMenuProjection")}
@@ -2223,6 +2383,10 @@ export function CodexFormFields({
               upstreamModel={catalogRowUpstreamModel(row)}
               value={String(row.contextWindow ?? "")}
               maximumIsTrusted={officialManagedOAuth}
+              enabled={row.enabled !== false}
+              onEnabledChange={(enabled) =>
+                handleUpdateCatalogRow(index, { enabled })
+              }
               discovered={fetchedModels.find(
                 (item) =>
                   item.id.trim().toLowerCase() ===
@@ -2466,6 +2630,11 @@ export function CodexFormFields({
           confirmedFreeModelCount={confirmedFreeModelCount}
           canUseFreeModelsOnly={canUseFreeModelsOnly}
           onUseFreeModelsOnly={handleUseFreeModelsOnly}
+          discoveredModelCount={fetchedModels.length}
+          canUseOnlyDiscoveredModels={isCompleteCodexCatalogFetch(apiKeyGroups)}
+          onUseOnlyDiscoveredModels={handleUseOnlyDiscoveredModels}
+          canReplaceCatalog={isCompleteCodexCatalogFetch(apiKeyGroups)}
+          onReplaceCatalog={handleReplaceCatalogFromDiscovery}
           isValidatingConnection={
             isProbingProtocol && isProtocolProbeStateCurrent
           }
@@ -3182,6 +3351,12 @@ export function CodexFormFields({
                     {t("codexConfig.modelMappingHint", {
                       defaultValue:
                         "This stores candidate models, real upstream model names, and context windows. When “Show in the Codex /model menu” is enabled, the menu label and upstream model name participate in Codex menu mapping; when disabled, they are still saved as catalog metadata.",
+                    })}
+                  </p>
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    {t("codexConfig.modelMappingInventoryHint", {
+                      defaultValue:
+                        "All includes retained excluded inventory for editing. Only Included models enter routes and model pickers; use “Enable only synced models” after a complete API sync when you want the latest fetched set enabled.",
                     })}
                   </p>
                 </div>

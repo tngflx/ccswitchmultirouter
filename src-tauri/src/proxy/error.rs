@@ -115,6 +115,19 @@ impl IntoResponse for ProxyError {
                     if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body_str) {
                         // 上游返回的是 JSON，直接透传
                         json_body
+                    } else if let Some(message) = super::error_mapper::upstream_html_error_message(
+                        *upstream_status,
+                        Some(body_str),
+                    ) {
+                        // 网关 HTML（例如 Cloudflare 502/524）不是 API 错误 JSON；不要把
+                        // 整页 HTML 回显给客户端，既避免误导也避免泄漏大段诊断内容。
+                        json!({
+                            "error": {
+                                "message": message,
+                                "type": "upstream_error",
+                                "upstream_status": upstream_status,
+                            }
+                        })
                     } else {
                         // 上游返回的不是 JSON，包装为错误消息
                         json!({
@@ -329,6 +342,33 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
             upstream_body
         );
+    }
+
+    #[tokio::test]
+    async fn upstream_html_error_response_is_safe_json_with_the_original_status() {
+        for status in [502, 520, 524] {
+            let response = ProxyError::UpstreamError {
+                status,
+                body: Some(
+                    "<!DOCTYPE html><html><body>redacted diagnostic marker</body></html>"
+                        .to_string(),
+                ),
+            }
+            .into_response();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            let bytes = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(message.contains("HTML error page"), "{message}");
+            assert!(message.contains(&format!("HTTP {status}")), "{message}");
+            assert!(!message.contains("<!DOCTYPE"), "{message}");
+            assert!(!message.contains("redacted diagnostic marker"), "{message}");
+            assert_eq!(body["error"]["type"], "upstream_error");
+            assert_eq!(body["error"]["upstream_status"], status);
+        }
     }
 
     #[test]

@@ -530,13 +530,20 @@ pub fn resolve_codex_model_capability_core(
     }
 
     // 5. 内置清单
-    if let Some(capability) = builtin_reasoning_capability_for_model(model) {
-        return resolved_with_catalog_ultra_setting(
-            settings,
-            model,
-            CapabilitySource::Builtin,
-            capability,
-        );
+    // Builtins use a vendor-native string contract. They are safe only
+    // for an unknown provider or the exact official DeepSeek platform; a
+    // known aggregator may expose the same model through a different wire
+    // shape, so applying this fallback there would silently mis-encode the
+    // request instead of failing closed.
+    if platform.is_none() || platform == Some("deepseek") {
+        if let Some(capability) = builtin_reasoning_capability_for_model(model) {
+            return resolved_with_catalog_ultra_setting(
+                settings,
+                model,
+                CapabilitySource::Builtin,
+                capability,
+            );
+        }
     }
 
     // 6. Codex 官方模型缓存（仅未知平台生效）
@@ -748,6 +755,65 @@ mod tests {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+        }
+    }
+
+    #[test]
+    fn upstream_metadata_official_deepseek_library_respects_provider_and_catalog_authority() {
+        let library = catalog::load_library_from_str(include_str!(
+            "../../resources/reasoning-capabilities.json"
+        ))
+        .expect("valid maintained library");
+        for model in ["deepseek-flash", "deepseek-v4-pro"] {
+            let provider = plain_provider("DeepSeek Official", "https://api.deepseek.com/v1");
+            let resolved =
+                resolve_codex_model_capability_with_library(&provider, model, None, Some(&library));
+            assert_eq!(resolved.source, CapabilitySource::Library);
+            let capability = resolved
+                .capability
+                .expect("official DeepSeek maintained capability");
+            assert_eq!(
+                capability.supported_efforts,
+                vec!["none", "low", "high", "max"]
+            );
+            assert_eq!(capability.default_effort.as_deref(), Some("high"));
+            for (effort, expected) in [("minimal", "low"), ("medium", "high"), ("xhigh", "high")] {
+                assert_eq!(
+                    capability
+                        .upstream
+                        .effort_map
+                        .get(effort)
+                        .map(String::as_str),
+                    Some(expected)
+                );
+            }
+            assert!(capability.codex_ultra_orchestration.is_none());
+            assert!(!capability.upstream.effort_map.contains_key("ultra"));
+            let projected =
+                crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(
+                    Some(&capability),
+                );
+            use crate::proxy::providers::codex_reasoning::CodexReasoningEffort as Effort;
+            assert_eq!(projected.provider_default_effort, Some(Effort::High));
+            assert_eq!(
+                projected.effort_map.get(&Effort::Medium),
+                Some(&Effort::High)
+            );
+            assert!(!projected.codex_selectable_efforts.contains(&Effort::Ultra));
+
+            let gateway = plain_provider("DeepSeek Gateway", "https://gateway.example/v1");
+            let resolved =
+                resolve_codex_model_capability_with_library(&gateway, model, None, Some(&library));
+            assert_ne!(resolved.source, CapabilitySource::Library);
+            let mut excluded = provider.clone();
+            excluded.settings_config["modelCatalog"] =
+                json!({"models": [{"model": model, "enabled": false}]});
+            let resolved =
+                resolve_codex_model_capability_with_library(&excluded, model, None, Some(&library));
+            assert!(
+                resolved.capability.is_none(),
+                "library never revives an excluded canonical row"
+            );
         }
     }
 
@@ -1357,6 +1423,23 @@ mod tests {
             None,
             None,
             &official,
+        );
+        assert_eq!(resolved.source, CapabilitySource::Unknown);
+        assert!(resolved.capability.is_none());
+    }
+
+    #[test]
+    fn resolver_core_builtin_source_is_skipped_for_known_aggregator_platform() {
+        // The maintained builtin uses the official string/reasoning_effort
+        // contract. A known aggregator must not inherit it when its packaged
+        // platform-specific entry is unavailable; fail closed instead.
+        let resolved = resolve_codex_model_capability_core(
+            &json!({}),
+            Some("openrouter"),
+            "deepseek-v4-pro",
+            None,
+            None,
+            &[],
         );
         assert_eq!(resolved.source, CapabilitySource::Unknown);
         assert!(resolved.capability.is_none());
