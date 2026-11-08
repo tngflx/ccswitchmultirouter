@@ -771,10 +771,13 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.change(search, { target: { value: "wire-second" } });
     fireEvent.click(screen.getByRole("checkbox", { name: "Select second" }));
     expect(screen.getByText("2 selected")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Catalogue actions" }));
-    await user.click(
-      screen.getByRole("menuitem", { name: "Use only selected" }),
-    );
+    expect(
+      screen.getByRole("button", { name: "Use only selected" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("menuitem", { name: "Use only selected" }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Use only selected" }));
     await waitFor(() =>
       expect(latestCatalog().map((row) => row.enabled)).toEqual([
         true,
@@ -798,6 +801,94 @@ describe("CodexFormFields local model routing", () => {
       screen.queryByRole("option", { name: "unselected" }),
     ).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("option", { name: "first" }));
+    await waitForReasoningResolution();
+  });
+
+  it("repairs the default when bulk inclusion changes exclude it", async () => {
+    const { latestCatalog, latestDefaultModel } = renderCatalogHarness(
+      [{ model: "first" }, { model: "second", enabled: false }],
+      { defaultModel: "first" },
+    );
+    await waitForReasoningResolution();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select first" }));
+    fireEvent.click(screen.getByRole("button", { name: "Exclude selected" }));
+    await waitFor(() => {
+      expect(latestCatalog().map((row) => row.enabled)).toEqual([false, false]);
+      expect(latestDefaultModel()).toBe("");
+    });
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select second" }));
+    await waitFor(() => expect(screen.getByText("1 selected")).toBeVisible());
+    fireEvent.click(screen.getByRole("button", { name: "Use only selected" }));
+    await waitFor(() => {
+      expect(latestCatalog().map((row) => row.enabled !== false)).toEqual([
+        false,
+        true,
+      ]);
+      expect(latestDefaultModel()).toBe("second");
+    });
+    await waitForReasoningResolution();
+  });
+
+  it("repairs the default when a single catalog row is excluded", async () => {
+    const { latestCatalog, latestDefaultModel } = renderCatalogHarness(
+      [{ model: "first" }, { model: "second" }],
+      { defaultModel: "first" },
+    );
+    await waitForReasoningResolution();
+
+    fireEvent.click(screen.getByRole("switch", { name: "Include first" }));
+    await waitFor(() => {
+      expect(latestCatalog().map((row) => row.enabled !== false)).toEqual([
+        false,
+        true,
+      ]);
+      expect(latestDefaultModel()).toBe("second");
+    });
+    await waitForReasoningResolution();
+  });
+
+  it("repairs the default and protocol overrides after bulk removal", async () => {
+    const user = userEvent.setup();
+    const { latestCatalog, latestDefaultModel, latestProtocolOverrides } =
+      renderCatalogHarness([{ model: "first" }, { model: "second" }], {
+        defaultModel: "first",
+        protocolOverrides: { first: "openai_chat" },
+      });
+    await waitForReasoningResolution();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select first" }));
+    await user.click(screen.getByRole("button", { name: "Catalogue actions" }));
+    await user.click(
+      screen.getByRole("menuitem", { name: "Remove selected models" }),
+    );
+    await waitFor(() => {
+      expect(latestCatalog().map((row) => row.model)).toEqual(["second"]);
+      expect(latestDefaultModel()).toBe("second");
+      expect(latestProtocolOverrides()).toEqual({});
+    });
+    await waitForReasoningResolution();
+  });
+
+  it("keeps excluded inventory when pruning outdated included versions", async () => {
+    const { latestCatalog } = renderCatalogHarness([
+      { model: "gpt-4" },
+      { model: "gpt-5" },
+      { model: "gpt-3", enabled: false },
+    ]);
+    await waitForReasoningResolution();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Keep latest versions" }),
+    );
+    await waitFor(() => {
+      expect(latestCatalog().map((row) => row.model)).toEqual([
+        "gpt-5",
+        "gpt-3",
+      ]);
+      expect(latestCatalog()[1].enabled).toBe(false);
+    });
     await waitForReasoningResolution();
   });
 
@@ -945,11 +1036,12 @@ describe("CodexFormFields local model routing", () => {
       updateCatalog([{ model: "replacement" }]);
     });
     expect(screen.getByText("0 selected")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Catalogue actions" }));
     expect(
-      screen.getByRole("menuitem", { name: "Use only selected" }),
-    ).toHaveAttribute("data-disabled");
-    await user.keyboard("{Escape}");
+      screen.getByRole("button", { name: "Use only selected" }),
+    ).toBeDisabled();
+    expect(
+      screen.queryByRole("menuitem", { name: "Use only selected" }),
+    ).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
     expect(
       screen.getByRole("checkbox", { name: "Select replacement" }),
@@ -1072,11 +1164,14 @@ describe("CodexFormFields local model routing", () => {
       { id: "hidden", ownedBy: null },
       { id: "new", ownedBy: null },
     ]);
-    const { latestCatalog } = renderCatalogHarness([
-      { model: "kept", upstreamModel: "wire-kept", displayName: "My Model" },
-      { model: "removed" },
-      { model: "hidden", enabled: false },
-    ]);
+    const { latestCatalog, latestDefaultModel } = renderCatalogHarness(
+      [
+        { model: "kept", upstreamModel: "wire-kept", displayName: "My Model" },
+        { model: "removed" },
+        { model: "hidden", enabled: false },
+      ],
+      { defaultModel: "removed" },
+    );
     await waitForReasoningResolution();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
@@ -1093,6 +1188,7 @@ describe("CodexFormFields local model routing", () => {
       ]);
     });
     expect(latestCatalog()[0].enabled).not.toBe(false);
+    expect(latestDefaultModel()).toBe("kept");
     expect(
       screen.queryByRole("button", {
         name: "Configure reasoning capabilities for removed",

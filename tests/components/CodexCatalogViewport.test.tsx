@@ -70,11 +70,21 @@ describe("large catalog viewport", () => {
       expect(
         within(toolbar).queryByRole("button", { name: "Exclude matching" }),
       ).not.toBeInTheDocument();
+      expect(
+        within(toolbar).getByRole("button", { name: "Use only selected" }),
+      ).toBeEnabled();
+      expect(
+        document.querySelector("[data-catalog-selection-spacer]"),
+      ).toHaveClass("h-24", "sm:h-20", "lg:h-16");
       await user.click(
         within(toolbar).getByRole("button", { name: "Catalogue actions" }),
       );
+      expect(
+        screen.queryByRole("menuitem", { name: "Use only selected" }),
+      ).not.toBeInTheDocument();
+      await user.keyboard("{Escape}");
       await user.click(
-        screen.getByRole("menuitem", { name: "Use only selected" }),
+        within(toolbar).getByRole("button", { name: "Use only selected" }),
       );
       expect(onUseOnlySelected).toHaveBeenCalledWith(["last"]);
     },

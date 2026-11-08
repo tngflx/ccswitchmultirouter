@@ -380,13 +380,33 @@ export function CodexCatalogViewport<
           <ListX className="mr-1.5 h-4 w-4 shrink-0" />
           {t("catalogBrowser.excludeSelected")}
         </Button>
+        {onUseOnlySelected && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-auto min-h-8 whitespace-normal"
+            disabled={selectedIds.length === 0}
+            onClick={() => {
+              onUseOnlySelected(selectedIds);
+              updateSelection("clear");
+            }}
+          >
+            <ListChecks className="mr-1.5 h-4 w-4 shrink-0" />
+            {t("catalogBrowser.useOnlySelected")}
+          </Button>
+        )}
         {onPruneOutdated && (
           <Button
             type="button"
             variant="outline"
             size="sm"
             className="h-auto min-h-8 whitespace-normal"
-            disabled={items.length < 2}
+            disabled={includedCount < 2}
+            title={t("catalogBrowser.keepRecentHint", {
+              defaultValue:
+                "Remove outdated versions from included models only; excluded inventory is preserved.",
+            })}
             onClick={onPruneOutdated}
           >
             <Sparkles className="mr-1.5 h-4 w-4 shrink-0" />
@@ -414,18 +434,7 @@ export function CodexCatalogViewport<
               <ArrowLeftRight className="h-4 w-4" />
               {t("catalogBrowser.invertSelection")}
             </DropdownMenuItem>
-            {onUseOnlySelected && (
-              <DropdownMenuItem
-                disabled={selectedIds.length === 0}
-                onSelect={() => {
-                  onUseOnlySelected(selectedIds);
-                  updateSelection("clear");
-                }}
-              >
-                <ListChecks className="h-4 w-4" />
-                {t("catalogBrowser.useOnlySelected")}
-              </DropdownMenuItem>
-            )}
+
             {onRemoveSelected && <DropdownMenuSeparator />}
             {onRemoveSelected && (
               <DropdownMenuItem
@@ -445,6 +454,13 @@ export function CodexCatalogViewport<
       </div>
     </div>
   );
+  const selectionToolbarSpacer = selectionToolbar ? (
+    <div
+      aria-hidden="true"
+      data-catalog-selection-spacer
+      className="h-24 shrink-0 sm:h-20 lg:h-16"
+    />
+  ) : null;
   const emptyState = onToggleEnabled && filteredItems.length === 0 && (
     <p role="status" className="py-6 text-center text-sm text-muted-foreground">
       {t("catalogBrowser.noMatches", { defaultValue: "No matching models" })}
@@ -515,6 +531,7 @@ export function CodexCatalogViewport<
               </div>
             );
           })}
+          {selectionToolbarSpacer}
           {selectionToolbar}
         </div>
       </div>
@@ -712,6 +729,7 @@ export function CodexCatalogViewport<
           );
         })}
       </div>
+      {selectionToolbarSpacer}
       {selectionToolbar}
     </div>
   );

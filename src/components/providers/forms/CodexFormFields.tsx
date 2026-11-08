@@ -1141,6 +1141,63 @@ export function CodexFormFields({
   const catalogPropKeyRef = useRef(JSON.stringify(catalogModels));
   const pendingCatalogSyncRef = useRef<CodexCatalogModel[] | null>(null);
 
+  const repairDefaultModel = useCallback(
+    (rows: readonly CodexCatalogRow[]) => {
+      if (!onModelChange) return;
+      const currentDefault = codexModel.trim().toLowerCase();
+      const enabledRows = rows.filter((row) => row.enabled !== false);
+      const currentDefaultStillEnabled = enabledRows.some((row) =>
+        modelIdentityValues(row).includes(currentDefault),
+      );
+      if (currentDefaultStillEnabled) return;
+      const nextDefault = enabledRows[0]
+        ? enabledRows[0].model.trim() ||
+          catalogRowUpstreamModel(enabledRows[0]).trim()
+        : "";
+      if (nextDefault !== codexModel) onModelChange(nextDefault);
+    },
+    [codexModel, onModelChange],
+  );
+
+  const reconcileProtocolOverrides = useCallback(
+    (rows: readonly CodexCatalogRow[]) => {
+      if (!onProtocolOverridesChange) return;
+      const validModels = new Set(
+        rows
+          .map((row) => normalizeCodexPublicModelKey(row.model))
+          .filter(Boolean),
+      );
+      const nextOverrides = Object.fromEntries(
+        Object.entries(protocolOverrides).filter(([model]) =>
+          validModels.has(normalizeCodexPublicModelKey(model)),
+        ),
+      );
+      if (JSON.stringify(nextOverrides) !== JSON.stringify(protocolOverrides)) {
+        onProtocolOverridesChange(nextOverrides);
+      }
+    },
+    [onProtocolOverridesChange, protocolOverrides],
+  );
+
+  const commitCatalogRows = useCallback(
+    (
+      updater: (current: CodexCatalogRow[]) => CodexCatalogRow[],
+      options: {
+        repairDefault?: boolean;
+        reconcileProtocolOverrides?: boolean;
+      } = {},
+    ) => {
+      const nextRows = updater(catalogRowsRef.current);
+      catalogRowsRef.current = nextRows;
+      setCatalogRows(nextRows);
+      if (options.repairDefault) repairDefaultModel(nextRows);
+      if (options.reconcileProtocolOverrides)
+        reconcileProtocolOverrides(nextRows);
+      return nextRows;
+    },
+    [reconcileProtocolOverrides, repairDefaultModel],
+  );
+
   // 保留最新的模型映射行给异步刷新回调用，避免点击“获取模型列表”时合并到旧闭包里的 catalogRows。
   useEffect(() => {
     catalogRowsRef.current = catalogRows;
@@ -1421,8 +1478,7 @@ export function CodexFormFields({
               inferContextWindow: false,
             },
           );
-          catalogRowsRef.current = rows;
-          setCatalogRows(rows);
+          commitCatalogRows(() => rows, { repairDefault: true });
           if (models.length === 0) {
             toast.info(t("providerForm.fetchModelsEmpty"));
           } else {
@@ -1541,8 +1597,7 @@ export function CodexFormFields({
             },
             isCompleteCodexCatalogFetch(apiKeyGroupsRef.current),
           );
-          catalogRowsRef.current = mergedRows;
-          setCatalogRows(mergedRows);
+          commitCatalogRows(() => mergedRows, { repairDefault: true });
         }
         if (models.length === 0) {
           toast.info(t("providerForm.fetchModelsEmpty"));
@@ -1572,6 +1627,7 @@ export function CodexFormFields({
     planSecretAccessKey,
     websiteUrl,
     onCatalogModelsChange,
+    commitCatalogRows,
     isXaiOauthPreset,
     isXaiOauthAuthenticated,
     selectedXaiAccountId,
@@ -1624,26 +1680,14 @@ export function CodexFormFields({
       );
       return;
     }
-    catalogRowsRef.current = nextRows;
-    setCatalogRows(nextRows);
-
-    const currentDefault = codexModel.trim().toLowerCase();
-    const currentDefaultStillEnabled = enabledRows.some((row) =>
-      modelIdentityValues(row).includes(currentDefault),
-    );
-    if (!currentDefaultStillEnabled && onModelChange) {
-      const nextDefault =
-        enabledRows[0].model.trim() ||
-        catalogRowUpstreamModel(enabledRows[0]).trim();
-      if (nextDefault) onModelChange(nextDefault);
-    }
+    commitCatalogRows(() => nextRows, { repairDefault: true });
     toast.success(
       t("codexConfig.freeModelsOnlyApplied", {
         count: enabledRows.length,
         defaultValue: `Enabled ${enabledRows.length} confirmed free model(s).`,
       }),
     );
-  }, [codexModel, fetchedModels, onCatalogModelsChange, onModelChange, t]);
+  }, [fetchedModels, onCatalogModelsChange, commitCatalogRows, t]);
 
   const handleUseOnlyDiscoveredModels = useCallback(() => {
     if (!onCatalogModelsChange) return;
@@ -1673,22 +1717,7 @@ export function CodexFormFields({
       discoveredIds,
     );
     const enabledCount = nextRows.filter((row) => row.enabled !== false).length;
-    catalogRowsRef.current = nextRows;
-    setCatalogRows(nextRows);
-    const currentDefault = codexModel.trim().toLowerCase();
-    const currentDefaultStillEnabled = nextRows.some(
-      (row) =>
-        row.enabled !== false &&
-        modelIdentityValues(row).includes(currentDefault),
-    );
-    if (!currentDefaultStillEnabled && onModelChange) {
-      const nextDefault = nextRows.find((row) => row.enabled !== false);
-      const nextDefaultModel = nextDefault
-        ? nextDefault.model.trim() ||
-          catalogRowUpstreamModel(nextDefault).trim()
-        : "";
-      if (nextDefaultModel) onModelChange(nextDefaultModel);
-    }
+    commitCatalogRows(() => nextRows, { repairDefault: true });
     toast.success(
       t("codexConfig.useOnlyDiscoveredModelsApplied", {
         count: enabledCount,
@@ -1696,7 +1725,7 @@ export function CodexFormFields({
           "Enabled {{count}} model(s) returned by the latest API sync; older rows remain excluded in the catalog.",
       }),
     );
-  }, [codexModel, fetchedModels, onCatalogModelsChange, onModelChange, t]);
+  }, [fetchedModels, onCatalogModelsChange, commitCatalogRows, t]);
 
   const handleReplaceCatalogFromDiscovery = useCallback(() => {
     if (!onCatalogModelsChange) return;
@@ -1734,11 +1763,10 @@ export function CodexFormFields({
         inferContextWindow: false,
       },
     );
-    const nextRows = result.rows;
-    catalogRowsRef.current = nextRows;
-    setCatalogRows(nextRows);
-    const nextDefault = nextRows[0]?.model.trim() || "";
-    if (nextDefault && onModelChange) onModelChange(nextDefault);
+    const nextRows = commitCatalogRows(() => result.rows, {
+      repairDefault: true,
+      reconcileProtocolOverrides: true,
+    });
     toast.success(
       t("codexConfig.replaceCatalogApplied", {
         count: nextRows.length,
@@ -1749,9 +1777,9 @@ export function CodexFormFields({
     codexBaseUrl,
     fetchedModels,
     onCatalogModelsChange,
-    onModelChange,
     providerId,
     providerName,
+    commitCatalogRows,
     t,
     websiteUrl,
   ]);
@@ -1995,22 +2023,29 @@ export function CodexFormFields({
   const handleAddCatalogRow = useCallback(() => {
     if (!onCatalogModelsChange) return;
     const row = createCatalogRow();
-    setCatalogRows((current) => [...current, row]);
+    commitCatalogRows((current) => [...current, row]);
     setRevealedCatalogRowId(row.rowId);
-  }, [onCatalogModelsChange]);
+  }, [commitCatalogRows, onCatalogModelsChange]);
 
   const handlePruneOutdatedCatalogRows = useCallback(() => {
-    const result = pruneOutdatedCodexCatalogModels(catalogRows);
-    if (!result.pruned.length) {
+    // Use the full inventory to identify newer releases, but never delete an
+    // explicitly excluded row from the editable catalog.
+    const result = pruneOutdatedCodexCatalogModels(catalogRowsRef.current);
+    const prunedIds = new Set(
+      result.pruned
+        .filter((row) => row.enabled !== false)
+        .map((row) => row.rowId),
+    );
+    if (prunedIds.size === 0) {
       toast.info(t("catalogBrowser.noOutdated"));
       return;
     }
-    const prunedIds = new Set(result.pruned.map((row) => row.rowId));
-    setCatalogRows((current) =>
-      current.filter((row) => !prunedIds.has(row.rowId)),
+    commitCatalogRows(
+      (current) => current.filter((row) => !prunedIds.has(row.rowId)),
+      { repairDefault: true, reconcileProtocolOverrides: true },
     );
-    toast.success(t("catalogBrowser.pruned", { count: result.pruned.length }));
-  }, [catalogRows, t]);
+    toast.success(t("catalogBrowser.pruned", { count: prunedIds.size }));
+  }, [commitCatalogRows, t]);
 
   const handleUpdateCatalogRow = useCallback(
     (index: number, patch: Partial<CodexCatalogModel>) => {
@@ -2024,34 +2059,37 @@ export function CodexFormFields({
           ),
         );
       }
-      setCatalogRows((current) => {
-        const nextRows = current.map((row, i) => {
-          if (i !== index) return row;
-          const next = { ...row, ...patch };
-          if (
-            patch.model !== undefined &&
-            patch.upstreamModel === undefined &&
-            patch.upstream_model === undefined
-          ) {
-            const previousVisibleModel = row.model.trim();
-            const previousUpstreamModel = catalogRowUpstreamModel(row);
+      commitCatalogRows(
+        (current) =>
+          current.map((row, i) => {
+            if (i !== index) return row;
+            const next = { ...row, ...patch };
             if (
-              previousVisibleModel &&
-              (!previousUpstreamModel ||
-                previousUpstreamModel === previousVisibleModel)
+              patch.model !== undefined &&
+              patch.upstreamModel === undefined &&
+              patch.upstream_model === undefined
             ) {
-              next.upstreamModel = previousVisibleModel;
+              const previousVisibleModel = row.model.trim();
+              const previousUpstreamModel = catalogRowUpstreamModel(row);
+              if (
+                previousVisibleModel &&
+                (!previousUpstreamModel ||
+                  previousUpstreamModel === previousVisibleModel)
+              ) {
+                next.upstreamModel = previousVisibleModel;
+              }
             }
-          }
-          return next;
-        });
-        // Keep asynchronous catalog refreshes and rapid successive UI patches
-        // anchored to the same latest canonical draft, before React commits.
-        catalogRowsRef.current = nextRows;
-        return nextRows;
-      });
+            return next;
+          }),
+        {
+          // A single-row switch/edit must keep the default model and its
+          // included-only projections aligned just like bulk catalog actions.
+          repairDefault:
+            patch.enabled !== undefined || patch.model !== undefined,
+        },
+      );
     },
-    [onProtocolOverridesChange, protocolOverrides],
+    [commitCatalogRows, onProtocolOverridesChange, protocolOverrides],
   );
 
   const handleUpdateCatalogReasoningJson = useCallback(
@@ -2148,14 +2186,20 @@ export function CodexFormFields({
     ],
   );
 
-  const handleRemoveCatalogRow = useCallback((index: number) => {
-    setCatalogRows((current) => current.filter((_, i) => i !== index));
-  }, []);
+  const handleRemoveCatalogRow = useCallback(
+    (index: number) => {
+      commitCatalogRows((current) => current.filter((_, i) => i !== index), {
+        repairDefault: true,
+        reconcileProtocolOverrides: true,
+      });
+    },
+    [commitCatalogRows],
+  );
 
   // 移动模型目录行本身；单 provider 表格里的顺序代表保留下来的模型展示/路由顺序，不再混用子 Agent 候选顺序。
   const handleMoveCatalogRow = useCallback(
     (index: number, direction: -1 | 1) => {
-      setCatalogRows((current) => {
+      commitCatalogRows((current) => {
         const targetIndex = index + direction;
         if (index < 0 || targetIndex < 0 || targetIndex >= current.length) {
           return current;
@@ -2165,7 +2209,7 @@ export function CodexFormFields({
         return next;
       });
     },
-    [],
+    [commitCatalogRows],
   );
 
   const renderCatalogActionButtons = (onAdd: () => void, addLabel: string) => (
@@ -2351,14 +2395,14 @@ export function CodexFormFields({
               size="sm"
               disabled={isFetchingModels || fetchedModels.length === 0}
               onClick={() => {
-                setCatalogRows((current) => {
-                  const next = selectOnlyDiscoveredCodexCatalogRows(
-                    current,
-                    fetchedModels.map((model) => model.id),
-                  );
-                  catalogRowsRef.current = next;
-                  return next;
-                });
+                commitCatalogRows(
+                  (current) =>
+                    selectOnlyDiscoveredCodexCatalogRows(
+                      current,
+                      fetchedModels.map((model) => model.id),
+                    ),
+                  { repairDefault: true },
+                );
               }}
             >
               {t("codexConfig.officialSelectDiscovered", {
@@ -2515,8 +2559,7 @@ export function CodexFormFields({
                       websiteUrl,
                     },
                   );
-                  catalogRowsRef.current = mergedRows;
-                  setCatalogRows(mergedRows);
+                  commitCatalogRows(() => mergedRows, { repairDefault: true });
                 }}
               />
               <div className="flex items-center gap-2">
@@ -3387,25 +3430,36 @@ export function CodexFormFields({
                       }}
                       onSetIncluded={(ids, enabled) => {
                         const matched = new Set(ids);
-                        setCatalogRows((current) =>
-                          current.map((row) =>
-                            matched.has(row.rowId) ? { ...row, enabled } : row,
-                          ),
+                        commitCatalogRows(
+                          (current) =>
+                            current.map((row) =>
+                              matched.has(row.rowId)
+                                ? { ...row, enabled }
+                                : row,
+                            ),
+                          { repairDefault: true },
                         );
                       }}
                       onUseOnlySelected={(ids) => {
                         const selected = new Set(ids);
-                        setCatalogRows((current) =>
-                          current.map((row) => ({
-                            ...row,
-                            enabled: selected.has(row.rowId),
-                          })),
+                        commitCatalogRows(
+                          (current) =>
+                            current.map((row) => ({
+                              ...row,
+                              enabled: selected.has(row.rowId),
+                            })),
+                          { repairDefault: true },
                         );
                       }}
                       onRemoveSelected={(ids) => {
                         const selected = new Set(ids);
-                        setCatalogRows((current) =>
-                          current.filter((row) => !selected.has(row.rowId)),
+                        commitCatalogRows(
+                          (current) =>
+                            current.filter((row) => !selected.has(row.rowId)),
+                          {
+                            repairDefault: true,
+                            reconcileProtocolOverrides: true,
+                          },
                         );
                       }}
                       onPruneOutdated={handlePruneOutdatedCatalogRows}

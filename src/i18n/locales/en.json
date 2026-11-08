@@ -93,6 +93,7 @@
     "moreActions": "Catalogue actions",
     "removeSelected": "Remove selected models",
     "keepRecent": "Keep latest versions",
+    "keepRecentHint": "Remove outdated versions from included models only; excluded inventory is preserved.",
     "noOutdated": "No outdated model versions found",
     "pruned": "Removed {{count}} outdated models",
     "protocolOverride": "Protocol override",

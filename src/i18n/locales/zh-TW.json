@@ -93,6 +93,7 @@
     "moreActions": "模型目錄操作",
     "removeSelected": "刪除所選模型",
     "keepRecent": "保留最新版本",
+    "keepRecentHint": "僅從已包含的模型中刪除過時版本；保留排除的目錄項。",
     "noOutdated": "沒有過時的模型版本",
     "pruned": "已刪除 {{count}} 個過時模型",
     "protocolOverride": "協定覆寫",
