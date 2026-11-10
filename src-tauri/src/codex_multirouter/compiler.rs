@@ -2406,13 +2406,224 @@ mod tests {
     }
 
     #[test]
-    fn upstream_official_capability_populates_routed_reasoning_without_inventing_custom_models() {
-        let provider = provider(
-            "sublyx",
-            "Sublyx",
+    fn identical_gpt_ids_keep_sublyx_and_openrouter_contracts_isolated_end_to_end() {
+        use crate::codex_multirouter::projection::effective_settings_for_candidate_with_providers;
+        use crate::proxy::providers::{
+            prepare_codex_native_responses_model, resolve_codex_chat_reasoning_config,
+            resolve_codex_v2_routed_provider,
+            transform_codex_chat::responses_to_chat_completions_with_reasoning,
+        };
+        use crate::reasoning_capabilities::{
+            provider_metadata::openrouter_reasoning_capability_from_model_entry,
+            resolve_codex_model_capability_with_library,
+        };
+
+        // Deliberately use the same ID, including the suffix, at both gateways.
+        // Only provider identity may select Sublyx's contract; OpenRouter's
+        // explicit API metadata must retain its native max tier.
+        let model_id = "gpt-6.1-sol-sublyx";
+        let openrouter_reasoning = openrouter_reasoning_capability_from_model_entry(&json!({
+            "id": model_id,
+            "supported_parameters": ["reasoning"],
+            "reasoning": {
+                "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+                "default_effort": "medium",
+                "mandatory": true
+            }
+        }))
+        .expect("OpenRouter API metadata is a valid graded contract");
+        let openrouter = provider(
+            "gateway-b",
+            "OpenRouter",
             "openai_chat",
             json!([{
-                "model": "gpt-5.6-sol-sublyx",
+                "model": model_id,
+                "reasoning": openrouter_reasoning,
+                "codexUltra": {"enabled": true, "providerEffort": "high"}
+            }]),
+        );
+        let sublyx = provider(
+            "gateway-a",
+            "Sublyx",
+            "openai_responses",
+            json!([{"model": model_id}]),
+        );
+        let providers = [sublyx.clone(), openrouter.clone()]
+            .into_iter()
+            .map(|provider| (provider.id.clone(), provider))
+            .collect::<HashMap<_, _>>();
+        let source_settings = providers
+            .iter()
+            .map(|(id, provider)| (id.clone(), provider.settings_config.clone()))
+            .collect::<HashMap<_, _>>();
+
+        // Route order must not change either model's capability or leak one
+        // provider's normalization into the other's persisted inventory.
+        for order in [["gateway-a", "gateway-b"], ["gateway-b", "gateway-a"]] {
+            let routing = plan(
+                order
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| {
+                        let mut route =
+                            route(&format!("route-{index}"), id, CodexModelSelection::All);
+                        // Presentation labels are deliberately misleading and
+                        // must never replace the actual target's identity.
+                        route.label = Some(if *id == "gateway-a" {
+                            "OpenRouter display label".into()
+                        } else {
+                            "Sublyx display label".into()
+                        });
+                        route
+                    })
+                    .collect(),
+            );
+            let compiled = compile_v2(&routing, &providers).expect("compile isolated routes");
+            let router = Provider::with_id(
+                "router".into(),
+                "Router".into(),
+                json!({"codexRouting": routing}),
+                None,
+            );
+            let projected =
+                effective_settings_for_candidate_with_providers(&router, true, &providers)
+                    .expect("project both provider-owned contracts");
+            let projected_models = catalog_models(&projected).expect("canonical picker catalog");
+            assert_eq!(compiled.model_catalog.len(), 2);
+            assert_eq!(projected_models.len(), 2);
+
+            for (provider_id, native_efforts, selectable_efforts) in [
+                (
+                    "gateway-a",
+                    vec!["low", "medium", "high", "xhigh"],
+                    vec!["low", "medium", "high", "xhigh", "ultra"],
+                ),
+                (
+                    "gateway-b",
+                    vec!["low", "medium", "high", "xhigh", "max"],
+                    vec!["low", "medium", "high", "xhigh", "max", "ultra"],
+                ),
+            ] {
+                let target = &providers[provider_id];
+                let compiled_model = compiled
+                    .model_catalog
+                    .iter()
+                    .find(|entry| entry.target_provider_id == provider_id)
+                    .expect("provider appears once in the routed catalog");
+                let projected_model = projected_models
+                    .iter()
+                    .find(|entry| entry["model"] == compiled_model.visible_model)
+                    .expect("compiled model appears in picker projection");
+                let request_resolution =
+                    resolve_codex_model_capability_with_library(target, model_id, None, None);
+                let request_capability = request_resolution
+                    .capability
+                    .expect("request resolver has a provider-scoped contract");
+                let projected_capability: CodexModelReasoningCapability =
+                    serde_json::from_value(projected_model["reasoning"].clone())
+                        .expect("picker projection contains a valid capability");
+                assert_eq!(projected_capability, request_capability);
+                let routed = resolve_codex_v2_routed_provider(
+                    &router,
+                    &json!({"model": compiled_model.visible_model}),
+                    &providers,
+                )
+                .expect("resolve the current target provider")
+                .expect("visible model has a route")
+                .into_effective_provider();
+                assert_eq!(
+                    resolve_codex_model_capability_with_library(&routed, model_id, None, None)
+                        .capability,
+                    Some(request_capability.clone()),
+                    "route labels must not change the target provider's capability"
+                );
+                assert_eq!(
+                    compiled_model.capability_summary.reasoning,
+                    Some(serde_json::to_value(&request_capability).unwrap())
+                );
+                assert_eq!(request_capability.supported_efforts, native_efforts);
+                assert_eq!(request_capability.upstream.format, "reasoning_object");
+                assert_eq!(request_capability.upstream.parameter, "reasoning.effort");
+                let selectable = resolve_subagent_reasoning_capability(Some(&projected_capability));
+                assert_eq!(
+                    selectable
+                        .codex_selectable_efforts
+                        .iter()
+                        .map(|effort| effort.as_str())
+                        .collect::<Vec<_>>(),
+                    selectable_efforts
+                );
+                if provider_id == "gateway-a" {
+                    assert!(!request_capability.upstream.effort_map.contains_key("max"));
+                    assert_eq!(
+                        selectable.effort_map.get(&CodexReasoningEffort::Ultra),
+                        Some(&CodexReasoningEffort::XHigh)
+                    );
+                    let mut request = json!({
+                        "model": model_id,
+                        "input": "test",
+                        "reasoning": {"effort": "ultra"}
+                    });
+                    prepare_codex_native_responses_model(&routed, &mut request)
+                        .expect("Sublyx Ultra maps on the native Responses boundary");
+                    assert_eq!(request["reasoning"]["effort"], "xhigh");
+                    let mut retired_max_request = json!({
+                        "model": model_id,
+                        "input": "test",
+                        "reasoning": {"effort": "max"}
+                    });
+                    prepare_codex_native_responses_model(&routed, &mut retired_max_request).expect(
+                        "stale sessions use the documented nearest-effort compatibility map",
+                    );
+                    assert_eq!(retired_max_request["reasoning"]["effort"], "xhigh");
+                } else {
+                    assert_eq!(
+                        selectable.effort_map.get(&CodexReasoningEffort::Max),
+                        Some(&CodexReasoningEffort::Max)
+                    );
+                    let request = json!({
+                        "model": model_id,
+                        "input": "test",
+                        "reasoning": {"effort": "max"}
+                    });
+                    assert_eq!(
+                        selectable.effort_map.get(&CodexReasoningEffort::Ultra),
+                        Some(&CodexReasoningEffort::High)
+                    );
+                    let config = resolve_codex_chat_reasoning_config(&routed, &request)
+                        .expect("OpenRouter request uses its API-derived contract");
+                    let wire = responses_to_chat_completions_with_reasoning(request, Some(&config))
+                        .expect("OpenRouter contract converts to the native reasoning object");
+                    assert_eq!(wire["reasoning"]["effort"], "max");
+                    assert!(wire.get("reasoning_effort").is_none());
+                    let ultra_request = json!({
+                        "model": model_id,
+                        "input": "test",
+                        "reasoning": {"effort": "ultra"}
+                    });
+                    let wire =
+                        responses_to_chat_completions_with_reasoning(ultra_request, Some(&config))
+                            .expect("OpenRouter Ultra maps separately from native max");
+                    assert_eq!(wire["reasoning"]["effort"], "high");
+                }
+            }
+        }
+        for (id, settings) in source_settings {
+            assert_eq!(providers[&id].settings_config, settings);
+        }
+    }
+
+    #[test]
+    fn upstream_official_capability_populates_routed_reasoning_without_inventing_custom_models() {
+        // Keep this test focused on the official-model fallback. A provider
+        // explicitly identified as Sublyx has its own Responses contract and
+        // must not inherit the official cache's effort levels.
+        let provider = provider(
+            "official-relay",
+            "Official relay",
+            "openai_chat",
+            json!([{
+                "model": "gpt-5.6-sol",
                 "upstreamModel": "gpt-5.6-sol"
             }]),
         );

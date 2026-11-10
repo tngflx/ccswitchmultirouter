@@ -87,6 +87,7 @@ function missingCapabilityPatch(
   row: CodexCatalogRowLike,
   fetched: FetchedCodexCatalogModel,
   refreshCapabilities = false,
+  clearAbsentReasoning = false,
 ): Partial<CodexCatalogRowLike> {
   const patch: Partial<CodexCatalogRowLike> = {};
   const fetchedModalities = fetched.inputModalities?.length
@@ -143,6 +144,16 @@ function missingCapabilityPatch(
   // but an explicit user declaration remains the single source of truth.
   if (fetched.reasoning && row.reasoning?.source !== "user") {
     patch.reasoning = fetched.reasoning;
+  } else if (
+    clearAbsentReasoning &&
+    !fetched.reasoning &&
+    row.reasoning?.source !== "user" &&
+    Object.prototype.hasOwnProperty.call(row, "reasoning")
+  ) {
+    // A complete refresh owns automatic metadata. Remove stale declarations
+    // when the provider no longer returns reasoning information; preserve an
+    // explicit user declaration above.
+    patch.reasoning = undefined;
   }
   return patch;
 }
@@ -150,8 +161,14 @@ function missingCapabilityPatch(
 function refreshedCapabilityPatch(
   row: CodexCatalogRowLike,
   fetched: FetchedCodexCatalogModel,
+  clearAbsentReasoning = false,
 ): Partial<CodexCatalogRowLike> {
-  const patch = missingCapabilityPatch(row, fetched, true);
+  const patch = missingCapabilityPatch(
+    row,
+    fetched,
+    true,
+    clearAbsentReasoning,
+  );
   if (typeof patch.supportsImage === "boolean") {
     const supportsImage = patch.supportsImage;
     const modalities =
@@ -187,9 +204,6 @@ function refreshedCapabilityPatch(
   }
   if (typeof patch.supportsParallelToolCalls === "boolean") {
     patch.supports_parallel_tool_calls = patch.supportsParallelToolCalls;
-  }
-  if (fetched.reasoning && row.reasoning?.source !== "user") {
-    patch.reasoning = fetched.reasoning;
   }
   return patch;
 }
@@ -424,7 +438,11 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       Object.assign(
         patch,
         refresh
-          ? refreshedCapabilityPatch(row, fetched)
+          ? refreshedCapabilityPatch(
+              row,
+              fetched,
+              options.removeMissingRemote === true,
+            )
           : missingCapabilityPatch(row, fetched),
       );
       Object.assign(patch, fetchedIdentityPatch(row, fetched, refresh));
@@ -436,6 +454,12 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       }
       if (Object.keys(patch).length > 0) {
         const updatedRow = { ...row, ...patch } as T;
+        if (
+          Object.prototype.hasOwnProperty.call(patch, "reasoning") &&
+          patch.reasoning === undefined
+        ) {
+          delete (updatedRow as Record<string, unknown>).reasoning;
+        }
         next[existingIndex] = updatedRow;
         hydrated += 1;
         updated.push(model);

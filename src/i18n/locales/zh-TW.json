@@ -143,7 +143,8 @@
     "deleting": "刪除中...",
     "auto": "自動",
     "enabled": "已啟用",
-    "notSet": "未設定"
+    "notSet": "未設定",
+    "undeclared": "未宣告"
   },
   "firstRunNotice": {
     "title": "歡迎使用 CC Switch",
@@ -1773,6 +1774,7 @@
     "reasoningEffortHint": "上游支援 low/high/max 等思考深度控制時啟用。啟用後會自動啟用思考模式，並把 Codex 的 reasoning.effort 轉成上游 Chat 參數。",
     "reasoningGroupTitle": "思考能力",
     "reasoningSectionHint": "預設供應商已自動設定；自訂供應商會按名稱/位址自動推斷。僅當自動識別不準時才需手動覆寫。",
+    "sublyxMaintainedReasoningContract": "Sublyx GPT 原生等級與上游參數由系統自動維護：low、medium、high、xhigh；Ultra 使用 xhigh 並啟用 Codex 編排。你仍可變更預設等級、關閉 Ultra，或選擇其他支援控制模式。",
     "advancedSectionHint": "包含模型目錄、協定檢測、Codex 選單映射、路由接管、思考能力與自訂 User-Agent。使用 Chat Completions 協定的供應商需透過本地路由轉換。",
     "localRoutingToggle": "在 Codex /model 選單中顯示",
     "localRoutingDescription": "開啟後，CCSwitchMulti 會產生 Codex 啟動時載入的模型目錄，讓此處設定的模型、顯示名稱、上下文視窗和推理檔位出現在 /model 中，並把顯示名稱映射到真實上游模型。它不控制 Provider、代理或 MultiRouter 是否可用；僅當你要使用自己維護的 model_catalog_json 時關閉。",

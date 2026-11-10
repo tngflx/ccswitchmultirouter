@@ -143,7 +143,8 @@
     "deleting": "削除中...",
     "auto": "自動",
     "enabled": "有効",
-    "notSet": "未設定"
+    "notSet": "未設定",
+    "undeclared": "未宣言"
   },
   "firstRunNotice": {
     "title": "CC Switch へようこそ",
@@ -1772,6 +1773,7 @@
     "reasoningEffortHint": "上流が low/high/max などの思考の深さの制御に対応している場合に有効化します。有効にすると思考モードも自動的にオンになり、Codex の reasoning.effort を上流の Chat パラメータに変換します。",
     "reasoningGroupTitle": "思考能力",
     "reasoningSectionHint": "プリセットの供給元は自動的に設定され、カスタム供給元は名前/URL から自動推論されます。自動識別が正しくない場合のみ手動で上書きしてください。",
+    "sublyxMaintainedReasoningContract": "Sublyx GPT のネイティブレベルと送信設定は自動管理されます: low、medium、high、xhigh。Ultra は xhigh と Codex オーケストレーションを使用します。既定レベルの変更、Ultra の無効化、サポート制御モードの変更は可能です。",
     "advancedSectionHint": "モデルカタログ、プロトコル検出、Codex メニューマッピング、ルーティング引き継ぎ、思考能力、カスタム User-Agent を含みます。Chat Completions プロトコルのプロバイダーはローカルルーティング変換が必要です。",
     "localRoutingToggle": "Codex /model メニューに表示",
     "localRoutingDescription": "有効にすると、CCSwitchMulti は Codex が起動時に読み込むモデルカタログを生成します。ここで設定したモデル、表示名、コンテキストウィンドウ、推論レベルが /model に表示され、表示名は実際の上流モデルへマッピングされます。Provider、プロキシ、MultiRouter の有効・無効を制御する設定ではありません。独自の model_catalog_json を管理する場合にのみ無効にしてください。",

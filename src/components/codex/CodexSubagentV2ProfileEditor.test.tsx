@@ -191,6 +191,10 @@ const ipcState = vi.hoisted(() => ({
   providers: {} as Record<string, Provider>,
   previewErrors: {} as Record<string, string>,
   statusResponse: undefined as unknown,
+  reasoningCapabilities: null as Record<
+    string,
+    CodexSubagentReasoningCapability
+  > | null,
   statusError: null as string | null,
   updateGate: null as Promise<void> | null,
   beforeV2Persistence: null as (() => void) | null,
@@ -572,10 +576,12 @@ vi.mock("@tauri-apps/api/core", () => ({
         return JSON.parse(JSON.stringify(response));
       }
       case "get_codex_subagent_reasoning_capabilities":
-        return {
-          "deepseek-v4-flash": deepseekReasoningCapability,
-          "deepseek-v4-pro": deepseekReasoningCapability,
-        };
+        return (
+          ipcState.reasoningCapabilities ?? {
+            "deepseek-v4-flash": deepseekReasoningCapability,
+            "deepseek-v4-pro": deepseekReasoningCapability,
+          }
+        );
       case "get_codex_subagent_profile_statuses":
         if (ipcState.statusError) throw new Error(ipcState.statusError);
         return JSON.parse(JSON.stringify(ipcState.statusResponse));
@@ -1146,6 +1152,7 @@ beforeEach(() => {
   ipcState.previewErrors = {};
   ipcState.statusResponse = JSON.parse(JSON.stringify(statusFixture));
   ipcState.statusError = null;
+  ipcState.reasoningCapabilities = null;
   ipcState.updateGate = null;
   ipcState.beforeV2Persistence = null;
   ipcState.nextInitializedProvider = null;
@@ -3422,6 +3429,57 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
       ).toEqual({ policy: "fixed", effort: "max" }),
     );
   });
+
+  it("uses the backend selectable efforts even for a Sublyx capability source", async () => {
+    ipcState.reasoningCapabilities = {
+      "deepseek-v4-flash": {
+        ...deepseekReasoningCapability,
+        source: "sublyx",
+        codexSelectableEfforts: ["high", "max"],
+      },
+    };
+    const user = userEvent.setup();
+    await renderWorkspace();
+    const flash = within(await openAdvancedFields(user));
+
+    expect(
+      flash.getByText("Capability source:sublyx (confirmed)"),
+    ).toBeInTheDocument();
+    expect(
+      within(flash.getByLabelText("Model reasoning effort"))
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("value")),
+    ).toEqual(["high", "max"]);
+  });
+
+  it.each([
+    ["xhigh", "xhigh"],
+    [undefined, "Undeclared"],
+  ] as const)(
+    "displays only the resolved Ultra provider target %s",
+    async (providerTarget, label) => {
+      ipcState.reasoningCapabilities = {
+        "deepseek-v4-flash": {
+          ...deepseekReasoningCapability,
+          source: "sublyx",
+          codexUltraOrchestrationEnabled: true,
+          effortMap: {
+            max: "max",
+            ...(providerTarget ? { ultra: providerTarget } : {}),
+          },
+        },
+      };
+      const user = userEvent.setup();
+      await renderWorkspace();
+      const flash = within(await openAdvancedFields(user));
+
+      expect(
+        flash.getByText(
+          new RegExp(`The third-party provider receives ${label}\\.`),
+        ),
+      ).toBeInTheDocument();
+    },
+  );
 
   it("uses backend capability evidence to restrict DeepSeek fixed effort choices", async () => {
     const user = userEvent.setup();

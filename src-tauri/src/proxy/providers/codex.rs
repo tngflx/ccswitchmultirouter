@@ -46,6 +46,7 @@ const CODEX_ROUTER_PARENT_PROVIDER_ID: &str = "codexRouterParentProviderId";
 const CODEX_ROUTER_PARENT_PROVIDER_NAME: &str = "codexRouterParentProviderName";
 const CODEX_ROUTER_PLAINTEXT_V2_COLLABORATION: &str = "codexRouterPlaintextV2Collaboration";
 const CODEX_RESOLVED_TARGET_PROVIDER_ID: &str = "codexResolvedTargetProviderId";
+const CODEX_RESOLVED_TARGET_PROVIDER_NAME: &str = "codexResolvedTargetProviderName";
 const CODEX_RESOLVED_UPSTREAM_MODEL_OVERRIDE: &str = "codexResolvedUpstreamModelOverride";
 const CODEX_NATIVE_AUTH_PASSTHROUGH: &str = "codexNativeAuthPassthrough";
 pub(crate) const CODEX_ACCOUNT_POOL_ENABLED: &str = "codexAccountPoolEnabled";
@@ -909,6 +910,13 @@ fn materialize_codex_v2_provider(
         CODEX_RESOLVED_TARGET_PROVIDER_ID.to_string(),
         JsonValue::String(target_provider.id.clone()),
     );
+    // Route IDs and labels are presentation/request identity, not the
+    // provider platform. Keep the current target's original name available to
+    // capability resolution without introducing another persisted source.
+    settings.insert(
+        CODEX_RESOLVED_TARGET_PROVIDER_NAME.to_string(),
+        JsonValue::String(target_provider.name.clone()),
+    );
     settings.insert(
         "codexResolvedRouteId".to_string(),
         JsonValue::String(route.id.clone()),
@@ -1331,6 +1339,17 @@ pub fn materialize_codex_routed_provider_from_target(
             settings.insert(key.to_string(), value);
         }
     }
+
+    // The actual target owns platform identity even when a legacy route
+    // wrapper carries a misleading name or stale target metadata.
+    settings.insert(
+        CODEX_RESOLVED_TARGET_PROVIDER_ID.to_string(),
+        JsonValue::String(target_provider.id.clone()),
+    );
+    settings.insert(
+        CODEX_RESOLVED_TARGET_PROVIDER_NAME.to_string(),
+        JsonValue::String(target_provider.name.clone()),
+    );
 
     // 保留 route provider 的 modelCatalog，使 apply_codex_request_upstream_model
     // 能通过 catalog 把可见模型名映射回真实上游模型名。MultiRouter 的 modelCatalog
@@ -3422,8 +3441,10 @@ pub fn resolve_codex_chat_reasoning_config(
     // P1：单一 resolver 入口——用户模型级声明 > 检测候选（TTL）> 能力库 > 内置 > unknown。
     // 请求路径只读 TTL 缓存，不发起网络请求；检测由 UI/目录层异步触发。
     // 优先级：用户模型级声明 > 用户 provider 级显式声明（meta）> 检测/能力库/内置 > 推断。
-    let detection =
-        crate::reasoning_capabilities::current_detection(&provider.id, &requested_model);
+    let detection = crate::reasoning_capabilities::current_detection(
+        crate::reasoning_capabilities::reasoning_provider_key(provider),
+        &requested_model,
+    );
     let resolved = crate::reasoning_capabilities::resolve_codex_model_capability(
         provider,
         &requested_model,
@@ -3472,8 +3493,8 @@ pub fn resolve_codex_chat_reasoning_config(
 }
 
 /// Apply the Provider capability map while keeping the native Responses shape.
-/// Codex uses `max` at the wire boundary for Ultra; third-party Providers may
-/// declare a different accepted value such as `xhigh`.
+/// Synthetic Codex Ultra uses the resolved Provider-native target (for example,
+/// `xhigh` for Sublyx); it must never be sent as a literal `ultra` value.
 pub fn apply_codex_native_responses_reasoning_effort(
     provider: &Provider,
     body: &mut JsonValue,
@@ -5387,6 +5408,86 @@ experimental_bearer_token = "PROXY_MANAGED"
             &materialized,
             "/v1/responses"
         ));
+    }
+
+    #[test]
+    fn routed_reasoning_detection_uses_target_cache_without_same_model_provider_bleed() {
+        use crate::reasoning_capabilities::{
+            detection_cache, ProviderCapabilitySnapshot, ReasoningCapabilitySnapshot,
+        };
+
+        // Cover both the initial request-model cache read and the shared
+        // resolver's later upstream-identity read. UUIDs isolate global TTL
+        // state without clearing snapshots that concurrent tests may own.
+        for cache_uses_wire_identity in [false, true] {
+            let suffix = uuid::Uuid::new_v4();
+            let public_model = format!("custom-public-{suffix}");
+            let wire_model = format!("custom-wire-{suffix}");
+            for (index, accepted_effort) in ["low", "high"].into_iter().enumerate() {
+                let target_id = format!("custom-target-{index}-{suffix}");
+                let target = Provider::with_id(
+                    target_id.clone(),
+                    format!("Custom target {index}"),
+                    json!({
+                        "baseUrl": "https://gateway.example/v1",
+                        "apiFormat": "openai_responses",
+                        "modelCatalog": {"models": [{
+                            "model": public_model,
+                            "upstreamModel": wire_model
+                        }]}
+                    }),
+                    None,
+                );
+                detection_cache()
+                    .lock()
+                    .unwrap()
+                    .insert(ProviderCapabilitySnapshot {
+                        provider_key: target_id.clone(),
+                        model: if cache_uses_wire_identity {
+                            wire_model.clone()
+                        } else {
+                            public_model.clone()
+                        },
+                        fetched_at: 1,
+                        source: "provider_metadata".into(),
+                        reasoning: Some(ReasoningCapabilitySnapshot {
+                            supported_efforts: vec![accepted_effort.into()],
+                            default_effort: Some(accepted_effort.into()),
+                            mandatory: true,
+                            upstream_format: Some("reasoning_object".into()),
+                            upstream_parameter: Some("reasoning.effort".into()),
+                            ..Default::default()
+                        }),
+                    });
+                let mut wrapper = create_provider(json!({
+                    "codexResolvedTargetProviderId": "stale-target",
+                    "codexResolvedTargetProviderName": "stale-name"
+                }));
+                wrapper.id = format!("router::route::route-{index}-{suffix}");
+                wrapper.name = "Display-only route label".into();
+                let routed = materialize_codex_routed_provider_from_target(&wrapper, &target);
+                assert_eq!(
+                    routed.settings_config[CODEX_RESOLVED_TARGET_PROVIDER_ID],
+                    target_id
+                );
+                assert_eq!(
+                    routed.settings_config[CODEX_RESOLVED_TARGET_PROVIDER_NAME],
+                    target.name
+                );
+                let mut request = json!({
+                    "model": public_model,
+                    "input": "test",
+                    "reasoning": {"effort": "medium"}
+                });
+                prepare_codex_native_responses_model(&routed, &mut request)
+                    .expect("target-scoped detected contract maps the request");
+                assert_eq!(
+                    request["reasoning"]["effort"], accepted_effort,
+                    "each routed target must use only its own metadata cache"
+                );
+                assert_eq!(request["model"], wire_model);
+            }
+        }
     }
 
     #[test]

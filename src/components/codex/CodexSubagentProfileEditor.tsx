@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import { Code2, Database, Search, SlidersHorizontal } from "lucide-react";
 import {
   Accordion,
@@ -1855,6 +1856,7 @@ function ReasoningCapabilitySummary({
   capability?: CodexSubagentReasoningCapability;
   policy: CodexSubagentV2Profile["reasoning"];
 }) {
+  const { t } = useTranslation();
   if (!capability) {
     return (
       <div className="rounded-md border border-amber-200 bg-amber-50/70 p-3 text-xs text-amber-900 dark:border-amber-500/35 dark:bg-amber-950/20 dark:text-amber-100">
@@ -1877,6 +1879,9 @@ function ReasoningCapabilitySummary({
           ? `Fixed at ${policy.effort}; the parent agent cannot override it`
           : "Reasoning disabled; the upstream uses the provider’s confirmed disabled semantics";
   const ultraEnabled = capability.codexUltraOrchestrationEnabled;
+  const ultraProviderEffort =
+    capability.effortMap.ultra ??
+    t("common.undeclared", { defaultValue: "Undeclared" });
 
   return (
     <div className="space-y-1 rounded-md border border-indigo-200 bg-indigo-50/70 p-3 text-xs text-indigo-950 dark:border-indigo-500/35 dark:bg-indigo-950/20 dark:text-indigo-100">
@@ -1899,7 +1904,7 @@ function ReasoningCapabilitySummary({
         <p>
           Ultra enabled: this is Codex V2’s “maximum reasoning + active
           sub-agent delegation” mode; The third-party provider receives{" "}
-          {capability.effortMap.ultra ?? "max"}.
+          {ultraProviderEffort}.
         </p>
       ) : (
         <p>

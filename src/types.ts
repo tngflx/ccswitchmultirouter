@@ -397,7 +397,8 @@ export interface CodexModelReasoningCapability {
     | "detection"
     | "library"
     | "provider_config"
-    | "official";
+    | "official"
+    | "sublyx";
   /** 证据等级（schema v2）。易变元数据，不进入能力指纹。 */
   confidence?: CodexReasoningConfidence;
   /** 检测时间（schema v2）。易变元数据，不进入能力指纹。 */
@@ -408,9 +409,14 @@ export interface CodexModelReasoningCapability {
   modelRevision?: string;
   /**
    * Codex V2 产品层的复合模式：最大推理 + 主动 Sub-Agent 委派。
-   * 它不会把 literal `ultra` 传给 Provider；Codex 出站固定使用 `max`。
+   * It never sends the literal `ultra` to a Provider. New declarations carry
+   * the native Provider target explicitly; older declarations fall back to the
+   * legacy `upstream.effortMap.max` mapping when this is omitted.
    */
-  codexUltraOrchestration?: { enabled: boolean };
+  codexUltraOrchestration?: {
+    enabled: boolean;
+    providerEffort?: CodexReasoningEffort;
+  };
 }
 
 export interface CodexCatalogModel {

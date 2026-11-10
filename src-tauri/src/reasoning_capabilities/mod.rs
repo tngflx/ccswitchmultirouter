@@ -21,8 +21,9 @@ pub mod provider_metadata;
 use crate::provider::Provider;
 use crate::proxy::providers::codex_reasoning::{
     builtin_reasoning_capability_for_model, capability_fingerprint,
-    official_reasoning_capability_for_model, reasoning_capability_from_model_entry,
-    reasoning_capability_from_provider_model_entry, resolve_reasoning_capability_from_settings,
+    normalize_sublyx_reasoning_capability_for_model, official_reasoning_capability_for_model,
+    reasoning_capability_from_model_entry, reasoning_capability_from_provider_model_entry,
+    resolve_reasoning_capability_from_settings, sublyx_reasoning_capability_for_model,
     CapabilityConfidence, CodexModelReasoningCapability, CodexModelReasoningUpstream,
     ReasoningControlKind, ReasoningSupportStatus,
 };
@@ -182,6 +183,19 @@ pub fn current_detection(provider_key: &str, model: &str) -> Option<ProviderCapa
     cache.get(provider_key, model).cloned()
 }
 
+/// Use the target provider identity for routed capability evidence. Route IDs
+/// and labels are presentation identities; they must not select another
+/// provider's detection-cache namespace.
+pub(crate) fn reasoning_provider_key(provider: &Provider) -> &str {
+    provider
+        .settings_config
+        .get("codexResolvedTargetProviderId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(&provider.id)
+}
+
 /// Tauri 资源目录（由 setup hook 初始化；测试/开发可缺省）。
 static RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -214,7 +228,7 @@ pub fn resolve_codex_model_capability(
             if candidate.eq_ignore_ascii_case(model) {
                 detection.cloned()
             } else {
-                current_detection(&provider.id, candidate)
+                current_detection(reasoning_provider_key(provider), candidate)
             }
         },
     )
@@ -342,7 +356,7 @@ pub(crate) fn resolve_codex_model_capability_for_settings(
             settings,
             canonical_model,
             resolved.source,
-            capability,
+            normalize_provider_reasoning_capability(platform, upstream_model, capability),
         );
     }
     let provider_reasoning = ["reasoning", "codexChatReasoning", "codex_chat_reasoning"]
@@ -358,9 +372,21 @@ pub(crate) fn resolve_codex_model_capability_for_settings(
             settings,
             canonical_model,
             CapabilitySource::ProviderFallback,
-            capability,
+            normalize_provider_reasoning_capability(platform, upstream_model, capability),
         )
     })
+}
+
+fn normalize_provider_reasoning_capability(
+    platform: Option<&str>,
+    wire_model: &str,
+    capability: CodexModelReasoningCapability,
+) -> CodexModelReasoningCapability {
+    if platform == Some("sublyx") {
+        normalize_sublyx_reasoning_capability_for_model(wire_model, capability)
+    } else {
+        capability
+    }
 }
 
 /// Apply the model's product-level Ultra setting after the capability source
@@ -412,13 +438,13 @@ fn apply_catalog_ultra_setting(
 
     let original = capability.clone();
     let mut capability = capability;
-    capability
-        .upstream
-        .effort_map
-        .insert("max".to_string(), provider_effort.to_string());
+    // Ultra's product-level target is independent of the native effort map.
+    // Never rewrite a real provider `max` mapping to change synthetic Ultra;
+    // legacy effortMap.max remains a read-only fallback for old declarations.
     capability.codex_ultra_orchestration = Some(
         crate::proxy::providers::codex_reasoning::CodexUltraOrchestrationCapability {
             enabled: true,
+            provider_effort: Some(provider_effort.to_string()),
         },
     );
     capability
@@ -485,13 +511,40 @@ pub fn resolve_codex_model_capability_core(
         };
     }
 
+    // A display/public name is not a provider contract. Normalize against
+    // the selected row's current wire identity, not a renamed GPT-looking
+    // public alias, while keeping the same row authoritative for exclusion
+    // and product-level settings.
+    let wire_model = match catalog_model {
+        crate::codex_multirouter::catalog::CatalogModelLookup::Found(entry) => {
+            ["upstreamModel", "upstream_model"]
+                .iter()
+                .find_map(|key| entry.get(*key))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|wire| !wire.is_empty())
+                .or_else(|| {
+                    ["model", "id", "slug"]
+                        .iter()
+                        .find_map(|key| entry.get(*key))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|canonical| !canonical.is_empty())
+                })
+                .unwrap_or(model)
+        }
+        _ => model,
+    };
+    let normalize_platform_capability =
+        |capability| normalize_provider_reasoning_capability(platform, wire_model, capability);
+
     // 1. 用户模型级声明（始终最高优先级）
     if let Some(capability) = resolve_reasoning_capability_from_settings(settings, model) {
         return resolved_with_catalog_ultra_setting(
             settings,
             model,
             CapabilitySource::UserConfig,
-            capability,
+            normalize_platform_capability(capability),
         );
     }
 
@@ -501,7 +554,7 @@ pub fn resolve_codex_model_capability_core(
             settings,
             model,
             CapabilitySource::ProviderConfig,
-            capability,
+            normalize_platform_capability(capability),
         );
     }
 
@@ -512,7 +565,7 @@ pub fn resolve_codex_model_capability_core(
                 settings,
                 model,
                 CapabilitySource::Detection,
-                capability,
+                normalize_platform_capability(capability),
             );
         }
     }
@@ -524,7 +577,7 @@ pub fn resolve_codex_model_capability_core(
                 settings,
                 model,
                 CapabilitySource::Library,
-                capability,
+                normalize_platform_capability(capability),
             );
         }
     }
@@ -541,7 +594,7 @@ pub fn resolve_codex_model_capability_core(
                 settings,
                 model,
                 CapabilitySource::Builtin,
-                capability,
+                normalize_platform_capability(capability),
             );
         }
     }
@@ -553,12 +606,26 @@ pub fn resolve_codex_model_capability_core(
                 settings,
                 model,
                 CapabilitySource::Official,
-                capability,
+                normalize_platform_capability(capability),
             );
         }
     }
 
-    // 7. Unknown（fail-closed）
+    // 7. Sublyx GPT fallback.  This is deliberately gated by the detected
+    // provider platform; a model suffix such as `-sublyx` on OpenRouter (or
+    // any other aggregator) must not inherit the Sublyx wire contract.
+    if platform == Some("sublyx") {
+        if let Some(capability) = sublyx_reasoning_capability_for_model(wire_model) {
+            return resolved_with_catalog_ultra_setting(
+                settings,
+                model,
+                CapabilitySource::ProviderFallback,
+                normalize_platform_capability(capability),
+            );
+        }
+    }
+
+    // 8. Unknown（fail-closed）
     ResolvedModelCapability {
         capability: None,
         source: CapabilitySource::Unknown,
@@ -707,6 +774,7 @@ pub fn snapshot_to_capability(
         codex_ultra_orchestration: codex_ultra_enabled.then_some(
             crate::proxy::providers::codex_reasoning::CodexUltraOrchestrationCapability {
                 enabled: true,
+                provider_effort: None,
             },
         ),
     };
@@ -828,6 +896,16 @@ mod tests {
             "upstream": {"format": "string", "parameter": "reasoning_effort"},
             "source": "user"
         })
+    }
+
+    fn native_max_reasoning(source: &str) -> serde_json::Value {
+        let mut reasoning = user_declared_reasoning();
+        reasoning["supportedEfforts"] = json!(["low", "high", "max"]);
+        reasoning["defaultEffort"] = json!("max");
+        reasoning["upstream"] =
+            json!({"format": "reasoning_object", "parameter": "reasoning.effort"});
+        reasoning["source"] = json!(source);
+        reasoning
     }
 
     #[test]
@@ -1196,11 +1274,23 @@ mod tests {
         assert_eq!(capability.source.as_deref(), Some("library"));
         assert_eq!(
             capability.upstream.effort_map.get("max"),
-            Some(&"high".to_string())
+            Some(&"max".to_string())
         );
-        assert!(capability
-            .codex_ultra_orchestration
-            .is_some_and(|ultra| ultra.enabled));
+        assert!(
+            capability.codex_ultra_orchestration.as_ref().is_some_and(
+                |ultra| ultra.enabled && ultra.provider_effort.as_deref() == Some("high")
+            )
+        );
+        let projected =
+            crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(Some(
+                &capability,
+            ));
+        use crate::proxy::providers::codex_reasoning::CodexReasoningEffort as Effort;
+        assert_eq!(projected.effort_map.get(&Effort::Max), Some(&Effort::Max));
+        assert_eq!(
+            projected.effort_map.get(&Effort::Ultra),
+            Some(&Effort::High)
+        );
     }
 
     #[test]
@@ -1388,6 +1478,297 @@ mod tests {
             "supported_reasoning_levels": ["low", "medium", "high", "xhigh", "max"],
             "default_reasoning_level": "medium"
         })]
+    }
+
+    #[test]
+    fn resolver_core_sublyx_fallback_is_scoped_and_uses_synthetic_ultra() {
+        let settings = json!({});
+        let resolved = resolve_codex_model_capability_core(
+            &settings,
+            Some("sublyx"),
+            "gpt-6.1-sol-sublyx",
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(resolved.source, CapabilitySource::ProviderFallback);
+        let capability = resolved.capability.expect("Sublyx GPT fallback capability");
+        assert_eq!(
+            capability.supported_efforts,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(capability.default_effort.as_deref(), Some("medium"));
+        assert!(!capability
+            .supported_efforts
+            .iter()
+            .any(|effort| effort == "max"));
+        assert!(!capability.upstream.effort_map.contains_key("ultra"));
+        assert!(!capability.upstream.effort_map.contains_key("max"));
+        assert!(capability.codex_ultra_orchestration.as_ref().is_some_and(
+            |ultra| ultra.enabled && ultra.provider_effort.as_deref() == Some("xhigh")
+        ));
+
+        let projected =
+            crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(Some(
+                &capability,
+            ));
+        use crate::proxy::providers::codex_reasoning::CodexReasoningEffort as Effort;
+        assert_eq!(
+            projected.provider_accepted_efforts,
+            vec![Effort::Low, Effort::Medium, Effort::High, Effort::XHigh]
+        );
+        assert!(projected.codex_selectable_efforts.contains(&Effort::Ultra));
+        assert_eq!(
+            projected.effort_map.get(&Effort::Ultra),
+            Some(&Effort::XHigh)
+        );
+        assert!(!projected.provider_accepted_efforts.contains(&Effort::Max));
+
+        // The same model suffix on an aggregator must remain unknown rather
+        // than inheriting the Sublyx Responses contract.
+        let openrouter = resolve_codex_model_capability_core(
+            &settings,
+            Some("openrouter"),
+            "gpt-6.1-sol-sublyx",
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(openrouter.source, CapabilitySource::Unknown);
+        assert!(openrouter.capability.is_none());
+    }
+
+    #[test]
+    fn reasoning_provider_key_preserves_target_identity_without_accepting_blank_overrides() {
+        let mut provider = provider_with_catalog("model", None);
+        provider.id = "synthetic-route".to_string();
+        for override_value in [Value::Null, json!(""), json!("  "), json!(false)] {
+            provider.settings_config["codexResolvedTargetProviderId"] = override_value;
+            assert_eq!(reasoning_provider_key(&provider), "synthetic-route");
+        }
+        provider.settings_config["codexResolvedTargetProviderId"] = json!("  original-provider  ");
+        assert_eq!(reasoning_provider_key(&provider), "original-provider");
+    }
+
+    #[test]
+    fn sublyx_normalization_uses_current_wire_identity_for_catalog_names_and_aliases() {
+        let stale_reasoning = native_max_reasoning("user");
+        for model_reasoning in [Some(stale_reasoning.clone()), None] {
+            let mut row = json!({
+                "model": "Renamed Friendly Model",
+                "upstreamModel": "gpt-6.1-sol",
+                "aliases": ["Old Friendly Model"]
+            });
+            if let Some(reasoning) = model_reasoning.as_ref() {
+                row["reasoning"] = reasoning.clone();
+            }
+            let settings = json!({
+                "modelCatalog": {"models": [row]},
+                "reasoning": stale_reasoning.clone()
+            });
+            for requested in [
+                "Renamed Friendly Model",
+                "Old Friendly Model",
+                "gpt-6.1-sol",
+            ] {
+                let resolved = resolve_codex_model_capability_for_settings(
+                    &settings,
+                    Some("sublyx"),
+                    requested,
+                    None,
+                    &[],
+                    |_| None,
+                );
+                let capability = resolved.capability.expect("Sublyx wire model capability");
+                assert_eq!(
+                    capability.supported_efforts,
+                    vec!["low", "medium", "high", "xhigh"],
+                    "{requested}"
+                );
+                assert_eq!(capability.upstream.parameter, "reasoning.effort");
+                assert!(!capability.upstream.effort_map.contains_key("max"));
+                if model_reasoning.is_some() {
+                    assert_eq!(resolved.source, CapabilitySource::UserConfig);
+                    assert_eq!(capability.source.as_deref(), Some("user"));
+                    assert_eq!(capability.default_effort.as_deref(), Some("xhigh"));
+                } else {
+                    assert_eq!(resolved.source, CapabilitySource::ProviderFallback);
+                }
+                assert_eq!(resolved.fingerprint, capability_fingerprint(&capability));
+            }
+        }
+    }
+
+    #[test]
+    fn sublyx_core_alias_without_wire_override_uses_the_rows_canonical_model() {
+        for reasoning in [Some(native_max_reasoning("user")), None] {
+            let mut row = json!({"model": "gpt-6.1-sol", "aliases": ["Friendly Alias"]});
+            if let Some(reasoning) = reasoning.as_ref() {
+                row["reasoning"] = reasoning.clone();
+            }
+            let settings = json!({"modelCatalog": {"models": [row]}});
+            let resolved = resolve_codex_model_capability_core(
+                &settings,
+                Some("sublyx"),
+                "Friendly Alias",
+                None,
+                None,
+                &[],
+            );
+            let capability = resolved.capability.expect("canonical GPT wire identity");
+            assert_eq!(
+                capability.supported_efforts,
+                vec!["low", "medium", "high", "xhigh"]
+            );
+            assert_eq!(
+                resolved.source,
+                if reasoning.is_some() {
+                    CapabilitySource::UserConfig
+                } else {
+                    CapabilitySource::ProviderFallback
+                }
+            );
+            assert_eq!(resolved.fingerprint, capability_fingerprint(&capability));
+        }
+    }
+
+    #[test]
+    fn sublyx_normalization_does_not_treat_a_public_gpt_alias_as_the_wire_model() {
+        let settings = json!({"modelCatalog": {"models": [{
+            "model": "gpt-friendly-label",
+            "upstreamModel": "claude-custom",
+            "reasoning": native_max_reasoning("user")
+        }]}});
+        let resolved = resolve_codex_model_capability_core(
+            &settings,
+            Some("sublyx"),
+            "gpt-friendly-label",
+            None,
+            None,
+            &[],
+        );
+        let capability = resolved
+            .capability
+            .expect("unchanged non-GPT wire capability");
+        assert_eq!(capability.supported_efforts, vec!["low", "high", "max"]);
+        assert_eq!(capability.provider_key, None);
+    }
+
+    #[test]
+    fn catalog_ultra_target_does_not_overwrite_openrouter_native_max() {
+        let settings = json!({"modelCatalog": {"models": [{
+            "model": "openai/gpt-native-max",
+            "reasoning": native_max_reasoning("openrouter_api"),
+            "codexUltra": {"enabled": true, "providerEffort": "high"}
+        }]}});
+        let resolved = resolve_codex_model_capability_core(
+            &settings,
+            Some("openrouter"),
+            "openai/gpt-native-max",
+            None,
+            None,
+            &[],
+        );
+        let capability = resolved.capability.expect("native max and synthetic Ultra");
+        assert_eq!(capability.supported_efforts, vec!["low", "high", "max"]);
+        assert_eq!(
+            capability
+                .upstream
+                .effort_map
+                .get("max")
+                .map(String::as_str),
+            Some("max")
+        );
+        let projected =
+            crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(Some(
+                &capability,
+            ));
+        use crate::proxy::providers::codex_reasoning::CodexReasoningEffort as Effort;
+        assert_eq!(projected.effort_map.get(&Effort::Max), Some(&Effort::Max));
+        assert_eq!(
+            projected.effort_map.get(&Effort::Ultra),
+            Some(&Effort::High)
+        );
+    }
+
+    #[test]
+    fn resolver_core_normalizes_stale_sublyx_user_max_without_affecting_openrouter() {
+        let settings = json!({
+            "modelCatalog": {
+                "models": [{
+                    "model": "gpt-6.1-sol-sublyx",
+                    "reasoning": {
+                        "schemaVersion": 2,
+                        "supportStatus": "confirmed_supported",
+                        "controlKind": "graded",
+                        "supportedEfforts": ["low", "medium", "high", "max"],
+                        "defaultEffort": "max",
+                        "disableAllowed": false,
+                        "upstream": {
+                            "format": "reasoning_object",
+                            "parameter": "reasoning.effort",
+                            "effortMap": {
+                                "low": "low",
+                                "medium": "medium",
+                                "high": "high",
+                                "max": "max"
+                            }
+                        },
+                        "source": "user"
+                    }
+                }]
+            }
+        });
+        let resolved = resolve_codex_model_capability_core(
+            &settings,
+            Some("sublyx"),
+            "gpt-6.1-sol-sublyx",
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(resolved.source, CapabilitySource::UserConfig);
+        let capability = resolved.capability.expect("normalized user capability");
+        assert_eq!(capability.source.as_deref(), Some("user"));
+        assert_eq!(capability.provider_key.as_deref(), Some("sublyx"));
+        assert_eq!(
+            capability.supported_efforts,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(capability.default_effort.as_deref(), Some("xhigh"));
+        assert!(!capability.upstream.effort_map.contains_key("max"));
+        assert!(!capability.upstream.effort_map.contains_key("ultra"));
+        assert!(capability.codex_ultra_orchestration.as_ref().is_some_and(
+            |ultra| ultra.enabled && ultra.provider_effort.as_deref() == Some("xhigh")
+        ));
+
+        let projected =
+            crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(Some(
+                &capability,
+            ));
+        use crate::proxy::providers::codex_reasoning::CodexReasoningEffort as Effort;
+        assert!(!projected.provider_accepted_efforts.contains(&Effort::Max));
+        assert_eq!(
+            projected.effort_map.get(&Effort::Ultra),
+            Some(&Effort::XHigh)
+        );
+
+        // Platform identity, not the model suffix, controls normalization.
+        let openrouter = resolve_codex_model_capability_core(
+            &settings,
+            Some("openrouter"),
+            "gpt-6.1-sol-sublyx",
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(openrouter.source, CapabilitySource::UserConfig);
+        let openrouter_capability = openrouter.capability.expect("user capability");
+        assert!(openrouter_capability
+            .supported_efforts
+            .iter()
+            .any(|effort| effort == "max"));
+        assert_eq!(openrouter_capability.provider_key, None);
     }
 
     #[test]

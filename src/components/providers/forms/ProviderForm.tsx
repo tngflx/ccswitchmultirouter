@@ -185,6 +185,12 @@ import {
   sanitizeCodexRoutingConfig,
 } from "@/lib/codexConfigSanitizer";
 
+import {
+  codexReasoningProviderIdentity,
+  normalizeCodexCatalogReasoningForProvider,
+  type CodexReasoningProviderIdentity,
+} from "@/lib/codexReasoningProviderIdentity";
+
 type PresetEntry = {
   id: string;
   preset:
@@ -226,11 +232,16 @@ const codexLocalModelMappingFromInitialData = (
 };
 export const normalizeCodexCatalogModelsForSave = (
   models: CodexCatalogModel[],
+  providerIdentity?: CodexReasoningProviderIdentity,
 ): CodexCatalogModel[] => {
   const seen = new Set<string>();
   const normalized: CodexCatalogModel[] = [];
 
-  for (const item of models) {
+  for (const original of models) {
+    const item = normalizeCodexCatalogReasoningForProvider(
+      original,
+      providerIdentity,
+    );
     const model = item.model.trim();
     if (!model || seen.has(model)) continue;
     seen.add(model);
@@ -1861,7 +1872,14 @@ function ProviderFormFull({
           (shouldPersistCodexLocalConfig || isCanonicalCodexOfficial) &&
           codexCatalogConfigured;
         const normalizedCatalogModels = shouldPersistCodexCatalog
-          ? normalizeCodexCatalogModelsForSave(codexCatalogModels)
+          ? normalizeCodexCatalogModelsForSave(
+              codexCatalogModels,
+              codexReasoningProviderIdentity({
+                id: providerId ?? "codex-draft",
+                name: values.name,
+                settingsConfig: { base_url: codexBaseUrl, config: codexConfig },
+              }),
+            )
           : [];
         const cleanedApiKeyGroups: CodexApiKeyGroup[] = codexApiKeyGroups
           .map((group) => ({
@@ -3069,6 +3087,7 @@ function ProviderFormFull({
                   codexOfficialAuth.mode === "managed_oauth"
                 }
                 providerName={form.watch("name")}
+                codexConfig={codexConfig}
                 codexProviderEditorSnapshot={codexProviderEditorSnapshot}
                 isXaiOauthPreset={
                   presetProviderType === "xai_oauth" ||
@@ -3145,7 +3164,17 @@ function ProviderFormFull({
                 onCatalogModelsChange={(models) => {
                   setCodexCatalogModels(models);
                   try {
-                    normalizeCodexCatalogModelsForSave(models);
+                    normalizeCodexCatalogModelsForSave(
+                      models,
+                      codexReasoningProviderIdentity({
+                        id: providerId ?? "codex-draft",
+                        name: form.getValues("name"),
+                        settingsConfig: {
+                          base_url: codexBaseUrl,
+                          config: codexConfig,
+                        },
+                      }),
+                    );
                     setCodexCatalogValidationError(null);
                   } catch (error) {
                     if (error instanceof CodexCatalogValidationError) {

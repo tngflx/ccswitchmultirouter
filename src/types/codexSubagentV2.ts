@@ -36,7 +36,7 @@ export interface CodexSubagentReasoningCapability {
   >;
   /** 来源能力的稳定指纹；无来源（unknown 兜底）时为空串。 */
   fingerprint?: string;
-  /** 是否可将 Codex Ultra 作为“max + V2 主动委派”复合模式使用。 */
+  /** 是否可将 Codex Ultra 作为“Provider 原生目标档位 + V2 主动委派”复合模式使用。 */
   codexUltraOrchestrationEnabled?: boolean;
 }
 
@@ -81,8 +81,14 @@ export interface CodexModelReasoningDeclaredCapability {
   upstream: CodexModelReasoningUpstream;
   outputFormat?: string | null;
   source?: string | null;
+  /** Provider transport identity is independent of manual/detected provenance. */
+  providerKey?: string | null;
   confidence?: CodexReasoningCapabilityConfidence | null;
-  codexUltraOrchestration?: { enabled: boolean };
+  codexUltraOrchestration?: {
+    enabled: boolean;
+    /** Provider-native effort used by the synthetic Codex Ultra selector. */
+    providerEffort?: string;
+  };
 }
 
 /** 只读检测快照的 reasoning 子对象（allowlist 字段，无敏感信息）。 */

@@ -143,7 +143,8 @@
     "deleting": "Deleting...",
     "auto": "Auto",
     "enabled": "Enabled",
-    "notSet": "Not Set"
+    "notSet": "Not Set",
+    "undeclared": "Undeclared"
   },
   "firstRunNotice": {
     "title": "Welcome to CC Switch",
@@ -1772,6 +1773,7 @@
     "reasoningEffortHint": "Enable when the upstream supports thinking-depth control such as low/high/max. Enabling this also turns on thinking mode and converts Codex's reasoning.effort into the upstream Chat parameter.",
     "reasoningGroupTitle": "Reasoning Capability",
     "reasoningSectionHint": "Preset providers are configured automatically; custom providers are inferred from name/URL. Override manually only when auto-detection is wrong.",
+    "sublyxMaintainedReasoningContract": "Sublyx GPT native levels and wire settings are maintained automatically: low, medium, high, xhigh; Ultra uses xhigh with Codex orchestration. You can change the default, disable Ultra, or choose a different support control mode.",
     "advancedSectionHint": "Includes model catalog, protocol detection, Codex menu mapping, routing takeover, reasoning overrides and custom User-Agent. Chat Completions providers require local routing conversion.",
     "localRoutingToggle": "Show in Codex /model menu",
     "localRoutingDescription": "When enabled, CCSwitchMulti generates the model catalog Codex loads at startup. Models, display names, context windows, and reasoning levels configured here appear in /model, and display names map to their real upstream models. This does not enable or disable the provider, proxy, or MultiRouter; turn it off only when you maintain your own model_catalog_json.",

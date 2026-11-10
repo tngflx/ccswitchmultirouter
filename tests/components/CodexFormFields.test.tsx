@@ -377,6 +377,7 @@ function renderCatalogHarness(
   options: {
     shouldShowSpeedTest?: boolean;
     providerName?: string;
+    codexConfig?: string;
     partnerPromotionKey?: string;
     baseUrl?: string;
     apiFormat?: CodexApiFormat;
@@ -408,11 +409,14 @@ function renderCatalogHarness(
   const onProtocolProbeReceiptIdsChange = vi.fn();
   let latestCatalog = initialCatalog;
   let updateCatalog: (next: CodexCatalogModel[]) => void;
+  let updateConfig: (next: string) => void;
   let latestProtocolOverrides = options.protocolOverrides ?? {};
   let latestDefaultModel = options.defaultModel ?? "";
 
   function Harness() {
     const [catalog, setCatalog] = useState<CodexCatalogModel[]>(initialCatalog);
+    const [codexConfig, setCodexConfig] = useState(options.codexConfig ?? "");
+    updateConfig = setCodexConfig;
     updateCatalog = (next) => {
       latestCatalog = next;
       setCatalog(next);
@@ -436,6 +440,7 @@ function renderCatalogHarness(
       <CodexFormFields
         providerId="codex-thirdparty"
         providerName={options.providerName}
+        codexConfig={codexConfig}
         codexProviderEditorSnapshot={options.codexProviderEditorSnapshot}
         codexApiKey={options.apiKey ?? "sk-test"}
         onApiKeyChange={vi.fn()}
@@ -525,6 +530,7 @@ function renderCatalogHarness(
     latestDefaultModel: () => latestDefaultModel,
     updateCatalog: (next: CodexCatalogModel[]) =>
       act(() => updateCatalog(next)),
+    updateConfig: (next: string) => act(() => updateConfig(next)),
   };
 }
 
@@ -1798,6 +1804,174 @@ describe("CodexFormFields local model routing", () => {
     expect(screen.getByText("Codex levels: low")).toBeInTheDocument();
   });
 
+  it("re-evaluates the active TOML transport for reasoning edits, resolve and detection", async () => {
+    const configFor = (selected: "sublyx" | "openrouter") =>
+      `model_provider = "${selected}"\n` +
+      '[model_providers.sublyx]\nname = "Sublyx"\nbase_url = "https://api.sublyx.example/v1"\n' +
+      '[model_providers.openrouter]\nname = "OpenRouter"\nbase_url = "https://openrouter.ai/api/v1"\n';
+    const sublyxConfig = configFor("sublyx");
+    const openrouterConfig = configFor("openrouter");
+    const model = "gpt-shared";
+    const staleCapability: NonNullable<CodexCatalogModel["reasoning"]> = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: ["low", "xhigh", "max"],
+      defaultEffort: "max",
+      disableAllowed: false,
+      upstream: {
+        format: "reasoning_object",
+        parameter: "reasoning.effort",
+        effortMap: { low: "low", xhigh: "xhigh", max: "max" },
+      },
+      source: "user",
+      providerKey: "sublyx",
+    };
+    reasoningApiMocks.resolve.mockImplementation(
+      async (_settings, _provider, requestedModel) =>
+        createUnknownReasoningResolution(requestedModel),
+    );
+    reasoningApiMocks.trigger.mockResolvedValue(
+      createDetectedReasoningOutcome(model),
+    );
+    const { updateConfig, latestCatalog } = renderCatalogHarness(
+      [{ model, reasoning: staleCapability }],
+      {
+        baseUrl: "",
+        providerName: "Sublyx legacy label",
+        codexConfig: sublyxConfig,
+      },
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `Configure reasoning capabilities for ${model}`,
+      }),
+    );
+    await screen.findByRole("button", { name: "Detect again" });
+    expect(screen.queryByLabelText("Provider-native effort max")).toBeNull();
+    expect(reasoningApiMocks.resolve).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        providerName: "Sublyx legacy label",
+        base_url: "",
+        config: sublyxConfig,
+      }),
+      "codex-thirdparty",
+      model,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Detect again" }));
+    await waitFor(() =>
+      expect(reasoningApiMocks.trigger).toHaveBeenLastCalledWith(
+        {
+          id: "codex-thirdparty",
+          name: "Sublyx legacy label",
+          category: "custom",
+          settingsConfig: { base_url: "", config: sublyxConfig },
+        },
+        model,
+      ),
+    );
+
+    updateConfig(openrouterConfig);
+    await waitFor(() =>
+      expect(reasoningApiMocks.resolve).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          providerName: "Sublyx legacy label",
+          base_url: "",
+          config: openrouterConfig,
+        }),
+        "codex-thirdparty",
+        model,
+      ),
+    );
+    expect(
+      await screen.findByLabelText("Provider-native effort max"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByLabelText(`${model} provider default effort`),
+    ).toHaveValue("max");
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Detect again" }),
+      ).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Detect again" }));
+    await waitFor(() =>
+      expect(reasoningApiMocks.trigger).toHaveBeenLastCalledWith(
+        {
+          id: "codex-thirdparty",
+          name: "Sublyx legacy label",
+          category: "custom",
+          settingsConfig: { base_url: "", config: openrouterConfig },
+        },
+        model,
+      ),
+    );
+    expect(latestCatalog()).toEqual([{ model, reasoning: staleCapability }]);
+  });
+
+  it.each([
+    ["inherited maintained overlay", undefined, true],
+    [
+      "stale explicit max target",
+      { enabled: true, providerEffort: "max" as const },
+      true,
+    ],
+    [
+      "explicit disabled override",
+      { enabled: false, providerEffort: "max" as const },
+      false,
+    ],
+  ] as const)(
+    "displays effective Ultra state for %s",
+    async (_case, codexUltra, enabled) => {
+      const model = "gpt-shared";
+      reasoningApiMocks.resolve.mockImplementation(
+        async (_settings, _provider, requestedModel) => {
+          const resolution = createSupportedReasoningResolution(
+            requestedModel,
+            ["low", "xhigh"],
+            "xhigh",
+            true,
+          );
+          return {
+            ...resolution,
+            source: "library",
+            resolved: {
+              ...resolution.resolved,
+              confidence: "maintained",
+              effortMap: { low: "low", xhigh: "xhigh", ultra: "xhigh" },
+            },
+          };
+        },
+      );
+      const row: CodexCatalogModel = {
+        model,
+        ...(codexUltra ? { codexUltra } : {}),
+      };
+      const { latestCatalog } = renderCatalogHarness([row], {
+        baseUrl: "https://api.sublyx.example/v1",
+        providerName: "Sublyx",
+      });
+      const checkbox = screen.getByRole("checkbox", {
+        name: `Unlock Ultra for ${model}`,
+      });
+      const target = screen.getByRole("combobox", {
+        name: `Provider reasoning effort used by ${model} Ultra`,
+      });
+      await waitFor(() => expect(target).toHaveValue("xhigh"));
+      if (enabled) {
+        expect(checkbox).toBeChecked();
+        expect(target).toBeEnabled();
+        expect(screen.getByText("Unlocked; uses xhigh")).toBeInTheDocument();
+      } else {
+        expect(checkbox).not.toBeChecked();
+        expect(target).toBeDisabled();
+      }
+      expect(within(target).queryByRole("option", { name: "max" })).toBeNull();
+      expect(latestCatalog()).toEqual([row]);
+    },
+  );
+
   it("keeps Ultra independent from automatic reasoning discovery", async () => {
     reasoningApiMocks.resolve.mockImplementation(
       async (_settings, _provider, model) => ({
@@ -2023,7 +2197,10 @@ describe("CodexFormFields local model routing", () => {
       expect(reasoningApiMocks.trigger).toHaveBeenCalledWith(
         expect.objectContaining({
           id: "codex-thirdparty",
-          settingsConfig: { base_url: "https://api.thirdparty.example/v1" },
+          settingsConfig: {
+            base_url: "https://api.thirdparty.example/v1",
+            config: "",
+          },
         }),
         "qwen3.8",
       );

@@ -791,6 +791,63 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     expect(user.rows[0].reasoning?.source).toBe("user");
   });
 
+  it("clears stale automatic reasoning metadata only after a complete refresh", () => {
+    const automaticReasoning: CodexModelReasoningCapability = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: ["high", "xhigh", "max"],
+      defaultEffort: "high",
+      disableAllowed: false,
+      upstream: {
+        format: "reasoning_object",
+        parameter: "reasoning.effort",
+        effortMap: { high: "high", xhigh: "xhigh", max: "max" },
+      },
+      source: "provider",
+    };
+    const automaticRow = createRow({
+      model: "wire-model",
+      upstreamModel: "wire-model",
+      reasoning: automaticReasoning,
+    });
+
+    const partial = reconcileFetchedCodexCatalogRows(
+      [automaticRow],
+      [{ id: "wire-model" }],
+      {},
+      { appendNew: false, createRow, existingMetadataMode: "refresh" },
+    );
+    expect(partial.rows[0].reasoning).toEqual(automaticReasoning);
+
+    const complete = reconcileFetchedCodexCatalogRows(
+      [automaticRow],
+      [{ id: "wire-model" }],
+      {},
+      {
+        appendNew: false,
+        createRow,
+        existingMetadataMode: "refresh",
+        removeMissingRemote: true,
+      },
+    );
+    expect(complete.rows[0]).not.toHaveProperty("reasoning");
+
+    const userReasoning = { ...automaticReasoning, source: "user" as const };
+    const user = reconcileFetchedCodexCatalogRows(
+      [createRow({ ...automaticRow, reasoning: userReasoning })],
+      [{ id: "wire-model" }],
+      {},
+      {
+        appendNew: false,
+        createRow,
+        existingMetadataMode: "refresh",
+        removeMissingRemote: true,
+      },
+    );
+    expect(user.rows[0].reasoning).toEqual(userReasoning);
+  });
+
   it("persists API protocol declarations on both existing and newly discovered rows", () => {
     const capability = {
       schemaVersion: 1 as const,

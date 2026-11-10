@@ -1482,6 +1482,37 @@ describe("Model order real drag sensors", () => {
     expect(providersApi.update).toHaveBeenCalledTimes(1);
   });
 
+  it("trusts resolved selectable efforts without reinterpreting source labels", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, _provider, model) => {
+      const resolution = modelReasoningResolution(
+        model,
+        ["low", "xhigh", "max"],
+        "xhigh",
+      );
+      return {
+        ...resolution,
+        resolved: { ...resolution.resolved, source: "sublyx" },
+      };
+    });
+    renderModelOrder({
+      models: [{ model: "non-gpt-model" }],
+      config: 'model = "non-gpt-model"\n',
+    });
+
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() =>
+      expect(
+        within(effort)
+          .getAllByRole("option")
+          .map((option) => option.getAttribute("value")),
+      ).toEqual(["low", "xhigh", "max"]),
+    );
+  });
+
   it("offers only declared effort tiers and resets to the newly first models declared default", async () => {
     const { plan, elementFor, rendered, source } = renderModelOrder({
       models: [

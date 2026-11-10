@@ -1,8 +1,14 @@
+import { useTranslation } from "react-i18next";
 import type {
   CodexModelReasoningCapability,
   CodexReasoningControlKind,
   CodexReasoningEffort,
 } from "@/types";
+import {
+  normalizeCodexReasoningCapabilityForProvider,
+  usesSublyxGptReasoningContract,
+  type CodexReasoningProviderIdentity,
+} from "@/lib/codexReasoningProviderIdentity";
 
 const PROVIDER_EFFORTS: CodexReasoningEffort[] = [
   "minimal",
@@ -15,9 +21,10 @@ const PROVIDER_EFFORTS: CodexReasoningEffort[] = [
 
 function identityCompleteMap(
   capability: CodexModelReasoningCapability,
+  nativeEfforts = capability.supportedEfforts,
 ): Partial<Record<CodexReasoningEffort, CodexReasoningEffort>> {
   const completed = { ...capability.upstream.effortMap };
-  for (const effort of capability.supportedEfforts) {
+  for (const effort of nativeEfforts) {
     completed[effort] ??= effort;
   }
   return completed;
@@ -25,6 +32,8 @@ function identityCompleteMap(
 
 export interface CodexModelReasoningEditorProps {
   model: string;
+  upstreamModel?: string;
+  providerIdentity?: CodexReasoningProviderIdentity;
   capability: CodexModelReasoningCapability;
   readOnly: boolean;
   onChange: (capability: CodexModelReasoningCapability) => void;
@@ -36,23 +45,56 @@ export interface CodexModelReasoningEditorProps {
  */
 export function CodexModelReasoningEditor({
   model,
-  capability,
+  upstreamModel,
+  providerIdentity,
+  capability: savedCapability,
   readOnly,
   onChange,
 }: CodexModelReasoningEditorProps) {
+  const { t } = useTranslation();
+  const contractModel = upstreamModel?.trim() || model;
+  const capability = normalizeCodexReasoningCapabilityForProvider(
+    contractModel,
+    savedCapability,
+    providerIdentity,
+  );
   const isGraded =
     (capability.controlKind ??
       (capability.supportedEfforts.length ? "graded" : "unknown")) === "graded";
-  const completedMap = identityCompleteMap(capability);
-  const addableEfforts = PROVIDER_EFFORTS.filter(
-    (effort) => !capability.supportedEfforts.includes(effort),
+  const isSublyx = usesSublyxGptReasoningContract(
+    contractModel,
+    providerIdentity,
+    capability,
   );
+  const hasMaintainedNativeContract =
+    isSublyx && isGraded && capability.supportStatus === "confirmed_supported";
+  const nativeEfforts = capability.supportedEfforts;
+  const completedMap = identityCompleteMap(capability, nativeEfforts);
+  const addableEfforts = hasMaintainedNativeContract
+    ? []
+    : PROVIDER_EFFORTS.filter(
+        (effort) =>
+          (!isSublyx || effort !== "max") &&
+          !capability.supportedEfforts.includes(effort),
+      );
 
   const update = (next: CodexModelReasoningCapability) => {
     // Read legacy evidence once, but write only the canonical v2 support state.
     // Keeping both fields makes a later control-mode edit contradict itself.
+    const normalized = normalizeCodexReasoningCapabilityForProvider(
+      contractModel,
+      next,
+      providerIdentity,
+    );
+    const providerEffort =
+      normalized.codexUltraOrchestration?.providerEffort ??
+      normalized.upstream.effortMap?.max;
     const canonical = {
-      ...next,
+      ...normalized,
+      codexUltraOrchestration:
+        normalized.codexUltraOrchestration?.enabled && providerEffort
+          ? { ...normalized.codexUltraOrchestration, providerEffort }
+          : normalized.codexUltraOrchestration,
       supportStatus:
         next.supportStatus ??
         (next.supported === true
@@ -62,16 +104,25 @@ export function CodexModelReasoningEditor({
             : "unknown"),
     } satisfies CodexModelReasoningCapability;
     delete canonical.supported;
-    const maxTarget = canonical.upstream.effortMap?.max;
+    const ultraTarget =
+      canonical.codexUltraOrchestration?.providerEffort ??
+      canonical.upstream.effortMap?.max;
     if (
       canonical.codexUltraOrchestration?.enabled &&
-      (!maxTarget || !canonical.supportedEfforts.includes(maxTarget))
+      (!ultraTarget || !canonical.supportedEfforts.includes(ultraTarget))
     ) {
-      // A control-mode or native-level edit can remove the verified max path.
-      // Do not retain an orchestration declaration the backend must reject.
+      // A control-mode or native-level edit can remove the verified Provider
+      // path. New capabilities carry providerEffort directly; old records use
+      // the legacy max mapping. Do not retain an orchestration declaration the
+      // backend must reject.
       delete canonical.codexUltraOrchestration;
     }
-    onChange({ ...canonical, schemaVersion: 2, source: "user" });
+    onChange({
+      ...canonical,
+      schemaVersion: 2,
+      // Manual provenance and provider transport identity are separate fields.
+      source: "user",
+    });
   };
 
   const updateControlKind = (controlKind: CodexReasoningControlKind) => {
@@ -144,18 +195,26 @@ export function CodexModelReasoningEditor({
             <legend className="px-1 font-medium">
               Native provider capability
             </legend>
+            {hasMaintainedNativeContract ? (
+              <p className="rounded-md bg-muted/30 p-2 text-muted-foreground">
+                {t("codexConfig.sublyxMaintainedReasoningContract", {
+                  defaultValue:
+                    "Sublyx GPT native levels and wire settings are maintained automatically: low, medium, high, xhigh; Ultra uses xhigh with Codex orchestration. You can change the default, disable Ultra, or choose a different support control mode.",
+                })}
+              </p>
+            ) : null}
             <p className="text-muted-foreground">
               Select only the levels this provider API actually accepts for the
               model, not the complete Codex level set.
             </p>
             <div className="flex flex-wrap gap-3">
-              {capability.supportedEfforts.map((effort) => (
+              {nativeEfforts.map((effort) => (
                 <label key={effort} className="flex items-center gap-1">
                   <input
                     type="checkbox"
                     aria-label={`Provider-native effort ${effort}`}
                     checked
-                    disabled={readOnly}
+                    disabled={readOnly || hasMaintainedNativeContract}
                     onChange={() => {
                       const supportedEfforts =
                         capability.supportedEfforts.filter(
@@ -226,7 +285,15 @@ export function CodexModelReasoningEditor({
             <select
               className="rounded-md border bg-background px-3 py-2"
               aria-label={`${model} provider default effort`}
-              value={capability.defaultEffort ?? ""}
+              value={
+                nativeEfforts.includes(
+                  capability.defaultEffort as CodexReasoningEffort,
+                )
+                  ? capability.defaultEffort
+                  : isSublyx && nativeEfforts.includes("xhigh")
+                    ? "xhigh"
+                    : ""
+              }
               disabled={readOnly}
               onChange={(event) =>
                 update({
@@ -236,8 +303,10 @@ export function CodexModelReasoningEditor({
                 })
               }
             >
-              <option value="">Not declared</option>
-              {capability.supportedEfforts.map((effort) => (
+              <option value="" disabled={hasMaintainedNativeContract}>
+                Not declared
+              </option>
+              {nativeEfforts.map((effort) => (
                 <option key={effort} value={effort}>
                   {effort}
                 </option>
@@ -257,7 +326,7 @@ export function CodexModelReasoningEditor({
                 className="rounded-md border bg-background px-3 py-2"
                 aria-label={`${model} upstream parameter format`}
                 value={capability.upstream.format}
-                disabled={readOnly}
+                disabled={readOnly || hasMaintainedNativeContract}
                 onChange={(event) => {
                   const format = event.target.value as
                     "string" | "reasoning_object";
@@ -285,7 +354,7 @@ export function CodexModelReasoningEditor({
                 className="rounded-md border bg-background px-3 py-2"
                 aria-label={`${model} upstream parameter name`}
                 value={capability.upstream.parameter}
-                readOnly={readOnly}
+                readOnly={readOnly || hasMaintainedNativeContract}
                 onChange={(event) =>
                   update({
                     ...capability,
@@ -318,7 +387,7 @@ export function CodexModelReasoningEditor({
               level for the model must have a valid target when saving.
             </p>
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-              {capability.supportedEfforts.map((effort) => (
+              {nativeEfforts.map((effort) => (
                 <label
                   key={effort}
                   className="grid grid-cols-[1fr_auto_1fr] items-center gap-1"
@@ -329,7 +398,7 @@ export function CodexModelReasoningEditor({
                     className="rounded border bg-background px-2 py-1"
                     aria-label={`${effort} mapping target`}
                     value={completedMap[effort] ?? ""}
-                    disabled={readOnly}
+                    disabled={readOnly || hasMaintainedNativeContract}
                     onChange={(event) =>
                       update({
                         ...capability,
@@ -344,7 +413,7 @@ export function CodexModelReasoningEditor({
                       })
                     }
                   >
-                    {capability.supportedEfforts.map((target) => (
+                    {nativeEfforts.map((target) => (
                       <option key={target} value={target}>
                         {target}
                       </option>
@@ -366,7 +435,11 @@ export function CodexModelReasoningEditor({
         <input
           type="checkbox"
           checked={capability.disableAllowed}
-          disabled={readOnly || capability.controlKind === "none"}
+          disabled={
+            readOnly ||
+            hasMaintainedNativeContract ||
+            capability.controlKind === "none"
+          }
           onChange={(event) =>
             update({ ...capability, disableAllowed: event.target.checked })
           }

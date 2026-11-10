@@ -68,6 +68,10 @@ import { CodexModelReasoningEditor } from "./CodexModelReasoningEditor";
 import { CodexModelReasoningSummary } from "./CodexModelReasoningSummary";
 import { CodexOfficialContextRow } from "./CodexOfficialContextRow";
 import { cn } from "@/lib/utils";
+import {
+  codexReasoningProviderIdentity,
+  resolveCodexCatalogUltraDisplay,
+} from "@/lib/codexReasoningProviderIdentity";
 import { buildCodexProtocolProbeProviderDraft } from "@/lib/codexProtocolSettings";
 import {
   migrateCodexProtocolOverrideKey,
@@ -246,10 +250,12 @@ export function validateCodexReasoningCapabilityDraft(
     }
   }
   if (capability.codexUltraOrchestration?.enabled) {
-    const ultraTarget = capability.upstream.effortMap?.max;
+    const ultraTarget =
+      capability.codexUltraOrchestration.providerEffort ??
+      capability.upstream.effortMap?.max;
     if (!ultraTarget || !capability.supportedEfforts.includes(ultraTarget)) {
       throw new Error(
-        "Unlocking Ultra requires a valid max-to-provider reasoning-effort mapping",
+        "Unlocking Ultra requires a valid provider reasoning-effort mapping",
       );
     }
   }
@@ -261,6 +267,8 @@ interface CodexFormFieldsProps {
   providerId?: string;
   // 当前表单里的 provider 名称；自动生成混合协议 route 标签时使用。
   providerName?: string;
+  /** Current TOML draft: only its selected provider may establish transport identity. */
+  codexConfig?: string;
   // xAI OAuth 托管预设（Grok 订阅）：隐藏 API Key / 端点输入，挂账号选择区块
   isXaiOauthPreset?: boolean;
   isMaintainedPreset?: boolean;
@@ -736,6 +744,7 @@ export function CodexFormFields({
   appId = "codex",
   providerId,
   providerName,
+  codexConfig = "",
   isXaiOauthPreset,
   isMaintainedPreset = false,
   isCanonicalOfficial = false,
@@ -1019,11 +1028,12 @@ export function CodexFormFields({
       // saved.
       providerName: providerName?.trim() || "",
       base_url: codexBaseUrl.trim(),
+      config: codexConfig,
       modelCatalog: {
         models: catalogRows.filter((row) => row.enabled !== false),
       },
     }),
-    [catalogRows, codexBaseUrl, providerName],
+    [catalogRows, codexBaseUrl, codexConfig, providerName],
   );
   const reasoningDetectionProvider = useMemo<Provider>(
     () => ({
@@ -1031,10 +1041,15 @@ export function CodexFormFields({
       name: providerName?.trim() || "Codex provider",
       settingsConfig: {
         base_url: codexBaseUrl.trim(),
+        config: codexConfig,
       },
       category,
     }),
-    [providerId, providerName, codexBaseUrl, category],
+    [providerId, providerName, codexBaseUrl, codexConfig, category],
+  );
+  const reasoningProviderIdentity = useMemo(
+    () => codexReasoningProviderIdentity(reasoningDetectionProvider),
+    [reasoningDetectionProvider],
   );
 
   // Product-level Ultra is a UI overlay on a provider capability. It may
@@ -2809,6 +2824,11 @@ export function CodexFormFields({
                   const defaultEffort =
                     reasoningResolution?.resolved.providerDefaultEffort ??
                     undefined;
+                  const effectiveUltra = resolveCodexCatalogUltraDisplay(
+                    row,
+                    reasoningResolution?.resolved,
+                    reasoningProviderIdentity,
+                  );
                   const discoveredReasoning = reasoningResolution?.capability
                     ? (reasoningResolution.capability as unknown as CodexModelReasoningCapability)
                     : undefined;
@@ -2830,8 +2850,8 @@ export function CodexFormFields({
                         source={reasoningSourceLabel}
                         selectableEfforts={selectableEfforts}
                         defaultEffort={defaultEffort}
-                        ultraEnabled={row.codexUltra?.enabled === true}
-                        ultraEffort={row.codexUltra?.providerEffort}
+                        ultraEnabled={effectiveUltra.enabled}
+                        ultraEffort={effectiveUltra.providerEffort}
                         ultraEfforts={
                           reasoningResolution?.resolved
                             .providerAcceptedEfforts ?? []
@@ -3060,6 +3080,8 @@ export function CodexFormFields({
                           {row.reasoning ? (
                             <CodexModelReasoningEditor
                               model={model || "Model"}
+                              upstreamModel={probeModel}
+                              providerIdentity={reasoningProviderIdentity}
                               capability={row.reasoning}
                               readOnly={isBuiltinReasoning}
                               onChange={(reasoning) =>

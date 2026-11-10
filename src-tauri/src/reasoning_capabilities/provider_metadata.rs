@@ -28,7 +28,11 @@ const ERROR_BODY_MAX_CHARS: usize = 512;
 /// 仅以平台标识判定，绝不掺入 model 名——model 名属于模型厂商，会把托管
 /// 平台误判成模型官方接口。
 pub fn detect_platform(provider: &Provider) -> Option<&'static str> {
-    detect_platform_from_settings_parts(&provider.settings_config, Some(&provider.name))
+    detect_platform_from_settings_parts(
+        &provider.settings_config,
+        Some(&provider.name),
+        Some(&provider.id),
+    )
 }
 
 /// Detect a known provider platform from the transient settings shape used by
@@ -39,56 +43,115 @@ pub fn detect_platform(provider: &Provider) -> Option<&'static str> {
 /// Keep this helper aligned with [`detect_platform`] so both paths select the
 /// same capability-library entries.
 pub fn detect_platform_from_settings(settings: &Value) -> Option<&'static str> {
-    detect_platform_from_settings_parts(settings, None)
+    detect_platform_from_settings_parts(settings, None, None)
 }
 
 fn detect_platform_from_settings_parts(
     settings: &Value,
     provider_name: Option<&str>,
+    provider_id: Option<&str>,
 ) -> Option<&'static str> {
-    let name = settings
-        .get("providerName")
-        .or_else(|| settings.get("provider_name"))
-        .or_else(|| settings.get("name"))
+    // Only the active TOML table belongs to the current transport. Inactive
+    // tables must never lend their platform identity to the selected gateway.
+    let config = settings
+        .get("config")
         .and_then(Value::as_str)
-        .or(provider_name)
+        .and_then(|config| toml::from_str::<toml::Value>(config).ok());
+    let selected_provider = config.as_ref().and_then(|config| {
+        let selected = config.get("model_provider")?.as_str()?.trim();
+        let provider = config.get("model_providers")?.get(selected)?;
+        Some((selected, provider))
+    });
+    let config_base_url = selected_provider.and_then(|(_, provider)| {
+        ["base_url", "baseURL", "baseUrl"]
+            .into_iter()
+            .find_map(|key| {
+                provider
+                    .get(key)
+                    .and_then(toml::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+    });
+    let base_url = settings_base_url(settings)
+        .or(config_base_url)
         .unwrap_or("");
-    let base_url = settings
-        .get("base_url")
-        .or_else(|| settings.get("baseURL"))
-        .or_else(|| settings.get("baseUrl"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if let Some(platform) = detect_platform_from_identity(name, base_url) {
+
+    // Actual OpenRouter/Sublyx transport wins stale display names, provider
+    // IDs, and selected TOML labels. Keep the other vendor exact-host guards
+    // and existing display-name behavior unchanged.
+    if let Some(platform @ ("openrouter" | "sublyx")) = detect_platform_from_identity("", base_url)
+    {
         return Some(platform);
     }
 
-    // Only the active TOML provider establishes identity. Inactive entries may
-    // retain unrelated official hosts and must never lend their capabilities
-    // to the selected gateway, or substitute for a missing selection.
-    let config = settings.get("config").and_then(Value::as_str)?;
-    let config = toml::from_str::<toml::Value>(config).ok()?;
-    let selected = config.get("model_provider")?.as_str()?.trim();
-    let provider = config.get("model_providers")?.get(selected)?;
-    let config_name = provider
-        .get("name")
-        .or_else(|| provider.get("providerName"))
-        .or_else(|| provider.get("provider_name"))
-        .and_then(toml::Value::as_str)
-        .unwrap_or("");
-    let config_base_url = provider
-        .get("base_url")
-        .or_else(|| provider.get("baseURL"))
-        .or_else(|| provider.get("baseUrl"))
-        .and_then(toml::Value::as_str)
-        .unwrap_or("");
-    detect_platform_from_identity(config_name, config_base_url)
+    if let Some((selected, provider)) = selected_provider {
+        let config_name = ["name", "providerName", "provider_name"]
+            .into_iter()
+            .find_map(|key| provider.get(key).and_then(toml::Value::as_str))
+            .unwrap_or("");
+        // Presets often omit a redundant name; the selected table key is
+        // still active provider identity, ahead of stale fallback labels.
+        if let Some(platform) =
+            detect_platform_from_identity(&format!("{selected} {config_name}"), "")
+        {
+            return Some(platform);
+        }
+    }
+
+    // Compiled routes use synthetic wrapper labels/IDs for routing, not for
+    // capability selection. Once original target identity is projected, do
+    // not let an adversarial or stale wrapper name identify another gateway.
+    let has_target_identity = settings.get("codexResolvedTargetProviderId").is_some()
+        || settings.get("codexResolvedTargetProviderName").is_some();
+    let (name, id) = if has_target_identity {
+        (
+            settings
+                .get("codexResolvedTargetProviderName")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            settings
+                .get("codexResolvedTargetProviderId")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        )
+    } else {
+        (
+            settings
+                .get("providerName")
+                .or_else(|| settings.get("provider_name"))
+                .or_else(|| settings.get("name"))
+                .and_then(Value::as_str)
+                .or(provider_name)
+                .unwrap_or(""),
+            provider_id.unwrap_or_default(),
+        )
+    };
+    detect_platform_from_identity(&format!("{name} {id}"), base_url)
+}
+
+fn settings_base_url(settings: &Value) -> Option<&str> {
+    ["base_url", "baseURL", "baseUrl"]
+        .into_iter()
+        .find_map(|key| {
+            settings
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
 }
 
 fn detect_platform_from_identity(name: &str, base_url: &str) -> Option<&'static str> {
     let platform = format!("{name} {base_url}").to_ascii_lowercase();
     if platform.contains("openrouter") {
         Some("openrouter")
+    } else if platform.contains("sublyx") {
+        // Sublyx is an OpenAI Responses-compatible gateway. Keep this
+        // identity provider-scoped (name/id/official host), never inferred
+        // from a model suffix, so an OpenRouter row named `*-sublyx` cannot
+        // inherit the Sublyx contract.
+        Some("sublyx")
     } else if platform.contains("vllm") {
         Some("vllm")
     } else if reqwest::Url::parse(base_url).ok().is_some_and(|url| {
@@ -140,15 +203,7 @@ fn now_millis() -> i64 {
 }
 
 fn base_url(provider: &Provider) -> Option<String> {
-    let explicit = provider
-        .settings_config
-        .get("base_url")
-        .or_else(|| provider.settings_config.get("baseURL"))
-        .or_else(|| provider.settings_config.get("baseUrl"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .map(ToString::to_string);
+    let explicit = settings_base_url(&provider.settings_config).map(ToString::to_string);
     if explicit.is_some() {
         return explicit;
     }
@@ -263,9 +318,7 @@ fn openrouter_reasoning_snapshot(entry: &Value) -> Option<ReasoningCapabilitySna
             .unwrap_or(false),
         upstream_format: Some(capability.upstream.format),
         upstream_parameter: Some(capability.upstream.parameter),
-        output_format: capability
-            .output_format
-            .or_else(|| Some("auto".to_string())),
+        output_format: capability.output_format,
     })
 }
 
@@ -992,6 +1045,7 @@ fn build_reasoning_capability(
         codex_ultra_orchestration: codex_ultra_enabled.then_some(
             crate::proxy::providers::codex_reasoning::CodexUltraOrchestrationCapability {
                 enabled: true,
+                provider_effort: None,
             },
         ),
     };
@@ -1162,6 +1216,10 @@ mod tests {
             detect_platform(&provider("Qwen vLLM", "http://vllm-roglinux:8000")),
             Some("vllm")
         );
+        assert_eq!(
+            detect_platform(&provider("Sublyx", "https://gateway.example/v1")),
+            Some("sublyx")
+        );
     }
 
     #[test]
@@ -1215,6 +1273,83 @@ mod tests {
             ..provider("Saved custom provider", "https://gateway.example/v1")
         };
         assert_eq!(detect_platform(&persisted), Some("openrouter"));
+    }
+
+    #[test]
+    fn active_gateway_transport_overrides_stale_provider_labels() {
+        for (active, stale, base_url) in [
+            ("openrouter", "Sublyx", "https://openrouter.ai/api/v1"),
+            ("sublyx", "OpenRouter", "https://sublyx.example/v1"),
+        ] {
+            let mut saved = provider(stale, "");
+            saved.id = format!("{stale}-saved-id");
+            saved.settings_config = json!({
+                "providerName": stale,
+                "config": format!(
+                    "model_provider = \"{active}\"\n[model_providers.{active}]\nbase_url = \"{base_url}\"\n"
+                ),
+            });
+            assert_eq!(detect_platform(&saved), Some(active));
+            assert_eq!(
+                detect_platform_from_settings(&saved.settings_config),
+                Some(active)
+            );
+
+            // The top-level URL is the actual request destination when both
+            // forms exist, not the stale selected TOML gateway declaration.
+            saved.settings_config["base_url"] = json!("  ");
+            saved.settings_config["baseURL"] = json!(base_url);
+            assert_eq!(super::base_url(&saved).as_deref(), Some(base_url));
+            saved.settings_config["config"] = json!(format!(
+                "model_provider = \"{stale}\"\n[model_providers.{stale}]\nbase_url = \"https://{stale}.example/v1\"\n"
+            ));
+            assert_eq!(detect_platform(&saved), Some(active));
+            assert_eq!(
+                detect_platform_from_settings(&saved.settings_config),
+                Some(active)
+            );
+        }
+    }
+
+    #[test]
+    fn active_toml_gateway_key_overrides_stale_provider_labels() {
+        for (active, stale) in [("openrouter", "Sublyx"), ("sublyx", "OpenRouter")] {
+            let mut saved = provider(stale, "");
+            saved.settings_config = json!({
+                "providerName": stale,
+                "config": format!(
+                    "model_provider = \"{active}\"\n[model_providers.{active}]\nbase_url = \"https://gateway.example/v1\"\n"
+                ),
+            });
+            assert_eq!(detect_platform(&saved), Some(active));
+            assert_eq!(
+                detect_platform_from_settings(&saved.settings_config),
+                Some(active)
+            );
+        }
+    }
+
+    #[test]
+    fn projected_target_identity_overrides_synthetic_router_labels() {
+        for (active, wrapper) in [
+            ("openrouter", "Sublyx router"),
+            ("sublyx", "OpenRouter router"),
+        ] {
+            let mut routed = provider(wrapper, "https://gateway.example/v1");
+            routed.id = format!("{wrapper}-synthetic-id");
+            routed.settings_config["codexResolvedTargetProviderId"] =
+                json!(format!("{active}-target"));
+            routed.settings_config["codexResolvedTargetProviderName"] = json!(active);
+            assert_eq!(detect_platform(&routed), Some(active));
+            assert_eq!(
+                detect_platform_from_settings(&routed.settings_config),
+                Some(active)
+            );
+        }
+
+        let mut unknown_target = provider("OpenRouter wrapper", "https://gateway.example/v1");
+        unknown_target.settings_config["codexResolvedTargetProviderId"] = json!("custom-target");
+        assert_eq!(detect_platform(&unknown_target), None);
     }
 
     #[test]
@@ -1342,6 +1477,60 @@ mod tests {
             "#
         });
         assert!(base_url(&provider).is_none());
+    }
+
+    #[test]
+    fn openrouter_catalog_and_detection_paths_share_the_same_capability_fingerprint() {
+        use crate::proxy::providers::codex_reasoning::capability_fingerprint;
+        use crate::reasoning_capabilities::snapshot_to_capability;
+
+        for entry in [
+            json!({
+                "id": "provider/native-max",
+                "supported_parameters": ["reasoning", "reasoning_effort"],
+                "reasoning": {
+                    "supported_efforts": ["max", "xhigh", "high", "medium", "low"],
+                    "default_effort": "high",
+                    "mandatory": true,
+                },
+            }),
+            json!({
+                "id": "provider/explicit-output-format",
+                "supported_parameters": ["reasoning"],
+                "reasoning": {
+                    "supported_efforts": ["high", "low"],
+                    "default_effort": "low",
+                    "output_format": "auto",
+                    "mandatory": false,
+                },
+            }),
+            json!({
+                "id": "provider/budget-only",
+                "supported_parameters": ["reasoning"],
+                "reasoning": {
+                    "supports_max_tokens": true,
+                    "mandatory": false,
+                    "default_enabled": true,
+                },
+            }),
+        ] {
+            let direct = openrouter_reasoning_capability_from_model_entry(&entry)
+                .expect("direct catalog capability");
+            let snapshot = ProviderCapabilitySnapshot {
+                provider_key: "openrouter-test".to_string(),
+                model: entry["id"].as_str().unwrap().to_string(),
+                fetched_at: 1,
+                source: "openrouter_api".to_string(),
+                reasoning: Some(openrouter_reasoning_snapshot(&entry).expect("reasoning snapshot")),
+            };
+            let detected = snapshot_to_capability(&snapshot).expect("detected capability");
+            assert_eq!(direct.output_format, detected.output_format, "{entry}");
+            assert_eq!(
+                capability_fingerprint(&direct),
+                capability_fingerprint(&detected),
+                "{entry}"
+            );
+        }
     }
 
     #[test]
