@@ -604,7 +604,7 @@ fn codex_catalog_models_response(mut catalog: Value) -> Value {
     let mut ids = Vec::new();
     let mut entries = Vec::new();
     collect_string_array(&mut ids, catalog.get("models"));
-    collect_model_objects(&mut entries, catalog.get("models"));
+    collect_model_objects(&mut entries, catalog.get("models"), None);
     ids.sort();
     ids.dedup();
     entries.extend(
@@ -2972,12 +2972,20 @@ fn external_provider_model_entries(
     // provider/profile 的真实数据，避免无条件混入与账号权限无关的旧静态模型。
     if catalog_models.is_some() {
         collect_string_array(&mut ids, catalog_models);
-        collect_model_objects(&mut entries, catalog_models);
+        collect_model_objects(&mut entries, catalog_models, Some(provider));
     } else {
         collect_string_array(&mut ids, provider.settings_config.get("models"));
         collect_string_array(&mut ids, provider.settings_config.get("modelList"));
-        collect_model_objects(&mut entries, provider.settings_config.get("models"));
-        collect_model_objects(&mut entries, provider.settings_config.get("modelList"));
+        collect_model_objects(
+            &mut entries,
+            provider.settings_config.get("models"),
+            Some(provider),
+        );
+        collect_model_objects(
+            &mut entries,
+            provider.settings_config.get("modelList"),
+            Some(provider),
+        );
         if let Some(model) = provider
             .settings_config
             .get("model")
@@ -2995,9 +3003,33 @@ fn external_provider_model_entries(
     entries.extend(
         ids.into_iter()
             .filter(|id| !id.trim().is_empty())
-            .map(|id| openai_model_entry(&id, "cc-switch")),
+            .map(|id| openai_model_entry_for_provider(&id, "cc-switch", &Value::Null, provider)),
     );
+    retain_included_provider_catalog_entries(provider, &mut entries);
     dedup_openai_model_entries(entries)
+}
+
+/// Apply the same canonical inventory admission to ordinary and legacy-router
+/// model lists. An unloaded/unknown catalog is not an authoritative empty one.
+fn retain_included_provider_catalog_entries(
+    provider: &crate::provider::Provider,
+    entries: &mut Vec<Value>,
+) {
+    if crate::codex_multirouter::catalog::read_catalog(&provider.settings_config).is_none() {
+        return;
+    }
+    entries.retain(|entry| {
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            return false;
+        };
+        matches!(
+            crate::codex_multirouter::catalog::lookup_catalog_model(
+                &provider.settings_config, id,
+            ),
+            crate::codex_multirouter::catalog::CatalogModelLookup::Found(row)
+                if row.get("enabled").and_then(Value::as_bool) != Some(false)
+        )
+    });
 }
 
 /// 从 Codex router route 中提取可展示模型。
@@ -3090,9 +3122,13 @@ fn external_codex_router_model_entries(
             collect_string_array(&mut ids, route.pointer("/match/models"));
             collect_string_array(&mut ids, route.get("models"));
             collect_string_array(&mut ids, route.pointer("/modelSelection/models"));
-            collect_model_objects(&mut entries, route.pointer("/match/models"));
-            collect_model_objects(&mut entries, route.get("models"));
-            collect_model_objects(&mut entries, route.pointer("/modelSelection/models"));
+            collect_model_objects(&mut entries, route.pointer("/match/models"), Some(provider));
+            collect_model_objects(&mut entries, route.get("models"), Some(provider));
+            collect_model_objects(
+                &mut entries,
+                route.pointer("/modelSelection/models"),
+                Some(provider),
+            );
             if ids.is_empty() {
                 collect_string_array(&mut ids, route.pointer("/match/prefixes"));
                 collect_string_array(&mut ids, route.get("matchPrefixes"));
@@ -3109,12 +3145,11 @@ fn external_codex_router_model_entries(
         ids.into_iter()
             .filter(|id| !id.trim().is_empty())
             .map(|id| {
-                catalog_sources
-                    .get(id.as_str())
-                    .map(|source| openai_model_entry_with_source(&id, "cc-switch", source))
-                    .unwrap_or_else(|| openai_model_entry(&id, "cc-switch"))
+                let source = catalog_sources.get(id.as_str()).unwrap_or(&Value::Null);
+                openai_model_entry_for_provider(&id, "cc-switch", source, provider)
             }),
     );
+    retain_included_provider_catalog_entries(provider, &mut entries);
     Ok(dedup_openai_model_entries(entries))
 }
 
@@ -3130,20 +3165,30 @@ fn collect_string_array(ids: &mut Vec<String>, value: Option<&Value>) {
 }
 
 /// 收集对象数组里的模型 id。
-fn collect_model_objects(entries: &mut Vec<Value>, value: Option<&Value>) {
+fn collect_model_objects(
+    entries: &mut Vec<Value>,
+    value: Option<&Value>,
+    provider: Option<&crate::provider::Provider>,
+) {
     if let Some(values) = value.and_then(|value| value.as_array()) {
         for value in values {
             if value.get("enabled").and_then(Value::as_bool) == Some(false) {
                 continue;
             }
-            if let Some(id) = value
-                .get("id")
-                .or_else(|| value.get("model"))
-                .or_else(|| value.get("slug"))
-                .or_else(|| value.get("name"))
-                .and_then(|value| value.as_str())
-            {
-                entries.push(openai_model_entry_with_source(id, "cc-switch", value));
+            if let Some(id) = codex_catalog_model_id(value).or_else(|| {
+                value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }) {
+                entries.push(match provider {
+                    Some(provider) => {
+                        openai_model_entry_for_provider(&id, "cc-switch", value, provider)
+                    }
+                    // These sources are already compiled catalog projections,
+                    // not raw persisted provider metadata.
+                    None => openai_model_entry_with_source(&id, "cc-switch", value),
+                });
             }
         }
     }
@@ -3174,7 +3219,32 @@ fn openai_model_entry(id: &str, owner: &str) -> Value {
 }
 
 /// 根据 catalog/source 对象构造 OpenAI model entry，透传明确的上下文窗口与显示名字段。
+fn openai_model_entry_for_provider(
+    id: &str,
+    owner: &str,
+    source: &Value,
+    provider: &crate::provider::Provider,
+) -> Value {
+    let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_for_model_source(
+        provider, id, source,
+    );
+    openai_model_entry_with_reasoning_source(id, owner, source, resolved.capability)
+}
+
+/// Serialize an already-compiled catalog projection without reinterpreting its
+/// provider identity; raw provider sources use the contextual resolver above.
 fn openai_model_entry_with_source(id: &str, owner: &str, source: &Value) -> Value {
+    let capability =
+        crate::proxy::providers::codex_reasoning::reasoning_capability_from_model_entry(source);
+    openai_model_entry_with_reasoning_source(id, owner, source, capability)
+}
+
+fn openai_model_entry_with_reasoning_source(
+    id: &str,
+    owner: &str,
+    source: &Value,
+    capability: Option<crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability>,
+) -> Value {
     let mut entry = openai_model_entry(id, owner);
     if let Some(display_name) = extract_model_display_name(source) {
         if let Some(object) = entry.as_object_mut() {
@@ -3214,9 +3284,7 @@ fn openai_model_entry_with_source(id: &str, owner: &str, source: &Value) -> Valu
             entry["supportsParallelToolCalls"] = json!(supported);
         }
     }
-    if let Some(capability) =
-        crate::proxy::providers::codex_reasoning::reasoning_capability_from_model_entry(source)
-    {
+    if let Some(capability) = capability {
         // Publish runtime fields only, never provider provenance or diagnostics.
         let mut reasoning = json!({
             "schemaVersion": 2,
@@ -10154,6 +10222,221 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
         }
     }
 
+    fn external_models_reasoning_fixture() -> Value {
+        json!({
+            "schemaVersion": 2,
+            "supportStatus": "confirmed_supported",
+            "controlKind": "graded",
+            "supportedEfforts": ["low", "high", "max"],
+            "defaultEffort": "max",
+            "disableAllowed": false,
+            "upstream": {
+                "format": "reasoning_object",
+                "parameter": "reasoning.effort",
+                "effortMap": {}
+            },
+            "source": "detection"
+        })
+    }
+
+    #[test]
+    fn external_models_response_omits_ambiguous_catalog_inventory() {
+        let provider = Provider::with_id(
+            "ambiguous-catalog".to_string(),
+            "Ambiguous Catalog".to_string(),
+            json!({"modelCatalog": {"models": [
+                {"model": "duplicate", "displayName": "First"},
+                {"model": "duplicate", "displayName": "Second"},
+                {"model": "excluded", "enabled": false},
+                {"model": "included"}
+            ]}}),
+            None,
+        );
+        let entries = super::external_provider_model_entries(
+            &provider,
+            &external_provider_backend_profile(&provider.id),
+        );
+        let ids = entries
+            .iter()
+            .filter_map(|entry| entry["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["included"]);
+    }
+
+    #[test]
+    fn external_models_response_requires_current_reasoning_evidence() {
+        for base_url in [
+            "https://openrouter.ai/api/v1",
+            "https://api.sublyx.org/v1",
+            "https://vllm.local/v1",
+            "https://api.deepseek.com/v1",
+            "https://api.z.ai/api/paas/v4",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ] {
+            let mut reasoning = external_models_reasoning_fixture();
+            reasoning["evidenceScope"] = serde_json::to_value(
+                crate::reasoning_capabilities::reasoning_evidence_scope(base_url, "wire-model")
+                    .expect("current scope"),
+            )
+            .expect("serialize scope");
+            let mut provider = Provider::with_id(
+                "external-evidence".to_string(),
+                "External Evidence".to_string(),
+                json!({
+                    "base_url": base_url,
+                    "modelCatalog": {"models": [{
+                        "model": "public-model",
+                        "upstreamModel": "wire-model",
+                        "reasoning": reasoning
+                    }]}
+                }),
+                None,
+            );
+            let profile = external_provider_backend_profile(&provider.id);
+            let current = super::external_provider_model_entries(&provider, &profile);
+            assert_eq!(
+                current[0]["reasoning"]["defaultEffort"], "max",
+                "{base_url}"
+            );
+            assert!(current[0]["reasoning"].get("evidenceScope").is_none());
+
+            provider.settings_config["base_url"] = json!("https://different.example/v1");
+            let moved = super::external_provider_model_entries(&provider, &profile);
+            assert!(
+                moved[0].get("reasoning").is_none(),
+                "stale endpoint: {base_url}"
+            );
+
+            provider.settings_config["base_url"] = json!(base_url);
+            provider.settings_config["modelCatalog"]["models"][0]["upstreamModel"] =
+                json!("different-wire-model");
+            let rebound = super::external_provider_model_entries(&provider, &profile);
+            assert!(
+                rebound[0].get("reasoning").is_none(),
+                "stale wire: {base_url}"
+            );
+
+            provider.settings_config["modelCatalog"]["models"][0]["reasoning"]["source"] =
+                json!("user");
+            let explicit = super::external_provider_model_entries(&provider, &profile);
+            assert_eq!(explicit[0]["reasoning"]["defaultEffort"], "max");
+        }
+    }
+
+    #[test]
+    fn external_models_response_legacy_lists_keep_explicit_but_not_stale_reasoning() {
+        for list_key in ["models", "modelList"] {
+            let mut reasoning = external_models_reasoning_fixture();
+            reasoning
+                .as_object_mut()
+                .expect("reasoning object")
+                .remove("source");
+            let mut provider = Provider::with_id(
+                "legacy-list".to_string(),
+                "Legacy List".to_string(),
+                json!({"base_url": "https://openrouter.ai/api/v1"}),
+                None,
+            );
+            provider.settings_config[list_key] = json!([{
+                "id": "legacy-public-model", "upstreamModel": "wire-model", "reasoning": reasoning,
+            }]);
+            let mut profile = external_provider_backend_profile(&provider.id);
+            profile.default_model = None;
+            let explicit = super::external_provider_model_entries(&provider, &profile);
+            assert_eq!(
+                explicit[0]["reasoning"]["defaultEffort"], "max",
+                "{list_key}"
+            );
+            provider.settings_config[list_key][0]["reasoning"]["source"] = json!("detection");
+            let automatic = super::external_provider_model_entries(&provider, &profile);
+            assert!(automatic[0].get("reasoning").is_none(), "{list_key}");
+            provider.settings_config["modelCatalog"] = json!({"models": []});
+            let empty = super::external_provider_model_entries(&provider, &profile);
+            assert!(empty.is_empty(), "{list_key}");
+        }
+    }
+
+    #[test]
+    fn external_models_response_uses_current_wire_provider_reasoning() {
+        let mut reasoning = external_models_reasoning_fixture();
+        reasoning["source"] = json!("user");
+        let mut provider = Provider::with_id(
+            "wire-provider".to_string(),
+            "Wire Provider".to_string(),
+            json!({
+                "base_url": "https://api.sublyx.org/v1",
+                "modelCatalog": {"models": [{
+                    "id": "incorrect-secondary-id",
+                    "model": "friendly-alias",
+                    "upstreamModel": "gpt-5.4",
+                    "reasoning": reasoning
+                }]}
+            }),
+            None,
+        );
+        let profile = external_provider_backend_profile(&provider.id);
+        let sublyx = super::external_provider_model_entries(&provider, &profile);
+        assert_eq!(sublyx[0]["id"], "friendly-alias");
+        assert_eq!(
+            sublyx[0]["reasoning"]["supportedEfforts"],
+            json!(["low", "medium", "high", "xhigh"])
+        );
+        assert_eq!(sublyx[0]["reasoning"]["defaultEffort"], "xhigh");
+        assert_eq!(
+            sublyx[0]["reasoning"]["codexUltraOrchestration"]["providerEffort"],
+            "xhigh"
+        );
+        provider.settings_config["base_url"] = json!("https://openrouter.ai/api/v1");
+        let openrouter = super::external_provider_model_entries(&provider, &profile);
+        assert_eq!(
+            openrouter[0]["reasoning"]["supportedEfforts"],
+            json!(["low", "high", "max"])
+        );
+        assert_eq!(openrouter[0]["reasoning"]["defaultEffort"], "max");
+    }
+
+    #[test]
+    fn external_models_response_legacy_router_rejects_stale_and_excluded_catalog_evidence() {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let mut provider = Provider::with_id(
+            "legacy-router".to_string(),
+            "Legacy Router".to_string(),
+            json!({
+                "base_url": "https://openrouter.ai/api/v1",
+                "modelCatalog": {"models": [{
+                    "model": "public-model", "reasoning": external_models_reasoning_fixture()
+                }]},
+                "codexRouting": {"enabled": true, "routes": [{
+                    "id": "legacy", "match": {"models": ["public-model"]}
+                }]}
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider)
+            .expect("save legacy router");
+        let state = build_state(db.clone());
+        let mut profile = external_provider_backend_profile(&provider.id);
+        profile.backend_type = ExternalOpenAiApiBackendType::CodexRouterRoute;
+        profile.default_model = None;
+        let stale = external_openai_api_models_response(&state, &profile).expect("legacy models");
+        assert!(stale["data"][0].get("reasoning").is_none());
+
+        provider.settings_config["modelCatalog"]["models"][0]["enabled"] = json!(false);
+        db.save_provider("codex", &provider)
+            .expect("save excluded row");
+        let excluded =
+            external_openai_api_models_response(&state, &profile).expect("excluded models");
+        assert_eq!(excluded["data"], json!([]));
+
+        provider.settings_config["model_catalog"] =
+            provider.settings_config["modelCatalog"].clone();
+        provider.settings_config["modelCatalog"] = json!({"models": []});
+        db.save_provider("codex", &provider)
+            .expect("save empty canonical catalog");
+        let empty = external_openai_api_models_response(&state, &profile).expect("empty models");
+        assert_eq!(empty["data"], json!([]));
+    }
+
     #[test]
     fn external_models_response_reads_provider_model_catalog_object() {
         let db = Arc::new(Database::memory().expect("memory db"));
@@ -10185,7 +10468,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
                                         "effortMap": {}
                                     },
                                     "codexUltraOrchestration": { "enabled": true },
-                                    "source": "REDACTED_SOURCE",
+                                    "source": "user",
                                     "providerKey": "REDACTED_PROVIDER",
                                     "outputFormat": "REDACTED_OUTPUT_FORMAT",
                                     "evidence": [{ "detail": "REDACTED_EVIDENCE" }]

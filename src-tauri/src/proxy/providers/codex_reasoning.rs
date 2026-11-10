@@ -183,6 +183,15 @@ pub struct CodexUltraOrchestrationCapability {
     pub provider_effort: Option<String>,
 }
 
+/// Non-secret binding for automatically obtained model evidence. This is
+/// provenance, not execution semantics, and is excluded from capability hashes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningEvidenceScope {
+    pub transport_fingerprint: String,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexModelReasoningCapability {
@@ -217,6 +226,9 @@ pub struct CodexModelReasoningCapability {
     /// Provider 身份（schema v2）。易变元数据，不进入能力指纹。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_key: Option<String>,
+    /// Current transport and canonical wire-model binding for automatic evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_scope: Option<ReasoningEvidenceScope>,
     /// 模型 revision（schema v2）。易变元数据，不进入能力指纹。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_revision: Option<String>,
@@ -874,6 +886,7 @@ pub fn builtin_reasoning_capability_for_model(
         confidence: Some(CapabilityConfidence::Maintained),
         fetched_at: None,
         provider_key: None,
+        evidence_scope: None,
         model_revision: None,
         codex_ultra_orchestration: None,
     })
@@ -930,6 +943,7 @@ pub fn sublyx_reasoning_capability_for_model(model: &str) -> Option<CodexModelRe
         confidence: Some(CapabilityConfidence::Maintained),
         fetched_at: None,
         provider_key: None,
+        evidence_scope: None,
         model_revision: None,
         codex_ultra_orchestration: Some(CodexUltraOrchestrationCapability {
             enabled: true,
@@ -1234,6 +1248,7 @@ fn lightweight_reasoning_capability(value: &Value) -> Option<CodexModelReasoning
         confidence: None,
         fetched_at: None,
         provider_key: None,
+        evidence_scope: None,
         model_revision: None,
         codex_ultra_orchestration: None,
     };
@@ -1310,6 +1325,7 @@ pub fn reasoning_capability_from_provider_model_entry(
         confidence: Some(CapabilityConfidence::Authoritative),
         fetched_at: None,
         provider_key: None,
+        evidence_scope: None,
         model_revision: None,
         codex_ultra_orchestration: None,
     };
@@ -1497,6 +1513,7 @@ pub fn official_reasoning_capability_for_model(
         confidence: Some(CapabilityConfidence::Authoritative),
         fetched_at: None,
         provider_key: None,
+        evidence_scope: None,
         model_revision: None,
         codex_ultra_orchestration: codex_ultra_enabled.then_some(
             CodexUltraOrchestrationCapability {
@@ -2605,6 +2622,10 @@ mod tests {
         volatile.source = Some("user".into());
         volatile.confidence = Some(CapabilityConfidence::Inferred);
         volatile.provider_key = Some("other".into());
+        volatile.evidence_scope = Some(ReasoningEvidenceScope {
+            transport_fingerprint: "different-transport".into(),
+            model: "different-model".into(),
+        });
         volatile.model_revision = Some("v9".into());
         volatile.schema_version = None;
         // legacy 形态但运行语义相同：指纹必须一致。

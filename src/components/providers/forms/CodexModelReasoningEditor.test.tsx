@@ -447,7 +447,7 @@ describe("CodexModelReasoningEditor", () => {
     render(
       <CodexModelReasoningEditor
         model="gpt-6.1"
-        providerIdentity={{ baseUrl: "https://api.sublyx.com/v1" }}
+        providerIdentity={{ baseUrl: "https://api.sublyx.org/v1" }}
         capability={sublyxCapability}
         readOnly={false}
         onChange={onChange}
@@ -490,7 +490,7 @@ describe("CodexModelReasoningEditor", () => {
     render(
       <CodexModelReasoningEditor
         model="gpt-6.1"
-        providerIdentity={{ baseUrl: "https://api.sublyx.com/v1" }}
+        providerIdentity={{ baseUrl: "https://api.sublyx.org/v1" }}
         capability={{ ...qwenCapability, supportStatus: "unknown" }}
         readOnly={false}
         onChange={vi.fn()}
@@ -579,7 +579,7 @@ describe("CodexModelReasoningEditor", () => {
   it.each([
     {
       label: "explicit provider",
-      providerIdentity: { baseUrl: "https://api.sublyx.com/v1" },
+      providerIdentity: { baseUrl: "https://api.sublyx.org/v1" },
       providerKey: undefined,
     },
     {
@@ -664,7 +664,7 @@ describe("CodexModelReasoningEditor", () => {
     render(
       <CodexModelReasoningEditor
         model="claude-sonnet"
-        providerIdentity={{ baseUrl: "https://api.sublyx.com/v1" }}
+        providerIdentity={{ baseUrl: "https://api.sublyx.org/v1" }}
         capability={sublyxCapability}
         readOnly={false}
         onChange={vi.fn()}
@@ -694,7 +694,7 @@ describe("CodexModelReasoningEditor", () => {
       <CodexModelReasoningEditor
         model="public-alias"
         upstreamModel="gpt-6.1"
-        providerIdentity={{ baseUrl: "https://api.sublyx.com/v1" }}
+        providerIdentity={{ baseUrl: "https://api.sublyx.org/v1" }}
         capability={{ ...sublyxCapability, source: "user" }}
         readOnly={false}
         onChange={vi.fn()}
@@ -708,7 +708,7 @@ describe("CodexModelReasoningEditor", () => {
       <CodexModelReasoningEditor
         model="gpt-public-alias"
         upstreamModel="claude-sonnet"
-        providerIdentity={{ baseUrl: "https://api.sublyx.com/v1" }}
+        providerIdentity={{ baseUrl: "https://api.sublyx.org/v1" }}
         capability={{ ...sublyxCapability, source: "user" }}
         readOnly={false}
         onChange={vi.fn()}

@@ -19,6 +19,7 @@ pub mod catalog;
 pub mod provider_metadata;
 
 use crate::provider::Provider;
+pub use crate::proxy::providers::codex_reasoning::ReasoningEvidenceScope;
 use crate::proxy::providers::codex_reasoning::{
     builtin_reasoning_capability_for_model, capability_fingerprint,
     normalize_sublyx_reasoning_capability_for_model, official_reasoning_capability_for_model,
@@ -29,6 +30,7 @@ use crate::proxy::providers::codex_reasoning::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -84,6 +86,9 @@ pub struct ProviderCapabilitySnapshot {
     pub fetched_at: i64,
     /// 来源标识：`openrouter_api` / `vllm_server` / ...
     pub source: String,
+    /// Binding to the current API transport and canonical wire identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_scope: Option<ReasoningEvidenceScope>,
     pub reasoning: Option<ReasoningCapabilitySnapshot>,
 }
 
@@ -146,7 +151,7 @@ pub struct DetectionCache {
 
 impl DetectionCache {
     fn key(provider_key: &str, model: &str) -> String {
-        format!("{provider_key}\u{1f}{model}")
+        format!("{provider_key}\u{1f}{}", model.trim().to_ascii_lowercase())
     }
 
     /// 读取未过期的候选快照；过期或不存在返回 None。
@@ -178,9 +183,154 @@ pub fn detection_cache() -> &'static Mutex<DetectionCache> {
 }
 
 /// 读取当前 provider+model 的 TTL 候选快照（无或过期返回 None）。
-pub fn current_detection(provider_key: &str, model: &str) -> Option<ProviderCapabilitySnapshot> {
+fn current_detection(provider_key: &str, model: &str) -> Option<ProviderCapabilitySnapshot> {
     let cache = detection_cache().lock().expect("detection cache poisoned");
     cache.get(provider_key, model).cloned()
+}
+
+/// Build non-secret provenance from the same conservative API URL normalizer
+/// used by protocol declarations. Credential-bearing/option URLs are rejected;
+/// neither their text nor their hashes enter saved evidence or diagnostics.
+pub(crate) fn reasoning_evidence_scope(
+    base_url: &str,
+    wire_model: &str,
+) -> Option<ReasoningEvidenceScope> {
+    let base_url =
+        crate::codex_multirouter::protocol_capability::normalize_protocol_capability_base_url(
+            base_url,
+        )?;
+    let model = wire_model.trim().to_ascii_lowercase();
+    if model.is_empty() {
+        return None;
+    }
+    Some(ReasoningEvidenceScope {
+        transport_fingerprint: hex::encode(Sha256::digest(base_url.as_bytes())),
+        model,
+    })
+}
+
+/// Resolve a public/catalog alias to its current enabled canonical wire model.
+/// Ambiguous and excluded rows cannot supply evidence or revive via the cache.
+pub(crate) fn reasoning_wire_model_for_settings(settings: &Value, model: &str) -> Option<String> {
+    use crate::codex_multirouter::catalog::{lookup_catalog_model, CatalogModelLookup};
+    let wire_model = match lookup_catalog_model(settings, model) {
+        CatalogModelLookup::Ambiguous => return None,
+        CatalogModelLookup::Found(entry) => {
+            if entry.get("enabled").and_then(Value::as_bool) == Some(false) {
+                return None;
+            }
+            ["upstreamModel", "upstream_model", "model", "id", "slug"]
+                .iter()
+                .filter_map(|key| entry.get(*key).and_then(Value::as_str))
+                .map(str::trim)
+                .find(|value| !value.is_empty())
+                .unwrap_or(model)
+        }
+        CatalogModelLookup::Missing => model,
+    };
+    let wire_model = wire_model.trim();
+    (!wire_model.is_empty()).then(|| wire_model.to_string())
+}
+
+pub(crate) fn reasoning_evidence_scope_for_settings(
+    settings: &Value,
+    model: &str,
+) -> Option<ReasoningEvidenceScope> {
+    let base_url = provider_metadata::base_url_from_settings(settings)?;
+    let wire_model = reasoning_wire_model_for_settings(settings, model)?;
+    reasoning_evidence_scope(&base_url, &wire_model)
+}
+
+fn evidence_scope_matches(
+    settings: &Value,
+    model: &str,
+    scope: Option<&ReasoningEvidenceScope>,
+) -> bool {
+    scope.is_some_and(|scope| {
+        reasoning_evidence_scope_for_settings(settings, model).as_ref() == Some(scope)
+    })
+}
+
+fn snapshot_matches_context(
+    settings: &Value,
+    platform: Option<&str>,
+    model: &str,
+    snapshot: &ProviderCapabilitySnapshot,
+) -> bool {
+    if !evidence_scope_matches(settings, model, snapshot.evidence_scope.as_ref()) {
+        return false;
+    }
+    if !snapshot.evidence_scope.as_ref().is_some_and(|scope| {
+        scope.model.eq_ignore_ascii_case(snapshot.model.trim())
+            || reasoning_wire_model_for_settings(settings, &snapshot.model)
+                .is_some_and(|wire| scope.model.eq_ignore_ascii_case(wire.trim()))
+    }) {
+        return false;
+    }
+    let source_platform = match snapshot.source.as_str() {
+        "openrouter_api" => Some("openrouter"),
+        "vllm_server" => Some("vllm"),
+        _ => None,
+    };
+    !matches!((platform, source_platform), (Some(actual), Some(source)) if actual != source)
+}
+
+/// Read only a snapshot bound to this endpoint and its current wire identity.
+/// Old unscoped cache entries are intentionally not adopted after upgrading.
+pub(crate) fn current_detection_for_settings(
+    settings: &Value,
+    provider_key: &str,
+    model: &str,
+) -> Option<ProviderCapabilitySnapshot> {
+    let wire_model = reasoning_wire_model_for_settings(settings, model)?;
+    let platform = provider_metadata::detect_platform_from_settings(settings);
+    current_detection(provider_key, model)
+        .filter(|snapshot| snapshot_matches_context(settings, platform, model, snapshot))
+        .or_else(|| {
+            (!model.trim().eq_ignore_ascii_case(&wire_model))
+                .then(|| current_detection(provider_key, &wire_model))
+                .flatten()
+                .filter(|snapshot| snapshot_matches_context(settings, platform, model, snapshot))
+        })
+}
+
+pub(crate) fn current_detection_for_provider(
+    provider: &Provider,
+    model: &str,
+) -> Option<ProviderCapabilitySnapshot> {
+    current_detection_for_settings(
+        &provider.settings_config,
+        reasoning_provider_key(provider),
+        model,
+    )
+}
+
+fn capability_matches_context(
+    settings: &Value,
+    platform: Option<&str>,
+    model: &str,
+    capability: &CodexModelReasoningCapability,
+) -> bool {
+    if is_explicit_reasoning_declaration(capability) {
+        return true;
+    }
+    if !evidence_scope_matches(settings, model, capability.evidence_scope.as_ref()) {
+        return false;
+    }
+    let source_platform = match capability.source.as_deref() {
+        Some("openrouter_api") => Some("openrouter"),
+        Some("vllm_server") => Some("vllm"),
+        Some("sublyx") => Some("sublyx"),
+        _ => None,
+    };
+    !matches!((platform, source_platform), (Some(actual), Some(source)) if actual != source)
+}
+
+fn is_explicit_reasoning_declaration(capability: &CodexModelReasoningCapability) -> bool {
+    matches!(
+        capability.source.as_deref(),
+        None | Some("user" | "user_confirmed_detection")
+    )
 }
 
 /// Use the target provider identity for routed capability evidence. Route IDs
@@ -226,12 +376,44 @@ pub fn resolve_codex_model_capability(
         &official_models,
         |candidate| {
             if candidate.eq_ignore_ascii_case(model) {
-                detection.cloned()
+                detection
+                    .filter(|snapshot| snapshot.provider_key == reasoning_provider_key(provider))
+                    .cloned()
             } else {
-                current_detection(reasoning_provider_key(provider), candidate)
+                current_detection_for_provider(provider, candidate)
             }
         },
     )
+}
+
+/// Resolve legacy model-list source objects through the same canonical pipeline.
+///
+/// This is a read-only compatibility adapter, not another persisted catalog:
+/// a valid current catalog (including an empty one) always wins. Only an absent
+/// or malformed catalog permits the legacy source to form an ephemeral row.
+pub(crate) fn resolve_codex_model_capability_for_model_source(
+    provider: &Provider,
+    model: &str,
+    source: &Value,
+) -> ResolvedModelCapability {
+    let adapted_provider =
+        if crate::codex_multirouter::catalog::read_catalog(&provider.settings_config).is_none() {
+            let mut adapted = provider.clone();
+            let mut row = source.as_object().cloned().unwrap_or_default();
+            row.insert("model".to_string(), Value::String(model.to_string()));
+            adapted.settings_config["modelCatalog"] = serde_json::json!({
+                "models": [Value::Object(row)]
+            });
+            if let Some(settings) = adapted.settings_config.as_object_mut() {
+                settings.remove("model_catalog");
+            }
+            Some(adapted)
+        } else {
+            None
+        };
+    let provider = adapted_provider.as_ref().unwrap_or(provider);
+    let detection = current_detection_for_provider(provider, model);
+    resolve_codex_model_capability(provider, model, detection.as_ref())
 }
 
 /// 测试用 resolver 入口（可注入能力库；不加载 official 缓存，保持确定性）。
@@ -252,7 +434,9 @@ pub fn resolve_codex_model_capability_with_library(
         &[],
         |candidate| {
             if candidate.eq_ignore_ascii_case(model) {
-                detection.cloned()
+                detection
+                    .filter(|snapshot| snapshot.provider_key == reasoning_provider_key(provider))
+                    .cloned()
             } else {
                 None
             }
@@ -366,6 +550,9 @@ pub(crate) fn resolve_codex_model_capability_for_settings(
             reasoning_capability_from_model_entry(&serde_json::json!({
                 "reasoning": reasoning,
             }))
+        })
+        .filter(|capability| {
+            capability_matches_context(settings, platform, canonical_model, capability)
         });
     provider_reasoning.map_or(resolved, |capability| {
         resolved_with_catalog_ultra_setting(
@@ -462,7 +649,10 @@ fn resolved_with_catalog_ultra_setting(
     source: CapabilitySource,
     capability: CodexModelReasoningCapability,
 ) -> ResolvedModelCapability {
-    let capability = apply_catalog_ultra_setting(settings, model, capability);
+    let mut capability = apply_catalog_ultra_setting(settings, model, capability);
+    if !is_explicit_reasoning_declaration(&capability) {
+        capability.evidence_scope = reasoning_evidence_scope_for_settings(settings, model);
+    }
     ResolvedModelCapability {
         fingerprint: capability_fingerprint(&capability),
         capability: Some(capability),
@@ -539,7 +729,9 @@ pub fn resolve_codex_model_capability_core(
         |capability| normalize_provider_reasoning_capability(platform, wire_model, capability);
 
     // 1. 用户模型级声明（始终最高优先级）
-    if let Some(capability) = resolve_reasoning_capability_from_settings(settings, model) {
+    if let Some(capability) = resolve_reasoning_capability_from_settings(settings, model)
+        .filter(|capability| capability_matches_context(settings, platform, model, capability))
+    {
         return resolved_with_catalog_ultra_setting(
             settings,
             model,
@@ -548,7 +740,10 @@ pub fn resolve_codex_model_capability_core(
         );
     }
 
-    // 2. Codex inline provider model declaration.
+    // 2. A declaration parsed from the currently selected TOML provider is
+    // explicit current configuration, not a previously persisted automatic
+    // projection. Only this parsing branch is trusted without a saved scope;
+    // catalog/provider-wide source=provider_config still requires provenance.
     if let Some(capability) = resolve_reasoning_capability_from_provider_config(settings, model) {
         return resolved_with_catalog_ultra_setting(
             settings,
@@ -559,7 +754,9 @@ pub fn resolve_codex_model_capability_core(
     }
 
     // 3. 动态检测候选（只读元数据，TTL）
-    if let Some(snapshot) = detection {
+    if let Some(snapshot) =
+        detection.filter(|snapshot| snapshot_matches_context(settings, platform, model, snapshot))
+    {
         if let Some(capability) = snapshot_to_capability(snapshot) {
             return resolved_with_catalog_ultra_setting(
                 settings,
@@ -588,7 +785,10 @@ pub fn resolve_codex_model_capability_core(
     // known aggregator may expose the same model through a different wire
     // shape, so applying this fallback there would silently mis-encode the
     // request instead of failing closed.
-    if platform.is_none() || platform == Some("deepseek") {
+    if platform.is_none()
+        || (platform == Some("deepseek")
+            && model.trim().to_ascii_lowercase().starts_with("deepseek-"))
+    {
         if let Some(capability) = builtin_reasoning_capability_for_model(model) {
             return resolved_with_catalog_ultra_setting(
                 settings,
@@ -770,6 +970,7 @@ pub fn snapshot_to_capability(
         confidence: Some(CapabilityConfidence::Verified),
         fetched_at: Some(snapshot.fetched_at.to_string()),
         provider_key: Some(snapshot.provider_key.clone()),
+        evidence_scope: snapshot.evidence_scope.clone(),
         model_revision: None,
         codex_ultra_orchestration: codex_ultra_enabled.then_some(
             crate::proxy::providers::codex_reasoning::CodexUltraOrchestrationCapability {
@@ -824,6 +1025,233 @@ mod tests {
             icon_color: None,
             in_failover_queue: false,
         }
+    }
+
+    const SCOPED_PROVIDER_ENDPOINTS: [&str; 6] = [
+        "https://openrouter.ai/api/v1",
+        "https://api.sublyx.org/v1",
+        "https://vllm.local/v1",
+        "https://api.deepseek.com/v1",
+        "https://api.z.ai/api/paas/v4",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    ];
+
+    fn automatic_capability(source: &str) -> CodexModelReasoningCapability {
+        let mut capability = reasoning_capability_from_model_entry(&json!({
+            "reasoning": user_declared_reasoning(),
+        }))
+        .expect("test capability");
+        capability.source = Some(source.into());
+        capability
+    }
+
+    #[test]
+    fn automatic_catalog_evidence_requires_current_scope_but_explicit_declarations_survive() {
+        for endpoint in SCOPED_PROVIDER_ENDPOINTS {
+            for source in [
+                "detection",
+                "library",
+                "builtin",
+                "official",
+                "provider",
+                "sublyx",
+            ] {
+                let mut provider = plain_provider("Provider", endpoint);
+                let mut capability = automatic_capability(source);
+                provider.settings_config["modelCatalog"] = json!({"models": [{
+                    "model": "public-model", "upstreamModel": "wire-model", "reasoning": capability,
+                }]});
+                let unresolved = resolve_codex_model_capability_with_library(
+                    &provider,
+                    "public-model",
+                    None,
+                    None,
+                );
+                assert!(
+                    unresolved.capability.is_none(),
+                    "{endpoint} inherited unscoped {source}"
+                );
+
+                for explicit_source in [None, Some("user"), Some("user_confirmed_detection")] {
+                    capability.source = explicit_source.map(str::to_string);
+                    provider.settings_config["modelCatalog"]["models"][0]["reasoning"] =
+                        serde_json::to_value(&capability).unwrap();
+                    let declared = resolve_codex_model_capability_with_library(
+                        &provider,
+                        "public-model",
+                        None,
+                        None,
+                    );
+                    assert_eq!(declared.source, CapabilitySource::UserConfig);
+                    assert_eq!(
+                        declared.capability.unwrap().supported_efforts,
+                        vec!["low", "high"]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_catalog_scope_isolates_every_known_endpoint_and_wire_model() {
+        for endpoint in SCOPED_PROVIDER_ENDPOINTS {
+            let mut provider = plain_provider("Provider", endpoint);
+            let mut capability = automatic_capability("detection");
+            capability.evidence_scope = reasoning_evidence_scope(endpoint, "wire-model");
+            provider.settings_config["modelCatalog"] = json!({"models": [{
+                "model": "public-model", "upstreamModel": "wire-model", "reasoning": capability,
+            }]});
+            let valid =
+                resolve_codex_model_capability_with_library(&provider, "public-model", None, None);
+            assert!(
+                valid.capability.is_some(),
+                "current evidence rejected for {endpoint}"
+            );
+            for other_endpoint in SCOPED_PROVIDER_ENDPOINTS {
+                if other_endpoint == endpoint {
+                    continue;
+                }
+                provider.settings_config["base_url"] = json!(other_endpoint);
+                let changed = resolve_codex_model_capability_with_library(
+                    &provider,
+                    "public-model",
+                    None,
+                    None,
+                );
+                assert!(
+                    changed.capability.is_none(),
+                    "{endpoint} evidence leaked into {other_endpoint}"
+                );
+            }
+            provider.settings_config["base_url"] = json!(endpoint);
+            provider.settings_config["modelCatalog"]["models"][0]["upstreamModel"] =
+                json!("new-wire");
+            let renamed =
+                resolve_codex_model_capability_with_library(&provider, "public-model", None, None);
+            assert!(
+                renamed.capability.is_none(),
+                "old wire evidence survived remapping for {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn detection_scope_rejects_cross_platform_and_unrelated_model_snapshots() {
+        let mut provider = plain_provider("vLLM", "https://vllm.local/v1");
+        let mut snapshot = openrouter_detection_snapshot();
+        snapshot.model = "wire-model".into();
+        snapshot.evidence_scope =
+            reasoning_evidence_scope_for_settings(&provider.settings_config, "wire-model");
+        let crossed = resolve_codex_model_capability_with_library(
+            &provider,
+            "wire-model",
+            Some(&snapshot),
+            None,
+        );
+        assert!(
+            crossed.capability.is_none(),
+            "OpenRouter source cannot become vLLM evidence"
+        );
+
+        provider.settings_config["base_url"] = json!("https://openrouter.ai/api/v1");
+        snapshot.evidence_scope =
+            reasoning_evidence_scope_for_settings(&provider.settings_config, "wire-model");
+        snapshot.model = "different-model".into();
+        let wrong_model = resolve_codex_model_capability_with_library(
+            &provider,
+            "wire-model",
+            Some(&snapshot),
+            None,
+        );
+        assert!(
+            wrong_model.capability.is_none(),
+            "an unrelated model snapshot cannot be adopted"
+        );
+    }
+
+    #[test]
+    fn scoped_detection_cache_uses_current_target_wire_and_rejects_endpoint_edits() {
+        let mut provider = plain_provider("OpenRouter", "https://openrouter.ai/api/v1");
+        provider.id = "scope-test-router".into();
+        provider.settings_config["codexResolvedTargetProviderId"] = json!("scope-test-target");
+        provider.settings_config["modelCatalog"] = json!({"models": [{
+            "model": "public-model", "aliases": ["friendly"], "upstreamModel": "wire-model",
+        }]});
+        let mut snapshot = openrouter_detection_snapshot();
+        snapshot.provider_key = "scope-test-target".into();
+        snapshot.model = "wire-model".into();
+        snapshot.evidence_scope =
+            reasoning_evidence_scope_for_settings(&provider.settings_config, "public-model");
+        detection_cache().lock().unwrap().insert(snapshot.clone());
+        for model in ["public-model", "friendly", "wire-model"] {
+            assert!(
+                current_detection_for_provider(&provider, model).is_some(),
+                "{model}"
+            );
+        }
+        provider.settings_config["base_url"] = json!("https://another-openrouter.example/api/v1");
+        assert!(current_detection_for_provider(&provider, "public-model").is_none());
+        provider.settings_config["base_url"] = json!("https://openrouter.ai/api/v1");
+        provider.settings_config["modelCatalog"]["models"][0]["enabled"] = json!(false);
+        assert!(current_detection_for_provider(&provider, "public-model").is_none());
+        provider.settings_config["modelCatalog"]["models"][0]["enabled"] = json!(true);
+        snapshot.evidence_scope = None;
+        detection_cache().lock().unwrap().insert(snapshot);
+        assert!(current_detection_for_provider(&provider, "public-model").is_none());
+    }
+
+    #[test]
+    fn official_deepseek_does_not_inherit_kimi_builtin_contract() {
+        for model in ["k3", "k3-256k"] {
+            let resolved = resolve_codex_model_capability_core(
+                &json!({}),
+                Some("deepseek"),
+                model,
+                None,
+                None,
+                &[],
+            );
+            assert!(
+                resolved.capability.is_none(),
+                "DeepSeek endpoint inherited Kimi {model}"
+            );
+            let legacy =
+                resolve_codex_model_capability_core(&json!({}), None, model, None, None, &[]);
+            assert_eq!(legacy.source, CapabilitySource::Builtin);
+        }
+        let deepseek = resolve_codex_model_capability_core(
+            &json!({}),
+            Some("deepseek"),
+            "deepseek-v4-pro",
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(deepseek.source, CapabilitySource::Builtin);
+    }
+
+    #[test]
+    fn reasoning_evidence_scope_normalizes_api_identity_without_serializing_secrets() {
+        let normal =
+            reasoning_evidence_scope("https://API.example:443/v1/", " Wire-Model ").unwrap();
+        let same = reasoning_evidence_scope("https://api.example/v1", "wire-model").unwrap();
+        assert_eq!(normal, same);
+        assert_eq!(normal.transport_fingerprint.len(), 64);
+        assert_ne!(
+            Some(normal.clone()),
+            reasoning_evidence_scope("https://api.example/v2", "wire-model")
+        );
+        for unsafe_url in [
+            "https://secret-user:secret-pass@api.example/v1",
+            "https://api.example/v1?api_key=secret-token",
+            "https://api.example/v1#secret-token",
+            "file:///secret-token",
+        ] {
+            assert!(reasoning_evidence_scope(unsafe_url, "wire-model").is_none());
+        }
+        let serialized = serde_json::to_string(&normal).unwrap();
+        assert!(!serialized.contains("api.example"));
+        assert!(!serialized.contains("secret"));
     }
 
     #[test]
@@ -933,8 +1361,11 @@ mod tests {
         provider.settings_config["modelCatalog"]["models"][0]["upstreamModel"] =
             json!("deepseek-v4-pro");
         provider.settings_config["reasoning"] = user_declared_reasoning();
+        provider.settings_config["base_url"] = json!("https://example.com/v1");
         let mut detection = openrouter_detection_snapshot();
         detection.model = "provider-fallback-public".into();
+        detection.evidence_scope =
+            reasoning_evidence_scope_for_settings(&provider.settings_config, &detection.model);
         detection.reasoning.as_mut().unwrap().supported_efforts = vec!["low".into()];
         detection.reasoning.as_mut().unwrap().default_effort = Some("low".into());
 
@@ -1009,8 +1440,11 @@ mod tests {
         provider.settings_config["modelCatalog"]["models"][0]["upstreamModel"] =
             json!("provider-fallback-detection-wire");
         provider.settings_config["reasoning"] = user_declared_reasoning();
+        provider.settings_config["base_url"] = json!("https://example.com/v1");
         let mut detection = openrouter_detection_snapshot();
         detection.model = "provider-fallback-detection-alias".into();
+        detection.evidence_scope =
+            reasoning_evidence_scope_for_settings(&provider.settings_config, &detection.model);
         detection.reasoning.as_mut().unwrap().supported_efforts = vec!["low".into()];
         detection.reasoning.as_mut().unwrap().default_effort = Some("low".into());
         let alias = resolve_codex_model_capability_with_library(
@@ -1054,8 +1488,11 @@ mod tests {
             json!("provider-fallback-wire");
         provider.settings_config["modelCatalog"]["models"][0]["codexUltra"] =
             json!({"enabled": true, "providerEffort": "max"});
+        provider.settings_config["base_url"] = json!("https://example.com/v1");
         let mut detection = openrouter_detection_snapshot();
         detection.model = "provider-fallback-wire".into();
+        detection.evidence_scope =
+            reasoning_evidence_scope_for_settings(&provider.settings_config, &detection.model);
         let resolved = resolve_codex_model_capability_for_settings(
             &provider.settings_config,
             None,
@@ -1157,6 +1594,10 @@ mod tests {
             model: "deepseek/deepseek-v4-pro".into(),
             fetched_at: 1_700_000_000_000,
             source: "openrouter_api".into(),
+            evidence_scope: reasoning_evidence_scope(
+                "https://openrouter.ai/api/v1",
+                "deepseek/deepseek-v4-pro",
+            ),
             reasoning: Some(ReasoningCapabilitySnapshot {
                 supported_efforts: vec!["max".into(), "high".into(), "low".into()],
                 default_effort: Some("high".into()),
@@ -1395,6 +1836,7 @@ mod tests {
             model: "m".into(),
             fetched_at: 0,
             source: "openrouter_api".into(),
+            evidence_scope: None,
             reasoning: Some(ReasoningCapabilitySnapshot {
                 supported_efforts: vec![],
                 default_effort: None,
@@ -1420,6 +1862,7 @@ mod tests {
             model: "m".into(),
             fetched_at: 0,
             source: "openrouter_api".into(),
+            evidence_scope: None,
             reasoning: Some(ReasoningCapabilitySnapshot::default()),
         };
         let capability = snapshot_to_capability(&snapshot).expect("reasoning capability");
@@ -1656,11 +2099,15 @@ mod tests {
 
     #[test]
     fn catalog_ultra_target_does_not_overwrite_openrouter_native_max() {
-        let settings = json!({"modelCatalog": {"models": [{
+        let mut settings = json!({"base_url":"https://openrouter.ai/api/v1", "modelCatalog": {"models": [{
             "model": "openai/gpt-native-max",
             "reasoning": native_max_reasoning("openrouter_api"),
             "codexUltra": {"enabled": true, "providerEffort": "high"}
         }]}});
+        settings["modelCatalog"]["models"][0]["reasoning"]["evidenceScope"] = serde_json::to_value(
+            reasoning_evidence_scope_for_settings(&settings, "openai/gpt-native-max").unwrap(),
+        )
+        .unwrap();
         let resolved = resolve_codex_model_capability_core(
             &settings,
             Some("openrouter"),
@@ -1886,6 +2333,62 @@ defaultReasoningLevel = "max"
                 .supported_efforts,
             vec!["high", "max"]
         );
+    }
+
+    #[test]
+    fn active_inline_reasoning_is_explicit_but_persisted_provider_config_remains_scoped() {
+        let mut settings = json!({
+            "base_url": "https://inline-evidence.example/v1",
+            "modelCatalog": {"models": [{
+                "model": "inline-evidence-model",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low"],
+                    "defaultEffort": "low",
+                    "disableAllowed": false,
+                    "upstream": {"format": "string", "parameter": "reasoning_effort"},
+                    "source": "provider_config"
+                }
+            }]},
+            "config": r#"
+model_provider = "active"
+[model_providers.active]
+base_url = "https://inline-evidence.example/v1"
+[[model_providers.active.models]]
+id = "inline-evidence-model"
+supported_reasoning_levels = ["high"]
+default_reasoning_level = "high"
+"#
+        });
+        let current_inline = resolve_codex_model_capability_core(
+            &settings,
+            None,
+            "inline-evidence-model",
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(current_inline.source, CapabilitySource::ProviderConfig);
+        assert_eq!(
+            current_inline.capability.unwrap().supported_efforts,
+            vec!["high"]
+        );
+
+        // A persisted projection is not an explicit declaration merely because
+        // it retained the source label from a formerly active TOML model.
+        settings.as_object_mut().unwrap().remove("config");
+        let stale_projection = resolve_codex_model_capability_core(
+            &settings,
+            None,
+            "inline-evidence-model",
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(stale_projection.source, CapabilitySource::Unknown);
+        assert!(stale_projection.capability.is_none());
     }
 
     #[test]

@@ -12,6 +12,51 @@ import {
 import { completeCodexReasoningEffortMap } from "./codexReasoningCapability";
 
 describe("Codex catalog reasoning capability persistence", () => {
+  it("preserves scoped automatic evidence through Sublyx save reconciliation", () => {
+    const scope = {
+      transportFingerprint: "a".repeat(64),
+      model: "gpt-wire-model",
+    };
+    const reasoning: CodexModelReasoningCapability = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: ["high", "max"],
+      defaultEffort: "max",
+      disableAllowed: false,
+      upstream: {
+        format: "reasoning_object",
+        parameter: "reasoning.effort",
+        effortMap: { high: "high", max: "max" },
+      },
+      source: "user_confirmed_detection",
+      evidenceScope: scope,
+    };
+    const before = structuredClone(reasoning);
+    const [saved] = normalizeCodexCatalogModelsForSave(
+      [
+        {
+          model: "Visible catalog alias",
+          upstreamModel: "gpt-wire-model",
+          reasoning,
+        },
+      ],
+      { baseUrl: "https://api.sublyx.org/v1" },
+    );
+    expect(saved.reasoning?.evidenceScope).toEqual(scope);
+    expect(saved.reasoning?.source).toBe("user_confirmed_detection");
+    expect(saved.reasoning?.supportedEfforts).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    expect(JSON.parse(JSON.stringify(saved)).reasoning.evidenceScope).toEqual(
+      scope,
+    );
+    expect(reasoning).toEqual(before);
+  });
+
   it("separates automatic, maintained and manual capability sources", () => {
     const maintained: CodexModelReasoningCapability = {
       supported: true,
@@ -334,7 +379,7 @@ describe("Codex catalog reasoning capability persistence", () => {
     };
     const snapshot = JSON.stringify(row);
     const [saved] = normalizeCodexCatalogModelsForSave([row], {
-      baseUrl: "https://api.sublyx.com/v1",
+      baseUrl: "https://api.sublyx.org/v1",
     });
     expect(saved.reasoning).toMatchObject({
       schemaVersion: 2,
@@ -370,7 +415,7 @@ describe("Codex catalog reasoning capability persistence", () => {
             codexUltra: { enabled: true, providerEffort: "max" },
           },
         ],
-        { baseUrl: "https://api.sublyx.com/v1" },
+        { baseUrl: "https://api.sublyx.org/v1" },
       )[0].codexUltra,
     ).toEqual({ enabled: true, providerEffort: "xhigh" });
   });
@@ -383,7 +428,7 @@ describe("Codex catalog reasoning capability persistence", () => {
     },
     {
       model: "claude-sonnet",
-      baseUrl: "https://api.sublyx.com/v1",
+      baseUrl: "https://api.sublyx.org/v1",
       source: "sublyx" as const,
     },
     {
@@ -447,7 +492,7 @@ describe("Codex catalog reasoning capability persistence", () => {
           codexUltra: { enabled: true, providerEffort: "max" },
         },
       ],
-      { baseUrl: "https://api.sublyx.com/v1" },
+      { baseUrl: "https://api.sublyx.org/v1" },
     );
     expect(saved.reasoning?.supportedEfforts).toEqual(["max"]);
     expect(saved.codexUltra?.providerEffort).toBe("max");

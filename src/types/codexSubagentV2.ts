@@ -1,3 +1,8 @@
+import type {
+  CodexReasoningEvidenceScope,
+  CodexModelReasoningCapability,
+} from "@/types";
+
 export type CodexSubagentV2SelectionPolicy =
   "balanced" | "official_first" | "third_party_first";
 
@@ -83,6 +88,7 @@ export interface CodexModelReasoningDeclaredCapability {
   source?: string | null;
   /** Provider transport identity is independent of manual/detected provenance. */
   providerKey?: string | null;
+  evidenceScope?: CodexReasoningEvidenceScope | null;
   confidence?: CodexReasoningCapabilityConfidence | null;
   codexUltraOrchestration?: {
     enabled: boolean;
@@ -99,6 +105,12 @@ export interface CodexModelReasoningDetectionReasoning {
   mandatory: boolean;
   /** 服务端默认是否开启推理。 */
   defaultEnabled?: boolean | null;
+  supportsMaxTokens?: boolean;
+  upstreamFormat?:
+    CodexModelReasoningCapability["upstream"]["format"] | "object" | null;
+  upstreamParameter?:
+    CodexModelReasoningCapability["upstream"]["parameter"] | null;
+  outputFormat?: CodexModelReasoningCapability["outputFormat"] | null;
 }
 
 /** 只读检测快照（TTL 缓存中的候选，供「采用检测结果」动作）。 */
@@ -109,6 +121,7 @@ export interface CodexModelReasoningDetection {
   fetchedAt: number;
   /** 来源标识：openrouter_api / vllm_server / ... */
   source: string;
+  evidenceScope?: CodexReasoningEvidenceScope | null;
   reasoning?: CodexModelReasoningDetectionReasoning | null;
 }
 

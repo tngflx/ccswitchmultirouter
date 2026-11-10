@@ -1618,6 +1618,7 @@ pub fn run() {
             codex_runtime_refresh::refresh_codex_runtime_state,
             codex_config::get_codex_subagent_reasoning_capabilities,
             codex_config::resolve_codex_model_reasoning_capability,
+            codex_config::bind_codex_preset_reasoning_evidence,
             codex_config::trigger_codex_model_reasoning_detection,
             codex_config::inspect_codex_reasoning_capability,
             codex_config::list_codex_reasoning_capabilities,

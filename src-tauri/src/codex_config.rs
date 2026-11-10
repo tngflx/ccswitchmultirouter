@@ -5677,7 +5677,7 @@ fn resolve_codex_model_reasoning_capability_value(
     model: &str,
 ) -> CodexModelReasoningResolution {
     let model = model.trim().to_string();
-    let detection = crate::reasoning_capabilities::current_detection(provider_id, &model);
+    let detection = std::cell::RefCell::new(None);
     let library = crate::reasoning_capabilities::catalog::global_library();
     let official_models = codex_official_models_cache().unwrap_or_default();
     let platform = crate::reasoning_capabilities::provider_metadata::detect_platform_from_settings(
@@ -5689,8 +5689,24 @@ fn resolve_codex_model_reasoning_capability_value(
         &model,
         library.as_ref(),
         &official_models,
-        |candidate| crate::reasoning_capabilities::current_detection(provider_id, candidate),
+        |candidate| {
+            let snapshot = crate::reasoning_capabilities::current_detection_for_settings(
+                settings_config,
+                provider_id,
+                candidate,
+            );
+            if detection.borrow().is_none()
+                && snapshot
+                    .as_ref()
+                    .and_then(crate::reasoning_capabilities::snapshot_to_capability)
+                    .is_some()
+            {
+                *detection.borrow_mut() = snapshot.clone();
+            }
+            snapshot
+        },
     );
+    let detection = detection.into_inner();
     let resolved_capability =
         crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(
             resolved.capability.as_ref(),
@@ -5717,6 +5733,55 @@ pub fn resolve_codex_model_reasoning_capability(
     model: String,
 ) -> CodexModelReasoningResolution {
     resolve_codex_model_reasoning_capability_value(&settingsConfig, &providerId, &model)
+}
+
+/// Bind freshly generated maintained preset declarations to their original
+/// transport. The frontend calls this only on explicit preset selection, never
+/// when loading, saving, or refreshing an existing provider's catalog.
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn bind_codex_preset_reasoning_evidence(mut settingsConfig: Value) -> Value {
+    use crate::codex_multirouter::catalog::read_catalog;
+    let Some(mut catalog) = read_catalog(&settingsConfig).cloned() else {
+        return settingsConfig;
+    };
+    if let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) {
+        for entry in models {
+            let Some(capability) =
+                crate::proxy::providers::codex_reasoning::reasoning_capability_from_model_entry(
+                    entry,
+                )
+            else {
+                continue;
+            };
+            // Only freshly selected maintained preset declarations belong at
+            // this generation boundary. Never reauthorize fetched or explicit
+            // user declarations merely because they passed through the form.
+            if capability.source.as_deref() != Some("builtin") {
+                continue;
+            }
+            let scope = entry
+                .get("model")
+                .and_then(Value::as_str)
+                .and_then(|model| {
+                    crate::reasoning_capabilities::reasoning_evidence_scope_for_settings(
+                        &settingsConfig,
+                        model,
+                    )
+                });
+            if let Some(reasoning) = entry.get_mut("reasoning").and_then(Value::as_object_mut) {
+                reasoning.remove("evidenceScope");
+                if let Some(scope) = scope.and_then(|scope| serde_json::to_value(scope).ok()) {
+                    reasoning.insert("evidenceScope".into(), scope);
+                }
+            }
+        }
+    }
+    if let Some(settings) = settingsConfig.as_object_mut() {
+        settings.insert("modelCatalog".into(), catalog);
+        settings.remove("model_catalog");
+    }
+    settingsConfig
 }
 
 /// P3：触发单模型只读检测（异步，调用发现适配器并写入 TTL 缓存）。
@@ -10415,6 +10480,7 @@ wire_api = "responses"
     #[test]
     fn provider_fallback_model_api_preserves_detection_cached_under_a_public_alias() {
         let settings = json!({
+            "base_url": "https://public-alias-evidence.example/v1",
             "modelCatalog": {"models": [{
                 "model": "provider-fallback-api-alias-public",
                 "upstreamModel": "provider-fallback-api-alias-wire",
@@ -10427,6 +10493,11 @@ wire_api = "responses"
             .insert(crate::reasoning_capabilities::ProviderCapabilitySnapshot {
                 provider_key: "provider-fallback-api-alias-source".into(),
                 model: "provider-fallback-api-alias".into(),
+                evidence_scope:
+                    crate::reasoning_capabilities::reasoning_evidence_scope_for_settings(
+                        &settings,
+                        "provider-fallback-api-alias",
+                    ),
                 reasoning: Some(crate::reasoning_capabilities::ReasoningCapabilitySnapshot {
                     supported_efforts: vec!["max".into()],
                     default_effort: Some("max".into()),
@@ -10452,6 +10523,113 @@ wire_api = "responses"
         assert!(codex_catalog_model_specs(&settings, "")[0]
             .reasoning
             .is_none());
+    }
+
+    #[test]
+    fn model_api_exposes_detection_candidate_for_current_wire_model() {
+        let settings = json!({
+            "base_url": "https://wire-evidence.example/v1",
+            "modelCatalog": {"models": [{
+                "model": "wire-evidence-public",
+                "upstreamModel": "wire-evidence-upstream"
+            }]}
+        });
+        crate::reasoning_capabilities::detection_cache()
+            .lock()
+            .unwrap()
+            .insert(crate::reasoning_capabilities::ProviderCapabilitySnapshot {
+                provider_key: "wire-evidence-provider".into(),
+                model: "wire-evidence-upstream".into(),
+                evidence_scope:
+                    crate::reasoning_capabilities::reasoning_evidence_scope_for_settings(
+                        &settings,
+                        "wire-evidence-upstream",
+                    ),
+                reasoning: Some(crate::reasoning_capabilities::ReasoningCapabilitySnapshot {
+                    supported_efforts: vec!["high".into()],
+                    default_effort: Some("high".into()),
+                    upstream_format: Some("string".into()),
+                    upstream_parameter: Some("reasoning_effort".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let resolution = resolve_codex_model_reasoning_capability_value(
+            &settings,
+            "wire-evidence-provider",
+            "wire-evidence-public",
+        );
+        assert_eq!(resolution.source, "detection");
+        assert!(resolution.has_detection_candidate);
+        assert_eq!(
+            resolution.detection.unwrap().model,
+            "wire-evidence-upstream"
+        );
+    }
+
+    #[test]
+    fn fresh_preset_reasoning_evidence_is_bound_without_blessing_explicit_declarations() {
+        let settings = json!({
+            "config": "model_provider = \"preset\"\n[model_providers.preset]\nbase_url = \"https://preset-evidence.example/v1/\"\n",
+            "modelCatalog": {"models": [
+                {"model": "preset-public", "upstreamModel": "preset-wire", "reasoning": {
+                    "schemaVersion": 2, "supportStatus": "confirmed_supported", "controlKind": "graded",
+                    "supportedEfforts": ["high"], "defaultEffort": "high", "disableAllowed": false,
+                    "upstream": {"format": "string", "parameter": "reasoning_effort"},
+                    "source": "builtin"
+                }},
+                {"model": "manual-public", "reasoning": {
+                    "schemaVersion": 2, "supportStatus": "confirmed_unsupported", "controlKind": "none",
+                    "supportedEfforts": [], "disableAllowed": false,
+                    "upstream": {"format": "none", "parameter": "none"}, "source": "user"
+                }}
+            ]}
+        });
+        let bound = bind_codex_preset_reasoning_evidence(settings.clone());
+        let scope = crate::reasoning_capabilities::reasoning_evidence_scope_for_settings(
+            &settings,
+            "preset-public",
+        )
+        .unwrap();
+        assert_eq!(
+            bound["modelCatalog"]["models"][0]["reasoning"]["evidenceScope"],
+            serde_json::to_value(scope).unwrap()
+        );
+        assert_eq!(
+            bound["modelCatalog"]["models"][1],
+            settings["modelCatalog"]["models"][1]
+        );
+        let resolved = resolve_codex_model_reasoning_capability_value(
+            &bound,
+            "preset-provider",
+            "preset-public",
+        );
+        assert!(resolved.capability.is_some());
+        let mut changed = bound;
+        changed["base_url"] = json!("https://different-preset-evidence.example/v1");
+        let stale = resolve_codex_model_reasoning_capability_value(
+            &changed,
+            "preset-provider",
+            "preset-public",
+        );
+        assert!(stale.capability.is_none());
+    }
+
+    #[test]
+    fn fresh_preset_reasoning_evidence_never_serializes_unsafe_transport() {
+        let settings = json!({
+            "base_url": "https://redacted:credential@preset-evidence.example/v1?credential=redacted",
+            "modelCatalog": {"models": [{"model": "preset-wire", "reasoning": {
+                "schemaVersion": 2, "supportStatus": "confirmed_unsupported", "controlKind": "none",
+                "supportedEfforts": [], "disableAllowed": false,
+                "upstream": {"format": "none", "parameter": "none"}, "source": "builtin",
+                "evidenceScope": {"transportFingerprint": "untrusted", "model": "old-wire"}
+            }}]}
+        });
+        let bound = bind_codex_preset_reasoning_evidence(settings);
+        let declaration = &bound["modelCatalog"]["models"][0]["reasoning"];
+        assert!(declaration.get("evidenceScope").is_none());
+        assert!(!declaration.to_string().contains("credential"));
     }
 
     #[test]
@@ -10752,6 +10930,7 @@ wire_api = "responses"
             fetched_at: None,
             provider_key: None,
             model_revision: None,
+            evidence_scope: None,
             codex_ultra_orchestration: None,
         }
     }
@@ -11884,7 +12063,7 @@ wire_api = "responses"
             "roleName": "Analysis Role",
             "nicknameCandidates": ["Neutral Scout"]
         });
-        let settings = codex_subagent_profile_status_settings(
+        let mut settings = codex_subagent_profile_status_settings(
             "v2",
             json!({ "neutral-model": profile }),
             json!([{
@@ -11902,6 +12081,17 @@ wire_api = "responses"
                 }
             }]),
         );
+        // The maintained fixture is fresh evidence for this active transport,
+        // not an unscoped automatic declaration inherited from another provider.
+        settings["base_url"] = json!("https://api.openai.com/v1");
+        settings["modelCatalog"]["models"][0]["reasoning"]["evidenceScope"] = serde_json::to_value(
+            crate::reasoning_capabilities::reasoning_evidence_scope_for_settings(
+                &settings,
+                "neutral-model",
+            )
+            .expect("fixture has a safe current transport and wire model"),
+        )
+        .expect("serialize fixture reasoning scope");
         let mut official = Provider::with_id(
             "official-target".to_string(),
             "Official target".to_string(),
@@ -16557,6 +16747,7 @@ base_url = "http://127.0.0.1:15721/v1"
                     fetched_at: None,
                     provider_key: None,
                     model_revision: None,
+                    evidence_scope: None,
                     codex_ultra_orchestration: None,
                 },
             ),
@@ -17398,6 +17589,7 @@ base_url = "http://127.0.0.1:15721/v1"
                     fetched_at: None,
                     provider_key: None,
                     model_revision: None,
+                    evidence_scope: None,
                     codex_ultra_orchestration: None,
                 },
             ),
@@ -19926,7 +20118,7 @@ model_catalog_json = "cc-switch-model-catalog.json"
 [model_providers.custom]
 base_url = "https://provider.example/v1"
 "#;
-        for (reasoning, expected_efforts, expected_default) in [
+        for (mut reasoning, expected_efforts, expected_default) in [
             (
                 json!({
                     "schemaVersion": 2,
@@ -19968,6 +20160,18 @@ base_url = "https://provider.example/v1"
                 Some("high"),
             ),
         ] {
+            if reasoning["source"] == "detection" {
+                // Automatic metadata must belong to this test's current endpoint
+                // and wire model; explicit user fixtures remain unscoped.
+                reasoning["evidenceScope"] = serde_json::to_value(
+                    crate::reasoning_capabilities::reasoning_evidence_scope(
+                        "https://provider.example/v1",
+                        "provider-declared-model",
+                    )
+                    .expect("fixture has a safe current transport and wire model"),
+                )
+                .expect("serialize fixture reasoning scope");
+            }
             let settings = json!({
                 "modelCatalog": {"models": [{
                     "model": "provider-declared-model",

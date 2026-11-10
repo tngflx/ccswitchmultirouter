@@ -16,7 +16,9 @@ use crate::{
 };
 
 use super::{
-    apply_codex_upstream_model, codex_provider_text_only_input, inject_codex_chat_prompt_cache_key,
+    apply_codex_upstream_model,
+    codex::validate_codex_catalog_request_model,
+    codex_provider_text_only_input, inject_codex_chat_prompt_cache_key,
     prepare_codex_native_responses_model, provider_needs_responses_namespace_flatten,
     resolve_codex_cache_config, resolve_codex_chat_reasoning_config,
     transform_codex_chat::{
@@ -122,6 +124,9 @@ impl CodexThirdPartyRequestPolicy {
             ));
         }
 
+        if let Some(model) = request_model {
+            validate_codex_catalog_request_model(provider, model)?;
+        }
         let adapter = CodexAdapter::new();
         let base_url = adapter.extract_base_url(provider)?;
         Url::parse(&base_url).map_err(|_| {
@@ -236,6 +241,9 @@ impl CodexThirdPartyRequestPolicy {
         logical_body: Value,
         options: &CodexRequestOptions,
     ) -> Result<Value, ProxyError> {
+        if let Some(model) = logical_body.get("model").and_then(Value::as_str) {
+            validate_codex_catalog_request_model(&self.provider, model)?;
+        }
         let body = match transport {
             CodexRequestTransport::ChatCompletions => {
                 self.prepare_chat_body(logical_body, options)?
@@ -351,10 +359,12 @@ impl CodexThirdPartyRequestPolicy {
             .get("prompt_cache_key")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        apply_codex_upstream_model(&self.provider, &mut logical_body);
+        // Resolve model-scoped metadata while the original public identity is
+        // still intact. Its wire ID may be another row's exact public ID.
         let reasoning_config = resolve_codex_chat_reasoning_config(&self.provider, &logical_body);
         let text_only_override = codex_provider_text_only_input(&self.provider);
         let cache_config = resolve_codex_cache_config(&self.provider, &logical_body);
+        apply_codex_upstream_model(&self.provider, &mut logical_body);
         let mut tool_context = build_codex_tool_context_from_request(&logical_body);
         tool_context.apply_hosted_tool_switches(
             options.hosted_web_search_enabled,

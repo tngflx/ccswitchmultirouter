@@ -953,7 +953,7 @@ fn effective_reasoning_capability(
         canonical_model,
         library.as_ref(),
         official_models,
-        |model| crate::reasoning_capabilities::current_detection(&provider.id, model),
+        |model| crate::reasoning_capabilities::current_detection_for_provider(provider, model),
     );
 
     if let Some(capability) = resolved.capability {
@@ -2415,7 +2415,7 @@ mod tests {
         };
         use crate::reasoning_capabilities::{
             provider_metadata::openrouter_reasoning_capability_from_model_entry,
-            resolve_codex_model_capability_with_library,
+            reasoning_evidence_scope_for_settings, resolve_codex_model_capability_with_library,
         };
 
         // Deliberately use the same ID, including the suffix, at both gateways.
@@ -2432,7 +2432,7 @@ mod tests {
             }
         }))
         .expect("OpenRouter API metadata is a valid graded contract");
-        let openrouter = provider(
+        let mut openrouter = provider(
             "gateway-b",
             "OpenRouter",
             "openai_chat",
@@ -2442,6 +2442,13 @@ mod tests {
                 "codexUltra": {"enabled": true, "providerEffort": "high"}
             }]),
         );
+        // API-derived automatic evidence is trusted only for the endpoint and
+        // wire model that produced it. Exercise the production provenance
+        // boundary rather than treating this persisted detection as a user edit.
+        let scope = reasoning_evidence_scope_for_settings(&openrouter.settings_config, model_id)
+            .expect("OpenRouter fixture has a valid current endpoint and wire model");
+        openrouter.settings_config["modelCatalog"]["models"][0]["reasoning"]["evidenceScope"] =
+            serde_json::to_value(scope).expect("serialize current API evidence scope");
         let sublyx = provider(
             "gateway-a",
             "Sublyx",

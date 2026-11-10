@@ -11,7 +11,9 @@ use crate::proxy::providers::codex_reasoning::{
     ReasoningControlKind, ReasoningSupportStatus,
 };
 use crate::reasoning_capabilities::{
-    DiscoveryOutcome, ProviderCapabilitySnapshot, ReasoningCapabilitySnapshot,
+    reasoning_evidence_scope_for_settings, reasoning_provider_key,
+    reasoning_wire_model_for_settings, DiscoveryOutcome, ProviderCapabilitySnapshot,
+    ReasoningCapabilitySnapshot,
 };
 use reqwest::StatusCode;
 use serde_json::Value;
@@ -19,9 +21,6 @@ use std::time::Duration;
 
 /// 发现请求超时（与 model_fetch 保持一致）。
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// 错误响应体截断长度：避免把几十 KB 的 HTML 404 页整页保留到日志。
-const ERROR_BODY_MAX_CHARS: usize = 512;
 
 /// 按平台标识（name / base_url）判定 provider 平台。
 ///
@@ -62,8 +61,19 @@ fn detect_platform_from_settings_parts(
         let provider = config.get("model_providers")?.get(selected)?;
         Some((selected, provider))
     });
-    let config_base_url = selected_provider.and_then(|(_, provider)| {
-        ["base_url", "baseURL", "baseUrl"]
+    // Share the exact runtime-compatible root/selected endpoint precedence
+    // with discovery and evidence scopes rather than duplicating a reader.
+    let base_url = base_url_from_settings(settings);
+
+    // The actual known transport owns platform identity for every supported
+    // provider, not just gateways. URL paths, queries, and credentials are data
+    // and must never let stale labels choose a different capability contract.
+    if let Some(platform) = base_url.as_deref().and_then(detect_platform_from_url) {
+        return Some(platform);
+    }
+
+    if let Some((selected, provider)) = selected_provider {
+        let config_name = ["name", "providerName", "provider_name"]
             .into_iter()
             .find_map(|key| {
                 provider
@@ -72,112 +82,111 @@ fn detect_platform_from_settings_parts(
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
             })
-    });
-    let base_url = settings_base_url(settings)
-        .or(config_base_url)
-        .unwrap_or("");
-
-    // Actual OpenRouter/Sublyx transport wins stale display names, provider
-    // IDs, and selected TOML labels. Keep the other vendor exact-host guards
-    // and existing display-name behavior unchanged.
-    if let Some(platform @ ("openrouter" | "sublyx")) = detect_platform_from_identity("", base_url)
-    {
-        return Some(platform);
-    }
-
-    if let Some((selected, provider)) = selected_provider {
-        let config_name = ["name", "providerName", "provider_name"]
-            .into_iter()
-            .find_map(|key| provider.get(key).and_then(toml::Value::as_str))
             .unwrap_or("");
         // Presets often omit a redundant name; the selected table key is
         // still active provider identity, ahead of stale fallback labels.
-        if let Some(platform) =
-            detect_platform_from_identity(&format!("{selected} {config_name}"), "")
-        {
+        if let Some(platform) = detect_platform_from_label(&format!("{selected} {config_name}")) {
             return Some(platform);
         }
     }
 
-    // Compiled routes use synthetic wrapper labels/IDs for routing, not for
-    // capability selection. Once original target identity is projected, do
-    // not let an adversarial or stale wrapper name identify another gateway.
+    let (name, id) = provider_identity_from_settings_parts(settings, provider_name, provider_id);
+    detect_platform_from_label(&format!("{name} {id}"))
+}
+
+/// Original provider label and ID for platform-aware compatibility fallbacks.
+/// Routed providers keep synthetic request identities, so consumers must not
+/// infer a transport contract from their wrapper display names or route IDs.
+pub fn provider_platform_identity(provider: &Provider) -> (&str, &str) {
+    provider_identity_from_settings_parts(
+        &provider.settings_config,
+        Some(&provider.name),
+        Some(&provider.id),
+    )
+}
+
+fn provider_identity_from_settings_parts<'a>(
+    settings: &'a Value,
+    provider_name: Option<&'a str>,
+    provider_id: Option<&'a str>,
+) -> (&'a str, &'a str) {
+    // Marker presence, even with an empty or malformed value, means wrapper
+    // labels are not provider identity. Do not accidentally restore them.
     let has_target_identity = settings.get("codexResolvedTargetProviderId").is_some()
         || settings.get("codexResolvedTargetProviderName").is_some();
-    let (name, id) = if has_target_identity {
+    if has_target_identity {
         (
-            settings
-                .get("codexResolvedTargetProviderName")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            settings
-                .get("codexResolvedTargetProviderId")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
+            settings_string(settings, &["codexResolvedTargetProviderName"]).unwrap_or(""),
+            settings_string(settings, &["codexResolvedTargetProviderId"]).unwrap_or(""),
         )
     } else {
         (
-            settings
-                .get("providerName")
-                .or_else(|| settings.get("provider_name"))
-                .or_else(|| settings.get("name"))
-                .and_then(Value::as_str)
+            settings_string(settings, &["providerName", "provider_name", "name"])
                 .or(provider_name)
                 .unwrap_or(""),
             provider_id.unwrap_or_default(),
         )
-    };
-    detect_platform_from_identity(&format!("{name} {id}"), base_url)
+    }
+}
+
+fn settings_string<'a>(settings: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        settings
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn settings_base_url(settings: &Value) -> Option<&str> {
-    ["base_url", "baseURL", "baseUrl"]
-        .into_iter()
-        .find_map(|key| {
-            settings
-                .get(key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        })
+    settings_string(settings, &["base_url", "baseURL", "baseUrl"])
 }
 
-fn detect_platform_from_identity(name: &str, base_url: &str) -> Option<&'static str> {
-    let platform = format!("{name} {base_url}").to_ascii_lowercase();
-    if platform.contains("openrouter") {
+fn detect_platform_from_label(identity: &str) -> Option<&'static str> {
+    let identity = identity.to_ascii_lowercase();
+    if identity.contains("openrouter") {
         Some("openrouter")
-    } else if platform.contains("sublyx") {
-        // Sublyx is an OpenAI Responses-compatible gateway. Keep this
-        // identity provider-scoped (name/id/official host), never inferred
-        // from a model suffix, so an OpenRouter row named `*-sublyx` cannot
-        // inherit the Sublyx contract.
+    } else if identity.contains("sublyx") {
+        // Explicit provider labels support custom gateway domains. Model names
+        // and arbitrary URL text never enter this fallback identity.
         Some("sublyx")
-    } else if platform.contains("vllm") {
+    } else if identity.contains("vllm") {
         Some("vllm")
-    } else if reqwest::Url::parse(base_url).ok().is_some_and(|url| {
-        matches!(url.scheme(), "https" | "http")
-            && url
-                .host_str()
-                .is_some_and(|host| host.eq_ignore_ascii_case("api.deepseek.com"))
-    }) {
-        // Only the official host establishes vendor identity, never a model or display name.
-        Some("deepseek")
     } else {
-        let host = reqwest::Url::parse(base_url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
-        match host.as_deref() {
-            // Match only exact official vendor hosts; model names and arbitrary
-            // gateways must never inherit a maintained capability library.
-            Some("api.z.ai" | "open.bigmodel.cn") => Some("zhipu"),
-            Some(host)
-                if host == "dashscope.aliyuncs.com"
-                    || host == "dashscope-intl.aliyuncs.com"
-                    || host.ends_with(".maas.aliyuncs.com") =>
-            {
-                Some("dashscope")
-            }
-            _ => None,
+        // Official model vendors remain host-only: a generic gateway called
+        // DeepSeek/Zhipu/DashScope must not inherit an official wire contract.
+        None
+    }
+}
+
+fn detect_platform_from_url(base_url: &str) -> Option<&'static str> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    if !matches!(url.scheme(), "https" | "http") {
+        return None;
+    }
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if host == "openrouter.ai" || (!host.starts_with('.') && host.ends_with(".openrouter.ai")) {
+        return Some("openrouter");
+    }
+    if host == "sublyx.org" || (!host.starts_with('.') && host.ends_with(".sublyx.org")) {
+        return Some("sublyx");
+    }
+    match host.as_str() {
+        "api.deepseek.com" => Some("deepseek"),
+        "api.z.ai" | "open.bigmodel.cn" => Some("zhipu"),
+        "dashscope.aliyuncs.com" | "dashscope-intl.aliyuncs.com" => Some("dashscope"),
+        host if !host.starts_with('.') && host.ends_with(".maas.aliyuncs.com") => Some("dashscope"),
+        _ => {
+            // vLLM is self-hosted rather than tied to an official API domain.
+            // Honor explicit deployment host labels such as vllm.local and
+            // vllm-roglinux, not arbitrary substring matches like notvllm.
+            let label = host.split('.').next().unwrap_or_default();
+            (label == "vllm"
+                || label
+                    .strip_prefix("vllm-")
+                    .is_some_and(|suffix| !suffix.is_empty()))
+            .then_some("vllm")
         }
     }
 }
@@ -192,7 +201,26 @@ pub async fn discover_provider_capability(provider: &Provider, model: &str) -> D
 }
 
 fn provider_key(provider: &Provider) -> String {
-    provider.id.clone()
+    reasoning_provider_key(provider).to_string()
+}
+
+fn discovery_snapshot(
+    provider: &Provider,
+    model: &str,
+    source: &str,
+    reasoning: Option<ReasoningCapabilitySnapshot>,
+) -> Option<ProviderCapabilitySnapshot> {
+    Some(ProviderCapabilitySnapshot {
+        provider_key: provider_key(provider),
+        model: reasoning_wire_model_for_settings(&provider.settings_config, model)?,
+        fetched_at: now_millis(),
+        source: source.to_string(),
+        evidence_scope: Some(reasoning_evidence_scope_for_settings(
+            &provider.settings_config,
+            model,
+        )?),
+        reasoning,
+    })
 }
 
 fn now_millis() -> i64 {
@@ -203,21 +231,42 @@ fn now_millis() -> i64 {
 }
 
 fn base_url(provider: &Provider) -> Option<String> {
-    let explicit = settings_base_url(&provider.settings_config).map(ToString::to_string);
-    if explicit.is_some() {
-        return explicit;
+    base_url_from_settings(&provider.settings_config)
+}
+
+/// Effective transport shared by platform detection, discovery and evidence.
+/// Mirrors `extract_codex_base_url`: built-in OpenAI override, active table,
+/// then historical root TOML. JSON draft overrides retain first precedence;
+/// empty/malformed aliases never shadow another usable transport declaration.
+pub(crate) fn base_url_from_settings(settings: &Value) -> Option<String> {
+    if let Some(explicit) = settings_base_url(settings) {
+        return Some(explicit.to_string());
     }
-    let config = provider.settings_config.get("config")?.as_str()?;
+    let config = settings.get("config")?.as_str()?;
     let config = toml::from_str::<toml::Value>(config).ok()?;
-    let selected = config.get("model_provider")?.as_str()?;
-    config
-        .get("model_providers")?
-        .get(selected)?
-        .get("base_url")?
-        .as_str()
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
+    let active = toml_string(&config, &["model_provider"]);
+    if active.is_none_or(|provider| provider == "openai") {
+        if let Some(base_url) = toml_string(&config, &["openai_base_url"]) {
+            return Some(base_url.to_string());
+        }
+    }
+    let aliases = &["base_url", "baseURL", "baseUrl"];
+    let selected = active
+        .and_then(|provider| config.get("model_providers")?.get(provider))
+        .and_then(|provider| toml_string(provider, aliases));
+    selected
+        .or_else(|| toml_string(&config, aliases))
         .map(ToString::to_string)
+}
+
+fn toml_string<'a>(value: &'a toml::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn client() -> Result<reqwest::Client, String> {
@@ -227,8 +276,26 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|error| format!("cannot build discovery client: {error}"))
 }
 
-fn truncate_body(body: &str) -> String {
-    body.chars().take(ERROR_BODY_MAX_CHARS).collect()
+/// A reqwest error may embed credential-bearing URLs or provider response
+/// context. Log only a closed classification, never its Display/Debug output.
+fn discovery_error_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_builder() {
+        "request-builder"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "transport"
+    }
 }
 
 /// OpenRouter 适配器：`GET {base}/api/v1/models`（公共端点，无需鉴权）。
@@ -237,6 +304,10 @@ fn truncate_body(body: &str) -> String {
 /// `supported_efforts` / `default_effort` / `mandatory` / `default_enabled` /
 /// `supports_max_tokens`。
 pub async fn discover_openrouter(provider: &Provider, model: &str) -> DiscoveryOutcome {
+    let Some(wire_model) = reasoning_wire_model_for_settings(&provider.settings_config, model)
+    else {
+        return DiscoveryOutcome::NotAdvertised;
+    };
     let Some(base) = base_url(provider) else {
         return DiscoveryOutcome::Unavailable;
     };
@@ -248,18 +319,19 @@ pub async fn discover_openrouter(provider: &Provider, model: &str) -> DiscoveryO
     let response = match http.get(&models_url).send().await {
         Ok(response) => response,
         Err(error) => {
-            log::debug!("openrouter discovery unreachable at {models_url}: {error}");
+            log::debug!(
+                "openrouter discovery unreachable: {}",
+                discovery_error_class(&error)
+            );
             return DiscoveryOutcome::Unavailable;
         }
     };
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        log::debug!(
-            "openrouter discovery failed at {models_url}: {status} {}",
-            truncate_body(&body)
-        );
+        // Response bodies can echo tokens or arbitrary provider diagnostics.
+        // The HTTP status is sufficient here; never retain the body or URL.
+        log::debug!("openrouter discovery failed: HTTP {status}");
         return DiscoveryOutcome::Unavailable;
     }
 
@@ -270,7 +342,7 @@ pub async fn discover_openrouter(provider: &Provider, model: &str) -> DiscoveryO
         return DiscoveryOutcome::Invalid;
     };
 
-    let normalized = model.trim().to_ascii_lowercase();
+    let normalized = wire_model.to_ascii_lowercase();
     let entry = models.iter().find(|candidate| {
         ["id", "canonical_slug", "slug"]
             .into_iter()
@@ -287,14 +359,9 @@ pub async fn discover_openrouter(provider: &Provider, model: &str) -> DiscoveryO
         return DiscoveryOutcome::NotAdvertised;
     };
 
-    let snapshot = ProviderCapabilitySnapshot {
-        provider_key: provider_key(provider),
-        model: model.to_string(),
-        fetched_at: now_millis(),
-        source: "openrouter_api".to_string(),
-        reasoning: Some(reasoning),
-    };
-    DiscoveryOutcome::Found(snapshot)
+    discovery_snapshot(provider, model, "openrouter_api", Some(reasoning))
+        .map(DiscoveryOutcome::Found)
+        .unwrap_or(DiscoveryOutcome::Invalid)
 }
 
 /// Both discovery paths use the same normalization before building a snapshot.
@@ -891,6 +958,7 @@ fn build_boolean_or_unknown_capability(
             fetched_at: None,
             provider_key: None,
             model_revision: None,
+            evidence_scope: None,
             codex_ultra_orchestration: None,
         }
     } else {
@@ -913,6 +981,7 @@ fn build_boolean_or_unknown_capability(
             fetched_at: None,
             provider_key: None,
             model_revision: None,
+            evidence_scope: None,
             codex_ultra_orchestration: None,
         }
     };
@@ -1042,6 +1111,7 @@ fn build_reasoning_capability(
         fetched_at: None,
         provider_key: None,
         model_revision: None,
+        evidence_scope: None,
         codex_ultra_orchestration: codex_ultra_enabled.then_some(
             crate::proxy::providers::codex_reasoning::CodexUltraOrchestrationCapability {
                 enabled: true,
@@ -1075,6 +1145,10 @@ fn openrouter_models_url(base: &str) -> String {
 /// `/server_info` 是开发端点（`VLLM_SERVER_DEV_MODE` 开启才暴露），生产部署
 /// 通常 404——按 `Unavailable` 降级，不是错误。
 pub async fn discover_vllm(provider: &Provider, model: &str) -> DiscoveryOutcome {
+    let Some(wire_model) = reasoning_wire_model_for_settings(&provider.settings_config, model)
+    else {
+        return DiscoveryOutcome::NotAdvertised;
+    };
     let Some(base) = base_url(provider) else {
         return DiscoveryOutcome::Unavailable;
     };
@@ -1100,7 +1174,10 @@ pub async fn discover_vllm(provider: &Provider, model: &str) -> DiscoveryOutcome
             None
         }
         Err(error) => {
-            log::debug!("vllm /version unreachable at {version_url}: {error}");
+            log::debug!(
+                "vllm /version unreachable: {}",
+                discovery_error_class(&error)
+            );
             return DiscoveryOutcome::Unavailable;
         }
     };
@@ -1117,7 +1194,7 @@ pub async fn discover_vllm(provider: &Provider, model: &str) -> DiscoveryOutcome
                     items.iter().any(|item| {
                         item.get("id")
                             .and_then(Value::as_str)
-                            .is_some_and(|id| id.trim().eq_ignore_ascii_case(model.trim()))
+                            .is_some_and(|id| id.trim().eq_ignore_ascii_case(&wire_model))
                     })
                 })
             })
@@ -1127,7 +1204,10 @@ pub async fn discover_vllm(provider: &Provider, model: &str) -> DiscoveryOutcome
             return DiscoveryOutcome::Unavailable;
         }
         Err(error) => {
-            log::debug!("vllm /v1/models unreachable at {models_url}: {error}");
+            log::debug!(
+                "vllm /v1/models unreachable: {}",
+                discovery_error_class(&error)
+            );
             return DiscoveryOutcome::Unavailable;
         }
     };
@@ -1165,14 +1245,10 @@ pub async fn discover_vllm(provider: &Provider, model: &str) -> DiscoveryOutcome
 
     let _ = reasoning_parser; // 首版仅记录到日志，不进入快照（无消费方）。
 
-    DiscoveryOutcome::Found(ProviderCapabilitySnapshot {
-        provider_key: provider_key(provider),
-        model: model.to_string(),
-        fetched_at: now_millis(),
-        source: "vllm_server".to_string(),
-        // vLLM 不声明逐模型 effort：reasoning 保持 None，resolver 落到能力库。
-        reasoning: None,
-    })
+    // vLLM 不声明逐模型 effort：reasoning 保持 None，resolver 落到能力库。
+    discovery_snapshot(provider, model, "vllm_server", None)
+        .map(DiscoveryOutcome::Found)
+        .unwrap_or(DiscoveryOutcome::Invalid)
 }
 
 #[cfg(test)]
@@ -1201,7 +1277,7 @@ mod tests {
     fn detect_platform_openrouter_by_name_or_url() {
         assert_eq!(
             detect_platform(&provider("OpenRouter", "https://api.deepseek.com")),
-            Some("openrouter")
+            Some("deepseek")
         );
         assert_eq!(
             detect_platform(&provider("My Gateway", "https://openrouter.ai/api/v1")),
@@ -1279,7 +1355,7 @@ mod tests {
     fn active_gateway_transport_overrides_stale_provider_labels() {
         for (active, stale, base_url) in [
             ("openrouter", "Sublyx", "https://openrouter.ai/api/v1"),
-            ("sublyx", "OpenRouter", "https://sublyx.example/v1"),
+            ("sublyx", "OpenRouter", "https://api.sublyx.org/v1"),
         ] {
             let mut saved = provider(stale, "");
             saved.id = format!("{stale}-saved-id");
@@ -1350,6 +1426,196 @@ mod tests {
         let mut unknown_target = provider("OpenRouter wrapper", "https://gateway.example/v1");
         unknown_target.settings_config["codexResolvedTargetProviderId"] = json!("custom-target");
         assert_eq!(detect_platform(&unknown_target), None);
+    }
+
+    #[test]
+    fn known_transport_hosts_override_every_stale_gateway_identity() {
+        for (platform, endpoint) in [
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            ("openrouter", "https://api.openrouter.ai/v1"),
+            ("openrouter", "https://OPENROUTER.AI.:443/api/v1"),
+            ("sublyx", "https://api.sublyx.org/v1"),
+            ("sublyx", "https://sublyx.org/v1"),
+            ("sublyx", "https://region.api.sublyx.org/v1"),
+            ("vllm", "http://vllm.local:8000/v1"),
+            ("vllm", "http://vllm-roglinux:8000/v1"),
+            ("deepseek", "https://api.deepseek.com/v1"),
+            ("zhipu", "https://api.z.ai/api/paas/v4"),
+            ("zhipu", "https://open.bigmodel.cn/api/paas/v4"),
+            (
+                "dashscope",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ),
+            (
+                "dashscope",
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            ),
+            ("dashscope", "https://example.maas.aliyuncs.com/v1"),
+        ] {
+            for stale in ["openrouter", "sublyx", "vllm"] {
+                let mut saved = provider(stale, endpoint);
+                saved.id = format!("{stale}-stale-id");
+                saved.settings_config["providerName"] = json!(stale);
+                saved.settings_config["codexResolvedTargetProviderId"] =
+                    json!(format!("{stale}-stale-target"));
+                saved.settings_config["codexResolvedTargetProviderName"] = json!(stale);
+                // The actual top-level transport wins even a selected table
+                // which still points at a different known gateway endpoint.
+                saved.settings_config["config"] = json!(format!(
+                    "model_provider = \"{stale}\"\n[model_providers.{stale}]\nbase_url = \"https://openrouter.ai/api/v1\"\n"
+                ));
+                assert_eq!(
+                    detect_platform(&saved),
+                    Some(platform),
+                    "{platform} transport vs {stale} stale identity"
+                );
+                assert_eq!(
+                    detect_platform_from_settings(&saved.settings_config),
+                    Some(platform),
+                    "{platform} draft vs {stale} stale identity"
+                );
+
+                // Without a top-level override, the selected table's URL is
+                // authoritative even when its key and name are stale.
+                saved
+                    .settings_config
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("base_url");
+                saved.settings_config["config"] = json!(format!(
+                    "model_provider = \"{stale}\"\n[model_providers.{stale}]\nname = \"{stale}\"\nbase_url = \"{endpoint}\"\n"
+                ));
+                assert_eq!(
+                    detect_platform(&saved),
+                    Some(platform),
+                    "{platform} selected transport vs {stale} stale identity"
+                );
+                assert_eq!(
+                    detect_platform_from_settings(&saved.settings_config),
+                    Some(platform)
+                );
+            }
+
+            // A path/query containing another platform is data, not identity.
+            let endpoint = format!("{endpoint}/openrouter/sublyx/vllm?provider=openrouter");
+            assert_eq!(
+                detect_platform(&provider("Gateway", &endpoint)),
+                Some(platform)
+            );
+        }
+    }
+
+    #[test]
+    fn platform_transport_detection_rejects_url_substring_spoofing() {
+        for endpoint in [
+            "https://openrouter.ai.example/v1",
+            "https://notopenrouter.ai/v1",
+            "https://.openrouter.ai/v1",
+            "https://gateway.example/openrouter",
+            "https://gateway.example/v1?provider=openrouter",
+            "https://openrouter.ai@gateway.example/v1",
+            "https://sublyx.org.example/v1",
+            "https://notsublyx.org/v1",
+            "https://.sublyx.org/v1",
+            "https://api.sublyx.com/v1",
+            "https://gateway.example/sublyx",
+            "https://gateway.example/v1?provider=sublyx",
+            "https://sublyx.org@gateway.example/v1",
+            "https://vllmish.example/v1",
+            "https://notvllm.example/v1",
+            "https://vllm-.example/v1",
+            "https://gateway.example/vllm",
+            "https://gateway.example/v1?provider=vllm",
+            "https://api.deepseek.com.example/v1",
+            "https://api.z.ai.example/v1",
+            "https://open.bigmodel.cn.example/v1",
+            "https://dashscope.aliyuncs.com.example/v1",
+            "https://example.maas.aliyuncs.com.evil/v1",
+            "https://maas.aliyuncs.com/v1",
+            "https://.maas.aliyuncs.com/v1",
+            "ftp://openrouter.ai/v1",
+            "ftp://api.sublyx.org/v1",
+            "ftp://vllm.local/v1",
+            "ftp://api.deepseek.com/v1",
+            "ftp://api.z.ai/v1",
+            "file://dashscope.aliyuncs.com/v1",
+        ] {
+            let saved = provider("Gateway", endpoint);
+            assert_eq!(detect_platform(&saved), None, "{endpoint}");
+            assert_eq!(
+                detect_platform_from_settings(&saved.settings_config),
+                None,
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_transport_preserves_only_explicit_supported_label_fallbacks() {
+        for (name, expected) in [
+            ("OpenRouter custom", Some("openrouter")),
+            ("Sublyx custom", Some("sublyx")),
+            ("vLLM custom", Some("vllm")),
+            ("DeepSeek custom", None),
+            ("Zhipu custom", None),
+            ("DashScope custom", None),
+        ] {
+            let mut saved = provider(name, "https://gateway.example/v1");
+            saved.settings_config["providerName"] = json!(name);
+            assert_eq!(detect_platform(&saved), expected, "{name}");
+            assert_eq!(
+                detect_platform_from_settings(&saved.settings_config),
+                expected,
+                "{name}"
+            );
+        }
+        let mut unknown = provider("Gateway", "https://gateway.example/v1");
+        unknown.settings_config["model"] = json!("openrouter/sublyx-vllm-deepseek-zhipu-dashscope");
+        assert_eq!(
+            detect_platform(&unknown),
+            None,
+            "model names never identify transport"
+        );
+    }
+
+    #[test]
+    fn provider_platform_identity_uses_target_markers_and_first_nonblank_labels() {
+        let mut saved = provider("Display-only wrapper", "https://gateway.example/v1");
+        saved.settings_config["providerName"] = json!("  ");
+        saved.settings_config["provider_name"] = json!(" Sublyx custom ");
+        assert_eq!(provider_platform_identity(&saved).0, "Sublyx custom");
+        assert_eq!(detect_platform(&saved), Some("sublyx"));
+
+        saved.settings_config["codexResolvedTargetProviderName"] = json!("OpenRouter target");
+        saved.settings_config["codexResolvedTargetProviderId"] = json!("original-target-id");
+        assert_eq!(
+            provider_platform_identity(&saved),
+            ("OpenRouter target", "original-target-id")
+        );
+        assert_eq!(detect_platform(&saved), Some("openrouter"));
+
+        for marker in [json!(null), json!(""), json!("  ")] {
+            saved.settings_config["codexResolvedTargetProviderName"] = marker.clone();
+            saved.settings_config["codexResolvedTargetProviderId"] = marker;
+            assert_eq!(provider_platform_identity(&saved), ("", ""));
+            assert_eq!(detect_platform(&saved), None);
+        }
+        // The original name/key remains a supported explicit fallback for
+        // historical or custom domains, but never hostname-only evidence.
+        let mut custom = provider("Sublyx custom", "https://api.sublyx.com/v1");
+        assert_eq!(detect_platform(&custom), Some("sublyx"));
+        custom.settings_config = json!({"config": r#"
+            model_provider = "custom"
+            [model_providers.custom]
+            name = "  "
+            providerName = "Sublyx custom"
+            base_url = "https://gateway.example/v1"
+        "#});
+        assert_eq!(detect_platform(&custom), Some("sublyx"));
+        assert_eq!(
+            detect_platform_from_settings(&custom.settings_config),
+            Some("sublyx")
+        );
     }
 
     #[test]
@@ -1429,6 +1695,82 @@ mod tests {
     }
 
     #[test]
+    fn discovery_error_diagnostics_exclude_credential_urls_and_provider_context() {
+        let unsafe_url =
+            "https://redacted-user:redacted-secret@example.invalid:invalid/v1?api_key=redacted-key";
+        let error = reqwest::Client::new()
+            .get(unsafe_url)
+            .build()
+            .expect_err("invalid port produces a request-builder failure");
+        let diagnostics = format!(
+            "openrouter discovery unreachable: {}",
+            discovery_error_class(&error)
+        );
+        assert_eq!(
+            diagnostics,
+            "openrouter discovery unreachable: request-builder"
+        );
+        for sensitive in [
+            unsafe_url,
+            "https://",
+            "redacted-user",
+            "redacted-secret",
+            "example.invalid",
+            "api_key",
+            "redacted-key",
+        ] {
+            assert!(!diagnostics.contains(sensitive));
+        }
+    }
+
+    #[test]
+    fn discovery_snapshot_uses_original_target_wire_model_and_current_transport_scope() {
+        let mut routed = provider("OpenRouter wrapper", "https://openrouter.ai/api/v1");
+        routed.id = "router::route::synthetic".to_string();
+        routed.settings_config["codexResolvedTargetProviderId"] = json!("actual-target");
+        routed.settings_config["codexResolvedTargetProviderName"] = json!("Actual gateway");
+        routed.settings_config["modelCatalog"] = json!({"models": [{
+            "model": "public-model",
+            "aliases": ["picker-alias"],
+            "upstreamModel": "Provider/Native-Model",
+        }]});
+        let snapshot = discovery_snapshot(&routed, "picker-alias", "openrouter_api", None)
+            .expect("routable alias has a scoped snapshot");
+        assert_eq!(snapshot.provider_key, "actual-target");
+        assert_eq!(snapshot.model, "Provider/Native-Model");
+        assert_eq!(
+            snapshot.evidence_scope,
+            reasoning_evidence_scope_for_settings(&routed.settings_config, "public-model")
+        );
+        let encoded = serde_json::to_string(&snapshot.evidence_scope).unwrap();
+        assert!(
+            !encoded.contains("https://"),
+            "scope never persists a raw endpoint"
+        );
+        assert!(
+            !encoded.contains("openrouter.ai"),
+            "scope fingerprints its transport"
+        );
+
+        routed.settings_config["base_url"] = json!("https://api.deepseek.com/v1");
+        let switched = discovery_snapshot(&routed, "picker-alias", "provider_api", None).unwrap();
+        assert_eq!(switched.provider_key, snapshot.provider_key);
+        assert_eq!(switched.model, snapshot.model);
+        assert_ne!(
+            switched.evidence_scope, snapshot.evidence_scope,
+            "changing transport invalidates prior evidence even with the same target and model"
+        );
+
+        routed.settings_config["modelCatalog"]["models"][0]["enabled"] = json!(false);
+        assert!(discovery_snapshot(&routed, "picker-alias", "provider_api", None).is_none());
+        routed.settings_config["modelCatalog"]["models"] = json!([
+            {"model": "first", "aliases": ["ambiguous"], "upstreamModel": "one"},
+            {"model": "second", "aliases": ["ambiguous"], "upstreamModel": "two"},
+        ]);
+        assert!(discovery_snapshot(&routed, "ambiguous", "provider_api", None).is_none());
+    }
+
+    #[test]
     fn openrouter_models_url_normalization() {
         assert_eq!(
             openrouter_models_url("https://openrouter.ai/api/v1"),
@@ -1446,6 +1788,99 @@ mod tests {
             openrouter_models_url("https://openrouter.ai/api"),
             "https://openrouter.ai/api/v1/models"
         );
+    }
+
+    #[test]
+    fn root_codex_toml_transport_keeps_runtime_platform_and_evidence_scope_in_parity() {
+        for (config, expected) in [
+            (
+                r#"model = "wire-model"
+base_url = "https://api.sublyx.org/v1"
+wire_api = "responses""#,
+                "https://api.sublyx.org/v1",
+            ),
+            (
+                r#"model_provider = "missing"
+base_url = "https://api.sublyx.org/v1"
+[model_providers.inactive]
+base_url = "https://openrouter.ai/api/v1""#,
+                "https://api.sublyx.org/v1",
+            ),
+            (
+                r#"openai_base_url = "https://api.sublyx.org/v1"
+base_url = "https://api.deepseek.com/v1""#,
+                "https://api.sublyx.org/v1",
+            ),
+            (
+                r#"model_provider = "openai"
+openai_base_url = "https://api.sublyx.org/v1"
+base_url = "https://api.deepseek.com/v1"
+[model_providers.openai]
+base_url = "https://openrouter.ai/api/v1""#,
+                "https://api.sublyx.org/v1",
+            ),
+            (
+                r#"model_provider = "custom"
+openai_base_url = "https://openrouter.ai/api/v1"
+base_url = "https://api.deepseek.com/v1"
+[model_providers.custom]
+base_url = "https://api.sublyx.org/v1""#,
+                "https://api.sublyx.org/v1",
+            ),
+        ] {
+            let mut saved = provider("OpenRouter stale label", "");
+            saved.settings_config = json!({"config": config});
+            assert_eq!(
+                crate::codex_config::extract_codex_base_url(config).as_deref(),
+                Some(expected),
+                "fixture describes the canonical runtime's transport"
+            );
+            assert_eq!(
+                base_url_from_settings(&saved.settings_config).as_deref(),
+                Some(expected)
+            );
+            assert_eq!(detect_platform(&saved), Some("sublyx"));
+            assert_eq!(
+                detect_platform_from_settings(&saved.settings_config),
+                Some("sublyx")
+            );
+            assert_eq!(
+                reasoning_evidence_scope_for_settings(&saved.settings_config, "wire-model"),
+                crate::reasoning_capabilities::reasoning_evidence_scope(expected, "wire-model"),
+                "root TOML must not discard valid persisted/API evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_toml_transport_uses_first_nonblank_alias_and_root_fallback() {
+        for config in [
+            r#"base_url = 42
+baseURL = " "
+baseUrl = "https://api.sublyx.org/v1""#,
+            r#"model_provider = "openai"
+openai_base_url = " "
+base_url = "https://api.sublyx.org/v1""#,
+            r#"model_provider = "custom"
+base_url = "https://api.sublyx.org/v1"
+[model_providers.custom]
+base_url = false
+baseURL = " ""#,
+            r#"model_provider = "custom"
+base_url = "https://api.deepseek.com/v1"
+[model_providers.custom]
+base_url = false
+baseURL = " "
+baseUrl = "https://api.sublyx.org/v1""#,
+        ] {
+            let settings = json!({"config": config});
+            assert_eq!(
+                base_url_from_settings(&settings).as_deref(),
+                Some("https://api.sublyx.org/v1")
+            );
+            assert_eq!(detect_platform_from_settings(&settings), Some("sublyx"));
+            assert!(reasoning_evidence_scope_for_settings(&settings, "wire-model").is_some());
+        }
     }
 
     #[test]
@@ -1521,6 +1956,7 @@ mod tests {
                 model: entry["id"].as_str().unwrap().to_string(),
                 fetched_at: 1,
                 source: "openrouter_api".to_string(),
+                evidence_scope: None,
                 reasoning: Some(openrouter_reasoning_snapshot(&entry).expect("reasoning snapshot")),
             };
             let detected = snapshot_to_capability(&snapshot).expect("detected capability");
@@ -2161,6 +2597,10 @@ mod tests {
             json!({"reasoning": {"supported_efforts": ["high"]}, "metadata": {"reasoning": {"supported_efforts": ["max"]}}}),
             json!({"reasoning": {"supported_efforts": [{"effort": "low", "reasoningEffort": "max"}]}}),
             json!({"reasoning": {"supported_efforts": ["ultra"]}}),
+            // Native wire "ultra" is not the product's synthetic orchestration
+            // selector. Unknown provider mappings must stay absent evidence,
+            // never fabricate max or a confirmed-unsupported declaration.
+            json!({"reasoning": {"supported_efforts": ["low", "medium", "high", "xhigh", "ultra"]}}),
             json!({"reasoning": "yes"}),
         ] {
             assert!(

@@ -791,6 +791,45 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     expect(user.rows[0].reasoning?.source).toBe("user");
   });
 
+  it.each([undefined, "user", "user_confirmed_detection"] as const)(
+    "preserves explicit source %s during metadata refresh and complete absence clearing",
+    (source) => {
+      const explicit: CodexModelReasoningCapability = {
+        schemaVersion: 2,
+        supportStatus: "confirmed_supported",
+        controlKind: "graded",
+        supportedEfforts: ["high"],
+        disableAllowed: false,
+        upstream: { format: "reasoning_object", parameter: "reasoning.effort" },
+        source,
+      };
+      for (const fetched of [
+        { id: "wire-model" },
+        {
+          id: "wire-model",
+          reasoning: {
+            ...explicit,
+            source: "detection" as const,
+            supportedEfforts: ["low" as const],
+          },
+        },
+      ]) {
+        const result = reconcileFetchedCodexCatalogRows(
+          [createRow({ model: "wire-model", reasoning: explicit })],
+          [fetched],
+          {},
+          {
+            appendNew: false,
+            createRow,
+            existingMetadataMode: "refresh",
+            removeMissingRemote: true,
+          },
+        );
+        expect(result.rows[0].reasoning).toEqual(explicit);
+      }
+    },
+  );
+
   it("clears stale automatic reasoning metadata only after a complete refresh", () => {
     const automaticReasoning: CodexModelReasoningCapability = {
       schemaVersion: 2,

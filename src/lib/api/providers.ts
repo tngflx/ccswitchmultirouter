@@ -237,6 +237,13 @@ export function normalizeProvidersPayload(
 }
 
 export const providersApi = {
+  async bindCodexPresetReasoningEvidence(
+    settingsConfig: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    return await invoke("bind_codex_preset_reasoning_evidence", {
+      settingsConfig,
+    });
+  },
   async migrateCodexOfficialAuthOwnership(): Promise<CodexOfficialAuthMigrationStatus> {
     return await invoke("migrate_codex_official_auth_ownership");
   },

@@ -170,6 +170,162 @@ fn namespace_consolidation_does_not_change_other_native_gateways() {
 }
 
 #[test]
+fn request_preparation_preserves_missing_catalog_identity_passthrough() {
+    for (api_format, transport) in [
+        ("openai_chat", CodexRequestTransport::ChatCompletions),
+        ("openai_responses", CodexRequestTransport::Responses),
+    ] {
+        let base_provider = third_party_provider(api_format);
+        for (case, catalog) in [
+            ("absent catalog", None),
+            ("malformed catalog", Some(json!({"models": "invalid"}))),
+            ("valid empty catalog", Some(json!({"models": []}))),
+            (
+                "unknown model in populated catalog",
+                Some(base_provider.settings_config["modelCatalog"].clone()),
+            ),
+        ] {
+            let mut provider = base_provider.clone();
+            if let Some(catalog) = catalog {
+                provider.settings_config["modelCatalog"] = catalog;
+            } else {
+                provider
+                    .settings_config
+                    .as_object_mut()
+                    .expect("provider settings object")
+                    .remove("modelCatalog");
+            }
+            let policy = CodexThirdPartyRequestPolicy::compile(&provider)
+                .expect("compile provider without a known requested catalog identity");
+            let mut logical = logical_request();
+            logical["model"] = json!("genuinely-unlisted-model");
+
+            assert!(
+                policy
+                    .prepare_protocol_body(transport, logical, &CodexRequestOptions::default())
+                    .is_ok(),
+                "{api_format}/{case}: a missing catalog identity must retain existing passthrough/default-mapping behavior"
+            );
+        }
+    }
+}
+#[test]
+fn request_preparation_rejects_disabled_and_ambiguous_catalog_identities() {
+    let mut accepted_blocked_requests = Vec::new();
+    for (api_format, transport) in [
+        ("openai_chat", CodexRequestTransport::ChatCompletions),
+        ("openai_responses", CodexRequestTransport::Responses),
+    ] {
+        let base_provider = third_party_provider(api_format);
+        let original_row = base_provider.settings_config["modelCatalog"]["models"][0].clone();
+        let mut disabled_row = original_row.clone();
+        disabled_row["enabled"] = json!(false);
+        disabled_row["aliases"] = json!(["disabled-alias"]);
+        let mut first_row = original_row.clone();
+        first_row["enabled"] = json!(true);
+        first_row["aliases"] = json!(["shared-alias"]);
+        let mut second_row = original_row;
+        second_row["model"] = json!("second-public-model");
+        second_row["upstreamModel"] = json!("second-wire-model");
+        second_row["enabled"] = json!(true);
+        second_row["aliases"] = json!(["shared-alias"]);
+
+        for (case, models, request_models) in [
+            (
+                "disabled",
+                json!([disabled_row]),
+                vec!["visible-model", "disabled-alias"],
+            ),
+            (
+                "ambiguous",
+                json!([first_row, second_row]),
+                vec!["shared-alias"],
+            ),
+        ] {
+            let mut provider = base_provider.clone();
+            provider.settings_config["modelCatalog"]["models"] = models;
+            let policy = CodexThirdPartyRequestPolicy::compile(&provider)
+                .expect("compile the provider without selecting a blocked model");
+            for request_model in request_models {
+                let mut logical = logical_request();
+                logical["model"] = json!(request_model);
+                if policy
+                    .prepare_protocol_body(transport, logical, &CodexRequestOptions::default())
+                    .is_ok()
+                {
+                    accepted_blocked_requests.push(format!("{api_format}/{case}/{request_model}"));
+                }
+            }
+        }
+    }
+
+    assert!(
+        accepted_blocked_requests.is_empty(),
+        "request preparation must reject disabled public IDs, their aliases, and ambiguous aliases before dispatch; accepted: {}",
+        accepted_blocked_requests.join(", ")
+    );
+}
+#[test]
+fn request_preparation_keeps_original_catalog_reasoning_when_wire_is_a_sibling_public_id() {
+    for (api_format, transport, effort_pointer) in [
+        (
+            "openai_chat",
+            CodexRequestTransport::ChatCompletions,
+            "/reasoning_effort",
+        ),
+        (
+            "openai_responses",
+            CodexRequestTransport::Responses,
+            "/reasoning/effort",
+        ),
+    ] {
+        let mut provider = third_party_provider(api_format);
+        let mut original_row = provider.settings_config["modelCatalog"]["models"][0].clone();
+        original_row["aliases"] = json!(["request-alias"]);
+        original_row["upstreamModel"] = json!("sibling-public-model");
+        let mut sibling_row = original_row.clone();
+        sibling_row["model"] = json!("sibling-public-model");
+        sibling_row["aliases"] = json!([]);
+        sibling_row["upstreamModel"] = json!("sibling-wire-model");
+        sibling_row["reasoning"]["supportedEfforts"] = json!(["low"]);
+        sibling_row["reasoning"]["defaultEffort"] = json!("low");
+        sibling_row["reasoning"]["upstream"]["effortMap"] = json!({"high": "low"});
+        provider.settings_config["modelCatalog"]["models"] = json!([original_row, sibling_row]);
+        let policy = CodexThirdPartyRequestPolicy::compile(&provider)
+            .expect("compile a provider with colliding public/wire identities");
+
+        for request_model in ["visible-model", "request-alias"] {
+            let mut logical = logical_request();
+            logical["model"] = json!(request_model);
+            let prepared = policy
+                .prepare_protocol_body(transport, logical, &CodexRequestOptions::default())
+                .expect("prepare the originally selected catalog row");
+
+            assert_eq!(
+                prepared["model"],
+                json!("sibling-public-model"),
+                "{api_format}: map {request_model} once, not through the sibling row"
+            );
+            assert_eq!(
+                prepared.pointer(effort_pointer),
+                Some(&json!("xhigh")),
+                "{api_format}: {request_model} must keep its own high-to-xhigh contract"
+            );
+        }
+
+        let mut sibling_request = logical_request();
+        sibling_request["model"] = json!("sibling-public-model");
+        let sibling_prepared = policy
+            .prepare_protocol_body(transport, sibling_request, &CodexRequestOptions::default())
+            .expect("prepare an explicitly selected sibling row");
+        assert_eq!(sibling_prepared["model"], json!("sibling-wire-model"));
+        assert_eq!(
+            sibling_prepared.pointer(effort_pointer),
+            Some(&json!("low"))
+        );
+    }
+}
+#[test]
 fn namespace_consolidation_does_not_change_chat_conversion() {
     let provider = third_party_provider("openai_chat");
     let mut go = provider.clone();

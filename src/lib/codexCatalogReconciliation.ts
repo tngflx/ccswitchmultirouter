@@ -1,4 +1,4 @@
-import type { CodexCatalogModel } from "@/types";
+import type { CodexCatalogModel, CodexModelReasoningCapability } from "@/types";
 import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
 import {
   modelBindingIdentityValues,
@@ -83,6 +83,18 @@ function hasValue(value: unknown): boolean {
   return value !== undefined && value !== null && value !== "";
 }
 
+/** Explicit user declarations survive discovery and model rebinding. */
+export function isExplicitCodexReasoningCapability(
+  capability: CodexModelReasoningCapability | null | undefined,
+): boolean {
+  return Boolean(
+    capability &&
+    (capability.source === undefined ||
+      capability.source === "user" ||
+      capability.source === "user_confirmed_detection"),
+  );
+}
+
 function missingCapabilityPatch(
   row: CodexCatalogRowLike,
   fetched: FetchedCodexCatalogModel,
@@ -142,12 +154,12 @@ function missingCapabilityPatch(
   }
   // Provider metadata is authoritative for automatic/built-in declarations,
   // but an explicit user declaration remains the single source of truth.
-  if (fetched.reasoning && row.reasoning?.source !== "user") {
+  if (fetched.reasoning && !isExplicitCodexReasoningCapability(row.reasoning)) {
     patch.reasoning = fetched.reasoning;
   } else if (
     clearAbsentReasoning &&
     !fetched.reasoning &&
-    row.reasoning?.source !== "user" &&
+    !isExplicitCodexReasoningCapability(row.reasoning) &&
     Object.prototype.hasOwnProperty.call(row, "reasoning")
   ) {
     // A complete refresh owns automatic metadata. Remove stale declarations

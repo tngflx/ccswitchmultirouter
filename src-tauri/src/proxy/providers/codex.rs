@@ -1763,6 +1763,10 @@ pub(crate) fn validate_codex_provider_api_capability(
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .unwrap_or_else(|| public_model.trim());
+    validate_codex_catalog_request_model(provider, public_model)?;
+    if requested_canonical_model != public_model.trim() {
+        validate_codex_catalog_request_model(provider, requested_canonical_model)?;
+    }
     let model_identity = |model: &JsonValue| {
         ["model", "id", "slug"]
             .into_iter()
@@ -3338,33 +3342,52 @@ pub fn codex_provider_upstream_model(provider: &Provider) -> Option<String> {
         })
 }
 
-/// 按 catalog 可见模型名查找真实上游模型；没有显式别名时回退为可见名本身。
+/// Resolve catalog public IDs and aliases through the same row-selection
+/// contract used by capability resolution. Excluded/ambiguous rows never map.
 fn codex_provider_catalog_upstream_model_for_request(
     provider: &Provider,
     request_model: &str,
 ) -> Option<String> {
-    crate::codex_multirouter::catalog::catalog_models(&provider.settings_config).and_then(
-        |models| {
-            models.iter().find_map(|model| {
-                let visible_model = model
-                    .get("model")
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|model| !model.is_empty())?;
-                if !visible_model.eq_ignore_ascii_case(request_model.trim()) {
-                    return None;
-                }
-                let upstream_model = model
-                    .get("upstreamModel")
-                    .or_else(|| model.get("upstream_model"))
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|model| !model.is_empty())
-                    .unwrap_or(visible_model);
-                Some(upstream_model.to_string())
-            })
-        },
-    )
+    match lookup_catalog_model(&provider.settings_config, request_model) {
+        CatalogModelLookup::Found(model)
+            if model.get("enabled").and_then(JsonValue::as_bool) != Some(false) =>
+        {
+            ["upstreamModel", "upstream_model", "model", "id", "slug"]
+                .iter()
+                .filter_map(|field| model.get(*field).and_then(JsonValue::as_str))
+                .map(str::trim)
+                .find(|model| !model.is_empty())
+                .map(ToString::to_string)
+        }
+        _ => None,
+    }
+}
+
+/// Reject only explicit catalog exclusions or ambiguous identities. Missing
+/// rows (including unloaded/absent catalogs) retain legacy passthrough semantics.
+pub(super) fn validate_codex_catalog_request_model(
+    provider: &Provider,
+    request_model: &str,
+) -> Result<(), ProxyError> {
+    match lookup_catalog_model(&provider.settings_config, request_model) {
+        CatalogModelLookup::Ambiguous => Err(ProxyError::ConfigError(format!(
+            "Codex model `{}` has an ambiguous catalog identity; select a unique public model",
+            request_model.trim()
+        ))),
+        CatalogModelLookup::Found(model)
+            if model.get("enabled").and_then(JsonValue::as_bool) == Some(false) =>
+        {
+            Err(ProxyError::ConfigError(format!(
+                "Codex model `{}` is excluded by the current provider catalog",
+                request_model.trim()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn codex_catalog_request_model_is_blocked(provider: &Provider, model: &str) -> bool {
+    validate_codex_catalog_request_model(provider, model).is_err()
 }
 
 /// 将 Codex 请求体里的可见模型名改回真实上游模型名；route 显式覆盖优先于 catalog 默认映射。
@@ -3372,6 +3395,13 @@ pub fn apply_codex_request_upstream_model(
     provider: &Provider,
     body: &mut JsonValue,
 ) -> Option<String> {
+    if body
+        .get("model")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|model| codex_catalog_request_model_is_blocked(provider, model))
+    {
+        return None;
+    }
     if let Some(route_override) = provider
         .settings_config
         .get(CODEX_RESOLVED_UPSTREAM_MODEL_OVERRIDE)
@@ -3408,6 +3438,15 @@ pub fn apply_codex_chat_upstream_model(
 
 /// Apply route or catalog model mapping for every converted Codex protocol.
 pub fn apply_codex_upstream_model(provider: &Provider, body: &mut JsonValue) -> Option<String> {
+    // Explicitly rejected catalog identities cannot fall through to a route
+    // override or configured default after shared row lookup rejects them.
+    if body
+        .get("model")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|model| codex_catalog_request_model_is_blocked(provider, model))
+    {
+        return None;
+    }
     if provider
         .settings_config
         .get("codexResolvedRouteMatched")
@@ -3438,13 +3477,14 @@ pub fn resolve_codex_chat_reasoning_config(
         .map(ToString::to_string)
         .or_else(|| codex_provider_upstream_model(provider))
         .unwrap_or_default();
+    if codex_catalog_request_model_is_blocked(provider, &requested_model) {
+        return None;
+    }
     // P1：单一 resolver 入口——用户模型级声明 > 检测候选（TTL）> 能力库 > 内置 > unknown。
     // 请求路径只读 TTL 缓存，不发起网络请求；检测由 UI/目录层异步触发。
     // 优先级：用户模型级声明 > 用户 provider 级显式声明（meta）> 检测/能力库/内置 > 推断。
-    let detection = crate::reasoning_capabilities::current_detection(
-        crate::reasoning_capabilities::reasoning_provider_key(provider),
-        &requested_model,
-    );
+    let detection =
+        crate::reasoning_capabilities::current_detection_for_provider(provider, &requested_model);
     let resolved = crate::reasoning_capabilities::resolve_codex_model_capability(
         provider,
         &requested_model,
@@ -3526,6 +3566,9 @@ pub(crate) fn prepare_codex_native_responses_model(
     provider: &Provider,
     body: &mut JsonValue,
 ) -> Result<Option<String>, ProxyError> {
+    if let Some(model) = body.get("model").and_then(JsonValue::as_str) {
+        validate_codex_catalog_request_model(provider, model)?;
+    }
     apply_codex_native_responses_reasoning_effort(provider, body)?;
     let preserve_future_grok = provider_needs_responses_namespace_flatten(provider)
         && body
@@ -3870,37 +3913,46 @@ fn infer_codex_chat_reasoning_config(
     provider: &Provider,
     body: &JsonValue,
 ) -> Option<CodexChatReasoningConfig> {
-    let model = body
+    let requested_model = body
         .get("model")
-        .and_then(|value| value.as_str())
+        .and_then(JsonValue::as_str)
         .map(ToString::to_string)
         .or_else(|| codex_provider_upstream_model(provider))
+        .unwrap_or_default();
+    if codex_catalog_request_model_is_blocked(provider, &requested_model) {
+        return None;
+    }
+    // Reuse request mapping, including route overrides/defaults, rather than
+    // inferring a vendor from a public alias unrelated to the upstream model.
+    let mut model_body = serde_json::json!({"model": requested_model});
+    let model = apply_codex_upstream_model(provider, &mut model_body)
+        .unwrap_or(requested_model)
+        .to_ascii_lowercase();
+    let base_url = provider_codex_base_url(provider)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let base_url = provider
-        .settings_config
-        .get("base_url")
-        .or_else(|| provider.settings_config.get("baseURL"))
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string)
-        .or_else(|| {
-            provider
-                .settings_config
-                .get("config")
-                .and_then(|v| v.as_str())
-                .and_then(extract_codex_base_url_from_toml)
-        })
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let name = provider.name.to_ascii_lowercase();
+    let (name, _) =
+        crate::reasoning_capabilities::provider_metadata::provider_platform_identity(provider);
+    let name = name.to_ascii_lowercase();
+    let platform = crate::reasoning_capabilities::provider_metadata::detect_platform(provider);
 
-    // 平台优先：聚合 / 托管平台的 reasoning 接口由平台的推理框架决定，而非模型官方实现，
-    // 因此先按平台标识（仅 name + base_url，不含 model 名）判定并覆盖模型规则。
-    if let Some(config) = infer_aggregator_platform_config(&name, &base_url) {
+    if let Some(config) = infer_aggregator_platform_config(platform, &name, &base_url) {
         return Some(config);
     }
 
-    let haystack = format!("{name} {base_url} {model}");
+    // A known transport contract outranks foreign model/vendor text and route
+    // labels. A capability miss is not permission to inherit another API's
+    // wire fields. vLLM retains only the existing Qwen output-budget safety.
+    let haystack = match platform {
+        Some("sublyx") => return None,
+        Some("vllm") if model.contains("qwen") => "qwen vllm".to_string(),
+        Some("vllm") => return None,
+        Some("deepseek") => "deepseek".to_string(),
+        Some("zhipu") => "zhipu".to_string(),
+        Some("dashscope") => "dashscope".to_string(),
+        Some(_) => return None,
+        None => format!("{name} {base_url} {model}"),
+    };
 
     if haystack.contains("deepseek") {
         return Some(CodexChatReasoningConfig {
@@ -4043,17 +4095,16 @@ fn infer_codex_chat_reasoning_config(
 /// OpenRouter 用原生 `reasoning:{effort}` 对象）。仅以平台标识（name / base_url）判定，
 /// 绝不掺入 model 名——model 名属于模型厂商，会把托管平台误判成模型官方接口。
 fn infer_aggregator_platform_config(
+    platform: Option<&str>,
     name: &str,
     base_url: &str,
 ) -> Option<CodexChatReasoningConfig> {
-    let platform = format!("{name} {base_url}");
-
     // OpenRouter：用原生归一化对象 `reasoning: { effort }`（由 OpenRouter 翻译成各底层
     // 模型的正确推理参数，比顶层 OpenAI 别名 reasoning_effort 覆盖面更全）。effort 走
     // "openrouter" 值映射：枚举为 xhigh|high|medium|low|minimal，无 max——max 会触发
     // `400 reasoning_effort: Invalid option`（见 openclaw#77350），故钳到 xhigh。
     // 安全降级：不发 `thinking:{type}`（OpenRouter 不认该字段），避免误配导致请求被拒。
-    if platform.contains("openrouter") {
+    if platform == Some("openrouter") {
         return Some(CodexChatReasoningConfig {
             supports_thinking: Some(false),
             supports_effort: Some(true),
@@ -4070,7 +4121,7 @@ fn infer_aggregator_platform_config(
     // SiliconFlow：平台级统一 `enable_thinking`，思维回传 reasoning_content。
     // 安全降级：不按 reasoning_effort 发 effort（平台用 thinking_budget 控制深度，
     // 发 reasoning_effort 反而可能不被接受）。
-    if platform.contains("siliconflow") {
+    if platform.is_none() && format!("{name} {base_url}").contains("siliconflow") {
         return Some(CodexChatReasoningConfig {
             supports_thinking: Some(true),
             supports_effort: Some(false),
@@ -5416,10 +5467,10 @@ experimental_bearer_token = "PROXY_MANAGED"
             detection_cache, ProviderCapabilitySnapshot, ReasoningCapabilitySnapshot,
         };
 
-        // Cover both the initial request-model cache read and the shared
-        // resolver's later upstream-identity read. UUIDs isolate global TTL
-        // state without clearing snapshots that concurrent tests may own.
-        for cache_uses_wire_identity in [false, true] {
+        // New evidence is stored under canonical wire identity. Both public
+        // and wire request identities must resolve the same target-scoped cache.
+        // UUIDs isolate global TTL state without clearing other tests' snapshots.
+        for request_uses_wire_identity in [false, true] {
             let suffix = uuid::Uuid::new_v4();
             let public_model = format!("custom-public-{suffix}");
             let wire_model = format!("custom-wire-{suffix}");
@@ -5443,13 +5494,14 @@ experimental_bearer_token = "PROXY_MANAGED"
                     .unwrap()
                     .insert(ProviderCapabilitySnapshot {
                         provider_key: target_id.clone(),
-                        model: if cache_uses_wire_identity {
-                            wire_model.clone()
-                        } else {
-                            public_model.clone()
-                        },
+                        model: wire_model.clone(),
                         fetched_at: 1,
                         source: "provider_metadata".into(),
+                        evidence_scope:
+                            crate::reasoning_capabilities::reasoning_evidence_scope_for_settings(
+                                &target.settings_config,
+                                &public_model,
+                            ),
                         reasoning: Some(ReasoningCapabilitySnapshot {
                             supported_efforts: vec![accepted_effort.into()],
                             default_effort: Some(accepted_effort.into()),
@@ -5475,7 +5527,7 @@ experimental_bearer_token = "PROXY_MANAGED"
                     target.name
                 );
                 let mut request = json!({
-                    "model": public_model,
+                    "model": if request_uses_wire_identity { &wire_model } else { &public_model },
                     "input": "test",
                     "reasoning": {"effort": "medium"}
                 });
@@ -7986,6 +8038,253 @@ wire_api = "responses"
     }
 
     #[test]
+    fn catalog_aliases_map_to_the_same_wire_model_for_native_and_converted_requests() {
+        for (alias_field, alias_value) in [
+            ("aliases", json!(["Alias-For-Model"])),
+            ("aliases", json!({"Alias-For-Model": "public-model"})),
+            ("alias", json!(["Alias-For-Model"])),
+            ("canonicalSlug", json!("Alias-For-Model")),
+            ("canonical_slug", json!("Alias-For-Model")),
+        ] {
+            let mut row = json!({
+                "model": "public-model",
+                "upstreamModel": "wire-model-a"
+            });
+            row[alias_field] = alias_value;
+            let provider = create_provider(json!({
+                "model": "default-model-b",
+                "modelCatalog": {"models": [row]}
+            }));
+            let request = json!({"model": "  ALIAS-for-model  ", "input": "ping"});
+            let mut native = request.clone();
+            let mut converted = request;
+            assert_eq!(
+                prepare_codex_native_responses_model(&provider, &mut native)
+                    .expect("native model mapping")
+                    .as_deref(),
+                Some("wire-model-a"),
+                "native {alias_field}"
+            );
+            assert_eq!(
+                apply_codex_upstream_model(&provider, &mut converted).as_deref(),
+                Some("wire-model-a"),
+                "converted {alias_field}"
+            );
+            assert_eq!(native["model"], json!("wire-model-a"));
+            assert_eq!(converted["model"], json!("wire-model-a"));
+        }
+    }
+
+    #[test]
+    fn blocked_catalog_aliases_never_revive_default_route_or_inferred_reasoning() {
+        for models in [
+            json!([
+                {"model": "first", "aliases": ["deepseek-blocked"]},
+                {"model": "second", "aliases": ["deepseek-blocked"]}
+            ]),
+            json!([{
+                "model": "disabled", "aliases": ["deepseek-blocked"], "enabled": false
+            }]),
+        ] {
+            for unmatched in [false, true] {
+                let mut provider = create_provider(json!({
+                    "baseUrl": "https://openrouter.ai/api/v1",
+                    "model": "default-model",
+                    "modelCatalog": {"models": models},
+                    "codexResolvedRouteMatched": !unmatched,
+                    "codexResolvedUpstreamModelOverride": "route-override"
+                }));
+                provider.meta = Some(ProviderMeta {
+                    codex_chat_reasoning: Some(CodexChatReasoningConfig {
+                        supports_effort: Some(true),
+                        effort_param: Some("reasoning_effort".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+                let original = json!({"model": "deepseek-blocked", "input": "ping"});
+                let mut native = original.clone();
+                let mut converted = original.clone();
+                let mut direct = original.clone();
+                assert!(apply_codex_request_upstream_model(&provider, &mut direct).is_none());
+                let native_error = prepare_codex_native_responses_model(&provider, &mut native)
+                    .expect_err("native request admission must reject blocked catalog identities");
+                assert!(native_error.to_string().contains("catalog"));
+                assert!(apply_codex_upstream_model(&provider, &mut converted).is_none());
+                assert_eq!(native, original);
+                assert_eq!(converted, original);
+                assert_eq!(direct, original);
+                assert!(resolve_codex_chat_reasoning_config(&provider, &original).is_none());
+                assert!(infer_codex_chat_reasoning_config(&provider, &original).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_admission_rejects_disabled_or_ambiguous_model_before_protocol_validation() {
+        let db = Database::memory().expect("memory database");
+        let mut provider = create_provider(json!({
+            "modelCatalog": {"models": [
+                {"model": "excluded", "aliases": ["excluded-alias"], "upstreamModel": "wire", "enabled": false},
+                {"model": "first", "aliases": ["shared-alias"], "upstreamModel": "wire"},
+                {"model": "second", "aliases": ["shared-alias"], "upstreamModel": "wire"},
+                {"model": "active", "upstreamModel": "wire"}
+            ]}
+        }));
+        let mut accepted = Vec::new();
+        for public_model in ["excluded", "excluded-alias", "shared-alias"] {
+            if validate_codex_provider_api_capability(&provider, public_model, "wire", &db, 0)
+                .is_ok()
+            {
+                accepted.push(public_model.to_string());
+            }
+        }
+        provider.settings_config["codexResolvedCanonicalModel"] = json!("excluded");
+        if validate_codex_provider_api_capability(&provider, "active", "wire", &db, 0).is_ok() {
+            accepted.push("excluded canonical identity behind active public model".to_string());
+        }
+        assert!(
+            accepted.is_empty(),
+            "catalog admission must reject excluded or ambiguous identities before API protocol checks; accepted: {}",
+            accepted.join(", ")
+        );
+    }
+
+    #[test]
+    fn catalog_admission_preserves_unknown_models_and_does_not_recheck_wire_as_public_id() {
+        let db = Database::memory().expect("memory database");
+        for settings in [
+            json!({}),
+            json!({"modelCatalog": {"models": "malformed"}}),
+            json!({"modelCatalog": {"models": []}}),
+            json!({"modelCatalog": {"models": [{"model": "other", "enabled": false}]}}),
+        ] {
+            let provider = create_provider(settings);
+            validate_codex_provider_api_capability(&provider, "unknown", "wire", &db, 0)
+                .expect("missing catalog identity is not an explicit exclusion");
+        }
+        let provider = create_provider(json!({
+            "modelCatalog": {"models": [
+                {"model": "active", "upstreamModel": "excluded"},
+                {"model": "excluded", "upstreamModel": "other-wire", "enabled": false}
+            ]}
+        }));
+        validate_codex_provider_api_capability(&provider, "active", "excluded", &db, 0).expect(
+            "an active row owns its wire identity even when it matches a disabled public row",
+        );
+    }
+
+    #[test]
+    fn fallback_reasoning_uses_wire_model_instead_of_public_alias() {
+        let provider = create_provider(json!({
+            "baseUrl": "https://gateway.example/v1",
+            "modelCatalog": {"models": [{
+                "model": "public-model", "aliases": ["deepseek-marketing-alias"],
+                "upstreamModel": "opaque-wire-model"
+            }]}
+        }));
+        assert!(infer_codex_chat_reasoning_config(
+            &provider,
+            &json!({"model": "deepseek-marketing-alias"})
+        )
+        .is_none());
+
+        let provider = create_provider(json!({
+            "baseUrl": "http://vllm.local/v1",
+            "modelCatalog": {"models": [{
+                "model": "deepseek-marketing-alias", "upstreamModel": "Qwen/custom-future-model"
+            }]}
+        }));
+        let config = infer_codex_chat_reasoning_config(
+            &provider,
+            &json!({"model": "deepseek-marketing-alias"}),
+        )
+        .expect("wire Qwen model retains vLLM safety defaults");
+        assert_eq!(config.supports_effort, Some(false));
+        assert_eq!(config.thinking_param.as_deref(), Some("none"));
+        assert_eq!(config.min_output_tokens, Some(QWEN_VLLM_MIN_OUTPUT_TOKENS));
+    }
+
+    #[test]
+    fn fallback_reasoning_isolates_platforms_from_wrapper_and_foreign_vendor_names() {
+        for (id, base_url, expected_parameter) in [
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                Some("reasoning.effort"),
+            ),
+            ("sublyx", "https://sublyx.org/v1", None),
+            ("vllm", "http://vllm.local/v1", Some("none")),
+            (
+                "zhipu",
+                "https://api.z.ai/api/paas/v4",
+                Some("reasoning_effort"),
+            ),
+            (
+                "dashscope",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                Some("none"),
+            ),
+            ("siliconflow", "https://api.siliconflow.cn/v1", Some("none")),
+        ] {
+            let mut provider = create_provider(json!({
+                "baseUrl": base_url,
+                "codexResolvedTargetProviderId": format!("target-{id}"),
+                "codexResolvedTargetProviderName": "Original target",
+                "modelCatalog": {"models": [{
+                    "model": "public-model", "upstreamModel": "deepseek-qwen-future-model"
+                }]}
+            }));
+            // Wrapper labels are user-facing only, never transport evidence.
+            provider.name = if id == "openrouter" {
+                "Sublyx route"
+            } else {
+                "OpenRouter route"
+            }
+            .into();
+            let config =
+                infer_codex_chat_reasoning_config(&provider, &json!({"model": "public-model"}));
+            assert_eq!(
+                config
+                    .as_ref()
+                    .and_then(|config| config.effort_param.as_deref()),
+                expected_parameter,
+                "platform {id}"
+            );
+            if id == "vllm" {
+                assert_eq!(
+                    config.unwrap().min_output_tokens,
+                    Some(QWEN_VLLM_MIN_OUTPUT_TOKENS)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_unknown_or_unsupported_reasoning_is_not_replaced_by_platform_fallback() {
+        for state in ["unknown", "confirmed_unsupported"] {
+            let provider = create_provider(json!({
+                "baseUrl": "https://openrouter.ai/api/v1",
+                "modelCatalog": {"models": [{
+                    "model": "deepseek-custom", "reasoning": {
+                        "schemaVersion": 2, "supportStatus": state,
+                        "controlKind": if state == "unknown" {"unknown"} else {"none"},
+                        "supportedEfforts": [], "defaultEffort": null, "disableAllowed": false,
+                        "source": "user", "upstream": {"format": "none", "parameter": "none", "effortMap": {}}
+                    }
+                }]}
+            }));
+            let config = resolve_codex_chat_reasoning_config(
+                &provider,
+                &json!({"model": "deepseek-custom"}),
+            )
+            .expect("explicit declaration remains authoritative");
+            assert_eq!(config.supports_effort, Some(false), "{state}");
+            assert_eq!(config.effort_param.as_deref(), Some("none"), "{state}");
+        }
+    }
+
+    #[test]
     fn test_resolve_codex_chat_reasoning_infers_deepseek_effort_support() {
         // 使用非内置清单模型（deepseek-chat），验证平台/模型推断分支。
         // deepseek-v4-pro/flash 在内置清单中，会走能力派生路径（见
@@ -10491,7 +10790,12 @@ model = "step-3.7-flash"
 name = "StepFun"
 base_url = "https://api.stepfun.com/v1"
 wire_api = "chat"
-"#
+"#,
+            "modelCatalog": {"models": [
+                {"model": "step-3.7-flash"},
+                {"model": "step-3.5-flash-2603"},
+                {"model": "step-3.5-flash"}
+            ]}
         }));
 
         let step_37 =

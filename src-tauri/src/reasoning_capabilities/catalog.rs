@@ -262,6 +262,7 @@ mod tests {
                 confidence: None,
                 fetched_at: None,
                 provider_key: None,
+                evidence_scope: None,
                 model_revision: None,
                 codex_ultra_orchestration: None,
             },

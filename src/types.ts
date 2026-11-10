@@ -365,6 +365,14 @@ export type CodexReasoningControlKind =
 export type CodexReasoningConfidence =
   "authoritative" | "verified" | "maintained" | "inferred";
 
+/** Non-secret binding for automatic evidence; valid only for the current API transport/model. */
+export interface CodexReasoningEvidenceScope {
+  /** SHA-256 fingerprint of the normalized, credential-free inference base URL. */
+  transportFingerprint: string;
+  /** Normalized upstream wire model, not its display name or catalog alias. */
+  model: string;
+}
+
 export interface CodexModelReasoningCapability {
   /**
    * 能力 schema 版本。缺失表示 legacy v1；新写入固定为 2。
@@ -392,6 +400,7 @@ export interface CodexModelReasoningCapability {
     | "provider"
     | "builtin"
     | "user"
+    | "user_confirmed_detection"
     | "legacy"
     | "protocol"
     | "detection"
@@ -405,6 +414,8 @@ export interface CodexModelReasoningCapability {
   fetchedAt?: string;
   /** Provider 身份（schema v2）。易变元数据，不进入能力指纹。 */
   providerKey?: string;
+  /** Automatic evidence is usable only while this transport/model binding remains current. */
+  evidenceScope?: CodexReasoningEvidenceScope;
   /** 模型 revision（schema v2）。易变元数据，不进入能力指纹。 */
   modelRevision?: string;
   /**

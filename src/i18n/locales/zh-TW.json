@@ -1320,6 +1320,8 @@
     "openReleaseNotesFailed": "開啟更新日誌失敗："
   },
   "providerForm": {
+    "codexPresetPreparing": "正在準備供應商預設…",
+    "codexPresetPrepareFailed": "無法準備供應商預設。現有草稿已保留，請重試。",
     "supplierName": "供應商名稱",
     "supplierNameRequired": "供應商名稱 *",
     "supplierNamePlaceholder": "例如：Anthropic 官方",

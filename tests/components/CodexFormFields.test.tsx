@@ -10,6 +10,8 @@ import { useState, type ReactNode } from "react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CodexFormFields } from "@/components/providers/forms/CodexFormFields";
+import { codexProviderPresets } from "@/config/codexProviderPresets";
+import { providersApi } from "@/lib/api/providers";
 import { fetchModelsForConfig } from "@/lib/api/model-fetch";
 import { preflightCodexProviderProtocolCompatibility } from "@/lib/api/protocol-compatibility";
 import type {
@@ -41,6 +43,10 @@ import type {
 const reasoningApiMocks = vi.hoisted(() => ({
   resolve: vi.fn(),
   trigger: vi.fn(),
+}));
+
+vi.mock("@/lib/api/providers", () => ({
+  providersApi: { bindCodexPresetReasoningEvidence: vi.fn() },
 }));
 
 vi.mock("@/lib/api/codexSubagentV2", () => ({
@@ -99,6 +105,7 @@ beforeEach(() => {
     writable: true,
     value: vi.fn(),
   });
+  vi.mocked(providersApi.bindCodexPresetReasoningEvidence).mockReset();
   reasoningApiMocks.resolve.mockReset();
   reasoningApiMocks.trigger.mockReset();
   reasoningApiMocks.resolve.mockImplementation(
@@ -170,8 +177,15 @@ function createDetectedReasoningOutcome(
       model,
       fetchedAt: 1_700_000_000_000,
       source: "openrouter_api",
+      evidenceScope: {
+        transportFingerprint: "detected-provider-transport",
+        model,
+      },
       reasoning: {
         supportedEfforts: ["low", "high"],
+        upstreamFormat: "string",
+        upstreamParameter: "reasoning_effort",
+        outputFormat: "reasoning_content",
         defaultEffort: "high",
         mandatory: false,
         defaultEnabled: true,
@@ -388,6 +402,7 @@ function renderCatalogHarness(
     allowModelMenuProjectionToggle?: boolean;
     openAdvancedOptions?: boolean;
     presetCatalogModels?: CodexCatalogModel[];
+    presetConfig?: string;
     customUserAgent?: string;
     headersOverride?: string;
     bodyOverride?: string;
@@ -488,6 +503,7 @@ function renderCatalogHarness(
         }}
         catalogModels={catalog}
         presetCatalogModels={options.presetCatalogModels}
+        presetConfig={options.presetConfig}
         onCatalogModelsChange={handleCatalogChange}
         spawnAgentModels={[]}
         onSpawnAgentModelsChange={vi.fn()}
@@ -2093,10 +2109,18 @@ describe("CodexFormFields local model routing", () => {
     await waitFor(() => {
       expect(latestCatalog()[0].reasoning).toEqual(
         expect.objectContaining({
-          source: "user",
+          source: "user_confirmed_detection",
+          providerKey: "codex-thirdparty",
+          evidenceScope: detected.found.evidenceScope,
           supportedEfforts: ["low", "high"],
           defaultEffort: "high",
           disableAllowed: true,
+          upstream: {
+            format: "string",
+            parameter: "reasoning_effort",
+            effortMap: { low: "low", high: "high" },
+          },
+          outputFormat: "reasoning_content",
         }),
       );
     });
@@ -2209,23 +2233,30 @@ describe("CodexFormFields local model routing", () => {
   });
 
   it("keeps built-in reasoning read-only until an explicit override and restores the preset", async () => {
+    const preset = codexProviderPresets.find(
+      (candidate) => candidate.presetKey === "deepseek",
+    )!;
+    const maintainedModel = preset.modelCatalog!.find(
+      (row) => row.model === "deepseek-v4-pro",
+    )!;
     const builtinReasoning: NonNullable<CodexCatalogModel["reasoning"]> = {
-      supported: true as const,
-      supportedEfforts: ["low", "high", "max"],
-      defaultEffort: "high" as const,
-      disableAllowed: false,
-      upstream: {
-        format: "reasoning_object" as const,
-        parameter: "reasoning.effort" as const,
+      ...maintainedModel.reasoning!,
+      evidenceScope: {
+        transportFingerprint: "maintained-deepseek-transport",
+        model: maintainedModel.model,
       },
-      source: "builtin" as const,
     };
+    vi.mocked(providersApi.bindCodexPresetReasoningEvidence).mockResolvedValue({
+      config: preset.config,
+      modelCatalog: {
+        models: [{ ...maintainedModel, reasoning: builtinReasoning }],
+      },
+    });
     const { latestCatalog } = renderCatalogHarness(
-      [{ model: "deepseek-v4-pro", reasoning: builtinReasoning }],
+      [{ model: maintainedModel.model, reasoning: builtinReasoning }],
       {
-        presetCatalogModels: [
-          { model: "deepseek-v4-pro", reasoning: builtinReasoning },
-        ],
+        presetCatalogModels: [maintainedModel],
+        presetConfig: preset.config,
       },
     );
 
@@ -2263,6 +2294,13 @@ describe("CodexFormFields local model routing", () => {
     await waitFor(() => {
       expect(latestCatalog()[0].reasoning).toEqual(builtinReasoning);
     });
+    expect(providersApi.bindCodexPresetReasoningEvidence).toHaveBeenCalledWith({
+      config: preset.config,
+      modelCatalog: { models: [maintainedModel] },
+    });
+    expect(latestCatalog()[0].reasoning?.evidenceScope).toEqual(
+      builtinReasoning.evidenceScope,
+    );
     expect(
       screen.getByLabelText("deepseek-v4-pro reasoning capability JSON"),
     ).toHaveAttribute("readonly");

@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
@@ -81,7 +88,9 @@ import {
 } from "@/lib/protocol-lab/codex-overrides";
 import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
 import {
+  catalogModelIdentity,
   isCompleteCodexCatalogFetch,
+  isExplicitCodexReasoningCapability,
   reconcileFetchedCodexCatalogRows,
 } from "@/lib/codexCatalogReconciliation";
 import { enableOnlyConfirmedFreeCatalogModels } from "@/lib/freeModelCatalog";
@@ -123,6 +132,9 @@ import type {
 } from "@/types";
 import type { CodexProviderEditorSnapshot } from "@/lib/api/protocol-compatibility";
 import type { AppId } from "@/lib/api";
+import { providersApi } from "@/lib/api/providers";
+import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
+import { codexProviderPresets } from "@/config/codexProviderPresets";
 import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
 import {
   customCodexTrafficPolicySeed,
@@ -133,6 +145,8 @@ import type {
   CodexModelReasoningResolution,
   CodexReasoningDiscoveryOutcome,
 } from "@/types/codexSubagentV2";
+
+const EMPTY_CODEX_API_KEY_GROUPS: CodexApiKeyGroup[] = [];
 
 interface EndpointCandidate {
   url: string;
@@ -348,6 +362,8 @@ interface CodexFormFieldsProps {
   catalogModels?: CodexCatalogModel[];
   // Current maintained preset baseline, used only for explicit override/restore.
   presetCatalogModels?: CodexCatalogModel[];
+  // Original maintained transport; never replace this with the edited draft endpoint.
+  presetConfig?: string;
   // Maintained and saved catalog inventory used only to hydrate missing,
   // unambiguous input-capability metadata.
   knownCatalogModels?: CodexCatalogModel[];
@@ -409,7 +425,7 @@ export function CodexFormSaveFeedback({
   );
 }
 
-function capabilityFromReasoningDetection(
+export function capabilityFromReasoningDetection(
   outcome: CodexReasoningDiscoveryOutcome,
 ): CodexModelReasoningCapability | undefined {
   if (typeof outcome !== "object" || !("found" in outcome)) return undefined;
@@ -434,10 +450,21 @@ function capabilityFromReasoningDetection(
       ? (reasoning.defaultEffort as CodexReasoningEffort)
       : undefined,
     disableAllowed: !reasoning.mandatory,
-    upstream: { format: "reasoning_object", parameter: "reasoning.effort" },
-    outputFormat: "auto",
-    source: "user",
+    upstream: {
+      format:
+        reasoning.upstreamFormat === "object"
+          ? "reasoning_object"
+          : (reasoning.upstreamFormat ?? "reasoning_object"),
+      parameter: reasoning.upstreamParameter ?? "reasoning.effort",
+      effortMap: Object.fromEntries(
+        supportedEfforts.map((effort) => [effort, effort]),
+      ),
+    },
+    outputFormat: reasoning.outputFormat ?? undefined,
+    source: "user_confirmed_detection",
     confidence: "authoritative",
+    providerKey: outcome.found.providerKey,
+    evidenceScope: outcome.found.evidenceScope ?? undefined,
   };
 }
 
@@ -739,6 +766,62 @@ function mergeFetchedModelsIntoCatalogRows(
   return result.rows;
 }
 
+/** Bind only fresh maintained constants to their original, trusted transport. */
+export async function bindFreshCodexPresetCatalogReasoning(
+  config: string,
+  models: CodexCatalogModel[],
+): Promise<CodexCatalogModel[]> {
+  const settings = await providersApi.bindCodexPresetReasoningEvidence({
+    config,
+    modelCatalog: { models: structuredClone(models) },
+  });
+  const catalog = readCodexCatalogSettings(settings);
+  if (!catalog || !Array.isArray(catalog.models)) {
+    throw new Error("Invalid fresh maintained preset catalog");
+  }
+  return catalog.models as CodexCatalogModel[];
+}
+
+/** Apply a model edit without turning a public alias rename into a wire rename. */
+export function updateCodexCatalogRowModelBinding<T extends CodexCatalogModel>(
+  row: T,
+  patch: Partial<CodexCatalogModel>,
+  fetched?: FetchedModel,
+): T {
+  const next = { ...row, ...patch };
+  if (
+    patch.model !== undefined &&
+    patch.upstreamModel === undefined &&
+    patch.upstream_model === undefined
+  ) {
+    const previousVisibleModel = row.model.trim();
+    const previousUpstreamModel = catalogRowUpstreamModel(row);
+    if (
+      previousVisibleModel &&
+      (!previousUpstreamModel || previousUpstreamModel === previousVisibleModel)
+    ) {
+      next.upstreamModel = previousVisibleModel;
+    }
+  }
+  const previousWireModel = catalogRowUpstreamModel(row).trim().toLowerCase();
+  const nextWireModel = catalogRowUpstreamModel(next).trim().toLowerCase();
+  const hasExplicitReasoning = isExplicitCodexReasoningCapability(
+    row.reasoning,
+  );
+  if (
+    !hasExplicitReasoning &&
+    !Object.prototype.hasOwnProperty.call(patch, "reasoning") &&
+    (previousWireModel !== nextWireModel || fetched !== undefined)
+  ) {
+    // A provider declaration is evidence about its wire model, not the menu
+    // alias. Never attach model A's automatic efforts to a newly bound B.
+    // Keep the fetched evidenceScope intact for the shared backend resolver.
+    if (fetched?.reasoning) next.reasoning = fetched.reasoning;
+    else delete next.reasoning;
+  }
+  return next;
+}
+
 export function CodexFormFields({
   codexProviderEditorSnapshot = null,
   appId = "codex",
@@ -755,7 +838,7 @@ export function CodexFormFields({
   onXaiAccountSelect,
   codexApiKey,
   onApiKeyChange,
-  apiKeyGroups = [],
+  apiKeyGroups = EMPTY_CODEX_API_KEY_GROUPS,
   onApiKeyGroupsChange,
   apiKeyGroupMode = "isolated",
   onApiKeyGroupModeChange,
@@ -808,6 +891,7 @@ export function CodexFormFields({
   onProtocolProbeReceiptIdsChange = ignoreProtocolProbeReceiptIds,
   catalogModels = [],
   presetCatalogModels = [],
+  presetConfig,
   knownCatalogModels = [],
   onCatalogModelsChange,
   catalogValidationError = null,
@@ -822,8 +906,92 @@ export function CodexFormFields({
 }: CodexFormFieldsProps) {
   const { t } = useTranslation();
 
-  const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
-  const [isFetchingModels, setIsFetchingModels] = useState(false);
+  // Request inputs stay in memory only. Opaque generations avoid serializing
+  // credentials and prevent A -> B -> A from reviving A's old model directory.
+  const modelFetchIdentity = useMemo(
+    () => Symbol("codex-model-discovery"),
+    [
+      providerId,
+      providerName,
+      codexBaseUrl,
+      isFullUrl,
+      codexApiKey,
+      customUserAgent,
+      partnerPromotionKey,
+      planAccessKeyId,
+      planSecretAccessKey,
+      apiKeyGroups,
+      apiKeyGroupMode,
+      websiteUrl,
+      isXaiOauthPreset,
+      isXaiOauthAuthenticated,
+      selectedXaiAccountId,
+      isCanonicalOfficial,
+      officialAccountId,
+      officialManagedOAuth,
+    ],
+  );
+  const modelFetchOwnershipRef = useRef({
+    identity: modelFetchIdentity,
+    sequence: 0,
+    mounted: false,
+  });
+  const [modelDiscoveryState, setModelDiscoveryState] = useState(() => ({
+    identity: modelFetchIdentity,
+    models: [] as FetchedModel[],
+    fetching: false,
+  }));
+  const fetchedModels =
+    modelDiscoveryState.identity === modelFetchIdentity
+      ? modelDiscoveryState.models
+      : [];
+  const isFetchingModels =
+    modelDiscoveryState.identity === modelFetchIdentity &&
+    modelDiscoveryState.fetching;
+
+  useLayoutEffect(() => {
+    const owner = modelFetchOwnershipRef.current;
+    owner.identity = modelFetchIdentity;
+    owner.mounted = true;
+    setModelDiscoveryState((previous) =>
+      previous.identity === modelFetchIdentity
+        ? previous
+        : { identity: modelFetchIdentity, models: [], fetching: false },
+    );
+    return () => {
+      // Invalidate committed ownership before queued promise callbacks run,
+      // while leaving abandoned renders unable to cancel the mounted owner.
+      owner.mounted = false;
+      owner.sequence += 1;
+    };
+  }, [modelFetchIdentity]);
+
+  const beginModelFetch = useCallback(() => {
+    const owner = modelFetchOwnershipRef.current;
+    if (!owner.mounted || owner.identity !== modelFetchIdentity) return null;
+    const sequence = ++owner.sequence;
+    const isCurrent = () =>
+      owner.mounted &&
+      owner.identity === modelFetchIdentity &&
+      owner.sequence === sequence;
+    return {
+      isCurrent,
+      start: () =>
+        setModelDiscoveryState((previous) =>
+          isCurrent() ? { ...previous, fetching: true } : previous,
+        ),
+      setModels: (models: FetchedModel[]) =>
+        setModelDiscoveryState((previous) =>
+          isCurrent()
+            ? { identity: modelFetchIdentity, models, fetching: true }
+            : previous,
+        ),
+      finish: () =>
+        setModelDiscoveryState((previous) =>
+          isCurrent() ? { ...previous, fetching: false } : previous,
+        ),
+    };
+  }, [modelFetchIdentity]);
   const [reasoningResolutionState, setReasoningResolutionState] = useState<{
     contextKey: string;
     models: Record<string, CodexModelReasoningResolution>;
@@ -857,29 +1025,6 @@ export function CodexFormFields({
   const protocolProbeSeqRef = useRef(0);
   const [shouldHighlightFetchModels, setShouldHighlightFetchModels] =
     useState(false);
-  // takeoverEnabled 现在只表示“Codex 菜单映射”开关；模型目录和上下文元数据可独立编辑。
-  // isChatFormat 仅在选了 Chat Completions 上游格式时为真（思考能力是 Chat 专属）。
-  // 拉取请求序号：请求身份（Base URL / 完整地址开关 / API Key / 自定义 UA）
-  // 一变即自增，清空旧列表并作废在途响应——/models 结果可能按 Key 的模型
-  // 授权返回，换号后残留旧列表会误导选择
-  const fetchModelsSeqRef = useRef(0);
-
-  useEffect(() => {
-    fetchModelsSeqRef.current += 1;
-    setFetchedModels((prev) => (prev.length === 0 ? prev : []));
-    setIsFetchingModels(false);
-  }, [
-    codexBaseUrl,
-    isFullUrl,
-    codexApiKey,
-    customUserAgent,
-    isXaiOauthPreset,
-    isXaiOauthAuthenticated,
-    selectedXaiAccountId,
-    isCanonicalOfficial,
-    officialAccountId,
-    officialManagedOAuth,
-  ]);
   // 思考能力随 Chat 格式显示（仅 Chat Completions 转换路径用得上）；模型映射常驻
   //（填了才生成 catalog）。两者都已与「路由接管」概念解耦。
   const isChatFormat = apiFormat === "openai_chat";
@@ -1444,19 +1589,20 @@ export function CodexFormFields({
   );
 
   const handleFetchModels = useCallback(() => {
+    const request = beginModelFetch();
+    if (!request) return;
     if (isCanonicalOfficial) {
       // Bind account limits to an observed account identity. A null ID would
       // let the backend select a changing default outside this request key.
       if (officialManagedOAuth && !officialAccountId?.trim()) return;
-      const seq = ++fetchModelsSeqRef.current;
-      setIsFetchingModels(true);
-      const request = officialManagedOAuth
+      request.start();
+      const modelsRequest = officialManagedOAuth
         ? fetchCodexOauthModels(officialAccountId)
         : fetchCodexOfficialFallbackModels();
-      request
+      modelsRequest
         .then((models) => {
-          if (seq !== fetchModelsSeqRef.current) return;
-          setFetchedModels(models);
+          if (!request.isCurrent()) return;
+          request.setModels(models);
           // Official account/default/max context values remain discovery-only
           // UI metadata, not persisted overrides. Refresh all other explicit
           // capability metadata through the same canonical reconciliation as
@@ -1503,13 +1649,13 @@ export function CodexFormFields({
           }
         })
         .catch(() => {
-          if (seq !== fetchModelsSeqRef.current) return;
+          if (!request.isCurrent()) return;
           // The selected account remains authoritative even when discovery
           // fails; never silently substitute a public catalog or log auth data.
           toast.error(t("codexConfig.officialCatalogFailed"));
         })
         .finally(() => {
-          if (seq === fetchModelsSeqRef.current) setIsFetchingModels(false);
+          request.finish();
         });
       return;
     }
@@ -1523,12 +1669,53 @@ export function CodexFormFields({
         );
         return;
       }
-      const seq = ++fetchModelsSeqRef.current;
-      setIsFetchingModels(true);
+      request.start();
       fetchXaiOauthModels(selectedXaiAccountId ?? null)
-        .then((models) => {
-          if (seq !== fetchModelsSeqRef.current) return;
-          setFetchedModels(models);
+        .then(async (models) => {
+          if (!request.isCurrent()) return;
+          // The OAuth directory does not advertise effort controls. Regenerate
+          // current maintained evidence from the fresh xAI constant, not from
+          // this provider's old automatic declarations or edited endpoint.
+          const preset = codexProviderPresets.find(
+            (candidate) => candidate.presetKey === "xai-grok-oauth",
+          );
+          const fetchedIds = new Set(
+            models.map((model) => catalogModelIdentity(model.id)),
+          );
+          const currentPresetRows = (preset?.modelCatalog ?? []).filter(
+            (row) =>
+              row.reasoning &&
+              fetchedIds.has(
+                catalogModelIdentity(catalogRowUpstreamModel(row)),
+              ),
+          );
+          if (preset && currentPresetRows.length > 0) {
+            const baseline = await bindFreshCodexPresetCatalogReasoning(
+              preset.config,
+              currentPresetRows,
+            );
+            if (!request.isCurrent()) return;
+            models = models.map((model) => ({
+              ...model,
+              reasoning:
+                model.reasoning ??
+                baseline.find(
+                  (row) =>
+                    catalogModelIdentity(catalogRowUpstreamModel(row)) ===
+                    catalogModelIdentity(model.id),
+                )?.reasoning,
+            }));
+          }
+          request.setModels(models);
+          if (onCatalogModelsChange) {
+            const rows = mergeFetchedModelsIntoCatalogRows(
+              catalogRowsRef.current,
+              models,
+              { providerId, providerName, baseUrl: codexBaseUrl, websiteUrl },
+              true,
+            );
+            commitCatalogRows(() => rows, { repairDefault: true });
+          }
           if (models.length === 0) {
             toast.info(t("providerForm.fetchModelsEmpty"));
           } else {
@@ -1538,12 +1725,12 @@ export function CodexFormFields({
           }
         })
         .catch((err) => {
-          if (seq !== fetchModelsSeqRef.current) return;
-          console.warn("[XaiOAuth] Failed to fetch models:", err);
+          if (!request.isCurrent()) return;
+          console.warn("[XaiOAuth] Failed to fetch models");
           showFetchModelsError(err, t);
         })
         .finally(() => {
-          if (seq === fetchModelsSeqRef.current) setIsFetchingModels(false);
+          request.finish();
         });
       return;
     }
@@ -1581,8 +1768,7 @@ export function CodexFormFields({
       });
       return;
     }
-    const seq = ++fetchModelsSeqRef.current;
-    setIsFetchingModels(true);
+    request.start();
     fetchModelsForConfig(
       codexBaseUrl,
       codexApiKey,
@@ -1598,8 +1784,8 @@ export function CodexFormFields({
         : undefined,
     )
       .then((models) => {
-        if (seq !== fetchModelsSeqRef.current) return;
-        setFetchedModels(models);
+        if (!request.isCurrent()) return;
+        request.setModels(models);
         if (onCatalogModelsChange) {
           const mergedRows = mergeFetchedModelsIntoCatalogRows(
             catalogRowsRef.current,
@@ -1610,7 +1796,7 @@ export function CodexFormFields({
               baseUrl: codexBaseUrl,
               websiteUrl,
             },
-            isCompleteCodexCatalogFetch(apiKeyGroupsRef.current),
+            isCompleteCodexCatalogFetch(apiKeyGroups),
           );
           commitCatalogRows(() => mergedRows, { repairDefault: true });
         }
@@ -1623,14 +1809,16 @@ export function CodexFormFields({
         }
       })
       .catch((err) => {
-        if (seq !== fetchModelsSeqRef.current) return;
-        console.warn("[ModelFetch] Failed:", err);
+        if (!request.isCurrent()) return;
+        console.warn("[ModelFetch] Failed");
         showFetchModelsError(err, t);
       })
       .finally(() => {
-        if (seq === fetchModelsSeqRef.current) setIsFetchingModels(false);
+        request.finish();
       });
   }, [
+    beginModelFetch,
+    apiKeyGroups,
     codexBaseUrl,
     codexApiKey,
     isFullUrl,
@@ -2078,23 +2266,19 @@ export function CodexFormFields({
         (current) =>
           current.map((row, i) => {
             if (i !== index) return row;
-            const next = { ...row, ...patch };
-            if (
-              patch.model !== undefined &&
-              patch.upstreamModel === undefined &&
-              patch.upstream_model === undefined
-            ) {
-              const previousVisibleModel = row.model.trim();
-              const previousUpstreamModel = catalogRowUpstreamModel(row);
-              if (
-                previousVisibleModel &&
-                (!previousUpstreamModel ||
-                  previousUpstreamModel === previousVisibleModel)
-              ) {
-                next.upstreamModel = previousVisibleModel;
-              }
-            }
-            return next;
+            const patchedWire = catalogRowUpstreamModel({ ...row, ...patch });
+            const isBindingEdit =
+              patch.model !== undefined ||
+              patch.upstreamModel !== undefined ||
+              patch.upstream_model !== undefined;
+            const fetched = isBindingEdit
+              ? fetchedModels.find(
+                  (model) =>
+                    model.id.trim().toLowerCase() ===
+                    patchedWire.trim().toLowerCase(),
+                )
+              : undefined;
+            return updateCodexCatalogRowModelBinding(row, patch, fetched);
           }),
         {
           // A single-row switch/edit must keep the default model and its
@@ -2104,7 +2288,12 @@ export function CodexFormFields({
         },
       );
     },
-    [commitCatalogRows, onProtocolOverridesChange, protocolOverrides],
+    [
+      commitCatalogRows,
+      fetchedModels,
+      onProtocolOverridesChange,
+      protocolOverrides,
+    ],
   );
 
   const handleUpdateCatalogReasoningJson = useCallback(
@@ -2132,6 +2321,55 @@ export function CodexFormFields({
       }
     },
     [handleUpdateCatalogRow],
+  );
+
+  const reasoningRestoreSequenceRef = useRef(new Map<string, number>());
+  const handleRestoreBuiltinReasoning = useCallback(
+    async (index: number) => {
+      const row = catalogRowsRef.current[index];
+      if (!row || !presetConfig) return;
+      const owner = modelFetchOwnershipRef.current;
+      const identity = modelFetchIdentity;
+      const sequence =
+        (reasoningRestoreSequenceRef.current.get(row.rowId) ?? 0) + 1;
+      reasoningRestoreSequenceRef.current.set(row.rowId, sequence);
+      const wire = catalogModelIdentity(catalogRowUpstreamModel(row));
+      const originalReasoning = row.reasoning;
+      const current = () =>
+        owner.mounted &&
+        owner.identity === identity &&
+        reasoningRestoreSequenceRef.current.get(row.rowId) === sequence;
+      try {
+        const baseline = await bindFreshCodexPresetCatalogReasoning(
+          presetConfig,
+          presetCatalogModels,
+        );
+        if (!current()) return;
+        const reasoning = baseline.find(
+          (candidate) =>
+            catalogModelIdentity(catalogRowUpstreamModel(candidate)) === wire,
+        )?.reasoning;
+        if (!reasoning) return;
+        commitCatalogRows((rows) =>
+          rows.map((candidate) =>
+            candidate.rowId === row.rowId &&
+            catalogModelIdentity(catalogRowUpstreamModel(candidate)) === wire &&
+            candidate.reasoning === originalReasoning
+              ? { ...candidate, reasoning }
+              : candidate,
+          ),
+        );
+      } catch {
+        if (current()) toast.error(t("providerForm.codexPresetPrepareFailed"));
+      }
+    },
+    [
+      commitCatalogRows,
+      modelFetchIdentity,
+      presetCatalogModels,
+      presetConfig,
+      t,
+    ],
   );
 
   const presetReasoningByModel = useMemo(() => {
@@ -2790,10 +3028,11 @@ export function CodexFormFields({
                     presetReasoningByModel.get(catalogRowUpstreamModel(row));
                   const isBuiltinReasoning =
                     row.reasoning?.source === "builtin";
-                  const isUserReasoning = row.reasoning?.source === "user";
+                  const isUserReasoning = isExplicitCodexReasoningCapability(
+                    row.reasoning,
+                  );
                   const isUserPresetOverride =
-                    Boolean(presetReasoning) &&
-                    row.reasoning?.source === "user";
+                    Boolean(presetReasoning) && isUserReasoning;
                   const reasoningSourceMode: CodexReasoningCapabilitySourceMode =
                     isBuiltinReasoning
                       ? "builtin"
@@ -2877,18 +3116,23 @@ export function CodexFormFields({
                               className="rounded-md border bg-background px-3 py-2"
                               value={reasoningSourceMode}
                               aria-label={`${model || "Model"} reasoning capability source`}
-                              onChange={(event) =>
+                              onChange={(event) => {
+                                const mode = event.target
+                                  .value as CodexReasoningCapabilitySourceMode;
+                                if (mode === "builtin") {
+                                  void handleRestoreBuiltinReasoning(index);
+                                  return;
+                                }
                                 handleUpdateCatalogRow(index, {
                                   reasoning:
                                     applyCodexReasoningCapabilitySource(
-                                      event.target
-                                        .value as CodexReasoningCapabilitySourceMode,
+                                      mode,
                                       row.reasoning,
                                       presetReasoning,
                                       discoveredReasoning,
                                     ),
-                                })
-                              }
+                                });
+                              }}
                             >
                               <option value="automatic">
                                 Automatic discovery
@@ -3020,16 +3264,9 @@ export function CodexFormFields({
                                       })
                                   : undefined
                               }
-                              onRestoreBuiltin={() =>
-                                handleUpdateCatalogRow(index, {
-                                  reasoning:
-                                    applyCodexReasoningCapabilitySource(
-                                      "builtin",
-                                      row.reasoning,
-                                      presetReasoning,
-                                    ),
-                                })
-                              }
+                              onRestoreBuiltin={() => {
+                                void handleRestoreBuiltinReasoning(index);
+                              }}
                             />
                           ) : (
                             <p className="text-muted-foreground">
@@ -3043,16 +3280,9 @@ export function CodexFormFields({
                               type="button"
                               variant="ghost"
                               size="sm"
-                              onClick={() =>
-                                handleUpdateCatalogRow(index, {
-                                  reasoning:
-                                    applyCodexReasoningCapabilitySource(
-                                      "builtin",
-                                      row.reasoning,
-                                      presetReasoning,
-                                    ),
-                                })
-                              }
+                              onClick={() => {
+                                void handleRestoreBuiltinReasoning(index);
+                              }}
                             >
                               Restore built-in default
                             </Button>

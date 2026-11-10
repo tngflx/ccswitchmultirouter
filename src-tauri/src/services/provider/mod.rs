@@ -1860,7 +1860,8 @@ command = "example-mcp"
                 .set_current_provider(AppType::Codex.as_str(), &current.id)
                 .expect("keep target provider non-current");
 
-            let target_settings = json!({
+            let mut target_settings = json!({
+                "base_url": "https://draft.example/v1",
                 "modelCatalog": { "models": [
                     {
                         "model": "repository-scout",
@@ -1910,6 +1911,17 @@ command = "example-mcp"
                     }
                 }
             });
+            // Automatic builtin evidence belongs to this target's active transport,
+            // not the separately configured current provider.
+            target_settings["modelCatalog"]["models"][0]["reasoning"]["evidenceScope"] =
+                serde_json::to_value(
+                    crate::reasoning_capabilities::reasoning_evidence_scope_for_settings(
+                        &target_settings,
+                        "repository-scout",
+                    )
+                    .expect("target fixture has a safe current transport and wire model"),
+                )
+                .expect("serialize target fixture reasoning scope");
             let target = Provider::with_id(
                 "draft-router".to_string(),
                 "Draft router".to_string(),

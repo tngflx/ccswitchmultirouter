@@ -6,13 +6,14 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import type { ComponentProps } from "react";
+import { StrictMode, type ComponentProps } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ProviderForm } from "@/components/providers/forms/ProviderForm";
 import { CodexProviderSetCancelled } from "@/components/providers/forms/useCodexProviderSetSave";
-import type { Provider } from "@/types";
+import type { CodexCatalogModel, Provider } from "@/types";
+import { codexProviderPresets } from "@/config/codexProviderPresets";
 import type { ManagedAuthStatus } from "@/lib/api/auth";
 import * as providerConfigUtils from "@/utils/providerConfigUtils";
 import { readCodexModelProtocolCapability } from "@/lib/codexProtocolCapability";
@@ -20,6 +21,7 @@ import { createSingleCodexProtocolLabAdapter } from "@/lib/protocol-lab/codex-ad
 
 const codexCandidateApiMocks = vi.hoisted(() => ({
   validateProviderCandidate: vi.fn(),
+  bindCodexPresetReasoningEvidence: vi.fn(),
   getTeProviderDescriptor: vi.fn().mockResolvedValue(null),
   authGetStatus: vi.fn().mockResolvedValue({ authenticated: false }),
 }));
@@ -64,6 +66,8 @@ vi.mock("@/lib/api", async () => {
     },
     providersApi: {
       ...actual.providersApi,
+      bindCodexPresetReasoningEvidence: (...args: unknown[]) =>
+        codexCandidateApiMocks.bindCodexPresetReasoningEvidence(...args),
       migrateCodexOfficialAuthOwnership: vi.fn().mockResolvedValue({
         state: "already_current",
         conflictingRouterIds: [],
@@ -89,8 +93,20 @@ vi.mock("@/components/providers/forms/CodexConfigEditor", () => ({
     configValue: string;
   }) => (
     <section aria-label="codex-config-editor">
-      <pre data-testid="codex-auth-editor">{authValue}</pre>
-      <pre data-testid="codex-config-editor">{configValue}</pre>
+      <pre
+        contentEditable
+        suppressContentEditableWarning
+        data-testid="codex-auth-editor"
+      >
+        {authValue}
+      </pre>
+      <pre
+        contentEditable
+        suppressContentEditableWarning
+        data-testid="codex-config-editor"
+      >
+        {configValue}
+      </pre>
     </section>
   ),
 }));
@@ -187,6 +203,9 @@ vi.mock("@/components/providers/forms/CodexFormFields", () => ({
       >
         mock-toggle-projection
       </button>
+      <div data-testid="codex-catalog-json">
+        {JSON.stringify(catalogModels ?? [])}
+      </div>
       <div data-testid="codex-catalog">
         {(catalogModels ?? []).map((model) => model.model).join(",")}
       </div>
@@ -337,9 +356,407 @@ describe("ProviderForm Codex preset selection", () => {
     codexCandidateApiMocks.authGetStatus
       .mockReset()
       .mockResolvedValue({ authenticated: false });
+    codexCandidateApiMocks.bindCodexPresetReasoningEvidence
+      .mockReset()
+      .mockImplementation(async (settings: Record<string, unknown>) => {
+        const result = structuredClone(settings);
+        const catalog = result.modelCatalog as { models: CodexCatalogModel[] };
+        catalog.models = catalog.models.map((model) => ({
+          ...model,
+          ...(model.reasoning
+            ? {
+                reasoning: {
+                  ...model.reasoning,
+                  evidenceScope: {
+                    transportFingerprint: "a".repeat(64),
+                    model: model.model.toLowerCase(),
+                  },
+                },
+              }
+            : {}),
+        }));
+        return result;
+      });
     codexCandidateApiMocks.validateProviderCandidate
       .mockReset()
       .mockResolvedValue(undefined);
+  });
+
+  it("binds only the credential-free fresh preset catalog and applies returned scoped evidence", async () => {
+    renderProviderForm();
+    fireEvent.click(screen.getByRole("button", { name: /DeepSeek$/ }));
+
+    await waitFor(() => {
+      expect(
+        codexCandidateApiMocks.bindCodexPresetReasoningEvidence,
+      ).toHaveBeenCalledOnce();
+      expect(screen.getByTestId("codex-base-url")).toHaveTextContent(
+        "https://api.deepseek.com",
+      );
+    });
+    const preset = codexProviderPresets.find(
+      (item) => item.presetKey === "deepseek",
+    )!;
+    expect(
+      codexCandidateApiMocks.bindCodexPresetReasoningEvidence,
+    ).toHaveBeenCalledWith({
+      config: preset.config,
+      modelCatalog: { models: preset.modelCatalog },
+    });
+    const rows = JSON.parse(
+      screen.getByTestId("codex-catalog-json").textContent!,
+    );
+    expect(rows[0].reasoning.evidenceScope).toEqual({
+      transportFingerprint: "a".repeat(64),
+      model: rows[0].model.toLowerCase(),
+    });
+    expect(preset.modelCatalog?.[0].reasoning?.evidenceScope).toBeUndefined();
+  });
+
+  it("does not rebind saved maintained automatic evidence on mount or rerender", async () => {
+    const initialData = {
+      name: "Saved DeepSeek",
+      settingsConfig: {
+        auth: {},
+        config: codexProviderPresets.find(
+          (item) => item.presetKey === "deepseek",
+        )!.config,
+        modelCatalog: {
+          models: [
+            {
+              model: "saved-model",
+              reasoning: { supportedEfforts: ["high"], source: "builtin" },
+            },
+          ],
+        },
+      },
+      meta: { codexPresetId: "deepseek" },
+    } as Partial<Provider>;
+    const view = renderProviderForm({ initialData });
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-catalog")).toHaveTextContent(
+        "saved-model",
+      ),
+    );
+    view.rerender(
+      <QueryClientProvider client={new QueryClient()}>
+        <ProviderForm
+          appId="codex"
+          submitLabel="Save"
+          onSubmit={vi.fn()}
+          onCancel={vi.fn()}
+          initialData={initialData}
+        />
+      </QueryClientProvider>,
+    );
+    expect(
+      codexCandidateApiMocks.bindCodexPresetReasoningEvidence,
+    ).not.toHaveBeenCalled();
+    expect(
+      JSON.parse(screen.getByTestId("codex-catalog-json").textContent!)[0]
+        .reasoning.evidenceScope,
+    ).toBeUndefined();
+  });
+
+  it("keeps the prior draft and blocks all submission while fresh preset binding is pending", async () => {
+    let resolveBinding!: (settings: Record<string, unknown>) => void;
+    codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mockImplementationOnce(
+      () =>
+        new Promise<Record<string, unknown>>((resolve) => {
+          resolveBinding = resolve;
+        }),
+    );
+    const onSubmit = vi.fn();
+    const onSubmittingChange = vi.fn();
+    renderProviderForm({
+      showButtons: true,
+      submitLabel: "Save",
+      onSubmit,
+      onSubmittingChange,
+    });
+    fireEvent.click(screen.getByRole("button", { name: /DeepSeek$/ }));
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Preparing provider preset",
+    );
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(screen.getByLabelText("provider.name")).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "mock-set-api-key" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Custom model source" }),
+    ).not.toBeDisabled();
+    expect(onSubmittingChange).toHaveBeenLastCalledWith(true);
+    expect(screen.getByTestId("codex-catalog")).toBeEmptyDOMElement();
+    fireEvent.submit(document.getElementById("provider-form")!);
+    await act(async () => {});
+    expect(onSubmit).not.toHaveBeenCalled();
+    await act(async () => {
+      resolveBinding(
+        codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mock
+          .calls[0][0],
+      );
+    });
+    expect(screen.getByRole("button", { name: "Save" })).not.toBeDisabled();
+    expect(onSubmittingChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("makes expanded contenteditable expert editors inert while fresh preset binding is pending", async () => {
+    let resolveBinding!: (settings: Record<string, unknown>) => void;
+    codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mockImplementationOnce(
+      () =>
+        new Promise<Record<string, unknown>>((resolve) => {
+          resolveBinding = resolve;
+        }),
+    );
+    renderProviderForm();
+    const authEditor = screen.getByTestId("codex-auth-editor");
+    const configEditor = screen.getByTestId("codex-config-editor");
+    expect(authEditor).toHaveAttribute("contenteditable", "true");
+    expect(configEditor).toHaveAttribute("contenteditable", "true");
+    expect(authEditor.closest("fieldset")).not.toHaveAttribute("inert");
+
+    fireEvent.click(screen.getByRole("button", { name: /DeepSeek$/ }));
+
+    // Native disabled only covers form controls, not CodeMirror's editable DOM.
+    // JSDOM does not implement native inert interaction, so assert the browser
+    // boundary around both already-mounted expanded expert editor surfaces.
+    expect(authEditor.closest("fieldset")).toHaveAttribute("inert", "");
+    expect(configEditor.closest("fieldset")).toHaveAttribute("inert", "");
+    expect(
+      screen
+        .getByRole("button", { name: "Custom model source" })
+        .closest("[inert]"),
+    ).toBeNull();
+
+    await act(async () => {
+      resolveBinding(
+        codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mock
+          .calls[0][0],
+      );
+    });
+    expect(authEditor.closest("fieldset")).not.toHaveAttribute("inert");
+    expect(configEditor.closest("fieldset")).not.toHaveAttribute("inert");
+  });
+
+  it("rejects stale bindings after a newer preset selection", async () => {
+    let resolveFirst!: (settings: Record<string, unknown>) => void;
+    codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mockImplementationOnce(
+      () =>
+        new Promise<Record<string, unknown>>((resolve) => {
+          resolveFirst = resolve;
+        }),
+    );
+    renderProviderForm();
+    fireEvent.click(screen.getByRole("button", { name: /DeepSeek$/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Zhipu GLM$/ }));
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-base-url")).toHaveTextContent(
+        "https://open.bigmodel.cn/api/v1",
+      ),
+    );
+    await act(async () => {
+      resolveFirst(
+        codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mock
+          .calls[0][0],
+      );
+    });
+    expect(screen.getByTestId("codex-base-url")).toHaveTextContent(
+      "https://open.bigmodel.cn/api/v1",
+    );
+    expect(screen.getByTestId("codex-catalog")).toHaveTextContent(
+      "glm-5.3,glm-5-turbo",
+    );
+  });
+
+  it("invalidates delayed preset binding when switching to custom", async () => {
+    let resolveBinding!: (settings: Record<string, unknown>) => void;
+    codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mockImplementationOnce(
+      () =>
+        new Promise<Record<string, unknown>>((resolve) => {
+          resolveBinding = resolve;
+        }),
+    );
+    renderProviderForm();
+    fireEvent.click(screen.getByRole("button", { name: /DeepSeek$/ }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Custom model source" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "mock-set-api-key" }));
+    await act(async () => {
+      resolveBinding(
+        codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mock
+          .calls[0][0],
+      );
+    });
+    expect(screen.getByTestId("codex-catalog")).toBeEmptyDOMElement();
+    expect(screen.getByTestId("codex-api-key")).toHaveTextContent("sk-test");
+    expect(
+      screen.getByTestId("codex-menu-projection-editability"),
+    ).toHaveTextContent("editable");
+  });
+
+  it("invalidates delayed preset binding when the component hydrates a saved provider", async () => {
+    let resolveBinding!: (settings: Record<string, unknown>) => void;
+    codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mockImplementationOnce(
+      () =>
+        new Promise<Record<string, unknown>>((resolve) => {
+          resolveBinding = resolve;
+        }),
+    );
+    const view = renderProviderForm();
+    fireEvent.click(screen.getByRole("button", { name: /DeepSeek$/ }));
+    const initialData = {
+      name: "Saved source",
+      settingsConfig: {
+        auth: {},
+        config:
+          'model_provider = "saved"\n[model_providers.saved]\nbase_url = "https://saved.example/v1"',
+        modelCatalog: { models: [{ model: "saved-only" }] },
+      },
+      meta: { codexPresetId: "deepseek" },
+    } as Partial<Provider>;
+    view.rerender(
+      <QueryClientProvider client={new QueryClient()}>
+        <ProviderForm
+          appId="codex"
+          submitLabel="Save"
+          onSubmit={vi.fn()}
+          onCancel={vi.fn()}
+          initialData={initialData}
+        />
+      </QueryClientProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-catalog")).toHaveTextContent(
+        "saved-only",
+      ),
+    );
+    await act(async () => {
+      resolveBinding(
+        codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mock
+          .calls[0][0],
+      );
+    });
+    expect(screen.getByTestId("codex-catalog")).toHaveTextContent("saved-only");
+    expect(screen.getByTestId("codex-base-url")).toHaveTextContent(
+      "https://saved.example/v1",
+    );
+    expect(
+      codexCandidateApiMocks.bindCodexPresetReasoningEvidence,
+    ).toHaveBeenCalledOnce();
+  });
+
+  it("does not clear a newer pending selection when an old binding fails", async () => {
+    let rejectFirst!: (error: Error) => void;
+    let resolveSecond!: (settings: Record<string, unknown>) => void;
+    codexCandidateApiMocks.bindCodexPresetReasoningEvidence
+      .mockImplementationOnce(
+        () =>
+          new Promise((_, reject) => {
+            rejectFirst = reject;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<Record<string, unknown>>((resolve) => {
+            resolveSecond = resolve;
+          }),
+      );
+    const errorToast = vi.spyOn(toast, "error");
+    try {
+      renderProviderForm({ showButtons: true, submitLabel: "Save" });
+      fireEvent.click(screen.getByRole("button", { name: /DeepSeek$/ }));
+      fireEvent.click(screen.getByRole("button", { name: /Zhipu GLM$/ }));
+      await act(async () => {
+        rejectFirst(new Error("Stale failure"));
+      });
+      expect(errorToast).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Preparing provider preset",
+      );
+      await act(async () => {
+        resolveSecond(
+          codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mock
+            .calls[1][0],
+        );
+      });
+      expect(screen.getByRole("button", { name: "Save" })).not.toBeDisabled();
+      expect(screen.getByTestId("codex-catalog")).toHaveTextContent(
+        "glm-5.3,glm-5-turbo",
+      );
+    } finally {
+      errorToast.mockRestore();
+    }
+  });
+
+  it("does not reapply a deferred selection after StrictMode unmount and remount", async () => {
+    let resolveBinding!: (settings: Record<string, unknown>) => void;
+    codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mockImplementationOnce(
+      () =>
+        new Promise<Record<string, unknown>>((resolve) => {
+          resolveBinding = resolve;
+        }),
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const view = render(
+      <StrictMode>
+        <QueryClientProvider client={client}>
+          <ProviderForm
+            appId="codex"
+            submitLabel="Save"
+            onSubmit={vi.fn()}
+            onCancel={vi.fn()}
+          />
+        </QueryClientProvider>
+      </StrictMode>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /DeepSeek$/ }));
+    const request =
+      codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mock.calls[0][0];
+    view.unmount();
+    renderProviderForm();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Custom model source" }),
+    );
+    await act(async () => {
+      resolveBinding(request);
+    });
+    expect(screen.getByTestId("codex-catalog")).toBeEmptyDOMElement();
+    expect(
+      screen.getByTestId("codex-menu-projection-editability"),
+    ).toHaveTextContent("editable");
+    expect(
+      codexCandidateApiMocks.bindCodexPresetReasoningEvidence,
+    ).toHaveBeenCalledOnce();
+  });
+
+  it("preserves the prior draft and reports a safe error when fresh binding fails", async () => {
+    const errorToast = vi.spyOn(toast, "error");
+    codexCandidateApiMocks.bindCodexPresetReasoningEvidence.mockRejectedValueOnce(
+      new Error("synthetic-sensitive-diagnostic-do-not-display"),
+    );
+    try {
+      renderProviderForm();
+      fireEvent.click(screen.getByRole("button", { name: "mock-set-api-key" }));
+      fireEvent.click(screen.getByRole("button", { name: /DeepSeek$/ }));
+      await waitFor(() =>
+        expect(errorToast).toHaveBeenCalledWith(
+          "Could not prepare provider preset. The existing draft was preserved. Please try again.",
+        ),
+      );
+      expect(screen.getByTestId("codex-catalog")).toBeEmptyDOMElement();
+      expect(screen.getByTestId("codex-api-key")).toHaveTextContent("sk-test");
+      expect(document.body.textContent).not.toContain(
+        "synthetic-sensitive-diagnostic-do-not-display",
+      );
+    } finally {
+      errorToast.mockRestore();
+    }
   });
 
   it("follows the current default OAuth account for official context discovery without changing the selected binding", async () => {

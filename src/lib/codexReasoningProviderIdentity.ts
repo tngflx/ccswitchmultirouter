@@ -18,6 +18,41 @@ export interface CodexReasoningProviderIdentity {
 }
 
 type Gateway = "openrouter" | "sublyx";
+type KnownPlatform = Gateway | "vllm" | "deepseek" | "zhipu" | "dashscope";
+
+/** Match actual transports, never URL paths, queries, userinfo, or model names. */
+function transportPlatform(baseUrl: unknown): KnownPlatform | undefined {
+  if (typeof baseUrl !== "string") return undefined;
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
+  // A terminal DNS dot is the same host, not a different provider. Keep this
+  // allowlist aligned with reasoning_capabilities/provider_metadata.rs.
+  const host = url.hostname.toLowerCase().replace(/\.+$/, "");
+  const hostMatches = (root: string) =>
+    host === root || (host.endsWith(`.${root}`) && !host.startsWith("."));
+  if (hostMatches("openrouter.ai")) return "openrouter";
+  if (hostMatches("sublyx.org")) return "sublyx";
+  if (host === "api.deepseek.com") return "deepseek";
+  if (host === "api.z.ai" || host === "open.bigmodel.cn") return "zhipu";
+  if (
+    host === "dashscope.aliyuncs.com" ||
+    host === "dashscope-intl.aliyuncs.com" ||
+    (host.endsWith(".maas.aliyuncs.com") && !host.startsWith("."))
+  )
+    return "dashscope";
+  const firstLabel = host.split(".")[0];
+  if (
+    firstLabel === "vllm" ||
+    (firstLabel.startsWith("vllm-") && firstLabel.length > "vllm-".length)
+  )
+    return "vllm";
+  return undefined;
+}
 
 function gateway(...values: unknown[]): Gateway | undefined {
   const identity = values
@@ -60,35 +95,49 @@ function firstString(
   return undefined;
 }
 
-function selectedTomlProvider(settings: Record<string, unknown>) {
+function parsedTomlSettings(settings: Record<string, unknown>) {
   if (typeof settings.config !== "string") return undefined;
   try {
-    const config = parseToml(normalizeTomlText(settings.config));
-    const selected = firstString(config, ["model_provider"]);
-    const selectedProvider = selected
-      ? record(record(config.model_providers)?.[selected])
-      : undefined;
-    return selectedProvider
-      ? { key: selected, settings: selectedProvider }
-      : undefined;
+    return parseToml(normalizeTomlText(settings.config));
   } catch {
     // An incomplete editor draft must not replace otherwise usable identity.
     return undefined;
   }
 }
 
-/** Same endpoint precedence as the Codex runtime: top-level, then active TOML. */
+function selectedTomlProvider(settings: Record<string, unknown>) {
+  const config = parsedTomlSettings(settings);
+  if (!config) return undefined;
+  const selected = firstString(config, ["model_provider"]);
+  const selectedProvider = selected
+    ? record(record(config.model_providers)?.[selected])
+    : undefined;
+  return selectedProvider
+    ? { key: selected, settings: selectedProvider }
+    : undefined;
+}
+
+/** Same endpoint precedence as the Codex runtime; never inspect inactive tables. */
 export function readCodexProviderBaseUrl(
   settingsConfig: Record<string, unknown> | null | undefined,
 ): string | undefined {
   if (!settingsConfig) return undefined;
+  const endpointKeys = ["base_url", "baseURL", "baseUrl"];
+  const topLevel = firstString(settingsConfig, endpointKeys);
+  if (topLevel) return topLevel;
+  const config = parsedTomlSettings(settingsConfig);
+  if (!config) return undefined;
+  const selected = firstString(config, ["model_provider"]);
+  if (!selected || selected === "openai") {
+    const openaiBaseUrl = firstString(config, ["openai_base_url"]);
+    if (openaiBaseUrl) return openaiBaseUrl;
+  }
+  const selectedProvider = selected
+    ? record(record(config.model_providers)?.[selected])
+    : undefined;
   return (
-    firstString(settingsConfig, ["base_url", "baseURL", "baseUrl"]) ??
-    firstString(selectedTomlProvider(settingsConfig)?.settings, [
-      "base_url",
-      "baseURL",
-      "baseUrl",
-    ])
+    firstString(selectedProvider, endpointKeys) ??
+    firstString(config, endpointKeys)
   );
 }
 
@@ -105,14 +154,22 @@ export function codexReasoningProviderIdentity(
   const baseUrl = readCodexProviderBaseUrl(settings);
   const targetId = firstString(settings, ["codexResolvedTargetProviderId"]);
   const targetName = firstString(settings, ["codexResolvedTargetProviderName"]);
-  const hasTargetIdentity = Boolean(targetId || targetName);
+  const hasTargetIdentity =
+    Object.prototype.hasOwnProperty.call(
+      settings,
+      "codexResolvedTargetProviderId",
+    ) ||
+    Object.prototype.hasOwnProperty.call(
+      settings,
+      "codexResolvedTargetProviderName",
+    );
   const providerId = hasTargetIdentity ? targetId : provider.id;
   const providerName = hasTargetIdentity
     ? targetName
     : (firstString(settings, ["providerName", "provider_name", "name"]) ??
       provider.name);
   const providerKind =
-    gateway(baseUrl) ??
+    transportPlatform(baseUrl) ??
     namedPlatform(
       selected?.key,
       firstString(selected?.settings, [
@@ -121,16 +178,19 @@ export function codexReasoningProviderIdentity(
         "provider_name",
       ]),
     ) ??
-    gateway(providerName, providerId);
+    namedPlatform(providerName, providerId) ??
+    // A complete current provider context is authoritative even when unknown.
+    // Do not revive stale capability provenance or synthetic wrapper labels.
+    "unknown";
   return { providerKind, providerId, providerName, baseUrl };
 }
 
-function explicitGateway(
+function explicitPlatform(
   identity?: CodexReasoningProviderIdentity | null,
-): Gateway | "other" | undefined {
+): KnownPlatform | "other" | undefined {
   if (!identity) return undefined;
   return (
-    gateway(identity.baseUrl) ??
+    transportPlatform(identity.baseUrl) ??
     (identity.providerKind?.trim()
       ? (gateway(identity.providerKind) ?? "other")
       : undefined) ??
@@ -150,7 +210,7 @@ export function isSublyxReasoningProvider(
   capabilityProviderKey?: string | null,
 ): boolean {
   return (
-    (explicitGateway(identity) ?? gateway(capabilityProviderKey, source)) ===
+    (explicitPlatform(identity) ?? gateway(capabilityProviderKey, source)) ===
     "sublyx"
   );
 }

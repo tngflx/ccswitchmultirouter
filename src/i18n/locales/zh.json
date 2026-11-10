@@ -1319,6 +1319,8 @@
     "openReleaseNotesFailed": "打开更新日志失败:"
   },
   "providerForm": {
+    "codexPresetPreparing": "正在准备供应商预设…",
+    "codexPresetPrepareFailed": "无法准备供应商预设。现有草稿已保留，请重试。",
     "supplierName": "供应商名称",
     "supplierNameRequired": "供应商名称 *",
     "supplierNamePlaceholder": "例如：Anthropic 官方",

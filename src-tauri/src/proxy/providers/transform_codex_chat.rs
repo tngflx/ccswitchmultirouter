@@ -1102,7 +1102,20 @@ fn apply_reasoning_options(
         // 注意：完全不带 reasoning 字段时 reasoning_requested 返回 None 已提前 return，
         // 不会走到这里，故只有上游「显式」表达关闭才透传 none。
         if effort_param == "reasoning.effort" {
-            result["reasoning"] = json!({ "effort": "none" });
+            // Explicit model capabilities must use the same disable contract as
+            // native Responses. Keep the legacy OpenRouter fallback permissive.
+            let mapped = if config
+                .effort_value_mode
+                .as_deref()
+                .is_some_and(|mode| mode.starts_with("capability|"))
+            {
+                map_codex_reasoning_effort("none", config)?
+            } else {
+                Some("none")
+            };
+            if let Some(mapped) = mapped {
+                result["reasoning"] = json!({ "effort": mapped });
+            }
         }
         return Ok(());
     }
@@ -4454,6 +4467,63 @@ mod tests {
             responses_to_chat_completions_with_reasoning(input_high, Some(&config)).unwrap();
         assert_eq!(result_high["reasoning"]["effort"], "high");
         assert!(result_high.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_rejects_nested_none_without_explicit_disable_capability() {
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("none".to_string()),
+            effort_param: Some("reasoning.effort".to_string()),
+            effort_value_mode: Some("capability|high|high=high".to_string()),
+            min_output_tokens: None,
+            default_output_tokens: None,
+            output_format: Some("auto".to_string()),
+            disable_contract: false,
+        };
+        let input = json!({
+            "model": "declared-model",
+            "input": "hello",
+            "reasoning": {"effort": "none"}
+        });
+
+        let native_error = map_codex_reasoning_effort("none", &config)
+            .expect_err("native capability mapping must reject unsupported none");
+        let chat_error = responses_to_chat_completions_with_reasoning(input, Some(&config))
+            .expect_err("Chat must reject the same unsupported none as native Responses");
+        assert_eq!(chat_error.to_string(), native_error.to_string());
+        assert!(chat_error.to_string().contains("allowed=[high]"));
+    }
+
+    #[test]
+    fn responses_request_to_chat_preserves_nested_none_with_explicit_disable_capability() {
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("none".to_string()),
+            effort_param: Some("reasoning.effort".to_string()),
+            effort_value_mode: Some("capability|high|none=none,high=high".to_string()),
+            min_output_tokens: None,
+            default_output_tokens: None,
+            output_format: Some("auto".to_string()),
+            disable_contract: true,
+        };
+        let input = json!({
+            "model": "declared-model",
+            "input": "hello",
+            "reasoning": {"effort": "none"}
+        });
+
+        assert_eq!(
+            map_codex_reasoning_effort("none", &config).unwrap(),
+            Some("none")
+        );
+        let result = responses_to_chat_completions_with_reasoning(input, Some(&config))
+            .expect("Chat must honor the explicitly supported disable effort");
+        assert_eq!(result["reasoning"], json!({"effort": "none"}));
+        assert!(result.get("reasoning_effort").is_none());
+        assert!(result.get("thinking").is_none());
     }
 
     #[test]

@@ -3195,12 +3195,14 @@ impl RequestForwarder {
                     },
                 )?
             } else {
-                super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
+                // Keep the selected public row authoritative for metadata;
+                // only then replace its model with the upstream wire identity.
                 let reasoning_config =
                     super::providers::resolve_codex_chat_reasoning_config(provider, &mapped_body);
                 let text_only_override = super::providers::codex_provider_text_only_input(provider);
                 let cache_config =
                     super::providers::resolve_codex_cache_config(provider, &mapped_body);
+                super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
                 let mut chat_body = super::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning_text_only_and_cache(
                     mapped_body,
                     reasoning_config.as_ref(),

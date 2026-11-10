@@ -818,6 +818,19 @@ fn parse_provider_models_response_with_pagination(
                         .then(|| extract_openrouter_parallel_tool_calls(&entry.extra))
                         .flatten()
                 });
+            let reasoning = crate::reasoning_capabilities::provider_metadata::
+                provider_reasoning_capability_from_model_entry(
+                    &serde_json::Value::Object(entry.extra.clone()),
+                    is_openrouter_models_discovery(base_url, models_url),
+                )
+                .and_then(|mut capability| {
+                    // Discovery evidence belongs to the inference transport and
+                    // requestable inventory ID, never the directory URL, display
+                    // alias, or a provider-supplied provenance declaration.
+                    capability.evidence_scope =
+                        crate::reasoning_capabilities::reasoning_evidence_scope(base_url, &entry.id);
+                    serde_json::to_value(capability).ok()
+                });
             FetchedModel {
                 context_window: extract_context_window(&entry.extra),
                 max_context_window: explicit_positive_model_limit(
@@ -844,12 +857,7 @@ fn parse_provider_models_response_with_pagination(
                 aliases: identity.aliases,
                 upstream_model: None,
                 supports_parallel_tool_calls,
-                reasoning: crate::reasoning_capabilities::provider_metadata::
-                    provider_reasoning_capability_from_model_entry(
-                        &serde_json::Value::Object(entry.extra.clone()),
-                        is_openrouter_models_discovery(base_url, models_url),
-                    )
-                    .and_then(|capability| serde_json::to_value(capability).ok()),
+                reasoning,
                 effort: entry
                     .extra
                     .get("effort")
@@ -3860,6 +3868,172 @@ mod tests {
         assert_eq!(reasoning["defaultEffort"], "high");
         assert_eq!(reasoning["upstream"]["parameter"], "reasoning_effort");
         assert_eq!(models[0].effort.as_ref().unwrap()["default_level"], "high");
+    }
+
+    #[test]
+    fn upstream_metadata_reasoning_evidence_scope_normalizes_transport_and_wire_model() {
+        let body = serde_json::json!({"data": [{
+            "id": " GPT-6.1-Wire ",
+            "canonical_slug": "not-the-wire-model",
+            "effort": {"supported_levels": ["low", "high"]},
+            "reasoning": {
+                "evidenceScope": {"transportFingerprint": "untrusted", "model": "not-the-wire-model"}
+            }
+        }]})
+        .to_string();
+        let expected_scope = serde_json::to_value(
+            crate::reasoning_capabilities::reasoning_evidence_scope(
+                "https://provider.test/v1",
+                "gpt-6.1-wire",
+            )
+            .expect("safe inference transport"),
+        )
+        .unwrap();
+        for base_url in [
+            "https://provider.test/v1",
+            "HTTPS://PROVIDER.TEST:443/v1///",
+        ] {
+            let models = parse_provider_models_response(
+                &body,
+                &[],
+                base_url,
+                "https://directory.test/catalog/models",
+            )
+            .expect("provider reasoning metadata");
+            let reasoning = models[0].reasoning.as_ref().expect("canonical reasoning");
+            assert_eq!(reasoning["evidenceScope"], expected_scope);
+            assert_eq!(reasoning["evidenceScope"]["model"], "gpt-6.1-wire");
+            assert_eq!(models[0].id, "GPT-6.1-Wire");
+            assert!(!reasoning.to_string().contains("https://"));
+        }
+    }
+
+    #[test]
+    fn upstream_metadata_reasoning_evidence_scope_overwrites_provider_supplied_scope() {
+        let body = serde_json::json!({"data": [{
+            "id": "actual-wire",
+            "reasoning": {
+                "schemaVersion": 2,
+                "supportStatus": "confirmed_supported",
+                "controlKind": "graded",
+                "supportedEfforts": ["low", "high"],
+                "defaultEffort": "high",
+                "disableAllowed": false,
+                "upstream": {"format": "string", "parameter": "reasoning_effort"},
+                "source": "user",
+                "evidenceScope": {
+                    "transportFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "model": "spoofed-wire"
+                }
+            }
+        }]})
+        .to_string();
+        for base_url in [
+            "https://provider.test/v1",
+            "https://[REDACTED]@provider.test/v1",
+        ] {
+            let models = parse_provider_models_response(
+                &body,
+                &[],
+                base_url,
+                "https://directory.test/models",
+            )
+            .expect("canonical provider reasoning metadata");
+            let reasoning = models[0].reasoning.as_ref().expect("canonical reasoning");
+            let expected_scope =
+                crate::reasoning_capabilities::reasoning_evidence_scope(base_url, "actual-wire")
+                    .map(|scope| serde_json::to_value(scope).unwrap());
+            assert_eq!(reasoning.get("evidenceScope").cloned(), expected_scope);
+            assert_eq!(reasoning["source"], "detection");
+            assert!(!reasoning.to_string().contains("spoofed-wire"));
+            assert!(!reasoning.to_string().contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn upstream_metadata_reasoning_evidence_scope_changes_with_transport_or_wire_model() {
+        let mut scopes = Vec::new();
+        for (base_url, model) in [
+            ("https://openrouter.ai/api/v1", "gpt-wire"),
+            ("https://sublyx.example/v1", "gpt-wire"),
+            ("https://provider.test/v1", "gpt-wire"),
+            ("https://provider.test/v1", "other-wire"),
+            ("https://provider.test/other/v1", "gpt-wire"),
+        ] {
+            let body = serde_json::json!({"data": [{
+                "id": model,
+                "effort": {"supported_levels": ["low", "high"]}
+            }]})
+            .to_string();
+            let models = parse_provider_models_response(
+                &body,
+                &[],
+                base_url,
+                "https://directory.test/models",
+            )
+            .expect("provider reasoning metadata");
+            let reasoning = models[0].reasoning.as_ref().expect("canonical reasoning");
+            let scope = reasoning
+                .get("evidenceScope")
+                .expect("all automatic API evidence is transport/model scoped");
+            assert_eq!(scope["model"], model);
+            assert!(
+                !scopes.contains(scope),
+                "scope reused across distinct contexts"
+            );
+            scopes.push(scope.clone());
+        }
+        assert_eq!(
+            scopes[2]["transportFingerprint"],
+            scopes[3]["transportFingerprint"]
+        );
+        assert_ne!(scopes[2]["model"], scopes[3]["model"]);
+    }
+
+    #[test]
+    fn upstream_metadata_reasoning_evidence_scope_rejects_unsafe_binding_without_serializing_secrets(
+    ) {
+        let body = serde_json::json!({"data": [{
+            "id": "model",
+            "effort": {"supported_levels": ["low", "high"]}
+        }]})
+        .to_string();
+        let safe_models = parse_provider_models_response(
+            &body,
+            &[],
+            "https://provider.test/v1",
+            "https://provider.test/models",
+        )
+        .expect("safe discovery");
+        assert!(safe_models[0]
+            .reasoning
+            .as_ref()
+            .unwrap()
+            .get("evidenceScope")
+            .is_some());
+        for base_url in [
+            "",
+            "not a url",
+            "https://[REDACTED]@provider.test/v1",
+            "https://user:[REDACTED]@provider.test/v1",
+            "https://provider.test/v1?api_key=[REDACTED]",
+            "https://provider.test/v1#[REDACTED]",
+            "https://provider.test/v 1",
+            "file:///provider/models",
+        ] {
+            let models = parse_provider_models_response(
+                &body,
+                &[],
+                base_url,
+                "https://provider.test/models",
+            )
+            .expect("unsafe binding does not discard the model inventory");
+            let reasoning = models[0].reasoning.as_ref().expect("canonical reasoning");
+            assert!(reasoning.get("evidenceScope").is_none());
+            assert!(!serde_json::to_string(&models)
+                .unwrap()
+                .contains("[REDACTED]"));
+        }
     }
 
     #[test]
