@@ -1987,6 +1987,85 @@ pub(crate) fn store_codex_public_official_models_cache(models: &[Value]) -> Resu
 }
 
 fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCatalogModelSpec> {
+    codex_catalog_model_specs_with_compiled_reasoning(settings, config_text, None)
+}
+
+type CompiledReasoning = std::collections::HashMap<
+    String,
+    Option<crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability>,
+>;
+
+fn compiled_reasoning_for_projection(
+    settings: &Value,
+    artifact: &crate::codex_multirouter::projection::CodexRoutingProjectionArtifact,
+) -> Result<CompiledReasoning, AppError> {
+    // Live config/auth may be merged after compilation, but the canonical
+    // catalog and dependency identity must still be exactly those compiled.
+    if settings.get("modelCatalog") != artifact.projection_settings.get("modelCatalog")
+        || settings.get("codexRoutingProjection")
+            != artifact.projection_settings.get("codexRoutingProjection")
+    {
+        return Err(AppError::Message(
+            "Codex MultiRouter compiler artifact does not match current catalog".into(),
+        ));
+    }
+    let rows = catalog_models(settings)
+        .ok_or_else(|| AppError::Message("Codex MultiRouter compiled catalog is missing".into()))?;
+    let mut reasoning = CompiledReasoning::new();
+    for compiled in &artifact.compiled.model_catalog {
+        let row = rows
+            .iter()
+            .find(|row| {
+                row.get("model").and_then(Value::as_str) == Some(compiled.visible_model.as_str())
+            })
+            .ok_or_else(|| {
+                AppError::Message(
+                    "Codex MultiRouter compiled model is absent from projection".into(),
+                )
+            })?;
+        if row.get("reasoning") != compiled.capability_summary.reasoning.as_ref()
+            || row.get("upstreamModel").and_then(Value::as_str)
+                != Some(compiled.upstream_model.as_str())
+        {
+            return Err(AppError::Message(
+                "Codex MultiRouter compiled model evidence differs from projection".into(),
+            ));
+        }
+        let capability = compiled
+            .capability_summary
+            .reasoning
+            .as_ref()
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|_| {
+                AppError::Message(
+                    "Codex MultiRouter compiled reasoning capability is malformed".into(),
+                )
+            })?;
+        if reasoning
+            .insert(compiled.visible_model.clone(), capability)
+            .is_some()
+        {
+            return Err(AppError::Message(
+                "Codex MultiRouter compiled model identity is duplicated".into(),
+            ));
+        }
+    }
+    // A missing compiler row is an explicit Unknown, not a fresh lookup
+    // against an unrelated loopback transport or stale official cache.
+    for row in rows {
+        if let Some(model) = row.get("model").and_then(Value::as_str) {
+            reasoning.entry(model.to_string()).or_insert(None);
+        }
+    }
+    Ok(reasoning)
+}
+
+fn codex_catalog_model_specs_with_compiled_reasoning(
+    settings: &Value,
+    config_text: &str,
+    compiled_reasoning: Option<&CompiledReasoning>,
+) -> Vec<CodexCatalogModelSpec> {
     let Some(models) = read_catalog(settings)
         .and_then(|catalog| catalog.get("models"))
         .and_then(Value::as_array)
@@ -2126,17 +2205,36 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
             crate::reasoning_capabilities::provider_metadata::detect_platform_from_settings(
                 &resolver_settings,
             );
-        let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_for_settings(
-            &resolver_settings,
-            platform,
-            model,
-            library.as_ref(),
-            &official_models,
-            |_| None,
-        );
-        let reasoning = resolved.capability;
-        let reasoning_fingerprint = resolved.fingerprint;
-        let reasoning_source = resolved.source.as_str().to_string();
+        let (reasoning, reasoning_fingerprint, reasoning_source) =
+            if let Some(compiled_reasoning) = compiled_reasoning {
+                // This typed map comes from a fresh compiler artifact, not a
+                // forgeable persisted projection marker. Never re-resolve target
+                // evidence against MultiRouter's loopback transport.
+                let reasoning = compiled_reasoning.get(model).cloned().flatten();
+                let fingerprint = reasoning.as_ref().map_or_else(String::new, |capability| {
+                    crate::proxy::providers::codex_reasoning::capability_fingerprint(capability)
+                });
+                let source = reasoning
+                    .as_ref()
+                    .and_then(|capability| capability.source.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                (reasoning, fingerprint, source)
+            } else {
+                let resolved =
+                    crate::reasoning_capabilities::resolve_codex_model_capability_for_settings(
+                        &resolver_settings,
+                        platform,
+                        model,
+                        library.as_ref(),
+                        &official_models,
+                        |_| None,
+                    );
+                (
+                    resolved.capability,
+                    resolved.fingerprint,
+                    resolved.source.as_str().to_string(),
+                )
+            };
 
         let sort_index = model_config
             .get("sortIndex")
@@ -3097,12 +3195,26 @@ fn codex_provider_service_tiers_toml_array(value: Option<&Value>) -> Option<toml
     Some(toml_edit::Value::Array(array))
 }
 
+#[cfg(test)]
 fn codex_model_catalog_from_settings(
     settings: &Value,
     config_text: &str,
     profile: CodexCatalogToolProfile,
 ) -> Result<Option<Value>, AppError> {
-    let specs = codex_catalog_model_specs(settings, config_text);
+    codex_model_catalog_from_settings_with_compiled_reasoning(settings, config_text, profile, None)
+}
+
+fn codex_model_catalog_from_settings_with_compiled_reasoning(
+    settings: &Value,
+    config_text: &str,
+    profile: CodexCatalogToolProfile,
+    compiled_reasoning: Option<&CompiledReasoning>,
+) -> Result<Option<Value>, AppError> {
+    let specs = codex_catalog_model_specs_with_compiled_reasoning(
+        settings,
+        config_text,
+        compiled_reasoning,
+    );
     if specs.is_empty() {
         return Ok(None);
     }
@@ -6490,9 +6602,17 @@ pub(crate) fn verify_codex_subagent_role_files(
     provider_context: Option<&ProviderClassificationContext>,
 ) -> Result<Vec<CodexSubagentRoleFileVerification>, AppError> {
     let specs = codex_catalog_model_specs(settings, "");
+    verify_codex_subagent_role_files_with_specs(settings, provider_context, &specs)
+}
+
+fn verify_codex_subagent_role_files_with_specs(
+    settings: &Value,
+    provider_context: Option<&ProviderClassificationContext>,
+    specs: &[CodexCatalogModelSpec],
+) -> Result<Vec<CodexSubagentRoleFileVerification>, AppError> {
     let Some(compilation) = compile_configured_codex_subagent_roles(
         settings,
-        &specs,
+        specs,
         codex_subagent_version(settings),
         provider_context,
     )?
@@ -7349,9 +7469,15 @@ fn projected_codex_model_catalog(
     config_text: &str,
     profile: CodexCatalogToolProfile,
     reasoning_authoritative_ids: &HashSet<String>,
+    compiled_reasoning: Option<&CompiledReasoning>,
 ) -> Result<(Value, Option<String>), AppError> {
-    let generated_catalog = codex_model_catalog_from_settings(settings, config_text, profile)?
-        .unwrap_or_else(|| json!({ "models": [] }));
+    let generated_catalog = codex_model_catalog_from_settings_with_compiled_reasoning(
+        settings,
+        config_text,
+        profile,
+        compiled_reasoning,
+    )?
+    .unwrap_or_else(|| json!({ "models": [] }));
     let mut catalog = enrich_codex_catalog_with_official_metadata_and_authority(
         &generated_catalog,
         reasoning_authoritative_ids,
@@ -7381,6 +7507,41 @@ fn prepare_codex_config_text_with_model_catalog_impl(
     profile: CodexCatalogToolProfile,
     provider_context: Option<&ProviderClassificationContext>,
 ) -> Result<String, AppError> {
+    prepare_codex_config_text_with_model_catalog_compiled(
+        settings,
+        config_text,
+        profile,
+        provider_context,
+        None,
+    )
+}
+
+/// Use only a fresh compiler artifact to carry target-scoped evidence into
+/// the Codex-facing projection. A stored fingerprint by itself grants nothing.
+pub(crate) fn prepare_codex_config_text_with_model_catalog_and_projection_artifact(
+    settings: &Value,
+    config_text: &str,
+    profile: CodexCatalogToolProfile,
+    provider_context: Option<&ProviderClassificationContext>,
+    artifact: &crate::codex_multirouter::projection::CodexRoutingProjectionArtifact,
+) -> Result<String, AppError> {
+    let reasoning = compiled_reasoning_for_projection(settings, artifact)?;
+    prepare_codex_config_text_with_model_catalog_compiled(
+        settings,
+        config_text,
+        profile,
+        provider_context,
+        Some(&reasoning),
+    )
+}
+
+fn prepare_codex_config_text_with_model_catalog_compiled(
+    settings: &Value,
+    config_text: &str,
+    profile: CodexCatalogToolProfile,
+    provider_context: Option<&ProviderClassificationContext>,
+    compiled_reasoning: Option<&CompiledReasoning>,
+) -> Result<String, AppError> {
     // Codex switches custom providers to StaticModelsManager when this catalog
     // pointer is present, and the projection below only reads the official
     // snapshot from disk. This function runs on synchronous projection paths,
@@ -7403,7 +7564,11 @@ fn prepare_codex_config_text_with_model_catalog_impl(
         config_text
     };
     let catalog_path = get_codex_model_catalog_path();
-    let specs = codex_catalog_model_specs(settings, config_text);
+    let specs = codex_catalog_model_specs_with_compiled_reasoning(
+        settings,
+        config_text,
+        compiled_reasoning,
+    );
     let reasoning_authoritative_ids = specs
         .iter()
         .filter(|spec| spec.reasoning.is_some())
@@ -7436,6 +7601,7 @@ fn prepare_codex_config_text_with_model_catalog_impl(
             config_text,
             profile,
             &reasoning_authoritative_ids,
+            compiled_reasoning,
         )?;
         let config_text = set_codex_model_catalog_projection_fields(
             config_text,
@@ -7541,15 +7707,30 @@ pub(crate) fn publish_codex_multirouter_projection(
 /// MultiRouter publication; Router records never persist this derived context.
 pub(crate) fn publish_codex_multirouter_projection_for_database(
     db: &crate::database::Database,
-    projection_settings: &Value,
+    artifact: &crate::codex_multirouter::projection::CodexRoutingProjectionArtifact,
 ) -> Result<crate::codex_multirouter::projection::ProjectionReadBack, AppError> {
     let provider_context = codex_provider_classification_context(db)?;
-    publish_codex_multirouter_projection_impl(projection_settings, Some(&provider_context))
+    let compiled_reasoning =
+        compiled_reasoning_for_projection(&artifact.projection_settings, artifact)?;
+    publish_codex_multirouter_projection_compiled(
+        &artifact.projection_settings,
+        Some(&provider_context),
+        Some(&compiled_reasoning),
+    )
 }
 
+#[cfg(test)]
 fn publish_codex_multirouter_projection_impl(
     projection_settings: &Value,
     provider_context: Option<&ProviderClassificationContext>,
+) -> Result<crate::codex_multirouter::projection::ProjectionReadBack, AppError> {
+    publish_codex_multirouter_projection_compiled(projection_settings, provider_context, None)
+}
+
+fn publish_codex_multirouter_projection_compiled(
+    projection_settings: &Value,
+    provider_context: Option<&ProviderClassificationContext>,
+    compiled_reasoning: Option<&CompiledReasoning>,
 ) -> Result<crate::codex_multirouter::projection::ProjectionReadBack, AppError> {
     let _expected_fingerprint = projection_settings
         .pointer("/codexRoutingProjection/dependencyFingerprint")
@@ -7562,28 +7743,48 @@ fn publish_codex_multirouter_projection_impl(
             )
         })?;
     reconcile_codex_live_config_atomic(|live_config| {
-        prepare_codex_config_text_with_model_catalog_impl(
+        prepare_codex_config_text_with_model_catalog_compiled(
             projection_settings,
             live_config,
             CodexCatalogToolProfile::NativeResponses,
             provider_context,
+            compiled_reasoning,
         )
     })?;
 
-    read_back_codex_multirouter_projection_impl(projection_settings, provider_context)
+    read_back_codex_multirouter_projection_compiled(
+        projection_settings,
+        provider_context,
+        compiled_reasoning,
+    )
 }
 
 pub(crate) fn read_back_codex_multirouter_projection_for_database(
     db: &crate::database::Database,
-    projection_settings: &Value,
+    artifact: &crate::codex_multirouter::projection::CodexRoutingProjectionArtifact,
 ) -> Result<crate::codex_multirouter::projection::ProjectionReadBack, AppError> {
     let provider_context = codex_provider_classification_context(db)?;
-    read_back_codex_multirouter_projection_impl(projection_settings, Some(&provider_context))
+    let compiled_reasoning =
+        compiled_reasoning_for_projection(&artifact.projection_settings, artifact)?;
+    read_back_codex_multirouter_projection_compiled(
+        &artifact.projection_settings,
+        Some(&provider_context),
+        Some(&compiled_reasoning),
+    )
 }
 
+#[cfg(test)]
 fn read_back_codex_multirouter_projection_impl(
     projection_settings: &Value,
     provider_context: Option<&ProviderClassificationContext>,
+) -> Result<crate::codex_multirouter::projection::ProjectionReadBack, AppError> {
+    read_back_codex_multirouter_projection_compiled(projection_settings, provider_context, None)
+}
+
+fn read_back_codex_multirouter_projection_compiled(
+    projection_settings: &Value,
+    provider_context: Option<&ProviderClassificationContext>,
+    compiled_reasoning: Option<&CompiledReasoning>,
 ) -> Result<crate::codex_multirouter::projection::ProjectionReadBack, AppError> {
     let expected_fingerprint = projection_settings
         .pointer("/codexRoutingProjection/dependencyFingerprint")
@@ -7597,7 +7798,11 @@ fn read_back_codex_multirouter_projection_impl(
         })?;
 
     let live_after = read_codex_config_text()?;
-    let specs = codex_catalog_model_specs(projection_settings, &live_after);
+    let specs = codex_catalog_model_specs_with_compiled_reasoning(
+        projection_settings,
+        &live_after,
+        compiled_reasoning,
+    );
     let reasoning_authoritative_ids = specs
         .iter()
         .filter(|spec| spec.reasoning.is_some())
@@ -7608,6 +7813,7 @@ fn read_back_codex_multirouter_projection_impl(
         &live_after,
         CodexCatalogToolProfile::NativeResponses,
         &reasoning_authoritative_ids,
+        compiled_reasoning,
     )?;
     let catalog: Value = read_json_file(&get_codex_model_catalog_path())?;
     let read_fingerprint = catalog
@@ -7683,7 +7889,7 @@ fn read_back_codex_multirouter_projection_impl(
                     .is_some_and(|(observed, expected)| observed == expected)
         });
     let agent_files_verified =
-        verify_codex_subagent_role_files(projection_settings, provider_context)?
+        verify_codex_subagent_role_files_with_specs(projection_settings, provider_context, &specs)?
             .iter()
             .all(|file| file.exists && file.content_matches);
 
@@ -8597,6 +8803,38 @@ pub(crate) fn write_codex_provider_live_with_catalog_and_provider_context(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_codex_provider_live_with_catalog_and_provider_context_and_projection_artifact(
+    settings: &Value,
+    category: Option<&str>,
+    auth: &Value,
+    config_text: Option<&str>,
+    profile: CodexCatalogToolProfile,
+    provider_context: &ProviderClassificationContext,
+    context_provider: Option<&Provider>,
+    artifact: &crate::codex_multirouter::projection::CodexRoutingProjectionArtifact,
+) -> Result<(), AppError> {
+    let (effective_settings, is_official) =
+        codex_context_projection(settings, category, context_provider);
+    let prepared_config = config_text
+        .map(|text| {
+            prepare_codex_config_text_with_model_catalog_and_projection_artifact(
+                &effective_settings,
+                text,
+                profile,
+                Some(provider_context),
+                artifact,
+            )
+        })
+        .transpose()?;
+    write_codex_live_for_provider_with_context(
+        category,
+        auth,
+        prepared_config.as_deref(),
+        is_official,
+    )
+}
+
 pub(crate) fn write_codex_provider_live_with_catalog_without_provider_context(
     settings: &Value,
     category: Option<&str>,
@@ -8647,6 +8885,46 @@ pub(crate) fn write_codex_provider_config_only_with_catalog_and_provider_context
                 text,
                 profile,
                 provider_context,
+            )
+        })
+        .transpose()?;
+    let unified_official_config =
+        if category == Some("official") && crate::settings::unify_codex_session_history() {
+            Some(inject_codex_unified_session_bucket(
+                prepared_config.as_deref().unwrap_or(""),
+            )?)
+        } else {
+            None
+        };
+    let config_text = unified_official_config
+        .as_deref()
+        .or(prepared_config.as_deref())
+        .unwrap_or("");
+    reconcile_codex_live_config_atomic(|live| {
+        merge_codex_provider_config_for_context(live, config_text, is_official)
+    })
+    .map(|_| ())
+}
+
+pub(crate) fn write_codex_provider_config_only_with_catalog_and_provider_context_and_projection_artifact(
+    settings: &Value,
+    category: Option<&str>,
+    config_text: Option<&str>,
+    profile: CodexCatalogToolProfile,
+    provider_context: &ProviderClassificationContext,
+    context_provider: Option<&Provider>,
+    artifact: &crate::codex_multirouter::projection::CodexRoutingProjectionArtifact,
+) -> Result<(), AppError> {
+    let (effective_settings, is_official) =
+        codex_context_projection(settings, category, context_provider);
+    let prepared_config = config_text
+        .map(|text| {
+            prepare_codex_config_text_with_model_catalog_and_projection_artifact(
+                &effective_settings,
+                text,
+                profile,
+                Some(provider_context),
+                artifact,
             )
         })
         .transpose()?;
@@ -16241,6 +16519,7 @@ base_url = "http://127.0.0.1:15721/v1"
                 config,
                 CodexCatalogToolProfile::ProxyChat,
                 &HashSet::from(["metadata-audit-custom".to_string()]),
+                None,
             )
             .expect("project router");
             assert_eq!(selected.as_deref(), expected, "{version} {advertised}");
@@ -21714,11 +21993,8 @@ wire_api = "responses"
             let artifact =
                 crate::codex_multirouter::projection::build_projection_artifact(&db, "router")
                     .unwrap();
-            let readback = publish_codex_multirouter_projection_for_database(
-                &db,
-                &artifact.projection_settings,
-            )
-            .unwrap();
+            let readback =
+                publish_codex_multirouter_projection_for_database(&db, &artifact).unwrap();
             assert!(
                 readback.catalog_verified && readback.cache_verified && readback.config_verified
             );
@@ -21847,11 +22123,8 @@ wire_api = "responses"
                 Some(&artifact.dependency_fingerprint)
             );
             previous_fingerprint = Some(artifact.dependency_fingerprint.clone());
-            let read_back = publish_codex_multirouter_projection_for_database(
-                &db,
-                &artifact.projection_settings,
-            )
-            .expect("publish included-only picker projection");
+            let read_back = publish_codex_multirouter_projection_for_database(&db, &artifact)
+                .expect("publish included-only picker projection");
             assert_eq!(
                 read_back.dependency_fingerprint,
                 artifact.dependency_fingerprint
@@ -22039,6 +22312,81 @@ wire_api = "responses"
 
     #[test]
     #[serial]
+    fn compiled_sublyx_projection_preserves_sol_reasoning_efforts_in_picker() {
+        let _home = TestHomeGuard::new();
+        let db = crate::database::Database::memory().expect("memory database");
+        let sublyx = Provider::with_id(
+            "sublyx".into(),
+            "Sublyx".into(),
+            json!({
+                "baseUrl": "https://api.sublyx.org/v1",
+                "apiFormat": "openai_responses",
+                "modelCatalog": {"models": [{
+                    "model": "gpt-6.1-sol-sublyx",
+                    "upstreamModel": "gpt-6.1-sol"
+                }]}
+            }),
+            None,
+        );
+        let router = Provider::with_id(
+            "router".into(),
+            "MultiRouter".into(),
+            json!({"codexRouting": {
+                "schemaVersion": 2,
+                "enabled": true,
+                "defaultRouteId": "sublyx-route",
+                "routes": [{
+                    "id": "sublyx-route", "enabled": true,
+                    "targetProviderId": "sublyx",
+                    "modelSelection": {"mode": "all"},
+                    "authPolicy": {"source": "provider_config"}
+                }]
+            }}),
+            None,
+        );
+        db.save_provider("codex", &sublyx).expect("save source");
+        db.save_provider("codex", &router).expect("save router");
+        let artifact =
+            crate::codex_multirouter::projection::build_projection_artifact(&db, "router")
+                .expect("compile current Provider-owned projection");
+        let projected_reasoning =
+            artifact.projection_settings["modelCatalog"]["models"][0]["reasoning"].clone();
+        assert_eq!(projected_reasoning["source"], "sublyx");
+        assert_eq!(
+            projected_reasoning["supportedEfforts"],
+            json!(["low", "medium", "high", "xhigh"])
+        );
+        write_codex_live_config_atomic(Some(
+            "model_provider = \"codex_model_router_v2\"\n\
+             [model_providers.codex_model_router_v2]\n\
+             base_url = \"http://127.0.0.1:15721/v1\"\nwire_api = \"responses\"\n",
+        ))
+        .expect("seed live router config");
+        seed_codex_models_cache(json!([]));
+        let read_back = publish_codex_multirouter_projection_for_database(&db, &artifact)
+            .expect("publish compiled projection");
+        assert!(read_back.catalog_verified && read_back.cache_verified);
+        let catalog: Value =
+            read_json_file(&get_codex_model_catalog_path()).expect("read published picker catalog");
+        let sol = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["slug"] == "gpt-6.1-sol-sublyx")
+            .expect("Sol visible in picker");
+        let levels = sol["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|level| level["effort"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(levels, ["low", "medium", "high", "xhigh", "ultra"]);
+        assert!(sol["supportedReasoningEfforts"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+    }
+    #[test]
+    #[serial]
     fn database_projection_publish_uses_provider_catalog_for_mode_all_agent_roles() {
         let _guard = TestHomeGuard::new();
         let db = crate::database::Database::memory().expect("memory database");
@@ -22099,7 +22447,12 @@ wire_api = "responses"
             }
         });
 
-        let read_back = publish_codex_multirouter_projection_for_database(&db, &settings)
+        let router = Provider::with_id("router".into(), "Router".into(), settings, None);
+        db.save_provider("codex", &router).expect("save router");
+        let artifact =
+            crate::codex_multirouter::projection::build_projection_artifact(&db, "router")
+                .expect("compile provider projection");
+        let read_back = publish_codex_multirouter_projection_for_database(&db, &artifact)
             .expect("publish projection with Provider context");
 
         assert!(read_back.agent_files_verified);

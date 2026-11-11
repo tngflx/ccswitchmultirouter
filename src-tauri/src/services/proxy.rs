@@ -4124,9 +4124,14 @@ impl ProxyService {
                     &provider,
                 )
                 .map_err(|e| format!("构建 Codex 有效配置失败: {e}"))?;
-                if let Some(projected) =
-                    self.codex_provider_with_projected_model_catalog(Some(&provider))?
-                {
+                let (projected_provider, projection_artifact) =
+                    self.codex_provider_with_projected_model_catalog(Some(&provider))?;
+                if let Some(artifact) = projection_artifact.as_ref() {
+                    crate::codex_multirouter::projection::apply_projection_owned_settings(
+                        &mut effective_settings,
+                        &artifact.projection_settings,
+                    );
+                } else if let Some(projected) = projected_provider.as_ref() {
                     if let Some(model_catalog) =
                         crate::codex_multirouter::catalog::read_catalog(&projected.settings_config)
                             .cloned()
@@ -4144,15 +4149,28 @@ impl ProxyService {
                 let provider_context =
                     crate::codex_config::codex_provider_classification_context(self.db.as_ref())
                         .map_err(|e| format!("读取 Codex Provider 分类上下文失败: {e}"))?;
-                crate::codex_config::write_codex_provider_live_with_catalog_and_provider_context(
-                    &effective_settings,
-                    provider.category.as_deref(),
-                    auth,
-                    config_str,
-                    profile,
-                    &provider_context,
-                    Some(&provider),
-                )
+                if let Some(artifact) = projection_artifact.as_ref() {
+                    crate::codex_config::write_codex_provider_live_with_catalog_and_provider_context_and_projection_artifact(
+                        &effective_settings,
+                        provider.category.as_deref(),
+                        auth,
+                        config_str,
+                        profile,
+                        &provider_context,
+                        Some(&provider),
+                        artifact,
+                    )
+                } else {
+                    crate::codex_config::write_codex_provider_live_with_catalog_and_provider_context(
+                        &effective_settings,
+                        provider.category.as_deref(),
+                        auth,
+                        config_str,
+                        profile,
+                        &provider_context,
+                        Some(&provider),
+                    )
+                }
                 .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
             }
 
@@ -5113,10 +5131,22 @@ impl ProxyService {
         self.write_codex_live_verbatim(config)
     }
 
+    #[cfg(test)]
     fn write_codex_live_for_provider(
         &self,
         config: &Value,
         provider: Option<&Provider>,
+    ) -> Result<(), String> {
+        self.write_codex_live_for_provider_with_projection(config, provider, None)
+    }
+
+    fn write_codex_live_for_provider_with_projection(
+        &self,
+        config: &Value,
+        provider: Option<&Provider>,
+        projection_artifact: Option<
+            &crate::codex_multirouter::projection::CodexRoutingProjectionArtifact,
+        >,
     ) -> Result<(), String> {
         let Some(provider) = provider else {
             if crate::settings::preserve_codex_official_auth_on_switch() {
@@ -5158,15 +5188,28 @@ impl ProxyService {
         let provider_context =
             crate::codex_config::codex_provider_classification_context(self.db.as_ref())
                 .map_err(|e| format!("读取 Codex Provider 分类上下文失败: {e}"))?;
-        crate::codex_config::write_codex_provider_live_with_catalog_and_provider_context(
-            &config_for_projection,
-            provider.category.as_deref(),
-            auth,
-            config_str,
-            profile,
-            &provider_context,
-            Some(provider),
-        )
+        if let Some(artifact) = projection_artifact {
+            crate::codex_config::write_codex_provider_live_with_catalog_and_provider_context_and_projection_artifact(
+                &config_for_projection,
+                provider.category.as_deref(),
+                auth,
+                config_str,
+                profile,
+                &provider_context,
+                Some(provider),
+                artifact,
+            )
+        } else {
+            crate::codex_config::write_codex_provider_live_with_catalog_and_provider_context(
+                &config_for_projection,
+                provider.category.as_deref(),
+                auth,
+                config_str,
+                profile,
+                &provider_context,
+                Some(provider),
+            )
+        }
         .map_err(|e| format!("写入 Codex 配置失败: {e}"))
     }
 
@@ -5282,10 +5325,18 @@ impl ProxyService {
         config: &Value,
         provider: Option<&Provider>,
     ) -> Result<(), String> {
-        let projected_provider = self.codex_provider_with_projected_model_catalog(provider)?;
+        let (projected_provider, projection_artifact) =
+            self.codex_provider_with_projected_model_catalog(provider)?;
         let provider = projected_provider.as_ref();
         let mut live_config = config.clone();
-        if let (Some(provider), Some(root)) = (provider, live_config.as_object_mut()) {
+        if let Some(artifact) = projection_artifact.as_ref() {
+            // Replace both inventory and provenance, never reuse a stale marker
+            // from an earlier takeover snapshot.
+            crate::codex_multirouter::projection::apply_projection_owned_settings(
+                &mut live_config,
+                &artifact.projection_settings,
+            );
+        } else if let (Some(provider), Some(root)) = (provider, live_config.as_object_mut()) {
             if let Some(model_catalog) =
                 crate::codex_multirouter::catalog::read_catalog(&provider.settings_config).cloned()
             {
@@ -5319,12 +5370,22 @@ impl ProxyService {
             let prepared_config = if provider.is_some()
                 || crate::codex_multirouter::catalog::read_catalog(&config_for_projection).is_some()
             {
-                crate::codex_config::prepare_codex_config_text_with_model_catalog_and_provider_context(
-                    &config_for_projection,
-                    config_str,
-                    profile,
-                    &provider_context,
-                )
+                if let Some(artifact) = projection_artifact.as_ref() {
+                    crate::codex_config::prepare_codex_config_text_with_model_catalog_and_projection_artifact(
+                        &config_for_projection,
+                        config_str,
+                        profile,
+                        Some(&provider_context),
+                        artifact,
+                    )
+                } else {
+                    crate::codex_config::prepare_codex_config_text_with_model_catalog_and_provider_context(
+                        &config_for_projection,
+                        config_str,
+                        profile,
+                        &provider_context,
+                    )
+                }
                 .map_err(|e| format!("写入 Codex 配置失败: {e}"))?
             } else {
                 config_str.to_string()
@@ -5341,16 +5402,26 @@ impl ProxyService {
             return Ok(());
         }
 
-        self.write_codex_live_for_provider(config, provider)
+        self.write_codex_live_for_provider_with_projection(
+            config,
+            provider,
+            projection_artifact.as_ref(),
+        )
     }
 
     /// V2 MultiRouter 的 live catalog 与依赖指纹必须来自当前 Provider 目录重新编译的投影。
     fn codex_provider_with_projected_model_catalog(
         &self,
         provider: Option<&Provider>,
-    ) -> Result<Option<Provider>, String> {
+    ) -> Result<
+        (
+            Option<Provider>,
+            Option<crate::codex_multirouter::projection::CodexRoutingProjectionArtifact>,
+        ),
+        String,
+    > {
         let Some(provider) = provider else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let is_v2_router = crate::codex_multirouter::schema::CodexRoutingDocument::parse(
             provider
@@ -5365,7 +5436,7 @@ impl ProxyService {
             )
         });
         if !is_v2_router {
-            return Ok(Some(provider.clone()));
+            return Ok((Some(provider.clone()), None));
         }
 
         let artifact = crate::codex_multirouter::projection::build_projection_artifact(
@@ -5378,7 +5449,7 @@ impl ProxyService {
             &mut projected.settings_config,
             &artifact.projection_settings,
         );
-        Ok(Some(projected))
+        Ok((Some(projected), Some(artifact)))
     }
 
     /// 根据 provider meta 决定 `modelCatalog` 是否参与 live 投射；目录元数据仍保存在 DB。
@@ -7679,8 +7750,7 @@ wire_api = "responses"
                 crate::codex_multirouter::projection::build_projection_artifact(&db, &router.id)
                     .unwrap();
             let manual = crate::codex_config::publish_codex_multirouter_projection_for_database(
-                &db,
-                &artifact.projection_settings,
+                &db, &artifact,
             )
             .expect("manual catalog resync");
             assert!(manual.catalog_verified && manual.config_verified && manual.cache_verified);
@@ -7691,8 +7761,7 @@ wire_api = "responses"
                     .expect("normal takeover rewrite");
                 let readback =
                     crate::codex_config::read_back_codex_multirouter_projection_for_database(
-                        &db,
-                        &artifact.projection_settings,
+                        &db, &artifact,
                     )
                     .expect("inspect after takeover rewrite");
                 assert!(

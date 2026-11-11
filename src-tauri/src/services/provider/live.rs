@@ -794,17 +794,27 @@ pub(crate) fn write_live_with_common_config(
                 crate::codex_multirouter::schema::CodexRoutingDocument::V2(_)
             )
         });
-        if is_v2_router {
-            let artifact = crate::codex_multirouter::projection::build_projection_artifact(
-                db,
-                &effective_provider.id,
-            )?;
+        let artifact = if is_v2_router {
+            Some(
+                crate::codex_multirouter::projection::build_projection_artifact(
+                    db,
+                    &effective_provider.id,
+                )?,
+            )
+        } else {
+            None
+        };
+        if let Some(artifact) = artifact.as_ref() {
             crate::codex_multirouter::projection::apply_projection_owned_settings(
                 &mut effective_provider.settings_config,
                 &artifact.projection_settings,
             );
         }
-        return write_codex_live_snapshot(&effective_provider, Some(&provider_context));
+        return write_codex_live_snapshot(
+            &effective_provider,
+            Some(&provider_context),
+            artifact.as_ref(),
+        );
     }
 
     write_live_snapshot(app_type, &effective_provider)
@@ -850,21 +860,54 @@ pub(crate) fn write_codex_config_only_with_common_config(
     provider: &Provider,
 ) -> Result<(), AppError> {
     let config_text = build_codex_live_config_for_provider(db, provider)?;
-    let settings_for_live = codex_settings_for_live_projection(provider)?;
+    let mut settings_for_live = codex_settings_for_live_projection(provider)?;
+    let artifact = provider
+        .settings_config
+        .get("codexRouting")
+        .and_then(|routing| {
+            crate::codex_multirouter::schema::CodexRoutingDocument::parse(routing).ok()
+        })
+        .filter(|document| {
+            matches!(
+                document,
+                crate::codex_multirouter::schema::CodexRoutingDocument::V2(_)
+            )
+        })
+        .map(|_| crate::codex_multirouter::projection::build_projection_artifact(db, &provider.id))
+        .transpose()?;
+    if let Some(artifact) = artifact.as_ref() {
+        crate::codex_multirouter::projection::apply_projection_owned_settings(
+            &mut settings_for_live,
+            &artifact.projection_settings,
+        );
+    }
     let provider_context = crate::codex_config::codex_provider_classification_context(db)?;
-    crate::codex_config::write_codex_provider_config_only_with_catalog_and_provider_context(
-        &settings_for_live,
-        provider.category.as_deref(),
-        Some(&config_text),
-        crate::codex_config::CodexCatalogToolProfile::from_api_format(
-            provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.api_format.as_deref()),
-        ),
-        &provider_context,
-        Some(provider),
-    )
+    let profile = crate::codex_config::CodexCatalogToolProfile::from_api_format(
+        provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.api_format.as_deref()),
+    );
+    if let Some(artifact) = artifact.as_ref() {
+        crate::codex_config::write_codex_provider_config_only_with_catalog_and_provider_context_and_projection_artifact(
+            &settings_for_live,
+            provider.category.as_deref(),
+            Some(&config_text),
+            profile,
+            &provider_context,
+            Some(provider),
+            artifact,
+        )
+    } else {
+        crate::codex_config::write_codex_provider_config_only_with_catalog_and_provider_context(
+            &settings_for_live,
+            provider.category.as_deref(),
+            Some(&config_text),
+            profile,
+            &provider_context,
+            Some(provider),
+        )
+    }
 }
 
 /// Build the exact Codex `config.toml` payload used by CCSM's live writer,
@@ -890,11 +933,17 @@ pub(crate) fn build_codex_live_config_for_provider(
                 crate::codex_multirouter::schema::CodexRoutingDocument::V2(_)
             )
         });
-    if is_v2_router {
-        let artifact = crate::codex_multirouter::projection::build_projection_artifact(
-            db,
-            &effective_provider.id,
-        )?;
+    let artifact = if is_v2_router {
+        Some(
+            crate::codex_multirouter::projection::build_projection_artifact(
+                db,
+                &effective_provider.id,
+            )?,
+        )
+    } else {
+        None
+    };
+    if let Some(artifact) = artifact.as_ref() {
         crate::codex_multirouter::projection::apply_projection_owned_settings(
             &mut effective_provider.settings_config,
             &artifact.projection_settings,
@@ -908,13 +957,22 @@ pub(crate) fn build_codex_live_config_for_provider(
         .unwrap_or("");
     let provider_context = crate::codex_config::codex_provider_classification_context(db)?;
     let profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(&effective_provider);
-    let prepared =
+    let prepared = if let Some(artifact) = artifact.as_ref() {
+        crate::codex_config::prepare_codex_config_text_with_model_catalog_and_projection_artifact(
+            &settings_for_live,
+            config_text,
+            profile,
+            Some(&provider_context),
+            artifact,
+        )?
+    } else {
         crate::codex_config::prepare_codex_config_text_with_model_catalog_and_provider_context(
             &settings_for_live,
             config_text,
             profile,
             &provider_context,
-        )?;
+        )?
+    };
     let prepared = if effective_provider.category.as_deref() == Some("official")
         && crate::settings::unify_codex_session_history()
     {
@@ -1278,7 +1336,7 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
             ));
         }
         AppType::Codex => {
-            write_codex_live_snapshot(provider, None)?;
+            write_codex_live_snapshot(provider, None, None)?;
         }
         AppType::Gemini => {
             // Delegate to write_gemini_live which handles env file writing correctly
@@ -1410,6 +1468,9 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
 fn write_codex_live_snapshot(
     provider: &Provider,
     provider_context: Option<&crate::codex_config::ProviderClassificationContext>,
+    projection_artifact: Option<
+        &crate::codex_multirouter::projection::CodexRoutingProjectionArtifact,
+    >,
 ) -> Result<(), AppError> {
     let settings_for_live = codex_settings_for_live_projection(provider)?;
     let obj = settings_for_live
@@ -1426,7 +1487,18 @@ fn write_codex_live_snapshot(
     // the proxy router (apiFormat meta/settings + TOML wire_api).
     let profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(provider);
 
-    if let Some(provider_context) = provider_context {
+    if let (Some(provider_context), Some(artifact)) = (provider_context, projection_artifact) {
+        crate::codex_config::write_codex_provider_live_with_catalog_and_provider_context_and_projection_artifact(
+            &settings_for_live,
+            provider.category.as_deref(),
+            auth,
+            config_str,
+            profile,
+            provider_context,
+            Some(provider),
+            artifact,
+        )
+    } else if let Some(provider_context) = provider_context {
         crate::codex_config::write_codex_provider_live_with_catalog_and_provider_context(
             &settings_for_live,
             provider.category.as_deref(),

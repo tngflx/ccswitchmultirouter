@@ -192,11 +192,8 @@ pub fn apply_codex_provider_mutation(
     provider: Provider,
 ) -> Result<CodexProviderMutationOutcome, AppError> {
     apply_codex_provider_mutation_with_profiles_and_publisher(db, provider, &[], &[], |artifact| {
-        crate::codex_config::publish_codex_multirouter_projection_for_database(
-            db,
-            &artifact.projection_settings,
-        )
-        .map_err(|error| error.to_string())
+        crate::codex_config::publish_codex_multirouter_projection_for_database(db, artifact)
+            .map_err(|error| error.to_string())
     })
 }
 
@@ -228,11 +225,8 @@ pub fn apply_codex_provider_mutation_with_protocol_state(
         profiles,
         observations,
         |artifact| {
-            crate::codex_config::publish_codex_multirouter_projection_for_database(
-                db,
-                &artifact.projection_settings,
-            )
-            .map_err(|error| error.to_string())
+            crate::codex_config::publish_codex_multirouter_projection_for_database(db, artifact)
+                .map_err(|error| error.to_string())
         },
     )
 }
@@ -253,11 +247,8 @@ pub(crate) fn apply_codex_official_auth_provider_mutation_with_protocol_state(
         true,
         None,
         |artifact| {
-            crate::codex_config::publish_codex_multirouter_projection_for_database(
-                db,
-                &artifact.projection_settings,
-            )
-            .map_err(|error| error.to_string())
+            crate::codex_config::publish_codex_multirouter_projection_for_database(db, artifact)
+                .map_err(|error| error.to_string())
         },
     )
 }
@@ -712,11 +703,8 @@ pub fn apply_codex_provider_set_mutation(
     prepared: PreparedCodexProviderSetMutation,
 ) -> Result<CodexProviderMutationOutcome, AppError> {
     apply_codex_provider_set_mutation_with_publisher(db, prepared, |artifact| {
-        crate::codex_config::publish_codex_multirouter_projection_for_database(
-            db,
-            &artifact.projection_settings,
-        )
-        .map_err(|error| error.to_string())
+        crate::codex_config::publish_codex_multirouter_projection_for_database(db, artifact)
+            .map_err(|error| error.to_string())
     })
 }
 
@@ -761,11 +749,8 @@ pub(crate) fn apply_codex_provider_mutation_with_protocol_state_if_unchanged(
         cleanup_legacy_official_auth,
         expected_provider,
         |artifact| {
-            crate::codex_config::publish_codex_multirouter_projection_for_database(
-                db,
-                &artifact.projection_settings,
-            )
-            .map_err(|error| error.to_string())
+            crate::codex_config::publish_codex_multirouter_projection_for_database(db, artifact)
+                .map_err(|error| error.to_string())
         },
     )
 }

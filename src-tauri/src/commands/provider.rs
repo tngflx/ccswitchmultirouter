@@ -2487,7 +2487,7 @@ fn commit_universal_provider_set_internal(
     commit_universal_provider_set_internal_with_publisher(state, request, now, |artifact| {
         crate::codex_config::publish_codex_multirouter_projection_for_database(
             state.db.as_ref(),
-            &artifact.projection_settings,
+            artifact,
         )
         .map_err(|error| error.to_string())
     })

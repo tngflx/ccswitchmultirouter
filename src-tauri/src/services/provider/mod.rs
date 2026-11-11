@@ -8559,7 +8559,7 @@ impl ProviderService {
                 |artifact| {
                     crate::codex_config::publish_codex_multirouter_projection_for_database(
                         state.db.as_ref(),
-                        &artifact.projection_settings,
+                        artifact,
                     )
                     .map_err(|error| error.to_string())
                 },
@@ -8639,7 +8639,7 @@ impl ProviderService {
                 |artifact| {
                     crate::codex_config::publish_codex_multirouter_projection_for_database(
                         state.db.as_ref(),
-                        &artifact.projection_settings,
+                        artifact,
                     )
                     .map_err(|error| error.to_string())
                 },
@@ -9093,7 +9093,7 @@ impl ProviderService {
             |artifact| {
                 crate::codex_config::publish_codex_multirouter_projection_for_database(
                     state.db.as_ref(),
-                    &artifact.projection_settings,
+                    artifact,
                 )
                 .map_err(|error| error.to_string())
             },
@@ -11312,7 +11312,7 @@ impl ProviderService {
             |artifact| {
                 crate::codex_config::publish_codex_multirouter_projection_for_database(
                     state.db.as_ref(),
-                    &artifact.projection_settings,
+                    artifact,
                 )
                 .map_err(|error| error.to_string())
             },
@@ -11351,7 +11351,7 @@ impl ProviderService {
             |artifact| {
                 crate::codex_config::publish_codex_multirouter_projection_for_database(
                     state.db.as_ref(),
-                    &artifact.projection_settings,
+                    artifact,
                 )
                 .map_err(|error| error.to_string())
             },
