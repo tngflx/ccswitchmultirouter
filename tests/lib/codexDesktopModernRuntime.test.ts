@@ -126,6 +126,7 @@ const createHarness = (
     catalog?: ReturnType<typeof payload>;
     moduleNamespaces?: Record<string, object>;
     importError?: boolean;
+    importPending?: boolean;
     runtimeFingerprint?: string;
     state?: RuntimeState;
   } = {},
@@ -169,6 +170,7 @@ const createHarness = (
     querySelectorAll: () => [],
   };
   const importModule = vi.fn(async (url: string) => {
+    if (options.importPending) return await new Promise(() => {});
     if (options.importError)
       throw new Error("Fixture numeric entry import unavailable");
     const configuredNamespace = options.moduleNamespaces?.[url];
@@ -341,6 +343,94 @@ const nativeVisible = (
     )
     .map((level) => level.reasoningEffort);
 describe("Codex Desktop current numeric-bundle runtime integration", () => {
+  it("rebinds a positively mounted retained RPC scope before pending bundle discovery", async () => {
+    const queryClient = new QueryClient();
+    const rpcBase = {
+      dup() {},
+      onRpcBroken() {},
+      map() {},
+      toString() {
+        return "[object RpcStub]";
+      },
+    };
+    const rpc = Object.assign(function rpc() {}, {
+      sendRequest: vi.fn(async () => ({})),
+      getCompatibleThreadSortKey() {},
+      supportsPaginatedThreadHistory() {},
+    });
+    Object.setPrototypeOf(rpc, rpcBase);
+    const client = { hostId: "local", rpc };
+    const atomScope = {};
+    const statusAtom = { scope: atomScope };
+    const managerToken = {};
+    const provider = { forHost: () => rpc };
+    const scope = {
+      scope: atomScope,
+      chain: {},
+      queryClient,
+      get(token: unknown) {
+        return token === managerToken ? provider : { status: "ready", client };
+      },
+      set() {},
+      watch() {},
+      node: {
+        queryClient,
+        familyBindings: new Map(),
+      },
+    };
+    const alias = { ...scope };
+    const orphan = {
+      chain: {},
+      queryClient,
+      get() {},
+      set() {},
+      watch() {},
+      node: { queryClient },
+    };
+    const harness = createHarness(
+      {},
+      {
+        reactScope: scope,
+        importPending: true,
+        state: {
+          appServerStatusAtoms: [statusAtom],
+          appServerStatusBindings: [{ atom: statusAtom, managerToken }],
+          rendererRuntimeFingerprint: "old-runtime",
+          scopedAppServerScopeCandidates: new Set([orphan, scope, alias]),
+        },
+      },
+    );
+    try {
+      await harness.execute();
+      expect(harness.state.appServerPatchInstalled).toBe(true);
+      expect(harness.state.appServerClients).toHaveLength(1);
+      expect(harness.state.scopedAppServerScopeCandidates).toEqual(
+        new Set([scope]),
+      );
+      const detached = createHarness(
+        {},
+        {
+          reactScope: { replacementRoot: true },
+          importPending: true,
+          state: {
+            rendererRuntimeFingerprint: "old-runtime",
+            scopedAppServerScopeCandidates: new Set([scope]),
+          },
+        },
+      );
+      try {
+        await detached.execute();
+        expect(detached.state.appServerPatchInstalled).not.toBe(true);
+        expect(detached.state.appServerClients).toEqual([]);
+      } finally {
+        detached.dispose();
+      }
+    } finally {
+      harness.dispose();
+      queryClient.clear();
+    }
+  });
+
   it("discovers an initialized Rspack cache and restores native-filtered Max/Ultra only for the managed local picker", async () => {
     const client = new QueryClient();
     const local = createPicker(client);
@@ -413,7 +503,9 @@ describe("Codex Desktop current numeric-bundle runtime integration", () => {
         missingMaxModelCount: 0,
         missingUltraModelCount: 1,
       });
-      expect(harness.state.nativeReasoningVisibilityReconciliation).toMatchObject({
+      expect(
+        harness.state.nativeReasoningVisibilityReconciliation,
+      ).toMatchObject({
         status: "known",
         managed: true,
         patchedScopes: 1,

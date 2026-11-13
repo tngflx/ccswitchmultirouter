@@ -52,6 +52,23 @@ export function CodexModelReasoningSummary({
   const displayModel = model || "Unnamed model";
   const displaySource = formatCapabilitySource(source);
   const [requestedUltraSetup, setRequestedUltraSetup] = useState(false);
+  const unavailableUltraEffort =
+    ultraEffort && !ultraEfforts.includes(ultraEffort)
+      ? ultraEffort
+      : undefined;
+  let ultraStatus =
+    "Independent of the capability source; select a level after unlocking";
+  if (requestedUltraSetup || (ultraEnabled && ultraEfforts.length === 0)) {
+    ultraStatus =
+      "First confirm that this model accepts reasoning levels. The capability editor is open; complete it before saving.";
+  }
+  if (ultraEnabled && ultraEffort) {
+    ultraStatus = unavailableUltraEffort
+      ? ultraEfforts.length > 0
+        ? `Saved provider level ${ultraEffort} is unavailable. Choose a currently supported level before saving.`
+        : `Saved provider level ${ultraEffort} is unavailable. Confirm this model's reasoning capabilities, then choose a supported level before saving.`
+      : `Unlocked; uses ${ultraEffort}`;
+  }
 
   return (
     <div className="grid gap-3 rounded-md border bg-background p-3 text-xs lg:grid-cols-[minmax(10rem,1fr)_minmax(12rem,1.2fr)_minmax(16rem,1.2fr)_auto] lg:items-center">
@@ -109,19 +126,18 @@ export function CodexModelReasoningSummary({
           }
         >
           <option value="">Select provider level…</option>
+          {unavailableUltraEffort ? (
+            <option value={unavailableUltraEffort} disabled>
+              {unavailableUltraEffort} (unavailable)
+            </option>
+          ) : null}
           {ultraEfforts.map((effort) => (
             <option key={effort} value={effort}>
               {effort}
             </option>
           ))}
         </select>
-        <p className="text-muted-foreground">
-          {requestedUltraSetup || (ultraEnabled && ultraEfforts.length === 0)
-            ? "First confirm that this model accepts reasoning levels. The capability editor is open; complete it before saving."
-            : ultraEnabled && ultraEffort
-              ? `Unlocked; uses ${ultraEffort}`
-              : "Independent of the capability source; select a level after unlocking"}
-        </p>
+        <p className="text-muted-foreground">{ultraStatus}</p>
       </div>
       <Button
         type="button"

@@ -3552,6 +3552,14 @@ pub fn apply_codex_native_responses_reasoning_effort(
     let Some(mapped) =
         super::transform_codex_chat::map_codex_reasoning_effort(&requested_effort, &config)?
     else {
+        let normalized = requested_effort.trim().to_ascii_lowercase();
+        if config.supports_effort.unwrap_or(false)
+            && !matches!(normalized.as_str(), "none" | "off" | "disabled")
+        {
+            return Err(ProxyError::TransformError(format!(
+                "reasoning effort `{requested_effort}` cannot be mapped for the declared Provider contract"
+            )));
+        }
         return Ok(());
     };
 
@@ -3618,6 +3626,8 @@ fn codex_chat_reasoning_config_from_capability(
     let has_efforts =
         resolved.support_kind == super::codex_reasoning::ReasoningSupportKind::EffortLevels;
     let boolean_thinking = capability.upstream.format == "boolean";
+    let reasoning_object = capability.upstream.format == "reasoning_object"
+        || capability.upstream.parameter == "reasoning.effort";
     let supported = capability.effective_support_status()
         == super::codex_reasoning::ReasoningSupportStatus::ConfirmedSupported;
     CodexChatReasoningConfig {
@@ -3625,6 +3635,11 @@ fn codex_chat_reasoning_config_from_capability(
         supports_effort: Some(has_efforts && !boolean_thinking),
         thinking_param: Some(if boolean_thinking {
             capability.upstream.parameter.clone()
+        } else if reasoning_object {
+            // Native Responses-style reasoning objects carry their own effort
+            // and disable controls. Do not add the separate Chat `thinking`
+            // object alongside them.
+            "none".to_string()
         } else if capability.disable_allowed {
             "thinking".to_string()
         } else {
@@ -4101,8 +4116,8 @@ fn infer_aggregator_platform_config(
 ) -> Option<CodexChatReasoningConfig> {
     // OpenRouter：用原生归一化对象 `reasoning: { effort }`（由 OpenRouter 翻译成各底层
     // 模型的正确推理参数，比顶层 OpenAI 别名 reasoning_effort 覆盖面更全）。effort 走
-    // "openrouter" 值映射：枚举为 xhigh|high|medium|low|minimal，无 max——max 会触发
-    // `400 reasoning_effort: Invalid option`（见 openclaw#77350），故钳到 xhigh。
+    // "openrouter" 值映射保留网关的 max 等原生值；逐模型能力声明在更早的
+    // resolver 分支使用精确 effortMap，这里只处理缺少声明的通用兼容路径。
     // 安全降级：不发 `thinking:{type}`（OpenRouter 不认该字段），避免误配导致请求被拒。
     if platform == Some("openrouter") {
         return Some(CodexChatReasoningConfig {
@@ -8572,6 +8587,138 @@ wire_api = "chat"
             .expect("identity effort map should apply");
 
         assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn optional_reasoning_object_capability_does_not_emit_chat_thinking_control() {
+        let provider = create_provider(json!({
+            "baseUrl": "https://openrouter.ai/api/v1",
+            "modelCatalog": {"models": [{
+                "model": "deepseek/deepseek-v4.1-flash-1017",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["max", "high", "low", "none"],
+                    "defaultEffort": "high",
+                    "disableAllowed": true,
+                    "upstream": {
+                        "format": "reasoning_object",
+                        "parameter": "reasoning.effort",
+                        "effortMap": {
+                            "none": "none",
+                            "low": "low",
+                            "high": "high",
+                            "max": "max"
+                        }
+                    },
+                    "outputFormat": "reasoning_content"
+                }
+            }]}
+        }));
+        let max_request = json!({
+            "model": "deepseek/deepseek-v4.1-flash-1017",
+            "input": "hello",
+            "reasoning": {"effort": "max"}
+        });
+        let config = resolve_codex_chat_reasoning_config(&provider, &max_request)
+            .expect("optional OpenRouter reasoning object capability");
+        assert_eq!(config.thinking_param.as_deref(), Some("none"));
+        let wire = crate::proxy::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
+            max_request,
+            Some(&config),
+        )
+        .expect("OpenRouter max request conversion");
+        assert_eq!(wire["reasoning"], json!({"effort": "max"}));
+        assert!(wire.get("thinking").is_none());
+        assert!(wire.get("reasoning_effort").is_none());
+
+        let none_request = json!({
+            "model": "deepseek/deepseek-v4.1-flash-1017",
+            "input": "hello",
+            "reasoning": {"effort": "none"}
+        });
+        let wire = crate::proxy::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
+            none_request,
+            Some(&config),
+        )
+        .expect("OpenRouter explicit disable conversion");
+        assert_eq!(wire["reasoning"], json!({"effort": "none"}));
+        assert!(wire.get("thinking").is_none());
+
+        for effort in ["max", "none"] {
+            let mut native = json!({
+                "model": "deepseek/deepseek-v4.1-flash-1017",
+                "input": "hello",
+                "reasoning": {"effort": effort}
+            });
+            prepare_codex_native_responses_model(&provider, &mut native)
+                .expect("same capability must apply to native Responses");
+            assert_eq!(native["reasoning"], json!({"effort": effort}));
+            assert!(native.get("thinking").is_none());
+            assert!(native.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn native_and_chat_reject_unmappable_effort_for_generic_openrouter_fallback() {
+        let provider = create_provider(json!({
+            "baseUrl": "https://openrouter.ai/api/v1",
+            "config": "model_provider = \"openrouter\"\nmodel = \"unknown-model\"\n"
+        }));
+        for effort in ["ultra", "ultramax"] {
+            let mut body = json!({
+                "model": "unknown-model",
+                "input": "hello",
+                "reasoning": {"effort": effort}
+            });
+            let config = resolve_codex_chat_reasoning_config(&provider, &body)
+                .expect("OpenRouter generic reasoning contract");
+            let chat_error = crate::proxy::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
+                body.clone(), Some(&config),
+            ).expect_err("Chat must not silently drop an unmappable effort");
+            let error = apply_codex_native_responses_reasoning_effort(&provider, &mut body)
+                .expect_err("unmapped native effort must not leak through unchanged");
+            assert!(error.to_string().contains("cannot be mapped"));
+            assert_eq!(error.to_string(), chat_error.to_string());
+            assert_eq!(body["reasoning"]["effort"], effort);
+        }
+        for effort in ["max", "xhigh", "none"] {
+            let mut body = json!({
+                "model": "unknown-model",
+                "input": "hello",
+                "reasoning": {"effort": effort}
+            });
+            apply_codex_native_responses_reasoning_effort(&provider, &mut body)
+                .expect("OpenRouter generic vocabulary remains usable");
+            assert_eq!(body["reasoning"]["effort"], effort);
+        }
+    }
+
+    #[test]
+    fn sublyx_native_and_chat_requests_use_provider_scoped_reasoning_contract() {
+        let provider = create_provider(json!({
+            "baseUrl": "https://sublyx.org/v1",
+            "modelCatalog": {"models": [{"model": "gpt-6.1-sol"}]}
+        }));
+        for (effort, expected) in [("xhigh", "xhigh"), ("max", "max"), ("ultra", "xhigh")] {
+            let mut native = json!({
+                "model": "gpt-6.1-sol", "input": "hello", "reasoning": {"effort": effort}
+            });
+            let config = resolve_codex_chat_reasoning_config(&provider, &native)
+                .expect("Sublyx maintained contract");
+            assert_eq!(config.thinking_param.as_deref(), Some("none"));
+            let wire = crate::proxy::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
+                native.clone(), Some(&config),
+            ).expect("Sublyx Chat compatibility preserves its reasoning object");
+            assert_eq!(wire["reasoning"], json!({"effort": expected}));
+            assert!(wire.get("thinking").is_none());
+            assert!(wire.get("reasoning_effort").is_none());
+            prepare_codex_native_responses_model(&provider, &mut native)
+                .expect("Sublyx native contract");
+            assert_eq!(native["reasoning"], json!({"effort": expected}));
+            assert!(native.get("thinking").is_none());
+        }
     }
 
     #[test]

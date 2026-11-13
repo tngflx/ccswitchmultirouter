@@ -119,10 +119,39 @@ fn tcp_state_label(state: u32) -> &'static str {
 /// Read every local TCP endpoint row that uses `port` (IPv4 + IPv6, all states).
 #[cfg(target_os = "windows")]
 pub(crate) fn tcp_port_rows(port: u16) -> Vec<TcpPortRow> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        TCP_TABLE_OWNER_PID_ALL, TCP_TABLE_OWNER_PID_LISTENER,
+    };
+
     let mut rows = Vec::new();
-    collect_tcp4_port_rows(port, &mut rows);
-    collect_tcp6_port_rows(port, &mut rows);
+    collect_tcp4_port_rows(port, TCP_TABLE_OWNER_PID_ALL, &mut rows);
+    collect_tcp6_port_rows(port, TCP_TABLE_OWNER_PID_ALL, &mut rows);
+    if rows.iter().any(|row| row.state == "UNKNOWN") {
+        let mut listeners = Vec::new();
+        collect_tcp4_port_rows(port, TCP_TABLE_OWNER_PID_LISTENER, &mut listeners);
+        collect_tcp6_port_rows(port, TCP_TABLE_OWNER_PID_LISTENER, &mut listeners);
+        reconcile_unknown_listener_states(&mut rows, &listeners);
+    }
     rows
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn reconcile_unknown_listener_states(rows: &mut [TcpPortRow], listeners: &[TcpPortRow]) {
+    // Some Windows TCP providers return state 0 even from the listener-only
+    // table. A matching row selected by that table is independent evidence of
+    // LISTEN; a zero state or remote port alone must not imply it.
+    for row in rows.iter_mut().filter(|row| row.state == "UNKNOWN") {
+        if row.pid != 0
+            && listeners.iter().any(|listener| {
+                row.family == listener.family
+                    && row.pid == listener.pid
+                    && row.local_address == listener.local_address
+                    && row.remote_address == listener.remote_address
+            })
+        {
+            row.state = "LISTEN";
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -132,13 +161,11 @@ pub(crate) fn tcp_port_rows(port: u16) -> Vec<TcpPortRow> {
 }
 
 #[cfg(target_os = "windows")]
-fn collect_tcp4_port_rows(port: u16, rows: &mut Vec<TcpPortRow>) {
-    use windows_sys::Win32::NetworkManagement::IpHelper::{
-        MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
-    };
+fn collect_tcp4_port_rows(port: u16, table_class: i32, rows: &mut Vec<TcpPortRow>) {
+    use windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCPROW_OWNER_PID;
     use windows_sys::Win32::Networking::WinSock::AF_INET;
 
-    let Some(buffer) = query_tcp_table(AF_INET as u32, TCP_TABLE_OWNER_PID_ALL) else {
+    let Some(buffer) = query_tcp_table(AF_INET as u32, table_class) else {
         return;
     };
     let count = table_entry_count::<MIB_TCPROW_OWNER_PID>(&buffer);
@@ -163,13 +190,11 @@ fn collect_tcp4_port_rows(port: u16, rows: &mut Vec<TcpPortRow>) {
 }
 
 #[cfg(target_os = "windows")]
-fn collect_tcp6_port_rows(port: u16, rows: &mut Vec<TcpPortRow>) {
-    use windows_sys::Win32::NetworkManagement::IpHelper::{
-        MIB_TCP6ROW_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
-    };
+fn collect_tcp6_port_rows(port: u16, table_class: i32, rows: &mut Vec<TcpPortRow>) {
+    use windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCP6ROW_OWNER_PID;
     use windows_sys::Win32::Networking::WinSock::AF_INET6;
 
-    let Some(buffer) = query_tcp_table(AF_INET6 as u32, TCP_TABLE_OWNER_PID_ALL) else {
+    let Some(buffer) = query_tcp_table(AF_INET6 as u32, table_class) else {
         return;
     };
     let count = table_entry_count::<MIB_TCP6ROW_OWNER_PID>(&buffer);
@@ -871,7 +896,62 @@ mod tests {
         assert_eq!(tcp_state_label(2), "LISTEN");
         assert_eq!(tcp_state_label(5), "ESTABLISHED");
         assert_eq!(tcp_state_label(11), "TIME_WAIT");
+        assert_eq!(tcp_state_label(0), "UNKNOWN");
         assert_eq!(tcp_state_label(99), "UNKNOWN");
+    }
+
+    #[test]
+    fn unknown_tcp_state_requires_matching_listener_table_evidence() {
+        let unknown = TcpPortRow {
+            family: "ipv4",
+            state: "UNKNOWN",
+            local_address: "127.0.0.1:15721".to_string(),
+            remote_address: "0.0.0.0:0".to_string(),
+            pid: 4321,
+        };
+        for listener in [
+            None,
+            Some(TcpPortRow {
+                pid: 99,
+                ..unknown.clone()
+            }),
+            Some(TcpPortRow {
+                family: "ipv6",
+                ..unknown.clone()
+            }),
+            Some(TcpPortRow {
+                local_address: "127.0.0.2:15721".to_string(),
+                ..unknown.clone()
+            }),
+            Some(TcpPortRow {
+                remote_address: "127.0.0.1:50000".to_string(),
+                ..unknown.clone()
+            }),
+        ] {
+            let mut rows = [unknown.clone()];
+            let listeners: Vec<_> = listener.into_iter().collect();
+            reconcile_unknown_listener_states(&mut rows, &listeners);
+            assert_eq!(rows[0].state, "UNKNOWN", "{listeners:?}");
+        }
+
+        let mut rows = [unknown.clone()];
+        reconcile_unknown_listener_states(&mut rows, std::slice::from_ref(&unknown));
+        assert_eq!(rows[0].state, "LISTEN");
+
+        let mut kernel_rows = [TcpPortRow {
+            pid: 0,
+            ..unknown.clone()
+        }];
+        let kernel_listener = kernel_rows[0].clone();
+        reconcile_unknown_listener_states(&mut kernel_rows, &[kernel_listener]);
+        assert_eq!(kernel_rows[0].state, "UNKNOWN");
+
+        let mut known_rows = [TcpPortRow {
+            state: "TIME_WAIT",
+            ..unknown.clone()
+        }];
+        reconcile_unknown_listener_states(&mut known_rows, &[unknown]);
+        assert_eq!(known_rows[0].state, "TIME_WAIT");
     }
 
     #[test]

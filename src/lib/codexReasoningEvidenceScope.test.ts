@@ -117,7 +117,7 @@ describe("Codex reasoning evidence scope preservation", () => {
     "user_confirmed_detection",
     "user",
   ] as const)(
-    "preserves %s scope while normalizing the maintained Sublyx GPT contract",
+    "preserves %s scope while respecting Sublyx GPT native max evidence",
     (source) => {
       const row: CodexCatalogModel = {
         model: "Visible catalog alias",
@@ -128,16 +128,17 @@ describe("Codex reasoning evidence scope preservation", () => {
       const normalized = normalizeCodexCatalogReasoningForProvider(row, {
         baseUrl: "https://api.sublyx.org/v1",
       });
-      expect(normalized.reasoning?.supportedEfforts).toEqual([
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-      ]);
+      expect(normalized.reasoning?.supportedEfforts).toEqual(
+        source === "provider"
+          ? ["low", "medium", "high", "xhigh", "max"]
+          : ["high", "max"],
+      );
       const [saved] = roundtripModels([normalized]);
       expect(saved.reasoning?.evidenceScope).toEqual(scope);
       expect(saved.reasoning?.source).toBe(source);
-      expect(saved.reasoning?.providerKey).toBe("sublyx");
+      expect(saved.reasoning?.providerKey).toBe(
+        source === "provider" ? "sublyx" : undefined,
+      );
       expect(row).toEqual(before);
     },
   );

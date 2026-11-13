@@ -180,7 +180,12 @@ fn permanent_reconnect_terminal(code: &'static str) -> ReconnectTerminal {
 }
 
 impl ReconnectFailure {
-    fn from_error(error: &ProxyError) -> Self {
+    fn from_error(error: &ProxyError, capacity_enabled: bool) -> Self {
+        let temporary_usage_limit = matches!(error,
+            ProxyError::UpstreamError { status, body }
+                if super::codex_terminal::http_error_status_is_retryable(*status)
+                    && body.as_deref().is_some_and(is_retryable_usage_limit_body)
+        );
         let terminal = match error {
             ProxyError::AuthError(_) => Some(ReconnectTerminal::new("authentication_error")),
             ProxyError::ResponsePending(_) => Some(ReconnectTerminal::new("response_pending")),
@@ -188,6 +193,9 @@ impl ReconnectFailure {
             | ProxyError::ConfigError(_)
             | ProxyError::RequestHealthBlocked(_) => {
                 Some(ReconnectTerminal::new("invalid_request_error"))
+            }
+            ProxyError::UpstreamError { .. } if temporary_usage_limit && !capacity_enabled => {
+                Some(ReconnectTerminal::new("overloaded_error"))
             }
             ProxyError::UpstreamError { status, body } => body
                 .as_deref()
@@ -205,8 +213,8 @@ impl ReconnectFailure {
             reason_class: "reconnect_transport_failure",
             terminal,
             retry_after: None,
-            long_wait_capacity: false,
-            capacity_retryable: false,
+            long_wait_capacity: capacity_enabled && temporary_usage_limit,
+            capacity_retryable: capacity_enabled && temporary_usage_limit,
         }
     }
 
@@ -249,8 +257,11 @@ impl ReconnectFailure {
             .as_deref()
             .and_then(|bytes| std::str::from_utf8(bytes).ok());
         let payload = text.and_then(|text| serde_json::from_str::<Value>(text).ok());
-        failure.terminal = text
-            .and_then(terminal_error_code_from_body)
+        let temporary_usage_limit =
+            capacity_enabled && text.is_some_and(is_retryable_usage_limit_body);
+        failure.terminal = (!temporary_usage_limit)
+            .then(|| text.and_then(terminal_error_code_from_body))
+            .flatten()
             .map(permanent_reconnect_terminal);
         if failure.terminal.is_none() {
             if capacity_enabled
@@ -261,9 +272,10 @@ impl ReconnectFailure {
                 failure.capacity_retryable = true;
                 failure.long_wait_capacity = capacity_error_body_requires_long_wait(text);
             } else if !capacity_enabled
-                && payload
+                && (payload
                     .as_ref()
                     .is_some_and(|payload| is_capacity_error_payload(payload, Some(status)))
+                    || text.is_some_and(is_retryable_usage_limit_body))
             {
                 failure.terminal = Some(ReconnectTerminal::new("overloaded_error"));
             }
@@ -531,7 +543,10 @@ impl StreamReconnector {
             }
             Err(error) => {
                 diagnostic.failed(&error);
-                Err(ReconnectFailure::from_error(&error))
+                Err(ReconnectFailure::from_error(
+                    &error,
+                    self.capacity_retry_enabled,
+                ))
             }
         }
     }
@@ -903,9 +918,7 @@ fn raw_responses_sse_payload(block: &[u8]) -> Option<Value> {
 /// 类型码是强信号；文案只接受明确的容量语义。泛化的 `please try again later`
 /// 只有与 overload 类型或 5xx HTTP 状态组合时才成立，避免把业务错误误重放。
 pub(crate) fn is_capacity_error_payload(payload: &Value, status: Option<http::StatusCode>) -> bool {
-    if permanent_reconnect_payload(payload).is_some() {
-        return false;
-    }
+    let temporary_usage_limit = is_retryable_usage_limit_payload(payload);
     let error = payload
         .pointer("/response/error")
         .or_else(|| payload.get("error"))
@@ -947,9 +960,20 @@ pub(crate) fn is_capacity_error_payload(payload: &Value, status: Option<http::St
         "concurrent requests limit",
         "too many concurrent requests",
         "maximum concurrent requests",
+        "maximum number of concurrent requests",
+        "concurrent usage limit",
     ]
     .iter()
     .any(|marker| message.contains(marker));
+    // Shared terminal policy has precedence over message-level capacity hints.
+    // A credential, permission, cancellation, or hard-quota failure must not
+    // become replayable merely because a provider included concurrency wording.
+    if permanent_reconnect_payload(payload).is_some() && !temporary_usage_limit {
+        return false;
+    }
+    if temporary_usage_limit {
+        return true;
+    }
     let retry_later_with_server_signal = message.contains("please try again later")
         && (overload_type || status.is_some_and(|status| status.is_server_error()));
 
@@ -959,9 +983,28 @@ pub(crate) fn is_capacity_error_payload(payload: &Value, status: Option<http::St
         || retry_later_with_server_signal
 }
 
+/// Use the same narrow temporary-usage exception as the terminal classifier
+/// and Desktop continuation; extraction paths and marker precedence belong to
+/// the canonical policy instead of a second capacity-only vocabulary.
+pub(crate) fn is_retryable_usage_limit_payload(payload: &Value) -> bool {
+    super::codex_terminal::is_retryable_usage_limit_payload(payload)
+}
+
+pub(crate) fn is_retryable_usage_limit_body(body: &str) -> bool {
+    let payload =
+        serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({ "message": body }));
+    is_retryable_usage_limit_payload(&payload)
+}
+
 /// Whether an otherwise replayable capacity error explicitly asks the caller
 /// to wait for a high-demand/concurrency window to clear.
 pub(crate) fn capacity_error_requires_long_wait(payload: &Value) -> bool {
+    if is_retryable_usage_limit_payload(payload) {
+        return true;
+    }
+    if permanent_reconnect_payload(payload).is_some() {
+        return false;
+    }
     let error = payload
         .pointer("/response/error")
         .or_else(|| payload.get("error"))
@@ -982,6 +1025,8 @@ pub(crate) fn capacity_error_requires_long_wait(payload: &Value) -> bool {
         "concurrent requests limit",
         "too many concurrent requests",
         "maximum concurrent requests",
+        "maximum number of concurrent requests",
+        "concurrent usage limit",
     ]
     .iter()
     .any(|marker| message.contains(marker))
@@ -3774,10 +3819,13 @@ mod tests {
                 ("Token expired", "authentication_error"),
                 ("Permission denied", "permission_denied"),
             ] {
-                let failure = ReconnectFailure::from_error(&ProxyError::UpstreamError {
-                    status,
-                    body: Some(message.to_string()),
-                });
+                let failure = ReconnectFailure::from_error(
+                    &ProxyError::UpstreamError {
+                        status,
+                        body: Some(message.to_string()),
+                    },
+                    true,
+                );
                 assert_eq!(
                     failure.terminal.map(|terminal| terminal.code),
                     Some(expected)
@@ -3789,11 +3837,45 @@ mod tests {
             "Connection reset before completion",
             "HTTP 429, retry later",
         ] {
-            let failure = ReconnectFailure::from_error(&ProxyError::UpstreamError {
-                status: 503,
-                body: Some(message.to_string()),
-            });
+            let failure = ReconnectFailure::from_error(
+                &ProxyError::UpstreamError {
+                    status: 503,
+                    body: Some(message.to_string()),
+                },
+                true,
+            );
             assert!(failure.terminal.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn temporary_usage_reconnect_failures_obey_capacity_setting_for_json_and_plaintext() {
+        for body in [
+            "Usage limit reached. Please try again later.".to_string(),
+            json!({"error": {"type": "usage_limit_reached", "message": "Please try again later."}})
+                .to_string(),
+        ] {
+            for capacity_enabled in [false, true] {
+                let error = ProxyError::UpstreamError {
+                    status: 429,
+                    body: Some(body.clone()),
+                };
+                let from_error = ReconnectFailure::from_error(&error, capacity_enabled);
+                let from_response = ReconnectFailure::from_response(
+                    ProxyResponse::buffered(
+                        http::StatusCode::TOO_MANY_REQUESTS,
+                        http::HeaderMap::new(),
+                        Bytes::from(body.clone()),
+                    ),
+                    capacity_enabled,
+                )
+                .await;
+                for failure in [from_error, from_response] {
+                    assert_eq!(failure.capacity_retryable, capacity_enabled, "{body}");
+                    assert_eq!(failure.long_wait_capacity, capacity_enabled, "{body}");
+                    assert_eq!(failure.terminal.is_none(), capacity_enabled, "{body}");
+                }
+            }
         }
     }
 
@@ -4039,6 +4121,7 @@ mod tests {
             "concurrent limit reached",
             "Concurrency limit reached for this model",
             "Too many concurrent requests",
+            "Maximum number of concurrent requests reached",
             "We're currently experiencing high demand",
         ] {
             let payload = json!({"error":{"type":"server_error","message":message}});
@@ -4063,6 +4146,74 @@ mod tests {
         assert!(!capacity_error_body_requires_long_wait(Some(
             r#"{"error":{"type":"insufficient_quota","message":"quota exhausted"}}"#
         )));
+    }
+
+    #[test]
+    fn capacity_classifier_preserves_terminal_categories_with_concurrency_wording() {
+        for error_type in [
+            "authentication_error",
+            "permission_denied",
+            "invalid_request_error",
+        ] {
+            let payload = json!({"error": {
+                "type": error_type,
+                "message": "Concurrent usage limit reached"
+            }});
+            assert!(!is_capacity_error_payload(&payload, None), "{error_type}");
+            assert!(!capacity_error_requires_long_wait(&payload), "{error_type}");
+        }
+
+        let payload = json!({"error": {
+            "type": "server_error",
+            "message": "Concurrent usage limit reached"
+        }});
+        assert!(!is_capacity_error_payload(&payload, None));
+        assert!(!is_capacity_error_response(
+            http::StatusCode::TOO_MANY_REQUESTS,
+            Some(&payload.to_string())
+        ));
+    }
+
+    #[test]
+    fn capacity_classifier_rejects_normalized_daily_usage_limit_code() {
+        let payload = json!({"response": {"error": {
+            "type": "daily_usage_limit",
+            "message": "Please try again later"
+        }}});
+        assert!(!is_retryable_usage_limit_payload(&payload));
+        assert!(!is_capacity_error_payload(&payload, None));
+        assert!(!is_capacity_error_response(
+            http::StatusCode::TOO_MANY_REQUESTS,
+            Some(&payload.to_string())
+        ));
+    }
+
+    #[test]
+    fn capacity_classifier_accepts_temporary_usage_limit_but_keeps_hard_limits_terminal() {
+        let temporary = json!({
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "You've hit your usage limit. Please try again later."
+            }
+        });
+        assert!(is_retryable_usage_limit_payload(&temporary));
+        assert!(is_capacity_error_payload(
+            &temporary,
+            Some(http::StatusCode::TOO_MANY_REQUESTS)
+        ));
+        assert!(capacity_error_requires_long_wait(&temporary));
+
+        for message in [
+            "Daily usage limit reached; please try again later",
+            "Quota exhausted; retry later",
+            "Billing limit reached; retry later",
+        ] {
+            let payload = json!({
+                "error": {"type": "usage_limit_reached", "message": message}
+            });
+            assert!(!is_retryable_usage_limit_payload(&payload), "{message}");
+            assert!(!is_capacity_error_payload(&payload, None), "{message}");
+        }
     }
 
     #[test]

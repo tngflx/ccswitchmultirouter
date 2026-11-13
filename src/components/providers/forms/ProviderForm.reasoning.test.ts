@@ -45,12 +45,7 @@ describe("Codex catalog reasoning capability persistence", () => {
     );
     expect(saved.reasoning?.evidenceScope).toEqual(scope);
     expect(saved.reasoning?.source).toBe("user_confirmed_detection");
-    expect(saved.reasoning?.supportedEfforts).toEqual([
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
+    expect(saved.reasoning?.supportedEfforts).toEqual(["high", "max"]);
     expect(JSON.parse(JSON.stringify(saved)).reasoning.evidenceScope).toEqual(
       scope,
     );
@@ -356,7 +351,7 @@ describe("Codex catalog reasoning capability persistence", () => {
       }),
     ).toThrow(/unknown or Codex-only level/);
   });
-  it("normalizes retired Sublyx GPT efforts on save without touching the editor", () => {
+  it("repairs malformed legacy Sublyx native efforts on save while preserving the explicit Ultra max overlay", () => {
     const row: CodexCatalogModel = {
       model: "public-model",
       upstreamModel: "gpt-6.1-sol",
@@ -389,24 +384,25 @@ describe("Codex catalog reasoning capability persistence", () => {
       providerKey: "sublyx",
       disableAllowed: false,
       upstream: { format: "reasoning_object", parameter: "reasoning.effort" },
-      supportedEfforts: ["low", "medium", "high", "xhigh"],
+      supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
       defaultEffort: "xhigh",
-      codexUltraOrchestration: { enabled: true, providerEffort: "xhigh" },
+      codexUltraOrchestration: { enabled: true, providerEffort: "max" },
     });
     expect(saved.reasoning?.upstream.effortMap).toEqual({
       low: "low",
       medium: "medium",
       high: "high",
       xhigh: "xhigh",
+      max: "max",
     });
     expect(saved.codexUltra).toEqual({
       enabled: false,
-      providerEffort: "xhigh",
+      providerEffort: "max",
     });
     expect(JSON.stringify(row)).toBe(snapshot);
   });
 
-  it("normalizes a legacy Sublyx Ultra overlay even without a manual capability", () => {
+  it("preserves an explicit Sublyx Ultra native max overlay without a manual capability", () => {
     expect(
       normalizeCodexCatalogModelsForSave(
         [
@@ -417,7 +413,7 @@ describe("Codex catalog reasoning capability persistence", () => {
         ],
         { baseUrl: "https://api.sublyx.org/v1" },
       )[0].codexUltra,
-    ).toEqual({ enabled: true, providerEffort: "xhigh" });
+    ).toEqual({ enabled: true, providerEffort: "max" });
   });
 
   it.each([

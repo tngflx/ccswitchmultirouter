@@ -8057,9 +8057,14 @@ where
         let mut response_headers = response.headers().clone();
         let retry_after = parse_retry_after_delay(&response_headers);
         let body_text = read_decoded_error_body(response).await?;
+        let temporary_usage_limit = capacity_retry_enabled
+            && body_text
+                .as_deref()
+                .is_some_and(super::providers::streaming_retry::is_retryable_usage_limit_body);
         if let Some(terminal_code) = body_text
             .as_deref()
             .and_then(super::providers::codex_terminal::terminal_error_code_from_body)
+            .filter(|_| !temporary_usage_limit)
         {
             // Permanent failures take precedence over admission/capacity status
             // and endpoint-unavailable hints. Preserve shared category ordering.
@@ -16394,6 +16399,49 @@ mod tests {
         assert_eq!(
             tokio::time::Instant::now() - started_at,
             crate::proxy::providers::streaming_retry::capacity_retry_delay(1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_capacity_retry_replays_temporary_usage_limit_with_retry_signal() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let started_at = tokio::time::Instant::now();
+
+        let result = send_codex_request_with_rate_limit_retry(
+            "test",
+            true,
+            safe_test_codex_traffic_policy(),
+            || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        let mut headers = http::HeaderMap::new();
+                        headers.insert(http::header::RETRY_AFTER, "1".parse().unwrap());
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::TOO_MANY_REQUESTS,
+                            headers,
+                            Bytes::from_static(
+                                br#"{"error":{"type":"usage_limit_reached","message":"You've hit your usage limit. Please try again later."}}"#,
+                            ),
+                        ))
+                    } else {
+                        Ok(ProxyResponse::buffered(
+                            http::StatusCode::OK,
+                            http::HeaderMap::new(),
+                            Bytes::new(),
+                        ))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            tokio::time::Instant::now() - started_at,
+            Duration::from_secs(1)
         );
     }
 

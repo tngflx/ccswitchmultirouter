@@ -16,6 +16,8 @@ type PickerCandidates = {
   queryClients: QueryClient[];
   queryObserverPrototypes: object[];
   scopes: object[];
+  registries: object[];
+  appServerStatusAtoms: object[];
   runtimeCount: number;
   moduleCount: number;
   candidateCount: number;
@@ -52,6 +54,67 @@ const scope = (client: QueryClient) => ({
 });
 
 describe("Codex Desktop initialized numeric Webpack discovery", () => {
+  it("discovers the canonical host status atom from an initialized manager factory without requiring it", () => {
+    const atomScope = {};
+    const atom = {
+      scope: atomScope,
+      kind: "signal-family",
+      read() {},
+      resolve() {},
+    };
+    const factory = new Function(
+      'return function manager(e,t,n){var o=n("status-module"); return function(scope,host){const status=scope.get(o.M4,host); if(status.client)return status.client.rpc; throw Error("AppServerManager RPC is unavailable for hostId:");}}',
+    )();
+    const manager = new Function(
+      'return function(scope,host){const status=scope.get(o.M4,host); if(status.client)return status.client.rpc; throw Error("AppServerManager RPC is unavailable for hostId:");}',
+    )();
+    const req = runtime({
+      manager: {
+        exports: {
+          V: manager,
+          p: { scope: atomScope, cache: "signal", resolve() {} },
+        },
+      },
+      "status-module": { exports: { M4: atom } },
+    });
+    Object.assign(req.m, { manager: factory });
+    expect(
+      api.candidates({ __webpack_require__: req }).appServerStatusAtoms,
+    ).toEqual([atom]);
+    expect(req).not.toHaveBeenCalled();
+  });
+
+  it("matches the manager dependency's whole identifier when another alias shares its suffix", () => {
+    const atomScope = {};
+    const atom = {
+      scope: atomScope,
+      kind: "signal-family",
+      read() {},
+      resolve() {},
+    };
+    const factory = new Function(
+      'return function manager(e,t,n){var foo=n("unrelated-module"),o=n("status-module"); return function(scope,host){const status=scope.get(o.M4,host); if(status.client)return status.client.rpc; throw Error("AppServerManager RPC is unavailable for hostId:");}}',
+    )();
+    const manager = new Function(
+      'return function(scope,host){const status=scope.get(o.M4,host); if(status.client)return status.client.rpc; throw Error("AppServerManager RPC is unavailable for hostId:");}',
+    )();
+    const req = runtime({
+      manager: {
+        exports: {
+          V: manager,
+          p: { scope: atomScope, cache: "signal", resolve() {} },
+        },
+      },
+      "unrelated-module": { exports: {} },
+      "status-module": { exports: { M4: atom } },
+    });
+    Object.assign(req.m, { manager: factory });
+    expect(
+      api.candidates({ __webpack_require__: req }).appServerStatusAtoms,
+    ).toEqual([atom]);
+    expect(req).not.toHaveBeenCalled();
+  });
+
   it("discovers initialized own-data picker clients, observer constructors, and scopes without invoking the runtime", () => {
     const client = new QueryClient();
     const currentScope = scope(client);
@@ -77,6 +140,34 @@ describe("Codex Desktop initialized numeric Webpack discovery", () => {
     } finally {
       client.clear();
     }
+  });
+
+  it("discovers a validated app-server registry before the bounded picker graph walk", () => {
+    class AppServerRegistry {
+      scope: object;
+
+      constructor(scope: object) {
+        this.scope = scope;
+      }
+
+      getForHostId(hostId: string) {
+        return (this.scope as { get: (id: string) => unknown }).get(hostId);
+      }
+
+      getAll() {
+        return [];
+      }
+
+      getImplForHostId(hostId: string) {
+        return (this.scope as { get: (id: string) => unknown }).get(hostId);
+      }
+    }
+
+    const result = api.candidates(
+      namespace({ registry: { exports: { AppServerRegistry } } }),
+    );
+
+    expect(result.registries).toEqual([AppServerRegistry]);
   });
 
   it("accepts the explicitly exported runtime from a real ESM namespace", async () => {

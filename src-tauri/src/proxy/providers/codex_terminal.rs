@@ -22,6 +22,17 @@ struct TerminalErrorCategory {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TemporaryUsageLimitPolicy {
+    category_code: String,
+    usage_markers: Vec<String>,
+    retry_message_paths: Vec<String>,
+    retry_markers: Vec<String>,
+    retry_denial_markers: Vec<String>,
+    hard_limit_markers: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TerminalErrorPolicy {
     schema_version: u8,
     ignored_separators: Vec<char>,
@@ -29,6 +40,7 @@ struct TerminalErrorPolicy {
     serialized_paths: Vec<String>,
     cancelled_events: Vec<String>,
     cancelled_code: String,
+    temporary_usage_limit: TemporaryUsageLimitPolicy,
     categories: Vec<TerminalErrorCategory>,
 }
 
@@ -84,8 +96,85 @@ fn terminal_error_policy() -> &'static TerminalErrorPolicy {
             category.serialized_markers = serialized_markers;
         }
         policy.categories = categories;
+        assert!(
+            policy
+                .categories
+                .iter()
+                .any(|category| category.code == policy.temporary_usage_limit.category_code)
+                && !policy.temporary_usage_limit.retry_message_paths.is_empty(),
+            "temporary usage-limit policy must preserve a permanent category"
+        );
+        let normalize_markers = |markers: &mut Vec<String>| {
+            assert!(
+                !markers.is_empty(),
+                "temporary usage-limit markers are required"
+            );
+            for marker in markers {
+                *marker = marker
+                    .chars()
+                    .filter(|ch| !policy.ignored_separators.contains(ch))
+                    .map(|ch| ch.to_ascii_lowercase())
+                    .collect();
+                assert!(
+                    !marker.is_empty(),
+                    "temporary usage-limit markers must not be empty"
+                );
+            }
+        };
+        normalize_markers(&mut policy.temporary_usage_limit.usage_markers);
+        normalize_markers(&mut policy.temporary_usage_limit.retry_markers);
+        normalize_markers(&mut policy.temporary_usage_limit.retry_denial_markers);
+        normalize_markers(&mut policy.temporary_usage_limit.hard_limit_markers);
         policy
     })
+}
+
+fn temporary_usage_limit_matches(policy: &TerminalErrorPolicy, payload: &Value) -> bool {
+    let rule = &policy.temporary_usage_limit;
+    let summary: Vec<_> = policy
+        .summary_paths
+        .iter()
+        .filter_map(|pointer| payload.pointer(pointer))
+        .filter_map(Value::as_str)
+        .map(|value| policy.normalize(value))
+        .collect();
+    let serialized: Vec<_> = policy
+        .serialized_paths
+        .iter()
+        .filter_map(|pointer| payload.pointer(pointer))
+        .map(|value| policy.normalize(&value.to_string()))
+        .collect();
+    // Explicit refusal always wins over a positive substring such as `retry`
+    // or `reset`, including a denial in a structured code or nested detail.
+    if summary.iter().chain(serialized.iter()).any(|value| {
+        rule.retry_denial_markers
+            .iter()
+            .any(|marker| value.contains(marker))
+    }) {
+        return false;
+    }
+    let has_usage_limit = summary.iter().any(|value| {
+        rule.usage_markers
+            .iter()
+            .any(|marker| value.contains(marker))
+    });
+    let has_retry_window = rule
+        .retry_message_paths
+        .iter()
+        .filter_map(|pointer| payload.pointer(pointer))
+        .filter_map(Value::as_str)
+        .map(|value| policy.normalize(value))
+        .any(|value| {
+            rule.retry_markers
+                .iter()
+                .any(|marker| value.contains(marker))
+        });
+    let has_hard_limit = summary.iter().chain(serialized.iter()).any(|value| {
+        rule.hard_limit_markers
+            .iter()
+            .any(|marker| value.contains(marker))
+    });
+    has_usage_limit && has_retry_window && !has_hard_limit
 }
 
 /// Map a decoded terminal payload to one stable category shared by reconnect
@@ -117,7 +206,14 @@ pub(crate) fn terminal_error_code(event_name: &str, payload: &Value) -> Option<&
         .filter_map(|pointer| payload.pointer(pointer))
         .map(|value| policy.normalize(&value.to_string()))
         .collect();
+    let temporary_usage_limit = temporary_usage_limit_matches(policy, payload);
     policy.categories.iter().find_map(|category| {
+        // Skip only the ambiguous usage category. Continue checking every
+        // other permanent guard so mixed auth/permission/cancellation errors
+        // cannot become replayable through a retry message.
+        if temporary_usage_limit && category.code == policy.temporary_usage_limit.category_code {
+            return None;
+        }
         let serialized_markers = category
             .serialized_markers
             .as_ref()
@@ -132,6 +228,13 @@ pub(crate) fn terminal_error_code(event_name: &str, payload: &Value) -> Option<&
             }))
         .then_some(category.code.as_str())
     })
+}
+
+/// The canonical narrow exception is shared by safe capacity replay and
+/// Desktop continuation. Other permanent categories always keep precedence.
+pub(crate) fn is_retryable_usage_limit_payload(payload: &Value) -> bool {
+    temporary_usage_limit_matches(terminal_error_policy(), payload)
+        && terminal_error_code("response.failed", payload).is_none()
 }
 
 /// Apply the same terminal policy to structured provider errors and plaintext
@@ -504,6 +607,45 @@ mod tests {
         ] {
             assert_eq!(terminal_error_code_from_body(body), expected);
         }
+    }
+
+    #[test]
+    fn temporary_usage_limits_never_override_explicit_retry_denial() {
+        for message in [
+            "Usage limit reached. Do not retry this request.",
+            "Usage limit reached. Don't retry this request.",
+            "Usage limit reached. Don’t retry this request.",
+            "Usage limit reached. This request is not retryable.",
+            "Usage limit reached. This is a non-retryable error.",
+            "Usage limit reached. You cannot retry this request.",
+            "Usage limit reached. Cannot retry until the next reset.",
+            "Usage limit reached. You can't retry this request.",
+            "Usage limit reached. Never retry this request.",
+            "Usage limit reached. You must not retry; wait for support.",
+        ] {
+            let payload = json!({"error": {"type": "usage_limit_reached", "message": message}});
+            assert!(!is_retryable_usage_limit_payload(&payload), "{message}");
+            assert_eq!(
+                terminal_error_code("response.failed", &payload),
+                Some("insufficient_quota"),
+                "{message}"
+            );
+            assert_eq!(
+                terminal_error_code_from_body(message),
+                Some("insufficient_quota"),
+                "{message}"
+            );
+        }
+        let payload = json!({"error": {
+            "type": "usage_limit_reached",
+            "code": "not_retryable",
+            "message": "Usage limit reached. Please retry later."
+        }});
+        assert!(!is_retryable_usage_limit_payload(&payload));
+        assert_eq!(
+            terminal_error_code("response.failed", &payload),
+            Some("insufficient_quota")
+        );
     }
 
     #[test]

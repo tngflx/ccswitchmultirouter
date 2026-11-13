@@ -2502,8 +2502,8 @@ mod tests {
             for (provider_id, native_efforts, selectable_efforts) in [
                 (
                     "gateway-a",
-                    vec!["low", "medium", "high", "xhigh"],
-                    vec!["low", "medium", "high", "xhigh", "ultra"],
+                    vec!["low", "medium", "high", "xhigh", "max"],
+                    vec!["low", "medium", "high", "xhigh", "max", "ultra"],
                 ),
                 (
                     "gateway-b",
@@ -2561,7 +2561,10 @@ mod tests {
                     selectable_efforts
                 );
                 if provider_id == "gateway-a" {
-                    assert!(!request_capability.upstream.effort_map.contains_key("max"));
+                    assert_eq!(
+                        request_capability.upstream.effort_map.get("max"),
+                        Some(&"max".to_string())
+                    );
                     assert_eq!(
                         selectable.effort_map.get(&CodexReasoningEffort::Ultra),
                         Some(&CodexReasoningEffort::XHigh)
@@ -2574,15 +2577,14 @@ mod tests {
                     prepare_codex_native_responses_model(&routed, &mut request)
                         .expect("Sublyx Ultra maps on the native Responses boundary");
                     assert_eq!(request["reasoning"]["effort"], "xhigh");
-                    let mut retired_max_request = json!({
+                    let mut max_request = json!({
                         "model": model_id,
                         "input": "test",
                         "reasoning": {"effort": "max"}
                     });
-                    prepare_codex_native_responses_model(&routed, &mut retired_max_request).expect(
-                        "stale sessions use the documented nearest-effort compatibility map",
-                    );
-                    assert_eq!(retired_max_request["reasoning"]["effort"], "xhigh");
+                    prepare_codex_native_responses_model(&routed, &mut max_request)
+                        .expect("Sublyx native max remains a supported effort");
+                    assert_eq!(max_request["reasoning"]["effort"], "max");
                 } else {
                     assert_eq!(
                         selectable.effort_map.get(&CodexReasoningEffort::Max),

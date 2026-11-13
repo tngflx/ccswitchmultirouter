@@ -44,6 +44,31 @@ const continuationTerminalErrorAtPath = (payload, pointer) => {
       payload,
     );
 };
+const continuationTemporaryUsageLimitPolicy =
+  continuationTerminalErrorPolicy.temporaryUsageLimit;
+if (
+  !continuationTemporaryUsageLimitPolicy ||
+  !continuationTerminalErrorCategories.some(
+    (category) =>
+      category.code === continuationTemporaryUsageLimitPolicy.categoryCode,
+  ) ||
+  !continuationTemporaryUsageLimitPolicy.retryMessagePaths?.length
+)
+  throw new Error("Invalid embedded temporary usage-limit policy");
+const continuationTemporaryUsageLimitMarkers = {};
+for (const key of [
+  "usageMarkers",
+  "retryMarkers",
+  "retryDenialMarkers",
+  "hardLimitMarkers",
+]) {
+  const markers = continuationTemporaryUsageLimitPolicy[key]?.map(
+    normalizeContinuationTerminalError,
+  );
+  if (!markers?.length || markers.some((marker) => !marker))
+    throw new Error("Invalid embedded temporary usage-limit markers");
+  continuationTemporaryUsageLimitMarkers[key] = markers;
+}
 const codexContinuationTerminalErrorCode = (eventName, payload) => {
   if (continuationTerminalErrorPolicy.cancelledEvents.includes(eventName))
     return continuationTerminalErrorPolicy.cancelledCode;
@@ -56,15 +81,38 @@ const codexContinuationTerminalErrorCode = (eventName, payload) => {
     .map((pointer) => continuationTerminalErrorAtPath(payload, pointer))
     .filter((value) => value !== undefined)
     .map((value) => normalizeContinuationTerminalError(JSON.stringify(value)));
+  const matchesMarker = (values, markers) =>
+    values.some((value) => markers.some((marker) => value.includes(marker)));
+  const retryMessages = continuationTemporaryUsageLimitPolicy.retryMessagePaths
+    .map((pointer) => continuationTerminalErrorAtPath(payload, pointer))
+    .filter((value) => typeof value === "string")
+    .map(normalizeContinuationTerminalError);
+  const temporaryUsageLimit =
+    !matchesMarker(
+      [...summary, ...serialized],
+      continuationTemporaryUsageLimitMarkers.retryDenialMarkers,
+    ) &&
+    matchesMarker(
+      summary,
+      continuationTemporaryUsageLimitMarkers.usageMarkers,
+    ) &&
+    matchesMarker(
+      retryMessages,
+      continuationTemporaryUsageLimitMarkers.retryMarkers,
+    ) &&
+    !matchesMarker(
+      [...summary, ...serialized],
+      continuationTemporaryUsageLimitMarkers.hardLimitMarkers,
+    );
   return (
     continuationTerminalErrorCategories.find(
       (category) =>
-        summary.some((value) =>
-          category.markers.some((marker) => value.includes(marker)),
-        ) ||
-        serialized.some((value) =>
-          category.serializedMarkers.some((marker) => value.includes(marker)),
-        ),
+        !(
+          temporaryUsageLimit &&
+          category.code === continuationTemporaryUsageLimitPolicy.categoryCode
+        ) &&
+        (matchesMarker(summary, category.markers) ||
+          matchesMarker(serialized, category.serializedMarkers)),
     )?.code || null
   );
 };
@@ -161,7 +209,7 @@ const classifyCodexContinuationThread = (thread, threadId, expectedModel) => {
   // interrupted turns only when their error identifies an unexpected failure.
   if (
     status === "interrupted" &&
-    !/overload|capacity|rate.?limit|server.?error|transport|connection|network|socket|fetch.?(?:failed|error)|econn(?:reset|refused)|enotfound|eai.?again|enetunreach|ehostunreach|unexpected|premature|eof|stream|timeout|timed.?out|crash|process.?exit/i.test(
+    !/overload|capacity|rate.?limit|usage.?limit|server.?error|transport|connection|network|socket|fetch.?(?:failed|error)|econn(?:reset|refused)|enotfound|eai.?again|enetunreach|ehostunreach|unexpected|premature|eof|stream|timeout|timed.?out|crash|process.?exit/i.test(
       error,
     ) &&
     !/(?:^|[^\d.])(?:408|425|429|5\d{2})(?!\d|\.\d)/.test(error)

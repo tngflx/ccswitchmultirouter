@@ -23,6 +23,42 @@
     "response.canceled",
     "response.aborted"
   ],
+  "temporaryUsageLimit": {
+    "categoryCode": "insufficient_quota",
+    "usageMarkers": ["usage limit"],
+    "retryMessagePaths": [
+      "/response/error/message",
+      "/error/message",
+      "/message",
+      "/error",
+      ""
+    ],
+    "retryMarkers": ["try again", "retry", "reset", "wait", "available in"],
+    "retryDenialMarkers": [
+      "do not retry",
+      "don't retry",
+      "don’t retry",
+      "not retryable",
+      "non retryable",
+      "not retriable",
+      "non retriable",
+      "cannot retry",
+      "can't retry",
+      "can’t retry",
+      "never retry",
+      "must not retry"
+    ],
+    "hardLimitMarkers": [
+      "daily",
+      "weekly",
+      "monthly",
+      "quota",
+      "billing",
+      "payment required",
+      "credit",
+      "balance"
+    ]
+  },
   "categories": [
     {
       "code": "response_pending",
@@ -47,6 +83,8 @@
         "payment required",
         "usage limit",
         "daily limit",
+        "weekly limit",
+        "monthly limit",
         "insufficient credit",
         "insufficient balance",
         "credit balance"
@@ -59,6 +97,8 @@
         "payment required",
         "usage limit",
         "daily limit",
+        "weekly limit",
+        "monthly limit",
         "insufficient credit",
         "insufficient balance",
         "credit balance"

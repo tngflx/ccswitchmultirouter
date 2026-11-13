@@ -231,6 +231,94 @@ export function usesSublyxGptReasoningContract(
   );
 }
 
+/** Keep explicit native-max evidence authoritative, as the backend resolver does. */
+export function hasExplicitSublyxNativeMaxEvidence(
+  capability: CodexModelReasoningCapability,
+): boolean {
+  if (
+    !(
+      capability.source == null ||
+      [
+        "user",
+        "user_confirmed_detection",
+        "openrouter_api",
+        "detection",
+      ].includes(capability.source)
+    ) ||
+    capability.upstream.effortMap?.max !== "max"
+  )
+    return false;
+
+  // The backend validates native declarations before preserving their
+  // evidence. Do not let an old native `ultra` or orphaned mapping bypass
+  // maintained repair just because it also contains max -> max. Missing
+  // identity entries remain valid here; save/runtime boundaries complete them.
+  const nativeEfforts: CodexReasoningEffort[] = [
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+  ];
+  const upstreamFormat = capability.upstream.format.trim();
+  const upstreamParameter = capability.upstream.parameter.trim();
+  if (
+    ![
+      "auto",
+      "text",
+      "summary",
+      "object",
+      "reasoning_object",
+      "string",
+      "boolean",
+      "none",
+      "budget",
+    ].includes(upstreamFormat) ||
+    !(
+      (upstreamFormat === "none" && upstreamParameter === "") ||
+      [
+        "reasoning",
+        "reasoning.effort",
+        "reasoning_effort",
+        "enable_thinking",
+        "thinking",
+        "thinking_budget",
+        "max_tokens",
+        "reasoning.max_tokens",
+        "none",
+      ].includes(upstreamParameter)
+    ) ||
+    !Array.isArray(capability.supportedEfforts) ||
+    capability.supportedEfforts.some(
+      (effort) => !nativeEfforts.includes(effort),
+    ) ||
+    (capability.defaultEffort !== undefined &&
+      !capability.supportedEfforts.includes(capability.defaultEffort)) ||
+    (!capability.disableAllowed &&
+      capability.supportedEfforts.includes("none")) ||
+    (capability.supportStatus !== undefined &&
+      capability.supported !== undefined &&
+      (capability.supportStatus === "confirmed_supported") !==
+        capability.supported) ||
+    Object.entries(capability.upstream.effortMap).some(
+      ([source, target]) =>
+        !nativeEfforts.includes(source as CodexReasoningEffort) ||
+        !nativeEfforts.includes(target as CodexReasoningEffort) ||
+        !capability.supportedEfforts.includes(target as CodexReasoningEffort),
+    )
+  )
+    return false;
+  const ultraTarget =
+    capability.codexUltraOrchestration?.providerEffort ??
+    capability.upstream.effortMap.max;
+  return (
+    !capability.codexUltraOrchestration?.enabled ||
+    capability.supportedEfforts.includes(ultraTarget)
+  );
+}
+
 /**
  * Match the backend's maintained, provider-scoped Sublyx GPT wire contract.
  * Repair native shape without changing evidence provenance or explicit opt-outs.
@@ -254,20 +342,27 @@ export function normalizeCodexReasoningCapabilityForProvider(
     !usesSublyxGptReasoningContract(model, identity, capability)
   )
     return capability;
+  if (hasExplicitSublyxNativeMaxEvidence(capability)) return capability;
 
   const nativeEfforts: CodexReasoningEffort[] = [
     "low",
     "medium",
     "high",
     "xhigh",
+    "max",
   ];
   const savedDefault = capability.defaultEffort?.trim().toLowerCase();
   const defaultEffort: CodexReasoningEffort =
-    savedDefault === "max" || savedDefault === "ultra"
+    savedDefault === "ultra"
       ? "xhigh"
       : nativeEfforts.includes(savedDefault as CodexReasoningEffort)
         ? (savedDefault as CodexReasoningEffort)
         : "medium";
+  const savedUltraTarget = capability.codexUltraOrchestration?.providerEffort;
+  const ultraTarget =
+    savedUltraTarget && nativeEfforts.includes(savedUltraTarget)
+      ? savedUltraTarget
+      : "xhigh";
   const canonical = { ...capability };
   delete canonical.supported;
   return {
@@ -282,11 +377,17 @@ export function normalizeCodexReasoningCapabilityForProvider(
     upstream: {
       format: "reasoning_object",
       parameter: "reasoning.effort",
-      effortMap: { low: "low", medium: "medium", high: "high", xhigh: "xhigh" },
+      effortMap: {
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "xhigh",
+        max: "max",
+      },
     },
     codexUltraOrchestration: {
       enabled: capability.codexUltraOrchestration?.enabled ?? true,
-      providerEffort: "xhigh",
+      providerEffort: ultraTarget,
     },
   };
 }
@@ -310,8 +411,7 @@ export function normalizeCodexCatalogReasoningForProvider<
           ),
         }
       : {}),
-    ...(row.codexUltra &&
-    ["max", "ultra"].includes(row.codexUltra.providerEffort ?? "")
+    ...(row.codexUltra?.providerEffort === "ultra"
       ? {
           codexUltra: { ...row.codexUltra, providerEffort: "xhigh" },
         }

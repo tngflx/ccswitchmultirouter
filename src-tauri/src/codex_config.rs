@@ -22354,7 +22354,7 @@ wire_api = "responses"
         assert_eq!(projected_reasoning["source"], "sublyx");
         assert_eq!(
             projected_reasoning["supportedEfforts"],
-            json!(["low", "medium", "high", "xhigh"])
+            json!(["low", "medium", "high", "xhigh", "max"])
         );
         write_codex_live_config_atomic(Some(
             "model_provider = \"codex_model_router_v2\"\n\
@@ -22380,7 +22380,7 @@ wire_api = "responses"
             .iter()
             .map(|level| level["effort"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(levels, ["low", "medium", "high", "xhigh", "ultra"]);
+        assert_eq!(levels, ["low", "medium", "high", "xhigh", "max", "ultra"]);
         assert!(sol["supportedReasoningEfforts"]
             .as_array()
             .is_some_and(|items| !items.is_empty()));

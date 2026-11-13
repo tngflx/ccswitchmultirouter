@@ -5,14 +5,17 @@ import { mkdtemp, open, readFile, rm, stat } from "node:fs/promises";
 import { createServer, get } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { loadCodexRendererSourceRuntime } from "./codex-renderer-source-runtime.mjs";
 
-// Bounded, background verification of the existing Desktop compatibility
-// runtime. No UI, runtime installation, process restart, or existing-chat RPC.
+// Bounded background verification of Desktop compatibility. Direct fixture
+// RPCs use only the owned thread lease. Explicit full source injection may
+// refresh existing model/history caches through the compatibility runtime.
 const startedAt = Date.now();
 const options = new Map();
 for (let index = 2; index < process.argv.length; index += 1) {
   const key = process.argv[index];
-  if (key === "--run-disposable-test") options.set(key, true);
+  if (key === "--run-disposable-test" || key === "--inject-source-runtime")
+    options.set(key, true);
   else {
     assert.ok(
       [
@@ -22,6 +25,7 @@ for (let index = 2; index < process.argv.length; index += 1) {
         "--ccswitch-binary",
         "--wait-ms",
         "--output",
+        "--scenario",
       ].includes(key),
       "Unknown verifier option",
     );
@@ -60,10 +64,42 @@ for (const file of [logPath, binaryPath, options.get("--output")].filter(
 ))
   assert.ok(path.isAbsolute(file), "Verifier paths must be absolute");
 const runDisposableTest = options.get("--run-disposable-test") === true;
+const injectSourceRuntime = options.get("--inject-source-runtime") === true;
+const threadScopeEvidence = () =>
+  injectSourceRuntime
+    ? {
+        existingThreadsPrompted: false,
+        fixtureOperationsRestrictedToOwnedThread: true,
+        sourceRuntimeMayRefreshModelAndHistoryCaches: true,
+      }
+    : { existingThreadsTouched: false };
+const fixtureScenarios = Object.freeze({
+  overload: Object.freeze({
+    code: "overloaded",
+    type: "server_error",
+    message: "Our servers are currently overloaded. Please try again later.",
+  }),
+  concurrent_limit: Object.freeze({
+    code: "concurrent_limit_reached",
+    type: "server_error",
+    message: "Stream account concurrent limit reached. Please try again later.",
+  }),
+  temporary_usage: Object.freeze({
+    code: "usage_limit_reached",
+    type: "server_error",
+    message: "You've hit your usage limit. Please try again later.",
+  }),
+  connection_drop: null,
+});
+const scenario = options.get("--scenario") || "overload";
+assert.ok(
+  Object.hasOwn(fixtureScenarios, scenario),
+  "Unknown verifier scenario",
+);
 const patchKey = "__ccSwitchCodexAppCompatibilityV9";
 const leaseKey = `__ccSwitchContinuationVerifier_${randomUUID().replaceAll("-", "")}`;
 const recoveryId = `desktop-verification-${randomUUID()}`;
-const providerId = `ccswitch_verifier_${randomUUID().replaceAll("-", "")}`;
+let providerId;
 const model = "fixture-model";
 const temporaryPrefix = path.join(
   os.tmpdir(),
@@ -73,18 +109,29 @@ let temporary;
 let connection;
 let fixture;
 let threadId;
+let testThreadCreationAttempted = false;
 const ownedTurnIds = [];
 let cleanupArchived = false;
 let stage = "readiness";
 let initialRequests = 0;
 let continuedRequests = 0;
+let initialTurnDiagnostics;
+let latestThreadDiagnostics;
 let receivedLiteralContinue = false;
-let fixturePhase = "overload";
+let fixturePhase = "initial";
 let fixtureFailure = false;
 let binaryIdentity;
 let binarySha256;
 let nativeIdentity;
 let readinessBlocker;
+let readinessDiagnostics;
+let rendererOperationFailure;
+let sourceRuntimeInjection;
+let sourceRuntime;
+let sourceRuntimeBootstrapped = false;
+let sourceRuntimeBaselineFingerprint;
+let sourceRuntimeReinjectionCount = 0;
+let sourceRuntimeReprepareCount = 0;
 let verificationDeadline = Infinity;
 const initialLogInfo = logPath ? await stat(logPath).catch(() => null) : null;
 let logFileIdentity = initialLogInfo
@@ -93,9 +140,102 @@ let logFileIdentity = initialLogInfo
 let logOffset = initialLogInfo?.size || 0;
 let logFragment = "";
 const fail = (code) => new Error(code);
+// Never serialize raw renderer exceptions: server messages can contain paths,
+// prompts, credentials, or reflected provider input. Keep only fixed classes.
+const classifyRendererException = (details) => {
+  const exception = details?.exception;
+  const structured = exception?.value;
+  const issues = Array.isArray(structured)
+    ? structured
+    : Array.isArray(structured?.issues)
+      ? structured.issues
+      : Array.isArray(structured?.errors)
+        ? structured.errors
+        : [];
+  if (
+    issues
+      .slice(0, 128)
+      .some((issue) =>
+        [
+          "invalid_value",
+          "invalid_type",
+          "invalid_union",
+          "unrecognized_keys",
+        ].includes(issue?.code),
+      )
+  )
+    return "invalid_params";
+  const message = [details?.text, exception?.description, exception?.value]
+    .filter((value) => typeof value === "string")
+    .join(" ")
+    .toLowerCase();
+  for (const reason of [
+    "runtime_changed",
+    "client_missing",
+    "lease_already_exists",
+    "created_thread_missing",
+    "wrong_test_thread",
+    "current_provider_unavailable",
+    "current_provider_changed",
+  ])
+    if (message.includes(reason)) return reason;
+  if (
+    /invalid.?params|invalid parameters|invalid type|invalid_value|invalid_type|invalid_union|unrecognized_keys|missing field|unknown field|expected (?:a |an )?(?:string|object|array|boolean|integer|number)|(?:zoderror|zod error)/.test(
+      message,
+    )
+  )
+    return "invalid_params";
+  if (
+    /unknown (?:method|variant)|method not found|unsupported method/.test(
+      message,
+    )
+  )
+    return "unsupported_method";
+  if (
+    /provider.*(?:not found|unknown|unavailable)|unknown.*provider/.test(
+      message,
+    )
+  )
+    return "provider_unavailable";
+  if (/timed? ?out|timeout/.test(message)) return "timeout";
+  if (/rpc.*(?:broken|disconnected)|connection.*closed/.test(message))
+    return "rpc_disconnected";
+  return "unclassified";
+};
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const sameIdentity = (left, right) =>
   JSON.stringify(left) === JSON.stringify(right);
+const cleanupTemporaryDirectory = async (evidence) => {
+  if (!temporary) return;
+  if (!temporary.startsWith(temporaryPrefix) || temporary === os.tmpdir()) {
+    evidence.pendingDirectory = true;
+    evidence.cleanupPending = "temporary_directory_outside_lease";
+    return;
+  }
+  if ((threadId || testThreadCreationAttempted) && !cleanupArchived) {
+    // Keep an uncertain thread's cwd intact. Archival and directory cleanup
+    // are separate: the app-server can hold cwd open after archival too.
+    evidence.pendingDirectory = true;
+    evidence.cleanupPending = "temporary_directory_thread_uncertain";
+    return;
+  }
+  try {
+    await rm(temporary, {
+      recursive: true,
+      force: true,
+      maxRetries: 2,
+      retryDelay: 100,
+    });
+  } catch (error) {
+    evidence.pendingDirectory = true;
+    evidence.cleanupPending =
+      error?.code === "EBUSY" || error?.code === "ENOTEMPTY"
+        ? "temporary_directory_busy"
+        : error?.code === "EACCES" || error?.code === "EPERM"
+          ? "temporary_directory_access_denied"
+          : "temporary_directory_cleanup_failed";
+  }
+};
 
 if (binaryPath) {
   const info = await stat(binaryPath);
@@ -166,7 +306,9 @@ const readNativeIdentity = () => {
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 if ($PSVersionTable.PSVersion.Major -ne 7 -or $PSVersionTable.PSVersion.Minor -lt 5) { throw 'powershell_75_required' }
-$owners = @(Get-NetTCPConnection -State Listen -LocalPort ${port} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
+$owners = @(Get-NetTCPConnection -LocalPort ${port} -ErrorAction SilentlyContinue |
+  Where-Object { $_.OwningProcess -ne 0 -and $_.RemotePort -eq 0 } |
+  Select-Object -ExpandProperty OwningProcess -Unique)
 $result = @($owners | ForEach-Object {
   $item = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $_) -ErrorAction Stop
   $exe = ([string]$item.ExecutablePath).Replace('/', '\\').ToLowerInvariant()
@@ -332,8 +474,39 @@ const connect = async (url) => {
         },
         timeoutMs || Math.min(8000, verificationDeadline - Date.now()),
       );
-      if (result.exceptionDetails) throw fail("renderer_operation_rejected");
+      if (result.exceptionDetails) {
+        rendererOperationFailure = {
+          stage,
+          reason: classifyRendererException(result.exceptionDetails),
+        };
+        throw fail("renderer_operation_rejected");
+      }
       return result.result?.value;
+    },
+    evaluateDetached: async (expression, timeoutMs = 30000) => {
+      if (
+        Date.now() >= verificationDeadline &&
+        Number.isFinite(verificationDeadline)
+      )
+        throw fail("verification_deadline");
+      const result = await command(
+        "Runtime.evaluate",
+        {
+          expression,
+          returnByValue: false,
+          awaitPromise: false,
+          allowUnsafeEvalBlockedByCSP: true,
+        },
+        timeoutMs,
+      );
+      if (result.exceptionDetails) {
+        rendererOperationFailure = {
+          stage,
+          reason: classifyRendererException(result.exceptionDetails),
+        };
+        throw fail("renderer_operation_rejected");
+      }
+      return result.result;
     },
     close: () => socket.close(),
   };
@@ -343,7 +516,52 @@ const readinessExpression = () => `(() => {
   const client = state?.appServerClients?.find((item) => typeof state.isCodexContinuationRequestClient==='function' && state.isCodexContinuationRequestClient(item));
   const fingerprintMatches = state?.rendererRuntimeFingerprint===${JSON.stringify(expectedFingerprint)};
   const readinessBlocker = !state ? 'renderer_runtime_not_installed' : !fingerprintMatches ? 'renderer_runtime_fingerprint_mismatch' : !['startCodexContinuation','readCodexContinuationJob','commitCodexContinuation','isCodexContinuationRequestClient'].every(k=>typeof state[k]==='function') ? 'renderer_continuation_api_unavailable' : !client ? 'desktop_request_client_unavailable' : null;
-  return {ready: readinessBlocker === null, fingerprintMatches, readinessBlocker};
+  const failures = Array.isArray(state?.failures) ? state.failures : [];
+  const failureKinds = [...new Set(failures.map((value) => {
+    const text = String(value || '').toLowerCase();
+    if (text.includes('asset not found')) return 'asset_not_found';
+    if (text.includes('request client')) return 'request_client_discovery';
+    if (text.includes('timeout') || text.includes('timed out')) return 'timeout';
+    if (text.includes('rpc')) return 'rpc';
+    return 'other';
+  }))].slice(-8);
+  const diagnostics = state ? {
+    installedRuntimeFingerprint: /^sha256-[a-f0-9]{64}$/.test(state.rendererRuntimeFingerprint || '') ? state.rendererRuntimeFingerprint : null,
+    expectedRuntimeFingerprint: ${JSON.stringify(expectedFingerprint)},
+    runtimeGeneration: Number.isSafeInteger(state.runtimeGeneration) ? state.runtimeGeneration : null,
+    appServerPatchInstalled: state.appServerPatchInstalled === true,
+    appServerClientCount: Array.isArray(state.appServerClients) ? state.appServerClients.length : 0,
+    scopedScopeCount: Number(state.scopedAppServerDiscovery?.scopeCount || state.scopedAppServerScopes?.size || 0),
+    scopedRegistryCount: Number(state.scopedAppServerDiscovery?.registryCount || state.scopedAppServerRegistryClasses?.length || 0),
+    scopedClientCount: Number(state.scopedAppServerDiscovery?.clientCount || 0),
+    scopedQueryClientCount: Number(state.scopedAppServerDiscovery?.queryClientCount || 0),
+    scopedAppServerScopeScanComplete: state.scopedAppServerScopeScanComplete === true,
+    pendingReactNodeCount: Number(state.pendingReactNodes?.size || 0),
+    webpackRuntimeCount: Number(state.webpackPickerDiscovery?.runtimeCount || 0),
+    webpackModuleCount: Number(state.webpackPickerDiscovery?.moduleCount || 0),
+    webpackCandidateCount: Number(state.webpackPickerDiscovery?.candidateCount || 0),
+    webpackDiscoveryTruncated: state.webpackPickerDiscovery?.truncated === true,
+    failureCount: failures.length,
+    failureKinds,
+  } : null;
+  return {ready: readinessBlocker === null, fingerprintMatches, readinessBlocker, diagnostics};
+})()`;
+const sourceRuntimeSnapshotExpression = (
+  allowedFingerprints = [expectedFingerprint],
+) => `(() => {
+  const state = window[${JSON.stringify(patchKey)}];
+  if (!state) return { ok: false, reason: "renderer_runtime_not_installed" };
+  if (!${JSON.stringify(allowedFingerprints)}.includes(state.rendererRuntimeFingerprint))
+    return { ok: false, reason: "renderer_runtime_fingerprint_mismatch" };
+  if (state.payload?.catalogAvailable !== true)
+    return { ok: false, reason: "catalog_payload_unavailable" };
+  return {
+    ok: true,
+    installedFingerprint: state.rendererRuntimeFingerprint,
+    payload: state.payload,
+    catalogReleased: state.catalogReleased === true,
+    requestHealthWarningsSuppressed: state.requestHealthWarningsSuppressed === true,
+  };
 })()`;
 const guarded = (body) => `(async () => {
   const state = window[${JSON.stringify(patchKey)}];
@@ -351,6 +569,13 @@ const guarded = (body) => `(async () => {
   const lease=window[${JSON.stringify(leaseKey)}];
   ${body}
 })()`;
+const currentProviderExpression = () =>
+  guarded(`
+    const provider = state.payload?.modelProvider;
+    if (typeof provider !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(provider))
+      throw new Error("current_provider_unavailable");
+    return provider;
+  `);
 const waitUntil = async (getValue) => {
   while (Date.now() < verificationDeadline) {
     const value = await getValue();
@@ -385,17 +610,67 @@ const cleanupExpression = () =>
   delete window[${JSON.stringify(leaseKey)}];
   return {archived:true};
 `);
+const restoreSourceRuntimeAfterNativeCheck = async (preparedGeneration) => {
+  if (!injectSourceRuntime) return false;
+  assert.ok(sourceRuntime && sourceRuntimeBaselineFingerprint);
+  const snapshot = await connection.evaluate(
+    sourceRuntimeSnapshotExpression([
+      sourceRuntimeBaselineFingerprint,
+      sourceRuntime.fingerprint,
+    ]),
+  );
+  if (!snapshot?.ok) throw fail("source_runtime_baseline_changed");
+  if (threadId) {
+    const lease = await connection.evaluate(`(() => {
+      const current = window[${JSON.stringify(leaseKey)}];
+      return {
+        threadMatches: current?.threadId === ${JSON.stringify(threadId)},
+        requestPresent: typeof current?.request === "function",
+      };
+    })()`);
+    if (!lease?.threadMatches || !lease?.requestPresent)
+      throw fail("unexpected_test_thread_turn");
+  }
+  if (snapshot.installedFingerprint === sourceRuntime.fingerprint) {
+    if (preparedGeneration == null) return false;
+    const ready = await connection.evaluate(readinessExpression());
+    return ready?.diagnostics?.runtimeGeneration !== preparedGeneration;
+  }
+  // The guardian can restore the running binary's older validated renderer.
+  // Reinstall exact current source after the native check, preserving the new
+  // current payload. Prepared jobs are invalidated by this new generation and
+  // callers must prepare the same exact failed turn again before committing.
+  await connection.evaluateDetached(
+    sourceRuntime.assemble(
+      JSON.stringify(snapshot.payload),
+      snapshot.catalogReleased,
+      snapshot.requestHealthWarningsSuppressed,
+    ),
+  );
+  sourceRuntimeReinjectionCount += 1;
+  await waitUntil(async () => {
+    const ready = await connection.evaluate(readinessExpression());
+    readinessDiagnostics = ready?.diagnostics;
+    return ready?.ready;
+  });
+  sourceRuntimeInjection = {
+    ...sourceRuntimeInjection,
+    reinjectionCount: sourceRuntimeReinjectionCount,
+    reprepareCount: sourceRuntimeReprepareCount,
+  };
+  return true;
+};
 const run = async () => {
   if (
     options.get("--output") &&
     (await stat(options.get("--output")).catch(() => null))
   )
     throw fail("output_exists");
-  const readinessDeadline = startedAt + waitMs;
+  let readinessDeadline = startedAt + waitMs;
   let readinessFailure = "desktop_bridge_not_ready";
   do {
     await checkBinary();
-    await refreshFingerprint();
+    if (!sourceRuntimeBootstrapped) await refreshFingerprint();
     const owner = readNativeIdentity();
     readinessBlocker = undefined;
     readinessFailure = !owner
@@ -407,15 +682,75 @@ const run = async () => {
       const targets = await readTargets();
       for (const target of targets) {
         const candidate = await connect(target.webSocketDebuggerUrl);
-        const ready = await candidate
-          .evaluate(readinessExpression())
-          .catch(() => null);
+        if (injectSourceRuntime && !sourceRuntimeBootstrapped) {
+          const snapshot = await candidate
+            .evaluate(sourceRuntimeSnapshotExpression())
+            .catch(() => null);
+          if (!snapshot?.ok) {
+            sourceRuntimeInjection = {
+              started: false,
+              reason: snapshot?.reason || "source_runtime_snapshot_failed",
+            };
+            readinessBlocker =
+              snapshot?.reason || "source_runtime_injection_failed";
+            candidate.close();
+            continue;
+          }
+          try {
+            sourceRuntimeBaselineFingerprint = snapshot.installedFingerprint;
+            sourceRuntime = await loadCodexRendererSourceRuntime();
+            const payload = JSON.stringify(snapshot.payload);
+            const source = sourceRuntime.assemble(
+              payload,
+              snapshot.catalogReleased,
+              snapshot.requestHealthWarningsSuppressed,
+            );
+            // The source runtime changes the renderer fingerprint as its first
+            // synchronous action. Fire it through CDP without awaiting its
+            // React/module discovery; readiness below polls the new state.
+            expectedFingerprint = sourceRuntime.fingerprint;
+            await candidate.evaluateDetached(source);
+            sourceRuntimeBootstrapped = true;
+            readinessDeadline = Math.max(
+              readinessDeadline,
+              Date.now() + 20_000,
+            );
+            sourceRuntimeInjection = {
+              started: true,
+              sourceFingerprint: sourceRuntime.fingerprint,
+              payloadPreserved: snapshot.payload?.catalogAvailable === true,
+              requestHealthWarningsSuppressed:
+                snapshot.requestHealthWarningsSuppressed === true,
+            };
+          } catch (error) {
+            sourceRuntimeInjection = {
+              started: false,
+              reason: String(error?.message || error),
+            };
+            readinessBlocker = "source_runtime_injection_failed";
+            candidate.close();
+            continue;
+          }
+        }
+        let ready = null;
+        do {
+          ready = await candidate
+            .evaluate(readinessExpression())
+            .catch(() => null);
+          if (ready?.ready || !injectSourceRuntime) break;
+          if (Date.now() >= readinessDeadline) break;
+          await sleep(250);
+        } while (true);
+        readinessDiagnostics = ready?.diagnostics;
         if (
           [
             "renderer_runtime_not_installed",
             "renderer_runtime_fingerprint_mismatch",
             "renderer_continuation_api_unavailable",
             "desktop_request_client_unavailable",
+            "source_runtime_injection_failed",
+            "source_runtime_snapshot_failed",
+            "catalog_payload_unavailable",
           ].includes(ready?.readinessBlocker)
         )
           readinessBlocker = ready.readinessBlocker;
@@ -435,13 +770,16 @@ const run = async () => {
     return {
       verified: false,
       readinessVerified: true,
+      scenario,
       desktopCdpVerified: false,
       noTestThreadCreated: true,
       runtimeFingerprint: expectedFingerprint,
+      ...threadScopeEvidence(),
     };
   // Bounded commands and eight-second native probes can overrun this soft
   // deadline once; the remainder of the minute is reserved for cleanup.
   verificationDeadline = Date.now() + 45_000;
+  providerId = await connection.evaluate(currentProviderExpression());
   temporary = await mkdtemp(temporaryPrefix);
   fixture = createServer(async (request, response) => {
     try {
@@ -467,21 +805,18 @@ const run = async () => {
         status: "in_progress",
       };
       event({ type: "response.created", response: base });
-      if (fixturePhase === "overload") {
+      if (fixturePhase === "initial") {
         initialRequests += 1;
-        event({
-          type: "response.failed",
-          response: {
-            ...base,
-            status: "failed",
-            error: {
-              code: "overloaded",
-              type: "server_error",
-              message:
-                "Our servers are currently overloaded. Please try again later.",
+        const initialError = fixtureScenarios[scenario];
+        if (initialError)
+          event({
+            type: "response.failed",
+            response: {
+              ...base,
+              status: "failed",
+              error: initialError,
             },
-          },
-        });
+          });
       } else {
         continuedRequests += 1;
         const latest = Array.isArray(input)
@@ -562,41 +897,70 @@ const run = async () => {
   stage = "create_test_thread";
   checkNativeIdentity();
   await checkBinary();
+  await restoreSourceRuntimeAfterNativeCheck();
+  testThreadCreationAttempted = true;
   const created = await connection.evaluate(
     guarded(`
     if(lease) throw new Error('lease_already_exists');
+    if(state.payload?.modelProvider!==${JSON.stringify(providerId)})throw new Error('current_provider_changed');
     const declared=(value,name)=>{for(let n=0;value&&n<5;n++,value=Object.getPrototypeOf(value)){const d=Object.getOwnPropertyDescriptor(value,name);if(d)return typeof d.value==='function'?d.value:null;}return null;};
     const client=state.appServerClients.find(item=>typeof state.isCodexContinuationRequestClient==='function'&&state.isCodexContinuationRequestClient(item));
     if(!client)throw new Error('client_missing');
     const request=declared(client,'__ccSwitchOriginalSendRequest').bind(client);
-    const result=await request('thread/start',${JSON.stringify({ model, modelProvider: providerId, allowProviderModelFallback: false, cwd: temporary, approvalPolicy: "never", sandbox: "read-only", environments: [], dynamicTools: [], baseInstructions: "Reply only OK. Do not call tools.", developerInstructions: "This is a disposable local protocol test. Do not call tools.", config: { [`model_providers.${providerId}`]: { name: "Local Desktop continuation verification fixture", base_url: localBase, wire_api: "responses", requires_openai_auth: false, request_max_retries: 0, stream_max_retries: 0, stream_idle_timeout_ms: 5000 }, model_reasoning_effort: "low" } })});
+    const result=await request('thread/start',${JSON.stringify({ model, modelProvider: providerId, allowProviderModelFallback: false, cwd: temporary, approvalPolicy: "never", sandbox: "read-only", environments: [], dynamicTools: [], baseInstructions: "Reply only OK. Do not call tools.", developerInstructions: "This is a disposable local protocol test. Do not call tools.", config: { [`model_providers.${providerId}.base_url`]: localBase, [`model_providers.${providerId}.request_max_retries`]: 0, [`model_providers.${providerId}.stream_max_retries`]: 0, [`model_providers.${providerId}.stream_idle_timeout_ms`]: 5000, model_reasoning_effort: "low" } })});
     const id=result?.thread?.id;
     if(!id)throw new Error('created_thread_missing');
     window[${JSON.stringify(leaseKey)}]={threadId:id,request,observedAtMs:Date.now(),providerMatches:result.modelProvider===${JSON.stringify(providerId)}&&result.model===${JSON.stringify(model)}};
     return {threadId:id,providerMatches:window[${JSON.stringify(leaseKey)}].providerMatches};
   `),
+    20_000,
   );
   threadId = created?.threadId;
   if (!threadId || created.providerMatches !== true)
     throw fail("local_fixture_provider_not_confirmed");
-  stage = "initial_overload";
+  stage = "initial_fixture_turn";
   const initialTurn = await connection.evaluate(
     guarded(`
     if(!lease?.providerMatches||lease.threadId!==${JSON.stringify(threadId)})throw new Error('wrong_test_thread');
     lease.observedAtMs=Date.now();
     const result=await lease.request('turn/start',{threadId:lease.threadId,input:[{type:'text',text:'Reply with OK. Do not call tools.'}]});
-    return {turnId:result?.turn?.id};
+    const turnId=String(result?.turn?.id||result?.turnId||result?.turn_id||'');
+    const returnedThreadId=String(result?.threadId||result?.thread_id||result?.thread?.id||'');
+    return {turnId,threadMatches:!returnedThreadId||returnedThreadId===lease.threadId,responseType:typeof result,responseKeys:result&&typeof result==='object'?Object.keys(result).filter(k=>/^[a-zA-Z_]{1,40}$/.test(k)).slice(0,24):[],turnStatus:typeof result?.turn?.status==='string'?result.turn.status:null};
   `),
   );
+  initialTurnDiagnostics = initialTurn;
+  stage = "initial_turn_acknowledgement";
+  assert.equal(initialTurn?.threadMatches, true);
   assert.ok(typeof initialTurn?.turnId === "string" && initialTurn.turnId);
   ownedTurnIds.push(initialTurn.turnId);
+  stage = "initial_failed_turn";
   const failed = await waitUntil(async () => {
     const current = await connection.evaluate(threadProjection());
+    latestThreadDiagnostics = {
+      turnCount: Number.isSafeInteger(current?.turnCount)
+        ? current.turnCount
+        : null,
+      status: [
+        "inProgress",
+        "in_progress",
+        "completed",
+        "failed",
+        "interrupted",
+      ].includes(current?.status)
+        ? current.status
+        : "unknown",
+      threadMatches: current?.threadMatches === true,
+      turnIdPresent: Boolean(current?.turnId),
+      initialTurnMatches: current?.turnId === initialTurn.turnId,
+    };
     if (current.turnId && current.turnId !== initialTurn.turnId)
       throw fail("unexpected_test_thread_turn");
     return current.status === "failed" ? current : null;
   });
+  stage = "initial_fixture_request_count";
   assert.equal(initialRequests, 1);
+  stage = "initial_fixture_turn_count";
   assert.equal(failed.turnCount, 1);
   stage = "production_prepare";
   await connection.evaluate(
@@ -614,9 +978,38 @@ const run = async () => {
   });
   assert.equal(prepared.status, "prepared");
   assert.equal(prepared.threadMatches, true);
+  const preparedReadiness = await connection.evaluate(readinessExpression());
+  const preparedGeneration = preparedReadiness?.diagnostics?.runtimeGeneration;
+  assert.ok(Number.isSafeInteger(preparedGeneration));
   stage = "production_commit";
   checkNativeIdentity();
   await checkBinary();
+  if (await restoreSourceRuntimeAfterNativeCheck(preparedGeneration)) {
+    const sameFailure = await connection.evaluate(threadProjection());
+    if (
+      sameFailure.turnId !== failed.turnId ||
+      sameFailure.status !== "failed" ||
+      sameFailure.turnCount !== 1
+    )
+      throw fail("unexpected_test_thread_turn");
+    await connection.evaluate(
+      guarded(`
+      if(lease.threadId!==${JSON.stringify(threadId)})throw new Error('wrong_test_thread');
+      return state.startCodexContinuation(lease.threadId,${JSON.stringify(recoveryId)},${JSON.stringify(model)},lease.observedAtMs);
+    `),
+    );
+    const reprepared = await waitUntil(async () => {
+      const job = await connection.evaluate(jobExpression);
+      return job && job.status !== "pending" ? job : null;
+    });
+    assert.equal(reprepared.status, "prepared");
+    assert.equal(reprepared.threadMatches, true);
+    sourceRuntimeReprepareCount += 1;
+    sourceRuntimeInjection = {
+      ...sourceRuntimeInjection,
+      reprepareCount: sourceRuntimeReprepareCount,
+    };
+  }
   fixturePhase = "continued";
   const commit = await connection.evaluate(
     guarded(
@@ -653,7 +1046,10 @@ const run = async () => {
   await checkBinary();
   return {
     verified: true,
-    scope: "actual_codex_desktop_cdp_existing_production_runtime",
+    scenario,
+    scope: injectSourceRuntime
+      ? "actual_codex_desktop_cdp_source_production_runtime"
+      : "actual_codex_desktop_cdp_existing_production_runtime",
     desktopCdpVerified: true,
     runtimeFingerprint: expectedFingerprint,
     ccswitchBinarySha256: binarySha256,
@@ -661,13 +1057,15 @@ const run = async () => {
     nativeOwnerPids: nativeIdentity.map((owner) => owner.pid),
     temporaryDurableTestThread: true,
     perThreadLocalFixtureProviderConfirmed: true,
-    sseOverloadFailedTurnObserved: true,
+    initialFailedTurnObserved: true,
+    ...(scenario === "overload" ? { sseOverloadFailedTurnObserved: true } : {}),
     productionGuardsPrepared: true,
     appServerAcceptedContinue: true,
     upstreamReceivedLiteralContinue: true,
     continuedTurnCompleted: true,
     exactlyOneContinuation: true,
-    existingThreadsTouched: false,
+    ...(sourceRuntimeInjection ? { sourceRuntimeInjection } : {}),
+    ...threadScopeEvidence(),
     initialRequests,
     continuedRequests,
   };
@@ -678,6 +1076,14 @@ try {
   evidence = await run();
 } catch (error) {
   const code = String(error?.message || "");
+  if (connection) {
+    const operationFailure = rendererOperationFailure;
+    const latest = await connection
+      .evaluate(readinessExpression(), 2500)
+      .catch(() => null);
+    if (latest?.diagnostics) readinessDiagnostics = latest.diagnostics;
+    rendererOperationFailure = operationFailure;
+  }
   const finiteCodes = new Set([
     "ccswitch_binary_changed",
     "native_identity_query_failed",
@@ -700,17 +1106,29 @@ try {
     "local_fixture_provider_not_confirmed",
     "output_exists",
     "unexpected_test_thread_turn",
+    "source_runtime_baseline_changed",
   ]);
   evidence = {
     verified: false,
+    scenario,
     desktopCdpVerified: false,
     stage,
     failure: finiteCodes.has(code) ? code : "verification_assertion_failed",
+    ...(rendererOperationFailure ? { rendererOperationFailure } : {}),
+    ...(initialTurnDiagnostics ? { initialTurnDiagnostics } : {}),
+    ...(latestThreadDiagnostics ? { latestThreadDiagnostics } : {}),
+    initialRequests,
+    continuedRequests,
     ...(code === "desktop_bridge_not_ready" && readinessBlocker
       ? { readinessBlocker }
       : {}),
+    ...(readinessDiagnostics ? { readinessDiagnostics } : {}),
+    ...(sourceRuntimeInjection ? { sourceRuntimeInjection } : {}),
     temporaryDurableTestThread: Boolean(threadId),
-    existingThreadsTouched: false,
+    ...(testThreadCreationAttempted && !threadId
+      ? { threadCreationUncertain: true }
+      : {}),
+    ...threadScopeEvidence(),
   };
   process.exitCode = 1;
 } finally {
@@ -718,6 +1136,11 @@ try {
   // or uncertain active turn is never interrupted or archived here.
   if (connection && runDisposableTest) {
     try {
+      if (injectSourceRuntime && threadId) {
+        checkNativeIdentity();
+        await checkBinary();
+        await restoreSourceRuntimeAfterNativeCheck();
+      }
       const cleanup = await connection.evaluate(cleanupExpression(), 2500);
       cleanupArchived = cleanup?.archived === true;
     } catch {
@@ -732,21 +1155,19 @@ try {
       process.exitCode = 1;
     }
   }
-  connection?.close();
-  fixture?.closeAllConnections();
-  if (fixture?.listening)
-    await new Promise((resolve) => fixture.close(resolve));
-  if (temporary) {
-    assert.ok(
-      temporary.startsWith(temporaryPrefix) && temporary !== os.tmpdir(),
-    );
-    await rm(temporary, {
-      recursive: true,
-      force: true,
-      maxRetries: 2,
-      retryDelay: 100,
-    });
+  try {
+    connection?.close();
+  } catch {
+    evidence.connectionCleanupPending = true;
   }
+  try {
+    fixture?.closeAllConnections();
+    if (fixture?.listening)
+      await new Promise((resolve) => fixture.close(resolve));
+  } catch {
+    evidence.fixtureCleanupPending = true;
+  }
+  await cleanupTemporaryDirectory(evidence);
 }
 evidence.verifiedAtUtc = new Date().toISOString();
 if (options.get("--output")) {

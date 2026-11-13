@@ -137,6 +137,277 @@
     "expectedCode": null
   },
   {
+    "name": "temporary usage admission window with explicit retry remains recoverable",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "You've hit your usage limit. Please try again later."
+    },
+    "expectedCode": null
+  },
+  {
+    "name": "temporary usage admission window with explicit reset remains recoverable",
+    "event": "response.failed",
+    "error": {
+      "code": "usage_limit_reached",
+      "message": "Your usage limit resets in a few minutes."
+    },
+    "expectedCode": null
+  },
+  {
+    "name": "usage limit without a retry signal remains terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "The usage limit has been reached."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "usage limit with do not retry denial remains terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. Do not retry this request."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "usage limit with contracted retry denial remains terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. Don't retry this request."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "usage limit that is not retryable remains terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. This request is not retryable."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "usage limit with curly apostrophe retry denial remains terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. Don’t retry this request."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "usage limit with contracted cannot retry denial remains terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. You can't retry this request."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "usage limit with curly contracted cannot retry denial remains terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. You can’t retry this request."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "usage limit that is not retriable remains terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. This request is not retriable."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "usage limit that is non-retriable remains terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. This request is non-retriable."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "usage limit that is non-retryable remains terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. This request is non-retryable."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "usage limit with cannot retry denial remains terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. You cannot retry this request."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "usage limit with cannot retry until remains conservatively terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. You cannot retry until the next reset."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "usage limit with never retry denial remains terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. Never retry this request."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "usage limit with must not retry denial remains terminal",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. You must not retry this request."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "structured not retryable code overrides positive retry message",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "code": "not_retryable",
+      "message": "Usage limit reached. Please try again later."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "temporary usage admission window with positive wait remains recoverable",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. Please wait a few minutes for the reset."
+    },
+    "expectedCode": null
+  },
+  {
+    "name": "daily usage remains terminal despite an explicit retry signal",
+    "event": "response.failed",
+    "error": {
+      "type": "daily_usage_limit",
+      "message": "Please try again later."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "weekly usage remains terminal despite an explicit retry signal",
+    "event": "response.failed",
+    "error": {
+      "type": "weekly_usage_limit",
+      "message": "Your usage limit resets next week."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "monthly usage remains terminal despite an explicit retry signal",
+    "event": "response.failed",
+    "error": {
+      "type": "monthly_usage_limit",
+      "message": "Your usage limit resets next month."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "hard quota remains terminal despite temporary usage wording",
+    "event": "response.failed",
+    "error": {
+      "type": "quota_exhausted",
+      "message": "Usage limit reached. Please retry later."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "weekly limit remains terminal without generic usage wording",
+    "event": "response.failed",
+    "error": {
+      "type": "weekly_limit_reached",
+      "message": "Please try again after the weekly reset."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "monthly limit remains terminal without generic usage wording",
+    "event": "response.failed",
+    "error": {
+      "type": "monthly_limit_reached",
+      "message": "Please wait for the next reset."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "billing remains terminal despite temporary usage wording",
+    "event": "response.failed",
+    "error": {
+      "type": "billing_limit",
+      "message": "Usage limit reached. Please retry later."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "credit remains terminal despite temporary usage wording",
+    "event": "response.failed",
+    "error": {
+      "type": "insufficient_credit",
+      "message": "Usage limit reached. Please retry later."
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "authentication remains terminal despite temporary usage wording",
+    "event": "response.failed",
+    "error": {
+      "type": "authentication_error",
+      "message": "Usage limit reached. Please try again later."
+    },
+    "expectedCode": "authentication_error"
+  },
+  {
+    "name": "permission remains terminal despite temporary usage wording",
+    "event": "response.failed",
+    "error": {
+      "type": "permission_denied",
+      "message": "Usage limit reached. Please try again later."
+    },
+    "expectedCode": "permission_denied"
+  },
+  {
+    "name": "invalid request remains terminal despite temporary usage wording",
+    "event": "response.failed",
+    "error": {
+      "type": "invalid_request_error",
+      "message": "Usage limit reached. Please try again later."
+    },
+    "expectedCode": "invalid_request_error"
+  },
+  {
+    "name": "cancelled usage admission event remains terminal",
+    "event": "response.cancelled",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "The user cancelled the turn. Usage limit reached. Please try again later."
+    },
+    "expectedCode": "cancelled"
+  },
+  {
     "name": "transient overload remains recoverable",
     "event": "response.failed",
     "error": {

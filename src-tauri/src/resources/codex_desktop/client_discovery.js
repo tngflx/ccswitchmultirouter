@@ -153,6 +153,18 @@ const codexAppServerClientHasCurrentOwner = (client) => {
       }
     }
   }
+  // Family bindings add a direct current node/map/entry boundary. Their owner
+  // callback also proves the exact scope is reachable from current roots, so
+  // a capped full discovery walk cannot retain an unmounted owner.
+  const rpcOwners = state.scopedAppServerRpcClientOwners;
+  if (rpcOwners instanceof Map) {
+    tracked = true;
+    for (const current of rpcOwners.get(client) || []) {
+      try {
+        if (current()) return true;
+      } catch {}
+    }
+  }
   const modules = state.moduleAppServerClientOwners;
   if (modules instanceof Map) {
     tracked = true;
@@ -349,6 +361,300 @@ const codexScopeQueryClient = (scope) => {
     ? client.value || null
     : client.get.call(scope) || null;
 };
+// Codex 26.1106 keeps the live app-server client in a retained family binding
+// instead of exporting the older AppServerRegistry/requestClient shape. The
+// binding value is still a declared ownership boundary: entry.value.current
+// is the current host status and its client owns a RpcPromise-backed `rpc`.
+const codexRpcPromise = (value) => {
+  if (typeof value !== "function") return false;
+  try {
+    if (
+      !["dup", "onRpcBroken", "map"].every((name) =>
+        codexDeclaredMethod(value, name),
+      )
+    )
+      return false;
+    // RpcPromise proxies report a custom string tag through their declared
+    // prototype toString; Object.prototype.toString still sees the function
+    // target in current Desktop builds.
+    const toString = codexDeclaredMethod(value, "toString");
+    const tag =
+      typeof toString === "function" ? String(toString.call(value)) : "";
+    return tag === "[object RpcPromise]" || tag === "[object RpcStub]";
+  } catch {
+    return false;
+  }
+};
+const codexScopedRpcClient = (value) => {
+  if (!value || typeof value !== "object") return null;
+  try {
+    const host = Object.getOwnPropertyDescriptor(value, "hostId");
+    const rpc = Object.getOwnPropertyDescriptor(value, "rpc");
+    if (host?.value !== "local" || !rpc || !("value" in rpc)) return null;
+    if (!codexRpcPromise(rpc.value)) return null;
+    // Reading these proxy properties creates RpcPromise method stubs but does
+    // not send a request. It proves the exact app-server capability before any
+    // wrapper is installed.
+    for (const name of [
+      "sendRequest",
+      "getCompatibleThreadSortKey",
+      "supportsPaginatedThreadHistory",
+    ])
+      if (typeof rpc.value[name] !== "function") return null;
+    return rpc.value;
+  } catch {
+    return null;
+  }
+};
+const codexScopedRpcClientBindings = (scope) => {
+  if (!codexDeclaredDependencyScope(scope)) return [];
+  const node = Object.getOwnPropertyDescriptor(scope, "node")?.value;
+  const familyBindings = Object.getOwnPropertyDescriptor(
+    node || {},
+    "familyBindings",
+  )?.value;
+  if (!(familyBindings instanceof Map)) return [];
+  const result = [];
+  const seen = new Set();
+  try {
+    for (const [familyKey, family] of familyBindings) {
+      if (!(family instanceof Map)) continue;
+      for (const [entryKey, entry] of family) {
+        const value = Object.getOwnPropertyDescriptor(
+          entry || {},
+          "value",
+        )?.value;
+        const current = Object.getOwnPropertyDescriptor(
+          value || {},
+          "current",
+        )?.value;
+        const client = Object.getOwnPropertyDescriptor(
+          current || {},
+          "client",
+        )?.value;
+        const rpc = codexScopedRpcClient(client);
+        if (!rpc || seen.has(client)) continue;
+        seen.add(client);
+        result.push({
+          scope,
+          node,
+          familyBindings,
+          familyKey,
+          client,
+          rpc,
+          family,
+          entryKey,
+          entry,
+        });
+      }
+    }
+  } catch {}
+  return result;
+};
+const codexScopedRpcCurrentClient = (binding) => {
+  try {
+    if (binding.atom) {
+      if (
+        Object.getOwnPropertyDescriptor(binding.scope || {}, "node")?.value !==
+          binding.node ||
+        Object.getOwnPropertyDescriptor(binding.scope, "scope")?.value !==
+          Object.getOwnPropertyDescriptor(binding.atom, "scope")?.value ||
+        !(state.appServerStatusAtoms || []).includes(binding.atom)
+      )
+        return null;
+      const get = Object.getOwnPropertyDescriptor(binding.scope, "get")?.value;
+      if (typeof get !== "function") return null;
+      const status = get.call(binding.scope, binding.atom, "local");
+      const code = Object.getOwnPropertyDescriptor(
+        status || {},
+        "status",
+      )?.value;
+      if (code !== "ready") return null;
+      const client = Object.getOwnPropertyDescriptor(
+        status || {},
+        "client",
+      )?.value;
+      return client === binding.client && codexScopedRpcClient(client)
+        ? client
+        : null;
+    }
+    if (
+      Object.getOwnPropertyDescriptor(binding.scope || {}, "node")?.value !==
+        binding.node ||
+      Object.getOwnPropertyDescriptor(binding.node || {}, "familyBindings")
+        ?.value !== binding.familyBindings ||
+      Map.prototype.get.call(binding.familyBindings, binding.familyKey) !==
+        binding.family ||
+      Map.prototype.get.call(binding.family, binding.entryKey) !== binding.entry
+    )
+      return null;
+    const current = Object.getOwnPropertyDescriptor(
+      Object.getOwnPropertyDescriptor(binding.entry || {}, "value")?.value ||
+        {},
+      "current",
+    )?.value;
+    const client = Object.getOwnPropertyDescriptor(
+      current || {},
+      "client",
+    )?.value;
+    return client === binding.client && codexScopedRpcClient(client)
+      ? client
+      : null;
+  } catch {
+    return null;
+  }
+};
+// Request clients and host providers are plain declared owners. Preflight both
+// data slots before mutating either one; RpcStub proxies themselves are never
+// queried for extensibility or assigned compatibility properties.
+const codexRpcMutationSlot = (owner, key, markerKey) => {
+  try {
+    const field = Object.getOwnPropertyDescriptor(owner, key);
+    const marker = Object.getOwnPropertyDescriptor(owner, markerKey);
+    if (
+      !field ||
+      !("value" in field) ||
+      field.writable !== true ||
+      (marker ? marker.configurable !== true : !Object.isExtensible(owner))
+    )
+      return null;
+    return { field, marker };
+  } catch (error) {
+    recordFailure(error);
+    return null;
+  }
+};
+const restoreCodexRpcMutation = (mutation) => {
+  if (!mutation) return;
+  const { owner, key, markerKey, slot, value, marker } = mutation;
+  try {
+    if (Object.getOwnPropertyDescriptor(owner, key)?.value === value)
+      Object.defineProperty(owner, key, slot.field);
+    if (Object.getOwnPropertyDescriptor(owner, markerKey)?.value === marker) {
+      if (slot.marker) Object.defineProperty(owner, markerKey, slot.marker);
+      else delete owner[markerKey];
+    }
+  } catch (error) {
+    recordFailure(error);
+  }
+};
+const installCodexRpcMutation = (mutation) => {
+  const { owner, key, markerKey, slot, value, marker } = mutation;
+  try {
+    Object.defineProperty(owner, markerKey, {
+      configurable: true,
+      enumerable: false,
+      writable: true,
+      value: marker,
+    });
+    Object.defineProperty(owner, key, { ...slot.field, value });
+    if (
+      Object.getOwnPropertyDescriptor(owner, key)?.value !== value ||
+      Object.getOwnPropertyDescriptor(owner, markerKey)?.value !== marker
+    )
+      throw new Error("Codex RPC owner did not accept its guarded hook");
+    return true;
+  } catch (error) {
+    restoreCodexRpcMutation(mutation);
+    recordFailure(error);
+    return false;
+  }
+};
+const codexScopedRpcFacade = (binding) => {
+  const sourceClient = binding.client;
+  const originalRpc = binding.rpc;
+  let marker;
+  try {
+    marker = Object.getOwnPropertyDescriptor(
+      sourceClient,
+      "__ccSwitchRpcBinding",
+    )?.value;
+  } catch {}
+  if (
+    marker?.source === sourceClient &&
+    marker.wrappedRpc === sourceClient.rpc &&
+    marker.facade &&
+    marker.originalRpc
+  )
+    return {
+      facade: marker.facade,
+      wrappedRpc: marker.wrappedRpc,
+      originalRpc: marker.originalRpc,
+      mutation: null,
+    };
+  const slot = codexRpcMutationSlot(
+    sourceClient,
+    "rpc",
+    "__ccSwitchRpcBinding",
+  );
+  if (!slot) return null;
+  const previousOriginal =
+    marker?.source === sourceClient &&
+    marker.wrappedRpc === sourceClient.rpc &&
+    typeof marker.originalRpc === "function"
+      ? marker.originalRpc
+      : null;
+  const baseRpc = previousOriginal || originalRpc;
+  const facade = {
+    hostId: "local",
+    sendRequest: (...args) => baseRpc.sendRequest(...args),
+    getCompatibleThreadSortKey: (...args) =>
+      baseRpc.getCompatibleThreadSortKey(...args),
+    supportsPaginatedThreadHistory: (...args) =>
+      baseRpc.supportsPaginatedThreadHistory(...args),
+  };
+  Object.defineProperty(facade, "__ccSwitchRpcRequestClient", {
+    configurable: true,
+    enumerable: false,
+    value: true,
+  });
+  const wrappedRpc = new Proxy(baseRpc, {
+    get(target, key) {
+      if (key === "sendRequest")
+        return (...args) => facade.sendRequest(...args);
+      const activityMethods = {
+        startTurn: "turn/start",
+        startTurnWithOutcome: "turn/start",
+        startEmptyTurn: "turn/start",
+        steerTurn: "turn/start",
+        retrySafetyBufferedTurn: "turn/start",
+        sendFollowUpMessage: "turn/start",
+        editLastUserTurn: "thread/revert",
+        stopThread: "turn/interrupt",
+        interruptConversation: "turn/interrupt",
+        interruptConversationWithOutcome: "turn/interrupt",
+        archiveConversation: "thread/archive",
+      };
+      if (
+        typeof key === "string" &&
+        Object.prototype.hasOwnProperty.call(activityMethods, key)
+      )
+        return (...args) => {
+          const first = args[0];
+          const threadId =
+            typeof first === "string"
+              ? first
+              : first && typeof first === "object"
+                ? first.threadId || first.thread_id || first.id
+                : undefined;
+          if (typeof rememberCodexUserTurnAction === "function")
+            rememberCodexUserTurnAction(activityMethods[key], { threadId });
+          return Reflect.get(target, key, target)(...args);
+        };
+      return Reflect.get(target, key, target);
+    },
+  });
+  const mutation = {
+    owner: sourceClient,
+    key: "rpc",
+    markerKey: "__ccSwitchRpcBinding",
+    slot,
+    value: wrappedRpc,
+    marker: { source: sourceClient, originalRpc: baseRpc, wrappedRpc, facade },
+  };
+  if (!installCodexRpcMutation(mutation)) return null;
+  return { facade, wrappedRpc, originalRpc: baseRpc, mutation };
+};
 const codexRendererScopeRootIdentities = () => {
   const roots = [window.__codexRoot?._internalRoot?.current];
   const root = document.getElementById("root");
@@ -359,18 +665,193 @@ const codexRendererScopeRootIdentities = () => {
   }
   return roots.filter(Boolean);
 };
+const codexRendererScopeRootsMatchCurrent = (
+  roots = codexRendererScopeRootIdentities(),
+) => {
+  const previous = state.scopedAppServerRootIdentities;
+  return (
+    Array.isArray(previous) &&
+    roots.length > 0 &&
+    roots.length === previous.length &&
+    roots.every((identity, index) => identity === previous[index]) &&
+    !(state.pendingReactNodes?.size > 0)
+  );
+};
+const codexRendererScopeIsMounted = (scope) => {
+  if (!codexDeclaredDependencyScope(scope)) return false;
+  const node = Object.getOwnPropertyDescriptor(scope, "node")?.value;
+  if (!node) return false;
+  return codexRendererNodeIsMounted(node);
+};
+const codexMountedRetainedScopeCandidates = (candidates) => {
+  const nodes = new Map();
+  for (const scope of candidates || []) {
+    if (!codexDeclaredDependencyScope(scope)) continue;
+    const node = Object.getOwnPropertyDescriptor(scope, "node")?.value;
+    if (!node || nodes.has(node)) continue;
+    nodes.set(node, scope);
+  }
+  const mounted = codexRendererMountedNodes(new Set(nodes.keys()));
+  return Array.from(mounted, (node) => nodes.get(node));
+};
+const codexCurrentAppServerScopeHints = () => {
+  const scopesByBrand = new Map();
+  for (const atom of state.appServerStatusAtoms || []) {
+    const brand = Object.getOwnPropertyDescriptor(atom || {}, "scope")?.value;
+    if (brand) scopesByBrand.set(brand, null);
+  }
+  if (!scopesByBrand.size) return [];
+  const fibers = codexRendererScopeRootIdentities();
+  const seen = new Set();
+  for (
+    let cursor = 0;
+    cursor < fibers.length && seen.size < 25000;
+    cursor += 1
+  ) {
+    const fiber = fibers[cursor];
+    if (!fiber || seen.has(fiber)) continue;
+    seen.add(fiber);
+    for (const key of ["child", "sibling"]) {
+      const next = Object.getOwnPropertyDescriptor(fiber, key)?.value;
+      if (next) fibers.push(next);
+    }
+    const visited = new Set();
+    const values = [
+      "memoizedState",
+      "dependencies",
+      "memoizedProps",
+      "pendingProps",
+    ].map((key) => ({
+      value: Object.getOwnPropertyDescriptor(fiber, key)?.value,
+      depth: 0,
+    }));
+    for (let index = 0; index < values.length && index < 160; index += 1) {
+      const { value, depth } = values[index];
+      if (
+        !value ||
+        typeof value !== "object" ||
+        visited.has(value) ||
+        value === window ||
+        (typeof Node !== "undefined" && value instanceof Node)
+      )
+        continue;
+      visited.add(value);
+      if (codexDeclaredDependencyScope(value)) {
+        const brand = Object.getOwnPropertyDescriptor(value, "scope")?.value;
+        if (scopesByBrand.has(brand) && !scopesByBrand.get(brand))
+          scopesByBrand.set(brand, value);
+        if (Array.from(scopesByBrand.values()).every(Boolean))
+          return Array.from(scopesByBrand.values());
+        continue;
+      }
+      if (depth >= 5) continue;
+      let descriptors = {};
+      try {
+        descriptors = Object.getOwnPropertyDescriptors(value);
+      } catch {}
+      for (const [key, field] of Object.entries(descriptors))
+        if (
+          "value" in field &&
+          ![
+            "return",
+            "child",
+            "sibling",
+            "alternate",
+            "ownerDocument",
+            "parentNode",
+            "parentElement",
+            "window",
+          ].includes(key)
+        )
+          values.push({ value: field.value, depth: depth + 1 });
+    }
+  }
+  return Array.from(scopesByBrand.values()).filter(Boolean);
+};
+const codexRendererNodeIsMounted = (node) => {
+  if (!node || typeof node !== "object") return false;
+  return codexRendererMountedNodes(new Set([node])).has(node);
+};
+const codexRendererMountedNodes = (targets) => {
+  const mounted = new Set();
+  if (!targets.size) return mounted;
+  const fibers = codexRendererScopeRootIdentities();
+  const seenFibers = new Set();
+  for (
+    let cursor = 0;
+    cursor < fibers.length && seenFibers.size < 25000;
+    cursor += 1
+  ) {
+    const fiber = fibers[cursor];
+    if (!fiber || seenFibers.has(fiber)) continue;
+    seenFibers.add(fiber);
+    for (const key of ["child", "sibling"]) {
+      const next = Object.getOwnPropertyDescriptor(fiber, key)?.value;
+      if (next) fibers.push(next);
+    }
+    const seenValues = new Set();
+    const values = [
+      "memoizedState",
+      "dependencies",
+      "memoizedProps",
+      "pendingProps",
+    ].map((key) => ({
+      value: Object.getOwnPropertyDescriptor(fiber, key)?.value,
+      depth: 0,
+    }));
+    for (let index = 0; index < values.length && index < 160; index += 1) {
+      const { value, depth } = values[index];
+      if (targets.has(value)) {
+        mounted.add(value);
+        if (mounted.size === targets.size) return mounted;
+      }
+      if (
+        !value ||
+        typeof value !== "object" ||
+        seenValues.has(value) ||
+        value === window ||
+        (typeof Node !== "undefined" && value instanceof Node)
+      )
+        continue;
+      seenValues.add(value);
+      if (codexDeclaredDependencyScope(value)) {
+        const node = Object.getOwnPropertyDescriptor(value, "node")?.value;
+        if (targets.has(node)) {
+          mounted.add(node);
+          if (mounted.size === targets.size) return mounted;
+        }
+        continue;
+      }
+      if (depth >= 5) continue;
+      let descriptors = {};
+      try {
+        descriptors = Object.getOwnPropertyDescriptors(value);
+      } catch {}
+      for (const [key, descriptor] of Object.entries(descriptors)) {
+        if (
+          "value" in descriptor &&
+          ![
+            "return",
+            "child",
+            "sibling",
+            "alternate",
+            "ownerDocument",
+            "parentNode",
+            "parentElement",
+            "window",
+          ].includes(key)
+        )
+          values.push({ value: descriptor.value, depth: depth + 1 });
+      }
+    }
+  }
+  return mounted;
+};
 const codexRendererScopeSnapshotIsCurrent = (
   roots = codexRendererScopeRootIdentities(),
 ) => {
   if (state.scopedAppServerScopeScanComplete !== true) return false;
-  const previous = state.scopedAppServerRootIdentities;
-  if (
-    !Array.isArray(previous) ||
-    roots.length === 0 ||
-    roots.length !== previous.length ||
-    !roots.every((identity, index) => identity === previous[index])
-  )
-    return false;
+  if (!codexRendererScopeRootsMatchCurrent(roots)) return false;
   // DOM changes can mount new dependency providers before the retained root
   // identity changes. Re-prove ownership before native visibility/continuation.
   return !(state.pendingReactNodes?.size > 0);
@@ -528,6 +1009,25 @@ const refreshCodexScopedAppServerClients = (
   const seenRequestClients = new Set();
   const verifiedRequestClients = new Set();
   const verifiedOwners = new Map();
+  const verifiedRpcOwners = new Map();
+  const scannedRpcNodes = new Set();
+  const canonicalBrands = new Set(
+    (state.appServerStatusAtoms || [])
+      .map(
+        (atom) => Object.getOwnPropertyDescriptor(atom || {}, "scope")?.value,
+      )
+      .filter(Boolean),
+  );
+  const canonicalScopes = Array.from(scopes).filter((scope) =>
+    canonicalBrands.has(
+      Object.getOwnPropertyDescriptor(scope || {}, "scope")?.value,
+    ),
+  );
+  const mountedRpcNodes = new Set(
+    codexMountedRetainedScopeCandidates(canonicalScopes).map(
+      (scope) => Object.getOwnPropertyDescriptor(scope, "node")?.value,
+    ),
+  );
   const retainOwner = (client, scope, registry, lookup) => {
     if (!verifiedOwners.has(client)) verifiedOwners.set(client, []);
     const scopeGet = Object.getOwnPropertyDescriptor(scope, "get")?.value;
@@ -574,6 +1074,199 @@ const refreshCodexScopedAppServerClients = (
         } catch (error) {
           recordFailure(error);
         }
+      }
+    }
+    // Current Desktop builds expose the request path through a family binding
+    // client `{hostId, rpc}`. Install a declared facade and route the exact
+    // live RpcPromise through the existing normalization/activity hook.
+    const rpcNode = Object.getOwnPropertyDescriptor(scope, "node")?.value;
+    const rpcBindings = [];
+    if (!scannedRpcNodes.has(rpcNode) && mountedRpcNodes.has(rpcNode)) {
+      // Older discovery mistook the account service for the manager. Restore
+      // only our exact owned wrapper; account RPC never authorizes a turn.
+      for (const activityBinding of codexScopedRpcClientBindings(scope)) {
+        const account = activityBinding.client;
+        const isCanonical = (state.appServerStatusAtoms || []).some((atom) => {
+          try {
+            const status = Object.getOwnPropertyDescriptor(
+              scope,
+              "get",
+            ).value.call(scope, atom, "local");
+            return (
+              Object.getOwnPropertyDescriptor(status || {}, "client")?.value ===
+              account
+            );
+          } catch {
+            return false;
+          }
+        });
+        if (isCanonical) continue;
+        const marker = Object.getOwnPropertyDescriptor(
+          account,
+          "__ccSwitchRpcBinding",
+        )?.value;
+        if (
+          marker?.source === account &&
+          marker.wrappedRpc === account.rpc &&
+          typeof marker.originalRpc === "function"
+        ) {
+          account.rpc = marker.originalRpc;
+          delete account.__ccSwitchRpcBinding;
+        }
+      }
+      for (const atom of state.appServerStatusAtoms || []) {
+        try {
+          const atomScope = Object.getOwnPropertyDescriptor(
+            atom || {},
+            "scope",
+          )?.value;
+          if (
+            !atomScope ||
+            Object.getOwnPropertyDescriptor(scope, "scope")?.value !== atomScope
+          )
+            continue;
+          const status = Object.getOwnPropertyDescriptor(
+            scope,
+            "get",
+          ).value.call(scope, atom, "local");
+          const statusCode = Object.getOwnPropertyDescriptor(
+            status || {},
+            "status",
+          )?.value;
+          const sourceClient = Object.getOwnPropertyDescriptor(
+            status || {},
+            "client",
+          )?.value;
+          const rpc = codexScopedRpcClient(sourceClient);
+          if (rpc && statusCode === "ready")
+            rpcBindings.push({
+              scope,
+              node: rpcNode,
+              atom,
+              client: sourceClient,
+              rpc,
+            });
+        } catch (error) {
+          recordFailure(error);
+        }
+      }
+    }
+    scannedRpcNodes.add(rpcNode);
+    for (const binding of rpcBindings) {
+      try {
+        if (codexScopedRpcCurrentClient(binding) !== binding.client) continue;
+        const providerBinding = (state.appServerStatusBindings || []).find(
+          (item) => item.atom === binding.atom,
+        );
+        // The host-provider hook observes the same manager capability used by
+        // the composer. A generic RPC facade alone cannot authorize recovery.
+        if (!providerBinding) continue;
+        const get = Object.getOwnPropertyDescriptor(scope, "get")?.value;
+        const provider = get.call(scope, providerBinding.managerToken);
+        const forHost = codexDeclaredMethod(provider, "forHost");
+        const providerSlot = codexRpcMutationSlot(
+          provider,
+          "forHost",
+          "__ccSwitchForHostBinding",
+        );
+        if (!forHost || !providerSlot || providerSlot.field.value !== forHost)
+          continue;
+        const previous = providerSlot.marker?.value;
+        const original =
+          previous?.provider === provider && previous.wrapper === forHost
+            ? previous.original
+            : forHost;
+        const clientMarker = Object.getOwnPropertyDescriptor(
+          binding.client,
+          "__ccSwitchRpcBinding",
+        )?.value;
+        const originalRpc =
+          clientMarker?.source === binding.client &&
+          clientMarker.wrappedRpc === binding.rpc
+            ? clientMarker.originalRpc
+            : binding.rpc;
+        if (original.call(provider, "local") !== originalRpc) continue;
+        const patchedRpc = codexScopedRpcFacade(binding);
+        if (!patchedRpc) continue;
+        const wrapper = function ccSwitchForHost(host, ...args) {
+          const result = original.call(this, host, ...args);
+          if (host === "local" && result === patchedRpc.originalRpc)
+            return patchedRpc.wrappedRpc;
+          return result;
+        };
+        const providerMutation = {
+          owner: provider,
+          key: "forHost",
+          markerKey: "__ccSwitchForHostBinding",
+          slot: providerSlot,
+          value: wrapper,
+          marker: { provider, original, wrapper },
+        };
+        if (!installCodexRpcMutation(providerMutation)) {
+          restoreCodexRpcMutation(patchedRpc.mutation);
+          continue;
+        }
+        binding.provider = provider;
+        binding.providerToken = providerBinding.managerToken;
+        binding.providerOriginal = original;
+        binding.providerWrapper = wrapper;
+        const requestClient = patchedRpc.facade;
+        retainedScopes.add(scope);
+        if (seenRequestClients.has(requestClient)) continue;
+        seenRequestClients.add(requestClient);
+        if (!patchRequestClient(requestClient)) {
+          restoreCodexRpcMutation(providerMutation);
+          restoreCodexRpcMutation(patchedRpc.mutation);
+          continue;
+        }
+        verifiedRequestClients.add(requestClient);
+        if (!verifiedOwners.has(requestClient))
+          verifiedOwners.set(requestClient, []);
+        if (!verifiedRpcOwners.has(requestClient))
+          verifiedRpcOwners.set(requestClient, []);
+        const scopeGet = Object.getOwnPropertyDescriptor(scope, "get")?.value;
+        const isCurrentRpcOwner = () => {
+          if (
+            !codexRendererScopeIsMounted(scope) ||
+            !Set.prototype.has.call(
+              state.scopedAppServerScopeCandidates,
+              scope,
+            ) ||
+            Object.getOwnPropertyDescriptor(scope, "get")?.value !== scopeGet
+          )
+            return false;
+          const current = codexScopedRpcCurrentClient(binding);
+          if (binding.provider) {
+            const provider = Object.getOwnPropertyDescriptor(
+              scope,
+              "get",
+            ).value.call(scope, binding.providerToken);
+            if (
+              provider !== binding.provider ||
+              codexDeclaredMethod(provider, "forHost") !==
+                binding.providerWrapper ||
+              binding.providerOriginal.call(provider, "local") !==
+                patchedRpc.originalRpc
+            )
+              return false;
+          }
+          const marker = Object.getOwnPropertyDescriptor(
+            binding.client,
+            "__ccSwitchRpcBinding",
+          )?.value;
+          return (
+            current === binding.client &&
+            marker?.source === binding.client &&
+            marker.wrappedRpc === binding.client.rpc &&
+            marker.wrappedRpc === patchedRpc.wrappedRpc &&
+            marker.facade === requestClient
+          );
+        };
+        verifiedOwners.get(requestClient).push(isCurrentRpcOwner);
+        verifiedRpcOwners.get(requestClient).push(isCurrentRpcOwner);
+        patched += 1;
+      } catch (error) {
+        recordFailure(error);
       }
     }
     for (const Registry of registries) {
@@ -679,6 +1372,7 @@ const refreshCodexScopedAppServerClients = (
     state.scopedAppServerClientOwners = owners;
   }
   state.scopedAppServerScopes = retainedScopes;
+  state.scopedAppServerRpcClientOwners = verifiedRpcOwners;
   state.scopedAppServerDiscovery = {
     scopeCount: retainedScopes.size,
     registryCount: registries.length,

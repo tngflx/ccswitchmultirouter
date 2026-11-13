@@ -1864,7 +1864,9 @@ describe("CodexFormFields local model routing", () => {
       }),
     );
     await screen.findByRole("button", { name: "Detect again" });
-    expect(screen.queryByLabelText("Provider-native effort max")).toBeNull();
+    expect(
+      screen.getByLabelText("Provider-native effort max"),
+    ).toBeInTheDocument();
     expect(reasoningApiMocks.resolve).toHaveBeenLastCalledWith(
       expect.objectContaining({
         providerName: "Sublyx legacy label",
@@ -1928,7 +1930,7 @@ describe("CodexFormFields local model routing", () => {
   it.each([
     ["inherited maintained overlay", undefined, true],
     [
-      "stale explicit max target",
+      "explicit native max target",
       { enabled: true, providerEffort: "max" as const },
       true,
     ],
@@ -1945,7 +1947,7 @@ describe("CodexFormFields local model routing", () => {
         async (_settings, _provider, requestedModel) => {
           const resolution = createSupportedReasoningResolution(
             requestedModel,
-            ["low", "xhigh"],
+            ["low", "xhigh", "max"],
             "xhigh",
             true,
           );
@@ -1955,7 +1957,12 @@ describe("CodexFormFields local model routing", () => {
             resolved: {
               ...resolution.resolved,
               confidence: "maintained",
-              effortMap: { low: "low", xhigh: "xhigh", ultra: "xhigh" },
+              effortMap: {
+                low: "low",
+                xhigh: "xhigh",
+                max: "max",
+                ultra: "xhigh",
+              },
             },
           };
         },
@@ -1974,16 +1981,21 @@ describe("CodexFormFields local model routing", () => {
       const target = screen.getByRole("combobox", {
         name: `Provider reasoning effort used by ${model} Ultra`,
       });
-      await waitFor(() => expect(target).toHaveValue("xhigh"));
+      const expectedTarget = codexUltra?.providerEffort ?? "xhigh";
+      await waitFor(() => expect(target).toHaveValue(expectedTarget));
       if (enabled) {
         expect(checkbox).toBeChecked();
         expect(target).toBeEnabled();
-        expect(screen.getByText("Unlocked; uses xhigh")).toBeInTheDocument();
+        expect(
+          screen.getByText(`Unlocked; uses ${expectedTarget}`),
+        ).toBeInTheDocument();
       } else {
         expect(checkbox).not.toBeChecked();
         expect(target).toBeDisabled();
       }
-      expect(within(target).queryByRole("option", { name: "max" })).toBeNull();
+      expect(
+        within(target).getByRole("option", { name: "max" }),
+      ).toBeInTheDocument();
       expect(latestCatalog()).toEqual([row]);
     },
   );

@@ -24,7 +24,7 @@ const sublyxCapability: CodexModelReasoningCapability = {
   supportStatus: "confirmed_supported",
   controlKind: "graded",
   // Simulate a catalog row written before the provider-scoped contract was
-  // introduced. The editor must hide and reconcile this stale native max.
+  // introduced. The editor must reconcile the provider-native max mapping.
   supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
   defaultEffort: "xhigh",
   disableAllowed: false,
@@ -503,6 +503,79 @@ describe("CodexModelReasoningEditor", () => {
     expect(screen.getByLabelText("high mapping target")).toBeEnabled();
   });
 
+  it("allows adding native max to an unconfirmed manual Sublyx declaration", () => {
+    const onChange = vi.fn();
+    render(
+      <CodexModelReasoningEditor
+        model="gpt-6.1"
+        providerIdentity={{ baseUrl: "https://api.sublyx.org/v1" }}
+        capability={{ ...qwenCapability, supportStatus: "unknown" }}
+        readOnly={false}
+        onChange={onChange}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Add native provider level"), {
+      target: { value: "max" },
+    });
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "user",
+        supportStatus: "unknown",
+        supportedEfforts: ["low", "medium", "high", "max"],
+        upstream: expect.objectContaining({
+          effortMap: { low: "low", medium: "medium", high: "high", max: "max" },
+        }),
+      }),
+    );
+  });
+
+  it("keeps explicit Sublyx effort subsets editable and preserves their native max target", () => {
+    const onChange = vi.fn();
+    render(
+      <CodexModelReasoningEditor
+        model="gpt-6.1"
+        providerIdentity={{ baseUrl: "https://api.sublyx.org/v1" }}
+        capability={{
+          ...qwenCapability,
+          supportedEfforts: ["low", "high", "max"],
+          defaultEffort: "max",
+          upstream: {
+            format: "reasoning_object",
+            parameter: "reasoning.effort",
+            effortMap: { low: "low", high: "high", max: "max" },
+          },
+          codexUltraOrchestration: { enabled: true, providerEffort: "max" },
+        }}
+        readOnly={false}
+        onChange={onChange}
+      />,
+    );
+
+    expect(screen.getByLabelText("Provider-native effort max")).toBeEnabled();
+    expect(screen.queryByLabelText("Provider-native effort medium")).toBeNull();
+    expect(screen.queryByLabelText("Provider-native effort xhigh")).toBeNull();
+    expect(screen.getByLabelText("max mapping target")).toBeEnabled();
+    expect(
+      screen.getByLabelText("gpt-6.1 upstream parameter format"),
+    ).toBeEnabled();
+    fireEvent.change(screen.getByLabelText("gpt-6.1 provider default effort"), {
+      target: { value: "high" },
+    });
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        supportedEfforts: ["low", "high", "max"],
+        defaultEffort: "high",
+        upstream: {
+          format: "reasoning_object",
+          parameter: "reasoning.effort",
+          effortMap: { low: "low", high: "high", max: "max" },
+        },
+        codexUltraOrchestration: { enabled: true, providerEffort: "max" },
+      }),
+    );
+  });
+
   it("keeps Sublyx max provider-scoped and exposes Ultra as xhigh", () => {
     const onChange = vi.fn();
     render(
@@ -514,8 +587,10 @@ describe("CodexModelReasoningEditor", () => {
       />,
     );
 
-    expect(screen.queryByLabelText("Provider-native effort max")).toBeNull();
-    expect(screen.queryByLabelText("max mapping target")).toBeNull();
+    expect(
+      screen.getByLabelText("Provider-native effort max"),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("max mapping target")).toHaveValue("max");
     expect(
       screen.getByLabelText("gpt-6.1-sol-sublyx provider default effort"),
     ).not.toHaveValue("max");
@@ -536,14 +611,14 @@ describe("CodexModelReasoningEditor", () => {
       expect.objectContaining({
         source: "user",
         providerKey: "sublyx",
-        supportedEfforts: ["low", "medium", "high", "xhigh"],
+        supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
         defaultEffort: "xhigh",
         codexUltraOrchestration: {
           enabled: true,
           providerEffort: "xhigh",
         },
         upstream: expect.objectContaining({
-          effortMap: expect.not.objectContaining({ max: expect.anything() }),
+          effortMap: expect.objectContaining({ max: "max" }),
         }),
       }),
     );
@@ -588,7 +663,7 @@ describe("CodexModelReasoningEditor", () => {
       providerKey: "sublyx",
     },
   ])(
-    "normalizes stale manual Sublyx GPT metadata using $label",
+    "preserves current manual Sublyx GPT max metadata using $label",
     ({ providerIdentity, providerKey }) => {
       const onChange = vi.fn();
       render(
@@ -606,10 +681,12 @@ describe("CodexModelReasoningEditor", () => {
           onChange={onChange}
         />,
       );
-      expect(screen.queryByLabelText("Provider-native effort max")).toBeNull();
+      expect(
+        screen.getByLabelText("Provider-native effort max"),
+      ).toBeInTheDocument();
       expect(
         screen.getByLabelText("gpt-6.1 provider default effort"),
-      ).toHaveValue("xhigh");
+      ).toHaveValue("max");
       fireEvent.change(
         screen.getByLabelText("gpt-6.1 provider default effort"),
         { target: { value: "high" } },
@@ -619,11 +696,11 @@ describe("CodexModelReasoningEditor", () => {
         source: "user",
         providerKey: "sublyx",
         defaultEffort: "high",
-        codexUltraOrchestration: { enabled: true, providerEffort: "xhigh" },
+        codexUltraOrchestration: { enabled: true, providerEffort: "max" },
       });
-      expect(next.supportedEfforts).not.toContain("max");
-      expect(next.upstream.effortMap).not.toHaveProperty("max");
-      expect(Object.values(next.upstream.effortMap)).not.toContain("max");
+      expect(next.supportedEfforts).toContain("max");
+      expect(next.upstream.effortMap).toHaveProperty("max", "max");
+      expect(Object.values(next.upstream.effortMap)).toContain("max");
     },
   );
 
@@ -700,7 +777,9 @@ describe("CodexModelReasoningEditor", () => {
         onChange={vi.fn()}
       />,
     );
-    expect(screen.queryByLabelText("Provider-native effort max")).toBeNull();
+    expect(
+      screen.getByLabelText("Provider-native effort max"),
+    ).toBeInTheDocument();
   });
 
   it("does not apply the GPT contract to a GPT-looking public alias for a non-GPT wire model", () => {

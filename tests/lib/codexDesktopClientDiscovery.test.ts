@@ -20,6 +20,8 @@ type Scope = {
   readonly queryClient: QueryClient;
 };
 type State = {
+  appServerStatusAtoms?: object[];
+  appServerStatusBindings?: { atom: object; managerToken: object }[];
   appServerClients?: object[];
   scopedAppServerClientSet?: Set<object>;
   scopedAppServerScopes?: Set<Scope>;
@@ -53,6 +55,7 @@ const createHarness = (
     return true;
   });
   const recordFailure = vi.fn();
+  const rememberCodexUserTurnAction = vi.fn();
   const api = new Function(
     "state",
     "window",
@@ -64,7 +67,8 @@ const createHarness = (
     "monotonicNow",
     "yieldReactDiscovery",
     "installationIsCurrent",
-    `${discoveryCore}\nreturn { patchAppServerModuleClients, patchCodexScopedAppServerClients, codexDeclaredDependencyScope, codexScopeQueryClient, codexQueryObserverPrototype };`,
+    "rememberCodexUserTurnAction",
+    `${discoveryCore}\nreturn { patchAppServerModuleClients, patchCodexScopedAppServerClients, refreshCodexScopedAppServerClients, codexAppServerClientHasCurrentOwner, codexDeclaredDependencyScope, codexScopeQueryClient, codexQueryObserverPrototype };`,
   )(
     state,
     window,
@@ -76,9 +80,16 @@ const createHarness = (
     () => 0,
     lifecycle.yieldDiscovery ?? (async () => {}),
     lifecycle.isCurrent ?? (() => true),
+    rememberCodexUserTurnAction,
   ) as {
     patchAppServerModuleClients: (module: object) => number;
     patchCodexScopedAppServerClients: (module: object) => Promise<number>;
+    refreshCodexScopedAppServerClients: (
+      scopes: Scope[],
+      registries?: object[],
+      patchedCaches?: Set<object>,
+    ) => number;
+    codexAppServerClientHasCurrentOwner: (client: object) => boolean;
     codexDeclaredDependencyScope: (value: unknown) => boolean;
     codexScopeQueryClient: (value: object) => QueryClient | null;
     codexQueryObserverPrototype: (value: unknown) => object | null;
@@ -90,6 +101,7 @@ const createHarness = (
     patchPrototype,
     patchRequest,
     recordFailure,
+    rememberCodexUserTurnAction,
   };
 };
 
@@ -520,7 +532,7 @@ describe("Codex Desktop declared client discovery", () => {
       get: (hostId: string) => (hostId === "local" ? manager : null),
     };
     const stale = { id: "stale" };
-    const root = {};
+    const root = { memoizedState: { scope } };
     const harness = createHarness(
       {
         appServerClients: [stale],
@@ -652,6 +664,241 @@ describe("Codex Desktop declared client discovery", () => {
     } finally {
       first.clear();
       second.clear();
+    }
+  });
+
+  it("adapts the current family-bound RpcPromise and routes app calls through the hook", async () => {
+    const rawSendRequest = vi.fn(async (...args: unknown[]) => ({ args }));
+    const hook = vi.fn();
+    const rpcBase = {
+      dup() {},
+      onRpcBroken() {},
+      map() {},
+      toString() {
+        return "[object RpcPromise]";
+      },
+    };
+    const rpcPrototype = Object.create(rpcBase);
+    const rpc = function rpcPromise() {};
+    Object.setPrototypeOf(rpc, rpcPrototype);
+    Object.assign(rpc, {
+      sendRequest: rawSendRequest,
+      getCompatibleThreadSortKey: () => "sort",
+      supportsPaginatedThreadHistory: () => true,
+      startTurn: vi.fn(async (...args: unknown[]) => ({ args })),
+      retrySafetyBufferedTurn: vi.fn(async (...args: unknown[]) => ({ args })),
+      interruptConversation: vi.fn(async (...args: unknown[]) => ({ args })),
+    });
+    const sourceClient = { hostId: "local", rpc };
+    const scope = createScope(new QueryClient());
+    const atomScope = {};
+    const statusAtom = { scope: atomScope };
+    Object.assign(scope, { scope: atomScope });
+    const managerToken = {};
+    const provider = {
+      forHost: (host: string) => (host === "local" ? rpc : "remote-rpc"),
+    };
+    scope.get = (token: unknown) =>
+      token === managerToken
+        ? provider
+        : { status: "ready", client: sourceClient };
+    const entry = { value: { current: { client: sourceClient } } };
+    const familyBindings = new Map([
+      ["app-server", new Map([["local", entry]])],
+    ]);
+    scope.node.familyBindings = familyBindings;
+    const root: Record<string, unknown> = { memoizedState: { scope } };
+    const testWindow = { __codexRoot: { _internalRoot: { current: root } } };
+    const harness = createHarness(
+      {
+        appServerStatusAtoms: [statusAtom],
+        appServerStatusBindings: [{ atom: statusAtom, managerToken }],
+        scopedAppServerScopeCandidates: new Set([scope]),
+        scopedAppServerScopeScanComplete: true,
+        scopedAppServerRootIdentities: [root],
+      },
+      testWindow,
+    );
+    harness.patchRequest.mockImplementation((client: object) => {
+      const original = (
+        client as { sendRequest: (...args: unknown[]) => unknown }
+      ).sendRequest;
+      (client as { sendRequest: (...args: unknown[]) => unknown }).sendRequest =
+        (...args: unknown[]) => {
+          hook(...args);
+          return original(...args);
+        };
+      harness.state.appServerClients = harness.state.appServerClients ?? [];
+      harness.state.appServerClients.push(client);
+      return true;
+    });
+    try {
+      expect(harness.api.refreshCodexScopedAppServerClients([scope])).toBe(1);
+      await (
+        sourceClient.rpc as unknown as {
+          sendRequest: (...args: unknown[]) => Promise<unknown>;
+        }
+      ).sendRequest("thread/read", { threadId: "x" });
+      expect(rawSendRequest).toHaveBeenCalledWith("thread/read", {
+        threadId: "x",
+      });
+      expect(hook).toHaveBeenCalledWith("thread/read", { threadId: "x" });
+      await (
+        sourceClient.rpc as unknown as {
+          startTurn: (threadId: string) => Promise<unknown>;
+        }
+      ).startTurn("thread-1");
+      expect(harness.rememberCodexUserTurnAction).toHaveBeenCalledWith(
+        "turn/start",
+        { threadId: "thread-1" },
+      );
+      await (
+        sourceClient.rpc as unknown as {
+          retrySafetyBufferedTurn: (params: {
+            threadId: string;
+          }) => Promise<unknown>;
+        }
+      ).retrySafetyBufferedTurn({ threadId: "thread-2" });
+      expect(harness.rememberCodexUserTurnAction).toHaveBeenCalledWith(
+        "turn/start",
+        { threadId: "thread-2" },
+      );
+      await (
+        sourceClient.rpc as unknown as {
+          interruptConversation: (threadId: string) => Promise<unknown>;
+        }
+      ).interruptConversation("thread-3");
+      expect(harness.rememberCodexUserTurnAction).toHaveBeenCalledWith(
+        "turn/interrupt",
+        { threadId: "thread-3" },
+      );
+      expect(provider.forHost("remote")).toBe("remote-rpc");
+      await (
+        provider.forHost("local") as unknown as {
+          startTurn: (id: string) => Promise<unknown>;
+        }
+      ).startTurn("via-provider");
+      expect(harness.rememberCodexUserTurnAction).toHaveBeenCalledWith(
+        "turn/start",
+        { threadId: "via-provider" },
+      );
+      expect(harness.state.appServerClients).toHaveLength(1);
+      const alias = createScope(scope.queryClient);
+      alias.node = scope.node;
+      harness.state.scopedAppServerScopeCandidates?.add(alias);
+      harness.patchRequest.mockClear();
+      expect(
+        harness.api.refreshCodexScopedAppServerClients([scope, alias]),
+      ).toBe(1);
+      expect(harness.patchRequest).toHaveBeenCalledTimes(1);
+      const ownedClient = harness.state.appServerClients?.[0];
+      if (!ownedClient)
+        throw new Error("Expected discovered app-server client");
+      expect(harness.api.codexAppServerClientHasCurrentOwner(ownedClient)).toBe(
+        true,
+      );
+      harness.state.scopedAppServerScopeScanComplete = false;
+      expect(harness.api.codexAppServerClientHasCurrentOwner(ownedClient)).toBe(
+        true,
+      );
+      testWindow.__codexRoot._internalRoot.current = {};
+      expect(harness.api.codexAppServerClientHasCurrentOwner(ownedClient)).toBe(
+        false,
+      );
+      testWindow.__codexRoot._internalRoot.current = root;
+      harness.state.scopedAppServerScopeScanComplete = true;
+      sourceClient.hostId = "durable";
+      expect(harness.api.codexAppServerClientHasCurrentOwner(ownedClient)).toBe(
+        false,
+      );
+      sourceClient.hostId = "local";
+      scope.get = () => null;
+      expect(harness.api.codexAppServerClientHasCurrentOwner(ownedClient)).toBe(
+        false,
+      );
+    } finally {
+      scope.queryClient.clear();
+    }
+  });
+
+  it.each([
+    "nonextensible_client",
+    "nonextensible_provider",
+    "client_write_rejected",
+    "provider_write_rejected",
+    "missing_provider_binding",
+  ] as const)("leaves both RPC owners unchanged when %s", (failure) => {
+    const rpc = Object.assign(function rpcStub() {}, {
+      sendRequest: vi.fn(),
+      getCompatibleThreadSortKey() {},
+      supportsPaginatedThreadHistory() {},
+    });
+    Object.setPrototypeOf(rpc, {
+      dup() {},
+      onRpcBroken() {},
+      map() {},
+      toString: () => "[object RpcStub]",
+    });
+    const rawClient = { hostId: "local", rpc };
+    const sourceClient =
+      failure === "client_write_rejected"
+        ? new Proxy(rawClient, {
+            defineProperty(target, key, descriptor) {
+              if (key === "rpc") throw new Error("RPC assignment rejected");
+              return Reflect.defineProperty(target, key, descriptor);
+            },
+          })
+        : rawClient;
+    const originalForHost = (host: string) =>
+      host === "local" ? rpc : "remote-rpc";
+    const rawProvider = { forHost: originalForHost };
+    const provider =
+      failure === "provider_write_rejected"
+        ? new Proxy(rawProvider, {
+            defineProperty(target, key, descriptor) {
+              if (key === "forHost")
+                throw new Error("Host assignment rejected");
+              return Reflect.defineProperty(target, key, descriptor);
+            },
+          })
+        : rawProvider;
+    if (failure === "nonextensible_client")
+      Object.preventExtensions(sourceClient);
+    if (failure === "nonextensible_provider")
+      Object.preventExtensions(provider);
+    const scope = createScope(new QueryClient());
+    const atomScope = {};
+    const atom = { scope: atomScope };
+    const managerToken = {};
+    Object.assign(scope, { scope: atomScope });
+    scope.get = (token: unknown) =>
+      token === managerToken
+        ? provider
+        : { status: "ready", client: sourceClient };
+    const root = { memoizedState: { scope } };
+    const harness = createHarness(
+      {
+        appServerStatusAtoms: [atom],
+        appServerStatusBindings:
+          failure === "missing_provider_binding"
+            ? []
+            : [{ atom, managerToken }],
+        scopedAppServerScopeCandidates: new Set([scope]),
+      },
+      { __codexRoot: { _internalRoot: { current: root } } },
+    );
+    try {
+      for (let pass = 0; pass < 2; pass += 1) {
+        expect(harness.api.refreshCodexScopedAppServerClients([scope])).toBe(0);
+        expect(sourceClient.rpc).toBe(rpc);
+        expect(provider.forHost).toBe(originalForHost);
+        expect(sourceClient).not.toHaveProperty("__ccSwitchRpcBinding");
+        expect(provider).not.toHaveProperty("__ccSwitchForHostBinding");
+      }
+      expect(harness.patchRequest).not.toHaveBeenCalled();
+      expect(rawClient.rpc.sendRequest).not.toHaveBeenCalled();
+    } finally {
+      scope.queryClient.clear();
     }
   });
 });

@@ -1,0 +1,621 @@
+{
+  "schemaVersion": 1,
+  "audit": "StreamRetry and Codex Desktop continuation",
+  "date": "2026-11-13",
+  "summary": {
+    "runCount": 17,
+    "successfulRunCount": 5,
+    "failedRunCount": 12
+  },
+  "latestSuccessfulRuns": {
+    "overload": "run-12",
+    "concurrent_limit": "run-13",
+    "temporary_usage": "run-17",
+    "connection_drop": "run-15"
+  },
+  "observations": {
+    "nativeStreamRetryRun": "run-11"
+  },
+  "receiptScopeNote": "Original receipts are preserved verbatim as parsed JSON. Older existingThreadsTouched:false fields describe direct fixture operations; full source-runtime injection may refresh existing model/history caches. See the companion Markdown audit for runtime boundaries.",
+  "runs": [
+    {
+      "id": "run-01",
+      "sourceFile": "2026-11-13-streamretry-desktop-live.json",
+      "receipt": {
+        "verified": false,
+        "desktopCdpVerified": false,
+        "stage": "readiness",
+        "failure": "desktop_bridge_not_ready",
+        "readinessBlocker": "renderer_runtime_fingerprint_mismatch",
+        "readinessDiagnostics": {
+          "appServerPatchInstalled": false,
+          "appServerClientCount": 0,
+          "scopedScopeCount": 1,
+          "scopedRegistryCount": 0,
+          "scopedClientCount": 0,
+          "scopedQueryClientCount": 1,
+          "scopedAppServerScopeScanComplete": true,
+          "pendingReactNodeCount": 0,
+          "webpackRuntimeCount": 1,
+          "webpackModuleCount": 9499,
+          "webpackCandidateCount": 32768,
+          "webpackDiscoveryTruncated": true,
+          "failureCount": 1,
+          "failureKinds": ["asset_not_found"]
+        },
+        "sourceRuntimeInjection": {
+          "started": true,
+          "sourceFingerprint": "sha256-029c2b091d442c58ac118987dd0327097aef3510c489c320eb9d75504633a377",
+          "payloadPreserved": true,
+          "requestHealthWarningsSuppressed": true
+        },
+        "temporaryDurableTestThread": false,
+        "existingThreadsTouched": false,
+        "verifiedAtUtc": "2026-11-13T12:13:43.470Z"
+      }
+    },
+    {
+      "id": "run-02",
+      "sourceFile": "2026-11-13-streamretry-desktop-continue.json",
+      "receipt": {
+        "verified": false,
+        "desktopCdpVerified": false,
+        "stage": "readiness",
+        "failure": "desktop_bridge_not_ready",
+        "readinessBlocker": "renderer_runtime_fingerprint_mismatch",
+        "readinessDiagnostics": {
+          "appServerPatchInstalled": false,
+          "appServerClientCount": 0,
+          "scopedScopeCount": 1,
+          "scopedRegistryCount": 0,
+          "scopedClientCount": 0,
+          "scopedQueryClientCount": 1,
+          "scopedAppServerScopeScanComplete": true,
+          "pendingReactNodeCount": 0,
+          "webpackRuntimeCount": 1,
+          "webpackModuleCount": 9499,
+          "webpackCandidateCount": 32768,
+          "webpackDiscoveryTruncated": true,
+          "failureCount": 1,
+          "failureKinds": ["asset_not_found"]
+        },
+        "temporaryDurableTestThread": false,
+        "existingThreadsTouched": false,
+        "verifiedAtUtc": "2026-11-13T12:25:51.330Z"
+      }
+    },
+    {
+      "id": "run-03",
+      "sourceFile": "2026-11-13-streamretry-desktop-live-v2.json",
+      "receipt": {
+        "verified": false,
+        "desktopCdpVerified": false,
+        "stage": "create_test_thread",
+        "failure": "renderer_operation_rejected",
+        "readinessDiagnostics": {
+          "appServerPatchInstalled": true,
+          "appServerClientCount": 1,
+          "scopedScopeCount": 1,
+          "scopedRegistryCount": 0,
+          "scopedClientCount": 1,
+          "scopedQueryClientCount": 1,
+          "scopedAppServerScopeScanComplete": false,
+          "pendingReactNodeCount": 0,
+          "webpackRuntimeCount": 0,
+          "webpackModuleCount": 0,
+          "webpackCandidateCount": 0,
+          "webpackDiscoveryTruncated": false,
+          "failureCount": 1,
+          "failureKinds": ["asset_not_found"]
+        },
+        "sourceRuntimeInjection": {
+          "started": true,
+          "sourceFingerprint": "sha256-c9e418fa6dca00666a0112ef4a74aad748728670ebd734438a026fbe0c5b8d89",
+          "payloadPreserved": true,
+          "requestHealthWarningsSuppressed": true
+        },
+        "temporaryDurableTestThread": false,
+        "existingThreadsTouched": false,
+        "cleanupArchived": false,
+        "verifiedAtUtc": "2026-11-13T12:29:38.174Z"
+      }
+    },
+    {
+      "id": "run-04",
+      "sourceFile": "2026-11-13-streamretry-desktop-live-v3.json",
+      "receipt": {
+        "verified": false,
+        "desktopCdpVerified": false,
+        "stage": "create_test_thread",
+        "failure": "renderer_operation_rejected",
+        "rendererOperationFailure": {
+          "stage": "create_test_thread",
+          "reason": "unclassified"
+        },
+        "readinessDiagnostics": {
+          "installedRuntimeFingerprint": "sha256-01bf114d16918305bfebd44ff5fbb8f7e25f17511bdebc34493d869a669d6b7f",
+          "expectedRuntimeFingerprint": "sha256-01bf114d16918305bfebd44ff5fbb8f7e25f17511bdebc34493d869a669d6b7f",
+          "appServerPatchInstalled": true,
+          "appServerClientCount": 1,
+          "scopedScopeCount": 1,
+          "scopedRegistryCount": 0,
+          "scopedClientCount": 1,
+          "scopedQueryClientCount": 1,
+          "scopedAppServerScopeScanComplete": false,
+          "pendingReactNodeCount": 0,
+          "webpackRuntimeCount": 1,
+          "webpackModuleCount": 9499,
+          "webpackCandidateCount": 32768,
+          "webpackDiscoveryTruncated": true,
+          "failureCount": 1,
+          "failureKinds": ["asset_not_found"]
+        },
+        "sourceRuntimeInjection": {
+          "started": true,
+          "sourceFingerprint": "sha256-01bf114d16918305bfebd44ff5fbb8f7e25f17511bdebc34493d869a669d6b7f",
+          "payloadPreserved": true,
+          "requestHealthWarningsSuppressed": true
+        },
+        "temporaryDurableTestThread": false,
+        "existingThreadsTouched": false,
+        "cleanupArchived": false,
+        "verifiedAtUtc": "2026-11-13T12:33:17.697Z"
+      }
+    },
+    {
+      "id": "run-05",
+      "sourceFile": "2026-11-13-streamretry-desktop-live-v4.json",
+      "receipt": {
+        "verified": false,
+        "desktopCdpVerified": false,
+        "stage": "readiness",
+        "failure": "desktop_bridge_not_ready",
+        "readinessBlocker": "source_runtime_injection_failed",
+        "sourceRuntimeInjection": {
+          "started": false,
+          "reason": "cdp_command_timeout"
+        },
+        "temporaryDurableTestThread": false,
+        "existingThreadsTouched": false,
+        "verifiedAtUtc": "2026-11-13T12:45:14.053Z"
+      }
+    },
+    {
+      "id": "run-06",
+      "sourceFile": "2026-11-13-streamretry-desktop-live-v5.json",
+      "receipt": {
+        "verified": false,
+        "desktopCdpVerified": false,
+        "stage": "readiness",
+        "failure": "desktop_bridge_not_ready",
+        "readinessBlocker": "renderer_runtime_fingerprint_mismatch",
+        "readinessDiagnostics": {
+          "installedRuntimeFingerprint": "sha256-b264570e710ef46ea67a41362dc3934ca9e3a91ff72f4fa652b157e0598c09e5",
+          "expectedRuntimeFingerprint": "sha256-fbcbe08e85351b7549568ff060e3a4245a8c23ed38060574c5e39ccc265fd7d5",
+          "runtimeGeneration": 19,
+          "appServerPatchInstalled": false,
+          "appServerClientCount": 0,
+          "scopedScopeCount": 0,
+          "scopedRegistryCount": 0,
+          "scopedClientCount": 0,
+          "scopedQueryClientCount": 0,
+          "scopedAppServerScopeScanComplete": false,
+          "pendingReactNodeCount": 0,
+          "webpackRuntimeCount": 1,
+          "webpackModuleCount": 9499,
+          "webpackCandidateCount": 32768,
+          "webpackDiscoveryTruncated": true,
+          "failureCount": 1,
+          "failureKinds": ["asset_not_found"]
+        },
+        "sourceRuntimeInjection": {
+          "started": true,
+          "sourceFingerprint": "sha256-fbcbe08e85351b7549568ff060e3a4245a8c23ed38060574c5e39ccc265fd7d5",
+          "payloadPreserved": true,
+          "requestHealthWarningsSuppressed": true
+        },
+        "temporaryDurableTestThread": false,
+        "existingThreadsTouched": false,
+        "verifiedAtUtc": "2026-11-13T12:49:24.912Z"
+      }
+    },
+    {
+      "id": "run-07",
+      "sourceFile": "2026-11-13-streamretry-desktop-live-v6.json",
+      "receipt": {
+        "verified": false,
+        "desktopCdpVerified": false,
+        "stage": "readiness",
+        "failure": "desktop_bridge_not_ready",
+        "readinessBlocker": "renderer_runtime_fingerprint_mismatch",
+        "readinessDiagnostics": {
+          "installedRuntimeFingerprint": "sha256-b264570e710ef46ea67a41362dc3934ca9e3a91ff72f4fa652b157e0598c09e5",
+          "expectedRuntimeFingerprint": "sha256-0cc15d5ab78818675e62eae720f01ec726e2406a194d64a01a1c06a0573a7699",
+          "runtimeGeneration": 21,
+          "appServerPatchInstalled": false,
+          "appServerClientCount": 0,
+          "scopedScopeCount": 0,
+          "scopedRegistryCount": 0,
+          "scopedClientCount": 0,
+          "scopedQueryClientCount": 0,
+          "scopedAppServerScopeScanComplete": false,
+          "pendingReactNodeCount": 0,
+          "webpackRuntimeCount": 1,
+          "webpackModuleCount": 9499,
+          "webpackCandidateCount": 32768,
+          "webpackDiscoveryTruncated": true,
+          "failureCount": 1,
+          "failureKinds": ["asset_not_found"]
+        },
+        "temporaryDurableTestThread": false,
+        "existingThreadsTouched": false,
+        "verifiedAtUtc": "2026-11-13T12:50:52.598Z"
+      }
+    },
+    {
+      "id": "run-08",
+      "sourceFile": "2026-11-13-streamretry-desktop-live-v8.json",
+      "receipt": {
+        "verified": false,
+        "desktopCdpVerified": false,
+        "stage": "initial_overload",
+        "failure": "renderer_operation_rejected",
+        "rendererOperationFailure": {
+          "stage": "initial_overload",
+          "reason": "unclassified"
+        },
+        "readinessDiagnostics": {
+          "installedRuntimeFingerprint": "sha256-fc1b2f8e690024aacee8ac473f4432bfe1accb09a3a6fdbd52e4047ce69cd5e7",
+          "expectedRuntimeFingerprint": "sha256-fc1b2f8e690024aacee8ac473f4432bfe1accb09a3a6fdbd52e4047ce69cd5e7",
+          "runtimeGeneration": 26,
+          "appServerPatchInstalled": true,
+          "appServerClientCount": 1,
+          "scopedScopeCount": 1,
+          "scopedRegistryCount": 0,
+          "scopedClientCount": 1,
+          "scopedQueryClientCount": 1,
+          "scopedAppServerScopeScanComplete": false,
+          "pendingReactNodeCount": 0,
+          "webpackRuntimeCount": 1,
+          "webpackModuleCount": 9499,
+          "webpackCandidateCount": 32768,
+          "webpackDiscoveryTruncated": true,
+          "failureCount": 1,
+          "failureKinds": ["asset_not_found"]
+        },
+        "sourceRuntimeInjection": {
+          "started": true,
+          "sourceFingerprint": "sha256-fc1b2f8e690024aacee8ac473f4432bfe1accb09a3a6fdbd52e4047ce69cd5e7",
+          "payloadPreserved": true,
+          "requestHealthWarningsSuppressed": true
+        },
+        "temporaryDurableTestThread": true,
+        "existingThreadsTouched": false,
+        "cleanupArchived": false,
+        "cleanupFailure": "disposable_thread_not_archived",
+        "pendingDirectory": true,
+        "cleanupPending": "temporary_directory_thread_uncertain",
+        "verifiedAtUtc": "2026-11-13T12:56:47.175Z"
+      }
+    },
+    {
+      "id": "run-09",
+      "sourceFile": "2026-11-13-streamretry-desktop-live-v9.json",
+      "receipt": {
+        "verified": false,
+        "desktopCdpVerified": false,
+        "stage": "readiness",
+        "failure": "desktop_bridge_not_ready",
+        "readinessBlocker": "source_runtime_injection_failed",
+        "sourceRuntimeInjection": {
+          "started": false,
+          "reason": "cdp_command_timeout"
+        },
+        "temporaryDurableTestThread": false,
+        "existingThreadsTouched": false,
+        "verifiedAtUtc": "2026-11-13T13:01:40.847Z"
+      }
+    },
+    {
+      "id": "run-10",
+      "sourceFile": "2026-11-13-streamretry-desktop-live-v10.json",
+      "receipt": {
+        "verified": false,
+        "desktopCdpVerified": false,
+        "stage": "initial_overload",
+        "failure": "verification_assertion_failed",
+        "readinessDiagnostics": {
+          "installedRuntimeFingerprint": "sha256-222fef1b204f608d79194f7d243e55f42f5ad91481c3a50f641d736afd58b30f",
+          "expectedRuntimeFingerprint": "sha256-222fef1b204f608d79194f7d243e55f42f5ad91481c3a50f641d736afd58b30f",
+          "runtimeGeneration": 38,
+          "appServerPatchInstalled": true,
+          "appServerClientCount": 1,
+          "scopedScopeCount": 1,
+          "scopedRegistryCount": 0,
+          "scopedClientCount": 1,
+          "scopedQueryClientCount": 1,
+          "scopedAppServerScopeScanComplete": false,
+          "pendingReactNodeCount": 6,
+          "webpackRuntimeCount": 1,
+          "webpackModuleCount": 9499,
+          "webpackCandidateCount": 32768,
+          "webpackDiscoveryTruncated": true,
+          "failureCount": 1,
+          "failureKinds": ["asset_not_found"]
+        },
+        "sourceRuntimeInjection": {
+          "started": true,
+          "sourceFingerprint": "sha256-222fef1b204f608d79194f7d243e55f42f5ad91481c3a50f641d736afd58b30f",
+          "payloadPreserved": true,
+          "requestHealthWarningsSuppressed": true,
+          "reinjectionCount": 1,
+          "reprepareCount": 0
+        },
+        "temporaryDurableTestThread": true,
+        "existingThreadsTouched": false,
+        "cleanupArchived": true,
+        "verifiedAtUtc": "2026-11-13T13:04:42.847Z"
+      }
+    },
+    {
+      "id": "run-11",
+      "sourceFile": "2026-11-13-streamretry-desktop-live-v11.json",
+      "receipt": {
+        "verified": false,
+        "desktopCdpVerified": false,
+        "stage": "initial_fixture_request_count",
+        "failure": "verification_assertion_failed",
+        "initialTurnDiagnostics": {
+          "turnId": "01a1d509-78ff-7700-9656-ab6b62eeac77",
+          "threadMatches": true,
+          "responseType": "object",
+          "responseKeys": ["turn"],
+          "turnStatus": "inProgress"
+        },
+        "initialRequests": 6,
+        "continuedRequests": 0,
+        "readinessDiagnostics": {
+          "installedRuntimeFingerprint": "sha256-222fef1b204f608d79194f7d243e55f42f5ad91481c3a50f641d736afd58b30f",
+          "expectedRuntimeFingerprint": "sha256-222fef1b204f608d79194f7d243e55f42f5ad91481c3a50f641d736afd58b30f",
+          "runtimeGeneration": 47,
+          "appServerPatchInstalled": true,
+          "appServerClientCount": 1,
+          "scopedScopeCount": 1,
+          "scopedRegistryCount": 0,
+          "scopedClientCount": 1,
+          "scopedQueryClientCount": 1,
+          "scopedAppServerScopeScanComplete": false,
+          "pendingReactNodeCount": 3,
+          "webpackRuntimeCount": 1,
+          "webpackModuleCount": 9510,
+          "webpackCandidateCount": 32768,
+          "webpackDiscoveryTruncated": true,
+          "failureCount": 1,
+          "failureKinds": ["asset_not_found"]
+        },
+        "sourceRuntimeInjection": {
+          "started": true,
+          "sourceFingerprint": "sha256-222fef1b204f608d79194f7d243e55f42f5ad91481c3a50f641d736afd58b30f",
+          "payloadPreserved": true,
+          "requestHealthWarningsSuppressed": true
+        },
+        "temporaryDurableTestThread": true,
+        "existingThreadsTouched": false,
+        "cleanupArchived": true,
+        "verifiedAtUtc": "2026-11-13T13:12:19.516Z"
+      }
+    },
+    {
+      "id": "run-12",
+      "sourceFile": "2026-11-13-streamretry-desktop-live-v12.json",
+      "receipt": {
+        "verified": true,
+        "scope": "actual_codex_desktop_cdp_source_production_runtime",
+        "desktopCdpVerified": true,
+        "runtimeFingerprint": "sha256-222fef1b204f608d79194f7d243e55f42f5ad91481c3a50f641d736afd58b30f",
+        "nativeOwnerVerified": true,
+        "nativeOwnerPids": [2660],
+        "temporaryDurableTestThread": true,
+        "perThreadLocalFixtureProviderConfirmed": true,
+        "sseOverloadFailedTurnObserved": true,
+        "productionGuardsPrepared": true,
+        "appServerAcceptedContinue": true,
+        "upstreamReceivedLiteralContinue": true,
+        "continuedTurnCompleted": true,
+        "exactlyOneContinuation": true,
+        "sourceRuntimeInjection": {
+          "started": true,
+          "sourceFingerprint": "sha256-222fef1b204f608d79194f7d243e55f42f5ad91481c3a50f641d736afd58b30f",
+          "payloadPreserved": true,
+          "requestHealthWarningsSuppressed": true
+        },
+        "existingThreadsTouched": false,
+        "initialRequests": 1,
+        "continuedRequests": 1,
+        "cleanupArchived": true,
+        "verifiedAtUtc": "2026-11-13T13:14:19.908Z"
+      }
+    },
+    {
+      "id": "run-13",
+      "sourceFile": "2026-11-13-streamretry-concurrent-live.json",
+      "receipt": {
+        "verified": true,
+        "scenario": "concurrent_limit",
+        "scope": "actual_codex_desktop_cdp_source_production_runtime",
+        "desktopCdpVerified": true,
+        "runtimeFingerprint": "sha256-222fef1b204f608d79194f7d243e55f42f5ad91481c3a50f641d736afd58b30f",
+        "nativeOwnerVerified": true,
+        "nativeOwnerPids": [2660],
+        "temporaryDurableTestThread": true,
+        "perThreadLocalFixtureProviderConfirmed": true,
+        "initialFailedTurnObserved": true,
+        "productionGuardsPrepared": true,
+        "appServerAcceptedContinue": true,
+        "upstreamReceivedLiteralContinue": true,
+        "continuedTurnCompleted": true,
+        "exactlyOneContinuation": true,
+        "sourceRuntimeInjection": {
+          "started": true,
+          "sourceFingerprint": "sha256-222fef1b204f608d79194f7d243e55f42f5ad91481c3a50f641d736afd58b30f",
+          "payloadPreserved": true,
+          "requestHealthWarningsSuppressed": true
+        },
+        "existingThreadsTouched": false,
+        "initialRequests": 1,
+        "continuedRequests": 1,
+        "cleanupArchived": true,
+        "verifiedAtUtc": "2026-11-13T13:18:42.471Z"
+      }
+    },
+    {
+      "id": "run-14",
+      "sourceFile": "2026-11-13-streamretry-usage-live.json",
+      "receipt": {
+        "verified": true,
+        "scenario": "temporary_usage",
+        "scope": "actual_codex_desktop_cdp_source_production_runtime",
+        "desktopCdpVerified": true,
+        "runtimeFingerprint": "sha256-222fef1b204f608d79194f7d243e55f42f5ad91481c3a50f641d736afd58b30f",
+        "nativeOwnerVerified": true,
+        "nativeOwnerPids": [2660],
+        "temporaryDurableTestThread": true,
+        "perThreadLocalFixtureProviderConfirmed": true,
+        "initialFailedTurnObserved": true,
+        "productionGuardsPrepared": true,
+        "appServerAcceptedContinue": true,
+        "upstreamReceivedLiteralContinue": true,
+        "continuedTurnCompleted": true,
+        "exactlyOneContinuation": true,
+        "sourceRuntimeInjection": {
+          "started": true,
+          "sourceFingerprint": "sha256-222fef1b204f608d79194f7d243e55f42f5ad91481c3a50f641d736afd58b30f",
+          "payloadPreserved": true,
+          "requestHealthWarningsSuppressed": true
+        },
+        "existingThreadsTouched": false,
+        "initialRequests": 1,
+        "continuedRequests": 1,
+        "cleanupArchived": true,
+        "verifiedAtUtc": "2026-11-13T13:19:54.790Z"
+      }
+    },
+    {
+      "id": "run-15",
+      "sourceFile": "2026-11-13-streamretry-drop-live.json",
+      "receipt": {
+        "verified": true,
+        "scenario": "connection_drop",
+        "scope": "actual_codex_desktop_cdp_source_production_runtime",
+        "desktopCdpVerified": true,
+        "runtimeFingerprint": "sha256-5c2010b14da9fafeb408f93b29929d54ecebb31a7a756109e40dfb23914abe49",
+        "nativeOwnerVerified": true,
+        "nativeOwnerPids": [2660],
+        "temporaryDurableTestThread": true,
+        "perThreadLocalFixtureProviderConfirmed": true,
+        "initialFailedTurnObserved": true,
+        "productionGuardsPrepared": true,
+        "appServerAcceptedContinue": true,
+        "upstreamReceivedLiteralContinue": true,
+        "continuedTurnCompleted": true,
+        "exactlyOneContinuation": true,
+        "sourceRuntimeInjection": {
+          "started": true,
+          "sourceFingerprint": "sha256-5c2010b14da9fafeb408f93b29929d54ecebb31a7a756109e40dfb23914abe49",
+          "payloadPreserved": true,
+          "requestHealthWarningsSuppressed": true
+        },
+        "existingThreadsPrompted": false,
+        "fixtureOperationsRestrictedToOwnedThread": true,
+        "sourceRuntimeMayRefreshModelAndHistoryCaches": true,
+        "initialRequests": 1,
+        "continuedRequests": 1,
+        "cleanupArchived": true,
+        "verifiedAtUtc": "2026-11-13T13:26:51.836Z"
+      }
+    },
+    {
+      "id": "run-16",
+      "sourceFile": "2026-11-13-streamretry-usage-final-live.json",
+      "receipt": {
+        "verified": false,
+        "scenario": "temporary_usage",
+        "desktopCdpVerified": false,
+        "stage": "create_test_thread",
+        "failure": "cdp_command_timeout",
+        "initialRequests": 0,
+        "continuedRequests": 0,
+        "readinessDiagnostics": {
+          "installedRuntimeFingerprint": "sha256-5c2010b14da9fafeb408f93b29929d54ecebb31a7a756109e40dfb23914abe49",
+          "expectedRuntimeFingerprint": "sha256-5c2010b14da9fafeb408f93b29929d54ecebb31a7a756109e40dfb23914abe49",
+          "runtimeGeneration": 65,
+          "appServerPatchInstalled": true,
+          "appServerClientCount": 1,
+          "scopedScopeCount": 1,
+          "scopedRegistryCount": 0,
+          "scopedClientCount": 1,
+          "scopedQueryClientCount": 1,
+          "scopedAppServerScopeScanComplete": false,
+          "pendingReactNodeCount": 0,
+          "webpackRuntimeCount": 0,
+          "webpackModuleCount": 0,
+          "webpackCandidateCount": 0,
+          "webpackDiscoveryTruncated": false,
+          "failureCount": 1,
+          "failureKinds": ["asset_not_found"]
+        },
+        "sourceRuntimeInjection": {
+          "started": true,
+          "sourceFingerprint": "sha256-5c2010b14da9fafeb408f93b29929d54ecebb31a7a756109e40dfb23914abe49",
+          "payloadPreserved": true,
+          "requestHealthWarningsSuppressed": true
+        },
+        "temporaryDurableTestThread": false,
+        "threadCreationUncertain": true,
+        "existingThreadsPrompted": false,
+        "fixtureOperationsRestrictedToOwnedThread": true,
+        "sourceRuntimeMayRefreshModelAndHistoryCaches": true,
+        "cleanupArchived": false,
+        "pendingDirectory": true,
+        "cleanupPending": "temporary_directory_thread_uncertain",
+        "verifiedAtUtc": "2026-11-13T13:28:02.468Z"
+      }
+    },
+    {
+      "id": "run-17",
+      "sourceFile": "2026-11-13-streamretry-usage-verified.json",
+      "receipt": {
+        "verified": true,
+        "scenario": "temporary_usage",
+        "scope": "actual_codex_desktop_cdp_source_production_runtime",
+        "desktopCdpVerified": true,
+        "runtimeFingerprint": "sha256-5c2010b14da9fafeb408f93b29929d54ecebb31a7a756109e40dfb23914abe49",
+        "nativeOwnerVerified": true,
+        "nativeOwnerPids": [2660],
+        "temporaryDurableTestThread": true,
+        "perThreadLocalFixtureProviderConfirmed": true,
+        "initialFailedTurnObserved": true,
+        "productionGuardsPrepared": true,
+        "appServerAcceptedContinue": true,
+        "upstreamReceivedLiteralContinue": true,
+        "continuedTurnCompleted": true,
+        "exactlyOneContinuation": true,
+        "sourceRuntimeInjection": {
+          "started": true,
+          "sourceFingerprint": "sha256-5c2010b14da9fafeb408f93b29929d54ecebb31a7a756109e40dfb23914abe49",
+          "payloadPreserved": true,
+          "requestHealthWarningsSuppressed": true,
+          "reinjectionCount": 1,
+          "reprepareCount": 0
+        },
+        "existingThreadsPrompted": false,
+        "fixtureOperationsRestrictedToOwnedThread": true,
+        "sourceRuntimeMayRefreshModelAndHistoryCaches": true,
+        "initialRequests": 1,
+        "continuedRequests": 1,
+        "cleanupArchived": true,
+        "verifiedAtUtc": "2026-11-13T13:32:31.848Z"
+      }
+    }
+  ]
+}

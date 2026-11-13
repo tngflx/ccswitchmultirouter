@@ -10379,12 +10379,12 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
         assert_eq!(sublyx[0]["id"], "friendly-alias");
         assert_eq!(
             sublyx[0]["reasoning"]["supportedEfforts"],
-            json!(["low", "medium", "high", "xhigh"])
+            json!(["low", "high", "max"])
         );
-        assert_eq!(sublyx[0]["reasoning"]["defaultEffort"], "xhigh");
+        assert_eq!(sublyx[0]["reasoning"]["defaultEffort"], "max");
         assert_eq!(
-            sublyx[0]["reasoning"]["codexUltraOrchestration"]["providerEffort"],
-            "xhigh"
+            sublyx[0]["reasoning"]["upstream"]["effortMap"]["max"],
+            "max"
         );
         provider.settings_config["base_url"] = json!("https://openrouter.ai/api/v1");
         let openrouter = super::external_provider_model_entries(&provider, &profile);

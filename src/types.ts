@@ -178,7 +178,7 @@ export type CodexChatEffortValueMode =
   | "passthrough"
   | "low_high"
   | "deepseek"
-  // OpenRouter effort 枚举 xhigh|high|medium|low|minimal（无 max，max 钳到 xhigh）
+  // Preserve OpenRouter native efforts, including max; model capabilities own exact mappings.
   | "openrouter";
 
 export type CodexChatReasoningOutputFormat =

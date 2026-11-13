@@ -3,6 +3,10 @@
   if (__CCSWITCH_CATALOG_RELEASED__) incomingPayload.catalogReleased = true;
   const patchKey = __CCSWITCH_PATCH_KEY__;
   const state = window[patchKey] || {};
+  // Canonical status tokens are only candidates across runtime replacement;
+  // the new code resolves their current mounted scope before rebinding.
+  const previousAppServerStatusAtoms = state.appServerStatusAtoms || [];
+  const previousAppServerStatusBindings = state.appServerStatusBindings || [];
   /*__CCSWITCH_CATALOG_PAYLOAD_SELECTION_CORE__*/
   const previousPayload = state.payload;
   /*__CCSWITCH_MODEL_PICKER_RELEASE_CORE__*/
@@ -74,6 +78,7 @@
     state.appServerClients = [];
     state.scopedAppServerClientSet = new Set();
     state.scopedAppServerClientOwners = new Map();
+    state.scopedAppServerRpcClientOwners = new Map();
     state.moduleAppServerClientOwners = new Map();
     state.reactAppServerClientOwners = new Map();
     state.requestIds = new Map();
@@ -86,6 +91,8 @@
     state.scopedAppServerScopes = new Set();
     state.scopedAppServerScopeCandidates = new Set();
     state.scopedAppServerRegistryClasses = [];
+    state.appServerStatusAtoms = [];
+    state.appServerStatusBindings = [];
     state.scopedAppServerRegistryInstances = new Set();
     state.scopedAppServerScopesScannedAt = null;
     state.scopedAppServerScopeScanComplete = false;
@@ -136,6 +143,18 @@
   /*__CCSWITCH_REQUEST_NORMALIZATION_CORE__*/
   /*__CCSWITCH_HISTORY_LINEAGE_HYDRATION_CORE__*/
   /*__CCSWITCH_MODULE_CLIENT_DISCOVERY_CORE__*/
+  // Status atoms were validated against initialized module exports. Preserve
+  // only their read-only token identity; every use re-reads the current local
+  // status/client and current mounted node before authorizing requests.
+  state.appServerStatusAtoms = previousAppServerStatusAtoms;
+  state.appServerStatusBindings = previousAppServerStatusBindings;
+  // Bootstrap only canonical app-server brands. Retained picker scopes can
+  // include thousands of orphan aliases; they belong to async inventory.
+  const mountedPreviousScopes = previousAppServerStatusAtoms.length
+    ? codexCurrentAppServerScopeHints()
+    : [];
+  state.scopedAppServerScopeCandidates = new Set(mountedPreviousScopes);
+  state.scopedAppServerSeedRefreshPending = mountedPreviousScopes.length > 0;
   /*__CCSWITCH_WEBPACK_DISCOVERY_CORE__*/
   /*__CCSWITCH_NATIVE_REASONING_VISIBILITY_CORE__*/
   /*__CCSWITCH_MODEL_PICKER_DIAGNOSTICS_CORE__*/
@@ -358,6 +377,13 @@
       candidates.nativeReasoningVisibilityRequired === true;
     state.nativeReasoningVisibilityAtoms =
       candidates.nativeReasoningVisibilityAtoms;
+    // Rspack can keep the app-server registry in an initialized numeric module
+    // cache while the current React scope contains only its query client. Keep
+    // the validated registry classes on the shared discovery state so the
+    // continuation client refresh can bind the exact local manager.
+    state.scopedAppServerRegistryClasses = candidates.registries || [];
+    state.appServerStatusAtoms = candidates.appServerStatusAtoms || [];
+    state.appServerStatusBindings = candidates.appServerStatusBindings || [];
     for (const prototype of candidates.queryObserverPrototypes) {
       try {
         patchCodexModelReasoningQueryObserverPrototype(prototype);
@@ -392,6 +418,7 @@
       moduleCount: candidates.moduleCount,
       candidateCount: candidates.candidateCount,
       queryClientCount,
+      registryCount: (candidates.registries || []).length,
       observerPrototypeCount: candidates.queryObserverPrototypes.length,
       nativeVisibilityRequired: state.nativeReasoningVisibilityRequired,
       nativeVisibilityAtomCount:
@@ -1040,8 +1067,22 @@
   const installAppServerPatch = async () => {
     if (!installationIsCurrent()) return;
     const patchedCaches = new Set();
-    let patched = 0;
+    // Rebinding a known, positively mounted family client is synchronous. Do
+    // it before async Webpack/Fiber inventory so reinjection immediately
+    // restores guarded continuation without waiting for a full picker scan.
     let modulePatched = 0;
+    if (state.scopedAppServerSeedRefreshPending === true) {
+      state.scopedAppServerSeedRefreshPending = false;
+      modulePatched = refreshCodexScopedAppServerClients(
+        codexMountedRetainedScopeCandidates(
+          state.scopedAppServerScopeCandidates || [],
+        ),
+        state.scopedAppServerRegistryClasses || [],
+        patchedCaches,
+      );
+    }
+    let patched = modulePatched;
+    if (modulePatched > 0) state.appServerPatchInstalled = true;
     const wallNow = Date.now();
     if (
       !state.appServerModuleRetryAt ||
@@ -1059,6 +1100,22 @@
           } catch (error) {
             recordFailure(error);
           }
+          // Numeric cache discovery can reveal the canonical status atom
+          // before the full Fiber inventory finishes. Bind it immediately
+          // through already positively mounted retained nodes.
+          if (!(state.scopedAppServerDiscovery?.clientCount > 0)) {
+            const warmScopes = codexCurrentAppServerScopeHints();
+            if (warmScopes.length) {
+              state.appServerScopeHints = warmScopes;
+              state.scopedAppServerScopeCandidates = new Set(warmScopes);
+              scopedPatched = refreshCodexScopedAppServerClients(
+                warmScopes,
+                state.scopedAppServerRegistryClasses || [],
+                patchedCaches,
+              );
+              if (scopedPatched > 0) state.appServerPatchInstalled = true;
+            }
+          }
           // Scope/cache discovery must not depend on finding an obsolete named
           // bundle. The current React provider retains the initialized scope
           // even when every semantic Vite import is unavailable.
@@ -1070,7 +1127,7 @@
           state.scopedAppServerScopeCandidates = new Set(rendererScopes);
           scopedPatched = refreshCodexScopedAppServerClients(
             rendererScopes,
-            undefined,
+            state.scopedAppServerRegistryClasses || [],
             patchedCaches,
           );
           const discover = async (module) => {
@@ -1130,8 +1187,8 @@
     if (!installationIsCurrent()) return;
     installReactRootObserver();
     const fullScanDue =
-      !state.reactInitialDiscoveryCompleted ||
-      (modulePatched === 0 &&
+      modulePatched === 0 &&
+      (!state.reactInitialDiscoveryCompleted ||
         wallNow - (state.lastReactFullScanAt || 0) >= 30000);
     const incrementalScanDue =
       modulePatched === 0 &&
@@ -1171,7 +1228,7 @@
     if (state.payload?.catalogAvailable === true) {
       patched += refreshCodexScopedAppServerClients(
         undefined,
-        undefined,
+        state.scopedAppServerRegistryClasses || [],
         patchedCaches,
       );
       for (const cache of state.reasoningQueryCaches?.keys() || []) {

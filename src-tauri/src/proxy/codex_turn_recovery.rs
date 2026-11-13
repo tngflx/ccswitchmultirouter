@@ -2700,6 +2700,68 @@ mod tests {
     }
 
     #[test]
+    fn temporary_usage_limits_remain_recoverable_after_semantic_output() {
+        use super::super::error::ProxyError;
+
+        let error = serde_json::json!({
+            "type": "usage_limit_reached",
+            "message": "You've hit your usage limit. Please try again later."
+        });
+        let payload = serde_json::json!({"response": {"status": "failed", "error": error}});
+        let evidence = NativeResponsesEvidence {
+            has_final_message: true,
+            valid_tool_calls: 1,
+            ..NativeResponsesEvidence::default()
+        };
+        assert!(terminal_is_recoverable("response.failed", &payload));
+        assert_eq!(
+            recovery_decision(
+                NativeResponsesTerminalDisposition::Failed,
+                "response.failed",
+                &payload,
+                evidence,
+            ),
+            RecoveryDecision::Recover("response_failed")
+        );
+        assert!(forward_error_is_recoverable(&ProxyError::UpstreamError {
+            status: 429,
+            body: Some(serde_json::json!({"error": error}).to_string()),
+        }));
+
+        for message in [
+            "Daily usage limit reached. Please try again later.",
+            "Weekly usage limit reached. Please retry later.",
+            "Monthly usage limit reached. Wait for the reset.",
+            "Usage limit reached; quota exhausted. Retry later.",
+            "Usage limit reached; billing payment required. Retry later.",
+            "Usage limit reached; insufficient credit balance. Retry later.",
+            "Usage limit reached. Permission denied; retry later.",
+            "Usage limit reached. Token expired; retry later.",
+            "Usage limit reached. User cancelled the turn; retry later.",
+        ] {
+            let error = serde_json::json!({"type": "usage_limit_reached", "message": message});
+            let payload = serde_json::json!({"response": {"status": "failed", "error": error}});
+            assert_eq!(
+                recovery_decision(
+                    NativeResponsesTerminalDisposition::Failed,
+                    "response.failed",
+                    &payload,
+                    evidence,
+                ),
+                RecoveryDecision::Ignore,
+                "{message}"
+            );
+            assert!(
+                !forward_error_is_recoverable(&ProxyError::UpstreamError {
+                    status: 429,
+                    body: Some(serde_json::json!({"error": error}).to_string()),
+                }),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
     fn permanent_terminal_failures_are_not_recoverable() {
         for payload in [
             serde_json::json!({"response":{"error":{"code":"invalid_api_key"}}}),

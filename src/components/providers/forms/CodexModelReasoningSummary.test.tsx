@@ -102,4 +102,100 @@ describe("CodexModelReasoningSummary", () => {
       ),
     ).toBeInTheDocument();
   });
+
+  it("shows a supported native max Ultra target as selected and usable", () => {
+    const onUltraChange = vi.fn();
+    render(
+      <CodexModelReasoningSummary
+        model="gpt-6.1"
+        source="User declaration"
+        selectableEfforts={["low", "high", "max"]}
+        ultraEnabled
+        ultraEffort="max"
+        ultraEfforts={["low", "high", "max"]}
+        onUltraChange={onUltraChange}
+        expanded={false}
+        onToggle={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("combobox", {
+        name: "Provider reasoning effort used by gpt-6.1 Ultra",
+      }),
+    ).toHaveValue("max");
+    expect(screen.getByRole("option", { name: "max" })).toBeEnabled();
+    expect(screen.getByText("Unlocked; uses max")).toBeInTheDocument();
+    expect(onUltraChange).not.toHaveBeenCalled();
+  });
+
+  it("shows an unavailable saved max target until the user chooses a supported effort", () => {
+    const onUltraChange = vi.fn();
+    render(
+      <CodexModelReasoningSummary
+        model="gpt-6.1"
+        source="User declaration"
+        selectableEfforts={["low", "high", "xhigh"]}
+        ultraEnabled
+        ultraEffort="max"
+        ultraEfforts={["low", "high", "xhigh"]}
+        onUltraChange={onUltraChange}
+        expanded={false}
+        onToggle={vi.fn()}
+      />,
+    );
+
+    const effort = screen.getByRole("combobox", {
+      name: "Provider reasoning effort used by gpt-6.1 Ultra",
+    });
+    expect(effort).toHaveValue("max");
+    expect(
+      screen.getByRole("option", { name: "max (unavailable)" }),
+    ).toBeDisabled();
+    expect(screen.queryByText("Unlocked; uses max")).toBeNull();
+    expect(
+      screen.getByText(
+        "Saved provider level max is unavailable. Choose a currently supported level before saving.",
+      ),
+    ).toBeInTheDocument();
+    expect(onUltraChange).not.toHaveBeenCalled();
+
+    fireEvent.change(effort, { target: { value: "xhigh" } });
+    expect(onUltraChange).toHaveBeenCalledWith({
+      enabled: true,
+      providerEffort: "xhigh",
+    });
+  });
+
+  it("retains an unavailable saved max when no provider efforts are available", () => {
+    const onUltraChange = vi.fn();
+    render(
+      <CodexModelReasoningSummary
+        model="gpt-6.1"
+        source="Automatic detection"
+        selectableEfforts={[]}
+        ultraEnabled
+        ultraEffort="max"
+        ultraEfforts={[]}
+        onUltraChange={onUltraChange}
+        expanded={false}
+        onToggle={vi.fn()}
+      />,
+    );
+
+    const effort = screen.getByRole("combobox", {
+      name: "Provider reasoning effort used by gpt-6.1 Ultra",
+    });
+    expect(effort).toHaveValue("max");
+    expect(effort).toBeDisabled();
+    expect(
+      screen.getByRole("option", { name: "max (unavailable)" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByText(
+        "Saved provider level max is unavailable. Confirm this model's reasoning capabilities, then choose a supported level before saving.",
+      ),
+    ).toBeInTheDocument();
+    expect(onUltraChange).not.toHaveBeenCalled();
+  });
 });

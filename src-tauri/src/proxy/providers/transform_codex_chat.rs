@@ -1159,7 +1159,18 @@ pub(crate) fn map_codex_reasoning_effort<'a>(
     if effort_mode.is_some_and(|mode| mode.starts_with("capability|")) {
         return map_capability_reasoning_effort(effort, effort_mode.unwrap()).map(Some);
     }
-    Ok(map_reasoning_effort(effort, effort_mode))
+    let mapped = map_reasoning_effort(effort, effort_mode);
+    if mapped.is_none()
+        && !matches!(
+            effort.trim().to_ascii_lowercase().as_str(),
+            "none" | "off" | "disabled"
+        )
+    {
+        return Err(ProxyError::TransformError(format!(
+            "reasoning effort `{effort}` cannot be mapped for the declared Provider contract"
+        )));
+    }
+    Ok(mapped)
 }
 
 fn map_capability_reasoning_effort<'a>(
@@ -1224,12 +1235,12 @@ fn map_reasoning_effort(effort: &str, mode: Option<&str>) -> Option<&'static str
             "minimal" | "low" => Some("low"),
             _ => Some("high"),
         },
-        // OpenRouter effort 枚举为 xhigh|high|medium|low|minimal（无 max）。max 是
-        // Codex / 部分模型的扩展档位，对 OpenRouter 非法，会触发
-        // `400 reasoning_effort: Invalid option`（见 openclaw#77350）；钳到最高合法档
-        // xhigh，其余合法值透传，未知值丢弃以免被上游拒绝。
+        // Preserve OpenRouter's native vocabulary for legacy configurations
+        // without per-model metadata. Declared model capabilities use the
+        // capability map above and never reach this generic fallback.
         "openrouter" => match effort.as_str() {
-            "max" | "xhigh" => Some("xhigh"),
+            "max" => Some("max"),
+            "xhigh" => Some("xhigh"),
             "high" => Some("high"),
             "medium" => Some("medium"),
             "low" => Some("low"),
@@ -4442,8 +4453,8 @@ mod tests {
             disable_contract: false,
         };
 
-        // max 不在 OpenRouter 枚举内（见 openclaw#77350），必须钳成 xhigh，
-        // 且写进原生 reasoning 对象，而非顶层 reasoning_effort 别名。
+        // OpenRouter advertises per-model `max` now. It must be written to the
+        // native reasoning object instead of the top-level alias.
         let input = json!({
             "model": "deepseek/deepseek-chat-v3.1",
             "input": "hello",
@@ -4451,7 +4462,7 @@ mod tests {
         });
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
 
-        assert_eq!(result["reasoning"]["effort"], "xhigh");
+        assert_eq!(result["reasoning"]["effort"], "max");
         assert!(result.get("reasoning_effort").is_none());
         // thinking_param=none：即使 supports_effort 把 supports_thinking 带成 true，
         // 也不写任何 thinking 字段（OpenRouter 不认 thinking:{type}）。

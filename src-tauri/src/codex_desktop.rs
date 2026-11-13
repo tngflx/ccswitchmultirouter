@@ -1051,28 +1051,40 @@ fn cdp_listener_belongs_to_verified_codex_shell(
         })
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn cdp_listener_queries_verify_codex_shell(
+    listener_output: Option<&str>,
+    processes: Option<&[crate::commands::CodexAppServerProcessDiagnostics]>,
+) -> bool {
+    let (Some(listener_output), Some(processes)) = (listener_output, processes) else {
+        return false;
+    };
+    let listener_pids = parse_cdp_listener_process_ids(listener_output);
+    // A declared launch port does not establish that the shell bound the port.
+    // Unknown ownership must not authorize a generic Electron renderer target.
+    cdp_listener_belongs_to_verified_codex_shell(&listener_pids, processes)
+}
+
 #[cfg(target_os = "windows")]
 fn codex_debug_port_has_verified_desktop_listener(debug_port: u16) -> bool {
     use std::os::windows::process::CommandExt;
     let script = format!(
-        "Get-NetTCPConnection -State Listen -LocalPort {debug_port} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique"
+        "Get-NetTCPConnection -LocalPort {debug_port} -ErrorAction SilentlyContinue | Where-Object {{ $_.OwningProcess -ne 0 -and $_.RemotePort -eq 0 }} | Select-Object -ExpandProperty OwningProcess -Unique"
     );
-    let Ok(output) = crate::powershell::command()
+    let (processes, error) = crate::commands::query_codex_processes();
+    let output = crate::powershell::command()
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(0x08000000)
         .output()
-    else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let listener_pids = parse_cdp_listener_process_ids(&String::from_utf8_lossy(&output.stdout));
-    if listener_pids.is_empty() {
-        return false;
-    }
-    let (processes, error) = crate::commands::query_codex_processes();
-    error.is_none() && cdp_listener_belongs_to_verified_codex_shell(&listener_pids, &processes)
+        .ok();
+    let listener_output = output
+        .as_ref()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout));
+    cdp_listener_queries_verify_codex_shell(
+        listener_output.as_deref(),
+        error.is_none().then_some(processes.as_slice()),
+    )
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -7273,6 +7285,43 @@ JSON.stringify({{ count, patched, propertyReads, client: looksLikeAppServerReque
     }
 
     #[test]
+    fn webpack_discovery_retains_initialized_app_server_registry_candidates() {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let script = format!(
+            r#"
+const state = {{}};
+const recordFailure = () => {{}};
+const patchCodexModelReasoningQueryObserverPrototype = () => {{}};
+{}
+{}
+class AppServerRegistry {{
+  constructor(scope) {{ this.scope = scope; }}
+  getForHostId(host) {{ return this.scope.get(host); }}
+  getImplForHostId(host) {{ return this.scope.get(host); }}
+  getAll() {{ return []; }}
+}}
+const runtime = () => {{}};
+runtime.c = {{
+  registry: {{ exports: {{ AppServerRegistry }} }}
+}};
+const result = codexInitializedWebpackPickerCandidates([{{ __webpack_require__: runtime }}]);
+JSON.stringify({{ registryCount: result.registries.length, registry: result.registries[0] === AppServerRegistry }});
+"#,
+            app_server_module_client_discovery_core_script(),
+            include_str!("resources/codex_desktop/webpack_discovery.js")
+        );
+        context.with(|ctx| {
+            let json_text: String = ctx
+                .eval(script)
+                .expect("execute webpack registry discovery probe");
+            let result: Value =
+                serde_json::from_str(&json_text).expect("parse webpack registry result");
+            assert_eq!(result, json!({ "registryCount": 1, "registry": true }));
+        });
+    }
+
+    #[test]
     fn app_server_module_discovery_finds_deep_scoped_local_clients_and_observes_replacement() {
         let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
         let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
@@ -7346,6 +7395,8 @@ void (async () => {{
         context.with(|ctx| {
             let result: String = ctx.eval("globalThis.__scopedClientDiscoveryResult").expect("read scoped discovery result");
             let result: Value = serde_json::from_str(&result).expect("parse scoped discovery result");
+            // The legacy registry path reads the current roots once per pass;
+            // canonical RPC scope proofs must not add work to that path.
             assert_eq!(result, json!({ "firstCount": 1, "secondCount": 1, "remoteCount": 0, "patched": ["first", "second"], "registryMutations": 0, "scopeScans": 1, "rootIdentityReads": 3, "queryClientReads": 3 }));
         });
     }
@@ -8635,6 +8686,59 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
             &processes
         ));
         assert!(!cdp_listener_belongs_to_verified_codex_shell(&[41], &[]));
+    }
+
+    #[test]
+    fn generic_shell_target_requires_successful_owner_queries_even_with_declared_port() {
+        let target = CdpTarget {
+            id: "generic-shell".to_string(),
+            target_type: "page".to_string(),
+            title: "Active task".to_string(),
+            url: "app://-/index.html".to_string(),
+            web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
+        };
+        let processes = [crate::commands::CodexAppServerProcessDiagnostics {
+            pid: 41,
+            name: Some("ChatGPT.exe".to_string()),
+            executable_path: None,
+            command_line: Some(r#""ChatGPT.exe" --remote-debugging-port=9229"#.to_string()),
+            started_at: None,
+            is_app_server: false,
+        }];
+
+        for listener_output in [
+            None,
+            Some(""),
+            Some("not-a-pid"),
+            Some("99"),
+            Some("41\n99"),
+        ] {
+            let verified = cdp_listener_queries_verify_codex_shell(
+                listener_output,
+                Some(processes.as_slice()),
+            );
+            assert!(
+                !verified,
+                "owner evidence must fail closed: {listener_output:?}"
+            );
+            assert!(pick_codex_page_targets_with_listener_identity(
+                std::slice::from_ref(&target),
+                DEFAULT_CODEX_DEBUG_PORT,
+                verified,
+            )
+            .is_err());
+        }
+        assert!(!cdp_listener_queries_verify_codex_shell(Some("41"), None));
+
+        let verified =
+            cdp_listener_queries_verify_codex_shell(Some("41"), Some(processes.as_slice()));
+        assert!(verified);
+        assert!(pick_codex_page_targets_with_listener_identity(
+            &[target],
+            DEFAULT_CODEX_DEBUG_PORT,
+            verified,
+        )
+        .is_ok());
     }
 
     #[test]

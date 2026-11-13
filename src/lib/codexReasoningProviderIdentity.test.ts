@@ -551,7 +551,7 @@ base_url = "https://gateway.example/v1"`,
     },
   );
 
-  it("rebuilds a supported graded Sublyx GPT native contract without native ultra or stale wire metadata", () => {
+  it("repairs malformed explicit Sublyx native ultra metadata despite a max identity mapping", () => {
     const capability: CodexModelReasoningCapability = {
       supported: true,
       supportedEfforts: ["high", "max", "ultra"],
@@ -578,7 +578,7 @@ base_url = "https://gateway.example/v1"`,
       schemaVersion: 2,
       supportStatus: "confirmed_supported",
       controlKind: "graded",
-      supportedEfforts: ["low", "medium", "high", "xhigh"],
+      supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
       defaultEffort: "xhigh",
       disableAllowed: false,
       upstream: {
@@ -589,6 +589,7 @@ base_url = "https://gateway.example/v1"`,
           medium: "medium",
           high: "high",
           xhigh: "xhigh",
+          max: "max",
         },
       },
       source: "user",
@@ -606,7 +607,7 @@ base_url = "https://gateway.example/v1"`,
     [undefined, "medium"],
     ["minimal", "medium"],
     ["high", "high"],
-    ["max", "xhigh"],
+    ["max", "max"],
   ] as const)(
     "normalizes Sublyx default %s and restores maintained Ultra",
     (defaultEffort, expected) => {
@@ -633,6 +634,180 @@ base_url = "https://gateway.example/v1"`,
     },
   );
 
+  it.each([
+    undefined,
+    "user",
+    "user_confirmed_detection",
+    "detection",
+  ] as const)(
+    "preserves %s Sublyx native max evidence and exact effort subsets",
+    (source) => {
+      const capability: CodexModelReasoningCapability = {
+        schemaVersion: 2,
+        supportStatus: "confirmed_supported",
+        controlKind: "graded",
+        supportedEfforts: ["low", "high", "max"],
+        defaultEffort: "max",
+        disableAllowed: false,
+        upstream: {
+          format: "reasoning_object",
+          parameter: "reasoning.effort",
+          effortMap: { low: "low", high: "high", max: "max" },
+        },
+        source,
+        confidence: "verified",
+        codexUltraOrchestration: { enabled: false, providerEffort: "max" },
+      };
+      const normalized = normalizeCodexReasoningCapabilityForProvider(
+        "gpt-6.1-sol",
+        capability,
+        { baseUrl: "https://api.sublyx.org/v1" },
+      );
+      expect(normalized).toBe(capability);
+      expect(normalized.supportedEfforts).toEqual(["low", "high", "max"]);
+      expect(normalized.defaultEffort).toBe("max");
+      expect(normalized.upstream.effortMap).toEqual({
+        low: "low",
+        high: "high",
+        max: "max",
+      });
+      expect(normalized.codexUltraOrchestration).toEqual({
+        enabled: false,
+        providerEffort: "max",
+      });
+    },
+  );
+
+  it("preserves valid explicit native max evidence before missing identity mappings are completed", () => {
+    const capability: CodexModelReasoningCapability = {
+      supported: true,
+      supportedEfforts: ["low", "high", "max"],
+      defaultEffort: "max",
+      disableAllowed: false,
+      upstream: {
+        format: "reasoning_object",
+        parameter: "reasoning.effort",
+        effortMap: { max: "max" },
+      },
+      source: "user",
+    };
+    expect(
+      normalizeCodexReasoningCapabilityForProvider("gpt-6.1", capability, {
+        baseUrl: "https://api.sublyx.org/v1",
+      }),
+    ).toBe(capability);
+  });
+
+  it.each([
+    { target: undefined, expected: "xhigh" },
+    { target: "ultra", expected: "xhigh" },
+    { target: "high", expected: "high" },
+    { target: "max", expected: "max" },
+  ] as const)(
+    "repairs malformed native efforts while retaining explicit Ultra target $target as $expected",
+    ({ target, expected }) => {
+      for (const enabled of [false, true]) {
+        const capability: CodexModelReasoningCapability = {
+          supported: true,
+          supportedEfforts: ["high", "max", "ultra"],
+          defaultEffort: "ultra",
+          disableAllowed: false,
+          upstream: {
+            format: "string",
+            parameter: "reasoning_effort",
+            effortMap: { high: "high", max: "max", ultra: "ultra" },
+          },
+          source: "user",
+          codexUltraOrchestration: { enabled, providerEffort: target },
+        };
+        const normalized = normalizeCodexReasoningCapabilityForProvider(
+          "gpt-6.1",
+          capability,
+          { baseUrl: "https://api.sublyx.org/v1" },
+        );
+        expect(normalized.supportedEfforts).toEqual([
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+        ]);
+        expect(normalized.defaultEffort).toBe("xhigh");
+        expect(normalized.codexUltraOrchestration).toEqual({
+          enabled,
+          providerEffort: expected,
+        });
+      }
+    },
+  );
+
+  it.each([
+    { defaultEffort: "ultra", effortMap: { high: "high", max: "max" } },
+    { defaultEffort: "max", effortMap: { high: "ultra", max: "max" } },
+    { defaultEffort: "max", effortMap: { ultra: "high", max: "max" } },
+    { defaultEffort: "max", effortMap: { high: "xhigh", max: "max" } },
+  ] as const)(
+    "repairs an invalid explicit default or mapping instead of treating max as validated evidence: %j",
+    ({ defaultEffort, effortMap }) => {
+      const capability: CodexModelReasoningCapability = {
+        supported: true,
+        supportedEfforts: ["high", "max"],
+        defaultEffort,
+        disableAllowed: false,
+        upstream: {
+          format: "reasoning_object",
+          parameter: "reasoning.effort",
+          effortMap,
+        },
+        source: "user",
+      };
+      const normalized = normalizeCodexReasoningCapabilityForProvider(
+        "gpt-6.1",
+        capability,
+        { baseUrl: "https://api.sublyx.org/v1" },
+      );
+      expect(normalized).not.toBe(capability);
+      expect(normalized.supportedEfforts).not.toContain("ultra");
+      expect(normalized.upstream.effortMap).toEqual({
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "xhigh",
+        max: "max",
+      });
+    },
+  );
+
+  it.each([
+    { format: "string", parameter: "reasoning_split" },
+    { format: "unsupported_format", parameter: "reasoning.effort" },
+  ])(
+    "repairs an invalid explicit upstream wire declaration instead of treating max as validated evidence: %j",
+    ({ format, parameter }) => {
+      const capability = {
+        supported: true,
+        supportedEfforts: ["high", "max"],
+        defaultEffort: "max",
+        disableAllowed: false,
+        upstream: {
+          format,
+          parameter,
+          effortMap: { high: "high", max: "max" },
+        },
+        source: "user",
+      } as unknown as CodexModelReasoningCapability;
+      const normalized = normalizeCodexReasoningCapabilityForProvider(
+        "gpt-6.1",
+        capability,
+        { baseUrl: "https://api.sublyx.org/v1" },
+      );
+      expect(normalized).not.toBe(capability);
+      expect(normalized.upstream.format).toBe("reasoning_object");
+      expect(normalized.upstream.parameter).toBe("reasoning.effort");
+      expect(normalized.upstream.effortMap?.max).toBe("max");
+    },
+  );
+
   it("projects maintained Ultra without inventing an explicit persisted overlay", () => {
     const row = { model: "gpt-6.1" };
     expect(
@@ -644,17 +819,36 @@ base_url = "https://gateway.example/v1"`,
     expect(row).not.toHaveProperty("codexUltra");
   });
 
-  it("keeps explicit Ultra disabled and reconciles a stale Sublyx overlay target", () => {
+  it.each([false, true])(
+    "preserves explicit Sublyx Ultra native max target when enabled=%s",
+    (enabled) => {
+      expect(
+        resolveCodexCatalogUltraDisplay(
+          {
+            model: "gpt-6.1",
+            codexUltra: { enabled, providerEffort: "max" },
+          },
+          {
+            codexUltraOrchestrationEnabled: true,
+            effortMap: { ultra: "xhigh" },
+          },
+          {
+            baseUrl: "https://api.sublyx.org/v1",
+          },
+        ),
+      ).toEqual({ enabled, providerEffort: "max" });
+    },
+  );
+
+  it("reconciles a literal synthetic Sublyx Ultra target without enabling it", () => {
     expect(
       resolveCodexCatalogUltraDisplay(
         {
           model: "gpt-6.1",
-          codexUltra: { enabled: false, providerEffort: "max" },
+          codexUltra: { enabled: false, providerEffort: "ultra" },
         },
         { codexUltraOrchestrationEnabled: true, effortMap: { ultra: "xhigh" } },
-        {
-          baseUrl: "https://api.sublyx.org/v1",
-        },
+        { baseUrl: "https://api.sublyx.org/v1" },
       ),
     ).toEqual({ enabled: false, providerEffort: "xhigh" });
   });

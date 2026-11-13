@@ -5776,6 +5776,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_models_response_preserves_current_openrouter_per_model_max_effort() {
+        let models = parse_provider_models_response(
+            r#"{"object":"list","data":[{
+                "id":"deepseek/deepseek-v4.1-flash-1017",
+                "canonical_slug":"deepseek/deepseek-v4.1-flash-20261017",
+                "supported_parameters":[
+                    "include_reasoning",
+                    "parallel_tool_calls",
+                    "reasoning",
+                    "reasoning_effort",
+                    "tools"
+                ],
+                "reasoning":{
+                    "mandatory":false,
+                    "default_enabled":true,
+                    "supported_efforts":["max","high","low","none"],
+                    "default_effort":"high"
+                }
+            }]}"#,
+            &[],
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/models",
+        )
+        .expect("parse current OpenRouter reasoning metadata");
+        let reasoning = models[0].reasoning.as_ref().expect("reasoning metadata");
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["max", "high", "low", "none"])
+        );
+        assert_eq!(reasoning["defaultEffort"], "high");
+        assert_eq!(reasoning["disableAllowed"], true);
+        assert_eq!(reasoning["upstream"]["format"], "reasoning_object");
+        assert_eq!(reasoning["upstream"]["parameter"], "reasoning.effort");
+        assert_eq!(
+            reasoning["upstream"]["effortMap"]["max"],
+            serde_json::json!("max")
+        );
+    }
+
+    #[test]
     fn parse_models_response_normalizes_openrouter_metadata_when_base_omits_v1() {
         let models = parse_provider_models_response(
             r#"{"object":"list","data":[

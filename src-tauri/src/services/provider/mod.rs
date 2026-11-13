@@ -6480,67 +6480,73 @@ requires_openai_auth = true
     }
 
     #[test]
+    #[serial]
     fn codex_current_provider_projects_a_generated_leaf_back_to_its_facade() {
-        let db = Arc::new(Database::memory().expect("memory db"));
-        let state = AppState::new(db.clone());
-        let facade = Provider::with_id(
-            "relay".to_string(),
-            "Relay".to_string(),
-            json!({
-                "codexProtocolSet": {
-                    "version": 1,
-                    "role": "facade",
-                    "responsesProviderId": "relay::responses",
-                    "chatProviderId": "relay::chat"
-                }
-            }),
-            None,
-        );
-        let leaf = generated_codex_provider_set_leaf("relay::chat", &facade.id);
-        db.save_provider(AppType::Codex.as_str(), &facade)
-            .expect("save facade");
-        db.save_provider(AppType::Codex.as_str(), &leaf)
-            .expect("save leaf");
-        db.set_current_provider(AppType::Codex.as_str(), &leaf.id)
-            .expect("seed stale current leaf");
+        with_test_home(|state, _| {
+            crate::settings::reload_settings().expect("reload isolated settings");
+            let db = &state.db;
+            let facade = Provider::with_id(
+                "relay".to_string(),
+                "Relay".to_string(),
+                json!({
+                    "codexProtocolSet": {
+                        "version": 1,
+                        "role": "facade",
+                        "responsesProviderId": "relay::responses",
+                        "chatProviderId": "relay::chat"
+                    }
+                }),
+                None,
+            );
+            let leaf = generated_codex_provider_set_leaf("relay::chat", &facade.id);
+            db.save_provider(AppType::Codex.as_str(), &facade)
+                .expect("save facade");
+            db.save_provider(AppType::Codex.as_str(), &leaf)
+                .expect("save leaf");
+            db.set_current_provider(AppType::Codex.as_str(), &leaf.id)
+                .expect("seed stale current leaf");
 
-        assert_eq!(
-            ProviderService::current(&state, AppType::Codex).expect("read current provider"),
-            facade.id
-        );
+            assert_eq!(
+                ProviderService::current(state, AppType::Codex).expect("read current provider"),
+                facade.id
+            );
+        });
     }
 
     #[test]
+    #[serial]
     fn codex_live_sync_resolves_a_stale_generated_leaf_to_its_facade() {
-        let db = Arc::new(Database::memory().expect("memory db"));
-        let state = AppState::new(db.clone());
-        let facade = Provider::with_id(
-            "relay".to_string(),
-            "Relay".to_string(),
-            json!({
-                "codexProtocolSet": {
-                    "version": 1,
-                    "role": "facade",
-                    "responsesProviderId": "relay::responses",
-                    "chatProviderId": "relay::chat"
-                }
-            }),
-            None,
-        );
-        let leaf = generated_codex_provider_set_leaf("relay::chat", &facade.id);
-        db.save_provider(AppType::Codex.as_str(), &facade)
-            .expect("save facade");
-        db.save_provider(AppType::Codex.as_str(), &leaf)
-            .expect("save leaf");
-        db.set_current_provider(AppType::Codex.as_str(), &leaf.id)
-            .expect("seed stale current leaf");
+        with_test_home(|state, _| {
+            crate::settings::reload_settings().expect("reload isolated settings");
+            let db = &state.db;
+            let facade = Provider::with_id(
+                "relay".to_string(),
+                "Relay".to_string(),
+                json!({
+                    "codexProtocolSet": {
+                        "version": 1,
+                        "role": "facade",
+                        "responsesProviderId": "relay::responses",
+                        "chatProviderId": "relay::chat"
+                    }
+                }),
+                None,
+            );
+            let leaf = generated_codex_provider_set_leaf("relay::chat", &facade.id);
+            db.save_provider(AppType::Codex.as_str(), &facade)
+                .expect("save facade");
+            db.save_provider(AppType::Codex.as_str(), &leaf)
+                .expect("save leaf");
+            db.set_current_provider(AppType::Codex.as_str(), &leaf.id)
+                .expect("seed stale current leaf");
 
-        assert_eq!(
-            ProviderService::user_operable_current_provider_id(&state, &AppType::Codex)
-                .expect("resolve current provider for live sync")
-                .as_deref(),
-            Some(facade.id.as_str())
-        );
+            assert_eq!(
+                ProviderService::user_operable_current_provider_id(state, &AppType::Codex)
+                    .expect("resolve current provider for live sync")
+                    .as_deref(),
+                Some(facade.id.as_str())
+            );
+        });
     }
 
     #[test]

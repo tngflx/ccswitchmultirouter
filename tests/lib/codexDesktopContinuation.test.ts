@@ -781,6 +781,91 @@ describe("Codex Desktop continuation authorization", () => {
     });
   });
 
+  it.each(["failed", "interrupted"])(
+    "prepares and commits the original temporary usage %s exactly once",
+    async (status) => {
+      const harness = createHarness(
+        false,
+        {
+          type: "usage_limit_reached",
+          message: "You've hit your usage limit. Please try again later.",
+        },
+        status,
+      );
+      harness.start();
+      await flushJobs();
+      expect(harness.job()).toMatchObject({ status: "prepared" });
+      expect(harness.startTurn).not.toHaveBeenCalled();
+      expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+
+      harness.state.commitCodexContinuation("recovery-id");
+      harness.state.commitCodexContinuation("recovery-id");
+      await flushJobs();
+
+      expect(harness.startTurn).toHaveBeenCalledTimes(1);
+      expect(harness.startTurn).toHaveBeenCalledWith({
+        threadId: "exact-thread",
+        input: [{ type: "text", text: "continue" }],
+      });
+      expect(harness.job()).toMatchObject({
+        status: "completed",
+        submitted: true,
+        mutationAttempted: true,
+      });
+    },
+  );
+
+  it("does not continue a temporary usage failure after a newer user stop", async () => {
+    const harness = createHarness(false, {
+      type: "usage_limit_reached",
+      message: "You've hit your usage limit. Please try again later.",
+    });
+    harness.start();
+    await flushJobs();
+    expect(harness.job().status).toBe("prepared");
+    harness.api.rememberCodexUserTurnAction("turn/interrupt", {
+      threadId: "exact-thread",
+    });
+    harness.state.commitCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+  });
+
+  it.each([
+    "Daily usage limit reached; please try again later",
+    "Weekly usage limit reached; please try again later",
+    "Monthly usage limit reached; please try again later",
+    "Usage limit reached because quota is exhausted; retry later",
+    "Usage limit reached because billing requires payment; retry later",
+    "Usage limit reached because credit is exhausted; retry later",
+  ])(
+    "does not continue hard usage failures with retry wording: %s",
+    async (message) => {
+      const harness = createHarness(false, {
+        type: "usage_limit_reached",
+        message,
+      });
+      harness.start();
+      await flushJobs();
+      expect(harness.job()).toMatchObject({
+        status: "completed",
+        submitted: false,
+        mutationAttempted: false,
+        reason: "The latest Codex turn needs a user action",
+      });
+      harness.state.commitCodexContinuation("recovery-id");
+      await flushJobs();
+      expect(harness.startTurn).not.toHaveBeenCalled();
+      expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+    },
+  );
+
   it("rechecks the exact failed turn immediately before commit", async () => {
     const harness = createHarness();
     harness.start();

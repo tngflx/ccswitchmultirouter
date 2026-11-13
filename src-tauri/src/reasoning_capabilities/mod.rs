@@ -1924,7 +1924,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_core_sublyx_fallback_is_scoped_and_uses_synthetic_ultra() {
+    fn resolver_core_sublyx_fallback_preserves_native_max_and_uses_synthetic_ultra() {
         let settings = json!({});
         let resolved = resolve_codex_model_capability_core(
             &settings,
@@ -1938,15 +1938,19 @@ mod tests {
         let capability = resolved.capability.expect("Sublyx GPT fallback capability");
         assert_eq!(
             capability.supported_efforts,
-            vec!["low", "medium", "high", "xhigh"]
+            vec!["low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(capability.default_effort.as_deref(), Some("medium"));
-        assert!(!capability
+        assert!(capability
             .supported_efforts
             .iter()
             .any(|effort| effort == "max"));
+        assert_eq!(
+            capability.upstream.effort_map.get("max"),
+            Some(&"max".to_string())
+        );
         assert!(!capability.upstream.effort_map.contains_key("ultra"));
-        assert!(!capability.upstream.effort_map.contains_key("max"));
+        assert!(capability.upstream.effort_map.contains_key("max"));
         assert!(capability.codex_ultra_orchestration.as_ref().is_some_and(
             |ultra| ultra.enabled && ultra.provider_effort.as_deref() == Some("xhigh")
         ));
@@ -1958,14 +1962,20 @@ mod tests {
         use crate::proxy::providers::codex_reasoning::CodexReasoningEffort as Effort;
         assert_eq!(
             projected.provider_accepted_efforts,
-            vec![Effort::Low, Effort::Medium, Effort::High, Effort::XHigh]
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::XHigh,
+                Effort::Max
+            ]
         );
         assert!(projected.codex_selectable_efforts.contains(&Effort::Ultra));
         assert_eq!(
             projected.effort_map.get(&Effort::Ultra),
             Some(&Effort::XHigh)
         );
-        assert!(!projected.provider_accepted_efforts.contains(&Effort::Max));
+        assert!(projected.provider_accepted_efforts.contains(&Effort::Max));
 
         // The same model suffix on an aggregator must remain unknown rather
         // than inheriting the Sublyx Responses contract.
@@ -2025,15 +2035,19 @@ mod tests {
                 let capability = resolved.capability.expect("Sublyx wire model capability");
                 assert_eq!(
                     capability.supported_efforts,
-                    vec!["low", "medium", "high", "xhigh"],
+                    if model_reasoning.is_some() {
+                        vec!["low", "high", "max"]
+                    } else {
+                        vec!["low", "medium", "high", "xhigh", "max"]
+                    },
                     "{requested}"
                 );
                 assert_eq!(capability.upstream.parameter, "reasoning.effort");
-                assert!(!capability.upstream.effort_map.contains_key("max"));
+                assert!(capability.upstream.effort_map.contains_key("max"));
                 if model_reasoning.is_some() {
                     assert_eq!(resolved.source, CapabilitySource::UserConfig);
                     assert_eq!(capability.source.as_deref(), Some("user"));
-                    assert_eq!(capability.default_effort.as_deref(), Some("xhigh"));
+                    assert_eq!(capability.default_effort.as_deref(), Some("max"));
                 } else {
                     assert_eq!(resolved.source, CapabilitySource::ProviderFallback);
                 }
@@ -2061,7 +2075,11 @@ mod tests {
             let capability = resolved.capability.expect("canonical GPT wire identity");
             assert_eq!(
                 capability.supported_efforts,
-                vec!["low", "medium", "high", "xhigh"]
+                if reasoning.is_some() {
+                    vec!["low", "high", "max"]
+                } else {
+                    vec!["low", "medium", "high", "xhigh", "max"]
+                }
             );
             assert_eq!(
                 resolved.source,
@@ -2139,7 +2157,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_core_normalizes_stale_sublyx_user_max_without_affecting_openrouter() {
+    fn resolver_core_preserves_current_sublyx_user_max_without_affecting_openrouter() {
         let settings = json!({
             "modelCatalog": {
                 "models": [{
@@ -2177,28 +2195,27 @@ mod tests {
         assert_eq!(resolved.source, CapabilitySource::UserConfig);
         let capability = resolved.capability.expect("normalized user capability");
         assert_eq!(capability.source.as_deref(), Some("user"));
-        assert_eq!(capability.provider_key.as_deref(), Some("sublyx"));
+        assert_eq!(capability.provider_key.as_deref(), None);
         assert_eq!(
             capability.supported_efforts,
-            vec!["low", "medium", "high", "xhigh"]
+            vec!["low", "medium", "high", "max"]
         );
-        assert_eq!(capability.default_effort.as_deref(), Some("xhigh"));
-        assert!(!capability.upstream.effort_map.contains_key("max"));
+        assert_eq!(capability.default_effort.as_deref(), Some("max"));
+        assert_eq!(
+            capability.upstream.effort_map.get("max"),
+            Some(&"max".to_string())
+        );
         assert!(!capability.upstream.effort_map.contains_key("ultra"));
-        assert!(capability.codex_ultra_orchestration.as_ref().is_some_and(
-            |ultra| ultra.enabled && ultra.provider_effort.as_deref() == Some("xhigh")
-        ));
+        assert!(capability.codex_ultra_orchestration.is_none());
 
         let projected =
             crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(Some(
                 &capability,
             ));
         use crate::proxy::providers::codex_reasoning::CodexReasoningEffort as Effort;
-        assert!(!projected.provider_accepted_efforts.contains(&Effort::Max));
-        assert_eq!(
-            projected.effort_map.get(&Effort::Ultra),
-            Some(&Effort::XHigh)
-        );
+        assert!(projected.provider_accepted_efforts.contains(&Effort::Max));
+        assert_eq!(projected.effort_map.get(&Effort::Max), Some(&Effort::Max));
+        assert!(!projected.codex_selectable_efforts.contains(&Effort::Ultra));
 
         // Platform identity, not the model suffix, controls normalization.
         let openrouter = resolve_codex_model_capability_core(

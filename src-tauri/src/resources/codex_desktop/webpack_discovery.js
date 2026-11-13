@@ -49,6 +49,8 @@ const codexInitializedWebpackPickerCandidates = (namespaces) => {
     queryClients: [],
     queryObserverPrototypes: [],
     scopes: [],
+    registries: [],
+    appServerStatusAtoms: [],
     runtimeCount: 0,
     moduleCount: 0,
     candidateCount: 0,
@@ -74,6 +76,9 @@ const codexInitializedWebpackPickerCandidates = (namespaces) => {
   const clients = new Set();
   const prototypes = new Set();
   const scopes = new Set();
+  const registries = new Set();
+  const appServerStatusAtoms = new Set();
+  const appServerStatusBindings = [];
   const visibilityAtoms = new Set();
   let inspectedModules = 0;
   let inspectedFields = 0;
@@ -86,6 +91,86 @@ const codexInitializedWebpackPickerCandidates = (namespaces) => {
     }
     queued.add(value);
     candidates.push({ value, depth });
+  };
+  const inspectRegistryExport = (value) => {
+    if (typeof codexScopedRegistryClass !== "function") return;
+    try {
+      if (codexScopedRegistryClass(value)) {
+        registries.add(value);
+        return;
+      }
+      if (!codexWebpackExportRecord(value)) return;
+      const keys = Object.getOwnPropertyNames(value);
+      for (
+        let index = 0;
+        index < Math.min(keys.length, limits.properties);
+        index += 1
+      ) {
+        const field = Object.getOwnPropertyDescriptor(value, keys[index]);
+        if (field && "value" in field && codexScopedRegistryClass(field.value))
+          registries.add(field.value);
+      }
+    } catch {}
+  };
+  const inspectAppServerStatusAtom = (runtime, moduleKey, exports) => {
+    if (!codexWebpackExportRecord(exports)) return;
+    const factory = codexWebpackOwnData(
+      codexWebpackOwnData(runtime, "m"),
+      moduleKey,
+    );
+    if (typeof factory !== "function") return;
+    let factorySource;
+    try {
+      factorySource = Function.prototype.toString.call(factory);
+    } catch {
+      return;
+    }
+    const values = Object.getOwnPropertyNames(exports)
+      .slice(0, limits.properties)
+      .map((key) => codexWebpackOwnData(exports, key));
+    const manager = values.find(
+      (value) =>
+        typeof value === "function" &&
+        Function.prototype.toString
+          .call(value)
+          .includes("AppServerManager RPC is unavailable for hostId:"),
+    );
+    if (!manager) return;
+    const managerSource = Function.prototype.toString.call(manager);
+    const statusReference = managerSource.match(
+      /\.get\(([$\w]+)\.([$\w]+),[$\w]+\)/,
+    );
+    if (!statusReference || !managerSource.includes(".rpc")) return;
+    const alias = statusReference[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const dependency = factorySource.match(
+      new RegExp(`(?:^|[^$\\w])${alias}=[$\\w]+\\(["']([^"']+)["']\\)`),
+    );
+    if (!dependency) return;
+    const dependencyModule = codexWebpackOwnData(
+      codexWebpackOwnData(runtime, "c"),
+      dependency[1],
+    );
+    if (codexWebpackOwnData(dependencyModule, "error") !== undefined) return;
+    const atom = codexWebpackOwnData(
+      codexWebpackOwnData(dependencyModule, "exports"),
+      statusReference[2],
+    );
+    if (
+      codexWebpackOwnData(atom, "kind") !== "signal-family" ||
+      typeof codexWebpackOwnData(atom, "read") !== "function" ||
+      typeof codexWebpackOwnData(atom, "resolve") !== "function"
+    )
+      return;
+    const atomScope = codexWebpackOwnData(atom, "scope");
+    const managerToken = values.find(
+      (value) =>
+        codexWebpackOwnData(value, "scope") === atomScope &&
+        codexWebpackOwnData(value, "cache") === "signal" &&
+        typeof codexWebpackOwnData(value, "resolve") === "function",
+    );
+    if (!atomScope || !managerToken) return;
+    appServerStatusAtoms.add(atom);
+    appServerStatusBindings.push({ atom, managerToken });
   };
   for (
     let index = 0;
@@ -128,6 +213,12 @@ const codexInitializedWebpackPickerCandidates = (namespaces) => {
       }
       if (!fields || !("value" in fields)) continue;
       result.moduleCount += 1;
+      // Registry classes are continuation capabilities, not picker objects.
+      // Inspect every initialized module export before the bounded object graph
+      // walk so a large Rspack cache cannot hide the local registry behind the
+      // candidate cap.
+      inspectRegistryExport(fields.value);
+      inspectAppServerStatusAtom(runtime, key, fields.value);
       // This is a read-only token for the separately guarded scope.get boundary,
       // not permission to execute an arbitrary export or resolve the atom here.
       // The current Q3tq factory uses Rspack's data-export argument for pN;
@@ -159,6 +250,12 @@ const codexInitializedWebpackPickerCandidates = (namespaces) => {
     if (prototype) prototypes.add(prototype);
     const isScope = codexDeclaredDependencyScope(value);
     if (isScope) scopes.add(value);
+    // Current Rspack builds can retain the read-only app-server registry in
+    // an initialized numeric module cache without exposing it through the
+    // React scope. It is safe to retain the class only when the shared
+    // validator proves the exact local lookup contract; request-client
+    // ownership is still checked later by client_discovery.js.
+    inspectRegistryExport(value);
     // Initialized polyfills can export globalThis/window; app instances can
     // retain arbitrary state too. Only plain export records authorize another
     // data-field edge. A recognized picker object is a leaf, not a new root.
@@ -194,6 +291,9 @@ const codexInitializedWebpackPickerCandidates = (namespaces) => {
   result.queryClients = Array.from(clients);
   result.queryObserverPrototypes = Array.from(prototypes);
   result.scopes = Array.from(scopes);
+  result.registries = Array.from(registries);
+  result.appServerStatusAtoms = Array.from(appServerStatusAtoms);
+  result.appServerStatusBindings = appServerStatusBindings;
   return result;
 };
 // The caller snapshots the document's module-script src/type fields. Links,

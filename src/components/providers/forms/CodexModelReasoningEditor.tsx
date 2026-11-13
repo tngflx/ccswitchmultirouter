@@ -5,6 +5,7 @@ import type {
   CodexReasoningEffort,
 } from "@/types";
 import {
+  hasExplicitSublyxNativeMaxEvidence,
   normalizeCodexReasoningCapabilityForProvider,
   usesSublyxGptReasoningContract,
   type CodexReasoningProviderIdentity,
@@ -67,15 +68,16 @@ export function CodexModelReasoningEditor({
     capability,
   );
   const hasMaintainedNativeContract =
-    isSublyx && isGraded && capability.supportStatus === "confirmed_supported";
+    isSublyx &&
+    isGraded &&
+    capability.supportStatus === "confirmed_supported" &&
+    !hasExplicitSublyxNativeMaxEvidence(savedCapability);
   const nativeEfforts = capability.supportedEfforts;
   const completedMap = identityCompleteMap(capability, nativeEfforts);
   const addableEfforts = hasMaintainedNativeContract
     ? []
     : PROVIDER_EFFORTS.filter(
-        (effort) =>
-          (!isSublyx || effort !== "max") &&
-          !capability.supportedEfforts.includes(effort),
+        (effort) => !capability.supportedEfforts.includes(effort),
       );
 
   const update = (next: CodexModelReasoningCapability) => {
@@ -199,7 +201,7 @@ export function CodexModelReasoningEditor({
               <p className="rounded-md bg-muted/30 p-2 text-muted-foreground">
                 {t("codexConfig.sublyxMaintainedReasoningContract", {
                   defaultValue:
-                    "Sublyx GPT native levels and wire settings are maintained automatically: low, medium, high, xhigh; Ultra uses xhigh with Codex orchestration. You can change the default, disable Ultra, or choose a different support control mode.",
+                    "Sublyx GPT native levels and wire settings are maintained automatically: low, medium, high, xhigh, max; Ultra defaults to xhigh with Codex orchestration. You can change the default, disable Ultra, or choose a different support control mode.",
                 })}
               </p>
             ) : null}
