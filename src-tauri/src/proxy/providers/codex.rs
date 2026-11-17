@@ -3555,6 +3555,29 @@ pub fn apply_codex_native_responses_reasoning_effort(
     let Some(config) = resolve_codex_chat_reasoning_config(provider, body) else {
         return Ok(());
     };
+    if !config.supports_effort.unwrap_or(false) {
+        // Responses and Chat share the logical Codex reasoning request, but a
+        // non-graded OpenRouter declaration uses the provider's boolean switch
+        // (or no control at all).  Do not leave the incoming Codex effort in a
+        // native Responses body: OpenRouter accepts `reasoning.effort` only for
+        // models whose declared contract exposes that graded control.
+        let mut converted = serde_json::json!({});
+        super::transform_codex_chat::apply_reasoning_options(&mut converted, body, Some(&config))?;
+        if let Some(reasoning) = body.get_mut("reasoning").and_then(JsonValue::as_object_mut) {
+            reasoning.remove("effort");
+            if let Some(mapped) = converted.get("reasoning").and_then(JsonValue::as_object) {
+                for (key, value) in mapped {
+                    reasoning.insert(key.clone(), value.clone());
+                }
+            }
+            if reasoning.is_empty() {
+                body.as_object_mut()
+                    .expect("Responses body is an object")
+                    .remove("reasoning");
+            }
+        }
+        return Ok(());
+    }
     let Some(mapped) =
         super::transform_codex_chat::map_codex_reasoning_effort(&requested_effort, &config)?
     else {
@@ -8960,6 +8983,170 @@ wire_api = "chat"
             apply_codex_native_responses_reasoning_effort(&provider, &mut body)
                 .expect("OpenRouter generic vocabulary remains usable");
             assert_eq!(body["reasoning"]["effort"], effort);
+        }
+    }
+
+    #[test]
+    fn native_responses_non_graded_switches_match_chat_contract_and_preserve_ancillary_fields() {
+        use crate::proxy::providers::codex_request::{
+            CodexRequestOptions, CodexRequestTransport, CodexThirdPartyRequestPolicy,
+        };
+
+        for (kind, format, parameter) in [
+            ("boolean", "boolean", "reasoning.enabled"),
+            ("budget", "budget", "reasoning.max_tokens"),
+        ] {
+            for disable_allowed in [false, true] {
+                let provider = create_provider(json!({
+                    "baseUrl": "https://openrouter.ai/api/v1",
+                    "auth": {"OPENAI_API_KEY": "fixture-redacted"},
+                    "modelCatalog": {"models": [{
+                        "model": "vendor/non-graded",
+                        "reasoning": {
+                            "schemaVersion": 2, "supportStatus": "confirmed_supported",
+                            "controlKind": kind, "supportedEfforts": [],
+                            "defaultEffort": null, "disableAllowed": disable_allowed,
+                            "source": "user",
+                            "upstream": {"format": format, "parameter": parameter, "effortMap": {}}
+                        }
+                    }]}
+                }));
+                let policy = CodexThirdPartyRequestPolicy::compile(&provider).unwrap();
+                for effort in ["high", "ultra", "none"] {
+                    let mut input = json!({
+                        "model": "vendor/non-graded", "input": "hello",
+                        "reasoning": {"effort": effort, "summary": "auto"}
+                    });
+                    if kind == "budget" {
+                        input["reasoning"]["max_tokens"] = json!(4096);
+                    }
+                    let options = CodexRequestOptions::default();
+                    let prepared = policy
+                        .prepare(
+                            CodexRequestTransport::Responses,
+                            input.clone(),
+                            options.clone(),
+                        )
+                        .expect("native Responses preparation");
+                    let native = policy
+                        .finalize_body(CodexRequestTransport::Responses, prepared.body, &options)
+                        .expect("native Responses finalization");
+                    let chat = policy
+                        .prepare(CodexRequestTransport::ChatCompletions, input, options)
+                        .expect("Chat preparation");
+                    assert!(
+                        native.pointer("/reasoning/effort").is_none(),
+                        "{kind}: {effort}: non-graded model must not receive a graded effort"
+                    );
+                    assert_eq!(
+                        native.pointer("/reasoning/enabled"),
+                        chat.body.pointer("/reasoning/enabled"),
+                        "{kind}: {effort}: transport selection must preserve the declared switch"
+                    );
+                    assert_eq!(native["reasoning"]["summary"], "auto");
+                    if kind == "budget" {
+                        assert_eq!(native["reasoning"]["max_tokens"], 4096);
+                    } else {
+                        assert!(native.pointer("/reasoning/max_tokens").is_none());
+                    }
+                    assert!(native.get("thinking").is_none());
+                    assert!(native.get("enable_thinking").is_none());
+                    assert!(native.get("reasoning_effort").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_responses_non_graded_declarations_remove_stale_effort_without_inventing_controls() {
+        use crate::proxy::providers::codex_request::{
+            CodexRequestOptions, CodexRequestTransport, CodexThirdPartyRequestPolicy,
+        };
+
+        for (status, kind) in [
+            ("confirmed_supported", "none"),
+            ("confirmed_unsupported", "none"),
+            ("unknown", "unknown"),
+        ] {
+            let provider = create_provider(json!({
+                "baseUrl": "https://openrouter.ai/api/v1",
+                "auth": {"OPENAI_API_KEY": "fixture-redacted"},
+                "modelCatalog": {"models": [{
+                    "model": "vendor/no-effort",
+                    "reasoning": {
+                        "schemaVersion": 2, "supportStatus": status, "controlKind": kind,
+                        "supportedEfforts": [], "defaultEffort": null, "disableAllowed": false,
+                        "source": "user",
+                        "upstream": {"format": "none", "parameter": "none", "effortMap": {}}
+                    }
+                }]}
+            }));
+            let policy = CodexThirdPartyRequestPolicy::compile(&provider).unwrap();
+            for effort in ["high", "ultra", "none"] {
+                for ancillary in [false, true] {
+                    let mut input = json!({
+                        "model": "vendor/no-effort", "input": "hello",
+                        "reasoning": {"effort": effort}
+                    });
+                    if ancillary {
+                        input["reasoning"]["summary"] = json!("auto");
+                    }
+                    let native = policy
+                        .prepare(
+                            CodexRequestTransport::Responses,
+                            input,
+                            CodexRequestOptions::default(),
+                        )
+                        .expect("declared no-effort native preparation")
+                        .body;
+                    assert!(
+                        native.pointer("/reasoning/effort").is_none(),
+                        "{status}: {effort}"
+                    );
+                    assert!(
+                        native.pointer("/reasoning/enabled").is_none(),
+                        "{status}: no invented switch"
+                    );
+                    if ancillary {
+                        assert_eq!(native["reasoning"], json!({"summary": "auto"}));
+                    } else {
+                        assert!(
+                            native.get("reasoning").is_none(),
+                            "{status}: remove an empty control object"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_responses_non_graded_changes_preserve_undeclared_model_compatibility() {
+        use crate::proxy::providers::codex_request::{
+            CodexRequestOptions, CodexRequestTransport, CodexThirdPartyRequestPolicy,
+        };
+
+        let provider = create_provider(json!({
+            "baseUrl": "https://openrouter.ai/api/v1",
+            "auth": {"OPENAI_API_KEY": "fixture-redacted"},
+            "modelCatalog": {"models": [{"model": "vendor/undeclared-model"}]}
+        }));
+        let policy = CodexThirdPartyRequestPolicy::compile(&provider).unwrap();
+        for effort in ["max", "xhigh", "none"] {
+            let prepared = policy
+                .prepare(
+                    CodexRequestTransport::Responses,
+                    json!({
+                        "model": "vendor/undeclared-model", "input": "hello",
+                        "reasoning": {"effort": effort, "summary": "auto"}
+                    }),
+                    CodexRequestOptions::default(),
+                )
+                .expect("generic OpenRouter native vocabulary remains usable");
+            assert_eq!(
+                prepared.body["reasoning"],
+                json!({"effort": effort, "summary": "auto"})
+            );
         }
     }
 

@@ -29,6 +29,26 @@ const script = path.join(
   "verify-codex-desktop-continuation.mjs",
 );
 const fingerprint = `sha256-${"0".repeat(64)}`;
+const normalizeMonitorSource = (source) => source.replace(/\r\n/g, "\n");
+const readMonitorSource = async () =>
+  normalizeMonitorSource(await readFile(script, "utf8"));
+
+test("monitor source slices preserve boundaries across LF and CRLF checkouts", async () => {
+  const original = await readFile(script, "utf8");
+  for (const newline of ["\n", "\r\n"]) {
+    const source = normalizeMonitorSource(original.replace(/\r?\n/g, newline));
+    for (const marker of [
+      "let evidence;\ntry {",
+      "assert.equal(\n  process.platform,",
+      "const options = new Map();",
+    ])
+      assert.ok(source.includes(marker), `Source marker missing: ${marker}`);
+    const begin = source.indexOf("const options = new Map();");
+    const end = source.indexOf("assert.equal(\n  process.platform,", begin);
+    assert.ok(end > begin, "The CLI slice must end before module-level awaits");
+    new vm.Script(source.slice(begin, end));
+  }
+});
 const runVerifier = (port, extra = []) =>
   new Promise((resolve, reject) => {
     const child = spawn(
@@ -92,7 +112,7 @@ test("the source renderer assembler resolves every production slot", async () =>
 });
 
 test("source injection evidence distinguishes fixture prompts from compatibility cache refreshes", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const threadScopeEvidence =");
   const end = source.indexOf("const fixtureScenarios =", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -117,7 +137,7 @@ test("source injection evidence distinguishes fixture prompts from compatibility
 });
 
 test("fixture scenarios are finite and preserve the explicit failure signals", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const fixtureScenarios =");
   const end = source.indexOf("const patchKey =", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -165,7 +185,7 @@ test("fixture scenarios are finite and preserve the explicit failure signals", a
 });
 
 test("terminal fixture scenarios keep explicit denial and hard quota distinct from the four recoverable failures", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const fixtureScenarios =");
   const end = source.indexOf("const patchKey =", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -195,7 +215,7 @@ test("terminal fixture scenarios keep explicit denial and hard quota distinct fr
 });
 
 const terminalRefusalContext = async (scenario, overrides = {}) => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const verifyTerminalFixtureRefusal =");
   const end = source.indexOf("const run =", begin);
   assert.ok(
@@ -322,7 +342,7 @@ test("terminal refusal verification rejects unrelated preparation failures, muta
 });
 
 test("continuation outcome diagnostics classify only fixed reasons and never serialize reflected values or read getters", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const projectContinuationResult =");
   const end = source.indexOf("const continuationResultExpression =", begin);
   assert.ok(
@@ -458,7 +478,7 @@ test("continuation outcome diagnostics classify only fixed reasons and never ser
 });
 
 test("continuation diagnostic RPC programs project reasons inside the renderer before returning", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const projectContinuationResult =");
   const end = source.indexOf("const currentProviderExpression =", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -517,7 +537,7 @@ test("continuation diagnostic RPC programs project reasons inside the renderer b
 });
 
 test("failed commit diagnostics observe the job once without repreparing or committing again", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const readContinuationJob =");
   const end = source.indexOf("const verifyTerminalFixtureRefusal =", begin);
   assert.ok(
@@ -576,7 +596,7 @@ test("failed commit diagnostics observe the job once without repreparing or comm
 });
 
 test("confirmation diagnostics wait for a read-only confirmed phase without committing", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const readContinuationJob =");
   const end = source.indexOf("const verifyTerminalFixtureRefusal =", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -645,7 +665,7 @@ test("confirmation diagnostics wait for a read-only confirmed phase without comm
 });
 
 test("renderer failures expose fixed reasons without reflected secrets", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const classifyRendererException =");
   const end = source.indexOf("const sleep =", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -690,7 +710,7 @@ test("renderer failures expose fixed reasons without reflected secrets", async (
 });
 
 test("busy temporary cleanup preserves the original failure and writes its receipt", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const cleanupTemporaryDirectory =");
   const end = source.indexOf("if (binaryPath)", begin);
   const receiptBegin = source.indexOf("evidence.verifiedAtUtc =");
@@ -757,7 +777,7 @@ test("busy temporary cleanup preserves the original failure and writes its recei
 });
 
 test("temporary cleanup leaves an uncertain thread cwd intact", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const cleanupTemporaryDirectory =");
   const end = source.indexOf("if (binaryPath)", begin);
   let deletes = 0;
@@ -787,7 +807,7 @@ test("temporary cleanup leaves an uncertain thread cwd intact", async () => {
 });
 
 test("source restoration accepts only validated baseline or exact source fingerprints", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const sourceRuntimeSnapshotExpression =");
   const end = source.indexOf("const guarded =", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -835,7 +855,7 @@ test("source restoration accepts only validated baseline or exact source fingerp
 });
 
 test("the disposable fixture validates the current provider but isolates a dedicated credential-free provider per thread", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const guarded =");
   const end = source.indexOf("const waitUntil =", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -897,7 +917,7 @@ const nativeListener = (
 });
 
 const nativeEndpointContext = async (initialRows, pinned = null) => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const helperBegin = source.indexOf("const normalizeListenerAddress =");
   const identityBegin = source.indexOf("const readNativeIdentity =");
   const begin = helperBegin >= 0 ? helperBegin : identityBegin;
@@ -1024,7 +1044,7 @@ test(
   "the native listener query rejects partial snapshots even when their error is ObjectNotFound",
   { skip: process.platform !== "win32", timeout: 15_000 },
   async () => {
-    const source = await readFile(script, "utf8");
+    const source = await readMonitorSource();
     const begin = source.indexOf("const normalizeListenerAddress =");
     const end = source.indexOf("const checkNativeIdentity =", begin);
     let query;
@@ -1088,7 +1108,7 @@ function Get-CimInstance {
 );
 
 test("CDP metadata and WebSockets stay on the selected concrete endpoint without redirects or credentials", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const readTargets =");
   const end = source.indexOf("const connect =", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -1168,7 +1188,7 @@ test("CDP metadata and WebSockets stay on the selected concrete endpoint without
 });
 
 const nativeIdentityFixture = async (result) => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const normalizeListenerAddress =");
   const end = source.indexOf("const checkNativeIdentity = () => {", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -1307,7 +1327,7 @@ test("native identity diagnostic state clears on success while invalid output an
 });
 
 test("the actual monitor failure receipt attaches sanitized native identity diagnostics without Desktop actions", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("let evidence;\ntry {");
   const end = source.indexOf("} finally {", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -1428,7 +1448,7 @@ test(
 );
 
 test("the actual log watcher accepts newly appended same-second installation records and rotation", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const refreshFingerprint = async () => {");
   const end = source.indexOf("const readNativeIdentity = () => {", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -1547,7 +1567,7 @@ test(
 );
 
 test("the actual cleanup renderer program refuses any unowned newer turn", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const guardedBegin = source.indexOf("const guarded = (body) =>");
   const guardedEnd = source.indexOf("const waitUntil = async", guardedBegin);
   const cleanupBegin = source.indexOf("const cleanupExpression = () =>");
@@ -1614,7 +1634,7 @@ test("the actual cleanup renderer program refuses any unowned newer turn", async
 });
 
 test("the actual readiness probe reports the blocked prerequisite without calling a Desktop method", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const readinessExpression = () =>");
   const end = source.indexOf("const guarded = (body) =>", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -1678,7 +1698,7 @@ test("the actual readiness probe reports the blocked prerequisite without callin
 });
 
 test("readiness rejects an unverified retained client even when an original-request marker exists", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const readinessExpression = () =>");
   const end = source.indexOf("const guarded = (body) =>", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -1723,7 +1743,7 @@ test("readiness rejects an unverified retained client even when an original-requ
 });
 
 const pickerInspectionProgram = async (context) => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const pickerInspectionExpression = () =>");
   const end = source.indexOf("const sourceRuntimeSnapshotExpression =", begin);
   assert.ok(
@@ -2992,7 +3012,7 @@ test("monitor and production native current-path ancestry limits share the same 
     ),
     "utf8",
   );
-  const monitorSource = await readFile(script, "utf8");
+  const monitorSource = await readMonitorSource();
   const declaration =
     /const CODEX_NATIVE_CURRENT_FIBER_PATH_LIMIT\s*=\s*(\d+)\s*;/;
   const runtimeLimit = runtimeSource.match(declaration)?.[1];
@@ -3177,7 +3197,7 @@ test("picker inspection bounds catalog and observation receipts and never treats
 });
 
 test("picker target sweep deadlines shorten only its optional connection budget while default readiness timeouts stay unchanged", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const connect = async (");
   const end = source.indexOf("const readinessExpression =", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -3239,6 +3259,76 @@ test("picker target sweep deadlines shorten only its optional connection budget 
   }
 });
 
+test("CDP command timeouts retain the fixed local command without request content", async () => {
+  const source = await readMonitorSource();
+  const begin = source.indexOf("const connect = async (");
+  const end = source.indexOf("const readinessExpression =", begin);
+  assert.ok(begin >= 0 && end > begin);
+  for (const timedOutCommand of ["Runtime.enable", "Runtime.evaluate"]) {
+    const timers = new Map();
+    let timerId = 0;
+    class FixtureSocket {
+      listeners = new Map();
+      constructor() {
+        queueMicrotask(() => this.emit("open", {}));
+      }
+      addEventListener(name, callback) {
+        this.listeners.set(name, [
+          ...(this.listeners.get(name) || []),
+          callback,
+        ]);
+      }
+      emit(name, value) {
+        for (const callback of this.listeners.get(name) || []) callback(value);
+      }
+      send(text) {
+        const command = JSON.parse(text);
+        if (command.method === timedOutCommand) {
+          const timeout = [...timers.values()].at(-1);
+          queueMicrotask(timeout);
+        } else
+          queueMicrotask(() =>
+            this.emit("message", {
+              data: JSON.stringify({ id: command.id, result: {} }),
+            }),
+          );
+      }
+      close() {
+        this.emit("close", {});
+      }
+    }
+    const context = vm.createContext({
+      WebSocket: FixtureSocket,
+      Date: { now: () => 1000 },
+      setTimeout: (callback) => {
+        timers.set(++timerId, callback);
+        return timerId;
+      },
+      clearTimeout: (id) => timers.delete(id),
+      fail: (code) => new Error(code),
+      verificationDeadline: Infinity,
+    });
+    const connect = vm.runInContext(
+      source.slice(begin, end) + "; connect",
+      context,
+    );
+    const operation = async () => {
+      const candidate = await connect("ws://127.0.0.1:9229/fixture");
+      try {
+        await candidate.evaluate("redacted-private-expression", 8000);
+      } finally {
+        candidate.close();
+      }
+    };
+    await assert.rejects(operation(), (error) => {
+      assert.equal(error.message, "cdp_command_timeout");
+      assert.equal(error.cdpCommand, timedOutCommand);
+      assert.equal(JSON.stringify(error).includes("redacted-private"), false);
+      return true;
+    });
+  }
+});
+
 const runPickerTargetsFixture = async (
   definitions,
   {
@@ -3249,7 +3339,7 @@ const runPickerTargetsFixture = async (
     nativeFailureAt = 1,
   } = {},
 ) => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const run = async () => {");
   const end = source.indexOf("\nlet evidence;", begin);
   const helpers = source.indexOf("const PICKER_INSPECTION_TARGET_LIMIT =");
@@ -3320,7 +3410,12 @@ const runPickerTargetsFixture = async (
     connect: async (url) => {
       connected.push(url);
       const definition = byUrl.get(url);
-      if (definition.connectFailure) throw new Error(definition.connectFailure);
+      if (definition.connectFailure) {
+        const error = new Error(definition.connectFailure);
+        if (definition.connectCommand)
+          error.cdpCommand = definition.connectCommand;
+        throw error;
+      }
       return {
         evaluate: async (expression) => {
           assert.equal(expression, program);
@@ -3332,6 +3427,7 @@ const runPickerTargetsFixture = async (
             (!definition.failureAt || index + 1 === definition.failureAt)
           )
             throw new Error(definition.failure);
+          if (definition.invalidInspection) return undefined;
           const state = Array.isArray(definition.states)
             ? definition.states[Math.min(index, definition.states.length - 1)]
             : definition.state;
@@ -3509,8 +3605,71 @@ test("picker target sweep reports all failed or deadline-exhausted inspections a
   assert.equal(deadline.collection.targets[0].failure, "inspection_deadline");
 });
 
+test("picker sampling preserves initial finite target failures when no session can be sampled", async () => {
+  const fixture = await runPickerTargetsFixture(
+    [
+      { id: nativeTargetId(1), connectFailure: "cdp_connect_failed" },
+      { id: nativeTargetId(2), failure: "renderer_operation_rejected" },
+      { id: nativeTargetId(3), failure: "private-target-error-never-reflect" },
+    ],
+    { sampleCount: 3, sampleIntervalMs: 100 },
+  );
+  assert.equal(fixture.failure, "picker_inspection_unavailable");
+  assert.equal(fixture.collection.inspectedTargetCount, 0);
+  assert.equal(fixture.collection.sampling.complete, false);
+  assert.equal(fixture.collection.sampling.ownershipVerified, false);
+  assert.equal(fixture.collection.sampling.samples.length, 0);
+  const failures = new Map(
+    Array.from(fixture.collection.targets, (target) => [
+      target.targetId,
+      target.failure,
+    ]),
+  );
+  assert.equal(failures.get(nativeTargetId(1)), "cdp_connect_failed");
+  assert.equal(failures.get(nativeTargetId(2)), "renderer_operation_rejected");
+  assert.equal(failures.get(nativeTargetId(3)), "picker_target_unavailable");
+  assert.equal(
+    JSON.stringify(fixture.collection).includes("private-target-error"),
+    false,
+  );
+});
+
+test("picker target diagnostics distinguish connection, runtime enable, evaluation and result shape without reflected commands", async () => {
+  const fixture = await runPickerTargetsFixture(
+    [
+      { id: nativeTargetId(1), connectFailure: "cdp_connect_failed" },
+      {
+        id: nativeTargetId(2),
+        connectFailure: "cdp_command_timeout",
+        connectCommand: "Runtime.enable",
+      },
+      { id: nativeTargetId(3), failure: "cdp_command_timeout" },
+      { id: nativeTargetId(4), invalidInspection: true },
+      {
+        id: nativeTargetId(5),
+        connectFailure: "cdp_protocol_error",
+        connectCommand: "private-command-never-reflect",
+      },
+    ],
+    { sampleCount: 3 },
+  );
+  const rows = new Map(
+    Array.from(fixture.collection.targets, (row) => [row.targetId, row]),
+  );
+  assert.equal(rows.get(nativeTargetId(1)).failureStage, "connect");
+  assert.equal(rows.get(nativeTargetId(2)).failureStage, "runtime_enable");
+  assert.equal(rows.get(nativeTargetId(3)).failureStage, "runtime_evaluate");
+  assert.equal(rows.get(nativeTargetId(4)).failureStage, "result_shape");
+  assert.equal(rows.get(nativeTargetId(4)).failure, "picker_result_invalid");
+  assert.equal(rows.get(nativeTargetId(5)).failureStage, "connect");
+  assert.equal(
+    JSON.stringify(fixture.collection).includes("private-command"),
+    false,
+  );
+});
+
 test("picker inspection execution uses the existing monitor without a test thread, source injection or bridge requirement", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const run = async () => {");
   const end = source.indexOf("\nlet evidence;", begin);
   const helperBegin = source.indexOf("const PICKER_INSPECTION_TARGET_LIMIT =");
@@ -3596,7 +3755,7 @@ test("picker inspection execution uses the existing monitor without a test threa
 });
 
 test("picker inspection cannot be combined with mutating verifier modes", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const runDisposableTest =");
   const end = source.indexOf("const threadScopeEvidence =", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -3616,7 +3775,7 @@ test("picker inspection cannot be combined with mutating verifier modes", async 
 });
 
 test("picker inspection preserves the default bridge-only readiness mode", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const run = async () => {");
   const end = source.indexOf("\nlet evidence;", begin);
   const forbidden = () => {
@@ -3683,7 +3842,7 @@ test("picker inspection preserves the default bridge-only readiness mode", async
 });
 
 test("picker inspection accepts its explicit flag without consuming a value", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const options = new Map();");
   const end = source.indexOf("assert.equal(\n  process.platform,", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -3871,7 +4030,7 @@ test("picker sampling fails closed on pinned-session closure instead of reconnec
 });
 
 test("picker sampling options require explicit read-only inspection and finite count and interval bounds", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const runDisposableTest =");
   const end = source.indexOf("const threadScopeEvidence =", begin);
   const parse = (entries) =>
@@ -3952,7 +4111,7 @@ test("picker sampling options require explicit read-only inspection and finite c
 });
 
 test("owned thread read diagnostics classify only fixed protocol and initialization reasons", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const classifyOwnedThreadReadFailure =");
   const end = source.indexOf("const threadProjection =", begin);
   assert.ok(
@@ -4013,7 +4172,7 @@ test("owned thread read diagnostics classify only fixed protocol and initializat
 });
 
 test("owned thread read diagnostics never invoke getters or inherited error fields", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const classifyOwnedThreadReadFailure =");
   const end = source.indexOf("const threadProjection =", begin);
   assert.ok(begin >= 0 && end > begin);
@@ -4068,7 +4227,7 @@ test("owned thread read diagnostics never invoke getters or inherited error fiel
 });
 
 test("owned thread read RPC failures are projected inside the actual guarded renderer program", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const classifyBegin = source.indexOf(
     "const classifyOwnedThreadReadFailure =",
   );
@@ -4137,7 +4296,7 @@ test("owned thread read RPC failures are projected inside the actual guarded ren
 });
 
 test("owned thread initial read rejection remains terminal without retry or mutation replay", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const classifyBegin = source.indexOf(
     "const classifyOwnedThreadReadFailure =",
   );
@@ -4196,7 +4355,7 @@ test("owned thread initial read rejection remains terminal without retry or muta
 });
 
 const ownerAuditContext = async (overrides = {}) => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("// Private owner-audit IPC");
   const end = source.indexOf("const cleanupTemporaryDirectory =", begin);
   assert.ok(
@@ -4272,7 +4431,7 @@ const ownerAuditReady = () => ({
 });
 
 test("owner remote audit CLI requires an explicit isolated disposable overload without injection", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const ownerRemoteAudit =");
   const end = source.indexOf("const patchKey =", begin);
   assert.ok(
@@ -4560,7 +4719,7 @@ test("owner audit asynchronously owns the exact executable and waits actual clos
 });
 
 test("owner audit branches before the automatic sender and precompiles before creating the owned fixture", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const run = source.slice(source.indexOf("const run = async () =>"));
   assert.ok(
     run.indexOf("ownerAuditExecutable = await compileOwnerAuditExecutable(") <
@@ -4595,7 +4754,7 @@ test("owner audit branches before the automatic sender and precompiles before cr
 });
 
 test("owner audit Cargo selection accepts exact library crate kinds and refuses other artifacts", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const selectOwnerAuditExecutable =");
   const end = source.indexOf("const compileOwnerAuditExecutable =", begin);
   assert.ok(
@@ -4644,7 +4803,7 @@ test("owner audit Cargo selection accepts exact library crate kinds and refuses 
 });
 
 test("disposable provider is a random dedicated credential-free definition independent of current provider config", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const fixtureProviderDefinition =");
   const end = source.indexOf("const temporaryPrefix =", begin);
   assert.ok(
@@ -4780,7 +4939,7 @@ test("owner audit view diagnostics accept only fixed status, thread binding and 
 });
 
 const completionPollContext = async (owner, responses) => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const stage = owner
     ? 'stage = "owner_remote_completion";'
     : 'stage = "continued_completion";';
@@ -4875,7 +5034,7 @@ test("both completion polls treat a read rejection as terminal without retry or 
 });
 
 test("cleanup diagnostics classify only fixed reasons without raw errors or getter reads", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const projectCleanupResult =");
   const end = source.indexOf("const cleanupExpression =", begin);
   assert.ok(
@@ -4932,7 +5091,7 @@ test("cleanup diagnostics classify only fixed reasons without raw errors or gett
 });
 
 test("actual cleanup read, active-metadata and archive refusals emit fixed diagnostics with no retry", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const guardBegin = source.indexOf("const guarded = (body) =>");
   const guardEnd = source.indexOf("const waitUntil = async", guardBegin);
   const cleanupBegin = source.indexOf("const cleanupExpression = () =>");
@@ -5008,7 +5167,7 @@ test("actual cleanup read, active-metadata and archive refusals emit fixed diagn
 });
 
 test("pinned precreation readiness waits only for current canonical client eligibility and never retries RPC failure", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const waitForPinnedCreationReadiness =");
   const end = source.indexOf("const pickerInspectionExpression =", begin);
   assert.ok(
@@ -5136,7 +5295,7 @@ test("owner ready error snapshots require explicit terminal-failure proof and ne
 });
 
 test("owner fixture precommit accepts exact failed systemError but rejects active, unknown, wrong turn and nonfailure", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const ownerBegin = source.indexOf("const verifyOwnerRemoteFixture =");
   const begin = source.indexOf(
     "  const sameFailure = await connection.evaluate",
@@ -5175,7 +5334,7 @@ test("owner fixture precommit accepts exact failed systemError but rejects activ
 });
 
 test("initial fixture request is observed locally before the first thread read without retrying rejected RPCs", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const waitForInitialFixtureRequest =");
   const end = source.indexOf("const classifyOwnedThreadReadFailure =", begin);
   assert.ok(
@@ -5274,7 +5433,7 @@ test("canonical owner refusal requires exact submitted-false mutation-false GET 
 });
 
 test("only a closed native child plus canonical refusal and exact unchanged failed fixture clears uncertainty", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const resolveOwnerAuditMutationUncertainty =");
   const end = source.indexOf("const verifyOwnerRemoteFixture =", begin);
   assert.ok(
@@ -5400,7 +5559,7 @@ test("browser audit single-UI-submit success requires explicit context and never
 });
 
 test("browser audit is explicit with an absolute bundled runtime and preserves the normal native mode", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   const begin = source.indexOf("const ownerRemoteAudit =");
   const end = source.indexOf("const patchKey =", begin);
   const parse = (entries) =>
@@ -5439,7 +5598,7 @@ test("browser audit is explicit with an absolute bundled runtime and preserves t
 });
 
 test("all public browser diagnostics use the strict projector, never raw spreads", async () => {
-  const source = await readFile(script, "utf8");
+  const source = await readMonitorSource();
   assert.match(source, /projectOwnerRemoteBrowserAuditDiagnostics,/);
   assert.equal(
     (

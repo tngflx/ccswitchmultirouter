@@ -28,7 +28,7 @@ use super::{
     CodexAdapter, ProviderAdapter,
 };
 
-pub(crate) const CODEX_REQUEST_PREPARER_VERSION: u32 = 8;
+pub(crate) const CODEX_REQUEST_PREPARER_VERSION: u32 = 9;
 const DEFAULT_THIRD_PARTY_USER_AGENT: &str = concat!("CCSwitchMulti/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

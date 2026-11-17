@@ -18,6 +18,7 @@ use crate::reasoning_capabilities::{
 use reqwest::StatusCode;
 use serde_json::Value;
 use std::time::Duration;
+use url::Url;
 
 /// 发现请求超时（与 model_fetch 保持一致）。
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -311,7 +312,9 @@ pub async fn discover_openrouter(provider: &Provider, model: &str) -> DiscoveryO
     let Some(base) = base_url(provider) else {
         return DiscoveryOutcome::Unavailable;
     };
-    let models_url = openrouter_models_url(&base);
+    let Some(models_url) = openrouter_models_url(&base) else {
+        return DiscoveryOutcome::Unavailable;
+    };
     let Ok(http) = client() else {
         return DiscoveryOutcome::Unavailable;
     };
@@ -1158,18 +1161,38 @@ fn build_reasoning_capability(
     capability.validate().ok().map(|_| capability)
 }
 
-/// 归一化 OpenRouter models 端点：base 已含 `/api/v1` 时直接拼 `/models`。
-fn openrouter_models_url(base: &str) -> String {
-    let trimmed = base.trim_end_matches('/');
-    if trimmed.to_ascii_lowercase().ends_with("/api/v1") {
-        format!("{trimmed}/models")
-    } else if trimmed.to_ascii_lowercase().ends_with("/api") {
-        format!("{trimmed}/v1/models")
-    } else if trimmed.to_ascii_lowercase().ends_with("/models") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/api/v1/models")
+/// Derive the OpenRouter catalog sibling from either a gateway base or a full
+/// `/responses`/`/chat/completions` request endpoint. Reject credentials and
+/// query-bearing URLs so malformed discovery input cannot become authority.
+fn openrouter_models_url(base: &str) -> Option<String> {
+    let mut url = Url::parse(base.trim()).ok()?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
     }
+    let mut path = url.path().trim_end_matches('/').to_string();
+    let lower = path.to_ascii_lowercase();
+    for suffix in ["/chat/completions", "/responses"] {
+        if lower.ends_with(suffix) {
+            path.truncate(path.len() - suffix.len());
+            break;
+        }
+    }
+    let lower = path.to_ascii_lowercase();
+    let models_path = if lower.ends_with("/models") {
+        path
+    } else if lower.ends_with("/api/v1") {
+        format!("{path}/models")
+    } else if lower.ends_with("/api") {
+        format!("{path}/v1/models")
+    } else {
+        format!("{}/api/v1/models", path.trim_end_matches('/'))
+    };
+    url.set_path(&models_path);
+    Some(url.to_string())
 }
 
 /// vLLM 适配器：组合 `/version`、`/v1/models`、`/server_info?config_format=json`。
@@ -1809,21 +1832,49 @@ mod tests {
     #[test]
     fn openrouter_models_url_normalization() {
         assert_eq!(
-            openrouter_models_url("https://openrouter.ai/api/v1"),
-            "https://openrouter.ai/api/v1/models"
+            openrouter_models_url("https://openrouter.ai/api/v1").as_deref(),
+            Some("https://openrouter.ai/api/v1/models")
         );
         assert_eq!(
-            openrouter_models_url("https://openrouter.ai"),
-            "https://openrouter.ai/api/v1/models"
+            openrouter_models_url("https://openrouter.ai").as_deref(),
+            Some("https://openrouter.ai/api/v1/models")
         );
         assert_eq!(
-            openrouter_models_url("https://openrouter.ai/api/v1/"),
-            "https://openrouter.ai/api/v1/models"
+            openrouter_models_url("https://openrouter.ai/api/v1/").as_deref(),
+            Some("https://openrouter.ai/api/v1/models")
         );
         assert_eq!(
-            openrouter_models_url("https://openrouter.ai/api"),
-            "https://openrouter.ai/api/v1/models"
+            openrouter_models_url("https://openrouter.ai/api").as_deref(),
+            Some("https://openrouter.ai/api/v1/models")
         );
+    }
+
+    #[test]
+    fn openrouter_models_url_full_responses_endpoint_uses_sibling_catalog() {
+        for base in [
+            "https://openrouter.ai/api/v1/responses",
+            "https://openrouter.ai/api/v1/responses/",
+        ] {
+            assert_eq!(
+                openrouter_models_url(base).as_deref(),
+                Some("https://openrouter.ai/api/v1/models"),
+                "a full Responses URL must discover the same OpenRouter model catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_models_url_full_chat_endpoint_uses_sibling_catalog() {
+        for base in [
+            "https://openrouter.ai/api/v1/chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions/",
+        ] {
+            assert_eq!(
+                openrouter_models_url(base).as_deref(),
+                Some("https://openrouter.ai/api/v1/models"),
+                "a full Chat URL must discover the same OpenRouter model catalog"
+            );
+        }
     }
 
     #[test]

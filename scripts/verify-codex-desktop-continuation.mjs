@@ -1477,6 +1477,12 @@ const connect = async (url, deadline = Infinity) => {
         pending.delete(id);
         reject(fail("cdp_closed"));
       }
+    }).catch((error) => {
+      // Only local fixed command identities cross the diagnostic boundary.
+      // Request expressions, protocol messages and parameters remain private.
+      if (method === "Runtime.enable" || method === "Runtime.evaluate")
+        Object.defineProperty(error, "cdpCommand", { value: method });
+      throw error;
     });
   try {
     await command(
@@ -2519,6 +2525,7 @@ const inspectPickerTargets = async (
     "cdp_command_timeout",
     "renderer_operation_rejected",
     "verification_deadline",
+    "picker_result_invalid",
   ]);
   const inspect = async (candidate) => {
     if (Date.now() >= deadline) throw fail("inspection_deadline");
@@ -2527,7 +2534,7 @@ const inspectPickerTargets = async (
       Math.max(1, Math.min(8000, deadline - Date.now())),
     );
     if (!inspection || typeof inspection.runtimeInstalled !== "boolean")
-      throw fail("picker_target_unavailable");
+      throw fail("picker_result_invalid");
     return inspection;
   };
   const close = (candidate, observation) => {
@@ -2544,16 +2551,30 @@ const inspectPickerTargets = async (
       targetRef: target.targetRef,
     };
     let candidate;
+    let failureStage = "connect";
     try {
       if (Date.now() >= deadline) throw fail("inspection_deadline");
       attemptedTargetCount += 1;
       candidate = await connect(target.key, deadline);
+      failureStage = "runtime_evaluate";
       observation.inspection = await inspect(candidate);
       observation.status = "inspected";
     } catch (error) {
       delete observation.inspection;
       observation.status = "unavailable";
       const code = error?.message;
+      let command;
+      try {
+        command = Object.getOwnPropertyDescriptor(error, "cdpCommand")?.value;
+      } catch {}
+      observation.failureStage =
+        code === "picker_result_invalid"
+          ? "result_shape"
+          : command === "Runtime.enable"
+            ? "runtime_enable"
+            : command === "Runtime.evaluate"
+              ? "runtime_evaluate"
+              : failureStage;
       observation.failure =
         code === "inspection_deadline"
           ? code
@@ -2669,9 +2690,14 @@ const inspectPickerTargets = async (
         sampling.samples = [];
         sampling.ownershipVerified = false;
         for (const observation of observations) {
+          // An unavailable target has no retained proof to invalidate. Keep its
+          // original finite connection/evaluation failure instead of replacing
+          // the actual cause with a later sampling failure from another stage.
+          if (observation.status !== "inspected") continue;
           delete observation.inspection;
           observation.status = "unavailable";
           observation.failure = samplingFailure || "picker_target_unavailable";
+          observation.failureStage = "sampling";
         }
       }
       if (samplingFailure) sampling.failure = samplingFailure;
