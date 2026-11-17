@@ -37,6 +37,70 @@ export type CodexSubagentV2MutationProvider = Provider & {
   };
 };
 
+/** Verify backend persistence/projection evidence before presenting mutation success. */
+export function evaluateCodexSubagentMutationResult(
+  result: CodexSubagentV2MutationProvider,
+): string {
+  const verification = result.verification;
+  if (!verification) {
+    throw new Error(
+      "Backend did not return Codex Agent file-write verification.",
+    );
+  }
+  if (!verification.databasePersisted) {
+    throw new Error(
+      "Backend did not confirm that the V2 sub-agent configuration was written to the database.",
+    );
+  }
+  if (verification.activation !== "restart_codex_and_start_new_session") {
+    throw new Error(
+      "Backend returned inconsistent Codex Agent activation conditions.",
+    );
+  }
+
+  switch (result.projection?.status) {
+    case "applied": {
+      const filesVerified =
+        Array.isArray(verification.roleFiles) &&
+        verification.roleFiles.every(
+          (file) => file.exists && file.contentMatches,
+        );
+      if (verification.roleFilesStatus !== "verified" || !filesVerified) {
+        throw new Error(
+          "Codex Agent file read-back verification failed after writing.",
+        );
+      }
+      return "Database and Codex Agent file were written and read back successfully; restart Codex/app-server and create a new session to apply";
+    }
+    case "not_required":
+      if (
+        verification.roleFilesStatus !== "not_required" ||
+        !Array.isArray(verification.roleFiles) ||
+        verification.roleFiles.length !== 0
+      ) {
+        throw new Error(
+          "Codex Agent file verification is inconsistent for a non-active plan.",
+        );
+      }
+      return "Database saved; the current plan is inactive, so the Codex Agent file was not changed";
+    case "pending_retry":
+      if (
+        verification.roleFilesStatus !== "pending_retry" ||
+        !Array.isArray(verification.roleFiles) ||
+        verification.roleFiles.length !== 0
+      ) {
+        throw new Error(
+          "Codex Agent pending-retry state failed backend consistency checks.",
+        );
+      }
+      return "Database saved; Codex Agent file projection is pending an automatic retry";
+    default:
+      throw new Error(
+        "Backend did not return a clear Codex Agent projection state.",
+      );
+  }
+}
+
 export type CodexSubagentV2ReconcileAction =
   | "sync_catalog"
   | "remove_all_invalid"

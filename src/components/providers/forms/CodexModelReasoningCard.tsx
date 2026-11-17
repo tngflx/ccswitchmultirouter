@@ -7,7 +7,7 @@ import type {
 
 /**
  * P3 模型卡片：展示单模型「最终生效」的推理能力（与 catalog / 请求 / Sub-Agent
- * 同源），以及 unknown 状态下的动作。
+ * 同源），以及只读元数据刷新和 unknown 状态下的动作。
  *
  * 设计原则：
  * - 只读展示 resolved 结果，不在此处编辑（编辑走下方既有手动声明 UI）。
@@ -174,6 +174,7 @@ export function CodexModelReasoningCard({
   const controlKind = reasoningControlKind(resolution);
   const { resolved, detection } = resolution;
   const isUnknown = status === "unknown";
+  const canRedetect = isUnknown || resolution.source !== "user";
   const hasUsableDetection =
     resolution.hasDetectionCandidate &&
     Boolean(
@@ -271,6 +272,25 @@ export function CodexModelReasoningCard({
         </div>
       ) : null}
 
+      {canRedetect ? (
+        <div className="space-y-2">
+          <p className="text-muted-foreground">
+            Refreshes provider metadata only; does not generate a model response
+            or change Included models or manual declarations.
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            title="Refresh provider metadata only; no model response is generated."
+            onClick={onRedetect}
+            disabled={redetecting}
+          >
+            {redetecting ? "Detecting…" : "Detect again"}
+          </Button>
+        </div>
+      ) : null}
+
       {isUnknown ? (
         <div className="space-y-2">
           <p className="text-muted-foreground">
@@ -278,15 +298,6 @@ export function CodexModelReasoningCard({
             server default is used. You can:
           </p>
           <div className="flex flex-wrap gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={onRedetect}
-              disabled={redetecting}
-            >
-              {redetecting ? "Detecting…" : "Detect again"}
-            </Button>
             {hasUsableDetection ? (
               <Button
                 type="button"

@@ -1,5 +1,6 @@
 import { Button } from "@/components/ui/button";
 import type { CodexReasoningEffort } from "@/types";
+import type { CodexModelReasoningResolution } from "@/types/codexSubagentV2";
 import { useState } from "react";
 
 const CAPABILITY_SOURCE_LABELS: Record<string, string> = {
@@ -24,6 +25,7 @@ function formatCapabilitySource(source: string): string {
 export interface CodexModelReasoningSummaryProps {
   model: string;
   source: string;
+  supportKind?: CodexModelReasoningResolution["resolved"]["supportKind"];
   selectableEfforts: string[];
   defaultEffort?: string;
   ultraEnabled: boolean;
@@ -40,6 +42,7 @@ export interface CodexModelReasoningSummaryProps {
 export function CodexModelReasoningSummary({
   model,
   source,
+  supportKind,
   selectableEfforts,
   defaultEffort,
   ultraEnabled,
@@ -51,6 +54,7 @@ export function CodexModelReasoningSummary({
 }: CodexModelReasoningSummaryProps) {
   const displayModel = model || "Unnamed model";
   const displaySource = formatCapabilitySource(source);
+  const isBooleanOnly = supportKind === "boolean_only";
   const [requestedUltraSetup, setRequestedUltraSetup] = useState(false);
   const unavailableUltraEffort =
     ultraEffort && !ultraEfforts.includes(ultraEffort)
@@ -79,12 +83,20 @@ export function CodexModelReasoningSummary({
         <p className="text-muted-foreground">
           Capability source: {displaySource}
         </p>
-        <p className="text-muted-foreground">
-          Codex levels: {selectableEfforts.join(" / ") || "Not declared"}
-        </p>
-        <p className="text-muted-foreground">
-          Default: {defaultEffort ?? "Model default"}
-        </p>
+        {isBooleanOnly ? (
+          <p className="text-muted-foreground">
+            Reasoning control: Thinking on/off
+          </p>
+        ) : (
+          <>
+            <p className="text-muted-foreground">
+              Codex levels: {selectableEfforts.join(" / ") || "Not declared"}
+            </p>
+            <p className="text-muted-foreground">
+              Default: {defaultEffort ?? "Model default"}
+            </p>
+          </>
+        )}
       </div>
       <div className="space-y-1 border-t pt-3 lg:border-l lg:border-t-0 lg:pl-3 lg:pt-0">
         <span className="label text-muted-foreground">Ultra</span>

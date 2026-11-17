@@ -1,37 +1,12 @@
-import { randomUUID } from "node:crypto";
-import {
-  existsSync,
-  closeSync,
-  fstatSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  readSync,
-  realpathSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { realpathSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import {
   parseWindowsJsonQueryOutput,
   runWindowsJsonQuery,
   windowsJsonQueryCommand,
 } from "./windows-json-query.mjs";
-
-const SCRIPT_ROOT = fileURLToPath(new URL(".", import.meta.url));
-export const GUARDIAN_RUNTIME_FILES = Object.freeze([
-  "watch-ccswitchmulti.mjs",
-  "ccswitchmulti-guardian-core.mjs",
-  "windows-json-query.mjs",
-  "dev-watchdog-policy.mjs",
-  "dev-recovery-output.mjs",
-  "dev-watchdog-identity.mjs",
-  "dev-recovery-policy.json",
-]);
 
 const VALUE_OPTIONS = new Map(
   [
@@ -57,17 +32,6 @@ const SWITCH_OPTIONS = new Map([
   ["-help", "help"],
   ["--help", "help"],
 ]);
-
-export function assertGuardianNodeVersion(version = process.versions.node) {
-  const [major, minor] = String(version).split(".").map(Number);
-  if (
-    !Number.isInteger(major) ||
-    !Number.isInteger(minor) ||
-    major < 22 ||
-    (major === 22 && minor < 12)
-  )
-    throw new Error("The JavaScript watchdog requires Node.js 22.12 or newer.");
-}
 
 export function parseGuardianInstallerArguments(arguments_) {
   const result = {};
@@ -351,91 +315,24 @@ $processes = @(Get-CimInstance Win32_Process -Filter "Name='node.exe' OR Name='p
 }
 
 export function guardianTaskMutationCommand(operation, options, expectedTask) {
-  const prelude = taskCommandPrelude({ ...options, expectedTask });
-  if (!["register", "unregister", "start"].includes(operation))
-    throw new Error("Unknown watchdog task operation.");
-  const body =
-    operation === "register"
-      ? `$action = New-ScheduledTaskAction -Execute $config.nodeExecutable -Argument $config.taskArguments
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentSid
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-$principal = New-ScheduledTaskPrincipal -UserId $currentSid -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskPath '\\' -TaskName $config.taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null`
-      : operation === "unregister"
-        ? `if ($null -ne $config.expectedTask) { Unregister-ScheduledTask -TaskPath '\\' -TaskName $config.taskName -Confirm:$false -ErrorAction Stop }`
-        : `Start-ScheduledTask -TaskPath '\\' -TaskName $config.taskName -ErrorAction Stop`;
-  return `${prelude}\nAssert-UnchangedWatchdogTask\n${body}\n[pscustomobject]@{ok=$true} | ConvertTo-Json -Compress`;
-}
-
-export function assertGuardianRootSafe(root) {
-  let current = root;
-  while (true) {
-    if (existsSync(current) && lstatSync(current).isSymbolicLink())
-      throw new Error(
-        "The guardian directory must not traverse a symbolic link or junction.",
-      );
-    if (existsSync(current) && !lstatSync(current).isDirectory())
-      throw new Error("The guardian directory must contain directories only.");
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
+  // This compatibility boundary may retire an owned legacy task, never create
+  // or start another production recovery owner. Refuse before even serializing
+  // configuration so direct imports have the same fail-closed contract.
+  if (operation !== "unregister")
+    throw new Error("Legacy watchdog task migration only supports unregister.");
+  if (expectedTask !== null) {
+    validateSnapshot(
+      {
+        currentSid: expectedTask?.ownerSid,
+        task: expectedTask,
+        processes: [],
+      },
+      options,
+    );
   }
-}
-
-export function stageGuardianRuntime({
-  sourceRoot = SCRIPT_ROOT,
-  guardianRoot,
-}) {
-  assertGuardianRootSafe(guardianRoot);
-  const files = GUARDIAN_RUNTIME_FILES.map((name) => {
-    const source = path.join(sourceRoot, name);
-    const target = path.join(guardianRoot, name);
-    if (
-      !existsSync(source) ||
-      !lstatSync(source).isFile() ||
-      lstatSync(source).isSymbolicLink()
-    )
-      throw new Error(
-        "A required JavaScript guardian runtime file is missing.",
-      );
-    if (
-      existsSync(target) &&
-      (!lstatSync(target).isFile() || lstatSync(target).isSymbolicLink())
-    )
-      throw new Error("A guardian runtime target is not a regular file.");
-    return {
-      target,
-      content: readFileSync(source),
-      previous: existsSync(target) ? readFileSync(target) : null,
-    };
-  });
-  return () => {
-    assertGuardianRootSafe(guardianRoot);
-    mkdirSync(guardianRoot, { recursive: true });
-    const applied = [];
-    const rollback = () => {
-      for (const file of applied.toReversed()) {
-        if (file.previous === null) rmSync(file.target, { force: true });
-        else writeFileSync(file.target, file.previous);
-      }
-    };
-    try {
-      for (const file of files) {
-        const temporary = `${file.target}.${randomUUID()}.tmp`;
-        try {
-          writeFileSync(temporary, file.content, { flag: "wx" });
-          renameSync(temporary, file.target);
-          applied.push(file);
-        } finally {
-          rmSync(temporary, { force: true });
-        }
-      }
-      return rollback;
-    } catch (error) {
-      rollback();
-      throw error;
-    }
-  };
+  const prelude = taskCommandPrelude({ ...options, expectedTask });
+  const body = `if ($null -ne $config.expectedTask) { Unregister-ScheduledTask -TaskPath '\\' -TaskName $config.taskName -Confirm:$false -ErrorAction Stop }`;
+  return `${prelude}\nAssert-UnchangedWatchdogTask\n${body}\n[pscustomobject]@{ok=$true} | ConvertTo-Json -Compress`;
 }
 
 function queryWindows(script, name, queryOptions) {
@@ -483,96 +380,12 @@ function validateSnapshot(snapshot, options) {
     );
 }
 
-export function guardianStartupReceiptMatches(logPath, identity, startedAtMs) {
-  let descriptor;
-  try {
-    descriptor = openSync(logPath, "r");
-    const length = fstatSync(descriptor).size;
-    const offset = Math.max(0, length - 65_536);
-    const bytes = Buffer.alloc(Math.min(length, 65_536));
-    const read = readSync(descriptor, bytes, 0, bytes.length, offset);
-    const lines = bytes.subarray(0, read).toString("utf8").split(/\r?\n/u);
-    if (offset > 0) lines.shift();
-    return lines.some((line) => {
-      let record;
-      try {
-        record = JSON.parse(line);
-      } catch {
-        return false;
-      }
-      return (
-        record?.event === "guardian-started" &&
-        Date.parse(record.timestamp) >= startedAtMs &&
-        record.detail?.GuardianProcessId === identity.pid &&
-        record.detail?.GuardianStartTimeUtc === identity.startedAtUtc
-      );
-    });
-  } catch (error) {
-    if (error.code === "ENOENT") return false;
-    throw new Error("Cannot read the JavaScript guardian startup receipt.");
-  } finally {
-    if (descriptor !== undefined) closeSync(descriptor);
-  }
-}
-
-export async function waitForGuardianStartup(
-  options,
-  {
-    inspect,
-    startedAtMs,
-    now = Date.now,
-    wait = (milliseconds) =>
-      new Promise((resolve) => setTimeout(resolve, milliseconds)),
-    lockExists = (value) => existsSync(value),
-    startupReceiptMatches = guardianStartupReceiptMatches,
-    timeoutMs = 45_000,
-  } = {},
-) {
-  const deadline = now() + timeoutMs;
-  while (now() <= deadline) {
-    const snapshot = await inspect();
-    validateSnapshot(snapshot, options);
-    if (
-      !snapshot.task ||
-      !sameWindowsPath(
-        snapshot.task.actions[0].execute,
-        options.nodeExecutable,
-      ) ||
-      snapshot.task.actions[0].arguments !== guardianTaskArguments(options)
-    )
-      throw new Error(
-        "The JavaScript watchdog task action changed while waiting for startup.",
-      );
-    const processes = ownedGuardianProcesses(snapshot, options).filter(
-      (identity) =>
-        path.win32.basename(identity.executablePath).toLowerCase() ===
-          "node.exe" &&
-        sameWindowsPath(identity.executablePath, options.nodeExecutable) &&
-        Date.parse(identity.startedAtUtc) >= startedAtMs,
-    );
-    if (processes.length > 1)
-      throw new Error("More than one owned JavaScript watchdog started.");
-    if (
-      processes.length === 1 &&
-      lockExists(path.win32.join(options.guardianRoot, "guardian.lock")) &&
-      startupReceiptMatches(
-        path.win32.join(options.guardianRoot, "guardian.jsonl"),
-        processes[0],
-        startedAtMs,
-      )
-    )
-      return processes[0].pid;
-    if (now() >= deadline) break;
-    await wait(Math.min(2000, deadline - now()));
-  }
-  throw new Error(
-    "The JavaScript watchdog did not publish a process and lock before the startup deadline.",
-  );
-}
-
-export async function installGuardian(options_, dependencies = {}) {
-  if (options_.help) throw new Error("Help is a CLI-only option.");
-  if (!options_.uninstall) assertGuardianNodeVersion(dependencies.nodeVersion);
+export async function installGuardian(options_ = {}, dependencies = {}) {
+  if (options_?.help) throw new Error("Help is a CLI-only option.");
+  // Enforce singular Rust production ownership for imports as well as the CLI.
+  // Check the raw option before normalization or observing any dependency;
+  // only an explicit boolean uninstall request may touch legacy task state.
+  assertProductionGuardianInstallSupported(options_);
   const options = normalizeGuardianInstallerOptions(options_, dependencies);
   const query = dependencies.query ?? queryWindows;
   const inspect =
@@ -616,79 +429,36 @@ export async function installGuardian(options_, dependencies = {}) {
   const ownedProcesses = ownedGuardianProcesses(snapshot, options);
   const baseResult = {
     taskName: options.taskName,
+    taskPresent: Boolean(snapshot.task),
     guardianRoot: options.guardianRoot,
     nodeExecutable: options.nodeExecutable,
     taskArguments: guardianTaskArguments(options),
     stoppedProcesses: [],
     dryRun: options.dryRun,
   };
-  let applyRuntime;
-  if (!options.uninstall) {
-    const checkFile =
-      dependencies.isRegularFile ??
-      ((value) => existsSync(value) && lstatSync(value).isFile());
-    if (!checkFile(options.nodeExecutable))
-      throw new Error("The scheduled Node.js executable is unavailable.");
-    if (!checkFile(options.installedExecutable))
-      throw new Error("The installed application executable is missing.");
-    applyRuntime = (dependencies.stageRuntime ?? stageGuardianRuntime)({
-      sourceRoot: dependencies.sourceRoot ?? SCRIPT_ROOT,
-      guardianRoot: options.guardianRoot,
-    });
-  }
   if (options.dryRun)
     return {
       ...baseResult,
-      operation: options.uninstall ? "uninstall" : "install",
+      operation: "uninstall",
       matchingProcesses: ownedProcesses.map(({ pid }) => pid),
-      runtimeFiles: options.uninstall ? [] : GUARDIAN_RUNTIME_FILES,
+      runtimeFiles: [],
     };
-  if (options.uninstall) {
-    await mutate("unregister", snapshot.task);
-    for (const identity of ownedProcesses) {
-      await stop(identity);
-      baseResult.stoppedProcesses.push(identity.pid);
-    }
-    // Keep lock, logs, maintenance leases, and unrelated files. Uninstall owns
-    // the task and exact process identities, never a recursive directory delete.
-    return { ...baseResult, taskRemoved: Boolean(snapshot.task) };
-  }
+  await mutate("unregister", snapshot.task);
   for (const identity of ownedProcesses) {
     await stop(identity);
     baseResult.stoppedProcesses.push(identity.pid);
   }
-  const rollback = applyRuntime();
-  try {
-    await mutate("register", snapshot.task);
-  } catch (error) {
-    rollback();
-    throw error;
+  // Keep lock, logs, maintenance leases, and unrelated files. Uninstall owns
+  // the task and exact process identities, never a recursive directory delete.
+  return { ...baseResult, taskRemoved: Boolean(snapshot.task) };
+}
+
+export function assertProductionGuardianInstallSupported(options) {
+  if (options?.uninstall !== true) {
+    throw new Error(
+      "Production recovery now uses the built-in Rust watchdog. Enable it in Settings > Connections > Crash recovery. The legacy scheduled guardian cannot be installed; use --uninstall to remove an existing task.",
+    );
   }
-  if (!options.noStart) {
-    const registered = await inspect();
-    validateSnapshot(registered, options);
-    if (
-      !registered.task ||
-      registered.task.actions[0].execute !== options.nodeExecutable ||
-      registered.task.actions[0].arguments !== guardianTaskArguments(options)
-    )
-      throw new Error(
-        "The registered JavaScript watchdog task does not match the requested action.",
-      );
-    const startedAtMs = (dependencies.now ?? Date.now)();
-    await mutate("start", registered.task);
-    baseResult.watcherPid = await (
-      dependencies.waitForStartup ?? waitForGuardianStartup
-    )(options, {
-      inspect,
-      startedAtMs,
-      now: dependencies.now,
-      wait: dependencies.wait,
-      lockExists: dependencies.lockExists,
-      startupReceiptMatches: dependencies.startupReceiptMatches,
-    });
-  }
-  return { ...baseResult, installed: true, startRequested: !options.noStart };
 }
 
 if (
@@ -699,9 +469,10 @@ if (
     const cliOptions = parseGuardianInstallerArguments(process.argv.slice(2));
     if (cliOptions.help) {
       process.stdout.write(
-        "Usage: node scripts/install-ccswitchmulti-watchdog.mjs [options]\n\nInstalls the current-user production watchdog with Node.js 22.12 or newer.\nWindows task and identity APIs use inline PowerShell 7 commands.\n\n  --guardian-root PATH\n  --task-name NAME\n  --installed-executable PATH\n  --config-path PATH\n  --port NUMBER\n  --poll-seconds NUMBER\n  --failure-threshold-seconds NUMBER\n  --no-start\n  --uninstall\n  --dry-run\n  --help\n\nLegacy -GuardianRoot/-TaskName/-InstalledExecutable/-ConfigPath/-Port/\n-PollSeconds/-FailureThresholdSeconds/-NoStart/-Uninstall are accepted.\n",
+        "Usage: node scripts/install-ccswitchmulti-watchdog.mjs [options]\n\nLegacy scheduled watchdog migration tool. New installs are disabled: production recovery is controlled by the built-in Rust watchdog in Settings > Connections > Crash recovery. Existing owned tasks can be removed with --uninstall. Node.js 22.12 or newer is needed for legacy inspection.\nWindows task and identity APIs use inline PowerShell 7 commands.\n\n  --guardian-root PATH\n  --task-name NAME\n  --installed-executable PATH\n  --config-path PATH\n  --port NUMBER\n  --poll-seconds NUMBER\n  --failure-threshold-seconds NUMBER\n  --no-start\n  --uninstall\n  --dry-run\n  --help\n\nLegacy -GuardianRoot/-TaskName/-InstalledExecutable/-ConfigPath/-Port/\n-PollSeconds/-FailureThresholdSeconds/-NoStart/-Uninstall are accepted.\n",
       );
     } else {
+      assertProductionGuardianInstallSupported(cliOptions);
       if (process.platform !== "win32")
         throw new Error("The scheduled watchdog installer requires Windows.");
       const result = await installGuardian(cliOptions, {

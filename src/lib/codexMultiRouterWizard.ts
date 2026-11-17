@@ -626,6 +626,7 @@ export function resolveWizardModelNameCollisions(
 function resolveWizardSourceModelContext(sourceProviders: Provider[]): {
   sources: Provider[];
   sourceModelId: WizardSourceModelId;
+  sourceCatalogByProviderId: Map<string, CodexCatalogModel[]>;
 } {
   const sources = resolveWizardModelNameCollisions(sourceProviders);
   // Collision resolution changes draft picker names only. Keep the original
@@ -633,8 +634,16 @@ function resolveWizardSourceModelContext(sourceProviders: Provider[]): {
   // upstream wire name. This map is transient and cannot become another source
   // of persisted catalog truth. Reuse it when restoring saved draft choices.
   const sourceIdByResolvedModel = new Map<CodexCatalogModel, string>();
+  const sourceCatalogByProviderId = new Map(
+    sourceProviders.map((provider) => [
+      provider.id,
+      readWizardModelCatalog(provider),
+    ]),
+  );
   sources.forEach((provider, providerIndex) => {
-    const originals = readWizardModelCatalog(sourceProviders[providerIndex]);
+    const originals = sourceCatalogByProviderId.get(
+      sourceProviders[providerIndex].id,
+    )!;
     readWizardModelCatalog(provider).forEach((model, modelIndex) => {
       sourceIdByResolvedModel.set(model, originals[modelIndex].model.trim());
     });
@@ -642,7 +651,7 @@ function resolveWizardSourceModelContext(sourceProviders: Provider[]): {
   const sourceModelId: WizardSourceModelId = (provider, model) =>
     sourceIdByResolvedModel.get(model) ??
     defaultWizardSourceModelId(provider, model);
-  return { sources, sourceModelId };
+  return { sources, sourceModelId, sourceCatalogByProviderId };
 }
 
 // 按 provider 名称和模型名推断默认前缀；这些前缀只作为向导初始规则，后续可在工作台细调。
@@ -1032,7 +1041,7 @@ export function collectWizardRouteAliasSelectionIssues(
     if (!provider) continue;
     const routeLabel = wizardRouteDisplayLabel(route, provider.name);
     const sourceIndex = buildCodexModelReferenceIndex(
-      readIncludedWizardModelCatalog(provider),
+      readWizardModelCatalog(provider),
     );
     const selectedSet =
       route.modelSelection?.mode === "all"
@@ -1087,6 +1096,7 @@ export function buildWizardRoutesFromSources(
   providers: Provider[],
   existingRoutes: CodexRoutingRouteV2[] = [],
   sourceModelId: WizardSourceModelId = defaultWizardSourceModelId,
+  sourceCatalogByProviderId?: ReadonlyMap<string, CodexCatalogModel[]>,
 ): CodexRoutingRouteV2[] {
   return providers.filter(hasWizardModelCatalog).map((provider) => {
     const modelMap = buildWizardRouteModelMap(provider, sourceModelId);
@@ -1096,14 +1106,28 @@ export function buildWizardRoutesFromSources(
     const canonicalModels = new Set(
       canonicalWizardModelIds(provider, sourceModelId),
     );
+    const sourceModels = readWizardModelCatalog(provider);
+    const originalCatalog = sourceCatalogByProviderId?.get(provider.id);
+    // Current public IDs own references before any visible/wire projection.
+    // This boundary intentionally accepts public and wire IDs only: historical
+    // metadata aliases cannot carry a saved route name into a renamed row.
     const sourceIndex = buildCodexModelReferenceIndex(
-      readIncludedWizardModelCatalog(provider).map((model) => ({
-        model: sourceModelId(provider, model),
+      (originalCatalog ?? sourceModels).map((model) => ({
+        model: model.model,
         upstreamModel: model.upstreamModel ?? model.upstream_model,
+        enabled: model.enabled,
         ...(isGeneratedCodexApiKeyGroupModel(model)
           ? { apiKeyGroupGenerated: true }
           : {}),
       })),
+    );
+    const sourceIdByCanonical = new Map(
+      sourceModels.map((model) => {
+        const projected = sourceModelId(provider, model);
+        // In a collision context, sourceModelId is the original public row ID.
+        // Otherwise this direct helper's legacy projection may use wire IDs.
+        return [originalCatalog ? projected : model.model.trim(), projected];
+      }),
     );
     const aliases = { ...(modelMap ?? {}) };
     // A generated collision alias becomes part of the route contract on first
@@ -1111,7 +1135,8 @@ export function buildWizardRoutesFromSources(
     for (const [visible, canonical] of Object.entries(
       existingRoute?.aliases ?? {},
     )) {
-      const target = sourceIndex.resolve(canonical);
+      const resolved = sourceIndex.resolve(canonical);
+      const target = resolved ? sourceIdByCanonical.get(resolved) : undefined;
       if (!target || !canonicalModels.has(target)) continue;
       for (const [generatedVisible, generatedTarget] of Object.entries(
         aliases,
@@ -1299,9 +1324,11 @@ export function initialWizardCatalogModelOrder(
   const selectedSourceIds = new Set(
     initialWizardSelectedSourceIds(existingPlan, sourceProviders),
   );
-  const { sources, sourceModelId } = resolveWizardSourceModelContext(
-    sourceProviders.filter((source) => selectedSourceIds.has(source.id)),
+  const selectedSources = sourceProviders.filter((source) =>
+    selectedSourceIds.has(source.id),
   );
+  const { sources, sourceModelId, sourceCatalogByProviderId } =
+    resolveWizardSourceModelContext(selectedSources);
   const sourceById = new Map(
     sources.map((provider) => [provider.id, provider]),
   );
@@ -1311,13 +1338,7 @@ export function initialWizardCatalogModelOrder(
     const source = sourceById.get(route.targetProviderId);
     if (!source) continue;
     const sourceIndex = buildCodexModelReferenceIndex(
-      readIncludedWizardModelCatalog(source).map((model) => ({
-        ...model,
-        model: sourceModelId(source, model),
-        ...(isGeneratedCodexApiKeyGroupModel(model)
-          ? { apiKeyGroupGenerated: true }
-          : {}),
-      })),
+      sourceCatalogByProviderId.get(source.id) ?? [],
     );
     const selected =
       route.modelSelection?.mode === "include"
@@ -1549,8 +1570,11 @@ export function buildCodexMultiRouterWizardPlan(
   existingPlan?: Provider | null,
   options: WizardPlanBuildOptions = {},
 ): WizardPlanBuildResult {
-  const { sources: collisionResolvedSources, sourceModelId } =
-    resolveWizardSourceModelContext(sourceProviders);
+  const {
+    sources: collisionResolvedSources,
+    sourceModelId,
+    sourceCatalogByProviderId,
+  } = resolveWizardSourceModelContext(sourceProviders);
   const resolvedSources = filterWizardProvidersByModelOrder(
     collisionResolvedSources,
     options.catalogModelOrder,
@@ -1596,6 +1620,7 @@ export function buildCodexMultiRouterWizardPlan(
     resolvedSources,
     existingRoutingV2?.routes ?? [],
     sourceModelId,
+    sourceCatalogByProviderId,
   ).map((route) => {
     if (!options.catalogModelOrder) return route;
     const selectedSource = resolvedSources.find(
@@ -1637,6 +1662,9 @@ export function buildCodexMultiRouterWizardPlan(
     schemaVersion: 2,
     enabled: true,
     subagentVersion,
+    // New and upgraded plans default to High; explicit saved choices, including
+    // the Profile opt-out, remain canonical.
+    subagentReasoningEffort: existingRouting?.subagentReasoningEffort ?? "high",
     subagentV2: subagentNameRedirector.remapSubagentV2(
       existingRouting?.subagentV2,
     ),

@@ -164,6 +164,13 @@ const verifyFreshHandoff = (thread, source, newThreadId, phase) => {
   }
   return String(thread?.name || "").trim();
 };
+const handoffReasoningEffort = (source) => {
+  const raw =
+    typeof source?.reasoningEffort === "string"
+      ? source.reasoningEffort.trim().toLowerCase()
+      : "";
+  return CODEX_NATIVE_REASONING_EFFORTS.has(raw) ? raw : null;
+};
 const runFreshSessionFromSummary = async (sourceThreadId, summary) => {
   const sourceId = String(sourceThreadId || "").trim();
   const handoffSummary = String(summary || "").trim();
@@ -175,11 +182,10 @@ const runFreshSessionFromSummary = async (sourceThreadId, summary) => {
     let mutationAttempted = false;
     try {
       const source = await readExactHandoffThread(client, sourceId, false);
-      const startParams = {
-        config: {
-          model_reasoning_effort: String(source?.reasoningEffort || "medium"),
-        },
-      };
+      const startParams = { config: {} };
+      const reasoningEffort = handoffReasoningEffort(source);
+      if (reasoningEffort)
+        startParams.config.model_reasoning_effort = reasoningEffort;
       for (const key of ["cwd", "model", "modelProvider"])
         if (source?.[key]) startParams[key] = source[key];
       mutationAttempted = true;

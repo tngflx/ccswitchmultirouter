@@ -130,7 +130,11 @@ pub fn record_startup() -> Option<PreviousRunReport> {
 /// 退出原因由调用方传入，便于区分托盘退出、窗口关闭、设置重启和更新安装等不同路径。
 pub fn record_clean_exit(reason: &str, exit_code: i32) {
     crate::proxy::codex_turn_recovery::clear_persisted_recovery();
-    append_event("clean_exit", reason, Some(exit_code), None);
+    let marker = read_run_marker();
+    let identity = crate::process_identity::current_process_identity();
+    let scope = crate::process_identity::config_scope_fingerprint_for(&get_app_config_dir());
+    let details = clean_exit_details(marker.as_ref(), identity.as_ref(), &scope);
+    append_event("clean_exit", reason, Some(exit_code), details);
     if let Err(err) = remove_run_marker_if_owned() {
         log::warn!("清理应用运行 marker 失败: {err}");
     }
@@ -257,7 +261,9 @@ fn classify_previous_run(
         if matches!(event.kind.as_str(), "panic" | "forced_exit") {
             confirmed_crash = true;
         }
-        if event.kind == "clean_exit" {
+        if event.kind == "clean_exit"
+            && (event.details.is_none() || exit_event_matches_marker(event, marker))
+        {
             clean_exit = true;
             planned_restart |= is_planned_exit_reason(&event.reason);
         }
@@ -282,6 +288,63 @@ fn startup_event_kind(classification: PreviousRunClassification) -> &'static str
     }
 }
 
+fn clean_exit_details(
+    marker: Option<&RunMarker>,
+    identity: Option<&crate::process_identity::ProcessIdentity>,
+    config_scope: &str,
+) -> Option<Value> {
+    let marker = marker?;
+    let identity = identity?;
+    if !marker_matches_process(marker, identity)
+        || marker.config_scope.as_deref() != Some(config_scope)
+    {
+        return None;
+    }
+    Some(json!({
+        "startedAt": marker.started_at,
+        "executablePath": identity.executable_path,
+        "processStartedAtTicks": identity.started_at_ticks.to_string(),
+        "configScope": config_scope,
+    }))
+}
+
+/// The supervisor uses the same exit classifier as startup, but only an exact
+/// identity-bound clean event can override a leftover marker. Older PID-only
+/// events remain supported by the startup migration path, not by live ownership.
+pub(crate) fn watchdog_exit_classification(
+    config_dir: &std::path::Path,
+    marker_json: &str,
+    expected: &crate::process_identity::ProcessIdentity,
+) -> Option<PreviousRunClassification> {
+    let marker: RunMarker = serde_json::from_str(marker_json).ok()?;
+    let scope = crate::process_identity::config_scope_fingerprint_for(config_dir);
+    if !marker_matches_process(&marker, expected)
+        || marker.config_scope.as_deref() != Some(scope.as_str())
+    {
+        return None;
+    }
+    let events = fs::read_to_string(config_dir.join("logs").join(EXIT_EVENTS_FILE))
+        .ok()
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<ExitEvent>(line).ok())
+                .filter(|event| {
+                    event.kind != "clean_exit" || exit_event_matches_marker(event, &marker)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let crash_after_marker = file_modified_at(config_dir.join("crash.log"))
+        .is_some_and(|modified| modified > marker.started_at);
+    Some(classify_previous_run(
+        Some(&marker),
+        &events,
+        crash_after_marker,
+        None,
+        &scope,
+    ))
+}
+
 fn planned_restart_matches_marker(event: &ExitEvent, marker: &RunMarker) -> bool {
     if event.kind != "planned_restart"
         || !matches!(
@@ -293,6 +356,10 @@ fn planned_restart_matches_marker(event: &ExitEvent, marker: &RunMarker) -> bool
     {
         return false;
     }
+    exit_event_matches_marker(event, marker)
+}
+
+fn exit_event_matches_marker(event: &ExitEvent, marker: &RunMarker) -> bool {
     let Some(details) = event.details.as_ref() else {
         return false;
     };
@@ -553,6 +620,100 @@ mod tests {
                 marker.config_scope.as_deref().expect("marker scope"),
             ),
             PreviousRunClassification::UncleanExit
+        );
+    }
+
+    #[test]
+    fn clean_exit_details_are_bound_to_exact_native_identity_and_scope() {
+        let marker = marker_with_identity();
+        let identity = crate::process_identity::ProcessIdentity {
+            pid: marker.pid,
+            executable_path: marker.executable_path.clone().unwrap(),
+            started_at_ticks: marker.process_started_at_ticks.unwrap(),
+        };
+        let scope = marker.config_scope.as_deref().unwrap();
+        let details =
+            clean_exit_details(Some(&marker), Some(&identity), scope).expect("exact clean event");
+        assert_eq!(
+            details["processStartedAtTicks"],
+            identity.started_at_ticks.to_string()
+        );
+        assert_eq!(details["startedAt"], marker.started_at);
+        assert_eq!(details["configScope"], scope);
+        let reused = crate::process_identity::ProcessIdentity {
+            started_at_ticks: identity.started_at_ticks + 1,
+            ..identity.clone()
+        };
+        assert!(clean_exit_details(Some(&marker), Some(&reused), scope).is_none());
+        assert!(clean_exit_details(Some(&marker), Some(&identity), "another-scope").is_none());
+        assert!(clean_exit_details(Some(&marker), None, scope).is_none());
+    }
+
+    #[test]
+    fn watchdog_clean_exit_suppression_requires_exact_event_and_marker_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("logs")).expect("logs");
+        let mut marker = marker_with_identity();
+        marker.config_scope = Some(crate::process_identity::config_scope_fingerprint_for(
+            dir.path(),
+        ));
+        let identity = crate::process_identity::ProcessIdentity {
+            pid: marker.pid,
+            executable_path: marker.executable_path.clone().unwrap(),
+            started_at_ticks: marker.process_started_at_ticks.unwrap(),
+        };
+        let mut event = ExitEvent {
+            timestamp: "2026-08-25 10:01:00.000".to_string(),
+            kind: "clean_exit".to_string(),
+            reason: "user_requested_exit".to_string(),
+            exit_code: Some(0),
+            version: "test".to_string(),
+            os: "test".to_string(),
+            arch: "test".to_string(),
+            pid: marker.pid,
+            details: clean_exit_details(
+                Some(&marker),
+                Some(&identity),
+                marker.config_scope.as_deref().unwrap(),
+            ),
+        };
+        let log = dir.path().join("logs").join(EXIT_EVENTS_FILE);
+        let marker_json = serde_json::to_string(&marker).unwrap();
+        fs::write(&log, serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(
+            watchdog_exit_classification(dir.path(), &marker_json, &identity),
+            Some(PreviousRunClassification::CleanExit)
+        );
+        event.details.as_mut().unwrap()["processStartedAtTicks"] = json!("wrong-generation");
+        fs::write(&log, serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(
+            classify_previous_run(
+                Some(&marker),
+                std::slice::from_ref(&event),
+                false,
+                None,
+                marker.config_scope.as_deref().unwrap()
+            ),
+            PreviousRunClassification::UncleanExit
+        );
+        assert_eq!(
+            watchdog_exit_classification(dir.path(), &marker_json, &identity),
+            Some(PreviousRunClassification::UncleanExit)
+        );
+        event.details = None;
+        fs::write(&log, serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(
+            watchdog_exit_classification(dir.path(), &marker_json, &identity),
+            Some(PreviousRunClassification::UncleanExit)
+        );
+        marker.config_scope = Some("another-scope".to_string());
+        assert_eq!(
+            watchdog_exit_classification(
+                dir.path(),
+                &serde_json::to_string(&marker).unwrap(),
+                &identity
+            ),
+            None
         );
     }
 

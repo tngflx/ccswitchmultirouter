@@ -270,6 +270,7 @@ struct Observer {
     total: usize,
     terminal: bool,
     skipping: bool,
+    skipped_terminal_event: bool,
     finished: bool,
 }
 
@@ -306,6 +307,7 @@ impl Observer {
             total: 0,
             terminal: false,
             skipping: false,
+            skipped_terminal_event: false,
             finished: false,
         }
     }
@@ -328,6 +330,11 @@ impl Observer {
             while let Some(block) = super::sse::take_sse_block(&mut self.buffer) {
                 if self.skipping {
                     self.skipping = false;
+                    // The event name is bounded metadata, not a parsed response.
+                    // Match the existing named-terminal semantics, but only once
+                    // the complete block delimiter has actually arrived.
+                    self.terminal |= self.skipped_terminal_event;
+                    self.skipped_terminal_event = false;
                     continue;
                 }
                 let data = block
@@ -384,14 +391,38 @@ impl Observer {
                     _ => {}
                 }
             }
-            if self.buffer.len() > BODY_LIMIT {
+            if self.skipping || self.buffer.len() > BODY_LIMIT {
+                if !self.skipping {
+                    self.skipped_terminal_event = self
+                        .buffer
+                        .lines()
+                        .find_map(|line| super::sse::strip_sse_field(line, "event"))
+                        .is_some_and(|event| {
+                            matches!(
+                                event,
+                                "message_stop"
+                                    | "response.completed"
+                                    | "response.done"
+                                    | "response.incomplete"
+                            )
+                        });
+                    self.skipping = true;
+                    events.push(self.evidence(
+                        "sse_inspection_limit",
+                        json!({"body":null,"limit":BODY_LIMIT}),
+                    ));
+                }
+                // Discard this event without repeatedly journaling its body
+                // chunks. Keep only a possible delimiter prefix so a split
+                // LF/CRLF boundary cannot swallow the following real error.
+                let delimiter_prefix = ["\r\n\r", "\r\n", "\n", "\r"]
+                    .into_iter()
+                    .find(|prefix| self.buffer.ends_with(*prefix))
+                    .unwrap_or("")
+                    .to_string();
                 self.buffer.clear();
+                self.buffer.push_str(&delimiter_prefix);
                 self.remainder.clear();
-                self.skipping = true;
-                events.push(self.evidence(
-                    "sse_inspection_limit",
-                    json!({"body":null,"limit":BODY_LIMIT}),
-                ));
             }
         }
         events
@@ -661,6 +692,93 @@ mod tests {
             std::io::ErrorKind::TimedOut
         );
         assert_eq!(output.len(), 2);
+    }
+
+    #[test]
+    fn journal_reports_one_limit_per_oversized_event_and_keeps_scanning() {
+        let mut observer = observer(200, "text/event-stream");
+        let oversized = format!("data: {{\"delta\":\"{}\"}}\n\n", "x".repeat(BODY_LIMIT * 4));
+        let mut records = Vec::new();
+        for bytes in oversized.as_bytes().chunks(8192) {
+            records.extend(observer.feed(bytes));
+            assert!(observer.buffer.len() <= BODY_LIMIT);
+        }
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["kind"] == "sse_inspection_limit")
+                .count(),
+            1
+        );
+        records.extend(observer.feed(oversized.as_bytes()));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["kind"] == "sse_inspection_limit")
+                .count(),
+            2,
+            "each distinct oversized event must retain its own diagnostic"
+        );
+        records.extend(
+            observer
+                .feed(b"event: error\ndata: {\"error\":{\"message\":\"capacity exhausted\"}}\n\n"),
+        );
+        assert_eq!(records.last().unwrap()["kind"], "upstream_sse_error");
+        assert!(observer.finish(None).is_empty());
+    }
+
+    #[test]
+    fn journal_keeps_split_delimiters_after_oversized_event() {
+        for (prefix, suffix) in [
+            ("\n", "\n"),
+            ("\r\n", "\r\n"),
+            ("\r", "\n\r\n"),
+            ("\r\n\r", "\n"),
+        ] {
+            let mut observer = observer(200, "text/event-stream");
+            let oversized = format!("data: {}{prefix}", "x".repeat(BODY_LIMIT));
+            observer.feed(oversized.as_bytes());
+            let next = format!(
+                "{suffix}event: error\ndata: {{\"error\":{{\"message\":\"capacity exhausted\"}}}}\n\n"
+            );
+            let records = observer.feed(next.as_bytes());
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record["kind"] == "upstream_sse_error"),
+                "lost the event following split delimiter {prefix:?}/{suffix:?}"
+            );
+            assert!(observer.finish(None).is_empty());
+        }
+    }
+
+    #[test]
+    fn journal_recognizes_only_complete_oversized_named_terminal_events() {
+        for event in [
+            "response.completed",
+            "response.done",
+            "response.incomplete",
+            "message_stop",
+        ] {
+            let mut observer = observer(200, "text/event-stream");
+            let oversized = format!("event: {event}\ndata: {}", "x".repeat(BODY_LIMIT * 2));
+            observer.feed(oversized.as_bytes());
+            assert!(
+                !observer.terminal,
+                "an unfinished event must not prove completion"
+            );
+            observer.feed(b"\n\n");
+            assert!(observer.terminal, "lost complete terminal event {event}");
+            assert!(observer.finish(None).is_empty());
+        }
+        let mut observer = observer(200, "text/event-stream");
+        let oversized = format!(
+            "event: response.output_text.delta\ndata: {}\n\n",
+            "x".repeat(BODY_LIMIT * 2)
+        );
+        observer.feed(oversized.as_bytes());
+        assert!(!observer.terminal);
+        assert_eq!(observer.finish(None)[0]["kind"], "sse_eof_without_terminal");
     }
 
     #[test]

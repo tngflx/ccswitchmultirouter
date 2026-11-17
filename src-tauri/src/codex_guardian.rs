@@ -4,11 +4,12 @@ use std::time::Duration;
 use tokio::sync::{watch, Mutex};
 
 use crate::codex_desktop::{
-    candidate_debug_ports, deactivate_codex_model_picker, detect_running_codex_main_process,
+    candidate_debug_ports, deactivate_codex_model_picker, detect_running_codex_main_process_async,
     inspect_codex_renderer_compatibility, list_cdp_targets,
-    load_cc_switch_model_catalog_projection_outcome, pick_codex_page_targets,
+    load_cc_switch_model_catalog_projection_outcome, pick_codex_page_targets_async,
     try_inject_on_candidate_ports, CodexModelCatalogLoadOutcome, CodexModelCatalogProjection,
-    CodexModelPickerReadiness, CodexRendererCompatibilityObservation, DEFAULT_CODEX_DEBUG_PORT,
+    CodexModelPickerDiagnosticsCounts, CodexModelPickerReadiness,
+    CodexRendererCompatibilityObservation, DEFAULT_CODEX_DEBUG_PORT,
 };
 
 const GUARDIAN_CHECK_INTERVAL: Duration = Duration::from_secs(3);
@@ -24,6 +25,8 @@ pub struct CodexGuardianStatus {
     pub injected: bool,
     pub picker_ready_target_count: usize,
     pub picker_status: CodexModelPickerReadiness,
+    pub picker_diagnostics: Option<CodexModelPickerDiagnosticsCounts>,
+    pub picker_verification_issues: Vec<String>,
     pub last_event: String,
     pub message: String,
 }
@@ -33,6 +36,7 @@ struct GuardianInner {
     injected_target_ids: Vec<String>,
     injected_catalog_fingerprint: Option<String>,
     inject_generation: u64,
+    last_picker_readiness_signature: Option<String>,
 }
 
 /// 守护的外部句柄；丢弃后守护自动停止。
@@ -56,6 +60,8 @@ pub(crate) fn start_codex_guardian() -> GuardianHandle {
         injected: false,
         picker_ready_target_count: 0,
         picker_status: CodexModelPickerReadiness::Unverified,
+        picker_diagnostics: None,
+        picker_verification_issues: Vec::new(),
         last_event: "守护已启动".into(),
         message: "守护已启动，等待 Codex Desktop...".into(),
     }));
@@ -64,6 +70,7 @@ pub(crate) fn start_codex_guardian() -> GuardianHandle {
         injected_target_ids: Vec::new(),
         injected_catalog_fingerprint: None,
         inject_generation: 0,
+        last_picker_readiness_signature: None,
     }));
 
     let s = status.clone();
@@ -95,6 +102,8 @@ async fn guardian_loop(
             s.active = false;
             s.picker_ready_target_count = 0;
             s.picker_status = CodexModelPickerReadiness::Unverified;
+            s.picker_diagnostics = None;
+            s.picker_verification_issues.clear();
             s.last_event = "守护已停止".into();
             s.message = "守护已停止".into();
             return;
@@ -109,6 +118,8 @@ async fn guardian_loop(
                 s.active = false;
                 s.picker_ready_target_count = 0;
                 s.picker_status = CodexModelPickerReadiness::Unverified;
+                s.picker_diagnostics = None;
+                s.picker_verification_issues.clear();
                 s.last_event = "守护已停止".into();
                 s.message = "守护已停止".into();
                 return;
@@ -122,7 +133,7 @@ async fn run_guardian_cycle(
     inner: &Arc<Mutex<GuardianInner>>,
 ) {
     // 1. 检查 Codex 主进程是否在运行。
-    let running = detect_running_codex_main_process();
+    let running = detect_running_codex_main_process_async().await;
     if running.is_none() {
         let mut s = status.lock().await;
         s.codex_running = false;
@@ -131,12 +142,15 @@ async fn run_guardian_cycle(
         s.injected_target_count = 0;
         s.picker_ready_target_count = 0;
         s.picker_status = CodexModelPickerReadiness::Unverified;
+        s.picker_diagnostics = None;
+        s.picker_verification_issues.clear();
         s.last_event = "Codex 未运行".into();
         s.message = "Codex Desktop 未运行，等待用户启动...".into();
         // 进程消失时清理已知 target，下次启动不会跳过新 target。
         let mut guard = inner.lock().await;
         guard.injected_target_ids.clear();
         guard.injected_catalog_fingerprint = None;
+        guard.last_picker_readiness_signature = None;
         return;
     }
 
@@ -148,7 +162,7 @@ async fn run_guardian_cycle(
 
     for port in &ports {
         match list_cdp_targets(*port).await {
-            Ok(targets) => match pick_codex_page_targets(&targets, *port) {
+            Ok(targets) => match pick_codex_page_targets_async(&targets, *port).await {
                 Ok(pages) => {
                     cdp_available = true;
                     target_ports.push(*port);
@@ -174,11 +188,14 @@ async fn run_guardian_cycle(
         s.injected_target_count = 0;
         s.picker_ready_target_count = 0;
         s.picker_status = CodexModelPickerReadiness::Unverified;
+        s.picker_diagnostics = None;
+        s.picker_verification_issues.clear();
         s.last_event = "Codex 运行中但无 CDP".into();
         s.message = "Codex Desktop 正在运行但未开放 CDP 调试端口；CCSM 不会静默终止 Codex，请退出后从 CCSM 启动或等待下次 CCSM 启动 Codex 时自动注入。".into();
         let mut guard = inner.lock().await;
         guard.injected_target_ids.clear();
         guard.injected_catalog_fingerprint = None;
+        guard.last_picker_readiness_signature = None;
         return;
     }
 
@@ -197,6 +214,8 @@ async fn run_guardian_cycle(
             s.cdp_available = true;
             s.picker_ready_target_count = 0;
             s.picker_status = CodexModelPickerReadiness::Unverified;
+            s.picker_diagnostics = None;
+            s.picker_verification_issues.clear();
             s.last_event = "模型目录加载失败".into();
             s.message = format!("无法加载 CCSM 模型目录: {error}");
             log::warn!("Codex 守护: 模型目录加载失败: {error}");
@@ -238,6 +257,8 @@ async fn run_guardian_cycle(
     ) {
         let mut guard = inner.lock().await;
         guard.injected_target_ids = observations.installed_target_ids.clone();
+        record_picker_readiness_transition(&mut guard, &observations);
+        drop(guard);
         let s = &mut *status.lock().await;
         s.codex_running = true;
         s.cdp_available = true;
@@ -295,6 +316,7 @@ async fn run_guardian_cycle(
         guard.injected_target_ids = observations.installed_target_ids.clone();
         guard.injected_catalog_fingerprint =
             (injected_target_count > 0).then_some(catalog_fingerprint);
+        record_picker_readiness_transition(&mut guard, &observations);
     }
     {
         let mut s = status.lock().await;
@@ -362,6 +384,7 @@ async fn release_unmanaged_picker(
         let mut guard = inner.lock().await;
         guard.injected_target_ids.clear();
         guard.injected_catalog_fingerprint = None;
+        guard.last_picker_readiness_signature = None;
     }
     let mut s = status.lock().await;
     s.codex_running = true;
@@ -369,6 +392,8 @@ async fn release_unmanaged_picker(
     s.injected = false;
     s.injected_target_count = 0;
     s.picker_ready_target_count = 0;
+    s.picker_diagnostics = None;
+    s.picker_verification_issues.clear();
     s.picker_status = if failed == 0 {
         CodexModelPickerReadiness::NotRequired
     } else {
@@ -391,6 +416,8 @@ struct RendererTargetsObservation {
     installed_target_ids: Vec<String>,
     picker_ready_target_count: usize,
     picker_status: CodexModelPickerReadiness,
+    picker_diagnostics: Option<CodexModelPickerDiagnosticsCounts>,
+    picker_verification_issues: Vec<String>,
 }
 
 impl Default for RendererTargetsObservation {
@@ -399,8 +426,83 @@ impl Default for RendererTargetsObservation {
             installed_target_ids: Vec::new(),
             picker_ready_target_count: 0,
             picker_status: CodexModelPickerReadiness::Unverified,
+            picker_diagnostics: None,
+            picker_verification_issues: Vec::new(),
         }
     }
+}
+
+const PICKER_VERIFICATION_ISSUE_ORDER: [&str; 12] = [
+    "runtime_not_current",
+    "catalog_unavailable",
+    "diagnostics_unavailable",
+    "observer_not_found",
+    "observer_pending",
+    "observer_error",
+    "observer_unsupported",
+    "observer_unreadable",
+    "native_visibility_unverified",
+    "boolean_control_unverified",
+    "effort_mismatch",
+    "flag_mismatch",
+];
+
+fn push_picker_verification_issue(issues: &mut Vec<String>, issue: &str) {
+    if PICKER_VERIFICATION_ISSUE_ORDER.contains(&issue) && !issues.iter().any(|item| item == issue)
+    {
+        issues.push(issue.to_string());
+    }
+}
+
+fn add_picker_diagnostics(
+    total: &mut CodexModelPickerDiagnosticsCounts,
+    value: &CodexModelPickerDiagnosticsCounts,
+) {
+    total.picker_observer_count = total
+        .picker_observer_count
+        .saturating_add(value.picker_observer_count);
+    total.success_observer_count = total
+        .success_observer_count
+        .saturating_add(value.success_observer_count);
+    total.error_observer_count = total
+        .error_observer_count
+        .saturating_add(value.error_observer_count);
+    total.pending_observer_count = total
+        .pending_observer_count
+        .saturating_add(value.pending_observer_count);
+    total.unsupported_observer_count = total
+        .unsupported_observer_count
+        .saturating_add(value.unsupported_observer_count);
+    total.unreadable_observer_count = total
+        .unreadable_observer_count
+        .saturating_add(value.unreadable_observer_count);
+    total.native_visibility_unverified_observer_count = total
+        .native_visibility_unverified_observer_count
+        .saturating_add(value.native_visibility_unverified_observer_count);
+    total.boolean_control_unverified_model_count = total
+        .boolean_control_unverified_model_count
+        .saturating_add(value.boolean_control_unverified_model_count);
+    total.boolean_control_ready_model_count = total
+        .boolean_control_ready_model_count
+        .saturating_add(value.boolean_control_ready_model_count);
+    total.effort_mismatch_count = total
+        .effort_mismatch_count
+        .saturating_add(value.effort_mismatch_count);
+    total.flag_mismatch_count = total
+        .flag_mismatch_count
+        .saturating_add(value.flag_mismatch_count);
+    total.missing_max_model_count = total
+        .missing_max_model_count
+        .saturating_add(value.missing_max_model_count);
+    total.missing_ultra_model_count = total
+        .missing_ultra_model_count
+        .saturating_add(value.missing_ultra_model_count);
+    total.selected_max_model_count = total
+        .selected_max_model_count
+        .saturating_add(value.selected_max_model_count);
+    total.selected_ultra_model_count = total
+        .selected_ultra_model_count
+        .saturating_add(value.selected_ultra_model_count);
 }
 
 fn summarize_renderer_observations(
@@ -408,11 +510,73 @@ fn summarize_renderer_observations(
 ) -> RendererTargetsObservation {
     let mut summary = RendererTargetsObservation::default();
     let mut statuses = Vec::new();
+    let mut aggregate_diagnostics = CodexModelPickerDiagnosticsCounts::default();
+    let mut has_diagnostics = false;
     for (id, observation) in observations {
         if observation.current {
             summary.installed_target_ids.push(id);
+        } else {
+            push_picker_verification_issue(
+                &mut summary.picker_verification_issues,
+                "runtime_not_current",
+            );
         }
-        let picker_status = if !observation.current {
+        let mut target_issues = Vec::new();
+        for issue in &observation.picker_verification_issues {
+            push_picker_verification_issue(&mut target_issues, issue);
+        }
+        if observation.current
+            && observation.picker_diagnostics.is_none()
+            && observation.picker_status != CodexModelPickerReadiness::NotRequired
+            && !target_issues
+                .iter()
+                .any(|issue| issue == "catalog_unavailable")
+        {
+            push_picker_verification_issue(&mut target_issues, "diagnostics_unavailable");
+        }
+        if let Some(diagnostics) = observation
+            .picker_diagnostics
+            .as_ref()
+            .filter(|_| observation.current)
+        {
+            has_diagnostics = true;
+            add_picker_diagnostics(&mut aggregate_diagnostics, diagnostics);
+            if diagnostics.picker_observer_count == 0
+                && observation.picker_status != CodexModelPickerReadiness::NotRequired
+            {
+                push_picker_verification_issue(&mut target_issues, "observer_not_found");
+            }
+            for (count, issue) in [
+                (diagnostics.pending_observer_count, "observer_pending"),
+                (diagnostics.error_observer_count, "observer_error"),
+                (
+                    diagnostics.unsupported_observer_count,
+                    "observer_unsupported",
+                ),
+                (diagnostics.unreadable_observer_count, "observer_unreadable"),
+                (
+                    diagnostics.native_visibility_unverified_observer_count,
+                    "native_visibility_unverified",
+                ),
+                (
+                    diagnostics.boolean_control_unverified_model_count,
+                    "boolean_control_unverified",
+                ),
+                (diagnostics.effort_mismatch_count, "effort_mismatch"),
+                (diagnostics.flag_mismatch_count, "flag_mismatch"),
+            ] {
+                if count > 0 {
+                    push_picker_verification_issue(&mut target_issues, issue);
+                }
+            }
+        }
+        for issue in &target_issues {
+            push_picker_verification_issue(&mut summary.picker_verification_issues, issue);
+        }
+        let picker_status = if !observation.current
+            || (!target_issues.is_empty()
+                && observation.picker_status == CodexModelPickerReadiness::Ready)
+        {
             CodexModelPickerReadiness::Unverified
         } else {
             // Query-cache observer proof certifies only the model picker.
@@ -424,6 +588,15 @@ fn summarize_renderer_observations(
         }
         statuses.push(picker_status);
     }
+    if has_diagnostics {
+        summary.picker_diagnostics = Some(aggregate_diagnostics);
+    }
+    summary.picker_verification_issues.sort_by_key(|issue| {
+        PICKER_VERIFICATION_ISSUE_ORDER
+            .iter()
+            .position(|item| *item == issue)
+            .unwrap_or(usize::MAX)
+    });
     if !statuses.is_empty() {
         summary.picker_status = [
             CodexModelPickerReadiness::Error,
@@ -453,6 +626,34 @@ fn summarize_renderer_observations(
     summary
 }
 
+fn picker_readiness_signature(observations: &RendererTargetsObservation) -> String {
+    format!(
+        "{:?}|{:?}|{:?}",
+        observations.picker_status,
+        observations.picker_verification_issues,
+        observations.picker_diagnostics
+    )
+}
+
+fn record_picker_readiness_transition(
+    inner: &mut GuardianInner,
+    observations: &RendererTargetsObservation,
+) -> bool {
+    let signature = picker_readiness_signature(observations);
+    if inner.last_picker_readiness_signature.as_deref() == Some(signature.as_str()) {
+        return false;
+    }
+    // Counts and allowlisted issues only: no model names, URLs or provider data.
+    log::info!(
+        "Codex guardian picker readiness changed: status={:?}, issues={:?}, counts={:?}",
+        observations.picker_status,
+        observations.picker_verification_issues,
+        observations.picker_diagnostics
+    );
+    inner.last_picker_readiness_signature = Some(signature);
+    true
+}
+
 async fn current_renderer_targets(
     targets: &[(String, String)],
     catalog: &CodexModelCatalogProjection,
@@ -479,6 +680,8 @@ fn apply_renderer_observation(
     status.injected = status.injected_target_count > 0;
     status.picker_ready_target_count = observations.picker_ready_target_count;
     status.picker_status = observations.picker_status;
+    status.picker_diagnostics = observations.picker_diagnostics.clone();
+    status.picker_verification_issues = observations.picker_verification_issues.clone();
 }
 
 fn renderer_observation_message(observations: &RendererTargetsObservation) -> String {
@@ -518,6 +721,7 @@ mod tests {
             injected_target_ids: vec!["previous-renderer".to_string()],
             injected_catalog_fingerprint: Some("previous-catalog".to_string()),
             inject_generation: 7,
+            last_picker_readiness_signature: Some("previous-readiness".to_string()),
         }));
         let status = Arc::new(Mutex::new(CodexGuardianStatus {
             active: true,
@@ -527,6 +731,8 @@ mod tests {
             injected: true,
             picker_ready_target_count: 1,
             picker_status: CodexModelPickerReadiness::Ready,
+            picker_diagnostics: Some(CodexModelPickerDiagnosticsCounts::default()),
+            picker_verification_issues: vec!["native_visibility_unverified".to_string()],
             last_event: "previous injection".to_string(),
             message: "previous managed catalog".to_string(),
         }));
@@ -548,6 +754,9 @@ mod tests {
         let serialized = serde_json::to_value(&*current).expect("serialize guardian status");
         assert_eq!(serialized["pickerReadyTargetCount"], 0);
         assert_eq!(serialized["pickerStatus"], "not_required");
+        assert_eq!(serialized["pickerDiagnostics"], serde_json::Value::Null);
+        assert_eq!(serialized["pickerVerificationIssues"], json!([]));
+        assert!(guard.last_picker_readiness_signature.is_none());
         assert!(current.active);
         assert!(current.codex_running);
         assert!(current.cdp_available);
@@ -565,6 +774,12 @@ mod tests {
                 current,
                 picker_status,
                 app_server_ready,
+                picker_diagnostics: Some(CodexModelPickerDiagnosticsCounts {
+                    picker_observer_count: 1,
+                    success_observer_count: 1,
+                    ..Default::default()
+                }),
+                picker_verification_issues: Vec::new(),
             },
         )
     }
@@ -663,6 +878,205 @@ mod tests {
         )]);
         assert_eq!(empty.picker_status, CodexModelPickerReadiness::NotRequired);
         assert_eq!(empty.picker_ready_target_count, 0);
+    }
+
+    #[test]
+    fn guardian_exposes_native_visibility_uncertainty_without_reinstalling() {
+        let (id, mut observation) =
+            observed_target("current", true, CodexModelPickerReadiness::Unverified, true);
+        observation.picker_diagnostics = Some(CodexModelPickerDiagnosticsCounts {
+            picker_observer_count: 3,
+            success_observer_count: 3,
+            native_visibility_unverified_observer_count: 3,
+            selected_max_model_count: 13,
+            selected_ultra_model_count: 13,
+            ..Default::default()
+        });
+        observation.picker_verification_issues = vec!["native_visibility_unverified".to_string()];
+        let summary = summarize_renderer_observations(vec![(id, observation)]);
+        assert_eq!(summary.installed_target_ids.len(), 1);
+        assert_eq!(summary.picker_ready_target_count, 0);
+        assert_eq!(summary.picker_status, CodexModelPickerReadiness::Unverified);
+        assert_eq!(
+            summary.picker_verification_issues,
+            vec!["native_visibility_unverified"]
+        );
+        let counts = summary.picker_diagnostics.as_ref().expect("fresh counts");
+        assert_eq!(counts.picker_observer_count, 3);
+        assert_eq!(counts.success_observer_count, 3);
+        assert_eq!(counts.native_visibility_unverified_observer_count, 3);
+        assert_eq!(counts.selected_max_model_count, 13);
+        assert!(!guardian_should_inject(
+            &[],
+            Some("catalog"),
+            "catalog",
+            true
+        ));
+    }
+
+    #[test]
+    fn guardian_preserves_boolean_control_evidence_from_only_current_targets() {
+        let (first_id, mut first) =
+            observed_target("first", true, CodexModelPickerReadiness::Unverified, true);
+        first.picker_diagnostics = Some(CodexModelPickerDiagnosticsCounts {
+            picker_observer_count: 3,
+            success_observer_count: 3,
+            boolean_control_unverified_model_count: 2,
+            boolean_control_ready_model_count: 1,
+            ..Default::default()
+        });
+        let (second_id, mut second) =
+            observed_target("second", true, CodexModelPickerReadiness::Ready, false);
+        second.picker_diagnostics = Some(CodexModelPickerDiagnosticsCounts {
+            picker_observer_count: 1,
+            success_observer_count: 1,
+            boolean_control_ready_model_count: 4,
+            ..Default::default()
+        });
+        let (stale_id, mut stale) =
+            observed_target("stale", false, CodexModelPickerReadiness::Ready, true);
+        stale.picker_diagnostics = Some(CodexModelPickerDiagnosticsCounts {
+            boolean_control_unverified_model_count: 100,
+            boolean_control_ready_model_count: 100,
+            ..Default::default()
+        });
+        let summary = summarize_renderer_observations(vec![
+            (first_id, first),
+            (second_id, second),
+            (stale_id, stale),
+        ]);
+        let counts = summary.picker_diagnostics.as_ref().expect("current counts");
+        assert_eq!(counts.picker_observer_count, 4);
+        assert_eq!(counts.boolean_control_unverified_model_count, 2);
+        assert_eq!(counts.boolean_control_ready_model_count, 5);
+        assert_eq!(summary.picker_status, CodexModelPickerReadiness::Unverified);
+        assert_eq!(summary.picker_ready_target_count, 1);
+        assert_eq!(
+            summary.picker_verification_issues,
+            vec!["runtime_not_current", "boolean_control_unverified"]
+        );
+        assert!(!guardian_should_inject(
+            &[],
+            Some("catalog"),
+            "catalog",
+            true
+        ));
+
+        let (id, mut inconsistent_ready) =
+            observed_target("inconsistent", true, CodexModelPickerReadiness::Ready, true);
+        inconsistent_ready
+            .picker_diagnostics
+            .as_mut()
+            .unwrap()
+            .boolean_control_unverified_model_count = 1;
+        let summary = summarize_renderer_observations(vec![(id, inconsistent_ready)]);
+        assert_eq!(summary.picker_status, CodexModelPickerReadiness::Unverified);
+        assert_eq!(summary.picker_ready_target_count, 0);
+        assert_eq!(
+            summary.picker_verification_issues,
+            vec!["boolean_control_unverified"]
+        );
+    }
+
+    #[test]
+    fn guardian_old_native_without_diagnostics_cannot_claim_ready() {
+        let (id, mut observation) =
+            observed_target("legacy", true, CodexModelPickerReadiness::Ready, true);
+        observation.picker_diagnostics = None;
+        let summary = summarize_renderer_observations(vec![(id, observation)]);
+        assert_eq!(summary.picker_status, CodexModelPickerReadiness::Unverified);
+        assert_eq!(summary.picker_ready_target_count, 0);
+        assert!(summary.picker_diagnostics.is_none());
+        assert_eq!(
+            summary.picker_verification_issues,
+            vec!["diagnostics_unavailable"]
+        );
+    }
+
+    #[test]
+    fn guardian_issues_are_allowlisted_deduplicated_and_order_independent() {
+        let (id_a, mut a) = observed_target("a", true, CodexModelPickerReadiness::Unverified, true);
+        a.picker_verification_issues = vec![
+            "native_visibility_unverified".to_string(),
+            "observer_pending".to_string(),
+            "unrecognized_detail".to_string(),
+        ];
+        let (id_b, mut b) = observed_target("b", true, CodexModelPickerReadiness::Mismatch, false);
+        b.picker_verification_issues = vec![
+            "effort_mismatch".to_string(),
+            "observer_pending".to_string(),
+        ];
+        let first = summarize_renderer_observations(vec![
+            (id_a.clone(), a.clone()),
+            (id_b.clone(), b.clone()),
+        ]);
+        let reversed = summarize_renderer_observations(vec![(id_b, b), (id_a, a)]);
+        assert_eq!(
+            first.picker_verification_issues,
+            vec![
+                "observer_pending",
+                "native_visibility_unverified",
+                "effort_mismatch"
+            ]
+        );
+        assert_eq!(
+            first.picker_verification_issues,
+            reversed.picker_verification_issues
+        );
+        assert_eq!(
+            first
+                .picker_diagnostics
+                .as_ref()
+                .expect("counts")
+                .picker_observer_count,
+            2
+        );
+        assert_eq!(first.picker_ready_target_count, 0);
+        assert_eq!(first.picker_status, CodexModelPickerReadiness::Mismatch);
+        assert_eq!(
+            picker_readiness_signature(&first),
+            picker_readiness_signature(&reversed)
+        );
+    }
+
+    #[test]
+    fn guardian_readiness_logging_is_transition_only_and_ignores_target_identity() {
+        let mut inner = GuardianInner {
+            injected_target_ids: Vec::new(),
+            injected_catalog_fingerprint: None,
+            inject_generation: 0,
+            last_picker_readiness_signature: None,
+        };
+        let mut observation = summarize_renderer_observations(vec![observed_target(
+            "a",
+            true,
+            CodexModelPickerReadiness::Ready,
+            false,
+        )]);
+        assert!(record_picker_readiness_transition(&mut inner, &observation));
+        assert!(!record_picker_readiness_transition(
+            &mut inner,
+            &observation
+        ));
+        observation.installed_target_ids = vec!["different-target".to_string()];
+        assert!(!record_picker_readiness_transition(
+            &mut inner,
+            &observation
+        ));
+        observation.picker_status = CodexModelPickerReadiness::Pending;
+        assert!(record_picker_readiness_transition(&mut inner, &observation));
+        observation.picker_verification_issues = vec!["observer_pending".to_string()];
+        assert!(record_picker_readiness_transition(&mut inner, &observation));
+        observation
+            .picker_diagnostics
+            .as_mut()
+            .expect("counts")
+            .pending_observer_count = 1;
+        assert!(record_picker_readiness_transition(&mut inner, &observation));
+        assert!(!record_picker_readiness_transition(
+            &mut inner,
+            &observation
+        ));
     }
 
     #[test]

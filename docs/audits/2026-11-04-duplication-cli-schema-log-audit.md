@@ -151,7 +151,7 @@ structured diagnostics script was used instead; no direct UI/CDP automation or
 paid provider probe was substituted.
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/codex-oauth-diagnostics.ps1 -LogTailLines 300 -SinceMinutes 180
+node scripts/codex-oauth-diagnostics.mjs --log-tail-lines 300 --since-minutes 180
 ```
 
 Configured logs: `C:/Users/Felix/.cc-switch/logs`.

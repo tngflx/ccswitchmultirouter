@@ -5,6 +5,7 @@
 //! asks Codex Desktop to start a new turn containing the literal `continue`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,161 @@ use super::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
 const RECOVERY_STATE_TTL: Duration = Duration::from_secs(15 * 60);
 const DESKTOP_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const DESKTOP_READY_DELAY: Duration = Duration::from_millis(500);
+#[cfg(not(test))]
 const RECOVERY_FILE: &str = "codex-turn-recovery.json";
+const RECOVERY_LEDGER_VERSION: u32 = 2;
+const MAX_OWNER_OPERATIONS_PER_THREAD: usize = 256;
+const MAX_IDLE_OWNER_EPOCHS: usize = 128;
+const IDLE_OWNER_EPOCH_TTL: Duration = Duration::from_secs(60);
+const MAX_RECOVERY_LEDGER_BYTES: usize = 16 * 1024 * 1024;
+
+/// Intent is recorded by the native transaction, never inferred from a proxy
+/// prompt/header. Literal `continue` can only retain a restrictive old budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ContinuationIntent {
+    AutoRecovery,
+    OwnerContinue,
+}
+
+/// An opaque, process-local observation of the canonical per-thread action
+/// epoch. It is not serializable and is not remote authorization.
+#[derive(Clone, Debug)]
+pub(crate) struct OwnerContinuationEpoch {
+    thread_id: String,
+    process_epoch: String,
+    action_epoch: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum OwnerContinuationStatus {
+    Reserved,
+    Committing,
+    Submitted,
+    Uncertain,
+    Refused,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OwnerContinuationOperation {
+    epoch: OwnerContinuationEpoch,
+    operation_id: String,
+    base_turn_id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OwnerContinuationReceipt {
+    pub(crate) operation_id: String,
+    pub(crate) status: OwnerContinuationStatus,
+    pub(crate) submitted: bool,
+    pub(crate) mutation_attempted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) acknowledged_turn_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum OwnerContinuationReservation {
+    Reserved(OwnerContinuationOperation),
+    AttachOnly(OwnerContinuationReceipt),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum OwnerContinuationOutcome {
+    Submitted {
+        turn_id: String,
+    },
+    Uncertain,
+    /// Only a positive renderer no-mutation result can select Refused.
+    Refused,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnerContinuationError {
+    InvalidBinding,
+    StaleEpoch,
+    Busy,
+    OperationConflict,
+    JournalFull,
+    StorageUnavailable,
+}
+
+impl std::fmt::Display for OwnerContinuationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidBinding => "Owner continuation binding is invalid",
+            Self::StaleEpoch => "Owner continuation view is stale",
+            Self::Busy => "The Codex thread is not available for owner continuation",
+            Self::OperationConflict => "Owner operation id belongs to another view",
+            Self::JournalFull => "Owner continuation journal requires reconciliation",
+            Self::StorageUnavailable => "Owner continuation evidence storage is unavailable",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContinuationTransaction {
+    intent: ContinuationIntent,
+    operation_id: String,
+    action_epoch: String,
+    base_turn_id: String,
+    status: OwnerContinuationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_turn_id: Option<String>,
+    #[serde(default)]
+    budget_reconciled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_auto_recovery_id: Option<String>,
+}
+
+impl ContinuationTransaction {
+    fn receipt(&self) -> OwnerContinuationReceipt {
+        OwnerContinuationReceipt {
+            operation_id: self.operation_id.clone(),
+            status: self.status,
+            submitted: self.status == OwnerContinuationStatus::Submitted,
+            acknowledged_turn_id: (self.status == OwnerContinuationStatus::Submitted)
+                .then(|| self.accepted_turn_id.clone())
+                .flatten(),
+            mutation_attempted: matches!(
+                self.status,
+                OwnerContinuationStatus::Committing
+                    | OwnerContinuationStatus::Submitted
+                    | OwnerContinuationStatus::Uncertain
+            ),
+        }
+    }
+
+    fn blocks_same_epoch(&self, action_epoch: &str) -> bool {
+        self.action_epoch == action_epoch
+            && matches!(
+                self.status,
+                OwnerContinuationStatus::Reserved
+                    | OwnerContinuationStatus::Committing
+                    | OwnerContinuationStatus::Submitted
+                    | OwnerContinuationStatus::Uncertain
+            )
+    }
+}
+
+static NATIVE_CONTINUATION_PROCESS_EPOCH: OnceLock<String> = OnceLock::new();
+// A malformed/unreadable ledger or a failed write must not be overwritten by
+// automatic bookkeeping and must never authorize a mutation.
+static RECOVERY_STORAGE_HEALTHY: AtomicBool = AtomicBool::new(true);
+static OWNER_LEDGER_LOADED: OnceLock<()> = OnceLock::new();
+
+fn native_continuation_process_epoch() -> &'static str {
+    NATIVE_CONTINUATION_PROCESS_EPOCH.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn valid_continuation_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct TurnRecoveryContext {
@@ -45,6 +200,14 @@ struct RecoveryState {
     phase: RecoveryPhase,
     updated_at: Instant,
     tracked: Option<TurnRecoveryContext>,
+    action_epoch: String,
+    tracked_epoch: Option<String>,
+    reservation_epoch: Option<String>,
+    reservation_intent: Option<ContinuationIntent>,
+    commit_charged: bool,
+    // Retained native mutation evidence lives in this same canonical ledger;
+    // it has no independent sender, retry loop, or timeout retirement.
+    continuations: HashMap<String, ContinuationTransaction>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +232,12 @@ impl Default for RecoveryState {
             phase: RecoveryPhase::Idle,
             updated_at: Instant::now(),
             tracked: None,
+            action_epoch: uuid::Uuid::new_v4().to_string(),
+            tracked_epoch: None,
+            reservation_epoch: None,
+            reservation_intent: None,
+            commit_charged: false,
+            continuations: HashMap::new(),
         }
     }
 }
@@ -79,7 +248,391 @@ fn recovery_states() -> &'static Mutex<HashMap<String, RecoveryState>> {
     RECOVERY_STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn reset_automatic_state(state: &mut RecoveryState, reset_budget: bool) {
+    if reset_budget {
+        state.submitted = 0;
+    }
+    state.phase = RecoveryPhase::Idle;
+    state.tracked = None;
+    state.tracked_epoch = None;
+    state.reservation_epoch = None;
+    state.reservation_intent = None;
+    state.commit_charged = false;
+    state.updated_at = Instant::now();
+}
+
+fn make_automatic_budget_dormant(state: &mut RecoveryState) {
+    state.phase = RecoveryPhase::AwaitingContinuation;
+    state.reservation_epoch = None;
+    state.reservation_intent = None;
+    state.commit_charged = false;
+    state.updated_at = Instant::now();
+}
+
+fn has_owner_transaction_for_current_epoch(state: &RecoveryState) -> bool {
+    state
+        .continuations
+        .values()
+        .any(|operation| operation.blocks_same_epoch(&state.action_epoch))
+}
+
+fn advance_action_epoch(state: &mut RecoveryState) {
+    state.action_epoch = uuid::Uuid::new_v4().to_string();
+    // A later user action invalidates uncommitted owner preparation. A commit
+    // intent/outcome is retained; observing input does not establish provenance.
+    for operation in state.continuations.values_mut() {
+        if operation.status == OwnerContinuationStatus::Reserved {
+            operation.status = OwnerContinuationStatus::Refused;
+        }
+    }
+}
+
+fn owner_epoch_capacity_allows(
+    states: &mut HashMap<String, RecoveryState>,
+    thread_id: &str,
+    now: Instant,
+) -> bool {
+    let is_empty = |state: &RecoveryState| {
+        state.phase == RecoveryPhase::Idle
+            && state.tracked.is_none()
+            && state.continuations.is_empty()
+    };
+    // Failed arbitrary thread reads must not accumulate epoch-only entries.
+    // Never prune a transaction, active request, or unresolved mutation receipt.
+    states.retain(|_, state| {
+        !is_empty(state) || now.saturating_duration_since(state.updated_at) <= IDLE_OWNER_EPOCH_TTL
+    });
+    states.contains_key(thread_id)
+        || states.values().filter(|state| is_empty(state)).count() < MAX_IDLE_OWNER_EPOCHS
+}
+
+pub(crate) fn owner_continuation_mutation_storage_available() -> bool {
+    ensure_owner_ledger_loaded();
+    RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst)
+}
+
+pub(crate) fn capture_owner_continuation_epoch(
+    thread_id: &str,
+) -> Result<OwnerContinuationEpoch, OwnerContinuationError> {
+    ensure_owner_ledger_loaded();
+    if !valid_continuation_identifier(thread_id) {
+        return Err(OwnerContinuationError::InvalidBinding);
+    }
+    let mut states = recovery_states()
+        .lock()
+        .map_err(|_| OwnerContinuationError::StorageUnavailable)?;
+    let now = Instant::now();
+    if !owner_epoch_capacity_allows(&mut states, thread_id, now) {
+        return Err(OwnerContinuationError::Busy);
+    }
+    let state = states.entry(thread_id.to_owned()).or_default();
+    if state.tracked.is_none() && state.continuations.is_empty() {
+        state.updated_at = now;
+    }
+    Ok(OwnerContinuationEpoch {
+        thread_id: thread_id.to_owned(),
+        process_epoch: native_continuation_process_epoch().to_owned(),
+        action_epoch: state.action_epoch.clone(),
+    })
+}
+
+pub(crate) fn owner_continuation_epoch_is_current(epoch: &OwnerContinuationEpoch) -> bool {
+    epoch.process_epoch == native_continuation_process_epoch()
+        && recovery_states().lock().ok().is_some_and(|states| {
+            states
+                .get(&epoch.thread_id)
+                .is_some_and(|state| state.action_epoch == epoch.action_epoch)
+        })
+}
+
+pub(crate) fn reserve_owner_continuation(
+    epoch: &OwnerContinuationEpoch,
+    base_turn_id: &str,
+    operation_id: &str,
+) -> Result<OwnerContinuationReservation, OwnerContinuationError> {
+    ensure_owner_ledger_loaded();
+    if !RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst) {
+        return Err(OwnerContinuationError::StorageUnavailable);
+    }
+    if epoch.process_epoch != native_continuation_process_epoch()
+        || !valid_continuation_identifier(base_turn_id)
+        || !valid_continuation_identifier(operation_id)
+    {
+        return Err(OwnerContinuationError::InvalidBinding);
+    }
+    let mut states = recovery_states()
+        .lock()
+        .map_err(|_| OwnerContinuationError::StorageUnavailable)?;
+    if states.iter().any(|(thread_id, state)| {
+        thread_id != &epoch.thread_id && state.continuations.contains_key(operation_id)
+    }) {
+        return Err(OwnerContinuationError::OperationConflict);
+    }
+    let Some(state) = states.get_mut(&epoch.thread_id) else {
+        return Err(OwnerContinuationError::StaleEpoch);
+    };
+    if let Some(existing) = state.continuations.get(operation_id) {
+        if existing.action_epoch != epoch.action_epoch || existing.base_turn_id != base_turn_id {
+            return Err(OwnerContinuationError::OperationConflict);
+        }
+        return Ok(OwnerContinuationReservation::AttachOnly(existing.receipt()));
+    }
+    if state.action_epoch != epoch.action_epoch {
+        return Err(OwnerContinuationError::StaleEpoch);
+    }
+    // Old-base mutation evidence is not erased by a new action, TTL, or policy
+    // change. Repeated clicks for the same exact base attach rather than send.
+    if let Some(existing) = state.continuations.values().find(|operation| {
+        operation.base_turn_id == base_turn_id
+            && matches!(
+                operation.status,
+                OwnerContinuationStatus::Reserved
+                    | OwnerContinuationStatus::Committing
+                    | OwnerContinuationStatus::Submitted
+                    | OwnerContinuationStatus::Uncertain
+            )
+    }) {
+        return Ok(OwnerContinuationReservation::AttachOnly(existing.receipt()));
+    }
+    if matches!(
+        state.phase,
+        RecoveryPhase::ActiveRequest
+            | RecoveryPhase::ToolStepComplete
+            | RecoveryPhase::CommittingRecovery
+    ) || state.continuations.values().any(|operation| {
+        operation.status == OwnerContinuationStatus::Committing
+            || operation.blocks_same_epoch(&state.action_epoch)
+    }) {
+        return Err(OwnerContinuationError::Busy);
+    }
+    if state.continuations.len() >= MAX_OWNER_OPERATIONS_PER_THREAD {
+        return Err(OwnerContinuationError::JournalFull);
+    }
+    // The owner may replace only a queued, uncommitted automatic reservation.
+    // Its old task fails the epoch/CAS checks at every later await/authorize.
+    let superseded_auto_recovery_id = (state.phase == RecoveryPhase::ReservedRecovery)
+        .then(|| {
+            state
+                .tracked
+                .as_ref()
+                .map(|context| context.recovery_id.clone())
+        })
+        .flatten();
+    if state.phase == RecoveryPhase::ReservedRecovery {
+        if state.submitted > 0 && state.tracked.is_some() {
+            // Superseding a queued attempt is not an accepted new user turn.
+            // Keep the old chain's spent cap durable until positive acceptance
+            // or another real user turn; only its retry eligibility is retired.
+            make_automatic_budget_dormant(state);
+        } else {
+            reset_automatic_state(state, false);
+        }
+    }
+    let transaction = ContinuationTransaction {
+        intent: ContinuationIntent::OwnerContinue,
+        operation_id: operation_id.to_owned(),
+        action_epoch: epoch.action_epoch.clone(),
+        base_turn_id: base_turn_id.to_owned(),
+        status: OwnerContinuationStatus::Reserved,
+        accepted_turn_id: None,
+        budget_reconciled: false,
+        superseded_auto_recovery_id,
+    };
+    state
+        .continuations
+        .insert(operation_id.to_owned(), transaction);
+    state.updated_at = Instant::now();
+    if !persist_states(&states) {
+        return Err(OwnerContinuationError::StorageUnavailable);
+    }
+    Ok(OwnerContinuationReservation::Reserved(
+        OwnerContinuationOperation {
+            epoch: epoch.clone(),
+            operation_id: operation_id.to_owned(),
+            base_turn_id: base_turn_id.to_owned(),
+        },
+    ))
+}
+
+fn owner_operation_matches(state: &RecoveryState, operation: &OwnerContinuationOperation) -> bool {
+    operation.epoch.process_epoch == native_continuation_process_epoch()
+        && state
+            .continuations
+            .get(&operation.operation_id)
+            .is_some_and(|record| {
+                record.intent == ContinuationIntent::OwnerContinue
+                    && record.action_epoch == operation.epoch.action_epoch
+                    && record.base_turn_id == operation.base_turn_id
+            })
+}
+
+pub(crate) fn read_owner_continuation_receipt(
+    operation_id: &str,
+) -> Option<OwnerContinuationReceipt> {
+    ensure_owner_ledger_loaded();
+    if !valid_continuation_identifier(operation_id) {
+        return None;
+    }
+    recovery_states().lock().ok()?.values().find_map(|state| {
+        state
+            .continuations
+            .get(operation_id)
+            .map(ContinuationTransaction::receipt)
+    })
+}
+
+pub(crate) fn owner_continuation_is_reserved(operation: &OwnerContinuationOperation) -> bool {
+    RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst)
+        && recovery_states().lock().ok().is_some_and(|states| {
+            states.get(&operation.epoch.thread_id).is_some_and(|state| {
+                owner_operation_matches(state, operation)
+                    && state.action_epoch == operation.epoch.action_epoch
+                    && state.continuations[&operation.operation_id].status
+                        == OwnerContinuationStatus::Reserved
+            })
+        })
+}
+
+pub(crate) fn authorize_owner_continuation_commit(operation: &OwnerContinuationOperation) -> bool {
+    authorize_owner_continuation_commit_with(operation, persist_states)
+}
+
+fn authorize_owner_continuation_commit_with(
+    operation: &OwnerContinuationOperation,
+    persist: impl FnOnce(&HashMap<String, RecoveryState>) -> bool,
+) -> bool {
+    if !RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst) {
+        return false;
+    }
+    let Ok(mut states) = recovery_states().lock() else {
+        return false;
+    };
+    let Some(state) = states.get_mut(&operation.epoch.thread_id) else {
+        return false;
+    };
+    if !owner_operation_matches(state, operation)
+        || state.action_epoch != operation.epoch.action_epoch
+        || state.continuations[&operation.operation_id].status != OwnerContinuationStatus::Reserved
+        || matches!(
+            state.phase,
+            RecoveryPhase::ActiveRequest | RecoveryPhase::CommittingRecovery
+        )
+    {
+        return false;
+    }
+    state
+        .continuations
+        .get_mut(&operation.operation_id)
+        .unwrap()
+        .status = OwnerContinuationStatus::Committing;
+    state.updated_at = Instant::now();
+    // Do not roll back an uncertain durable-write failure to a replayable
+    // reservation. A failed write positively prevents this caller from sending.
+    persist(&states)
+}
+
+pub(crate) fn finish_owner_continuation(
+    operation: &OwnerContinuationOperation,
+    outcome: OwnerContinuationOutcome,
+) -> OwnerContinuationReceipt {
+    let fallback = OwnerContinuationReceipt {
+        operation_id: operation.operation_id.clone(),
+        status: OwnerContinuationStatus::Uncertain,
+        submitted: false,
+        mutation_attempted: true,
+        acknowledged_turn_id: None,
+    };
+    let Ok(mut states) = recovery_states().lock() else {
+        return fallback;
+    };
+    let Some(state) = states.get_mut(&operation.epoch.thread_id) else {
+        return fallback;
+    };
+    if !owner_operation_matches(state, operation) {
+        return fallback;
+    }
+    let record = state
+        .continuations
+        .get_mut(&operation.operation_id)
+        .unwrap();
+    if !matches!(
+        record.status,
+        OwnerContinuationStatus::Reserved | OwnerContinuationStatus::Committing
+    ) {
+        return record.receipt();
+    }
+    match outcome {
+        OwnerContinuationOutcome::Submitted { turn_id }
+            if record.status == OwnerContinuationStatus::Committing
+                && valid_continuation_identifier(&turn_id)
+                && turn_id != record.base_turn_id =>
+        {
+            record.status = OwnerContinuationStatus::Submitted;
+            record.accepted_turn_id = Some(turn_id);
+            // If input arrived during commit, no proxy body can prove whose
+            // input it was. A later exact acknowledged-turn read reconciles it.
+            if state.action_epoch == operation.epoch.action_epoch {
+                state.submitted = 0;
+                record.budget_reconciled = true;
+            }
+        }
+        OwnerContinuationOutcome::Refused => record.status = OwnerContinuationStatus::Refused,
+        _ if record.status == OwnerContinuationStatus::Committing => {
+            record.status = OwnerContinuationStatus::Uncertain;
+        }
+        _ => record.status = OwnerContinuationStatus::Refused,
+    }
+    state.updated_at = Instant::now();
+    let receipt = record.receipt();
+    if !persist_states(&states) && receipt.mutation_attempted {
+        return fallback;
+    }
+    receipt
+}
+
+/// Only the exact owned native view adapter may supply this post-read proof.
+/// It must capture/recheck epoch around a read proving the current turn equals
+/// the validated acknowledgement, not infer it from a proxy `continue` body.
+pub(crate) fn reconcile_owner_accepted_turn(
+    epoch: &OwnerContinuationEpoch,
+    current_turn_id: &str,
+) -> bool {
+    if epoch.process_epoch != native_continuation_process_epoch()
+        || !valid_continuation_identifier(current_turn_id)
+        || !RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst)
+    {
+        return false;
+    }
+    let Ok(mut states) = recovery_states().lock() else {
+        return false;
+    };
+    let Some(state) = states.get_mut(&epoch.thread_id) else {
+        return false;
+    };
+    if state.action_epoch != epoch.action_epoch
+        || state.commit_charged
+        || matches!(
+            state.phase,
+            RecoveryPhase::ReservedRecovery | RecoveryPhase::CommittingRecovery
+        )
+    {
+        return false;
+    }
+    let Some(record) = state.continuations.values_mut().find(|record| {
+        record.status == OwnerContinuationStatus::Submitted
+            && !record.budget_reconciled
+            && record.accepted_turn_id.as_deref() == Some(current_turn_id)
+    }) else {
+        return false;
+    };
+    record.budget_reconciled = true;
+    state.submitted = 0;
+    state.updated_at = Instant::now();
+    persist_states(&states)
+}
+
 fn reserve_recovery(context: &TurnRecoveryContext) -> Option<u32> {
+    ensure_owner_ledger_loaded();
     if !context.desktop_eligible
         || context.max_recoveries == 0
         || context.desktop_thread_id.is_empty()
@@ -89,8 +642,25 @@ fn reserve_recovery(context: &TurnRecoveryContext) -> Option<u32> {
 
     let now = Instant::now();
     let mut states = recovery_states().lock().ok()?;
-    states.retain(|_, state| now.duration_since(state.updated_at) <= RECOVERY_STATE_TTL);
+    states.retain(|_, state| {
+        !state.continuations.is_empty()
+            || now.duration_since(state.updated_at) <= RECOVERY_STATE_TTL
+    });
     let state = states.entry(context.desktop_thread_id.clone()).or_default();
+    if has_owner_transaction_for_current_epoch(state)
+        || state.continuations.values().any(|operation| {
+            operation.status == OwnerContinuationStatus::Committing
+                || operation.superseded_auto_recovery_id.as_deref()
+                    == Some(context.recovery_id.as_str())
+        })
+        || (state
+            .tracked
+            .as_ref()
+            .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
+            && state.tracked_epoch.as_deref() != Some(state.action_epoch.as_str()))
+    {
+        return None;
+    }
     if state.phase == RecoveryPhase::AwaitingContinuation
         && state
             .tracked
@@ -113,17 +683,37 @@ fn reserve_recovery(context: &TurnRecoveryContext) -> Option<u32> {
     {
         return None;
     }
+    // Once a later automatic chain reserves, a delayed owner-acceptance read
+    // must never refund that chain's reserved/precharged/uncertain attempts.
+    // Settle the old owner budget conservatively without granting a reset.
+    for operation in state.continuations.values_mut() {
+        if operation.status == OwnerContinuationStatus::Submitted {
+            operation.budget_reconciled = true;
+        }
+    }
     state.phase = RecoveryPhase::ReservedRecovery;
     state.tracked = Some(context.clone());
+    state.tracked_epoch = Some(state.action_epoch.clone());
+    state.reservation_epoch = Some(state.action_epoch.clone());
+    state.reservation_intent = Some(ContinuationIntent::AutoRecovery);
+    state.commit_charged = false;
     state.updated_at = now;
     let attempt = state.submitted.saturating_add(1);
-    persist_states(&states);
-    Some(attempt)
+    persist_states(&states).then_some(attempt)
 }
 
+// Test-only simulation/cleanup. Runtime completions must carry their observed context.
+#[cfg(test)]
 pub(crate) fn mark_turn_completed(session_id: &str) {
+    ensure_owner_ledger_loaded();
     if let Ok(mut states) = recovery_states().lock() {
-        states.remove(session_id);
+        if let Some(state) = states.get_mut(session_id) {
+            advance_action_epoch(state);
+            reset_automatic_state(state, true);
+            if state.continuations.is_empty() {
+                states.remove(session_id);
+            }
+        }
         persist_states(&states);
     }
 }
@@ -132,13 +722,18 @@ pub(crate) fn mark_observed_turn_completed(context: &TurnRecoveryContext) {
     if let Ok(mut states) = recovery_states().lock() {
         let owned = states.get(&context.desktop_thread_id).is_some_and(|state| {
             state.phase != RecoveryPhase::AwaitingContinuation
+                && state.tracked_epoch.as_deref() == Some(state.action_epoch.as_str())
                 && state
                     .tracked
                     .as_ref()
                     .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
         });
         if owned {
-            states.remove(&context.desktop_thread_id);
+            let state = states.get_mut(&context.desktop_thread_id).unwrap();
+            reset_automatic_state(state, true);
+            if state.continuations.is_empty() {
+                states.remove(&context.desktop_thread_id);
+            }
             persist_states(&states);
         }
     }
@@ -148,16 +743,12 @@ fn mark_observed_tool_step_completed(context: &TurnRecoveryContext) {
     if let Ok(mut states) = recovery_states().lock() {
         if let Some(state) = states.get_mut(&context.desktop_thread_id) {
             if state.phase != RecoveryPhase::AwaitingContinuation
+                && state.tracked_epoch.as_deref() == Some(state.action_epoch.as_str())
                 && state
                     .tracked
                     .as_ref()
                     .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
             {
-                // A successful tool step hands control back to the Desktop's
-                // tool loop. Its next request is still the same user turn.
-                // Keep crash evidence across the gap between delivering a
-                // completed tool item and the next tool-result request. A
-                // final assistant response or explicit cancellation clears it.
                 state.phase = RecoveryPhase::ToolStepComplete;
                 state.updated_at = Instant::now();
                 persist_states(&states);
@@ -166,22 +757,27 @@ fn mark_observed_tool_step_completed(context: &TurnRecoveryContext) {
     }
 }
 
-/// Reset stale recovery state when the user starts a genuinely new turn. The
-/// exact continuation that this module submits keeps the existing budget.
-pub(crate) fn begin_turn(session_id: &str, is_continuation: bool) {
-    if is_continuation {
-        if let Ok(mut states) = recovery_states().lock() {
-            if let Some(state) = states.get_mut(session_id) {
-                if state.phase == RecoveryPhase::CommittingRecovery {
-                    state.submitted = state.submitted.saturating_add(1);
-                    state.phase = RecoveryPhase::AwaitingContinuation;
-                }
-                state.updated_at = Instant::now();
-            }
-            persist_states(&states);
+/// Every unproven user input is a new native action epoch. A literal continue
+/// only retains a conservative already-spent automatic cap; it does not prove
+/// that this module (or the owner) submitted that input and never charges it.
+/// Tool-only/unknown requests do not call this function and retain their chain.
+pub(crate) fn begin_turn(session_id: &str, preserve_spent_budget: bool) {
+    ensure_owner_ledger_loaded();
+    if let Ok(mut states) = recovery_states().lock() {
+        let state = states.entry(session_id.to_owned()).or_default();
+        advance_action_epoch(state);
+        if preserve_spent_budget && state.submitted > 0 && state.tracked.is_some() {
+            // Retain spent-cap crash evidence across the gap before this new
+            // request is tracked. This is not proof that its input came from
+            // our sender; the old epoch can never authorize another mutation.
+            state.phase = RecoveryPhase::AwaitingContinuation;
+            state.reservation_epoch = None;
+            state.reservation_intent = None;
+            state.updated_at = Instant::now();
+        } else {
+            reset_automatic_state(state, !preserve_spent_budget);
         }
-    } else {
-        mark_turn_completed(session_id);
+        persist_states(&states);
     }
 }
 
@@ -194,36 +790,53 @@ fn recovery_is_active(context: &TurnRecoveryContext) -> bool {
                 matches!(
                     state.phase,
                     RecoveryPhase::ReservedRecovery | RecoveryPhase::CommittingRecovery
-                ) && state
-                    .tracked
-                    .as_ref()
-                    .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
+                ) && state.reservation_epoch.as_deref() == Some(state.action_epoch.as_str())
+                    && state.reservation_intent == Some(ContinuationIntent::AutoRecovery)
+                    && !has_owner_transaction_for_current_epoch(state)
+                    && state
+                        .tracked
+                        .as_ref()
+                        .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
             })
         })
         .unwrap_or(false)
 }
 
 fn authorize_reserved_recovery(context: &TurnRecoveryContext) -> bool {
+    authorize_reserved_recovery_with(context, persist_states)
+}
+
+fn authorize_reserved_recovery_with(
+    context: &TurnRecoveryContext,
+    persist: impl FnOnce(&HashMap<String, RecoveryState>) -> bool,
+) -> bool {
+    if !RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst) {
+        return false;
+    }
     let Ok(mut states) = recovery_states().lock() else {
         return false;
     };
     let Some(state) = states.get_mut(&context.desktop_thread_id) else {
         return false;
     };
-    if !matches!(
-        state.phase,
-        RecoveryPhase::ReservedRecovery | RecoveryPhase::CommittingRecovery
-    ) || state
-        .tracked
-        .as_ref()
-        .is_none_or(|tracked| tracked.recovery_id != context.recovery_id)
+    if state.phase != RecoveryPhase::ReservedRecovery
+        || state.reservation_epoch.as_deref() != Some(state.action_epoch.as_str())
+        || state.reservation_intent != Some(ContinuationIntent::AutoRecovery)
+        || has_owner_transaction_for_current_epoch(state)
+        || state
+            .tracked
+            .as_ref()
+            .is_none_or(|tracked| tracked.recovery_id != context.recovery_id)
     {
         return false;
     }
     state.phase = RecoveryPhase::CommittingRecovery;
+    // Charge the exact native transaction at durable precommit. An arriving
+    // proxy body is never treated as proof of origin/acceptance.
+    state.submitted = state.submitted.saturating_add(1);
+    state.commit_charged = true;
     state.updated_at = Instant::now();
-    persist_states(&states);
-    true
+    persist(&states)
 }
 
 #[cfg(test)]
@@ -235,6 +848,8 @@ fn recovery_commit_started(context: &TurnRecoveryContext) -> bool {
     recovery_states().lock().ok().is_some_and(|states| {
         states.get(&context.desktop_thread_id).is_some_and(|state| {
             state.phase == RecoveryPhase::CommittingRecovery
+                && state.reservation_epoch.as_deref() == Some(state.action_epoch.as_str())
+                && state.reservation_intent == Some(ContinuationIntent::AutoRecovery)
                 && state
                     .tracked
                     .as_ref()
@@ -244,6 +859,9 @@ fn recovery_commit_started(context: &TurnRecoveryContext) -> bool {
 }
 
 fn release_refused_recovery_commit(context: &TurnRecoveryContext) {
+    if !RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst) {
+        return;
+    }
     let Ok(mut states) = recovery_states().lock() else {
         return;
     };
@@ -251,12 +869,18 @@ fn release_refused_recovery_commit(context: &TurnRecoveryContext) {
         return;
     };
     if state.phase == RecoveryPhase::CommittingRecovery
+        && state.reservation_epoch.as_deref() == Some(state.action_epoch.as_str())
+        && state.reservation_intent == Some(ContinuationIntent::AutoRecovery)
         && state
             .tracked
             .as_ref()
             .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
     {
         state.phase = RecoveryPhase::ReservedRecovery;
+        if state.commit_charged {
+            state.submitted = state.submitted.saturating_sub(1);
+            state.commit_charged = false;
+        }
         state.updated_at = Instant::now();
         persist_states(&states);
     }
@@ -272,22 +896,29 @@ fn finish_reserved_recovery(context: &TurnRecoveryContext, submitted: bool) -> u
     if !matches!(
         state.phase,
         RecoveryPhase::ReservedRecovery | RecoveryPhase::CommittingRecovery
-    ) || state
-        .tracked
-        .as_ref()
-        .is_none_or(|tracked| tracked.recovery_id != context.recovery_id)
+    ) || state.reservation_epoch.as_deref() != Some(state.action_epoch.as_str())
+        || state.reservation_intent != Some(ContinuationIntent::AutoRecovery)
+        || state
+            .tracked
+            .as_ref()
+            .is_none_or(|tracked| tracked.recovery_id != context.recovery_id)
     {
         return state.submitted;
     }
     let committed_submission = submitted && state.phase == RecoveryPhase::CommittingRecovery;
-    if committed_submission {
-        state.submitted = state.submitted.saturating_add(1);
+    // A positive no-mutation finish can retire its precommit charge. Ambiguous
+    // results use submitted=true and must retain it.
+    if !submitted && state.commit_charged {
+        state.submitted = state.submitted.saturating_sub(1);
     }
     state.phase = if committed_submission {
         RecoveryPhase::AwaitingContinuation
     } else {
         RecoveryPhase::Idle
     };
+    state.commit_charged = false;
+    state.reservation_epoch = None;
+    state.reservation_intent = None;
     state.updated_at = Instant::now();
     let submitted = state.submitted;
     persist_states(&states);
@@ -304,18 +935,26 @@ fn cancel_reserved_recovery(context: &TurnRecoveryContext) {
     if !matches!(
         state.phase,
         RecoveryPhase::ReservedRecovery | RecoveryPhase::CommittingRecovery
-    ) || state
-        .tracked
-        .as_ref()
-        .is_none_or(|tracked| tracked.recovery_id != context.recovery_id)
+    ) || state.reservation_epoch.as_deref() != Some(state.action_epoch.as_str())
+        || state.reservation_intent != Some(ContinuationIntent::AutoRecovery)
+        || state
+            .tracked
+            .as_ref()
+            .is_none_or(|tracked| tracked.recovery_id != context.recovery_id)
     {
         return;
     }
     if state.submitted > 0 {
         state.phase = RecoveryPhase::AwaitingContinuation;
+        state.reservation_epoch = None;
+        state.reservation_intent = None;
+        state.commit_charged = false;
         state.updated_at = Instant::now();
     } else {
-        states.remove(&context.desktop_thread_id);
+        reset_automatic_state(state, false);
+        if state.continuations.is_empty() {
+            states.remove(&context.desktop_thread_id);
+        }
     }
     persist_states(&states);
 }
@@ -369,7 +1008,11 @@ impl Drop for TrackedTurn {
                             .is_some_and(|tracked| tracked.recovery_id == self.context.recovery_id)
                 });
             if owned_active {
-                states.remove(&self.context.desktop_thread_id);
+                let state = states.get_mut(&self.context.desktop_thread_id).unwrap();
+                reset_automatic_state(state, true);
+                if state.continuations.is_empty() {
+                    states.remove(&self.context.desktop_thread_id);
+                }
                 persist_states(&states);
             }
         }
@@ -377,20 +1020,30 @@ impl Drop for TrackedTurn {
 }
 
 pub(crate) fn track_turn(context: &TurnRecoveryContext) -> TrackedTurn {
-    let armed = context.desktop_eligible
-        && context.max_recoveries > 0
-        && !context.desktop_thread_id.is_empty();
+    ensure_owner_ledger_loaded();
+    let armed = context.desktop_eligible && !context.desktop_thread_id.is_empty();
     let mut owns_state = false;
     if armed {
         if let Ok(mut states) = recovery_states().lock() {
             let state = states.entry(context.desktop_thread_id.clone()).or_default();
             let can_claim = state.tracked.as_ref().is_none_or(|tracked| {
                 (tracked.recovery_id == context.recovery_id
-                    && state.phase != RecoveryPhase::AwaitingContinuation)
+                    && state.phase != RecoveryPhase::AwaitingContinuation
+                    && state.tracked_epoch.as_deref() == Some(state.action_epoch.as_str()))
+                    || (tracked.recovery_id != context.recovery_id
+                        && state.phase == RecoveryPhase::AwaitingContinuation
+                        && state.tracked_epoch.as_deref() != Some(state.action_epoch.as_str()))
                     || context.observed_at_ms > tracked.observed_at_ms
             });
             if can_claim {
+                // A tool-only followup is not a new user action, but its exact
+                // request still invalidates an idle owner view.
+                advance_action_epoch(state);
                 state.tracked = Some(context.clone());
+                state.tracked_epoch = Some(state.action_epoch.clone());
+                state.reservation_epoch = None;
+                state.reservation_intent = None;
+                state.commit_charged = false;
                 state.phase = RecoveryPhase::ActiveRequest;
                 state.updated_at = Instant::now();
                 persist_states(&states);
@@ -432,33 +1085,153 @@ pub(crate) fn track_turn(context: &TurnRecoveryContext) -> TrackedTurn {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RecoveryLedger {
+    #[serde(default = "legacy_recovery_ledger_version")]
+    version: u32,
+    #[serde(alias = "config_scope")]
     config_scope: String,
+    #[serde(alias = "saved_at")]
     saved_at: i64,
     turns: Vec<PersistedTurn>,
+    #[serde(default)]
+    continuations: Vec<PersistedContinuation>,
+}
+
+fn legacy_recovery_ledger_version() -> u32 {
+    1
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedContinuation {
+    thread_id: String,
+    transaction: ContinuationTransaction,
 }
 
 static STARTUP_LEDGER: OnceLock<Mutex<Option<RecoveryLedger>>> = OnceLock::new();
 
-/// Capture before listener startup so a new request cannot overwrite evidence
-/// left by the previous process while startup reconciliation is still running.
+fn validate_ledger(ledger: &RecoveryLedger, config_scope: &str) -> bool {
+    matches!(ledger.version, 1 | RECOVERY_LEDGER_VERSION)
+        && (ledger.version == RECOVERY_LEDGER_VERSION || ledger.continuations.is_empty())
+        && ledger.config_scope == config_scope
+        && ledger.continuations.iter().all(|entry| {
+            valid_continuation_identifier(&entry.thread_id)
+                && entry.transaction.intent == ContinuationIntent::OwnerContinue
+                && valid_continuation_identifier(&entry.transaction.operation_id)
+                && valid_continuation_identifier(&entry.transaction.action_epoch)
+                && valid_continuation_identifier(&entry.transaction.base_turn_id)
+                && entry
+                    .transaction
+                    .superseded_auto_recovery_id
+                    .as_deref()
+                    .is_none_or(valid_continuation_identifier)
+                && match entry.transaction.status {
+                    OwnerContinuationStatus::Submitted => entry
+                        .transaction
+                        .accepted_turn_id
+                        .as_deref()
+                        .is_some_and(|turn_id| {
+                            valid_continuation_identifier(turn_id)
+                                && turn_id != entry.transaction.base_turn_id
+                        }),
+                    _ => {
+                        entry.transaction.accepted_turn_id.is_none()
+                            && !entry.transaction.budget_reconciled
+                    }
+                }
+        })
+        && {
+            let mut identities = std::collections::HashSet::new();
+            ledger
+                .continuations
+                .iter()
+                .all(|entry| identities.insert(&entry.transaction.operation_id))
+        }
+}
+
+fn import_owner_continuations(ledger: &RecoveryLedger) {
+    if let Ok(mut states) = recovery_states().lock() {
+        for entry in &ledger.continuations {
+            let state = states.entry(entry.thread_id.clone()).or_default();
+            let mut transaction = entry.transaction.clone();
+            transaction.status = match transaction.status {
+                // A reservation from another process is never replayed.
+                OwnerContinuationStatus::Reserved => OwnerContinuationStatus::Refused,
+                OwnerContinuationStatus::Committing => OwnerContinuationStatus::Uncertain,
+                other => other,
+            };
+            state
+                .continuations
+                .entry(transaction.operation_id.clone())
+                .or_insert(transaction);
+        }
+        for turn in &ledger.turns {
+            if turn.submitted == 0 {
+                continue;
+            }
+            let Some(state) = states.get_mut(&turn.context.desktop_thread_id) else {
+                continue;
+            };
+            if state.continuations.is_empty() || state.tracked.is_some() {
+                continue;
+            }
+            state.submitted = turn.submitted;
+            state.tracked = Some(turn.context.clone());
+            state.tracked_epoch = Some(state.action_epoch.clone());
+            make_automatic_budget_dormant(state);
+        }
+    } else {
+        RECOVERY_STORAGE_HEALTHY.store(false, Ordering::SeqCst);
+    }
+}
+
+fn ensure_owner_ledger_loaded() {
+    OWNER_LEDGER_LOADED.get_or_init(|| {
+        // Fixtures must never read or mutate a running user's recovery ledger.
+        #[cfg(not(test))]
+        {
+            let loaded = match std::fs::read(recovery_path()) {
+                Ok(bytes) => serde_json::from_slice::<RecoveryLedger>(&bytes)
+                    .ok()
+                    .filter(|ledger| validate_ledger(ledger, &crate::process_identity::config_scope_fingerprint()))
+                    .map(Some)
+                    .ok_or(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err(()),
+            };
+            match loaded {
+                Ok(ledger) => {
+                    if let Some(ledger) = &ledger {
+                        import_owner_continuations(ledger);
+                    }
+                    let _ = STARTUP_LEDGER.set(Mutex::new(ledger));
+                }
+                Err(()) => {
+                    RECOVERY_STORAGE_HEALTHY.store(false, Ordering::SeqCst);
+                    log::warn!("[Codex/Recovery] recovery evidence is unreadable; continuation mutation is disabled");
+                    let _ = STARTUP_LEDGER.set(Mutex::new(None));
+                }
+            }
+        }
+    });
+}
+
+/// Load durable transaction tombstones regardless of exit classification/TTL.
+/// Only automatic interrupted-request scheduling is limited to crash recovery.
 pub(crate) fn capture_startup_recovery(
     classification: crate::app_exit_monitor::PreviousRunClassification,
 ) {
+    ensure_owner_ledger_loaded();
     if !classification.allows_proxy_startup() {
         return;
     }
-    let ledger = classification
-        .allows_crash_recovery()
-        .then(|| {
-            std::fs::read(recovery_path())
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<RecoveryLedger>(&bytes).ok())
-        })
-        .flatten();
-    let _ = STARTUP_LEDGER.set(Mutex::new(ledger));
     if !classification.allows_crash_recovery() {
+        if let Some(ledger) = STARTUP_LEDGER.get() {
+            if let Ok(mut ledger) = ledger.lock() {
+                *ledger = None;
+            }
+        }
         clear_persisted_recovery();
     }
 }
@@ -467,63 +1240,149 @@ pub(crate) fn capture_startup_recovery(
 struct PersistedTurn {
     context: TurnRecoveryContext,
     submitted: u32,
-    // Older ledgers only contain interrupted request evidence.
     #[serde(default)]
     phase: RecoveryPhase,
+    // Version-1 committing records charged on acknowledgement; version 2
+    // charges before send so restore must never add the same charge twice.
+    #[serde(default)]
+    commit_charged: bool,
 }
 
 fn ledger_from_states(states: &HashMap<String, RecoveryState>) -> RecoveryLedger {
     RecoveryLedger {
+        version: RECOVERY_LEDGER_VERSION,
         config_scope: crate::process_identity::config_scope_fingerprint(),
         saved_at: chrono::Utc::now().timestamp(),
         turns: states
             .values()
             .filter_map(|state| {
                 let context = state.tracked.as_ref()?;
-                (state.updated_at.elapsed() <= RECOVERY_STATE_TTL).then(|| PersistedTurn {
+                (state.updated_at.elapsed() <= RECOVERY_STATE_TTL
+                    || (state.submitted > 0 && !state.continuations.is_empty()))
+                .then(|| PersistedTurn {
                     context: context.clone(),
                     submitted: state.submitted,
                     phase: state.phase,
+                    commit_charged: state.commit_charged,
                 })
+            })
+            .collect(),
+        // No wall-clock TTL retires attempted/uncertain owner evidence.
+        continuations: states
+            .iter()
+            .flat_map(|(thread_id, state)| {
+                state
+                    .continuations
+                    .values()
+                    .map(|transaction| PersistedContinuation {
+                        thread_id: thread_id.clone(),
+                        transaction: transaction.clone(),
+                    })
             })
             .collect(),
     }
 }
 
+#[cfg(not(test))]
 fn recovery_path() -> std::path::PathBuf {
     crate::config::get_app_config_dir()
         .join("logs")
         .join(RECOVERY_FILE)
 }
 
-fn persist_states(states: &HashMap<String, RecoveryState>) {
-    // Unit tests must never mutate a running user's recovery ledger.
-    #[cfg(not(test))]
-    {
-        let result = serde_json::to_vec(&ledger_from_states(states))
-            .map_err(|error| error.to_string())
-            .and_then(|bytes| {
-                crate::config::atomic_write(&recovery_path(), &bytes)
-                    .map_err(|error| error.to_string())
-            });
-        if let Err(error) = result {
-            log::warn!("[Codex/Recovery] failed to persist recovery ledger: {error}");
-        }
-    }
-    #[cfg(test)]
-    let _ = states;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryPersistenceError {
+    TooLarge,
+    Serialization,
+    AtomicWrite,
+    FileSync,
+    #[cfg(unix)]
+    DirectorySync,
 }
 
-/// An explicit app exit must not look like an interrupted coding turn later.
-pub(crate) fn clear_persisted_recovery() {
-    if let Ok(mut states) = recovery_states().lock() {
-        states.clear();
+fn synchronize_recovery_ledger(path: &std::path::Path) -> Result<(), RecoveryPersistenceError> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| RecoveryPersistenceError::FileSync)?;
+    #[cfg(unix)]
+    std::fs::File::open(
+        path.parent()
+            .ok_or(RecoveryPersistenceError::DirectorySync)?,
+    )
+    .and_then(|directory| directory.sync_all())
+    .map_err(|_| RecoveryPersistenceError::DirectorySync)?;
+    Ok(())
+}
+
+fn persist_ledger_to_path(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), RecoveryPersistenceError> {
+    persist_ledger_to_path_with_sync(path, bytes, synchronize_recovery_ledger)
+}
+
+fn persist_ledger_to_path_with_sync(
+    path: &std::path::Path,
+    bytes: &[u8],
+    synchronize: impl FnOnce(&std::path::Path) -> Result<(), RecoveryPersistenceError>,
+) -> Result<(), RecoveryPersistenceError> {
+    if bytes.len() > MAX_RECOVERY_LEDGER_BYTES {
+        return Err(RecoveryPersistenceError::TooLarge);
+    }
+    crate::config::atomic_write_private(path, bytes)
+        .map_err(|_| RecoveryPersistenceError::AtomicWrite)?;
+    // atomic_write flushes buffers but does not fsync. Authorize only after
+    // the evidence reaches this durable-write boundary. Any error propagates.
+    synchronize(path)
+}
+
+fn persist_states_to_path(
+    states: &HashMap<String, RecoveryState>,
+    path: &std::path::Path,
+) -> Result<(), RecoveryPersistenceError> {
+    let bytes = serde_json::to_vec(&ledger_from_states(states))
+        .map_err(|_| RecoveryPersistenceError::Serialization)?;
+    persist_ledger_to_path(path, &bytes)
+}
+
+fn persist_states(states: &HashMap<String, RecoveryState>) -> bool {
+    if !RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst) {
+        return false;
     }
     #[cfg(not(test))]
-    if let Err(error) = std::fs::remove_file(recovery_path()) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            log::warn!("[Codex/Recovery] failed to clear recovery ledger: {error}");
-        }
+    if persist_states_to_path(states, &recovery_path()).is_err() {
+        RECOVERY_STORAGE_HEALTHY.store(false, Ordering::SeqCst);
+        log::warn!(
+            "[Codex/Recovery] failed to persist continuation evidence; mutation is disabled"
+        );
+        return false;
+    }
+    // Routine tests still never touch the running user's ledger. Dedicated
+    // tests exercise this same IO helper explicitly with an isolated tempfile.
+    #[cfg(test)]
+    let _ = states;
+    true
+}
+
+fn retire_automatic_scheduling_for_exit(state: &mut RecoveryState) -> bool {
+    if !state.continuations.is_empty() && state.submitted > 0 && state.tracked.is_some() {
+        make_automatic_budget_dormant(state);
+    } else {
+        reset_automatic_state(state, true);
+    }
+    advance_action_epoch(state);
+    !state.continuations.is_empty()
+}
+
+/// An explicit exit retires automatic crash scheduling, not durable owner
+/// mutation evidence. A malformed document is preserved without overwriting it.
+pub(crate) fn clear_persisted_recovery() {
+    ensure_owner_ledger_loaded();
+    if let Ok(mut states) = recovery_states().lock() {
+        states.retain(|_, state| retire_automatic_scheduling_for_exit(state));
+        persist_states(&states);
     }
 }
 
@@ -561,9 +1420,9 @@ fn restore_ledger(ledger: Option<RecoveryLedger>, budget: u32, db: &crate::datab
     };
     for turn in ledger.turns {
         let mut context = turn.context;
-        let submitted = turn
-            .submitted
-            .saturating_add(u32::from(turn.phase == RecoveryPhase::CommittingRecovery));
+        let submitted = turn.submitted.saturating_add(u32::from(
+            turn.phase == RecoveryPhase::CommittingRecovery && !turn.commit_charged,
+        ));
         if budget > 0 {
             context.max_recoveries = context.max_recoveries.min(budget);
         }
@@ -583,23 +1442,31 @@ fn restore_ledger(ledger: Option<RecoveryLedger>, budget: u32, db: &crate::datab
             continue;
         }
         if let Ok(mut states) = recovery_states().lock() {
-            // A newly observed request supersedes the old process's evidence.
-            if states.contains_key(&context.desktop_thread_id) {
+            let state = states.entry(context.desktop_thread_id.clone()).or_default();
+            // Strict startup import may already retain a dormant spent cap
+            // alongside owner evidence. It is not a newly observed request;
+            // only this exact saved generation may resume normal automatic
+            // crash policy. A live newer request still wins unconditionally.
+            let imported_same_generation_budget = !state.continuations.is_empty()
+                && state.phase == RecoveryPhase::AwaitingContinuation
+                && state.submitted == submitted
+                && state
+                    .tracked
+                    .as_ref()
+                    .is_some_and(|tracked| tracked.recovery_id == context.recovery_id);
+            if (state.tracked.is_some() && !imported_same_generation_budget)
+                || has_owner_transaction_for_current_epoch(state)
+            {
                 continue;
             }
-            states.insert(
-                context.desktop_thread_id.clone(),
-                RecoveryState {
-                    submitted,
-                    phase: if dormant {
-                        RecoveryPhase::AwaitingContinuation
-                    } else {
-                        RecoveryPhase::Idle
-                    },
-                    tracked: dormant.then(|| context.clone()),
-                    ..RecoveryState::default()
-                },
-            );
+            state.submitted = submitted;
+            state.phase = if dormant {
+                RecoveryPhase::AwaitingContinuation
+            } else {
+                RecoveryPhase::Idle
+            };
+            state.tracked = dormant.then(|| context.clone());
+            state.tracked_epoch = dormant.then(|| state.action_epoch.clone());
         }
         if dormant {
             continue;
@@ -1252,6 +2119,700 @@ mod tests {
         }
     }
 
+    fn owner_test_operation(label: &str) -> (OwnerContinuationEpoch, OwnerContinuationOperation) {
+        let thread_id = format!("owner-{label}-{}", uuid::Uuid::new_v4());
+        let epoch = capture_owner_continuation_epoch(&thread_id).unwrap();
+        let operation_id = format!("owner-operation-{thread_id}");
+        let reservation = reserve_owner_continuation(&epoch, "base-turn", &operation_id).unwrap();
+        let OwnerContinuationReservation::Reserved(operation) = reservation else {
+            panic!("first owner operation must reserve");
+        };
+        (epoch, operation)
+    }
+
+    fn cleanup_owner_test(epoch: &OwnerContinuationEpoch) {
+        recovery_states().lock().unwrap().remove(&epoch.thread_id);
+    }
+
+    #[test]
+    fn invalid_owner_view_epoch_reads_are_bounded_without_retiring_mutation_evidence() {
+        let now = Instant::now();
+        let mut states = HashMap::new();
+        for index in 0..MAX_IDLE_OWNER_EPOCHS {
+            states.insert(format!("invalid-thread-{index}"), RecoveryState::default());
+        }
+        assert!(!owner_epoch_capacity_allows(
+            &mut states,
+            "one-more-invalid",
+            now
+        ));
+        assert!(owner_epoch_capacity_allows(
+            &mut states,
+            "invalid-thread-0",
+            now
+        ));
+        states.get_mut("invalid-thread-0").unwrap().updated_at =
+            now - IDLE_OWNER_EPOCH_TTL - Duration::from_secs(1);
+        assert!(owner_epoch_capacity_allows(
+            &mut states,
+            "one-more-invalid",
+            now
+        ));
+        let (epoch, operation) = owner_test_operation("bounded-evidence");
+        assert!(authorize_owner_continuation_commit(&operation));
+        finish_owner_continuation(&operation, OwnerContinuationOutcome::Uncertain);
+        let mut retained = recovery_states()
+            .lock()
+            .unwrap()
+            .remove(&epoch.thread_id)
+            .unwrap();
+        retained.updated_at = now - RECOVERY_STATE_TTL - Duration::from_secs(1);
+        states.insert(epoch.thread_id.clone(), retained);
+        assert!(owner_epoch_capacity_allows(
+            &mut states,
+            "one-more-invalid",
+            now
+        ));
+        assert_eq!(
+            states[&epoch.thread_id].continuations[&operation.operation_id].status,
+            OwnerContinuationStatus::Uncertain
+        );
+    }
+
+    #[test]
+    fn owner_epoch_is_process_local_and_invalidated_by_every_unproven_user_action() {
+        let (epoch, operation) = owner_test_operation("epoch");
+        assert!(owner_continuation_epoch_is_current(&epoch));
+        assert!(owner_continuation_is_reserved(&operation));
+        begin_turn(&epoch.thread_id, true);
+        assert!(!owner_continuation_epoch_is_current(&epoch));
+        assert!(!authorize_owner_continuation_commit(&operation));
+        let fresh = capture_owner_continuation_epoch(&epoch.thread_id).unwrap();
+        assert!(owner_continuation_epoch_is_current(&fresh));
+        let mut other_process = fresh.clone();
+        other_process.process_epoch = "another-process".into();
+        assert!(!owner_continuation_epoch_is_current(&other_process));
+        assert_eq!(
+            reserve_owner_continuation(&other_process, "base-turn", "other-operation").unwrap_err(),
+            OwnerContinuationError::InvalidBinding
+        );
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    fn owner_supersedes_only_uncommitted_auto_and_old_generation_cannot_reclaim() {
+        let thread_id = format!("owner-supersede-{}", uuid::Uuid::new_v4());
+        let automatic = context(&thread_id, 2);
+        assert_eq!(reserve_recovery(&automatic), Some(1));
+        let epoch = capture_owner_continuation_epoch(&thread_id).unwrap();
+        let OwnerContinuationReservation::Reserved(owner) = reserve_owner_continuation(
+            &epoch,
+            "base-turn",
+            &format!("owner-operation-{thread_id}"),
+        )
+        .unwrap() else {
+            panic!("owner must replace queued automatic reservation");
+        };
+        assert!(!recovery_is_active(&automatic));
+        assert!(!authorize_reserved_recovery(&automatic));
+        assert_eq!(finish_reserved_recovery(&automatic, true), 0);
+        assert!(owner_continuation_is_reserved(&owner));
+        finish_owner_continuation(&owner, OwnerContinuationOutcome::Refused);
+        assert_eq!(
+            reserve_recovery(&automatic),
+            None,
+            "cancelled auto generation cannot reclaim after owner refusal"
+        );
+        cleanup_owner_test(&epoch);
+
+        let thread_id = format!("owner-no-committing-supersede-{}", uuid::Uuid::new_v4());
+        let automatic = context(&thread_id, 2);
+        assert_eq!(reserve_recovery(&automatic), Some(1));
+        assert!(authorize_reserved_recovery(&automatic));
+        let epoch = capture_owner_continuation_epoch(&thread_id).unwrap();
+        assert_eq!(
+            reserve_owner_continuation(
+                &epoch,
+                "base-turn",
+                &format!("owner-operation-{thread_id}")
+            )
+            .unwrap_err(),
+            OwnerContinuationError::Busy
+        );
+        assert_eq!(finish_reserved_recovery(&automatic, true), 1);
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    fn owner_supersession_retains_spent_auto_cap_through_refusal_ttl_exit_and_restore() {
+        let mut automatic = context(&format!("owner-spent-cap-{}", uuid::Uuid::new_v4()), 3);
+        assert_eq!(reserve_recovery(&automatic), Some(1));
+        assert!(authorize_reserved_recovery(&automatic));
+        assert_eq!(finish_reserved_recovery(&automatic, true), 1);
+        let tracking = observe_next_continuation(&mut automatic);
+        assert_eq!(reserve_recovery(&automatic), Some(2));
+        let epoch = capture_owner_continuation_epoch(&automatic.desktop_thread_id).unwrap();
+        let operation_id = format!("owner-spent-cap-operation-{}", uuid::Uuid::new_v4());
+        let OwnerContinuationReservation::Reserved(operation) =
+            reserve_owner_continuation(&epoch, "base-turn", &operation_id).unwrap()
+        else {
+            panic!("owner must supersede only the queued second attempt");
+        };
+        assert!(!authorize_reserved_recovery(&automatic));
+        {
+            let states = recovery_states().lock().unwrap();
+            let state = &states[&automatic.desktop_thread_id];
+            assert_eq!(state.submitted, 1);
+            assert_eq!(state.phase, RecoveryPhase::AwaitingContinuation);
+            assert_eq!(
+                state.tracked.as_ref().unwrap().recovery_id,
+                automatic.recovery_id
+            );
+            let ledger = ledger_from_states(&states);
+            let turn = ledger
+                .turns
+                .iter()
+                .find(|turn| turn.context.desktop_thread_id == automatic.desktop_thread_id)
+                .unwrap();
+            assert_eq!(
+                turn.submitted, 1,
+                "owner preparation must not erase a spent automatic cap from persistence"
+            );
+            assert_eq!(turn.phase, RecoveryPhase::AwaitingContinuation);
+        }
+        let receipt = finish_owner_continuation(&operation, OwnerContinuationOutcome::Refused);
+        assert!(!receipt.mutation_attempted);
+        let mut state = recovery_states()
+            .lock()
+            .unwrap()
+            .remove(&automatic.desktop_thread_id)
+            .unwrap();
+        state.updated_at = Instant::now() - RECOVERY_STATE_TTL - Duration::from_secs(1);
+        let mut ledger = ledger_from_states(&HashMap::from([(
+            automatic.desktop_thread_id.clone(),
+            state,
+        )]));
+        assert_eq!(ledger.turns.len(), 1, "the retained owner evidence must also retain its conservative old-chain cap beyond auto TTL");
+        assert_eq!(ledger.turns[0].submitted, 1);
+        ledger.saved_at -= RECOVERY_STATE_TTL.as_secs() as i64 + 1;
+        import_owner_continuations(&ledger);
+        {
+            let mut states = recovery_states().lock().unwrap();
+            let state = states.get_mut(&automatic.desktop_thread_id).unwrap();
+            assert_eq!(state.submitted, 1);
+            assert_eq!(state.phase, RecoveryPhase::AwaitingContinuation);
+            assert!(retire_automatic_scheduling_for_exit(state));
+            assert_eq!(
+                state.submitted, 1,
+                "graceful exit retires scheduling, not an unaccepted owner reset"
+            );
+            assert!(state.tracked.is_some());
+        }
+        assert_eq!(
+            reserve_recovery(&automatic),
+            None,
+            "the superseded old generation remains revoked after restore"
+        );
+        begin_turn(&automatic.desktop_thread_id, true);
+        automatic.recovery_id.push_str("-actual-manual-request");
+        automatic.observed_at_ms += 1;
+        let newer_tracking = track_turn(&automatic);
+        assert_eq!(
+            reserve_recovery(&automatic),
+            Some(2),
+            "an unproven manual continue must not get a third fresh automatic budget"
+        );
+        drop(newer_tracking);
+        drop(tracking);
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retained_owner_budget_does_not_disable_a_distinct_eligible_auto_crash_recovery() {
+        let _home = crate::config::TestHomeGuard::new();
+        let database = crate::database::Database::memory().unwrap();
+        let provider = crate::provider::Provider::with_id(
+            "owner-history-auto-provider".into(),
+            "test".into(),
+            serde_json::json!({"baseUrl":"https://example.test"}),
+            None,
+        );
+        database.save_provider("codex", &provider).unwrap();
+        let (epoch, operation) = owner_test_operation("eligible-auto-restore");
+        finish_owner_continuation(&operation, OwnerContinuationOutcome::Refused);
+        let mut automatic = context(&epoch.thread_id, 3);
+        automatic.durable_provider_id = provider.id.clone();
+        automatic.provider_fingerprint = provider_fingerprint(&provider);
+        assert_eq!(reserve_recovery(&automatic), Some(1));
+        assert!(authorize_reserved_recovery(&automatic));
+        assert_eq!(finish_reserved_recovery(&automatic, true), 1);
+        let tracking = observe_next_continuation(&mut automatic);
+        let state = recovery_states()
+            .lock()
+            .unwrap()
+            .remove(&epoch.thread_id)
+            .unwrap();
+        let ledger = ledger_from_states(&HashMap::from([(epoch.thread_id.clone(), state)]));
+        assert_eq!(ledger.turns[0].phase, RecoveryPhase::ActiveRequest);
+        import_owner_continuations(&ledger);
+        assert_eq!(
+            recovery_states().lock().unwrap()[&epoch.thread_id].phase,
+            RecoveryPhase::AwaitingContinuation
+        );
+        restore_ledger(Some(ledger), 3, &database);
+        assert!(recovery_reserved_for_test(&epoch.thread_id), "passive spent-cap import must not disable a different legitimate automatic crash-recovery generation");
+        let states = recovery_states().lock().unwrap();
+        assert_eq!(states[&epoch.thread_id].submitted, 1);
+        assert_eq!(
+            states[&epoch.thread_id]
+                .tracked
+                .as_ref()
+                .unwrap()
+                .recovery_id,
+            automatic.recovery_id
+        );
+        drop(states);
+        drop(tracking);
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    fn real_ledger_persistence_atomically_replaces_and_synchronizes_isolated_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("ledger.json");
+        persist_ledger_to_path(&path, b"first-evidence").unwrap();
+        persist_ledger_to_path(&path, b"replacement-evidence").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement-evidence");
+        let states = HashMap::new();
+        persist_states_to_path(&states, &path).unwrap();
+        let ledger: RecoveryLedger =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(ledger.version, RECOVERY_LEDGER_VERSION);
+        assert!(ledger.turns.is_empty());
+        assert!(ledger.continuations.is_empty());
+    }
+
+    #[test]
+    fn real_ledger_persistence_rejects_size_write_and_rename_failures_without_erasing_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("ledger.json");
+        std::fs::write(&path, b"existing-evidence").unwrap();
+        let too_large = vec![b'x'; MAX_RECOVERY_LEDGER_BYTES + 1];
+        assert_eq!(
+            persist_ledger_to_path(&path, &too_large),
+            Err(RecoveryPersistenceError::TooLarge)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing-evidence");
+        let blocked_parent = temporary.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"untouched-parent").unwrap();
+        assert_eq!(
+            persist_ledger_to_path(&blocked_parent.join("ledger.json"), b"evidence"),
+            Err(RecoveryPersistenceError::AtomicWrite)
+        );
+        assert_eq!(std::fs::read(&blocked_parent).unwrap(), b"untouched-parent");
+        let directory_target = temporary.path().join("existing-directory");
+        std::fs::create_dir(&directory_target).unwrap();
+        std::fs::write(directory_target.join("sentinel"), b"untouched-directory").unwrap();
+        assert_eq!(
+            persist_ledger_to_path(&directory_target, b"evidence"),
+            Err(RecoveryPersistenceError::AtomicWrite)
+        );
+        assert_eq!(
+            std::fs::read(directory_target.join("sentinel")).unwrap(),
+            b"untouched-directory"
+        );
+    }
+
+    #[test]
+    fn real_post_replace_sync_failure_propagates_before_owner_precommit_can_send() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("isolated-ledger.json");
+        let (epoch, operation) = owner_test_operation("real-sync-failure");
+        let failure = std::cell::Cell::new(None);
+        let authorized = authorize_owner_continuation_commit_with(&operation, |states| {
+            let bytes = serde_json::to_vec(&ledger_from_states(states)).unwrap();
+            let result = persist_ledger_to_path_with_sync(&path, &bytes, |written_path| {
+                assert!(
+                    written_path.is_file(),
+                    "the real atomic replacement already completed"
+                );
+                // Simulate a filesystem race solely inside this temporary
+                // directory, then exercise the real durability-stage IO error.
+                // This is not a fake boolean persistence result.
+                std::fs::remove_file(written_path).unwrap();
+                synchronize_recovery_ledger(written_path)
+            });
+            failure.set(result.err());
+            result.is_ok()
+        });
+        let mut sends = 0;
+        if authorized {
+            sends += 1;
+        }
+        assert_eq!(failure.get(), Some(RecoveryPersistenceError::FileSync));
+        assert_eq!(
+            sends, 0,
+            "a real durable-write boundary failure must withhold mutation authorization"
+        );
+        assert!(
+            !authorize_owner_continuation_commit(&operation),
+            "failed intent cannot be authorized again"
+        );
+        let receipt = read_owner_continuation_receipt(&operation.operation_id).unwrap();
+        assert_eq!(receipt.status, OwnerContinuationStatus::Committing);
+        assert!(receipt.mutation_attempted);
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    fn owner_precommit_is_one_use_and_failed_durable_write_cannot_authorize_send() {
+        let (epoch, operation) = owner_test_operation("persist-refusal");
+        assert!(!authorize_owner_continuation_commit_with(
+            &operation,
+            |_| false
+        ));
+        assert!(!owner_continuation_is_reserved(&operation));
+        assert!(!authorize_owner_continuation_commit(&operation));
+        let OwnerContinuationReservation::AttachOnly(receipt) =
+            reserve_owner_continuation(&epoch, "base-turn", "another-click").unwrap()
+        else {
+            panic!("uncertain durable intent is attach-only");
+        };
+        assert_eq!(receipt.status, OwnerContinuationStatus::Committing);
+        assert!(receipt.mutation_attempted);
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    fn owner_unknown_outcome_survives_actions_ttl_and_auto_disabled_without_replay() {
+        let (epoch, operation) = owner_test_operation("uncertain-retention");
+        assert!(authorize_owner_continuation_commit(&operation));
+        let receipt = finish_owner_continuation(&operation, OwnerContinuationOutcome::Uncertain);
+        assert_eq!(receipt.status, OwnerContinuationStatus::Uncertain);
+        assert!(!receipt.submitted);
+        assert!(receipt.mutation_attempted);
+        begin_turn(&epoch.thread_id, false);
+        mark_turn_completed(&epoch.thread_id);
+        {
+            let mut states = recovery_states().lock().unwrap();
+            let state = states.get_mut(&epoch.thread_id).unwrap();
+            state.updated_at = Instant::now() - RECOVERY_STATE_TTL - Duration::from_secs(1);
+        }
+        let unrelated = context(&format!("unrelated-{}", uuid::Uuid::new_v4()), 0);
+        assert_eq!(reserve_recovery(&unrelated), None);
+        let unrelated_enabled = context(&format!("retention-sweep-{}", uuid::Uuid::new_v4()), 1);
+        assert_eq!(reserve_recovery(&unrelated_enabled), Some(1));
+        mark_turn_completed(&unrelated_enabled.desktop_thread_id);
+        let fresh = capture_owner_continuation_epoch(&epoch.thread_id).unwrap();
+        let OwnerContinuationReservation::AttachOnly(receipt) =
+            reserve_owner_continuation(&fresh, "base-turn", "new-click").unwrap()
+        else {
+            panic!("old exact-base uncertainty must not replay");
+        };
+        assert_eq!(receipt.operation_id, operation.operation_id);
+        assert_eq!(receipt.status, OwnerContinuationStatus::Uncertain);
+        let encoded =
+            serde_json::to_value(ledger_from_states(&recovery_states().lock().unwrap())).unwrap();
+        assert!(encoded["continuations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["threadId"] == epoch.thread_id));
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    fn owner_operation_replay_is_attach_only_and_payload_reuse_conflicts() {
+        let (epoch, operation) = owner_test_operation("idempotency");
+        assert!(matches!(
+            reserve_owner_continuation(&epoch, "base-turn", &operation.operation_id).unwrap(),
+            OwnerContinuationReservation::AttachOnly(_)
+        ));
+        assert_eq!(
+            reserve_owner_continuation(&epoch, "different-base", &operation.operation_id)
+                .unwrap_err(),
+            OwnerContinuationError::OperationConflict
+        );
+        let other_thread = format!("another-owner-thread-{}", uuid::Uuid::new_v4());
+        let other_epoch = capture_owner_continuation_epoch(&other_thread).unwrap();
+        assert_eq!(
+            reserve_owner_continuation(&other_epoch, "base-turn", &operation.operation_id)
+                .unwrap_err(),
+            OwnerContinuationError::OperationConflict
+        );
+        cleanup_owner_test(&other_epoch);
+        assert!(authorize_owner_continuation_commit(&operation));
+        assert!(!authorize_owner_continuation_commit(&operation));
+        let receipt = finish_owner_continuation(
+            &operation,
+            OwnerContinuationOutcome::Submitted {
+                turn_id: "accepted-turn".into(),
+            },
+        );
+        assert!(receipt.submitted);
+        assert_eq!(receipt.status, OwnerContinuationStatus::Submitted);
+        let serialized = serde_json::to_value(receipt).unwrap();
+        assert_eq!(serialized.as_object().unwrap().len(), 5);
+        assert_eq!(serialized["acknowledgedTurnId"], "accepted-turn");
+        assert!(serialized.get("actionEpoch").is_none());
+        assert!(serialized.get("baseTurnId").is_none());
+        assert!(serialized.get("provider").is_none());
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    fn owner_accepted_turn_reconciliation_never_uses_proxy_continue_as_provenance() {
+        let (epoch, operation) = owner_test_operation("ack-reconciliation");
+        recovery_states()
+            .lock()
+            .unwrap()
+            .get_mut(&epoch.thread_id)
+            .unwrap()
+            .submitted = 2;
+        assert!(authorize_owner_continuation_commit(&operation));
+        // Any manual or injected request is unproven at the proxy boundary.
+        begin_turn(&epoch.thread_id, true);
+        assert_eq!(
+            recovery_states().lock().unwrap()[&epoch.thread_id].submitted,
+            2
+        );
+        let receipt = finish_owner_continuation(
+            &operation,
+            OwnerContinuationOutcome::Submitted {
+                turn_id: "accepted-turn".into(),
+            },
+        );
+        assert!(receipt.submitted);
+        assert_eq!(
+            recovery_states().lock().unwrap()[&epoch.thread_id].submitted,
+            2
+        );
+        assert!(
+            !reconcile_owner_accepted_turn(&epoch, "accepted-turn"),
+            "stale native epoch cannot reset budget"
+        );
+        let fresh = capture_owner_continuation_epoch(&epoch.thread_id).unwrap();
+        assert!(!reconcile_owner_accepted_turn(&fresh, "another-turn"));
+        assert!(reconcile_owner_accepted_turn(&fresh, "accepted-turn"));
+        assert_eq!(
+            recovery_states().lock().unwrap()[&epoch.thread_id].submitted,
+            0
+        );
+        assert!(
+            !reconcile_owner_accepted_turn(&fresh, "accepted-turn"),
+            "canonical acceptance reconciles once"
+        );
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    fn delayed_owner_acceptance_reconciliation_never_refunds_a_new_auto_commit() {
+        let (epoch, operation) = owner_test_operation("reconcile-auto-race");
+        assert!(authorize_owner_continuation_commit(&operation));
+        begin_turn(&epoch.thread_id, true);
+        finish_owner_continuation(
+            &operation,
+            OwnerContinuationOutcome::Submitted {
+                turn_id: "accepted-owner-turn".into(),
+            },
+        );
+        let automatic = context(&epoch.thread_id, 3);
+        let tracking = track_turn(&automatic);
+        let read_epoch = capture_owner_continuation_epoch(&epoch.thread_id).unwrap();
+        assert_eq!(reserve_recovery(&automatic), Some(1));
+        assert!(authorize_reserved_recovery(&automatic));
+        assert!(
+            owner_continuation_epoch_is_current(&read_epoch),
+            "reservation need not fake a user action to guard its charge"
+        );
+        assert!(!reconcile_owner_accepted_turn(
+            &read_epoch,
+            "accepted-owner-turn"
+        ));
+        assert_eq!(
+            recovery_states().lock().unwrap()[&epoch.thread_id].submitted,
+            1
+        );
+        assert_eq!(finish_reserved_recovery(&automatic, true), 1);
+        assert!(
+            !reconcile_owner_accepted_turn(&read_epoch, "accepted-owner-turn"),
+            "a late view cannot refund an ambiguous completed auto commit either"
+        );
+        assert_eq!(
+            recovery_states().lock().unwrap()[&epoch.thread_id].submitted,
+            1
+        );
+        drop(tracking);
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    fn owner_late_finish_cannot_clear_a_newer_active_proxy_request() {
+        let (epoch, operation) = owner_test_operation("late-finish");
+        assert!(authorize_owner_continuation_commit(&operation));
+        begin_turn(&epoch.thread_id, true);
+        let newer = context(&epoch.thread_id, 2);
+        let tracking = track_turn(&newer);
+        finish_owner_continuation(&operation, OwnerContinuationOutcome::Uncertain);
+        let states = recovery_states().lock().unwrap();
+        let state = &states[&epoch.thread_id];
+        assert_eq!(state.phase, RecoveryPhase::ActiveRequest);
+        assert_eq!(
+            state.tracked.as_ref().unwrap().recovery_id,
+            newer.recovery_id
+        );
+        assert_eq!(
+            state.continuations[&operation.operation_id].status,
+            OwnerContinuationStatus::Uncertain
+        );
+        drop(states);
+        drop(tracking);
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    fn owner_reserved_startup_is_refused_and_committing_startup_is_uncertain_never_replayed() {
+        for commit in [false, true] {
+            let (epoch, operation) = owner_test_operation(if commit {
+                "restore-committing"
+            } else {
+                "restore-reserved"
+            });
+            if commit {
+                assert!(authorize_owner_continuation_commit(&operation));
+            }
+            let mut states = recovery_states().lock().unwrap();
+            let state = states.remove(&epoch.thread_id).unwrap();
+            drop(states);
+            let ledger = ledger_from_states(&HashMap::from([(epoch.thread_id.clone(), state)]));
+            assert!(ledger.turns.is_empty());
+            assert_eq!(ledger.continuations.len(), 1);
+            import_owner_continuations(&ledger);
+            assert!(!owner_continuation_epoch_is_current(&epoch));
+            assert!(!authorize_owner_continuation_commit(&operation));
+            let states = recovery_states().lock().unwrap();
+            let restored = &states[&epoch.thread_id];
+            assert_eq!(restored.phase, RecoveryPhase::Idle);
+            assert_eq!(
+                restored.continuations[&operation.operation_id].status,
+                if commit {
+                    OwnerContinuationStatus::Uncertain
+                } else {
+                    OwnerContinuationStatus::Refused
+                }
+            );
+            assert!(restored.tracked.is_none());
+            drop(states);
+            cleanup_owner_test(&epoch);
+        }
+    }
+
+    #[test]
+    fn literal_legacy_ledger_wire_names_migrate_without_disabling_mutation() {
+        // Real older files used snake_case, not a freshly serialized v2 fixture.
+        let legacy = br#"{"config_scope":"legacy-scope","saved_at":1,"turns":[]}"#;
+        let ledger: RecoveryLedger = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(ledger.version, 1);
+        assert!(ledger.continuations.is_empty());
+        assert!(validate_ledger(&ledger, "legacy-scope"));
+        let prior_camel_case = br#"{"configScope":"legacy-scope","savedAt":1,"turns":[]}"#;
+        let ledger: RecoveryLedger = serde_json::from_slice(prior_camel_case).unwrap();
+        assert!(validate_ledger(&ledger, "legacy-scope"));
+        let duplicate_scope = br#"{"configScope":"a","config_scope":"b","savedAt":1,"turns":[]}"#;
+        assert!(serde_json::from_slice::<RecoveryLedger>(duplicate_scope).is_err());
+    }
+
+    #[test]
+    fn owner_ledger_validation_rejects_malformed_unknown_version_or_duplicate_evidence() {
+        let (epoch, operation) = owner_test_operation("ledger-validation");
+        assert!(authorize_owner_continuation_commit(&operation));
+        let mut states = recovery_states().lock().unwrap();
+        let state = states.remove(&epoch.thread_id).unwrap();
+        drop(states);
+        let mut ledger = ledger_from_states(&HashMap::from([(epoch.thread_id.clone(), state)]));
+        assert!(validate_ledger(&ledger, &ledger.config_scope));
+        assert!(!validate_ledger(&ledger, "another-configuration"));
+        ledger.version = RECOVERY_LEDGER_VERSION + 1;
+        assert!(!validate_ledger(&ledger, &ledger.config_scope));
+        ledger.version = RECOVERY_LEDGER_VERSION;
+        let json = serde_json::to_value(&ledger).unwrap();
+        let mut malformed = json.clone();
+        malformed["continuations"][0]["transaction"]["status"] = serde_json::json!("unknown-state");
+        assert!(serde_json::from_value::<RecoveryLedger>(malformed).is_err());
+        let mut duplicate = json;
+        let entry = duplicate["continuations"][0].clone();
+        duplicate["continuations"]
+            .as_array_mut()
+            .unwrap()
+            .push(entry);
+        let duplicate: RecoveryLedger = serde_json::from_value(duplicate).unwrap();
+        assert!(!validate_ledger(&duplicate, &duplicate.config_scope));
+    }
+
+    #[test]
+    fn arriving_unproven_continue_preserves_precharged_cap_across_crash_tracking_gap() {
+        let automatic = context(&format!("auto-incoming-gap-{}", uuid::Uuid::new_v4()), 2);
+        assert_eq!(reserve_recovery(&automatic), Some(1));
+        assert!(authorize_reserved_recovery(&automatic));
+        begin_turn(&automatic.desktop_thread_id, true);
+        assert!(!recovery_is_active(&automatic));
+        assert!(!authorize_reserved_recovery(&automatic));
+        let mut states = recovery_states().lock().unwrap();
+        let state = states.remove(&automatic.desktop_thread_id).unwrap();
+        let ledger = ledger_from_states(&HashMap::from([(
+            automatic.desktop_thread_id.clone(),
+            state,
+        )]));
+        assert_eq!(ledger.turns.len(), 1);
+        assert_eq!(ledger.turns[0].submitted, 1);
+        assert_eq!(ledger.turns[0].phase, RecoveryPhase::AwaitingContinuation);
+        let restored = RecoveryState {
+            submitted: ledger.turns[0].submitted,
+            phase: RecoveryPhase::AwaitingContinuation,
+            tracked: Some(automatic.clone()),
+            tracked_epoch: Some("previous-action-epoch".into()),
+            ..RecoveryState::default()
+        };
+        states.insert(automatic.desktop_thread_id.clone(), restored);
+        drop(states);
+        let mut newer = automatic.clone();
+        newer.recovery_id.push_str("-actual-new-request");
+        newer.observed_at_ms -= 1;
+        let tracking = track_turn(&newer);
+        assert_eq!(
+            recovery_states().lock().unwrap()[&newer.desktop_thread_id].phase,
+            RecoveryPhase::ActiveRequest
+        );
+        assert_eq!(
+            recovery_states().lock().unwrap()[&newer.desktop_thread_id].submitted,
+            1
+        );
+        assert_eq!(reserve_recovery(&newer), Some(2));
+        drop(tracking);
+        mark_turn_completed(&newer.desktop_thread_id);
+    }
+
+    #[test]
+    fn auto_precommit_charges_once_without_incoming_text_and_storage_failure_refuses() {
+        let automatic = context(&format!("auto-precommit-{}", uuid::Uuid::new_v4()), 2);
+        assert_eq!(reserve_recovery(&automatic), Some(1));
+        assert!(authorize_reserved_recovery(&automatic));
+        assert_eq!(
+            recovery_states().lock().unwrap()[&automatic.desktop_thread_id].submitted,
+            1
+        );
+        assert!(!authorize_reserved_recovery(&automatic));
+        release_refused_recovery_commit(&automatic);
+        assert_eq!(
+            recovery_states().lock().unwrap()[&automatic.desktop_thread_id].submitted,
+            0
+        );
+        assert!(!authorize_reserved_recovery_with(&automatic, |_| false));
+        assert!(recovery_commit_started(&automatic), "failed durable intent remains non-replayable rather than granting another authorization");
+        mark_turn_completed(&automatic.desktop_thread_id);
+    }
+
     fn observe_next_continuation(context: &mut TurnRecoveryContext) -> TrackedTurn {
         begin_turn(&context.desktop_thread_id, true);
         context.recovery_id.push_str("-next");
@@ -1574,7 +3135,10 @@ mod tests {
         context.provider_fingerprint = provider_fingerprint(&provider);
         assert_eq!(reserve_recovery(&context), Some(1));
         assert!(authorize_reserved_recovery(&context));
-        assert!(authorize_reserved_recovery(&context));
+        assert!(
+            !authorize_reserved_recovery(&context),
+            "precommit authorization is a one-use CAS"
+        );
         let ledger = ledger_from_states(&recovery_states().lock().unwrap());
         mark_turn_completed(&context.desktop_thread_id);
 
@@ -1625,9 +3189,12 @@ mod tests {
             context.durable_provider_id = provider.id.clone();
             context.provider_fingerprint = provider_fingerprint(&provider);
             let ledger = RecoveryLedger {
+                version: RECOVERY_LEDGER_VERSION,
+                continuations: Vec::new(),
                 config_scope: crate::process_identity::config_scope_fingerprint(),
                 saved_at: chrono::Utc::now().timestamp(),
                 turns: vec![PersistedTurn {
+                    commit_charged: false,
                     context: context.clone(),
                     submitted: 1,
                     phase,
@@ -2377,20 +3944,25 @@ mod tests {
         let mut old = newer.clone();
         old.recovery_id = "previous-process-generation".into();
         let ledger = RecoveryLedger {
+            version: RECOVERY_LEDGER_VERSION,
+            continuations: Vec::new(),
             config_scope: crate::process_identity::config_scope_fingerprint(),
             saved_at: chrono::Utc::now().timestamp(),
             turns: vec![
                 PersistedTurn {
+                    commit_charged: false,
                     context: valid.clone(),
                     submitted: 1,
                     phase: RecoveryPhase::Idle,
                 },
                 PersistedTurn {
+                    commit_charged: false,
                     context: changed.clone(),
                     submitted: 0,
                     phase: RecoveryPhase::Idle,
                 },
                 PersistedTurn {
+                    commit_charged: false,
                     context: old,
                     submitted: 0,
                     phase: RecoveryPhase::Idle,
@@ -2759,6 +4331,62 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_retry_denials_never_reserve_a_continuation() {
+        use super::super::error::ProxyError;
+
+        for (index, error) in [
+            serde_json::json!({"code":"server_error","message":"Temporary overload; retry later.","retryable":false}),
+            serde_json::json!({"code":"overloaded_error","message":"The upstream provider is overloaded; automatic capacity retry is disabled.","retryable":false}),
+            serde_json::json!({"code":"server_error","message":"Temporary overload. Do not retry this request; retry another request."}),
+            serde_json::json!({"code":"not_retryable","message":"Temporary overload"}),
+            serde_json::json!({"type":"usage_limit_reached","message":"Usage limit reached. Please retry later.","retryable":false}),
+        ].into_iter().enumerate() {
+            let context = context(&format!("explicit-no-retry-{index}"), 3);
+            let terminal = format!(
+                "event: response.failed\ndata: {}\n\n",
+                serde_json::json!({"type":"response.failed","response":{"status":"failed","error":error}}),
+            );
+            let output = observe_responses_turn_stream(
+                futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(terminal.clone()))]),
+                context.clone(),
+            ).collect::<Vec<_>>().await;
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].as_ref().unwrap(), &Bytes::from(terminal));
+            assert!(
+                !recovery_states().lock().unwrap().contains_key(&context.desktop_thread_id),
+                "an explicit retry denial must clear tracking without queuing a continuation: {error}"
+            );
+            assert!(!forward_error_is_recoverable(&ProxyError::UpstreamError {
+                status: 503,
+                body: Some(serde_json::json!({"error":error}).to_string()),
+            }));
+            mark_turn_completed(&context.desktop_thread_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_disabled_capacity_failure_keeps_independent_continuation_policy() {
+        let context = context("capacity-replay-disabled-continuation", 3);
+        let terminal = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"overloaded_error\",\"message\":\"The upstream provider is overloaded; automatic capacity retry is disabled.\"}}}\n\n"
+        );
+        let output = observe_responses_turn_stream(
+            futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(terminal))]),
+            context.clone(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(output.len(), 1);
+        assert_eq!(
+            recovery_states().lock().unwrap().get(&context.desktop_thread_id).unwrap().phase,
+            RecoveryPhase::ReservedRecovery,
+            "the provider capacity setting stops same-request replays, not separately enabled Aggressive continuation"
+        );
+        mark_turn_completed(&context.desktop_thread_id);
     }
 
     #[test]

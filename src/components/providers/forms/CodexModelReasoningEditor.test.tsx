@@ -47,6 +47,198 @@ const sublyxCapability: CodexModelReasoningCapability = {
 };
 
 describe("CodexModelReasoningEditor", () => {
+  it("keeps the OpenRouter on/off wire contract when confirming Boolean mode", () => {
+    const onChange = vi.fn();
+    render(
+      <CodexModelReasoningEditor
+        model="xiaomi/mimo-v2.6-flash"
+        capability={{
+          schemaVersion: 2,
+          supportStatus: "confirmed_supported",
+          controlKind: "boolean",
+          supportedEfforts: [],
+          disableAllowed: true,
+          upstream: {
+            format: "boolean",
+            parameter: "reasoning.enabled",
+            effortMap: {},
+          },
+          source: "detection",
+        }}
+        readOnly={false}
+        onChange={onChange}
+      />,
+    );
+    expect(
+      screen.getByText(/This control mode does not use effort levels/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Provider-native effort high"),
+    ).not.toBeInTheDocument();
+    fireEvent.change(
+      screen.getByLabelText("xiaomi/mimo-v2.6-flash reasoning control"),
+      { target: { value: "boolean" } },
+    );
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        controlKind: "boolean",
+        supportedEfforts: [],
+        upstream: {
+          format: "boolean",
+          parameter: "reasoning.enabled",
+          effortMap: {},
+        },
+      }),
+    );
+  });
+
+  it("preserves a discovered OpenRouter token-budget contract when confirming Budget mode", () => {
+    const onChange = vi.fn();
+    const capability: CodexModelReasoningCapability = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      controlKind: "budget",
+      supportedEfforts: [],
+      disableAllowed: true,
+      upstream: {
+        format: "budget",
+        parameter: "reasoning.max_tokens",
+        effortMap: {},
+      },
+      source: "detection",
+    };
+    render(
+      <CodexModelReasoningEditor
+        model="budget-model"
+        capability={capability}
+        providerIdentity={{ baseUrl: "https://openrouter.ai/api/v1" }}
+        readOnly={false}
+        onChange={onChange}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("budget-model reasoning control"), {
+      target: { value: "budget" },
+    });
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        controlKind: "budget",
+        supportStatus: "confirmed_supported",
+        supportedEfforts: [],
+        defaultEffort: undefined,
+        disableAllowed: true,
+        upstream: {
+          format: "budget",
+          parameter: "reasoning.max_tokens",
+          effortMap: {},
+        },
+        source: "user",
+      }),
+    );
+    expect(capability.upstream).toEqual({
+      format: "budget",
+      parameter: "reasoning.max_tokens",
+      effortMap: {},
+    });
+    expect(capability.disableAllowed).toBe(true);
+  });
+
+  it.each(["budget", "graded"] as const)(
+    "uses the verified OpenRouter wire contract when manually changing %s to Boolean",
+    (controlKind) => {
+      const onChange = vi.fn();
+      const capability: CodexModelReasoningCapability =
+        controlKind === "budget"
+          ? {
+              schemaVersion: 2,
+              supportStatus: "confirmed_supported",
+              controlKind: "budget",
+              supportedEfforts: [],
+              disableAllowed: true,
+              upstream: {
+                format: "budget",
+                parameter: "reasoning.max_tokens",
+                effortMap: {},
+              },
+            }
+          : {
+              ...qwenCapability,
+              upstream: {
+                format: "reasoning_object",
+                parameter: "reasoning.effort",
+                effortMap: { low: "low", medium: "medium", high: "high" },
+              },
+            };
+      render(
+        <CodexModelReasoningEditor
+          model="openrouter-model"
+          capability={capability}
+          providerIdentity={{
+            baseUrl: "https://openrouter.ai/api/v1",
+            providerName: "Renamed gateway",
+          }}
+          readOnly={false}
+          onChange={onChange}
+        />,
+      );
+      fireEvent.change(
+        screen.getByLabelText("openrouter-model reasoning control"),
+        { target: { value: "boolean" } },
+      );
+      expect(onChange).toHaveBeenCalledWith(
+        expect.objectContaining({
+          controlKind: "boolean",
+          supportedEfforts: [],
+          defaultEffort: undefined,
+          upstream: {
+            format: "boolean",
+            parameter: "reasoning.enabled",
+            effortMap: {},
+          },
+          source: "user",
+        }),
+      );
+    },
+  );
+
+  it.each([
+    {
+      providerName: "OpenRouter",
+      baseUrl: "https://other-provider.example/v1",
+    },
+    {
+      providerKind: "openrouter",
+      baseUrl: "https://openrouter.ai.evil.example/v1",
+    },
+    { providerName: "OpenRouter" },
+    { baseUrl: "https://other-provider.example/openrouter.ai/api/v1" },
+  ])(
+    "does not guess an OpenRouter Boolean wire contract from unverified provider identity %j",
+    (providerIdentity) => {
+      const onChange = vi.fn();
+      render(
+        <CodexModelReasoningEditor
+          model="qwen3.8"
+          capability={qwenCapability}
+          providerIdentity={providerIdentity}
+          readOnly={false}
+          onChange={onChange}
+        />,
+      );
+      fireEvent.change(screen.getByLabelText("qwen3.8 reasoning control"), {
+        target: { value: "boolean" },
+      });
+      expect(onChange).toHaveBeenCalledWith(
+        expect.objectContaining({
+          upstream: {
+            format: "boolean",
+            parameter: "enable_thinking",
+            effortMap: {},
+          },
+        }),
+      );
+    },
+  );
+
   it("explains every manual configuration group", () => {
     render(
       <CodexModelReasoningEditor
@@ -471,7 +663,7 @@ describe("CodexModelReasoningEditor", () => {
     expect(screen.getByLabelText("gpt-6.1 reasoning control")).toBeEnabled();
     expect(
       screen.getByText(
-        /Sublyx GPT native levels and wire settings are maintained automatically/,
+        /Sublyx GPT native levels and wire settings follow the maintained model contract or verified model evidence\. Max is shown only when supported\. Ultra is a separate Codex selector/,
       ),
     ).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("gpt-6.1 reasoning control"), {
@@ -576,6 +768,59 @@ describe("CodexModelReasoningEditor", () => {
     );
   });
 
+  it("locks exact verified native bindings without removing Max or widening its effort subset", () => {
+    const onChange = vi.fn();
+    render(
+      <CodexModelReasoningEditor
+        model="scoped-public-model"
+        upstreamModel="gpt-6-astra"
+        providerIdentity={{ baseUrl: "https://api.sublyx.org/v1" }}
+        capability={{
+          schemaVersion: 2,
+          supportStatus: "confirmed_supported",
+          controlKind: "graded",
+          supportedEfforts: ["low", "high", "max"],
+          defaultEffort: "max",
+          disableAllowed: false,
+          upstream: {
+            format: "reasoning_object",
+            parameter: "reasoning.effort",
+            effortMap: { low: "low", high: "high", max: "max" },
+          },
+          source: "detection",
+          confidence: "verified",
+          evidenceScope: {
+            transportFingerprint: "a".repeat(64),
+            model: "gpt-6-astra",
+          },
+        }}
+        readOnly={false}
+        onChange={onChange}
+      />,
+    );
+    expect(screen.getByLabelText("Provider-native effort max")).toBeChecked();
+    expect(screen.getByLabelText("Provider-native effort max")).toBeDisabled();
+    expect(screen.queryByLabelText("Provider-native effort xhigh")).toBeNull();
+    expect(screen.getByLabelText("max mapping target")).toHaveValue("max");
+    expect(screen.getByLabelText("max mapping target")).toBeDisabled();
+    expect(
+      screen.getByLabelText("scoped-public-model provider default effort"),
+    ).toHaveValue("max");
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.change(
+      screen.getByLabelText("scoped-public-model provider default effort"),
+      { target: { value: "high" } },
+    );
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "user",
+        supportedEfforts: ["low", "high", "max"],
+        defaultEffort: "high",
+        codexUltraOrchestration: { enabled: true, providerEffort: "max" },
+      }),
+    );
+  });
+
   it("keeps Sublyx max provider-scoped and exposes Ultra as xhigh", () => {
     const onChange = vi.fn();
     render(
@@ -587,13 +832,11 @@ describe("CodexModelReasoningEditor", () => {
       />,
     );
 
-    expect(
-      screen.getByLabelText("Provider-native effort max"),
-    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Provider-native effort max")).toBeChecked();
     expect(screen.getByLabelText("max mapping target")).toHaveValue("max");
     expect(
       screen.getByLabelText("gpt-6.1-sol-sublyx provider default effort"),
-    ).not.toHaveValue("max");
+    ).toHaveValue("xhigh");
     expect(screen.queryByLabelText("Add native provider level")).toBeNull();
     expect(
       within(
@@ -669,6 +912,7 @@ describe("CodexModelReasoningEditor", () => {
       render(
         <CodexModelReasoningEditor
           model="gpt-6.1"
+          upstreamModel="gpt-6.1-sol"
           providerIdentity={providerIdentity}
           capability={{
             ...sublyxCapability,
@@ -694,13 +938,15 @@ describe("CodexModelReasoningEditor", () => {
       const next = onChange.mock.calls[0][0];
       expect(next).toMatchObject({
         source: "user",
-        providerKey: "sublyx",
+        providerKey,
         defaultEffort: "high",
         codexUltraOrchestration: { enabled: true, providerEffort: "max" },
       });
       expect(next.supportedEfforts).toContain("max");
-      expect(next.upstream.effortMap).toHaveProperty("max", "max");
-      expect(Object.values(next.upstream.effortMap)).toContain("max");
+      // Explicit max compatibility mapping is user-owned; native Max remains
+      // independently available through its declared provider level.
+      expect(next.upstream.effortMap).toHaveProperty("max", "xhigh");
+      expect(next.codexUltraOrchestration.providerEffort).toBe("max");
     },
   );
 
@@ -770,7 +1016,7 @@ describe("CodexModelReasoningEditor", () => {
     render(
       <CodexModelReasoningEditor
         model="public-alias"
-        upstreamModel="gpt-6.1"
+        upstreamModel="gpt-6.1-sol"
         providerIdentity={{ baseUrl: "https://api.sublyx.org/v1" }}
         capability={{ ...sublyxCapability, source: "user" }}
         readOnly={false}
@@ -796,5 +1042,74 @@ describe("CodexModelReasoningEditor", () => {
     expect(
       screen.getByLabelText("Provider-native effort max"),
     ).toBeInTheDocument();
+  });
+});
+
+describe("explicit reasoning editor authority regressions", () => {
+  it("keeps a manual Sublyx subset editable without reviving native Max", () => {
+    const onChange = vi.fn();
+    render(
+      <CodexModelReasoningEditor
+        model="gpt-6.1-sol"
+        providerIdentity={{ baseUrl: "https://api.sublyx.org/v1" }}
+        capability={{
+          ...qwenCapability,
+          upstream: {
+            format: "reasoning_object",
+            parameter: "reasoning.effort",
+            effortMap: { low: "low", medium: "medium", high: "high" },
+          },
+        }}
+        readOnly={false}
+        onChange={onChange}
+      />,
+    );
+    expect(screen.queryByLabelText("Provider-native effort max")).toBeNull();
+    expect(screen.getByLabelText("Provider-native effort low")).toBeEnabled();
+    fireEvent.click(screen.getByLabelText("Provider-native effort low"));
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "user",
+        supportedEfforts: ["medium", "high"],
+      }),
+    );
+  });
+  it("uses the OpenRouter effort object when changing Boolean to graded", () => {
+    const onChange = vi.fn();
+    render(
+      <CodexModelReasoningEditor
+        model="openrouter-model"
+        providerIdentity={{ baseUrl: "https://openrouter.ai/api/v1" }}
+        capability={{
+          schemaVersion: 2,
+          supportStatus: "confirmed_supported",
+          controlKind: "boolean",
+          supportedEfforts: [],
+          disableAllowed: true,
+          upstream: {
+            format: "boolean",
+            parameter: "reasoning.enabled",
+            effortMap: {},
+          },
+          source: "user",
+        }}
+        readOnly={false}
+        onChange={onChange}
+      />,
+    );
+    fireEvent.change(
+      screen.getByLabelText("openrouter-model reasoning control"),
+      { target: { value: "graded" } },
+    );
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        controlKind: "graded",
+        upstream: {
+          format: "reasoning_object",
+          parameter: "reasoning.effort",
+          effortMap: {},
+        },
+      }),
+    );
   });
 });

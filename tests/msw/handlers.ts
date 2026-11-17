@@ -70,7 +70,11 @@ const codexSubagentPreviewFixtures: Record<
     providerKind: "third_party",
     requestedRoleName: "deepseek-flash",
     effectiveRoleName: "deepseek-flash",
+    editableDescription:
+      "Read repositories, trace architecture, and collect evidence.",
     description: "Read repositories, trace architecture, and collect evidence.",
+    editableDeveloperInstructions:
+      "Inspect the repository carefully and do not modify source files.",
     developerInstructions:
       "Inspect the repository carefully and do not modify source files.",
     nicknameCandidates: ["Flash", "Scout"],
@@ -88,8 +92,12 @@ const codexSubagentPreviewFixtures: Record<
     providerKind: "third_party",
     requestedRoleName: "deepseek-pro",
     effectiveRoleName: "deepseek-pro",
+    editableDescription:
+      "Handle complex debugging, architecture decisions, and high-risk review.",
     description:
       "Handle complex debugging, architecture decisions, and high-risk review.",
+    editableDeveloperInstructions:
+      "Investigate the complete call chain before proposing or making changes.",
     developerInstructions:
       "Investigate the complete call chain before proposing or making changes.",
     nicknameCandidates: ["Pro", "Reviewer"],

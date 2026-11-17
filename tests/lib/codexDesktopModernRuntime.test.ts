@@ -69,6 +69,7 @@ const assembleRuntime = (
     MODEL_PICKER_RELEASE: "model_picker_release.js",
     QUERY_CACHE_LIFECYCLE: "model_picker_cache_lifecycle.js",
     MODEL_PATCH: "model_picker_core.js",
+    NATIVE_BOOLEAN_REASONING: "native_boolean_reasoning.js",
     GUARDIAN_V2_PATCH: "guardian_v2_compatibility.js",
     REQUEST_NORMALIZATION: "app_server_request_normalization.js",
     HISTORY_LINEAGE_HYDRATION: "history_lineage_hydration.js",
@@ -79,6 +80,7 @@ const assembleRuntime = (
     REQUEST_HEALTH_WARNING: "request_health_warning.js",
     SUMMARY_HANDOFF: "summary_handoff.js",
     CODEX_CONTINUATION: "continuation.js",
+    OWNER_REMOTE_VIEW: "owner_remote_view.js",
     APP_SERVER_MODEL_LIST_SCOPE: "app_server_model_list_scope.js",
   };
   let script = renderer;
@@ -127,6 +129,7 @@ const createHarness = (
     moduleNamespaces?: Record<string, object>;
     importError?: boolean;
     importPending?: boolean;
+    numericImport?: Promise<object>;
     runtimeFingerprint?: string;
     state?: RuntimeState;
   } = {},
@@ -173,6 +176,7 @@ const createHarness = (
     if (options.importPending) return await new Promise(() => {});
     if (options.importError)
       throw new Error("Fixture numeric entry import unavailable");
+    if (url === entryUrl && options.numericImport) return options.numericImport;
     const configuredNamespace = options.moduleNamespaces?.[url];
     if (configuredNamespace) return configuredNamespace;
     if (url !== entryUrl)
@@ -241,6 +245,14 @@ const createHarness = (
     },
     importModule,
     fetch,
+    setInterval,
+    pulse: () => heartbeat?.(),
+    replaceReactRoot: (scope: object) => {
+      if (!window.__codexRoot) throw new Error("The fixture has no React root");
+      window.__codexRoot._internalRoot.current = {
+        dependencies: { first: scope },
+      };
+    },
     dispose: () => {
       for (const entry of state.reasoningObserverPrototypes?.values() ?? [])
         entry.dispose();
@@ -530,6 +542,458 @@ describe("Codex Desktop current numeric-bundle runtime integration", () => {
     }
   });
 
+  it.each([
+    {
+      label: "OpenRouter minimal without Max",
+      efforts: ["minimal"],
+      enabled: [],
+    },
+    {
+      label: "OpenRouter low/high without Max",
+      efforts: ["low", "high"],
+      enabled: ["medium"],
+    },
+  ])(
+    "reconciles every declared native graded effort: $label",
+    async ({ efforts, enabled }) => {
+      const client = new QueryClient();
+      const picker = createPicker(client);
+      const native = createNativeVisibilityFixture(client, new Set(enabled));
+      const catalog = payload();
+      catalog.models[0].supported_reasoning_levels = efforts;
+      const harness = createHarness(native.webpack.namespace, {
+        reactScope: native.scope,
+        catalog,
+      });
+      const original = native.scope.get;
+      try {
+        await harness.execute();
+        expect(picker.efforts()).toEqual(efforts);
+        expect(nativeVisible(picker, native.scope.get(native.atom))).toEqual(
+          efforts,
+        );
+        expect([...native.enabled]).toEqual(enabled);
+        expect(
+          harness.state.nativeReasoningVisibilityReconciliation,
+        ).toMatchObject({
+          status: "known",
+          managed: true,
+          patchedScopes: 1,
+        });
+        expect(harness.state.readCodexModelPickerDiagnostics?.()).toMatchObject(
+          {
+            status: "ready",
+            missingMaxModelCount: 0,
+            missingUltraModelCount: 0,
+          },
+        );
+        expect(native.scope.get).not.toBe(original);
+        expect(native.resolve).not.toHaveBeenCalled();
+        expect(native.set).not.toHaveBeenCalled();
+        expect(native.watch).not.toHaveBeenCalled();
+        expect(harness.state.appServerClients ?? []).toEqual([]);
+
+        // When the authoritative catalog removes the effort, the wrapper must
+        // disappear rather than remembering the previous model's declaration.
+        catalog.models[0].supported_reasoning_levels = [];
+        const replacement = createHarness(native.webpack.namespace, {
+          reactScope: native.scope,
+          catalog,
+          state: harness.state,
+        });
+        await replacement.execute();
+        expect(native.scope.get).toBe(original);
+        expect([...native.enabled]).toEqual(enabled);
+        expect(picker.efforts()).toEqual([]);
+        replacement.dispose();
+      } finally {
+        harness.dispose();
+        picker.dispose();
+        client.clear();
+      }
+    },
+  );
+
+  it("shares one numeric inventory between picker and continuation discovery", async () => {
+    const client = new QueryClient();
+    const picker = createPicker(client);
+    const native = createNativeVisibilityFixture(client, new Set(allEfforts));
+    const harness = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+    });
+    const publishedInventories: unknown[] = [];
+    let currentInventory: unknown;
+    Object.defineProperty(harness.state, "webpackPickerDiscovery", {
+      configurable: true,
+      get: () => currentInventory,
+      set: (value: unknown) => {
+        currentInventory = value;
+        if (value) publishedInventories.push(value);
+      },
+    });
+    try {
+      await harness.execute();
+      expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "ready",
+      );
+      expect(publishedInventories).toHaveLength(1);
+      await harness.tick();
+      expect(publishedInventories).toHaveLength(1);
+      expect(
+        harness.importModule.mock.calls.filter(([url]) => url === entryUrl),
+      ).toHaveLength(1);
+      expect(native.webpack.requireModule).not.toHaveBeenCalled();
+      expect(native.webpack.factory).not.toHaveBeenCalled();
+    } finally {
+      harness.dispose();
+      picker.dispose();
+      client.clear();
+    }
+  });
+
+  it("installs the heartbeat while a numeric import stays unresolved and recovers without duplicate discovery jobs", async () => {
+    const client = new QueryClient();
+    const picker = createPicker(client);
+    const native = createNativeVisibilityFixture(client, new Set(allEfforts));
+    let resolveImport!: (namespace: object) => void;
+    const numericImport = new Promise<object>((resolve) => {
+      resolveImport = resolve;
+    });
+    const harness = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+      numericImport,
+    });
+    let completed = false;
+    const installation = harness.execute().then((result) => {
+      completed = true;
+      return result;
+    });
+    const now = vi.spyOn(Date, "now");
+    try {
+      for (let index = 0; index < 512; index += 1) await Promise.resolve();
+      expect(completed).toBe(true);
+      expect(harness.setInterval).toHaveBeenCalledTimes(1);
+      expect(harness.state.interval).toBe(1);
+      expect(harness.state.messagePatchInstalled).toBe(true);
+      expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "unverified",
+      );
+      const pendingJob = harness.state.webpackPickerDiscoveryPromise;
+      expect(pendingJob).toBeInstanceOf(Promise);
+      const startedAt = Date.now();
+      for (let tick = 1; tick <= 3; tick += 1) {
+        now.mockReturnValue(startedAt + tick * 6000);
+        await harness.tick();
+        expect(harness.state.webpackPickerDiscoveryPromise).toBe(pendingJob);
+        expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
+          "unverified",
+        );
+      }
+      expect(
+        harness.importModule.mock.calls.filter(([url]) => url === entryUrl),
+      ).toHaveLength(1);
+      resolveImport(native.webpack.namespace);
+      for (let index = 0; index < 256; index += 1) await Promise.resolve();
+      await harness.tick();
+      expect(harness.state.webpackPickerDiscoveryPromise).toBeNull();
+      expect(harness.state.readCodexModelPickerDiagnostics?.()).toMatchObject({
+        status: "ready",
+        missingMaxModelCount: 0,
+        missingUltraModelCount: 0,
+      });
+      expect(native.webpack.requireModule).not.toHaveBeenCalled();
+      expect(native.webpack.factory).not.toHaveBeenCalled();
+      expect(native.resolve).not.toHaveBeenCalled();
+      expect(native.set).not.toHaveBeenCalled();
+      expect(native.watch).not.toHaveBeenCalled();
+      expect(harness.state.appServerClients ?? []).toEqual([]);
+    } finally {
+      resolveImport(native.webpack.namespace);
+      await installation;
+      now.mockRestore();
+      harness.dispose();
+      picker.dispose();
+      client.clear();
+    }
+  });
+
+  it("keeps a successor discovery job and import cache when an old generation import rejects", async () => {
+    const client = new QueryClient();
+    const picker = createPicker(client);
+    const native = createNativeVisibilityFixture(client, new Set(allEfforts));
+    let rejectOldImport!: (error: Error) => void;
+    const oldImport = new Promise<object>((_resolve, reject) => {
+      rejectOldImport = reject;
+    });
+    let resolveCurrentImport!: (namespace: object) => void;
+    const currentImport = new Promise<object>((resolve) => {
+      resolveCurrentImport = resolve;
+    });
+    const state: RuntimeState = {};
+    const previous = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+      numericImport: oldImport,
+      runtimeFingerprint: "previous-discovery-generation",
+      state,
+    });
+    const current = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+      numericImport: currentImport,
+      runtimeFingerprint: "current-discovery-generation",
+      state,
+    });
+    try {
+      await previous.execute();
+      await current.execute();
+      const currentJob = state.webpackPickerDiscoveryPromise;
+      const promises = state.modulePromises as Map<string, Promise<object>>;
+      const key = `webpack-entry:${entryUrl}`;
+      const currentModulePromise = promises.get(key);
+      expect(currentModulePromise).toBeInstanceOf(Promise);
+      rejectOldImport(new Error("Redacted previous-generation import failure"));
+      for (let index = 0; index < 256; index += 1) await Promise.resolve();
+      expect(state.webpackPickerDiscoveryPromise).toBe(currentJob);
+      expect(promises.get(key)).toBe(currentModulePromise);
+      expect(state.failures).not.toContain(
+        "Redacted previous-generation import failure",
+      );
+      expect(state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "unverified",
+      );
+      resolveCurrentImport(native.webpack.namespace);
+      for (let index = 0; index < 256; index += 1) await Promise.resolve();
+      await current.tick();
+      expect(state.webpackPickerDiscoveryPromise).toBeNull();
+      expect(state.readCodexModelPickerDiagnostics?.().status).toBe("ready");
+      expect(
+        current.importModule.mock.calls.filter(([url]) => url === entryUrl),
+      ).toHaveLength(1);
+    } finally {
+      rejectOldImport(new Error("Redacted previous-generation cleanup"));
+      resolveCurrentImport(native.webpack.namespace);
+      for (let index = 0; index < 256; index += 1) await Promise.resolve();
+      current.dispose();
+      picker.dispose();
+      client.clear();
+    }
+  });
+
+  it("does not let a same-fingerprint old discovery finalize a still-pending successor job", async () => {
+    const client = new QueryClient();
+    const picker = createPicker(client);
+    const native = createNativeVisibilityFixture(client, new Set(allEfforts));
+    let resolveInitialImport!: (namespace: object) => void;
+    const initialImport = new Promise<object>((resolve) => {
+      resolveInitialImport = resolve;
+    });
+    let resolveSecondImport!: (namespace: object) => void;
+    const secondImport = new Promise<object>((resolve) => {
+      resolveSecondImport = resolve;
+    });
+    const secondEntryUrl = "https://codex.test/assets/348411.fixture.js";
+    const state: RuntimeState = {};
+    const previous = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+      numericImport: initialImport,
+      state,
+    });
+    const current = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+      scripts: [
+        { src: entryUrl, type: "module" },
+        { src: secondEntryUrl, type: "module" },
+      ],
+      moduleNamespaces: { [secondEntryUrl]: secondImport },
+      state,
+    });
+    try {
+      await previous.execute();
+      const oldJob = state.webpackPickerDiscoveryPromise;
+      await current.execute();
+      const currentJob = state.webpackPickerDiscoveryPromise;
+      expect(currentJob).not.toBe(oldJob);
+      resolveInitialImport(native.webpack.namespace);
+      for (let index = 0; index < 256; index += 1) await Promise.resolve();
+      expect(state.webpackPickerDiscoveryPromise).toBe(currentJob);
+      expect(state.nativeReasoningVisibilityAtoms).toEqual([]);
+      expect(current.importModule).toHaveBeenCalledWith(secondEntryUrl);
+      expect(state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "unverified",
+      );
+      await current.tick();
+      expect(state.webpackPickerDiscoveryPromise).toBe(currentJob);
+      resolveSecondImport({});
+      for (let index = 0; index < 256; index += 1) await Promise.resolve();
+      await current.tick();
+      expect(state.webpackPickerDiscoveryPromise).toBeNull();
+      expect(state.readCodexModelPickerDiagnostics?.().status).toBe("ready");
+      expect(previous.importModule).toHaveBeenCalledTimes(1);
+      expect(current.importModule).toHaveBeenCalledTimes(1);
+    } finally {
+      resolveInitialImport(native.webpack.namespace);
+      resolveSecondImport({});
+      for (let index = 0; index < 256; index += 1) await Promise.resolve();
+      current.dispose();
+      picker.dispose();
+      client.clear();
+    }
+  });
+
+  it("keeps current native proof available during a routine initialized-cache rescan", async () => {
+    const client = new QueryClient();
+    const picker = createPicker(client);
+    const native = createNativeVisibilityFixture(client, new Set(allEfforts));
+    const harness = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+    });
+    try {
+      await harness.execute();
+      expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "ready",
+      );
+      harness.state.appServerModuleRetryAt = 0;
+      harness.state.webpackPickerDiscoveryRetryAt = 0;
+      harness.pulse();
+      // A cached ESM import is still an await boundary. Never publish an empty
+      // atom list between inspecting the same current initialized cache and
+      // committing its current native visibility token.
+      expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "ready",
+      );
+      await harness.tick();
+      expect(native.resolve).not.toHaveBeenCalled();
+      expect(native.set).not.toHaveBeenCalled();
+      expect(native.watch).not.toHaveBeenCalled();
+      expect(native.webpack.requireModule).not.toHaveBeenCalled();
+      expect(native.webpack.factory).not.toHaveBeenCalled();
+    } finally {
+      harness.dispose();
+      picker.dispose();
+      client.clear();
+    }
+  });
+
+  it("retries a late initialized native atom without waiting for continuation module backoff", async () => {
+    const client = new QueryClient();
+    const picker = createPicker(client);
+    const native = createNativeVisibilityFixture(client, new Set(allEfforts));
+    const nativeModule = native.webpack.cache.Q3tq;
+    delete native.webpack.cache.Q3tq;
+    const harness = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+    });
+    const now = vi.spyOn(Date, "now");
+    try {
+      await harness.execute();
+      expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "unverified",
+      );
+      const startedAt = Date.now();
+      harness.state.appServerModuleRetryAt = startedAt + 30000;
+      native.webpack.cache.Q3tq = nativeModule;
+      now.mockReturnValue(startedAt + 6000);
+      await harness.tick();
+      expect(harness.state.readCodexModelPickerDiagnostics?.()).toMatchObject({
+        status: "ready",
+        missingMaxModelCount: 0,
+        missingUltraModelCount: 0,
+      });
+      expect(harness.state.appServerModuleRetryAt).toBe(startedAt + 30000);
+      expect(harness.importModule).toHaveBeenCalledWith(entryUrl);
+      expect(native.webpack.requireModule).not.toHaveBeenCalled();
+      expect(native.webpack.factory).not.toHaveBeenCalled();
+      expect(native.resolve).not.toHaveBeenCalled();
+      expect(native.set).not.toHaveBeenCalled();
+      expect(native.watch).not.toHaveBeenCalled();
+      expect(harness.state.appServerClients ?? []).toEqual([]);
+    } finally {
+      now.mockRestore();
+      harness.dispose();
+      picker.dispose();
+      client.clear();
+    }
+  });
+
+  it("refreshes changed current native scope ownership independently of continuation module backoff", async () => {
+    const client = new QueryClient();
+    const picker = createPicker(client);
+    const native = createNativeVisibilityFixture(client, new Set(allEfforts));
+    const harness = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+    });
+    try {
+      await harness.execute();
+      expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "ready",
+      );
+      const scanStartedAt = harness.state.scopedAppServerScopesScannedAt;
+      await harness.tick();
+      expect(harness.state.scopedAppServerScopesScannedAt).toBe(scanStartedAt);
+      expect(harness.state.nativeReasoningScopeRetryAt).toBe(0);
+      const retryAt = Date.now() + 30000;
+      harness.state.appServerModuleRetryAt = retryAt;
+      harness.replaceReactRoot(native.scope);
+      expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "unverified",
+      );
+      await harness.tick();
+      expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "ready",
+      );
+      expect(harness.state.appServerModuleRetryAt).toBe(retryAt);
+      expect(harness.state.scopedAppServerScopeCandidates).toEqual(
+        new Set([native.scope]),
+      );
+      expect(native.resolve).not.toHaveBeenCalled();
+      expect(native.set).not.toHaveBeenCalled();
+      expect(native.watch).not.toHaveBeenCalled();
+      expect(harness.state.appServerClients ?? []).toEqual([]);
+    } finally {
+      harness.dispose();
+      picker.dispose();
+      client.clear();
+    }
+  });
+
+  it("bounds repeated native owner rescans without borrowing the previous React root's readiness", async () => {
+    const client = new QueryClient();
+    const picker = createPicker(client);
+    const native = createNativeVisibilityFixture(client, new Set(allEfforts));
+    const harness = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+    });
+    const now = vi.spyOn(Date, "now");
+    try {
+      await harness.execute();
+      const startedAt = Date.now();
+      now.mockReturnValue(startedAt);
+      harness.state.appServerModuleRetryAt = startedAt + 30000;
+      harness.replaceReactRoot(native.scope);
+      await harness.tick();
+      expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "ready",
+      );
+      expect(harness.state.nativeReasoningScopeRetryAt).toBe(startedAt + 5000);
+      harness.replaceReactRoot(native.scope);
+      await harness.tick();
+      expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "unverified",
+      );
+      expect(harness.state.nativeReasoningScopeRetryAt).toBe(startedAt + 5000);
+      now.mockReturnValue(startedAt + 6000);
+      await harness.tick();
+      expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "ready",
+      );
+      expect(harness.state.nativeReasoningScopeRetryAt).toBe(startedAt + 11000);
+    } finally {
+      now.mockRestore();
+      harness.dispose();
+      picker.dispose();
+      client.clear();
+    }
+  });
+
   it("does not promote an orphaned module-export scope into current React ownership", async () => {
     const currentClient = new QueryClient();
     const orphanClient = new QueryClient();
@@ -619,6 +1083,90 @@ describe("Codex Desktop current numeric-bundle runtime integration", () => {
       }
     },
   );
+
+  it("keeps incomplete native picker owners when newly discovered status brands warm a mounted RPC scope", async () => {
+    const client = new QueryClient();
+    const picker = createPicker(client);
+    const native = createNativeVisibilityFixture(client, new Set(allEfforts));
+    const atomScope = {};
+    const statusAtom = {
+      scope: atomScope,
+      kind: "signal-family",
+      read() {},
+      resolve() {},
+    };
+    const managerToken = { scope: atomScope, cache: "signal", resolve() {} };
+    const manager = new Function(
+      'return function(scope,host){const status=scope.get(o.M4,host); if(status.client)return status.client.rpc; throw Error("AppServerManager RPC is unavailable for hostId:");}',
+    )();
+    const managerFactory = new Function(
+      'return function manager(e,t,n){var o=n("status-module"); return function(scope,host){const status=scope.get(o.M4,host); if(status.client)return status.client.rpc; throw Error("AppServerManager RPC is unavailable for hostId:");}}',
+    )();
+    native.webpack.cache.manager = {
+      id: "manager",
+      loaded: true,
+      exports: { V: manager, p: managerToken },
+    };
+    native.webpack.cache["status-module"] = {
+      id: "status-module",
+      loaded: true,
+      exports: { M4: statusAtom },
+    };
+    Object.assign(native.webpack.requireModule, {
+      m: { manager: managerFactory },
+    });
+    Object.assign(native.scope, {
+      scope: atomScope,
+      get: vi.fn((token: object) => {
+        if (token === statusAtom) return { status: "pending" };
+        if (token === native.atom) return native.enabled;
+        throw new Error("Unknown fixture atom");
+      }),
+    });
+    const incomplete = {
+      chain: {},
+      node: { queryClient: null },
+      queryClient: client,
+      get() {},
+      set: vi.fn(),
+      watch: vi.fn(),
+    };
+    const harness = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+      additionalReactScopes: [incomplete],
+    });
+    try {
+      await harness.execute();
+      expect(harness.state.appServerStatusAtoms).toEqual([statusAtom]);
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(true);
+      expect(harness.state.scopedAppServerScopeCandidates).toEqual(
+        new Set([native.scope, incomplete]),
+      );
+      expect(harness.state.readCodexModelPickerDiagnostics?.()).toMatchObject({
+        status: "unverified",
+        nativeVisibilityUnverifiedObserverCount: 1,
+      });
+      expect(harness.state.appServerClients ?? []).toEqual([]);
+      // Same-window, same-fingerprint reinjection may warm only the canonical
+      // RPC brand. That subset must not replace a complete native owner set.
+      await harness.execute();
+      expect(harness.state.scopedAppServerScopeCandidates).toEqual(
+        new Set([native.scope, incomplete]),
+      );
+      expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
+        "unverified",
+      );
+      expect(native.webpack.requireModule).not.toHaveBeenCalled();
+      expect(native.webpack.factory).not.toHaveBeenCalled();
+      expect(native.resolve).not.toHaveBeenCalled();
+      expect(incomplete.set).not.toHaveBeenCalled();
+      expect(incomplete.watch).not.toHaveBeenCalled();
+    } finally {
+      harness.dispose();
+      picker.dispose();
+      client.clear();
+    }
+  });
 
   it("fails closed when a second recognized scope owner is incomplete even though the first cache has known native visibility", async () => {
     const client = new QueryClient();

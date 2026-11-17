@@ -5,6 +5,7 @@ import {
   updateCodexCatalogRowModelBinding,
 } from "./CodexFormFields";
 import type { CodexCatalogModel, CodexModelReasoningCapability } from "@/types";
+import type { CodexModelReasoningDetectionReasoning } from "@/types/codexSubagentV2";
 
 describe("selectOnlyDiscoveredCodexCatalogRows", () => {
   it("enables discovered upstream IDs and preserves row metadata", () => {
@@ -172,6 +173,192 @@ describe("capabilityFromReasoningDetection", () => {
     });
     expect(adopted?.outputFormat).toBe("reasoning_content");
   });
+
+  it("preserves validated mapped and control metadata from detection", () => {
+    const adopted = capabilityFromReasoningDetection({
+      found: {
+        providerKey: "openrouter",
+        model: "provider/wire-model",
+        fetchedAt: 1,
+        source: "openrouter_api",
+        reasoning: {
+          supportedEfforts: ["low", "medium", "high"],
+          defaultEffort: "medium",
+          mandatory: true,
+          disableAllowed: false,
+          controlKind: "graded",
+          effortMap: { low: "low", medium: "high", high: "high" },
+        },
+      },
+    });
+    expect(adopted?.controlKind).toBe("graded");
+    expect(adopted?.disableAllowed).toBe(false);
+    expect(adopted?.upstream.effortMap).toEqual({
+      low: "low",
+      medium: "high",
+      high: "high",
+    });
+  });
+
+  it.each([
+    {
+      controlKind: "boolean" as const,
+      format: "boolean" as const,
+      parameter: "reasoning" as const,
+    },
+    {
+      controlKind: "budget" as const,
+      format: "budget" as const,
+      parameter: "reasoning.max_tokens" as const,
+    },
+  ])(
+    "preserves explicit $controlKind control without inventing effort levels",
+    ({ controlKind, format, parameter }) => {
+      const adopted = capabilityFromReasoningDetection({
+        found: {
+          providerKey: "openrouter",
+          model: "provider/control-only",
+          fetchedAt: 1,
+          source: "openrouter_api",
+          reasoning: {
+            supportedEfforts: [],
+            mandatory: false,
+            disableAllowed: true,
+            controlKind,
+            upstreamFormat: format,
+            upstreamParameter: parameter,
+            effortMap: {},
+          },
+        },
+      });
+      expect(adopted).toMatchObject({
+        controlKind,
+        supportedEfforts: [],
+        disableAllowed: true,
+        upstream: { format, parameter, effortMap: {} },
+      });
+      expect(adopted?.defaultEffort).toBeUndefined();
+    },
+  );
+
+  it("preserves declared compatibility mappings without advertising their input as native", () => {
+    const adopted = capabilityFromReasoningDetection({
+      found: {
+        providerKey: "openrouter",
+        model: "provider/native-high",
+        fetchedAt: 1,
+        source: "openrouter_api",
+        reasoning: {
+          supportedEfforts: ["high"],
+          defaultEffort: "high",
+          mandatory: true,
+          controlKind: "graded",
+          effortMap: { high: "high", max: "high" },
+        },
+      },
+    });
+    expect(adopted?.supportedEfforts).toEqual(["high"]);
+    expect(adopted?.upstream.effortMap).toEqual({ high: "high", max: "high" });
+  });
+
+  it("preserves explicit unsupported evidence instead of turning it into support", () => {
+    const adopted = capabilityFromReasoningDetection({
+      found: {
+        providerKey: "openrouter",
+        model: "provider/unsupported",
+        fetchedAt: 1,
+        source: "openrouter_api",
+        reasoning: {
+          supportedEfforts: [],
+          mandatory: true,
+          disableAllowed: false,
+          controlKind: "none",
+          supportStatus: "confirmed_unsupported",
+          upstreamFormat: "none",
+          upstreamParameter: "none",
+          effortMap: {},
+        },
+      },
+    });
+    expect(adopted).toMatchObject({
+      supportStatus: "confirmed_unsupported",
+      controlKind: "none",
+      supportedEfforts: [],
+      disableAllowed: false,
+    });
+  });
+
+  it("preserves synthetic Ultra separately without adding native max or ultra", () => {
+    const adopted = capabilityFromReasoningDetection({
+      found: {
+        providerKey: "sublyx",
+        model: "gpt-6.1-sol",
+        fetchedAt: 1,
+        source: "provider_api",
+        reasoning: {
+          supportedEfforts: ["low", "medium", "high", "xhigh"],
+          defaultEffort: "xhigh",
+          mandatory: true,
+          disableAllowed: false,
+          controlKind: "graded",
+          supportStatus: "confirmed_supported",
+          codexUltraOrchestration: { enabled: true, providerEffort: "xhigh" },
+          effortMap: {
+            low: "low",
+            medium: "medium",
+            high: "high",
+            xhigh: "xhigh",
+          },
+        },
+      },
+    });
+    expect(adopted?.supportedEfforts).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    expect(adopted?.codexUltraOrchestration).toEqual({
+      enabled: true,
+      providerEffort: "xhigh",
+    });
+    expect(adopted?.upstream.effortMap).not.toHaveProperty("ultra");
+    expect(adopted?.upstream.effortMap).not.toHaveProperty("max");
+  });
+
+  it.each<Partial<CodexModelReasoningDetectionReasoning>>([
+    { disableAllowed: true },
+    { defaultEffort: "max" },
+    { effortMap: {} },
+    { effortMap: { high: "max" } },
+    { effortMap: { high: "high", ultra: "high" } },
+    { controlKind: "boolean" as const },
+    { supportStatus: "confirmed_unsupported" },
+    { codexUltraOrchestration: { enabled: true, providerEffort: "max" } },
+  ])(
+    "rejects contradictory canonical detection instead of repairing it silently: %j",
+    (invalid) => {
+      expect(
+        capabilityFromReasoningDetection({
+          found: {
+            providerKey: "openrouter",
+            model: "provider/invalid",
+            fetchedAt: 1,
+            source: "openrouter_api",
+            reasoning: {
+              supportedEfforts: ["high"],
+              defaultEffort: "high",
+              mandatory: true,
+              disableAllowed: false,
+              controlKind: "graded",
+              effortMap: { high: "high" },
+              ...invalid,
+            },
+          },
+        }),
+      ).toBeUndefined();
+    },
+  );
 
   it.each([
     { supportedEfforts: [] },

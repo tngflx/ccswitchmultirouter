@@ -1,0 +1,1021 @@
+{
+  "schemaVersion": 1,
+  "observedAtUtc": "2026-11-17T01:07:36.262Z",
+  "scope": "Existing app-owned structured diagnostics and configured log files only; no provider calls or UI/CDP",
+  "liveVerification": {
+    "automationDirectoryAvailable": false,
+    "uiAutomationPerformed": false,
+    "releaseInstalled": false,
+    "currentVisibleIncidentCauseVerified": false,
+    "frontendHotReloadVerified": false,
+    "runtimeRebuildInstallRestartCommandIssued": false,
+    "repositoryReadOnlyVerifierInvoked": true,
+    "pickerInspectionPerformed": true,
+    "cdpVerified": false,
+    "renderedMenuVerified": false,
+    "explicitProviderProbeRequests": 0
+  },
+  "structuredJournals": {
+    "proxy-errors.jsonl": {
+      "events": 1085,
+      "fromUtc": "2026-11-16T22:33:11.743128800+00:00",
+      "toUtc": "2026-11-17T01:07:35.844208600+00:00",
+      "kinds": {
+        "sse_inspection_limit": 823,
+        "response_consumption_stopped": 262
+      },
+      "statuses": {
+        "200": 1085
+      },
+      "hosts": {
+        "api.sublyx.org": 1085
+      },
+      "recordsLost": 0
+    },
+    "proxy-errors.1.jsonl": {
+      "events": 3741,
+      "fromUtc": "2026-11-16T21:03:42.667444600+00:00",
+      "toUtc": "2026-11-16T22:33:11.696460200+00:00",
+      "kinds": {
+        "sse_inspection_limit": 2837,
+        "response_consumption_stopped": 901,
+        "stream_transport_error": 2,
+        "request_failure": 1
+      },
+      "statuses": {
+        "200": 3740,
+        "none": 1
+      },
+      "hosts": {
+        "api.sublyx.org": 3738,
+        "internal": 3
+      },
+      "recordsLost": 0
+    },
+    "proxy-errors.2.jsonl": {
+      "events": 3743,
+      "fromUtc": "2026-11-16T19:34:16.428356200+00:00",
+      "toUtc": "2026-11-16T21:03:42.183535600+00:00",
+      "kinds": {
+        "sse_inspection_limit": 2848,
+        "response_consumption_stopped": 892,
+        "stream_transport_error": 3
+      },
+      "statuses": {
+        "200": 3743
+      },
+      "hosts": {
+        "api.sublyx.org": 3735,
+        "internal": 8
+      },
+      "recordsLost": 0
+    }
+  },
+  "applicationLogs": {
+    "cc-switch.log": {
+      "lines": 47820,
+      "warningErrorLines": 11730,
+      "moduleCounts": {
+        "cc_switch_lib::services::session_usage_codex": 11181,
+        "cc_switch_lib::proxy::forwarder": 260,
+        "cc_switch_lib::codex_guardian": 102,
+        "cc_switch_lib::proxy::providers::streaming_retry": 101,
+        "cc_switch_lib": 39,
+        "cc_switch_lib::proxy::response_processor": 28,
+        "cc_switch_lib::services::proxy": 8,
+        "cc_switch_lib::proxy::codex_turn_recovery": 4,
+        "cc_switch_lib::proxy::circuit_breaker": 3,
+        "cc_switch_lib::proxy::usage::logger": 2,
+        "webview:reportFrontendError@http://localhost:3000/lib/frontendLogger.ts:234:8": 2
+      },
+      "todayWarningErrorLines": 3591,
+      "reasoningMentions": 1122
+    },
+    "codex-router.log": {
+      "lines": 13336,
+      "warningErrorLines": 1,
+      "moduleCounts": {
+        "router": 1
+      },
+      "todayWarningErrorLines": 1,
+      "reasoningMentions": 0
+    }
+  },
+  "usageBacklogObservation": {
+    "deferredLines": 11084,
+    "uniqueHashedPaths": 1345,
+    "window": "2026-11-15 through 2026-11-17 SGT",
+    "topPathRecurrences": 13,
+    "causalBugAttributionVerified": false
+  },
+  "providerState": {
+    "observedAtUtc": "2026-11-17T01:09:37.654Z",
+    "databaseMode": "read-only",
+    "providers": [
+      {
+        "name": "Sublyx",
+        "selectedModel": "gpt-5.6-luna",
+        "selectedProviderConfigKeys": ["wire_api"],
+        "catalogPresent": true,
+        "models": [
+          {
+            "model": "gpt-5.6-luna",
+            "enabled": true
+          },
+          {
+            "model": "gpt-5.6-openai-compact",
+            "enabled": true
+          },
+          {
+            "model": "gpt-5.6-sol",
+            "enabled": true
+          },
+          {
+            "model": "gpt-5.6-terra",
+            "enabled": true
+          },
+          {
+            "model": "gpt-6",
+            "enabled": true
+          },
+          {
+            "model": "gpt-6-astra",
+            "enabled": true
+          },
+          {
+            "model": "gpt-6-luna",
+            "enabled": true
+          },
+          {
+            "model": "gpt-6-sol",
+            "enabled": true
+          },
+          {
+            "model": "gpt-6.1-sol",
+            "enabled": true
+          },
+          {
+            "model": "gpt-6.1-terra",
+            "enabled": true
+          },
+          {
+            "model": "gpt-5.6",
+            "enabled": true
+          },
+          {
+            "model": "gpt-image-2.6-flare",
+            "enabled": true
+          },
+          {
+            "model": "gpt-image-2.6-sunburst",
+            "enabled": true
+          }
+        ],
+        "catalogInventoryCount": 41,
+        "excludedModelCount": 28
+      },
+      {
+        "name": "OpenRouter",
+        "selectedModel": "cohere/north-mini-code:free",
+        "selectedProviderConfigKeys": ["wire_api"],
+        "catalogPresent": true,
+        "models": [
+          {
+            "model": "cohere/north-mini-code:free",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "boolean",
+              "supportedEfforts": [],
+              "upstream": {
+                "format": "boolean",
+                "parameter": "reasoning.enabled",
+                "effortMap": {}
+              }
+            }
+          },
+          {
+            "model": "dots-studio/dots-3-note-preview:free",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "boolean",
+              "supportedEfforts": [],
+              "upstream": {
+                "format": "boolean",
+                "parameter": "reasoning.enabled",
+                "effortMap": {}
+              }
+            }
+          },
+          {
+            "model": "google/gemma-4-26b-a4b-it:free",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "boolean",
+              "supportedEfforts": [],
+              "upstream": {
+                "format": "boolean",
+                "parameter": "reasoning.enabled",
+                "effortMap": {}
+              }
+            }
+          },
+          {
+            "model": "google/gemma-4-31b-it:free",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "boolean",
+              "supportedEfforts": [],
+              "upstream": {
+                "format": "boolean",
+                "parameter": "reasoning.enabled",
+                "effortMap": {}
+              }
+            }
+          },
+          {
+            "model": "liquid/lfm-3-1.7b:free",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "none",
+              "supportedEfforts": [],
+              "upstream": {
+                "format": "reasoning_object",
+                "parameter": "reasoning.effort",
+                "effortMap": {}
+              }
+            }
+          },
+          {
+            "model": "minimax/minimax-m3",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "boolean",
+              "supportedEfforts": [],
+              "upstream": {
+                "format": "boolean",
+                "parameter": "reasoning.enabled",
+                "effortMap": {}
+              }
+            }
+          },
+          {
+            "model": "minimax/minimax-m3.1-flash",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["max", "xhigh", "high", "medium", "low"],
+              "defaultEffort": "max",
+              "upstream": {
+                "format": "reasoning_object",
+                "parameter": "reasoning.effort",
+                "effortMap": {
+                  "medium": "medium",
+                  "low": "low",
+                  "high": "high",
+                  "xhigh": "xhigh",
+                  "max": "max"
+                }
+              }
+            }
+          },
+          {
+            "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "budget",
+              "supportedEfforts": [],
+              "upstream": {
+                "format": "budget",
+                "parameter": "reasoning.max_tokens",
+                "effortMap": {}
+              }
+            }
+          },
+          {
+            "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["high", "medium", "none"],
+              "defaultEffort": "high",
+              "upstream": {
+                "format": "reasoning_object",
+                "parameter": "reasoning.effort",
+                "effortMap": {
+                  "high": "high",
+                  "medium": "medium"
+                }
+              }
+            }
+          },
+          {
+            "model": "nvidia/nemotron-3.5-lightning:free",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "boolean",
+              "supportedEfforts": [],
+              "upstream": {
+                "format": "boolean",
+                "parameter": "reasoning.enabled",
+                "effortMap": {}
+              }
+            }
+          },
+          {
+            "model": "nvidia/nemotron-3.5-super-vl:free",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "boolean",
+              "supportedEfforts": [],
+              "upstream": {
+                "format": "boolean",
+                "parameter": "reasoning.enabled",
+                "effortMap": {}
+              }
+            }
+          },
+          {
+            "model": "openrouter/free",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "none",
+              "supportedEfforts": [],
+              "upstream": {
+                "format": "reasoning_object",
+                "parameter": "reasoning.effort",
+                "effortMap": {}
+              }
+            }
+          },
+          {
+            "model": "recursive/flint-v1.0:free",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "none",
+              "supportedEfforts": [],
+              "upstream": {
+                "format": "reasoning_object",
+                "parameter": "reasoning.effort",
+                "effortMap": {}
+              }
+            }
+          },
+          {
+            "model": "thinkingmachines/inkling-2-small:free",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["max", "high", "medium", "low", "minimal"],
+              "defaultEffort": "high",
+              "upstream": {
+                "format": "reasoning_object",
+                "parameter": "reasoning.effort",
+                "effortMap": {
+                  "high": "high",
+                  "minimal": "minimal",
+                  "medium": "medium",
+                  "max": "max",
+                  "low": "low"
+                }
+              }
+            }
+          },
+          {
+            "model": "xiaomi/mimo-v2.6-flash",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "boolean",
+              "supportedEfforts": [],
+              "upstream": {
+                "format": "boolean",
+                "parameter": "reasoning.enabled",
+                "effortMap": {}
+              }
+            }
+          },
+          {
+            "model": "xiaomi/mimo-v2.6-pro",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "boolean",
+              "supportedEfforts": [],
+              "upstream": {
+                "format": "boolean",
+                "parameter": "reasoning.enabled",
+                "effortMap": {}
+              }
+            }
+          },
+          {
+            "model": "~deepseek/deepseek-flash-latest",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["max", "high", "low", "none"],
+              "defaultEffort": "high",
+              "upstream": {
+                "format": "reasoning_object",
+                "parameter": "reasoning.effort",
+                "effortMap": {
+                  "high": "high",
+                  "max": "max",
+                  "low": "low"
+                }
+              }
+            }
+          },
+          {
+            "model": "~deepseek/deepseek-pro-latest",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["max", "high", "low", "none"],
+              "defaultEffort": "high",
+              "upstream": {
+                "format": "reasoning_object",
+                "parameter": "reasoning.effort",
+                "effortMap": {
+                  "max": "max",
+                  "high": "high",
+                  "low": "low"
+                }
+              }
+            }
+          },
+          {
+            "model": "~deepseek/deepseek-v4-flash-latest",
+            "enabled": true,
+            "reasoning": {
+              "source": "detection",
+              "confidence": "verified",
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["max", "high", "low", "none"],
+              "defaultEffort": "high",
+              "upstream": {
+                "format": "reasoning_object",
+                "parameter": "reasoning.effort",
+                "effortMap": {
+                  "high": "high",
+                  "low": "low",
+                  "max": "max"
+                }
+              }
+            }
+          }
+        ],
+        "catalogInventoryCount": 446,
+        "excludedModelCount": 427
+      }
+    ]
+  },
+  "generatedProjection": {
+    "model": "gpt-6.1-sol-sublyx",
+    "modelProvider": "codex_model_router_v2",
+    "configuredReasoningEffort": "ultra",
+    "generatedAtUtc": "2026-11-17T00:58:58.586Z",
+    "models": [
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        "defaultEffort": "medium",
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-6-astra-sublyx",
+        "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        "defaultEffort": "medium",
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-6-luna-sublyx",
+        "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        "defaultEffort": "medium",
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-6-sol-sublyx",
+        "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        "defaultEffort": "medium",
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-5.6-luna-sublyx",
+        "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        "defaultEffort": "medium",
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-5.6-sol-sublyx",
+        "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        "defaultEffort": "medium",
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-5.6-terra-sublyx",
+        "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        "defaultEffort": "medium",
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-5.6-openai-compact",
+        "efforts": ["low", "medium", "high", "xhigh", "ultra"],
+        "defaultEffort": "medium",
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-6",
+        "efforts": ["low", "medium", "high", "xhigh", "ultra"],
+        "defaultEffort": "medium",
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-6.1-terra",
+        "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        "defaultEffort": "medium",
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-5.6",
+        "efforts": ["low", "medium", "high", "xhigh", "ultra"],
+        "defaultEffort": "medium",
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-image-2.6-flare",
+        "efforts": ["low", "medium", "high", "xhigh", "ultra"],
+        "defaultEffort": "medium",
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-image-2.6-sunburst",
+        "efforts": ["low", "medium", "high", "xhigh", "ultra"],
+        "defaultEffort": "medium",
+        "reasoningSupported": true
+      },
+      {
+        "model": "claude-fable-5-1-zmhub",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-6.1-sol-zmhub",
+        "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        "defaultEffort": "low",
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-6-astra-zmhub",
+        "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        "defaultEffort": "low",
+        "reasoningSupported": true
+      },
+      {
+        "model": "claude-fable-5-1-s1a",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "claude-opus-5-5",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "claude-sonnet-5-5",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "gpt-6.1-sol-s1a",
+        "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        "defaultEffort": "low",
+        "reasoningSupported": true
+      },
+      {
+        "model": "cohere/north-mini-code:free",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "dots-studio/dots-3-note-preview:free",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "google/gemma-4-26b-a4b-it:free",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "google/gemma-4-31b-it:free",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "nvidia/nemotron-3.5-lightning:free",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "efforts": ["medium", "high"],
+        "defaultEffort": "high",
+        "reasoningSupported": true
+      },
+      {
+        "model": "openrouter/free",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "~deepseek/deepseek-flash-latest",
+        "efforts": ["low", "high", "max"],
+        "defaultEffort": "high",
+        "reasoningSupported": true
+      },
+      {
+        "model": "liquid/lfm-3-1.7b:free",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "minimax/minimax-m3",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "minimax/minimax-m3.1-flash",
+        "efforts": ["low", "medium", "high", "xhigh", "max"],
+        "defaultEffort": "max",
+        "reasoningSupported": true
+      },
+      {
+        "model": "nvidia/nemotron-3.5-super-vl:free",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "recursive/flint-v1.0:free",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "thinkingmachines/inkling-2-small:free",
+        "efforts": ["minimal", "low", "medium", "high", "max"],
+        "defaultEffort": "high",
+        "reasoningSupported": true
+      },
+      {
+        "model": "xiaomi/mimo-v2.6-flash",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "xiaomi/mimo-v2.6-pro",
+        "efforts": [],
+        "reasoningSupported": true
+      },
+      {
+        "model": "~deepseek/deepseek-pro-latest",
+        "efforts": ["low", "high", "max"],
+        "defaultEffort": "high",
+        "reasoningSupported": true
+      },
+      {
+        "model": "~deepseek/deepseek-v4-flash-latest",
+        "efforts": ["low", "high", "max"],
+        "defaultEffort": "high",
+        "reasoningSupported": true
+      }
+    ]
+  },
+  "runtime": {
+    "startedAtUtc": "2026-11-17T00:58:11.687Z",
+    "version": "3.20.4-3",
+    "root": "H:\\repos\\ccswitchmulti-refork"
+  },
+  "cautions": [
+    "Diagnostic event counts do not equal failed provider requests.",
+    "An authoritative empty graded-effort list must not inherit a different model effort ladder.",
+    "Configured/generated native max and ultra were already present before these source edits.",
+    "No raw errors, response bodies, credentials, session IDs, or session filenames are included."
+  ],
+  "followupLogSnapshot": {
+    "observedAtUtc": "2026-11-17T01:45:58.405Z",
+    "structuredJournal": {
+      "from": "2026-11-17T01:33:10.770332300+00:00",
+      "to": "2026-11-17T01:45:58.039276900+00:00",
+      "eventCount": 1442,
+      "kinds": {
+        "sse_inspection_limit": 1075,
+        "response_consumption_stopped": 342,
+        "stream_transport_error": 1,
+        "request_failure": 1,
+        "upstream_sse_error": 23
+      }
+    },
+    "runtimeSession": {
+      "startedAtUtc": "2026-11-17T00:58:11.687Z",
+      "state": "running",
+      "appStartedAt": "2026-11-17 08:58:19.008",
+      "version": "3.20.4-3"
+    },
+    "warning": "Read-only file observation only; no UI/provider/runtime verification."
+  },
+  "followupErrorClassification": {
+    "observedAtUtc": "2026-11-17T01:46:47.704Z",
+    "errorEvents": 25,
+    "countsByKind": {
+      "stream_transport_error": 1,
+      "request_failure": 1,
+      "upstream_sse_error": 23
+    },
+    "countsByCategory": {
+      "connection_or_stream_error": 2,
+      "gateway_concurrency_limit": 23
+    },
+    "recent": [
+      {
+        "timestamp": "2026-11-17T01:35:58.714901+00:00",
+        "kind": "upstream_sse_error",
+        "httpStatus": 200,
+        "errorCodes": [],
+        "categories": [],
+        "evidenceKeys": ["event", "error"]
+      },
+      {
+        "timestamp": "2026-11-17T01:36:04.487440+00:00",
+        "kind": "upstream_sse_error",
+        "httpStatus": 200,
+        "errorCodes": [],
+        "categories": [],
+        "evidenceKeys": ["event", "error"]
+      },
+      {
+        "timestamp": "2026-11-17T01:36:10.850973900+00:00",
+        "kind": "upstream_sse_error",
+        "httpStatus": 200,
+        "errorCodes": [],
+        "categories": [],
+        "evidenceKeys": ["event", "error"]
+      },
+      {
+        "timestamp": "2026-11-17T01:36:18.315704500+00:00",
+        "kind": "upstream_sse_error",
+        "httpStatus": 200,
+        "errorCodes": [],
+        "categories": [],
+        "evidenceKeys": ["event", "error"]
+      },
+      {
+        "timestamp": "2026-11-17T01:36:30.183470600+00:00",
+        "kind": "upstream_sse_error",
+        "httpStatus": 200,
+        "errorCodes": [],
+        "categories": [],
+        "evidenceKeys": ["event", "error"]
+      },
+      {
+        "timestamp": "2026-11-17T01:36:44.731328400+00:00",
+        "kind": "upstream_sse_error",
+        "httpStatus": 200,
+        "errorCodes": [],
+        "categories": [],
+        "evidenceKeys": ["event", "error"]
+      },
+      {
+        "timestamp": "2026-11-17T01:38:11.479224500+00:00",
+        "kind": "upstream_sse_error",
+        "httpStatus": 200,
+        "errorCodes": [],
+        "categories": [],
+        "evidenceKeys": ["event", "error"]
+      },
+      {
+        "timestamp": "2026-11-17T01:38:57.862266200+00:00",
+        "kind": "upstream_sse_error",
+        "httpStatus": 200,
+        "errorCodes": [],
+        "categories": [],
+        "evidenceKeys": ["event", "error"]
+      }
+    ],
+    "safeErrorCodeCounts": {
+      "gateway_concurrency_limit": 23
+    },
+    "providerLimitChineseMentions": 0
+  },
+  "liveVerifierSummary": {
+    "verified": false,
+    "readinessVerified": false,
+    "pickerInspectionPerformed": true,
+    "desktopCdpVerified": false,
+    "renderedMenuVerified": false,
+    "noTestThreadCreated": true,
+    "existingThreadsTouched": false,
+    "runtimeStatus": "expected_fingerprint_unavailable",
+    "refusalReasons": ["renderer_scope_snapshot_unverified"],
+    "cappedSamples": [
+      {
+        "reason": "object_limit",
+        "visitedFiberCount": 12533,
+        "scopeCount": 2432,
+        "fiberLimit": 30000,
+        "elapsedMs": 1022
+      },
+      {
+        "reason": "object_limit",
+        "visitedFiberCount": 12533,
+        "scopeCount": 2432,
+        "fiberLimit": 30000,
+        "elapsedMs": 1022
+      },
+      {
+        "visitedFiberCount": 12533,
+        "scopeCount": 2432,
+        "fiberLimit": 30000,
+        "elapsedMs": 929
+      },
+      {
+        "reason": "object_limit",
+        "visitedFiberCount": 12533,
+        "scopeCount": 2432,
+        "fiberLimit": 30000,
+        "elapsedMs": 929
+      },
+      {
+        "visitedFiberCount": 12533,
+        "scopeCount": 2432,
+        "fiberLimit": 30000,
+        "elapsedMs": 1022
+      },
+      {
+        "reason": "object_limit",
+        "visitedFiberCount": 12533,
+        "scopeCount": 2432,
+        "fiberLimit": 30000,
+        "elapsedMs": 1022
+      },
+      {
+        "reason": "object_limit",
+        "visitedFiberCount": 12533,
+        "scopeCount": 2432,
+        "fiberLimit": 30000,
+        "elapsedMs": 1022
+      }
+    ],
+    "verifiedAtUtc": "2026-11-17T02:01:36.087Z"
+  },
+  "auditUpdatedAtUtc": "2026-11-17T02:14:52.909Z",
+  "sharedCheckout": {
+    "branch": "main",
+    "otherActiveChatTitle": "Fix model picker reasoning effort",
+    "sameCheckout": true,
+    "coordinationAuthorized": false,
+    "otherChatMessaged": false,
+    "combinedTreeCertified": false,
+    "observedContractConflict": "Concurrent High default/omission changes versus existing Profile omission regressions"
+  },
+  "lastCompletedChecks": {
+    "typecheck": "passed",
+    "catalog": {
+      "passed": 850,
+      "failed": 4,
+      "earlierSequentialPass": 854
+    },
+    "frontend": {
+      "passed": 4273,
+      "failed": 4,
+      "files": 306
+    },
+    "rustLibrary": {
+      "passed": 5593,
+      "failed": 6,
+      "ignored": 12,
+      "earlierPass": 5597
+    },
+    "multirouter": {
+      "passed": 188,
+      "failed": 0
+    },
+    "capacityClassifier": {
+      "passed": 9,
+      "failed": 0
+    },
+    "clippy": "passed",
+    "prettier": "failed: src/components/codex/CodexRouterWorkspacePage.tsx",
+    "rustfmt": "failed: src-tauri/src/codex_config.rs",
+    "scriptsPolicy": "passed",
+    "gitDiffCheck": "passed",
+    "sameImmutableSnapshot": false
+  },
+  "sourceHashesAtReceiptTime": {
+    "src/lib/codexReasoningProviderIdentity.ts": {
+      "sha256": "ad9a000f5f4eb954ccbace0edb2fecda536d17e8089d5b2b70fca16a4ef214c0",
+      "modifiedAtUtc": "2026-11-17T01:09:22.332Z"
+    },
+    "src/components/providers/forms/CodexModelReasoningEditor.tsx": {
+      "sha256": "4b66d6e4edb61182ad98f258c9737438a1756574f8bb5a51330130259487ac9f",
+      "modifiedAtUtc": "2026-11-17T01:07:50.438Z"
+    },
+    "src-tauri/src/proxy/providers/codex_reasoning.rs": {
+      "sha256": "1244e729dce80748581d83b387223ec5b22ef66f0f48fb6608eec9480025833a",
+      "modifiedAtUtc": "2026-11-17T01:23:26.482Z"
+    },
+    "src-tauri/src/proxy/providers/codex.rs": {
+      "sha256": "aa043ab306a70c78946a7d31c95f2ec4e472cb846c8919a6b6aaf80d1a9aa7f9",
+      "modifiedAtUtc": "2026-11-17T01:20:52.567Z"
+    },
+    "src-tauri/src/codex_subagent_profiles.rs": {
+      "sha256": "8d1c53db5128db3443a2ef059ce2bc1b1f91796f914e165449d675031591a98a",
+      "modifiedAtUtc": "2026-11-17T01:20:37.356Z"
+    },
+    "src-tauri/src/proxy/error_journal.rs": {
+      "sha256": "76ee085005cdc6c7e5328ac0e527e1c738e7efd9ede935490e973819ed3871c0",
+      "modifiedAtUtc": "2026-11-17T01:21:22.715Z"
+    },
+    "src-tauri/src/services/session_usage_codex.rs": {
+      "sha256": "f133c37496fc6050f76955b6f3347de07f82d19dc9b073386c00843627ac54f3",
+      "modifiedAtUtc": "2026-11-17T01:20:44.153Z"
+    },
+    "src-tauri/src/proxy/providers/streaming_retry.rs": {
+      "sha256": "45fd56863e6529cf027401c69eefe1b7a802abe5e9b0ed9fffd062c7798dbe41",
+      "modifiedAtUtc": "2026-11-17T01:57:42.721Z"
+    },
+    "src-tauri/src/resources/codex_desktop/native_reasoning_visibility.js": {
+      "sha256": "feada8fe90564b06dfd72c39abbd91c3fd39283d6ad895de92f911105059be08",
+      "modifiedAtUtc": "2026-11-17T01:22:03.530Z"
+    },
+    "src/components/codex/CodexRouterWorkspacePage.tsx": {
+      "sha256": "008ac1321afeb7c541124edb646eee603066be638c38fc133bf4cd762568cb4f",
+      "modifiedAtUtc": "2026-11-17T01:50:02.335Z"
+    },
+    "src-tauri/src/codex_multirouter/compiler.rs": {
+      "sha256": "9248afb94010e1864bdcc0d2af341151583f109ca13cd4b31afbe125e2351e17",
+      "modifiedAtUtc": "2026-11-17T01:58:12.364Z"
+    },
+    "src-tauri/src/codex_config.rs": {
+      "sha256": "aa4b355db54d84f9a48f346372bfd977555da0da48836bde0b5c9f4bd92ff25e",
+      "modifiedAtUtc": "2026-11-17T02:11:32.092Z"
+    }
+  }
+}

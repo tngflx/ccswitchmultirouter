@@ -38,6 +38,7 @@ import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import {
   createDevReconnectTracker,
   createDevWatchdogOutputReader,
@@ -77,6 +78,8 @@ const WINDOWS_PROCESS_EXIT_TIMEOUT_MS = 2_000;
 const WINDOWS_LISTENER_RELEASE_TIMEOUT_MS = 60_000;
 const DEV_AUTO_RESTART_DELAY_MS = 1_000;
 const DEV_SUPERVISOR_PUBLICATION_TIMEOUT_MS = 30_000;
+const DEV_WATCHDOG_LIVENESS_FALLBACK_TIMEOUT_MS = 1_500;
+const DEV_WATCHDOG_LIVENESS_FALLBACK_MAX_BUFFER = 64 * 1024;
 const DEV_SUPERVISOR_ENV = "CC_SWITCH_DEV_SUPERVISOR";
 const DEV_WORKER_FLAG = "--ccsm-dev-worker";
 const DEV_WATCHDOG_FLAG = "--ccsm-dev-watchdog";
@@ -2135,6 +2138,8 @@ function devSupervisorIsAlive(session, processes) {
     );
     return Boolean(
       identity &&
+      typeof identity.ExecutablePath === "string" &&
+      typeof identity.CreationDate === "string" &&
       path.resolve(identity.ExecutablePath).toLowerCase() ===
         path.resolve(session.supervisorExecutablePath).toLowerCase() &&
       windowsProcessStartedAtUtc(identity) === session.supervisorStartedAtUtc,
@@ -2146,6 +2151,60 @@ function devSupervisorIsAlive(session, processes) {
   } catch (error) {
     if (error.code !== "ESRCH") throw error;
     return false;
+  }
+}
+
+/**
+ * Bounded fallback used only after the authoritative Windows process query
+ * times out. It may prove that a PID is absent, but it must never claim that
+ * a live PID belongs to our supervisor. Exact executable/start-time identity
+ * remains mandatory in the replacement publication path.
+ */
+export function probeDevSupervisorLivenessFallback(
+  supervisorPid,
+  {
+    platform = process.platform,
+    kill = process.kill,
+    run = spawnSync,
+    timeoutMs = DEV_WATCHDOG_LIVENESS_FALLBACK_TIMEOUT_MS,
+  } = {},
+) {
+  if (
+    platform !== "win32" ||
+    !Number.isSafeInteger(supervisorPid) ||
+    supervisorPid < 1
+  )
+    return "unknown";
+  try {
+    kill(supervisorPid, 0);
+    return "present";
+  } catch (error) {
+    // ESRCH proves absence. EPERM/EACCES proves that the PID exists but is
+    // inaccessible to this process; never let a secondary query override that
+    // positive liveness signal. Other errors remain unknown and may use the
+    // bounded tasklist cross-check below.
+    if (error?.code === "ESRCH") return "absent";
+    if (["EPERM", "EACCES"].includes(error?.code)) return "present";
+  }
+  try {
+    const result = run(
+      "tasklist.exe",
+      ["/FI", `PID eq ${supervisorPid}`, "/FO", "CSV", "/NH"],
+      {
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: timeoutMs,
+        maxBuffer: DEV_WATCHDOG_LIVENESS_FALLBACK_MAX_BUFFER,
+      },
+    );
+    if (!result || result.error || result.status !== 0) return "unknown";
+    const pidPattern = new RegExp(`^"[^"\r\n]+","${supervisorPid}"(?:,|$)`);
+    const lines = String(result.stdout ?? "").split(/\r?\n/);
+    return lines.some((line) => pidPattern.test(line.trim()))
+      ? "present"
+      : "absent";
+  } catch {
+    return "unknown";
   }
 }
 
@@ -2226,65 +2285,148 @@ export async function handoffDetachedDevSupervisor({
   persistSession = (nextSession) =>
     persistDetachedDevSession(markerPath, nextSession),
   readSession = () => JSON.parse(readFileSync(markerPath, "utf8")),
+  acquireLaunchLock = acquireDevSessionLaunchLock,
   spawnReplacement = async (specification) => {
     const { child } = await spawnDevRecoveryProcess(specification);
     return child;
   },
   waitForPublication = waitForDevSupervisorPublication,
   queryProcesses = queryWindowsProcesses,
+  isSupervisorAbsent = () => {
+    if (process.platform === "win32") {
+      try {
+        const processes = queryProcesses(supervisorPid);
+        return (
+          Array.isArray(processes) &&
+          !processes.some(
+            (candidate) => Number(candidate.ProcessId) === supervisorPid,
+          )
+        );
+      } catch {
+        return probeDevSupervisorLivenessFallback(supervisorPid) === "absent";
+      }
+    }
+    try {
+      process.kill(supervisorPid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  },
   writeEvent = writeDevWatchdogEvent,
   executable = process.execPath,
   scriptPath = fileURLToPath(import.meta.url),
   repoRoot = REPO_ROOT,
   environment = process.env,
 }) {
-  const nowMs = now();
-  const restartTimesMs = readDevRestartTimesMs(session, nowMs);
-  const decision = devWorkerRestartDecision({
-    exitCode: 1,
-    signal: null,
-    watchdogEnabled: readEnabled(),
-    nowMs,
-    restartTimesMs,
-  });
-  if (!decision.restart) {
+  // This snapshot is the version observed by the detached watcher. It is not
+  // authority to overwrite a marker that an explicit/newer launcher published.
+  const observedSession = structuredClone(session);
+  const normalizePath = (value) => {
+    if (typeof value !== "string") return undefined;
+    const normalized = path.resolve(value);
+    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  const sessionChanged = (current) => {
+    if (current?.state === "stopping") return "intentional-stop";
+    return current?.schemaVersion === 1 &&
+      current.state === "running" &&
+      current.supervisorPid === supervisorPid &&
+      Number.isSafeInteger(supervisorPid) &&
+      supervisorPid > 0 &&
+      typeof current.supervisorStartedAtUtc === "string" &&
+      Number.isFinite(Date.parse(current.supervisorStartedAtUtc)) &&
+      normalizePath(current.supervisorExecutablePath) ===
+        normalizePath(executable) &&
+      normalizePath(current.repoRoot) === normalizePath(repoRoot) &&
+      normalizePath(current.scriptPath) === normalizePath(scriptPath) &&
+      isDeepStrictEqual(current, observedSession)
+      ? undefined
+      : "superseded-session";
+  };
+  const skip = (reason, current, retry = false) => {
+    const decision = { restart: false, reason };
     writeEvent("dev-supervisor-restart-skipped", {
       supervisorPid,
-      reason: decision.reason,
-      restartCount: restartTimesMs.length,
+      reason,
+      restartCount: readDevRestartTimesMs(current, now()).length,
     });
-    return { restarted: false, decision };
-  }
+    return { restarted: false, ...(retry ? { retry: true } : {}), decision };
+  };
+  let replacement;
+  let decision;
+  let launchedAtMs;
+  const releaseLaunch = await acquireLaunchLock({ markerPath });
+  try {
+    releaseLaunch.assertHeld();
+    let current = readSession();
+    releaseLaunch.assertHeld();
+    let changed = sessionChanged(current);
+    if (changed) return skip(changed, current);
+    decision = devWorkerRestartDecision({
+      exitCode: 1,
+      signal: null,
+      watchdogEnabled: readEnabled(),
+      nowMs: now(),
+      restartTimesMs: readDevRestartTimesMs(current, now()),
+    });
+    if (!decision.restart) return skip(decision.reason, current);
 
-  session.restartTimesMs = [...restartTimesMs, nowMs];
-  delete session.supervisorRestartTimesMs;
-  persistSession(session);
+    // An earlier absent observation can become stale while a manual launch is
+    // waiting for serialization. Unknown/present cannot authorize a relaunch.
+    const absent = await isSupervisorAbsent({
+      supervisorPid,
+      session: current,
+    });
+    releaseLaunch.assertHeld();
+    current = readSession();
+    releaseLaunch.assertHeld();
+    changed = sessionChanged(current);
+    if (changed) return skip(changed, current);
+    if (absent !== true)
+      return skip("supervisor-present-or-unknown", current, true);
+    const nowMs = now();
+    const restartTimesMs = readDevRestartTimesMs(current, nowMs);
+    decision = devWorkerRestartDecision({
+      exitCode: 1,
+      signal: null,
+      watchdogEnabled: readEnabled(),
+      nowMs,
+      restartTimesMs,
+    });
+    if (!decision.restart) return skip(decision.reason, current);
+    releaseLaunch.assertHeld();
+    const claimed = { ...current, restartTimesMs: [...restartTimesMs, nowMs] };
+    delete claimed.supervisorRestartTimesMs;
+    persistSession(claimed);
+    releaseLaunch.assertHeld();
 
-  // Relaunch the entry point of pnpm dev, not the compiled application.
-  const launchedAtMs = now();
-  writeEvent("dev-supervisor-restarting", {
-    oldPid: supervisorPid,
-    outputPath: devRecoveryLogPath(markerPath),
-  });
-  const replacement = await spawnReplacement({
-    executable,
-    markerPath,
-    args: [
-      scriptPath,
-      DEV_RECOVERY_FLAG,
-      String(supervisorPid),
-      ...session.args,
-    ],
-    options: {
-      cwd: repoRoot,
-      env: {
-        ...environment,
-        ...devSessionEnvironment(session.environment),
+    // Charge the one canonical ledger and launch under the same ownership gate
+    // used by explicit pnpm dev. Never hold it while waiting for the child to
+    // publish: the child must acquire this gate to claim the replacement.
+    launchedAtMs = now();
+    writeEvent("dev-supervisor-restarting", {
+      oldPid: supervisorPid,
+      outputPath: devRecoveryLogPath(markerPath),
+    });
+    releaseLaunch.assertHeld();
+    replacement = await spawnReplacement({
+      executable,
+      markerPath,
+      args: [
+        scriptPath,
+        DEV_RECOVERY_FLAG,
+        String(supervisorPid),
+        ...claimed.args,
+      ],
+      options: {
+        cwd: repoRoot,
+        env: { ...environment, ...devSessionEnvironment(claimed.environment) },
       },
-      // The shared recovery launcher owns detachment and durable output.
-      // Detached Windows children cannot use inherited console handles.
-    },
-  });
+    });
+  } finally {
+    await releaseLaunch();
+  }
   try {
     await waitForPublication({
       expected: {
@@ -2336,6 +2478,8 @@ export async function runDetachedDevWatchdog(
     readSession = () => JSON.parse(readFileSync(markerPath, "utf8")),
     wait = () => new Promise((resolve) => setTimeout(resolve, 2_000)),
     queryProcesses = queryWindowsProcesses,
+    livenessFallback = ({ supervisorPid: pid }) =>
+      probeDevSupervisorLivenessFallback(pid),
     handoff = handoffDetachedDevSupervisor,
     writeEvent = writeDevWatchdogEvent,
   } = {},
@@ -2358,10 +2502,30 @@ export async function runDetachedDevWatchdog(
         session.scriptPath !== fileURLToPath(import.meta.url)
       )
         return;
-      const alive = devSupervisorIsAlive(
-        session,
-        process.platform === "win32" ? queryProcesses(supervisorPid) : [],
-      );
+      let alive;
+      try {
+        alive = devSupervisorIsAlive(
+          session,
+          process.platform === "win32" ? queryProcesses(supervisorPid) : [],
+        );
+      } catch (error) {
+        const fallback = await livenessFallback({
+          supervisorPid,
+          error,
+          session,
+        });
+        writeEvent("dev-watchdog-liveness-fallback", {
+          supervisorPid,
+          result: ["present", "absent", "unknown"].includes(fallback)
+            ? fallback
+            : "unknown",
+          reason: String(error?.message || error).slice(0, 240),
+        });
+        // Only a positive absence proof can advance to recovery. A live or
+        // unknown fallback result remains fail-closed and retries later.
+        if (fallback !== "absent") continue;
+        alive = false;
+      }
       if (alive) continue;
       const result = await handoff({
         supervisorPid,
@@ -2930,6 +3094,11 @@ Options:
 Watchdog:
   watchdogEnabled recovers crashes and sustained reconnect loops immediately,
   without the source-edit delay (maximum 5 automatic restarts / 30 minutes).
+  A worker crash is restarted by the supervisor in the launching terminal.
+  If the supervisor itself disappears, a detached watchdog relaunches the
+  complete pnpm dev session independently and writes output to dev-recovery.log.
+  Ctrl+C, a clean/manual quit, a disabled watchdog, or the restart limit does
+  not trigger another launch.
 
 Environment:
   TAURI_DEV_REBUILD_DELAY_MS  Same setting as --delay; CLI option takes priority

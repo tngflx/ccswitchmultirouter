@@ -883,6 +883,77 @@ impl Database {
         Ok(settings_config)
     }
 
+    /// Merge a focused Sub-Agent policy edit against the latest router and source
+    /// providers under one writer boundary. The callback must not query this DB.
+    pub(crate) fn update_codex_subagent_policy<M>(
+        &self,
+        provider_id: &str,
+        mutate: M,
+    ) -> Result<serde_json::Value, AppError>
+    where
+        M: FnOnce(&mut Provider, &HashMap<String, Provider>) -> Result<(), AppError>,
+    {
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        let providers = {
+            let mut stmt = tx.prepare(
+                "SELECT id, name, settings_config, website_url, category, created_at, sort_index,
+                        notes, icon, icon_color, meta, in_failover_queue
+                 FROM providers WHERE app_type = 'codex'",
+            ).map_err(|error| AppError::Database(error.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let settings: String = row.get(2)?;
+                    let meta: String = row.get(10)?;
+                    Ok(Provider {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        settings_config: parse_provider_settings_config_for_app("codex", &settings),
+                        website_url: row.get(3)?,
+                        category: row.get(4)?,
+                        created_at: row.get(5)?,
+                        sort_index: row.get(6)?,
+                        notes: row.get(7)?,
+                        icon: row.get(8)?,
+                        icon_color: row.get(9)?,
+                        meta: Some(serde_json::from_str::<ProviderMeta>(&meta).unwrap_or_default()),
+                        in_failover_queue: row.get(11)?,
+                    })
+                })
+                .map_err(|error| AppError::Database(error.to_string()))?;
+            let mut providers = HashMap::new();
+            for row in rows {
+                let provider = row.map_err(|error| AppError::Database(error.to_string()))?;
+                providers.insert(provider.id.clone(), provider);
+            }
+            providers
+        };
+        let mut provider = providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| AppError::InvalidInput("Codex provider does not exist".to_string()))?;
+        mutate(&mut provider, &providers)?;
+        let serialized = serde_json::to_string(&provider.settings_config).map_err(|_| {
+            AppError::Database("Failed to serialize focused Sub-Agent policy".to_string())
+        })?;
+        let changed = tx
+            .execute(
+                "UPDATE providers SET settings_config = ?1 WHERE id = ?2 AND app_type = 'codex'",
+                params![serialized, provider_id],
+            )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        if changed != 1 {
+            return Err(AppError::Database(
+                "Focused Sub-Agent policy update changed an unexpected row count".to_string(),
+            ));
+        }
+        tx.commit()
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        Ok(provider.settings_config)
+    }
+
     pub fn add_custom_endpoint(
         &self,
         app_type: &str,
@@ -1871,6 +1942,65 @@ mod tests {
             serde_json::from_str(&stored).expect("stored JSON is valid");
         assert_eq!(stored["modelCatalog"], json!({"models": []}));
         assert!(stored.get("model_catalog").is_none());
+    }
+
+    #[test]
+    fn codex_subagent_policy_atomic_update_observes_latest_router_and_provider_snapshot() {
+        let db = Database::memory().unwrap();
+        let source = Provider::with_id(
+            "policy-source".into(),
+            "Source".into(),
+            json!({
+                "modelCatalog": {"models": [{"model": "current-model"}]}
+            }),
+            None,
+        );
+        db.save_provider("codex", &source).unwrap();
+        let mut router = Provider::with_id(
+            "policy-router".into(),
+            "Router".into(),
+            json!({
+                "codexRouting": {"schemaVersion": 2, "subagentVersion": "v2", "subagentV2": {"profiles": {"latest": true}}},
+                "future": {"keep": true}
+            }),
+            None,
+        );
+        db.save_provider("codex", &router).unwrap();
+        router.settings_config["codexRouting"]["subagentV2"]["profiles"]["concurrent"] =
+            json!(true);
+        db.save_provider("codex", &router).unwrap();
+        let updated = db
+            .update_codex_subagent_policy("policy-router", |latest, providers| {
+                assert_eq!(latest.settings_config, router.settings_config);
+                assert_eq!(
+                    providers["policy-source"].settings_config,
+                    source.settings_config
+                );
+                latest.settings_config["codexRouting"]["subagentVersion"] = json!("v1");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            updated["codexRouting"]["subagentV2"],
+            router.settings_config["codexRouting"]["subagentV2"]
+        );
+        assert_eq!(updated["future"], router.settings_config["future"]);
+        let before = db
+            .get_provider_by_id("policy-router", "codex")
+            .unwrap()
+            .unwrap();
+        let rejected = db.update_codex_subagent_policy("policy-router", |latest, _| {
+            latest.settings_config["future"] = json!("must-roll-back");
+            Err(AppError::InvalidInput("rejected policy".into()))
+        });
+        assert!(rejected.is_err());
+        assert_eq!(
+            db.get_provider_by_id("policy-router", "codex")
+                .unwrap()
+                .unwrap()
+                .settings_config,
+            before.settings_config
+        );
     }
 
     /// Deterministic TOCTOU regression: the editor's stale snapshot is read first, then a

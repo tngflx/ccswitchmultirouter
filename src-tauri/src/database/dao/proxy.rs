@@ -930,17 +930,27 @@ impl Database {
     /// 用于托盘菜单构建等同步场景
     /// 返回 (enabled, auto_failover_enabled)
     pub fn get_proxy_flags_sync(&self, app_type: &str) -> (bool, bool) {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(_) => return (false, false),
-        };
+        self.try_get_proxy_flags_sync(app_type)
+            .unwrap_or((false, false))
+    }
 
-        conn.query_row(
+    /// Checked canonical projection for safety-sensitive native bindings.
+    /// Tray rendering can use the best-effort wrapper above; a failed query must
+    /// not certify unchanged routing policy for an owner continuation.
+    pub(crate) fn try_get_proxy_flags_sync(
+        &self,
+        app_type: &str,
+    ) -> Result<(bool, bool), AppError> {
+        let conn = lock_conn!(self.conn);
+        match conn.query_row(
             "SELECT enabled, auto_failover_enabled FROM proxy_config WHERE app_type = ?1",
             [app_type],
             |row| Ok((row.get::<_, i32>(0)? != 0, row.get::<_, i32>(1)? != 0)),
-        )
-        .unwrap_or((false, false))
+        ) {
+            Ok(flags) => Ok(flags),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((false, false)),
+            Err(error) => Err(AppError::Database(error.to_string())),
+        }
     }
 
     /// 同步设置应用的 proxy 启用状态和自动故障转移状态

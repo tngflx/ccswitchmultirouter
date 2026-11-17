@@ -445,6 +445,153 @@ pub(crate) fn process_exists(pid: u32) -> bool {
     process_identity(pid).is_some()
 }
 
+/// Native liveness is deliberately independent of executable metadata. In
+/// particular, an exited Windows process can still have a queryable identity
+/// while another owner retains its process handle.
+#[cfg(target_os = "windows")]
+pub(crate) fn process_liveness_result(pid: u32) -> Result<bool, ProcessIdentityError> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    if pid == 0 {
+        return Ok(false);
+    }
+    let handle = unsafe { OpenProcess(SYNCHRONIZE_ACCESS, 0, pid) };
+    if handle.is_null() {
+        let error = ProcessIdentityError::from_win32(unsafe { GetLastError() });
+        return match error {
+            ProcessIdentityError::NotFound => Ok(false),
+            ProcessIdentityError::AccessDenied => Err(error),
+            // Windows may report ERROR_GEN_FAILURE for an already retired PID.
+            // Only a complete native snapshot can prove absence in that case.
+            ProcessIdentityError::Unavailable(_) => match process_present_in_snapshot(pid) {
+                Ok(false) => Ok(false),
+                Ok(true) => Err(error),
+                Err(snapshot_error) => Err(snapshot_error),
+            },
+        };
+    }
+    let result = match unsafe { WaitForSingleObject(handle, 0) } {
+        WAIT_OBJECT_0 => Ok(false),
+        WAIT_TIMEOUT => Ok(true),
+        _ => Err(ProcessIdentityError::from_win32(unsafe { GetLastError() })),
+    };
+    unsafe { CloseHandle(handle) };
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn process_present_in_snapshot(pid: u32) -> Result<bool, ProcessIdentityError> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, SetLastError, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(ProcessIdentityError::from_win32(unsafe { GetLastError() }));
+    }
+    let result = (|| {
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        unsafe { SetLastError(0) };
+        let mut found = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+        loop {
+            if !found {
+                let code = unsafe { GetLastError() };
+                return if code == ERROR_NO_MORE_FILES {
+                    Ok(false)
+                } else {
+                    Err(ProcessIdentityError::Unavailable(code))
+                };
+            }
+            if entry.th32ProcessID == pid {
+                return Ok(true);
+            }
+            unsafe { SetLastError(0) };
+            found = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+        }
+    })();
+    unsafe { CloseHandle(snapshot) };
+    result
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn proc_stat_liveness(stat: &str) -> Result<bool, ProcessIdentityError> {
+    // comm may contain spaces and parentheses; the state follows its last ')'.
+    let close = stat
+        .rfind(')')
+        .ok_or(ProcessIdentityError::Unavailable(0))?;
+    let fields = stat
+        .get(close + 2..)
+        .ok_or(ProcessIdentityError::Unavailable(0))?;
+    match fields.split_whitespace().next() {
+        Some("Z" | "X" | "x") => Ok(false),
+        Some("R" | "S" | "D" | "T" | "t" | "W" | "K" | "P" | "I") => Ok(true),
+        _ => Err(ProcessIdentityError::Unavailable(0)),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn process_liveness_result(pid: u32) -> Result<bool, ProcessIdentityError> {
+    if pid == 0 {
+        return Ok(false);
+    }
+    match std::fs::read_to_string(PathBuf::from("/proc").join(pid.to_string()).join("stat")) {
+        Ok(stat) => proc_stat_liveness(&stat),
+        Err(error) => match error.kind() {
+            std::io::ErrorKind::NotFound => Ok(false),
+            std::io::ErrorKind::PermissionDenied => Err(ProcessIdentityError::AccessDenied),
+            _ => Err(ProcessIdentityError::Unavailable(
+                error.raw_os_error().unwrap_or_default() as u32,
+            )),
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_liveness_result(pid: u32) -> Result<bool, ProcessIdentityError> {
+    if pid == 0 {
+        return Ok(false);
+    }
+    let pid = libc::pid_t::try_from(pid).map_err(|_| ProcessIdentityError::NotFound)?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let info_size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            info_size as libc::c_int,
+        )
+    };
+    if written == info_size as libc::c_int {
+        // proc_bsdinfo.pbi_status remains available until the launcher reaps it.
+        return Ok(unsafe { info.assume_init() }.pbi_status != libc::SZOMB);
+    }
+    if written > 0 {
+        return Err(ProcessIdentityError::Unavailable(0));
+    }
+    let code = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or_default();
+    match code {
+        libc::ESRCH => Ok(false),
+        libc::EPERM | libc::EACCES => Err(ProcessIdentityError::AccessDenied),
+        _ => Err(ProcessIdentityError::Unavailable(code as u32)),
+    }
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+pub(crate) fn process_liveness_result(_pid: u32) -> Result<bool, ProcessIdentityError> {
+    Err(ProcessIdentityError::Unavailable(0))
+}
+
 /// 该端口的所有 TCP 行是否都属于同一个 PID（即占用者是“我们自己”而不是外部程序）。
 pub(crate) fn port_rows_all_owned_by(port: u16, pid: u32) -> bool {
     let rows = tcp_port_rows(port);
@@ -517,10 +664,13 @@ fn windows_file_identity(path: &str) -> Option<(u64, [u8; 16])> {
 }
 
 pub(crate) fn config_scope_fingerprint() -> String {
+    config_scope_fingerprint_for(&crate::config::get_app_config_dir())
+}
+
+pub(crate) fn config_scope_fingerprint_for(path: &Path) -> String {
     use sha2::{Digest, Sha256};
 
-    let path = crate::config::get_app_config_dir();
-    let normalized = std::fs::canonicalize(&path).unwrap_or(path);
+    let normalized = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut hasher = Sha256::new();
     hasher.update(normalized_path(normalized.to_string_lossy().as_ref()).as_bytes());
     hex::encode(hasher.finalize())[..16].to_string()
@@ -870,6 +1020,65 @@ mod tests {
         assert_eq!(
             executable_fingerprint(host_path.to_string_lossy().as_ref()),
             executable_fingerprint(projected_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn proc_liveness_recognizes_zombies_and_parentheses_without_guessing_unknown() {
+        assert_eq!(
+            proc_stat_liveness("42 (name (nested) text) Z 1 2 3"),
+            Ok(false)
+        );
+        assert_eq!(proc_stat_liveness("42 (name) R 1 2 3"), Ok(true));
+        assert!(proc_stat_liveness("malformed").is_err());
+        assert!(proc_stat_liveness("42 (name) ? 1 2").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_process_liveness_recognizes_exited_child_before_reap() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("disposable child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut observed_exit = false;
+        while std::time::Instant::now() < deadline {
+            if process_liveness_result(child.id()) == Ok(false) {
+                observed_exit = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(child.wait().expect("reap disposable child").success());
+        assert!(
+            observed_exit,
+            "retained zombie must not strand watchdog in Unknown"
+        );
+    }
+
+    #[test]
+    fn native_process_liveness_distinguishes_current_and_absent_pids() {
+        assert_eq!(process_liveness_result(std::process::id()), Ok(true));
+        assert_eq!(process_liveness_result(0), Ok(false));
+    }
+
+    #[test]
+    fn explicit_config_scope_uses_the_same_canonical_fingerprint() {
+        assert_eq!(
+            config_scope_fingerprint(),
+            config_scope_fingerprint_for(&crate::config::get_app_config_dir())
+        );
+        let first = tempfile::tempdir().expect("first scope");
+        let second = tempfile::tempdir().expect("second scope");
+        assert_eq!(
+            config_scope_fingerprint_for(first.path()),
+            config_scope_fingerprint_for(&first.path().join("."))
+        );
+        assert_ne!(
+            config_scope_fingerprint_for(first.path()),
+            config_scope_fingerprint_for(second.path())
         );
     }
 

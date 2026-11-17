@@ -8,6 +8,8 @@ import {
 } from "react";
 import {
   ArrowLeftRight,
+  BadgeDollarSign,
+  Brain,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -49,6 +51,10 @@ export function CodexCatalogViewport<
   onSetIncluded,
   onSelectionChange,
   onUseOnlySelected,
+  onUseOnlyFreeModels,
+  freeModelCount = 0,
+  onUseOnlyReasoningEffort,
+  reasoningEffortModelCount = 0,
   onRemoveSelected,
   onPruneOutdated,
   showSelection = true,
@@ -64,6 +70,10 @@ export function CodexCatalogViewport<
   onSetIncluded?: (ids: string[], enabled: boolean) => void;
   onSelectionChange?: (ids: Set<string>) => void;
   onUseOnlySelected?: (ids: string[]) => void;
+  onUseOnlyFreeModels?: () => void;
+  freeModelCount?: number;
+  onUseOnlyReasoningEffort?: () => void;
+  reasoningEffortModelCount?: number;
   onRemoveSelected?: (ids: string[]) => void;
   onPruneOutdated?: () => void;
   showSelection?: boolean;
@@ -394,6 +404,54 @@ export function CodexCatalogViewport<
           >
             <ListChecks className="mr-1.5 h-4 w-4 shrink-0" />
             {t("catalogBrowser.useOnlySelected")}
+          </Button>
+        )}
+        {onUseOnlyFreeModels && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-auto min-h-8 whitespace-normal"
+            disabled={freeModelCount === 0}
+            title={t("catalogBrowser.enableOnlyFreeModelsHint", {
+              defaultValue:
+                "Enable only models that the provider explicitly identifies as free; excluded rows remain available for editing.",
+            })}
+            onClick={() => {
+              onUseOnlyFreeModels();
+              updateSelection("clear");
+            }}
+          >
+            <BadgeDollarSign className="mr-1.5 h-4 w-4 shrink-0" />
+            {t("catalogBrowser.enableOnlyFreeModels", {
+              defaultValue: "Use free models only",
+            })}
+            <span className="text-[11px] opacity-75">({freeModelCount})</span>
+          </Button>
+        )}
+        {onUseOnlyReasoningEffort && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-auto min-h-8 whitespace-normal"
+            disabled={reasoningEffortModelCount === 0}
+            title={t("catalogBrowser.enableOnlyReasoningModelsHint", {
+              defaultValue:
+                "Enable only catalog models that advertise a selectable reasoning effort; excluded rows remain available for editing.",
+            })}
+            onClick={() => {
+              onUseOnlyReasoningEffort();
+              updateSelection("clear");
+            }}
+          >
+            <Brain className="mr-1.5 h-4 w-4 shrink-0" />
+            {t("catalogBrowser.enableOnlyReasoningModels", {
+              defaultValue: "Enable only models with reasoning effort",
+            })}
+            <span className="text-[11px] opacity-75">
+              ({reasoningEffortModelCount})
+            </span>
           </Button>
         )}
         {onPruneOutdated && (

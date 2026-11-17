@@ -1,22 +1,13 @@
 import assert from "node:assert/strict";
-import {
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
-import os from "node:os";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import * as guardianMigration from "./install-ccswitchmulti-watchdog.mjs";
 import {
-  GUARDIAN_RUNTIME_FILES,
-  assertGuardianNodeVersion,
+  assertProductionGuardianInstallSupported,
   guardianSnapshotCommand,
-  guardianStartupReceiptMatches,
   guardianTaskArguments,
   guardianTaskMutationCommand,
   installGuardian,
@@ -26,9 +17,68 @@ import {
   parseGuardianInstallerArguments,
   quoteWindowsArgument,
   splitWindowsArguments,
-  stageGuardianRuntime,
-  waitForGuardianStartup,
 } from "./install-ccswitchmulti-watchdog.mjs";
+
+test("retired installation, staging, and startup APIs are not exported by the migration module", () => {
+  for (const name of [
+    "GUARDIAN_RUNTIME_FILES",
+    "stageGuardianRuntime",
+    "assertGuardianRootSafe",
+    "guardianStartupReceiptMatches",
+    "waitForGuardianStartup",
+    "assertGuardianNodeVersion",
+  ]) {
+    assert.equal(
+      Object.hasOwn(guardianMigration, name),
+      false,
+      `${name} must not remain a second-owner capability`,
+    );
+  }
+});
+
+test("task mutator rejects every operation except unregister before reading any configuration", () => {
+  const untouchedConfiguration = new Proxy(
+    {},
+    {
+      ownKeys() {
+        throw new Error("configuration must remain unobserved");
+      },
+      get() {
+        throw new Error("configuration must remain unobserved");
+      },
+    },
+  );
+  for (const operation of [
+    "register",
+    "start",
+    "delete-everything",
+    "UNREGISTER",
+    null,
+    undefined,
+  ]) {
+    assert.throws(
+      () =>
+        guardianTaskMutationCommand(
+          operation,
+          untouchedConfiguration,
+          untouchedConfiguration,
+        ),
+      /only supports.*unregister/iu,
+    );
+  }
+});
+
+test("CLI refuses legacy production installs without touching uninstall migration", () => {
+  for (const options of [{}, { dryRun: true }, { noStart: true }]) {
+    assert.throws(
+      () => assertProductionGuardianInstallSupported(options),
+      /built-in Rust watchdog/,
+    );
+  }
+  assert.doesNotThrow(() =>
+    assertProductionGuardianInstallSupported({ uninstall: true }),
+  );
+});
 
 const environment = {
   LOCALAPPDATA: "C:\\Users\\fixture\\AppData\\Local",
@@ -112,6 +162,46 @@ function dependencies(overrides = {}) {
   };
 }
 
+test("direct import refuses a competing production guardian before any dependency is observed", async () => {
+  for (const requested of [
+    {},
+    { dryRun: true },
+    { noStart: true },
+    { noStart: true, dryRun: true },
+    { uninstall: false },
+    { uninstall: "true" },
+    { uninstall: "false" },
+    { uninstall: 1 },
+    { uninstall: null },
+  ]) {
+    const deps = dependencies();
+    await assert.rejects(
+      installGuardian(requested, deps),
+      /built-in Rust watchdog/,
+    );
+    assert.deepEqual(
+      deps.calls,
+      [],
+      "refused install must not inspect, stage, stop, register, or start",
+    );
+  }
+  const unexpectedDependency = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error("dependency must remain unobserved");
+      },
+    },
+  );
+  await assert.rejects(
+    installGuardian(
+      { guardianRoot: "invalid", dryRun: true },
+      unexpectedDependency,
+    ),
+    /built-in Rust watchdog/,
+  );
+});
+
 test("installer accepts all legacy parameter names and JavaScript aliases", () => {
   assert.deepEqual(
     parseGuardianInstallerArguments([
@@ -188,17 +278,6 @@ test("installer help runs before Windows, filesystem, identity, or task probes",
   assert.match(result.stdout, /Usage:/);
   assert.match(result.stdout, /--dry-run/);
   assert.equal(result.stderr, "");
-});
-
-test("install rejects Node versions that cannot preserve raw modern marker identity", async () => {
-  for (const version of ["20.19.0", "22.11.0", "invalid"]) {
-    assert.throws(() => assertGuardianNodeVersion(version), /22.12/);
-    const deps = dependencies({ nodeVersion: version });
-    await assert.rejects(installGuardian({}, deps), /22.12/);
-    assert.deepEqual(deps.calls, []);
-  }
-  for (const version of ["22.12.0", "22.20.1", "24.0.0"])
-    assert.doesNotThrow(() => assertGuardianNodeVersion(version));
 });
 
 test("installer requires absolute Node, user-scoped task names and positive timings", () => {
@@ -336,47 +415,64 @@ test("process migration preserves exact creation identities and ignores other us
   );
 });
 
-test("dry run validates sources and task ownership but mutates nothing", async () => {
+test("uninstall dry run validates task ownership without staging or mutating anything", async () => {
   const deps = dependencies();
-  const result = await installGuardian({ dryRun: true }, deps);
-  assert.equal(result.operation, "install");
+  const result = await installGuardian({ uninstall: true, dryRun: true }, deps);
+  assert.equal(result.operation, "uninstall");
   assert.deepEqual(result.matchingProcesses, [4321]);
-  assert.deepEqual(deps.calls, ["inspect", "stage"]);
+  assert.deepEqual(result.runtimeFiles, []);
+  assert.deepEqual(result.stoppedProcesses, []);
+  assert.deepEqual(deps.calls, ["inspect"]);
 });
 
-test("install migrates exact old watcher then publishes JS files and registers Node before start", async () => {
-  const deps = dependencies();
-  const result = await installGuardian({}, deps);
-  assert.deepEqual(deps.calls, [
-    "inspect",
-    "stage",
-    "stop:4321",
-    "apply",
-    "register",
-    "inspect",
-    "start",
-    "ready",
-  ]);
-  assert.deepEqual(result.stoppedProcesses, [4321]);
-  assert.equal(result.watcherPid, 5432);
-  assert.equal(result.startRequested, true);
-});
-
-test("NoStart registers production Node task without starting it", async () => {
-  const deps = dependencies();
-  const result = await installGuardian({ noStart: true }, deps);
-  assert.equal(result.startRequested, false);
-  assert.ok(!deps.calls.includes("start"));
+test("read-only inspection distinguishes a dormant owned task from an absent task", async () => {
+  for (const task of [snapshotFixture().task, null]) {
+    const deps = dependencies({
+      inspect: async () => {
+        deps.calls.push("inspect");
+        return snapshotFixture({ task, processes: [] });
+      },
+    });
+    const result = await installGuardian(
+      { uninstall: true, dryRun: true },
+      deps,
+    );
+    assert.equal(result.taskPresent, Boolean(task));
+    assert.deepEqual(result.matchingProcesses, []);
+    assert.deepEqual(result.stoppedProcesses, []);
+    assert.deepEqual(deps.calls, ["inspect"]);
+  }
 });
 
 test("uninstall removes only owned task and exact processes without copying or deleting files", async () => {
   const deps = dependencies();
   const result = await installGuardian({ uninstall: true }, deps);
   assert.equal(result.taskRemoved, true);
+  assert.deepEqual(result.stoppedProcesses, [4321]);
   assert.deepEqual(deps.calls, ["inspect", "unregister", "stop:4321"]);
 });
 
-test("task from another user or another guardian directory blocks every mutation", async () => {
+test("uninstall recognizes an owned legacy Node guardian without registering a replacement", async () => {
+  const action = {
+    execute: executable,
+    arguments: guardianTaskArguments(options),
+  };
+  const deps = dependencies({
+    inspect: async () => {
+      deps.calls.push("inspect");
+      return snapshotFixture({
+        task: { ownerSid: sid, actions: [action], state: "Running" },
+        processes: [processFixture(action)],
+      });
+    },
+  });
+  const result = await installGuardian({ uninstall: true }, deps);
+  assert.equal(result.taskRemoved, true);
+  assert.deepEqual(result.stoppedProcesses, [4321]);
+  assert.deepEqual(deps.calls, ["inspect", "unregister", "stop:4321"]);
+});
+
+test("task from another user or another guardian directory blocks every uninstall mutation", async () => {
   for (const task of [
     { ownerSid: "S-1-5-21-other", actions: [legacyAction] },
     {
@@ -391,24 +487,40 @@ test("task from another user or another guardian directory blocks every mutation
     { ownerSid: sid, actions: [legacyAction, legacyAction] },
   ]) {
     const deps = dependencies({ inspect: () => snapshotFixture({ task }) });
-    await assert.rejects(installGuardian({}, deps), /not owned/);
-    assert.deepEqual(deps.calls, []);
+    for (const dryRun of [false, true]) {
+      await assert.rejects(
+        installGuardian({ uninstall: true, dryRun }, deps),
+        /not owned/,
+      );
+      assert.deepEqual(deps.calls, []);
+    }
   }
 });
 
-test("missing app/Node or failed identity inspection prevents stopping the old watcher", async () => {
-  const missing = dependencies({ isRegularFile: () => false });
-  await assert.rejects(
-    installGuardian({}, missing),
-    /Node.js executable is unavailable/,
-  );
-  assert.deepEqual(missing.calls, ["inspect"]);
+test("uninstall does not require a surviving app executable, runtime file, or modern marker parser", async () => {
+  const unexpectedFileAccess = () => {
+    throw new Error("uninstall must not inspect runtime sources");
+  };
+  const deps = dependencies({
+    nodeVersion: "20.19.0",
+    isRegularFile: unexpectedFileAccess,
+    stageRuntime: unexpectedFileAccess,
+    waitForStartup: unexpectedFileAccess,
+  });
+  await installGuardian({ uninstall: true }, deps);
+  assert.deepEqual(deps.calls, ["inspect", "unregister", "stop:4321"]);
+});
+
+test("failed or incomplete identity inspection prevents stopping an old watcher during uninstall", async () => {
   const failure = dependencies({
     inspect: () => {
       throw new Error("Process probe failed.");
     },
   });
-  await assert.rejects(installGuardian({}, failure), /probe failed/);
+  await assert.rejects(
+    installGuardian({ uninstall: true }, failure),
+    /probe failed/,
+  );
   assert.deepEqual(failure.calls, []);
   const incomplete = dependencies({
     inspect: () =>
@@ -417,314 +529,113 @@ test("missing app/Node or failed identity inspection prevents stopping the old w
       }),
   });
   await assert.rejects(
-    installGuardian({}, incomplete),
+    installGuardian({ uninstall: true }, incomplete),
     /inspection is incomplete/,
   );
   assert.deepEqual(incomplete.calls, []);
 });
 
-test("registration failure rolls runtime files back and never starts an unverified task", async () => {
+test("unregister failure cannot stop processes, write files, or start a replacement", async () => {
   const deps = dependencies({
     mutate: async (operation) => {
       deps.calls.push(operation);
-      throw new Error("Registration failed.");
+      throw new Error("Unregister failed.");
     },
   });
-  await assert.rejects(installGuardian({}, deps), /Registration failed/);
-  assert.deepEqual(deps.calls, [
-    "inspect",
-    "stage",
-    "stop:4321",
-    "apply",
-    "register",
-    "rollback",
-  ]);
+  await assert.rejects(
+    installGuardian({ uninstall: true }, deps),
+    /Unregister failed/,
+  );
+  assert.deepEqual(deps.calls, ["inspect", "unregister"]);
 });
 
-test("changed registered action blocks a task start", async () => {
-  let inspections = 0;
+test("changed task ownership during unregister blocks stopping even the previously owned process", async () => {
   const deps = dependencies({
-    inspect: () => {
-      inspections += 1;
-      return inspections === 1
-        ? snapshotFixture()
-        : snapshotFixture({ task: null });
+    mutate: async (operation, expectedTask) => {
+      assert.equal(operation, "unregister");
+      assert.deepEqual(expectedTask, snapshotFixture().task);
+      deps.calls.push(operation);
+      throw new Error("Watchdog task action changed.");
     },
   });
-  await assert.rejects(installGuardian({}, deps), /does not match/);
-  assert.ok(!deps.calls.includes("start"));
-});
-
-test("startup waits for a fresh owned Node watcher and lock instead of an old lock alone", async () => {
-  let currentTime = 1000;
-  let inspections = 0;
-  const nodeAction = {
-    execute: executable,
-    arguments: guardianTaskArguments(options),
-  };
-  const watcherPid = await waitForGuardianStartup(options, {
-    inspect: () => {
-      inspections += 1;
-      return snapshotFixture({
-        task: { ownerSid: sid, actions: [nodeAction] },
-        processes:
-          inspections < 3
-            ? []
-            : [
-                processFixture(nodeAction, {
-                  pid: 5432,
-                  startedAtUtc: new Date(1100).toISOString(),
-                }),
-              ],
-      });
-    },
-    startedAtMs: 1000,
-    now: () => currentTime,
-    wait: async (duration) => {
-      currentTime += duration;
-    },
-    lockExists: () => true,
-    startupReceiptMatches: () => true,
-  });
-  assert.equal(watcherPid, 5432);
-  assert.equal(inspections, 3);
-});
-
-test("startup deadline and duplicate owned Node watcher both fail explicitly", async () => {
-  let currentTime = 1000;
   await assert.rejects(
-    waitForGuardianStartup(options, {
-      inspect: () =>
-        snapshotFixture({
-          task: {
-            ownerSid: sid,
-            actions: [
-              {
-                execute: executable,
-                arguments: guardianTaskArguments(options),
-              },
-            ],
-          },
-          processes: [],
-        }),
-      startedAtMs: 1000,
-      now: () => currentTime,
-      wait: async (duration) => {
-        currentTime += duration;
-      },
-      timeoutMs: 5,
-      lockExists: () => true,
-    }),
-    /startup deadline/,
+    installGuardian({ uninstall: true }, deps),
+    /task action changed/,
   );
-  const action = {
-    execute: executable,
-    arguments: guardianTaskArguments(options),
-  };
-  await assert.rejects(
-    waitForGuardianStartup(options, {
-      inspect: () =>
-        snapshotFixture({
-          task: { ownerSid: sid, actions: [action] },
-          processes: [
-            processFixture(action, {
-              pid: 100,
-              startedAtUtc: new Date(1100).toISOString(),
-            }),
-            processFixture(action, {
-              pid: 101,
-              startedAtUtc: new Date(1100).toISOString(),
-            }),
-          ],
-        }),
-      startedAtMs: 1000,
-      now: () => 1000,
-    }),
-    /More than one/,
+  assert.deepEqual(deps.calls, ["inspect", "unregister"]);
+});
+
+test("migration source has no staging, file-writing, registration, or startup implementation", () => {
+  const source = readFileSync(
+    new URL("./install-ccswitchmulti-watchdog.mjs", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(source, /\b(?:New|Register|Start)-ScheduledTask\b/iu);
+  assert.doesNotMatch(
+    source,
+    /\b(?:writeFileSync|mkdirSync|renameSync|rmSync|stageGuardianRuntime|waitForGuardianStartup)\b/u,
   );
 });
 
-test("a stale lock and fresh Node process cannot pass startup without its matching post-lock receipt", async () => {
-  const fixture = mkdtempSync(path.join(os.tmpdir(), "ccsm-guardian-receipt-"));
-  const logPath = path.join(fixture, "guardian.jsonl");
-  const nodeAction = {
-    execute: executable,
-    arguments: guardianTaskArguments(options),
-  };
-  const identity = processFixture(nodeAction, {
-    pid: 5432,
-    startedAtUtc: "2026-10-21T12:00:00.1234567Z",
-  });
-  const startedAtMs = Date.parse("2026-10-21T12:00:00.000Z");
-  const receipt = (changed = {}) => ({
-    timestamp: "2026-10-21T12:00:00.500Z",
-    event: "guardian-started",
-    detail: {
-      GuardianProcessId: identity.pid,
-      GuardianStartTimeUtc: identity.startedAtUtc,
+test("unregister builder rejects missing or foreign snapshots before native configuration is serialized", () => {
+  const notSerializable = new Proxy(options, {
+    ownKeys() {
+      throw new Error("foreign snapshot must not be serialized");
     },
-    ...changed,
   });
-  try {
-    writeFileSync(
-      logPath,
-      `${JSON.stringify(receipt({ detail: { GuardianProcessId: 9999, GuardianStartTimeUtc: identity.startedAtUtc } }))}\n`,
-    );
-    assert.equal(
-      guardianStartupReceiptMatches(logPath, identity, startedAtMs),
-      false,
-    );
-    let currentTime = startedAtMs;
-    await assert.rejects(
-      waitForGuardianStartup(options, {
-        inspect: () =>
-          snapshotFixture({
-            task: { ownerSid: sid, actions: [nodeAction] },
-            processes: [identity],
-          }),
-        startedAtMs,
-        now: () => currentTime,
-        wait: async (duration) => {
-          currentTime += duration;
-        },
-        lockExists: () => true,
-        startupReceiptMatches: (_, candidate, after) =>
-          guardianStartupReceiptMatches(logPath, candidate, after),
-        timeoutMs: 5,
-      }),
-      /startup deadline/,
-    );
-    writeFileSync(
-      logPath,
-      `${JSON.stringify(receipt({ detail: { GuardianProcessId: identity.pid, GuardianStartTimeUtc: "2026-10-21T12:00:00.1234560Z" } }))}\n`,
-    );
-    assert.equal(
-      guardianStartupReceiptMatches(logPath, identity, startedAtMs),
-      false,
-      "Submillisecond identity differences must remain visible.",
-    );
-    writeFileSync(
-      logPath,
-      `${JSON.stringify(receipt({ timestamp: "2026-10-21T11:59:59.000Z" }))}\n`,
-    );
-    assert.equal(
-      guardianStartupReceiptMatches(logPath, identity, startedAtMs),
-      false,
-    );
-    writeFileSync(
-      logPath,
-      `invalid-partial-record\n${JSON.stringify(receipt())}\n`,
-    );
-    assert.equal(
-      guardianStartupReceiptMatches(logPath, identity, startedAtMs),
-      true,
-    );
-    assert.equal(
-      await waitForGuardianStartup(options, {
-        inspect: () =>
-          snapshotFixture({
-            task: { ownerSid: sid, actions: [nodeAction] },
-            processes: [identity],
-          }),
-        startedAtMs,
-        now: () => startedAtMs,
-        lockExists: () => true,
-        startupReceiptMatches: (_, candidate, after) =>
-          guardianStartupReceiptMatches(logPath, candidate, after),
-      }),
-      identity.pid,
-    );
-  } finally {
-    rmSync(fixture, { recursive: true, force: true });
-  }
-});
-
-test("runtime copy has no PS1 dependency and rollback preserves unrelated files", () => {
-  const fixture = mkdtempSync(path.join(os.tmpdir(), "ccsm-guardian-install-"));
-  const source = path.join(fixture, "source");
-  const target = path.join(fixture, "target");
-  // Directory creation is a fixture operation; no real installed guardian touched.
-  try {
-    mkdirSync(source);
-    mkdirSync(target);
-    for (const name of GUARDIAN_RUNTIME_FILES)
-      writeFileSync(path.join(source, name), `new:${name}`);
-    writeFileSync(
-      path.join(target, GUARDIAN_RUNTIME_FILES[0]),
-      "previous-runtime",
-    );
-    writeFileSync(path.join(target, "guardian.jsonl"), "keep-log");
-    const apply = stageGuardianRuntime({
-      sourceRoot: source,
-      guardianRoot: target,
-    });
-    assert.equal(
-      readFileSync(path.join(target, GUARDIAN_RUNTIME_FILES[0]), "utf8"),
-      "previous-runtime",
-    );
-    const rollback = apply();
-    assert.equal(
-      readFileSync(path.join(target, GUARDIAN_RUNTIME_FILES[0]), "utf8"),
-      `new:${GUARDIAN_RUNTIME_FILES[0]}`,
-    );
-    rollback();
-    assert.equal(
-      readFileSync(path.join(target, GUARDIAN_RUNTIME_FILES[0]), "utf8"),
-      "previous-runtime",
-    );
-    assert.equal(
-      readFileSync(path.join(target, "guardian.jsonl"), "utf8"),
-      "keep-log",
-    );
+  for (const expectedTask of [
+    undefined,
+    {},
+    { ownerSid: "unknown", actions: [legacyAction] },
+    { ownerSid: sid, actions: [legacyAction, legacyAction] },
+    {
+      ownerSid: sid,
+      actions: [
+        { execute: "C:\\Windows\\System32\\cmd.exe", arguments: "unrelated" },
+      ],
+    },
+  ]) {
     assert.throws(
-      () => readFileSync(path.join(target, GUARDIAN_RUNTIME_FILES[1])),
-      /ENOENT/,
+      () =>
+        guardianTaskMutationCommand(
+          "unregister",
+          notSerializable,
+          expectedTask,
+        ),
+      /Windows user identity|not owned/iu,
     );
-    assert.ok(GUARDIAN_RUNTIME_FILES.every((name) => !name.endsWith(".ps1")));
-  } finally {
-    rmSync(fixture, { recursive: true, force: true });
   }
 });
 
-test("runtime copy rejects a junction and never writes through it", () => {
-  const fixture = mkdtempSync(
-    path.join(os.tmpdir(), "ccsm-guardian-junction-"),
+test("missing legacy task is rechecked for absence and cannot authorize removing a new task", () => {
+  const command = guardianTaskMutationCommand("unregister", options, null);
+  assert.match(command, /if \(\$null -eq \$config.expectedTask\)/);
+  assert.match(
+    command,
+    /if \(\$null -ne \$current\) \{ throw 'Watchdog task ownership changed\.'/,
   );
-  const target = path.join(fixture, "target");
-  const link = path.join(fixture, "link");
-  try {
-    mkdirSync(target);
-    symlinkSync(
-      target,
-      link,
-      process.platform === "win32" ? "junction" : "dir",
-    );
-    assert.throws(
-      () => stageGuardianRuntime({ guardianRoot: link }),
-      /symbolic link or junction/,
-    );
-  } finally {
-    rmSync(fixture, { recursive: true, force: true });
-  }
+  assert.match(
+    command,
+    /if \(\$null -ne \$config.expectedTask\) \{ Unregister-ScheduledTask/,
+  );
 });
 
-test("scheduled task mutations recheck the inspected action and current SID", () => {
+test("owned unregister rechecks the inspected action and current SID before native removal", () => {
   const command = guardianTaskMutationCommand(
-    "register",
-    { ...options, taskArguments: guardianTaskArguments(options) },
+    "unregister",
+    options,
     snapshotFixture().task,
   );
-  assert.match(command, /Assert-UnchangedWatchdogTask\n\$action/);
-  assert.match(command, /-LogonType Interactive -RunLevel Limited/);
-  assert.match(command, /-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries/);
-  assert.match(command, /-MultipleInstances IgnoreNew/);
-  assert.match(command, /-ExecutionTimeLimit \(\[TimeSpan\]::Zero\)/);
-  assert.match(command, /-RestartCount 3/);
+  assert.match(
+    command,
+    /Assert-UnchangedWatchdogTask\nif \(\$null -ne \$config.expectedTask\) \{ Unregister-ScheduledTask/,
+  );
+  assert.doesNotMatch(command, /\b(?:New|Register|Start)-ScheduledTask\b/iu);
   assert.match(command, /current\.ownerSid -cne \$currentSid/);
   assert.match(command, /current\.actions \| ConvertTo-Json/);
   assert.throws(
     () => guardianTaskMutationCommand("delete-everything", options, null),
-    /Unknown/,
+    /only supports.*unregister/iu,
   );
 });
 
@@ -735,8 +646,8 @@ test(
     for (const command of [
       guardianSnapshotCommand(options),
       guardianTaskMutationCommand(
-        "register",
-        { ...options, taskArguments: guardianTaskArguments(options) },
+        "unregister",
+        options,
         snapshotFixture().task,
       ),
     ]) {

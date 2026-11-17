@@ -1154,29 +1154,49 @@ fn parse_cumulative_tokens(total_usage: &serde_json::Value) -> Option<Cumulative
 
 pub(crate) type RolloutIndex = HashMap<String, Vec<PathBuf>>;
 
-static CODEX_DISCOVERY: OnceLock<Mutex<discovery::CodexDiscoveryState>> = OnceLock::new();
+#[derive(Debug)]
+struct CodexDiscoveryOwner {
+    root: PathBuf,
+    state: discovery::CodexDiscoveryState,
+}
+
+static CODEX_DISCOVERY: OnceLock<Mutex<Option<CodexDiscoveryOwner>>> = OnceLock::new();
 
 fn discover_codex_session_files(codex_dir: &Path) -> Result<Vec<PathBuf>, AppError> {
-    let roots = vec![
-        discovery::CodexDiscoveryRoot {
-            kind: discovery::CodexDiscoveryRootKind::Sessions,
-            path: codex_dir.join("sessions"),
-        },
-        discovery::CodexDiscoveryRoot {
-            kind: discovery::CodexDiscoveryRootKind::ArchivedSessions,
-            path: codex_dir.join("archived_sessions"),
-        },
-    ];
-    let state =
-        CODEX_DISCOVERY.get_or_init(|| Mutex::new(discovery::CodexDiscoveryState::new(roots)));
+    let root = if codex_dir.is_dir() {
+        fs::canonicalize(codex_dir)
+            .map_err(|error| AppError::Config(format!("无法规范化 Codex 配置目录: {error}")))?
+    } else {
+        codex_dir.to_path_buf()
+    };
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
-    let mut state = state
+    let mut cache = CODEX_DISCOVERY
+        .get_or_init(|| Mutex::new(None))
         .lock()
         .map_err(|error| AppError::Database(format!("Codex discovery mutex poisoned: {error}")))?;
-    let batch = state.discover_at(now)?;
+    if cache.as_ref().is_some_and(|cached| cached.root != root) {
+        // A settings change moves discovery ownership, not just its next scan.
+        // Keep the normal bounded scan schedule only while the owner is current.
+        *cache = None;
+        clear_codex_replay_caches();
+    }
+    let cached = cache.get_or_insert_with(|| CodexDiscoveryOwner {
+        root: root.clone(),
+        state: discovery::CodexDiscoveryState::new(vec![
+            discovery::CodexDiscoveryRoot {
+                kind: discovery::CodexDiscoveryRootKind::Sessions,
+                path: root.join("sessions"),
+            },
+            discovery::CodexDiscoveryRoot {
+                kind: discovery::CodexDiscoveryRootKind::ArchivedSessions,
+                path: root.join("archived_sessions"),
+            },
+        ]),
+    });
+    let batch = cached.state.discover_at(now)?;
     if batch.full_scan {
         log::debug!(
             "[CODEX-SYNC] discovery 全量扫描: {} 个候选文件",
@@ -3097,6 +3117,52 @@ mod tests {
     const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";
     const CHILD_A_ID: &str = "00000000-0000-4000-8000-000000000002";
     const CHILD_B_ID: &str = "00000000-0000-4000-8000-000000000003";
+
+    #[test]
+    #[serial_test::serial]
+    fn discovery_follows_changed_codex_root_without_process_restart() -> Result<(), AppError> {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        let first_file = first.path().join("sessions/2020/01/01/first.jsonl");
+        let second_file = second.path().join("sessions/2020/01/01/second.jsonl");
+        let archived_file = second.path().join("archived_sessions/archived.jsonl");
+        for file in [&first_file, &second_file, &archived_file] {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "{}\n").unwrap();
+        }
+        let first_file = fs::canonicalize(first_file).unwrap();
+        let second_file = fs::canonicalize(second_file).unwrap();
+        let archived_file = fs::canonicalize(archived_file).unwrap();
+
+        let first_paths = discover_codex_session_files(first.path())?;
+        assert_eq!(first_paths, vec![first_file.clone()]);
+        let later_file = first.path().join("sessions/2020/01/01/later.jsonl");
+        fs::write(&later_file, "{}\n").unwrap();
+        let later_file = fs::canonicalize(later_file).unwrap();
+        assert!(
+            !discover_codex_session_files(first.path())?.contains(&later_file),
+            "the same configured root must retain the bounded repair-scan schedule"
+        );
+        let second_paths = discover_codex_session_files(second.path())?;
+        assert!(
+            second_paths.contains(&second_file),
+            "changing the configured Codex directory must discover its old sessions immediately"
+        );
+        assert!(second_paths.contains(&archived_file));
+        assert!(
+            !second_paths.contains(&first_file),
+            "the previous configured directory must not remain the discovery authority"
+        );
+        let restored_paths = discover_codex_session_files(first.path())?;
+        assert_eq!(restored_paths.len(), 2);
+        assert!(restored_paths.contains(&first_file));
+        assert!(restored_paths.contains(&later_file));
+        assert!(
+            !restored_paths.contains(&second_file) && !restored_paths.contains(&archived_file),
+            "switching back must also discard the other directory's cached inventory"
+        );
+        Ok(())
+    }
 
     #[test]
     fn repeated_retryable_defer_with_new_file_stamp_does_not_spam_warning() {

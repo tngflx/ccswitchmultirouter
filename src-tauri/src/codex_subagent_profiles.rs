@@ -339,7 +339,11 @@ pub struct CompileOutput {
 pub struct GeneratedRole {
     pub requested_role_name: String,
     pub effective_role_name: String,
+    /// Derived authoring text before the mandatory modality projection.
+    pub editable_description: String,
     pub description: String,
+    /// Derived authoring prose; never includes generated scope/governance guards.
+    pub editable_developer_instructions: String,
     pub developer_instructions: String,
     pub nickname_candidates: Vec<String>,
     pub model: String,
@@ -896,7 +900,15 @@ fn compile_reasoning_policy(
                 | ReasoningSupportKind::BooleanOnly
                 | ReasoningSupportKind::Unsupported => {
                     let resolved = capability.effort_map.get(&effort).unwrap_or(&effort);
-                    if capability.codex_selectable_efforts.contains(resolved) {
+                    // Runtime compatibility mappings can clamp an old request,
+                    // but cannot enable the product-only Ultra selector. Ultra
+                    // must be advertised by the validated orchestration projection.
+                    let selectable = if effort == CodexReasoningEffort::Ultra {
+                        capability.codex_selectable_efforts.contains(&effort)
+                    } else {
+                        capability.codex_selectable_efforts.contains(resolved)
+                    };
+                    if selectable {
                         Ok((Some(effort), Vec::new()))
                     } else {
                         Err(validation_error(
@@ -927,10 +939,14 @@ fn compile_reasoning_policy(
             }
         }
         ReasoningRuntimePolicy::Disabled => {
+            // None is intentionally absent from positive picker efforts.
+            // Disabling has its own confirmed contract, including boolean-only
+            // providers, rather than requiring an impossible positive None tier.
             if !capability.disable_allowed
-                || !capability
-                    .codex_selectable_efforts
-                    .contains(&CodexReasoningEffort::None)
+                || !matches!(
+                    capability.support_kind,
+                    ReasoningSupportKind::EffortLevels | ReasoningSupportKind::BooleanOnly
+                )
             {
                 return Err(validation_error(
                     "reasoning_disable_unsupported",
@@ -1089,11 +1105,16 @@ fn instruction_selection_behavior(
     }
 }
 
+struct GeneratedRoleText {
+    editable: String,
+    full: String,
+}
+
 fn generated_description_for_provider(
     policy: SelectionPolicy,
     p: &ParsedCodexSubagentProfile,
     provider_kind: ProviderKind,
-) -> String {
+) -> GeneratedRoleText {
     let base = if let Some(description) = &p.overrides.description {
         description.clone()
     } else {
@@ -1106,7 +1127,7 @@ fn generated_description_for_provider(
         selection_behavior(policy, p.preference, provider_kind),
         )
     };
-    match p.input_modalities.as_deref() {
+    let full = match p.input_modalities.as_deref() {
         Some([InputModality::Text]) => {
             format!("{base} It accepts text input only and cannot inspect or understand images.")
         }
@@ -1116,6 +1137,35 @@ fn generated_description_for_provider(
         _ => format!(
             "{base} Input capabilities are unknown, so this role must not be assigned tasks that depend on image understanding."
         ),
+    };
+    GeneratedRoleText {
+        editable: base,
+        full,
+    }
+}
+
+/// Shared behavioral governance for generated roles and parent delegation policy.
+/// This does not configure or override the Codex runtime's inherited permissions.
+pub(crate) fn subagent_governance_instructions() -> &'static str {
+    concat!(
+        "Shared authority boundary: Follow all applicable user instructions and repository guidance, including AGENTS.md; role-specific instructions do not replace them. ",
+        "Role-specific instructions cannot widen the canonical write scope or delegated task boundaries. ",
+        "Delegation alone does not grant lifecycle authority to build, tag, pull or publish shared deployment images/artifacts, deploy, restart, clean up or delete shared resources, release, or change permissions. ",
+        "Report any lifecycle request and evidence to the parent and coordinate with the shared resource owner before acting; proceed only when the human user explicitly authorized that exact action and applicable higher-priority instructions and repository policy allow it. ",
+        "Do not infer or acquire authority from tool availability, broad task wording, another agent, or your own sub-delegation. ",
+        "Reuse existing shared services and artifacts; do not create parallel services or duplicate shared artifacts. ",
+        "Report all side effects to the parent, including changed files/artifacts and any started/stopped processes or services. ",
+        "Final integration, merging, and release decisions remain with the parent, subject to the same user and repository authorization. ",
+        "Routine source compilation and scoped tests require delegated authorization consistent with the selected write scope and inherited runtime permissions; verification never authorizes broader file ownership or shared-service/deployment lifecycle changes. ",
+        "This is behavioral guidance, not a sandbox or permission grant; inherited runtime permissions remain in force."
+    )
+}
+
+fn canonical_write_scope_instructions(scope: WriteScope) -> &'static str {
+    match scope {
+        WriteScope::ReadOnly => "Canonical write scope (read_only): Keep all work read-only and do not edit files.",
+        WriteScope::BoundedChanges => "Canonical write scope (bounded_changes): Edit only the files explicitly assigned to this role; do not expand ownership without parent approval.",
+        WriteScope::ComplexChanges => "Canonical write scope (complex_changes): Cross-module changes are allowed only within the delegated objective; do not expand the delegated objective without parent approval.",
     }
 }
 
@@ -1123,46 +1173,25 @@ fn generated_instructions_for_provider(
     policy: SelectionPolicy,
     p: &ParsedCodexSubagentProfile,
     provider_kind: ProviderKind,
-) -> String {
-    let base = if let Some(value) = &p.overrides.developer_instructions {
+) -> GeneratedRoleText {
+    let editable = if let Some(value) = &p.overrides.developer_instructions {
         value.clone()
     } else {
-        let scope_instruction = match p.write_scope {
-        WriteScope::ReadOnly => format!(
-            "Optimize for {} and keep all work read-only.",
-            optimization_label(p.optimization)
-        ),
-        WriteScope::BoundedChanges => format!(
-            "Optimize for {} and edit only the files explicitly assigned to this role; do not expand ownership without parent approval.",
-            optimization_label(p.optimization)
-        ),
-        WriteScope::ComplexChanges => format!(
-            "Optimize for {}; cross-module changes are allowed within the delegated objective, but final integration, merging, and release remain with the parent agent.",
-            optimization_label(p.optimization)
-        ),
-        };
-        let task_boundary = if p.write_scope == WriteScope::ReadOnly {
-            format!(
-                "Work only on delegated {} tasks and do not edit files.",
-                joined_strengths(&p.strengths)
-            )
-        } else {
-            format!(
-                "Work only on delegated {} tasks.",
-                joined_strengths(&p.strengths)
-            )
-        };
-        let final_boundary = if p.write_scope == WriteScope::ComplexChanges {
-            "Return concrete evidence and verification to the parent agent."
-        } else {
-            "Return concrete evidence to the parent; final integration, merging, and release remain with the parent agent."
-        };
         format!(
-            "{task_boundary} {scope_instruction} {} {final_boundary}",
+            "Work only on delegated {} tasks. Optimize for {}. {} Return concrete evidence and verification to the parent agent.",
+            joined_strengths(&p.strengths),
+            optimization_label(p.optimization),
             instruction_selection_behavior(policy, p.preference, provider_kind),
         )
     };
-    match p.input_modalities.as_deref() {
+    // Authoring prose and mandatory projections are separate. Editing an
+    // automatic preview must never persist generated scope/governance guards.
+    let base = format!(
+        "{editable} {} {}",
+        canonical_write_scope_instructions(p.write_scope),
+        subagent_governance_instructions(),
+    );
+    let full = match p.input_modalities.as_deref() {
         Some([InputModality::Text]) => format!(
             "{base} This model does not support image input; do not select this role for tasks that depend on image understanding."
         ),
@@ -1172,7 +1201,8 @@ fn generated_instructions_for_provider(
         _ => format!(
             "{base} This model's input capabilities are unknown; do not select this role for tasks that depend on image understanding."
         ),
-    }
+    };
+    GeneratedRoleText { editable, full }
 }
 
 fn default_role_name(p: &ParsedCodexSubagentProfile) -> String {
@@ -1437,19 +1467,17 @@ pub fn compile_subagent_v2_profiles(request: &CompileRequest) -> CompileResult {
             .unwrap_or_else(|| vec![default_nickname(&p)]);
         let (effort, warnings) =
             compile_reasoning_policy(&p.reasoning, &catalog.reasoning, p.reasoning_origin, &p.key)?;
+        let description =
+            generated_description_for_provider(config.selection_policy, &p, catalog.provider_kind);
+        let instructions =
+            generated_instructions_for_provider(config.selection_policy, &p, catalog.provider_kind);
         output.generated_roles.push(GeneratedRole {
             requested_role_name: requested,
             effective_role_name: effective,
-            description: generated_description_for_provider(
-                config.selection_policy,
-                &p,
-                catalog.provider_kind,
-            ),
-            developer_instructions: generated_instructions_for_provider(
-                config.selection_policy,
-                &p,
-                catalog.provider_kind,
-            ),
+            editable_description: description.editable,
+            description: description.full,
+            editable_developer_instructions: instructions.editable,
+            developer_instructions: instructions.full,
             nickname_candidates: nicknames,
             model: role_model,
             model_provider: "codex_model_router_v2".to_string(),
@@ -1491,9 +1519,12 @@ pub fn initialize_legacy_subagent_v2() -> Result<CodexSubagentV2, CompileError> 
         optimization: Optimization::Speed,
         write_scope: WriteScope::ReadOnly,
         preference: Preference::Preferred,
+        // New built-in profiles prefer high rather than inheriting a
+        // parent/session effort. Saved choices remain authoritative; users can
+        // still explicitly select max or delegated/model-default behavior.
         reasoning: CodexSubagentReasoningPolicy {
-            policy: ReasoningRuntimePolicy::Delegated,
-            effort: None,
+            policy: ReasoningRuntimePolicy::Fixed,
+            effort: Some(CodexReasoningEffort::High),
         },
         reasoning_origin: ReasoningPolicyOrigin::Declared,
         overrides: CodexSubagentProfileOverrides::default(),
@@ -1636,8 +1667,14 @@ mod tests {
         GeneratedRole {
             requested_role_name: s(requested),
             effective_role_name: s(effective),
+            editable_description: s(description),
             description: format!("{description}{UNKNOWN_MODALITY_DESCRIPTION_SAFETY}"),
-            developer_instructions: format!("{instructions}{UNKNOWN_MODALITY_INSTRUCTIONS_SAFETY}"),
+            editable_developer_instructions: s(instructions),
+            developer_instructions: format!(
+                "{instructions} {} {}{UNKNOWN_MODALITY_INSTRUCTIONS_SAFETY}",
+                governance_scope_expectation(WriteScope::ReadOnly),
+                subagent_governance_instructions(),
+            ),
             nickname_candidates: nicknames,
             model: s("DeepSeek-V4-Flash"),
             model_provider: s("codex_model_router_v2"),
@@ -1707,16 +1744,16 @@ mod tests {
     const DESC_THIRD_PARTY_FIRST_ELIGIBLE: &str = "This role matches delegated repository exploration tasks. It excludes long-context reading, evidence collection, summarization, complex debugging, architecture design, bounded implementation, complex implementation, testing, and high-risk review, and it does not own final integration, merging, or release. It optimizes for speed and is limited to read-only work. Under third-party-first selection, matching preferred or eligible third-party profiles go first; this profile is eligible.";
     const DESC_OFFICIAL_FIRST_PREFERRED: &str = "This role matches delegated repository exploration tasks. It excludes long-context reading, evidence collection, summarization, complex debugging, architecture design, bounded implementation, complex implementation, testing, and high-risk review, and it does not own final integration, merging, or release. It optimizes for speed and is limited to read-only work. Task match makes this preferred third-party profile override the global official-first provider bias.";
     const DESC_FALLBACK: &str = "This role matches delegated repository exploration tasks. It excludes long-context reading, evidence collection, summarization, complex debugging, architecture design, bounded implementation, complex implementation, testing, and high-risk review, and it does not own final integration, merging, or release. It optimizes for speed and is limited to read-only work. This third-party fallback profile is never promoted and may be used only when preferred profiles are unavailable or it is explicitly requested.";
-    const INSTRUCTIONS_BALANCED_REPOSITORY: &str = "Work only on delegated repository exploration tasks and do not edit files. Optimize for speed and keep all work read-only. Under balanced selection, this eligible third-party profile has no provider bias. Return concrete evidence to the parent; final integration, merging, and release remain with the parent agent.";
-    const INSTRUCTIONS_BALANCED_PREFERRED: &str = "Work only on delegated repository exploration tasks and do not edit files. Optimize for speed and keep all work read-only. Under balanced selection, when declared task strengths match, prefer this specialized role over the built-in generic default, worker, and explorer roles; provider identity does not break ties otherwise. Return concrete evidence to the parent; final integration, merging, and release remain with the parent agent.";
-    const INSTRUCTIONS_ARCHITECTURE: &str = "Work only on delegated architecture design tasks and do not edit files. Optimize for quality and keep all work read-only. Under balanced selection, this eligible third-party profile has no provider bias. Return concrete evidence to the parent; final integration, merging, and release remain with the parent agent.";
-    const INSTRUCTIONS_TESTING: &str = "Work only on delegated testing tasks and do not edit files. Optimize for speed and keep all work read-only. Under balanced selection, this eligible third-party profile has no provider bias. Return concrete evidence to the parent; final integration, merging, and release remain with the parent agent.";
-    const INSTRUCTIONS_OFFICIAL_FIRST_ELIGIBLE: &str = "Work only on delegated repository exploration tasks and do not edit files. Optimize for speed and keep all work read-only. Under official-first selection, use this eligible third-party profile only for a strong, well-bounded task match; otherwise prefer an official provider path. Return concrete evidence to the parent; final integration, merging, and release remain with the parent agent.";
-    const INSTRUCTIONS_THIRD_PARTY_FIRST_ELIGIBLE: &str = "Work only on delegated repository exploration tasks and do not edit files. Optimize for speed and keep all work read-only. Under third-party-first selection, put matching preferred or eligible third-party profiles first; this profile is eligible. Return concrete evidence to the parent; final integration, merging, and release remain with the parent agent.";
-    const INSTRUCTIONS_OFFICIAL_FIRST_PREFERRED: &str = "Work only on delegated repository exploration tasks and do not edit files. Optimize for speed and keep all work read-only. Task match makes this preferred third-party profile override the global official-first provider bias. Return concrete evidence to the parent; final integration, merging, and release remain with the parent agent.";
-    const INSTRUCTIONS_FALLBACK: &str = "Work only on delegated repository exploration tasks and do not edit files. Optimize for speed and keep all work read-only. Never promote this third-party fallback profile; use it only when preferred profiles are unavailable or it is explicitly requested. Return concrete evidence to the parent; final integration, merging, and release remain with the parent agent.";
-    const INSTRUCTIONS_BOUNDED_CHANGES: &str = "Work only on delegated bounded implementation tasks. Optimize for balanced execution and edit only the files explicitly assigned to this role; do not expand ownership without parent approval. Under balanced selection, this eligible third-party profile has no provider bias. Return concrete evidence to the parent; final integration, merging, and release remain with the parent agent.";
-    const INSTRUCTIONS_COMPLEX_CHANGES: &str = "Work only on delegated complex implementation tasks. Optimize for quality; cross-module changes are allowed within the delegated objective, but final integration, merging, and release remain with the parent agent. Under balanced selection, this eligible third-party profile has no provider bias. Return concrete evidence and verification to the parent agent.";
+    const INSTRUCTIONS_BALANCED_REPOSITORY: &str = "Work only on delegated repository exploration tasks. Optimize for speed. Under balanced selection, this eligible third-party profile has no provider bias. Return concrete evidence and verification to the parent agent.";
+    const INSTRUCTIONS_BALANCED_PREFERRED: &str = "Work only on delegated repository exploration tasks. Optimize for speed. Under balanced selection, when declared task strengths match, prefer this specialized role over the built-in generic default, worker, and explorer roles; provider identity does not break ties otherwise. Return concrete evidence and verification to the parent agent.";
+    const INSTRUCTIONS_ARCHITECTURE: &str = "Work only on delegated architecture design tasks. Optimize for quality. Under balanced selection, this eligible third-party profile has no provider bias. Return concrete evidence and verification to the parent agent.";
+    const INSTRUCTIONS_TESTING: &str = "Work only on delegated testing tasks. Optimize for speed. Under balanced selection, this eligible third-party profile has no provider bias. Return concrete evidence and verification to the parent agent.";
+    const INSTRUCTIONS_OFFICIAL_FIRST_ELIGIBLE: &str = "Work only on delegated repository exploration tasks. Optimize for speed. Under official-first selection, use this eligible third-party profile only for a strong, well-bounded task match; otherwise prefer an official provider path. Return concrete evidence and verification to the parent agent.";
+    const INSTRUCTIONS_THIRD_PARTY_FIRST_ELIGIBLE: &str = "Work only on delegated repository exploration tasks. Optimize for speed. Under third-party-first selection, put matching preferred or eligible third-party profiles first; this profile is eligible. Return concrete evidence and verification to the parent agent.";
+    const INSTRUCTIONS_OFFICIAL_FIRST_PREFERRED: &str = "Work only on delegated repository exploration tasks. Optimize for speed. Task match makes this preferred third-party profile override the global official-first provider bias. Return concrete evidence and verification to the parent agent.";
+    const INSTRUCTIONS_FALLBACK: &str = "Work only on delegated repository exploration tasks. Optimize for speed. Never promote this third-party fallback profile; use it only when preferred profiles are unavailable or it is explicitly requested. Return concrete evidence and verification to the parent agent.";
+    const INSTRUCTIONS_BOUNDED_CHANGES: &str = "Work only on delegated bounded implementation tasks. Optimize for balanced execution. Under balanced selection, this eligible third-party profile has no provider bias. Return concrete evidence and verification to the parent agent.";
+    const INSTRUCTIONS_COMPLEX_CHANGES: &str = "Work only on delegated complex implementation tasks. Optimize for quality. Under balanced selection, this eligible third-party profile has no provider bias. Return concrete evidence and verification to the parent agent.";
 
     fn assert_parse(raw: Value, expected: Result<CodexSubagentV2, CompileError>) {
         assert_eq!(parse_persisted_subagent_v2(&raw), expected);
@@ -2147,7 +2184,11 @@ mod tests {
         );
         assert_eq!(
             role.developer_instructions,
-            "Follow the delegated objective. This model does not support image input; do not select this role for tasks that depend on image understanding."
+            format!(
+                "Follow the delegated objective. {} {} This model does not support image input; do not select this role for tasks that depend on image understanding.",
+                governance_scope_expectation(WriteScope::ReadOnly),
+                subagent_governance_instructions(),
+            )
         );
     }
 
@@ -2209,7 +2250,11 @@ mod tests {
         );
         assert_eq!(
             role.developer_instructions,
-            format!("Follow the delegated objective.{UNKNOWN_MODALITY_INSTRUCTIONS_SAFETY}")
+            format!(
+                "Follow the delegated objective. {} {}{UNKNOWN_MODALITY_INSTRUCTIONS_SAFETY}",
+                governance_scope_expectation(WriteScope::ReadOnly),
+                subagent_governance_instructions(),
+            )
         );
     }
 
@@ -2684,12 +2729,14 @@ mod tests {
                 SelectionPolicy::Balanced,
                 &p,
                 ProviderKind::ThirdParty,
-            );
+            )
+            .full;
             let instructions = generated_instructions_for_provider(
                 SelectionPolicy::Balanced,
                 &p,
                 ProviderKind::ThirdParty,
-            );
+            )
+            .full;
             assert!(
                 description.to_ascii_lowercase().contains(phrase),
                 "description missing {phrase}: {description}"
@@ -2711,7 +2758,8 @@ mod tests {
             SelectionPolicy::OfficialFirst,
             &p,
             ProviderKind::ThirdParty,
-        );
+        )
+        .full;
         assert!(description.contains("quality"));
         assert!(description.contains("bounded changes"));
         assert!(description.contains("preferred"));
@@ -2750,8 +2798,13 @@ mod tests {
                 SelectionPolicy::Balanced,
                 &bounded,
                 ProviderKind::ThirdParty,
-            ),
-            format!("{INSTRUCTIONS_BOUNDED_CHANGES}{UNKNOWN_MODALITY_INSTRUCTIONS_SAFETY}")
+            )
+            .full,
+            format!(
+                "{INSTRUCTIONS_BOUNDED_CHANGES} {} {}{UNKNOWN_MODALITY_INSTRUCTIONS_SAFETY}",
+                governance_scope_expectation(WriteScope::BoundedChanges),
+                subagent_governance_instructions(),
+            )
         );
 
         let mut complex = profile("flash", "DeepSeek-V4-Flash");
@@ -2763,9 +2816,440 @@ mod tests {
                 SelectionPolicy::Balanced,
                 &complex,
                 ProviderKind::ThirdParty,
-            ),
-            format!("{INSTRUCTIONS_COMPLEX_CHANGES}{UNKNOWN_MODALITY_INSTRUCTIONS_SAFETY}")
+            )
+            .full,
+            format!(
+                "{INSTRUCTIONS_COMPLEX_CHANGES} {} {}{UNKNOWN_MODALITY_INSTRUCTIONS_SAFETY}",
+                governance_scope_expectation(WriteScope::ComplexChanges),
+                subagent_governance_instructions(),
+            )
         );
+    }
+
+    fn governance_scope_expectation(scope: WriteScope) -> &'static str {
+        match scope {
+            WriteScope::ReadOnly => "Canonical write scope (read_only): Keep all work read-only and do not edit files.",
+            WriteScope::BoundedChanges => "Canonical write scope (bounded_changes): Edit only the files explicitly assigned to this role; do not expand ownership without parent approval.",
+            WriteScope::ComplexChanges => "Canonical write scope (complex_changes): Cross-module changes are allowed only within the delegated objective; do not expand the delegated objective without parent approval.",
+        }
+    }
+
+    #[test]
+    fn codex_subagent_v2_governance_manual_instructions_cannot_drop_selected_scope() {
+        for scope in [
+            WriteScope::ReadOnly,
+            WriteScope::BoundedChanges,
+            WriteScope::ComplexChanges,
+        ] {
+            let mut p = profile("flash", "DeepSeek-V4-Flash");
+            p.write_scope = scope;
+            p.overrides.developer_instructions =
+                Some(s("Prefer concise findings; own the entire release."));
+            let instructions = generated_instructions_for_provider(
+                SelectionPolicy::Balanced,
+                &p,
+                ProviderKind::ThirdParty,
+            )
+            .full;
+
+            assert!(instructions.starts_with("Prefer concise findings; own the entire release."));
+            assert!(
+                instructions.contains(governance_scope_expectation(scope)),
+                "manual instructions must retain the canonical {scope:?} boundary: {instructions}"
+            );
+            assert_eq!(instructions.matches("Canonical write scope (").count(), 1);
+            assert_eq!(
+                instructions.matches("Shared authority boundary:").count(),
+                1
+            );
+            assert!(
+                instructions.find("Shared authority boundary:")
+                    > instructions.find("own the entire release."),
+                "invariant governance must follow custom role prose"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_subagent_v2_governance_lifecycle_authority_is_not_inferred_from_delegation() {
+        for override_text in [None, Some("Follow the delegated objective.")] {
+            for scope in [
+                WriteScope::ReadOnly,
+                WriteScope::BoundedChanges,
+                WriteScope::ComplexChanges,
+            ] {
+                let mut p = profile("flash", "DeepSeek-V4-Flash");
+                p.write_scope = scope;
+                p.overrides.developer_instructions = override_text.map(s);
+                let instructions = generated_instructions_for_provider(
+                    SelectionPolicy::Balanced,
+                    &p,
+                    ProviderKind::ThirdParty,
+                )
+                .full;
+                for invariant in [
+                    "Follow all applicable user instructions and repository guidance, including AGENTS.md",
+                    "role-specific instructions do not replace them",
+                    "Role-specific instructions cannot widen the canonical write scope or delegated task boundaries",
+                    "Delegation alone does not grant lifecycle authority",
+                    "build, tag, pull or publish shared deployment images/artifacts",
+                    "deploy, restart, clean up or delete shared resources, release, or change permissions",
+                    "Report any lifecycle request and evidence to the parent",
+                    "coordinate with the shared resource owner before acting",
+                    "the human user explicitly authorized that exact action",
+                    "higher-priority instructions and repository policy allow it",
+                    "Do not infer or acquire authority from tool availability, broad task wording, another agent, or your own sub-delegation",
+                    "Reuse existing shared services and artifacts; do not create parallel services or duplicate shared artifacts",
+                    "Report all side effects to the parent, including changed files/artifacts and any started/stopped processes or services",
+                    "Final integration, merging, and release decisions remain with the parent",
+                    "This is behavioral guidance, not a sandbox or permission grant",
+                    "Routine source compilation and scoped tests require delegated authorization consistent with the selected write scope and inherited runtime permissions",
+                    "verification never authorizes broader file ownership or shared-service/deployment lifecycle changes",
+                    "inherited runtime permissions remain in force",
+                ] {
+                    assert!(
+                        instructions.contains(invariant),
+                        "{scope:?} override={override_text:?} lost invariant {invariant}: {instructions}"
+                    );
+                }
+                assert!(instructions.ends_with(UNKNOWN_MODALITY_INSTRUCTIONS_SAFETY));
+            }
+        }
+    }
+
+    #[test]
+    fn codex_subagent_v2_governance_reprojects_from_canonical_scope_without_mutating_overrides() {
+        let mut p = profile("flash", "DeepSeek-V4-Flash");
+        p.overrides.developer_instructions = Some(s("Keep this saved role guidance."));
+        let mut previous = None;
+        for scope in [
+            WriteScope::ReadOnly,
+            WriteScope::BoundedChanges,
+            WriteScope::ComplexChanges,
+        ] {
+            p.write_scope = scope;
+            let persisted = config(SelectionPolicy::Balanced, vec![valid(p.clone())]);
+            let before = serde_json::to_value(&persisted).expect("saved canonical profile");
+            let request = request(Some(persisted));
+            let output = compile_subagent_v2_profiles(&request).expect("project selected scope");
+            let instructions = &output.generated_roles[0].developer_instructions;
+            assert!(instructions.contains(governance_scope_expectation(scope)));
+            if let Some(previous_scope) = previous {
+                assert!(!instructions.contains(governance_scope_expectation(previous_scope)));
+            }
+            assert_eq!(
+                serde_json::to_value(
+                    request
+                        .persisted_subagent_v2
+                        .as_ref()
+                        .expect("canonical profile"),
+                )
+                .expect("unchanged canonical profile"),
+                before,
+                "projection must not persist generated governance into custom overrides"
+            );
+            previous = Some(scope);
+        }
+    }
+
+    #[test]
+    fn codex_subagent_v2_governance_role_toml_has_no_fabricated_security_fields() {
+        let mut p = profile("flash", "DeepSeek-V4-Flash");
+        p.overrides.developer_instructions = Some(s("Investigate only the assigned task."));
+        let output = compile_subagent_v2_profiles(&request(Some(config(
+            SelectionPolicy::Balanced,
+            vec![valid(p)],
+        ))))
+        .expect("compile governed role");
+        let rendered = render_generated_role_toml(&output.generated_roles[0], "# managed")
+            .expect("serialize governed role");
+        let parsed: toml::Value = toml::from_str(&rendered).expect("parse governed role TOML");
+        let instructions = parsed
+            .get("developer_instructions")
+            .and_then(toml::Value::as_str)
+            .expect("projected instructions");
+        assert!(instructions.contains("Shared authority boundary:"));
+        assert!(instructions.contains(governance_scope_expectation(WriteScope::ReadOnly)));
+        for field in [
+            "sandbox_mode",
+            "approval_policy",
+            "sandbox_permissions",
+            "tools",
+        ] {
+            assert!(
+                parsed.get(field).is_none(),
+                "governance must not invent a child {field} override"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_subagent_v2_editable_instructions_automatic_base_excludes_derived_boundaries() {
+        let expected_base = "Work only on delegated repository exploration tasks. Optimize for speed. Under balanced selection, this eligible third-party profile has no provider bias. Return concrete evidence and verification to the parent agent.";
+        for scope in [
+            WriteScope::ReadOnly,
+            WriteScope::BoundedChanges,
+            WriteScope::ComplexChanges,
+        ] {
+            let mut p = profile("flash", "DeepSeek-V4-Flash");
+            p.write_scope = scope;
+            let output = compile_subagent_v2_profiles(&request(Some(config(
+                SelectionPolicy::Balanced,
+                vec![valid(p)],
+            ))))
+            .expect("compile editable automatic prose");
+            let role = &output.generated_roles[0];
+            let serialized = serde_json::to_value(role).expect("serialize generated role");
+            let editable = serialized
+                .get("editableDeveloperInstructions")
+                .and_then(Value::as_str)
+                .expect("preview must expose separate editable role prose");
+            assert_eq!(editable, expected_base);
+            for mandatory_text in [
+                "Canonical write scope",
+                "Shared authority boundary",
+                "read-only",
+                "do not edit files",
+                "files explicitly assigned",
+                "cross-module changes",
+                "final integration",
+                "release remain",
+                "input capabilities",
+            ] {
+                assert!(
+                    !editable
+                        .to_ascii_lowercase()
+                        .contains(&mandatory_text.to_ascii_lowercase()),
+                    "automatic editable text must not bake in {mandatory_text}: {editable}"
+                );
+            }
+            assert!(role
+                .developer_instructions
+                .contains(governance_scope_expectation(scope)));
+            assert_eq!(
+                role.developer_instructions
+                    .matches("Canonical write scope (")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                role.developer_instructions
+                    .matches("Shared authority boundary:")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn codex_subagent_v2_editable_instructions_override_stays_raw_and_out_of_role_toml() {
+        let custom = "Return concise evidence.\n\nKeep this  custom spacing.";
+        let mut p = profile("flash", "DeepSeek-V4-Flash");
+        p.overrides.developer_instructions = Some(s(custom));
+        let persisted = config(SelectionPolicy::Balanced, vec![valid(p)]);
+        let before = serde_json::to_value(&persisted).expect("saved profile before preview");
+        let request = request(Some(persisted));
+        let output = compile_subagent_v2_profiles(&request).expect("compile custom editable prose");
+        let role = &output.generated_roles[0];
+        let serialized = serde_json::to_value(role).expect("serialize role preview");
+        assert_eq!(
+            serialized
+                .get("editableDeveloperInstructions")
+                .and_then(Value::as_str),
+            Some(custom),
+            "editable custom text must not contain generated constraints or lose its bytes"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                request
+                    .persisted_subagent_v2
+                    .as_ref()
+                    .expect("saved profile")
+            )
+            .expect("unchanged profile after preview"),
+            before
+        );
+        let rendered = render_generated_role_toml(role, "# managed").expect("role TOML");
+        let parsed: toml::Value = toml::from_str(&rendered).expect("parse role TOML");
+        assert_eq!(
+            parsed
+                .get("developer_instructions")
+                .and_then(toml::Value::as_str),
+            Some(role.developer_instructions.as_str())
+        );
+        for field in [
+            "editable_developer_instructions",
+            "editableDeveloperInstructions",
+        ] {
+            assert!(
+                parsed.get(field).is_none(),
+                "{field} is preview-only, not role config"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_subagent_v2_editable_instructions_saved_edit_reprojects_without_stale_scope() {
+        let mut p = profile("flash", "DeepSeek-V4-Flash");
+        let initial = compile_subagent_v2_profiles(&request(Some(config(
+            SelectionPolicy::Balanced,
+            vec![valid(p.clone())],
+        ))))
+        .expect("initial automatic preview");
+        let serialized =
+            serde_json::to_value(&initial.generated_roles[0]).expect("editable preview");
+        let editable = serialized
+            .get("editableDeveloperInstructions")
+            .and_then(Value::as_str)
+            .expect("separate editable automatic prose");
+        let custom = format!("{editable}\nPrefer concise results.");
+        p.overrides.developer_instructions = Some(custom.clone());
+        for scope in [WriteScope::BoundedChanges, WriteScope::ComplexChanges] {
+            p.write_scope = scope;
+            let output = compile_subagent_v2_profiles(&request(Some(config(
+                SelectionPolicy::Balanced,
+                vec![valid(p.clone())],
+            ))))
+            .expect("reproject edited role with current questionnaire scope");
+            let role = &output.generated_roles[0];
+            let serialized = serde_json::to_value(role).expect("updated editable preview");
+            assert_eq!(
+                serialized
+                    .get("editableDeveloperInstructions")
+                    .and_then(Value::as_str),
+                Some(custom.as_str())
+            );
+            assert_eq!(
+                role.developer_instructions
+                    .matches("Canonical write scope (")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                role.developer_instructions
+                    .matches("Shared authority boundary:")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                role.developer_instructions
+                    .matches(UNKNOWN_MODALITY_INSTRUCTIONS_SAFETY)
+                    .count(),
+                1
+            );
+            assert!(role
+                .developer_instructions
+                .contains(governance_scope_expectation(scope)));
+            for stale_scope in [
+                WriteScope::ReadOnly,
+                WriteScope::BoundedChanges,
+                WriteScope::ComplexChanges,
+            ] {
+                if stale_scope != scope {
+                    assert!(!role
+                        .developer_instructions
+                        .contains(governance_scope_expectation(stale_scope)));
+                }
+            }
+            assert!(!custom.contains("do not edit files"));
+            assert!(!custom.contains("Shared authority boundary:"));
+        }
+    }
+
+    #[test]
+    fn codex_subagent_v2_editable_description_keeps_selection_narrative_without_modality_suffix() {
+        for (modalities, safety) in [
+            (None, UNKNOWN_MODALITY_DESCRIPTION_SAFETY),
+            (
+                Some(vec![InputModality::Text]),
+                " It accepts text input only and cannot inspect or understand images.",
+            ),
+            (
+                Some(vec![InputModality::Text, InputModality::Image]),
+                " It supports text and image input, including image understanding.",
+            ),
+        ] {
+            let mut p = profile("flash", "DeepSeek-V4-Flash");
+            p.input_modalities = modalities;
+            let output = compile_subagent_v2_profiles(&request(Some(config(
+                SelectionPolicy::Balanced,
+                vec![valid(p)],
+            ))))
+            .expect("compile editable description");
+            let role = &output.generated_roles[0];
+            let serialized = serde_json::to_value(role).expect("serialize description preview");
+            assert_eq!(
+                serialized.get("editableDescription").and_then(Value::as_str),
+                Some(DESC_BALANCED_REPOSITORY),
+                "editable description keeps the existing selection narrative without modality policy"
+            );
+            assert_eq!(
+                role.description,
+                format!("{DESC_BALANCED_REPOSITORY}{safety}")
+            );
+            let rendered = render_generated_role_toml(role, "# managed").expect("description TOML");
+            let parsed: toml::Value = toml::from_str(&rendered).expect("parse description TOML");
+            for field in ["editable_description", "editableDescription"] {
+                assert!(parsed.get(field).is_none(), "{field} is preview-only");
+            }
+        }
+    }
+
+    #[test]
+    fn codex_subagent_v2_editable_description_saved_edit_uses_current_modality_once() {
+        let mut p = profile("flash", "DeepSeek-V4-Flash");
+        let initial = compile_subagent_v2_profiles(&request(Some(config(
+            SelectionPolicy::Balanced,
+            vec![valid(p.clone())],
+        ))))
+        .expect("automatic description preview");
+        let serialized =
+            serde_json::to_value(&initial.generated_roles[0]).expect("editable description");
+        let editable = serialized
+            .get("editableDescription")
+            .and_then(Value::as_str)
+            .expect("separate editable description");
+        let custom = format!("{editable}\nKeep this  custom description spacing.");
+        p.overrides.description = Some(custom.clone());
+        for (modalities, safety) in [
+            (
+                Some(vec![InputModality::Text]),
+                " It accepts text input only and cannot inspect or understand images.",
+            ),
+            (
+                Some(vec![InputModality::Text, InputModality::Image]),
+                " It supports text and image input, including image understanding.",
+            ),
+            (None, UNKNOWN_MODALITY_DESCRIPTION_SAFETY),
+        ] {
+            p.input_modalities = modalities;
+            let persisted = config(SelectionPolicy::Balanced, vec![valid(p.clone())]);
+            let before =
+                serde_json::to_value(&persisted).expect("saved description before projection");
+            let request = request(Some(persisted));
+            let output =
+                compile_subagent_v2_profiles(&request).expect("current modality description");
+            let role = &output.generated_roles[0];
+            let serialized = serde_json::to_value(role).expect("updated editable description");
+            assert_eq!(
+                serialized
+                    .get("editableDescription")
+                    .and_then(Value::as_str),
+                Some(custom.as_str())
+            );
+            assert_eq!(role.description, format!("{custom}{safety}"));
+            assert_eq!(role.description.matches(safety).count(), 1);
+            assert_eq!(
+                serde_json::to_value(
+                    request
+                        .persisted_subagent_v2
+                        .as_ref()
+                        .expect("saved profile")
+                )
+                .expect("unchanged custom description"),
+                before
+            );
+        }
     }
 
     fn effort_profile(
@@ -2821,6 +3305,19 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_policy_fixed_high_round_trips_exact_role_toml() {
+        let toml = reasoning_policy_toml(fixed_reasoning(CodexReasoningEffort::High))
+            .expect("fixed high role TOML");
+        let parsed: toml::Value = toml::from_str(&toml).expect("parse fixed high role TOML");
+        assert_eq!(
+            parsed
+                .get("model_reasoning_effort")
+                .and_then(toml::Value::as_str),
+            Some("high")
+        );
+    }
+
+    #[test]
     fn reasoning_policy_fixed_max_round_trips_exact_role_toml() {
         let toml = reasoning_policy_toml(fixed_reasoning(CodexReasoningEffort::Max))
             .expect("fixed max role TOML");
@@ -2841,6 +3338,141 @@ mod tests {
         })
         .expect("disabled role TOML");
         assert!(toml.contains("model_reasoning_effort = \"none\""));
+    }
+
+    fn resolved_policy_capability(value: serde_json::Value) -> ResolvedSubagentReasoningCapability {
+        use crate::proxy::providers::codex_reasoning::{
+            resolve_subagent_reasoning_capability, CodexModelReasoningCapability,
+        };
+        let capability: CodexModelReasoningCapability =
+            serde_json::from_value(value).expect("valid capability declaration");
+        capability.validate().expect("valid upstream contract");
+        resolve_subagent_reasoning_capability(Some(&capability))
+    }
+
+    #[test]
+    fn reasoning_policy_disabled_uses_real_graded_and_boolean_disable_contracts() {
+        for declaration in [
+            serde_json::json!({
+                "supported": true,
+                "supportedEfforts": ["low", "high"],
+                "defaultEffort": "high",
+                "disableAllowed": true,
+                "upstream": {"format": "string", "parameter": "reasoning_effort", "effortMap": {"low": "low", "high": "high"}}
+            }),
+            serde_json::json!({
+                "supported": true,
+                "supportedEfforts": [],
+                "disableAllowed": true,
+                "upstream": {"format": "boolean", "parameter": "enable_thinking", "effortMap": {}}
+            }),
+        ] {
+            let capability = resolved_policy_capability(declaration);
+            assert!(capability.disable_allowed);
+            assert!(!capability
+                .codex_selectable_efforts
+                .contains(&CodexReasoningEffort::None));
+            let mut p = profile("flash", "DeepSeek-V4-Flash");
+            p.reasoning = CodexSubagentReasoningPolicy {
+                policy: ReasoningRuntimePolicy::Disabled,
+                effort: None,
+            };
+            let mut compile_request =
+                request(Some(config(SelectionPolicy::Balanced, vec![valid(p)])));
+            compile_request.catalog_models[0].reasoning = capability;
+            let output = compile_subagent_v2_profiles(&compile_request).expect(
+                "a confirmed disable contract must not require a positive None picker tier",
+            );
+            let role = output
+                .generated_roles
+                .first()
+                .expect("one disabled-reasoning role");
+            assert_eq!(role.effort, Some(CodexReasoningEffort::None));
+            let toml = render_generated_role_toml(role, "# managed").expect("disabled role TOML");
+            assert!(toml.contains("model_reasoning_effort = \"none\""));
+        }
+    }
+
+    #[test]
+    fn reasoning_policy_disabled_rejects_unknown_unsupported_and_mandatory_reasoning() {
+        for declaration in [
+            serde_json::json!({
+                "supportStatus": "unknown",
+                "controlKind": "boolean",
+                "supportedEfforts": [],
+                "disableAllowed": true,
+                "upstream": {"format": "boolean", "parameter": "enable_thinking", "effortMap": {}}
+            }),
+            serde_json::json!({
+                "supported": false,
+                "supportedEfforts": [],
+                "disableAllowed": false,
+                "upstream": {"format": "none", "parameter": "none", "effortMap": {}}
+            }),
+            serde_json::json!({
+                "supported": true,
+                "supportedEfforts": ["high"],
+                "defaultEffort": "high",
+                "disableAllowed": false,
+                "upstream": {"format": "string", "parameter": "reasoning_effort", "effortMap": {"high": "high"}}
+            }),
+        ] {
+            let capability = resolved_policy_capability(declaration);
+            assert_eq!(
+                compile_reasoning_policy(
+                    &CodexSubagentReasoningPolicy {
+                        policy: ReasoningRuntimePolicy::Disabled,
+                        effort: None
+                    },
+                    &capability,
+                    ReasoningPolicyOrigin::Declared,
+                    "flash",
+                ),
+                Err(validation(
+                    "reasoning_disable_unsupported",
+                    Some("flash"),
+                    "target model does not support disabling reasoning"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_policy_fixed_ultra_rejects_runtime_fallback_without_orchestration() {
+        let capability = resolved_policy_capability(serde_json::json!({
+            "supported": true,
+            "supportedEfforts": ["low", "high"],
+            "defaultEffort": "high",
+            "disableAllowed": false,
+            "upstream": {"format": "string", "parameter": "reasoning_effort", "effortMap": {"low": "low", "high": "high"}}
+        }));
+        assert!(!capability.codex_ultra_orchestration_enabled);
+        assert!(!capability
+            .codex_selectable_efforts
+            .contains(&CodexReasoningEffort::Ultra));
+        assert_eq!(
+            capability.effort_map.get(&CodexReasoningEffort::Ultra),
+            Some(&CodexReasoningEffort::High)
+        );
+        for origin in [
+            ReasoningPolicyOrigin::Declared,
+            ReasoningPolicyOrigin::Legacy,
+        ] {
+            assert_eq!(
+                compile_reasoning_policy(
+                    &fixed_reasoning(CodexReasoningEffort::Ultra),
+                    &capability,
+                    origin,
+                    "flash"
+                ),
+                Err(validation(
+                    "unsupported_reasoning_effort",
+                    Some("flash"),
+                    "fixed reasoning effort is not supported by the target model"
+                )),
+                "a runtime compatibility mapping cannot grant an unavailable product selector"
+            );
+        }
     }
 
     #[test]
@@ -3214,7 +3846,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_subagent_v2_restoring_description_keeps_other_override() {
+    fn codex_subagent_v2_restoring_description_keeps_override_and_canonical_boundaries() {
         let mut p = profile("flash", "DeepSeek-V4-Flash");
         p.overrides.developer_instructions = Some(s("Keep this override."));
         generated_for_profile(
@@ -3675,6 +4307,7 @@ mod tests {
             TaskStrength::Testing,
         ];
         flash.preference = Preference::Preferred;
+        flash.reasoning = fixed_reasoning(CodexReasoningEffort::High);
         let mut pro = profile("deepseek-v4-pro", "deepseek-v4-pro");
         pro.strengths = vec![
             TaskStrength::ComplexDebugging,
@@ -3686,6 +4319,7 @@ mod tests {
         pro.optimization = Optimization::Quality;
         pro.write_scope = WriteScope::ComplexChanges;
         pro.preference = Preference::Preferred;
+        pro.reasoning = fixed_reasoning(CodexReasoningEffort::High);
         assert_eq!(
             initialize_legacy_subagent_v2(),
             Ok(config(
@@ -3693,6 +4327,77 @@ mod tests {
                 vec![valid(flash), valid(pro)],
             ))
         );
+    }
+
+    #[test]
+    fn codex_subagent_v2_builtin_high_reaches_role_files_even_with_max_catalog_default() {
+        let initialized = initialize_legacy_subagent_v2().expect("built-in defaults");
+        let mut request = request(Some(initialized));
+        request.catalog_models = vec![
+            catalog("deepseek-v4-flash", true),
+            catalog("deepseek-v4-pro", true),
+        ];
+        for model in &mut request.catalog_models {
+            model.reasoning.provider_default_effort = Some(CodexReasoningEffort::Max);
+        }
+
+        let output = compile_subagent_v2_profiles(&request).expect("compile built-in defaults");
+        assert_eq!(output.generated_roles.len(), 2);
+        for role in &output.generated_roles {
+            assert_eq!(role.effort, Some(CodexReasoningEffort::High));
+            let rendered = render_generated_role_toml(role, "# managed").expect("render role");
+            let parsed: toml::Value = toml::from_str(&rendered).expect("parse role TOML");
+            assert_eq!(
+                parsed
+                    .get("model_reasoning_effort")
+                    .and_then(toml::Value::as_str),
+                Some("high"),
+                "profile {} must keep the high profile default despite the max catalog default",
+                role.model
+            );
+        }
+    }
+
+    #[test]
+    fn codex_subagent_v2_saved_policies_are_not_replaced_by_new_high_default() {
+        let policies = [
+            CodexSubagentReasoningPolicy {
+                policy: ReasoningRuntimePolicy::Delegated,
+                effort: None,
+            },
+            CodexSubagentReasoningPolicy {
+                policy: ReasoningRuntimePolicy::ModelDefault,
+                effort: None,
+            },
+            fixed_reasoning(CodexReasoningEffort::Low),
+            fixed_reasoning(CodexReasoningEffort::Max),
+            CodexSubagentReasoningPolicy {
+                policy: ReasoningRuntimePolicy::Disabled,
+                effort: None,
+            },
+        ];
+        for policy in policies {
+            let mut p = profile("deepseek-v4-flash", "DeepSeek-V4-Flash");
+            p.reasoning = policy.clone();
+            let persisted = config(SelectionPolicy::Balanced, vec![valid(p)]);
+            let serialized = serde_json::to_value(&persisted).expect("serialize saved policy");
+            let reparsed = parse_persisted_subagent_v2(&serialized).expect("read saved policy");
+            assert_eq!(reparsed, persisted);
+            let mut request = request(Some(reparsed));
+            request.catalog_models[0].reasoning.provider_default_effort =
+                Some(CodexReasoningEffort::Max);
+            let output = compile_subagent_v2_profiles(&request).expect("compile saved policy");
+            let expected_effort = match policy.policy {
+                ReasoningRuntimePolicy::Delegated => None,
+                ReasoningRuntimePolicy::ModelDefault => Some(CodexReasoningEffort::Max),
+                ReasoningRuntimePolicy::Fixed => policy.effort,
+                ReasoningRuntimePolicy::Disabled => Some(CodexReasoningEffort::None),
+            };
+            assert_eq!(
+                output.generated_roles[0].effort, expected_effort,
+                "explicit saved policy must remain authoritative"
+            );
+        }
     }
 
     #[test]

@@ -267,6 +267,26 @@ export interface StreamRetryActivity {
 export type CodexModelPickerReadiness =
   "ready" | "pending" | "error" | "mismatch" | "unverified" | "not_required";
 
+/** Counts from the current renderer observation, never a readiness certificate. */
+export interface CodexModelPickerDiagnosticsCounts {
+  pickerObserverCount: number;
+  successObserverCount: number;
+  errorObserverCount: number;
+  pendingObserverCount: number;
+  unsupportedObserverCount: number;
+  unreadableObserverCount: number;
+  nativeVisibilityUnverifiedObserverCount: number;
+  // Older native builds may omit Boolean control telemetry.
+  booleanControlUnverifiedModelCount?: number;
+  booleanControlReadyModelCount?: number;
+  effortMismatchCount: number;
+  flagMismatchCount: number;
+  missingMaxModelCount: number;
+  missingUltraModelCount: number;
+  selectedMaxModelCount: number;
+  selectedUltraModelCount: number;
+}
+
 export interface CodexGuardianStatus {
   active: boolean;
   codexRunning: boolean;
@@ -277,6 +297,9 @@ export interface CodexGuardianStatus {
   // Missing readiness evidence must never be treated as picker-ready.
   pickerReadyTargetCount?: number;
   pickerStatus?: CodexModelPickerReadiness;
+  pickerDiagnostics?: CodexModelPickerDiagnosticsCounts | null;
+  // Only allowlisted, localized reason codes are displayed by the renderer.
+  pickerVerificationIssues?: string[];
   lastEvent: string;
   message: string;
 }

@@ -89,6 +89,7 @@ type State = {
       unsubscribe: () => void;
       dispose?: () => void;
       selectorSources?: WeakMap<object, object>;
+      refreshNative?: (nativeRefreshVersion?: number) => void;
     }
   >;
 };
@@ -294,6 +295,71 @@ describe("Codex Desktop post-filter reasoning projection", () => {
         ultraEffortModelCount: 0,
       });
     } finally {
+      harness.dispose();
+    }
+  });
+
+  it("publishes one native visibility refresh without retaining structural-sharing overrides", () => {
+    const harness = createHarness();
+    let notifications = 0;
+    const unsubscribe = harness.observer.subscribe(() => {
+      notifications += 1;
+    });
+    try {
+      harness.patch();
+      const entry = harness.state.reasoningQueryCaches?.get(
+        harness.client.getQueryCache(),
+      );
+      expect(entry?.refreshNative).toEqual(expect.any(Function));
+      const before = notifications;
+      entry?.refreshNative?.(1);
+      expect(notifications).toBeGreaterThan(before);
+      expect(harness.observer.options).not.toHaveProperty("structuralSharing");
+
+      const afterFirstRefresh = notifications;
+      entry?.refreshNative?.(1);
+      expect(notifications).toBe(afterFirstRefresh);
+
+      entry?.refreshNative?.(2);
+      expect(notifications).toBeGreaterThan(afterFirstRefresh);
+      expect(harness.observer.options).not.toHaveProperty("structuralSharing");
+    } finally {
+      unsubscribe();
+      harness.dispose();
+    }
+  });
+
+  it("queues a native refresh requested while the observer is already refreshing", async () => {
+    const harness = createHarness();
+    let notifications = 0;
+    const unsubscribe = harness.observer.subscribe(() => {
+      notifications += 1;
+    });
+    try {
+      harness.patch();
+      const entry = harness.state.reasoningQueryCaches?.get(
+        harness.client.getQueryCache(),
+      );
+      expect(entry?.refreshNative).toEqual(expect.any(Function));
+      let updateCalls = 0;
+      let nested = false;
+      const originalUpdateResult = harness.observer.updateResult.bind(
+        harness.observer,
+      );
+      harness.observer.updateResult = () => {
+        updateCalls += 1;
+        if (!nested) {
+          nested = true;
+          entry?.refreshNative?.(2);
+        }
+        return originalUpdateResult();
+      };
+      entry?.refreshNative?.(1);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(updateCalls).toBeGreaterThanOrEqual(2);
+      expect(notifications).toBeGreaterThan(0);
+    } finally {
+      unsubscribe();
       harness.dispose();
     }
   });
@@ -1637,7 +1703,7 @@ return patchCodexScopedAppServerClients;`,
     }
   });
 
-  it("matches unique declared identities without borrowing a shared upstream alias", () => {
+  it("projects a canonical row once across declared aliases without borrowing a shared upstream identity", () => {
     const harness = createHarness();
     try {
       harness.state.payload = {
@@ -1690,16 +1756,13 @@ return patchCodexScopedAppServerClients;`,
           reasoningEffort,
           description: reasoningEffort,
         })),
-        ["high", "max", "ultra"].map((reasoningEffort) => ({
-          reasoningEffort,
-          description: reasoningEffort,
-        })),
         ["low", "high"].map((reasoningEffort) => ({
           reasoningEffort,
           description: reasoningEffort,
         })),
       ]);
-      expect(restored.models).toHaveLength(3);
+      // Both declared identities resolve to one canonical public route.
+      expect(restored.models).toHaveLength(2);
       expect(restored.models).not.toContain(official);
       expect(restored.models).not.toContain(unknown);
     } finally {
@@ -1779,6 +1842,66 @@ return patchCodexScopedAppServerClients;`,
       harness.dispose();
     }
   });
+
+  it("deduplicates managed public model names by the same case-insensitive identity used for lookup", () => {
+    const harness = createHarness();
+    try {
+      harness.state.payload.modelNames = [
+        " SOL-RELAY ",
+        "sol-relay",
+        "Sol-Relay",
+      ];
+      const models: Record<string, unknown>[] = [];
+      harness.api.patchModelArray(models, true, true);
+      expect(models).toHaveLength(1);
+      expect(models[0].model).toBe("SOL-RELAY");
+      expect(models[0].supportedReasoningEfforts).toEqual(
+        allEfforts.map((reasoningEffort) => ({
+          reasoningEffort,
+          description: reasoningEffort,
+        })),
+      );
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it.each([false, true])(
+    "fails closed on conflicting duplicate public catalog identities (reversed=%s)",
+    (reversed) => {
+      const harness = createHarness();
+      try {
+        harness.state.payload.models = [
+          {
+            model: "sol-relay",
+            enabled: true,
+            supported_reasoning_levels: ["high"],
+          },
+          {
+            model: "SOL-RELAY",
+            enabled: false,
+            supported_reasoning_levels: ["max"],
+          },
+        ];
+        if (reversed) harness.state.payload.models.reverse();
+        const models: Record<string, unknown>[] = [
+          {
+            model: "sol-relay",
+            supportedReasoningEfforts: [{ reasoningEffort: "ultra" }],
+          },
+        ];
+        harness.api.patchModelArray(models, true, true);
+        expect(models).toEqual([]);
+        expect(harness.api.codexModelCatalogDiagnostics()).toEqual({
+          reasoningModelCount: 0,
+          maxEffortModelCount: 0,
+          ultraEffortModelCount: 0,
+        });
+      } finally {
+        harness.dispose();
+      }
+    },
+  );
 
   it("does not treat unknown modelNames as managed catalog rows", () => {
     const harness = createHarness();

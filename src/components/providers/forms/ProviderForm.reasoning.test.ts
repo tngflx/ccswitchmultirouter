@@ -12,6 +12,42 @@ import {
 import { completeCodexReasoningEffortMap } from "./codexReasoningCapability";
 
 describe("Codex catalog reasoning capability persistence", () => {
+  it("matches backend none, control-shape and wire-contract guards", () => {
+    const capability: CodexModelReasoningCapability = {
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: ["none", "high"],
+      defaultEffort: "high",
+      disableAllowed: true,
+      upstream: {
+        format: "string",
+        parameter: "reasoning_effort",
+        effortMap: { none: "none", high: "high" },
+      },
+    };
+    expect(() =>
+      validateCodexReasoningCapabilityDraft(capability),
+    ).not.toThrow();
+    expect(() =>
+      validateCodexReasoningCapabilityDraft({
+        ...capability,
+        disableAllowed: false,
+      }),
+    ).toThrow(/requires explicit disabling/);
+    expect(() =>
+      validateCodexReasoningCapabilityDraft({
+        ...capability,
+        controlKind: "boolean",
+      }),
+    ).toThrow(/cannot advertise/);
+    expect(() =>
+      validateCodexReasoningCapabilityDraft({
+        ...capability,
+        upstream: { ...capability.upstream, parameter: "reasoning.enabled" },
+      }),
+    ).toThrow(/wire contract/);
+  });
+
   it("preserves scoped automatic evidence through Sublyx save reconciliation", () => {
     const scope = {
       transportFingerprint: "a".repeat(64),
@@ -272,6 +308,37 @@ describe("Codex catalog reasoning capability persistence", () => {
     });
   });
 
+  it.each(["xiaomi/mimo-v2.6-flash", "xiaomi/mimo-v2.6-pro"])(
+    "round-trips %s OpenRouter on/off reasoning without inventing effort levels",
+    (model) => {
+      const capability: CodexModelReasoningCapability = {
+        schemaVersion: 2,
+        supportStatus: "confirmed_supported",
+        controlKind: "boolean",
+        supportedEfforts: [],
+        disableAllowed: true,
+        upstream: {
+          format: "boolean",
+          parameter: "reasoning.enabled",
+          effortMap: {},
+        },
+        source: "detection",
+      };
+      const original = structuredClone(capability);
+      expect(() =>
+        validateCodexReasoningCapabilityDraft(capability),
+      ).not.toThrow();
+      const [saved] = normalizeCodexCatalogModelsForSave(
+        [{ model, enabled: true, reasoning: capability }],
+        { baseUrl: "https://openrouter.ai/api/v1" },
+      );
+      expect(saved.reasoning).toEqual(capability);
+      expect(saved.enabled).not.toBe(false);
+      expect(JSON.parse(JSON.stringify(saved)).reasoning).toEqual(capability);
+      expect(capability).toEqual(original);
+    },
+  );
+
   it("does not require effort mappings for boolean controls", () => {
     expect(() =>
       validateCodexReasoningCapabilityDraft({
@@ -385,7 +452,9 @@ describe("Codex catalog reasoning capability persistence", () => {
       disableAllowed: false,
       upstream: { format: "reasoning_object", parameter: "reasoning.effort" },
       supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
-      defaultEffort: "xhigh",
+      // A legacy literal Ultra default follows the same validated native
+      // target as its explicit overlay; native Max is not silently downgraded.
+      defaultEffort: "max",
       codexUltraOrchestration: { enabled: true, providerEffort: "max" },
     });
     expect(saved.reasoning?.upstream.effortMap).toEqual({
@@ -407,7 +476,7 @@ describe("Codex catalog reasoning capability persistence", () => {
       normalizeCodexCatalogModelsForSave(
         [
           {
-            model: "gpt-6.1",
+            model: "gpt-6.1-sol",
             codexUltra: { enabled: true, providerEffort: "max" },
           },
         ],

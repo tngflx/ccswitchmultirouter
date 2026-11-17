@@ -1,0 +1,12 @@
+{
+  "verified": false,
+  "scenario": "overload",
+  "desktopCdpVerified": false,
+  "stage": "readiness",
+  "failure": "runtime_fingerprint_not_observed",
+  "initialRequests": 0,
+  "continuedRequests": 0,
+  "temporaryDurableTestThread": false,
+  "existingThreadsTouched": false,
+  "verifiedAtUtc": "2026-11-14T09:39:29.200Z"
+}

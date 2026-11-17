@@ -261,18 +261,25 @@ pub fn compile_v2(
     }
 
     apply_router_model_order(plan, &mut model_catalog);
-    // Ultra is a Codex orchestration preference, never a Provider-native default.
-    if let Some(effort) =
-        supported_router_default_effort(plan, &model_catalog).filter(|effort| effort != "ultra")
-    {
-        if let Some(reasoning) = model_catalog
-            .first_mut()
-            .and_then(|model| model.capability_summary.reasoning.as_mut())
-            .and_then(Value::as_object_mut)
-        {
-            reasoning.insert("defaultEffort".to_string(), Value::String(effort));
-        }
+    // Route membership is unchanged by presentation ordering. Keep its derived
+    // model list in the same order as the canonical compiled catalog so API
+    // consumers do not see a second, pre-ordering representation.
+    let model_ranks = model_catalog
+        .iter()
+        .enumerate()
+        .map(|(rank, model)| (model.visible_model.as_str(), rank))
+        .collect::<HashMap<_, _>>();
+    for route_models in &mut route_visible_models {
+        route_models.sort_by_key(|model| {
+            model_ranks
+                .get(model.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
     }
+    // The main-model preference is projected separately through
+    // supported_router_default_effort. Keep Provider-native capabilities intact:
+    // Sub-Agent model_default must not inherit a main-model picker override.
 
     let routes = plan
         .routes
@@ -348,14 +355,40 @@ fn collect_candidates<'a>(
                     ),
                 })?;
         let entries = provider_model_entries(provider)?;
+        let ambiguous_model_error = |model: &str| CodexRoutingCompileError {
+            code: "catalog_model_ambiguous".to_string(),
+            message: format!(
+                "route {} selects ambiguous catalog model `{model}` from provider {}",
+                route_display(route, Some(provider)),
+                provider_display(provider),
+            ),
+        };
         let selected = match &route.model_selection {
             CodexModelSelection::All => None,
-            CodexModelSelection::Include { models } => Some(
-                models
-                    .iter()
-                    .map(|model| model.trim().to_ascii_lowercase())
-                    .collect::<HashSet<_>>(),
-            ),
+            CodexModelSelection::Include { models } => {
+                let mut canonical_models = HashSet::new();
+                let mut references = HashMap::new();
+                for reference in models {
+                    // Resolve against the complete inventory first. An exact
+                    // public owner, including an excluded one, must not be
+                    // reinterpreted as a sibling's upstream identity.
+                    let canonical = match lookup_catalog_model(&provider.settings_config, reference)
+                    {
+                        CatalogModelLookup::Found(row) => {
+                            model_name(row).map(|model| model.to_ascii_lowercase())
+                        }
+                        CatalogModelLookup::Missing => None,
+                        CatalogModelLookup::Ambiguous => {
+                            return Err(ambiguous_model_error(reference));
+                        }
+                    };
+                    if let Some(model) = canonical.as_ref() {
+                        canonical_models.insert(model.clone());
+                    }
+                    references.insert(reference.trim().to_ascii_lowercase(), canonical);
+                }
+                Some((canonical_models, references))
+            }
         };
         let mut found = HashSet::new();
         let mut seen_canonical = HashSet::new();
@@ -366,20 +399,28 @@ fn collect_candidates<'a>(
             };
             let canonical_model = visible_model.clone();
             let upstream_model = upstream_model(model_entry, &canonical_model);
-            let visible_key = visible_model.to_ascii_lowercase();
             let canonical_key = canonical_model.to_ascii_lowercase();
-            let upstream_key = upstream_model.to_ascii_lowercase();
-            if selected.as_ref().is_some_and(|models| {
-                !models.contains(&canonical_key) && !models.contains(&upstream_key)
-            }) {
+            if selected
+                .as_ref()
+                .is_some_and(|(models, _)| !models.contains(&canonical_key))
+            {
                 continue;
+            }
+            // Every reader must agree on the public model's owner. Choosing
+            // the first duplicate here while runtime lookup rejects it as
+            // ambiguous would project a different wire/capability contract.
+            // An excluded duplicate still owns its exact public identity, so
+            // fail closed instead of silently routing around that exclusion.
+            if matches!(
+                lookup_catalog_model(&provider.settings_config, &canonical_model),
+                CatalogModelLookup::Ambiguous
+            ) {
+                return Err(ambiguous_model_error(&canonical_model));
             }
             if !seen_canonical.insert(canonical_key.clone()) {
                 continue;
             }
-            found.insert(visible_key);
             found.insert(canonical_key);
-            found.insert(upstream_key);
             candidates.push(ModelCandidate {
                 route_index,
                 route_id: &route.id,
@@ -391,8 +432,16 @@ fn collect_candidates<'a>(
                 explicit_aliases: Vec::new(),
             });
         }
-        if let Some(selected) = selected {
-            let mut missing = selected.difference(&found).cloned().collect::<Vec<_>>();
+        if let Some((_, selected)) = selected {
+            let mut missing = selected
+                .into_iter()
+                .filter(|(_, canonical)| {
+                    canonical
+                        .as_ref()
+                        .is_none_or(|model| !found.contains(model))
+                })
+                .map(|(reference, _)| reference)
+                .collect::<Vec<_>>();
             missing.sort();
             for missing in missing {
                 warnings.push(CompilerWarning {
@@ -476,6 +525,230 @@ fn resolve_route_alias_owner(
     } else {
         Ok(first)
     }
+}
+
+/// Reconcile only Router model references from the current source inventory.
+/// The caller owns a transaction containing `providers`; never interpret a
+/// missing/malformed source catalog as empty or resurrect an emptied include.
+/// Profile inventory is deliberately retained for editing and explicit recovery.
+pub(crate) fn reconcile_router_policy_references(
+    router: &mut Provider,
+    providers: &HashMap<String, Provider>,
+) -> Result<(), CodexRoutingCompileError> {
+    use crate::codex_multirouter::schema::CodexRoutingDocument;
+    let invalid = |code: &str, message: &str| CodexRoutingCompileError {
+        code: code.to_string(),
+        message: message.to_string(),
+    };
+    let raw = router.settings_config.get("codexRouting").ok_or_else(|| {
+        invalid(
+            "subagent_policy_requires_v2_router",
+            "Sub-Agent policy requires a schema-v2 Router",
+        )
+    })?;
+    let routes_with_aliases = raw
+        .get("routes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|route| route.get("aliases").is_some())
+        .filter_map(|route| route.get("id").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect::<HashSet<_>>();
+    let document = CodexRoutingDocument::parse(raw)
+        .map_err(|error| invalid(&error.code, "Codex routing configuration is invalid"))?;
+    let CodexRoutingDocument::V2(mut plan) = document else {
+        return Err(invalid(
+            "subagent_policy_requires_v2_router",
+            "Sub-Agent policy requires a schema-v2 Router",
+        ));
+    };
+    for route in &mut plan.routes {
+        let provider = providers
+            .get(route.target_provider_id.trim())
+            .ok_or_else(|| {
+                invalid(
+                    "target_provider_missing",
+                    "Target provider does not exist; routing references were not changed",
+                )
+            })?;
+        provider_model_entries(provider)?;
+        let resolve =
+            |reference: &str| -> Result<Option<(String, String)>, CodexRoutingCompileError> {
+                match lookup_catalog_model(&provider.settings_config, reference) {
+                    CatalogModelLookup::Found(row)
+                        if row.get("enabled").and_then(Value::as_bool) != Some(false) =>
+                    {
+                        Ok(model_name(row).map(|name| {
+                            let upstream = upstream_model(row, &name);
+                            (name, upstream)
+                        }))
+                    }
+                    CatalogModelLookup::Ambiguous => Err(invalid(
+                        "catalog_model_ambiguous",
+                        "Model reference is ambiguous; routing references were not changed",
+                    )),
+                    _ => Ok(None),
+                }
+            };
+        let mut selected = HashSet::new();
+        if let CodexModelSelection::Include { models } = &mut route.model_selection {
+            let old_aliases = route.aliases.clone();
+            let mut reconciled = Vec::new();
+            for reference in models.iter() {
+                let resolved = match resolve(reference)? {
+                    Some(value) => Some(value),
+                    None => match old_aliases
+                        .iter()
+                        .find(|(alias, _)| alias.eq_ignore_ascii_case(reference.trim()))
+                    {
+                        Some((_, target)) => resolve(target)?,
+                        None => None,
+                    },
+                };
+                let Some((canonical, upstream)) = resolved else {
+                    continue;
+                };
+                if !selected.insert(canonical.to_ascii_lowercase()) {
+                    continue;
+                }
+                // Existing explicit upstream bindings stay upstream bindings.
+                reconciled.push(if reference.trim().eq_ignore_ascii_case(&upstream) {
+                    upstream
+                } else {
+                    canonical
+                });
+            }
+            *models = reconciled;
+            if models.is_empty() {
+                route.enabled = false;
+            }
+        }
+        let include = matches!(route.model_selection, CodexModelSelection::Include { .. });
+        let mut aliases = BTreeMap::new();
+        for (alias, target) in &route.aliases {
+            let Some((canonical, upstream)) = resolve(target)? else {
+                continue;
+            };
+            if alias.trim().is_empty()
+                || (include && !selected.contains(&canonical.to_ascii_lowercase()))
+            {
+                continue;
+            }
+            aliases.insert(
+                alias.trim().to_string(),
+                if target.trim().eq_ignore_ascii_case(&upstream) {
+                    upstream
+                } else {
+                    canonical
+                },
+            );
+        }
+        route.aliases = aliases;
+    }
+    let compiled = compile_v2_strict(&plan, providers)?;
+    let resolve_visible = |reference: &str| -> Option<String> {
+        let exact = compiled
+            .model_catalog
+            .iter()
+            .filter(|model| model.visible_model.eq_ignore_ascii_case(reference.trim()))
+            .collect::<Vec<_>>();
+        if exact.len() == 1 {
+            return Some(exact[0].visible_model.clone());
+        }
+        if !exact.is_empty() {
+            return None;
+        }
+        let matches = compiled
+            .model_catalog
+            .iter()
+            .filter(|model| {
+                model.canonical_model.eq_ignore_ascii_case(reference.trim())
+                    || model.upstream_model.eq_ignore_ascii_case(reference.trim())
+            })
+            .collect::<Vec<_>>();
+        (matches.len() == 1).then(|| matches[0].visible_model.clone())
+    };
+    let canonicalize = |references: &[String], limit: usize| {
+        let mut seen = HashSet::new();
+        references
+            .iter()
+            .filter_map(|reference| resolve_visible(reference))
+            .filter(|reference| seen.insert(reference.to_ascii_lowercase()))
+            .take(limit)
+            .collect::<Vec<_>>()
+    };
+    if let Some(order) = plan.extensions.get("modelOrder").and_then(Value::as_array) {
+        let references = order
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        plan.extensions.insert(
+            "modelOrder".to_string(),
+            json!(canonicalize(&references, usize::MAX)),
+        );
+    }
+    plan.spawn_agent_models = canonicalize(&plan.spawn_agent_models, 5);
+    // Preserve the latest unknown/future routing fields by replacing only the
+    // known reference projections, never round-tripping the whole typed schema.
+    let routing = router
+        .settings_config
+        .get_mut("codexRouting")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            invalid(
+                "invalid_v2_schema",
+                "Codex routing configuration is invalid",
+            )
+        })?;
+    let mut routes = serde_json::to_value(&plan.routes)
+        .map_err(|_| invalid("invalid_v2_schema", "Unable to encode routing references"))?;
+    if let Some(routes) = routes.as_array_mut() {
+        for route in routes {
+            if route
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| routes_with_aliases.contains(id))
+                && route.get("aliases").is_none()
+            {
+                route["aliases"] = json!({});
+            }
+        }
+    }
+    routing.insert("routes".to_string(), routes);
+    if let Some(order) = plan.extensions.get("modelOrder") {
+        routing.insert("modelOrder".to_string(), order.clone());
+    }
+    if routing.contains_key("spawnAgentModels") {
+        routing.insert(
+            "spawnAgentModels".to_string(),
+            json!(plan.spawn_agent_models),
+        );
+    }
+    if let Some(config) = router.settings_config.get("config").and_then(Value::as_str) {
+        let mut document = config.parse::<toml_edit::DocumentMut>().map_err(|_| {
+            invalid(
+                "invalid_codex_config",
+                "Codex configuration TOML is invalid",
+            )
+        })?;
+        if let Some(model) = document.get("model").and_then(toml_edit::Item::as_str) {
+            if let Some(resolved) =
+                resolve_visible(model).or_else(|| compiled.visible_models.first().cloned())
+            {
+                document["model"] = toml_edit::value(resolved);
+            } else {
+                document.as_table_mut().remove("model");
+            }
+            router.settings_config["config"] = json!(document.to_string());
+        }
+    }
+    if let Some(settings) = router.settings_config.as_object_mut() {
+        settings.remove("modelCatalog");
+        settings.remove("model_catalog");
+    }
+    Ok(())
 }
 
 pub fn compile_v2_strict(
@@ -568,9 +841,26 @@ fn model_display_name(model_entry: &Value, canonical_model: &str) -> String {
 }
 
 fn apply_router_model_order(plan: &CodexRoutingConfigV2, models: &mut [CompiledCodexModel]) {
-    let Some(order) = plan.extensions.get("modelOrder").and_then(Value::as_array) else {
-        return;
-    };
+    // Provider identity and group order come from the current enabled routes,
+    // not display-name suffixes or a stale flattened modelOrder snapshot. A
+    // provider targeted by several routes still owns one contiguous block.
+    let mut provider_ranks = HashMap::new();
+    for (rank, route) in plan
+        .routes
+        .iter()
+        .enumerate()
+        .filter(|(_, route)| route.enabled)
+    {
+        provider_ranks
+            .entry(route.target_provider_id.as_str())
+            .or_insert(rank);
+    }
+    let order = plan
+        .extensions
+        .get("modelOrder")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     let visible = models
         .iter()
         .map(|model| model.visible_model.to_ascii_lowercase())
@@ -631,17 +921,25 @@ fn apply_router_model_order(plan: &CodexRoutingConfigV2, models: &mut [CompiledC
                 .or_insert(rank);
         }
     }
-    if ranks.is_empty() {
-        return;
-    }
     models.sort_by_key(|model| {
-        ranks
-            .get(&model.visible_model.to_ascii_lowercase())
-            .copied()
-            .unwrap_or(usize::MAX)
+        (
+            provider_ranks
+                .get(model.target_provider_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX),
+            ranks
+                .get(&model.visible_model.to_ascii_lowercase())
+                .copied()
+                .unwrap_or(usize::MAX),
+        )
     });
-    for (index, model) in models.iter_mut().enumerate() {
-        model.sort_index = Some(index);
+    // A reset order remains implicit; do not reintroduce provider-local saved
+    // sort indexes as a competing Router order. Stable grouping alone is
+    // represented by the canonical compiled array.
+    if !ranks.is_empty() {
+        for (index, model) in models.iter_mut().enumerate() {
+            model.sort_index = Some(index);
+        }
     }
 }
 
@@ -950,6 +1248,9 @@ fn effective_reasoning_capability(
     let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_for_settings(
         &provider.settings_config,
         platform,
+        Some(crate::reasoning_capabilities::reasoning_provider_key(
+            provider,
+        )),
         canonical_model,
         library.as_ref(),
         official_models,
@@ -1354,6 +1655,8 @@ fn dependency_fingerprint(
         "modelOrder": plan.extensions.get("modelOrder"),
         "modelDisplayStyle": plan.extensions.get("modelDisplayStyle"),
         "defaultReasoningEffort": plan.extensions.get("defaultReasoningEffort"),
+        "subagentReasoningEffort": plan.extensions.get("subagentReasoningEffort")
+            .and_then(Value::as_str).unwrap_or("high"),
         "spawnAgentModels": plan.spawn_agent_models,
         "routes": plan.routes,
     });
@@ -1732,6 +2035,233 @@ mod tests {
             .map(|provider| (provider.id.clone(), provider))
             .collect::<HashMap<_, _>>();
         compile_v2(plan, &providers).expect("compile v2")
+    }
+
+    #[test]
+    fn router_duplicate_public_models_fail_closed_independent_of_row_order_or_exclusions() {
+        for reverse in [false, true] {
+            for second_excluded in [false, true] {
+                for selection in [
+                    CodexModelSelection::All,
+                    CodexModelSelection::Include {
+                        models: vec!["shared".into()],
+                    },
+                ] {
+                    let mut models = vec![
+                        json!({"model": "Shared", "upstreamModel": "wire-first"}),
+                        json!({
+                            "model": "shared", "upstreamModel": "wire-second",
+                            "enabled": !second_excluded
+                        }),
+                        json!({"model": "safe"}),
+                    ];
+                    if reverse {
+                        models.reverse();
+                    }
+                    let source = provider("source", "Source", "openai_chat", json!(models));
+                    let providers = HashMap::from([(source.id.clone(), source)]);
+                    let routing = plan(vec![route("source-route", "source", selection)]);
+                    let error = compile_v2(&routing, &providers)
+                        .err()
+                        .expect("ambiguous canonical public IDs must not choose a wire model");
+                    assert_eq!(error.code, "catalog_model_ambiguous");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn router_duplicate_public_models_do_not_block_an_unrelated_closed_selection() {
+        let source = provider(
+            "source",
+            "Source",
+            "openai_chat",
+            json!([
+                {"model": "Shared", "upstreamModel": "wire-first"},
+                {"model": "shared", "upstreamModel": "wire-second", "enabled": false},
+                {"model": "safe"}
+            ]),
+        );
+        let routing = plan(vec![route(
+            "source-route",
+            "source",
+            CodexModelSelection::Include {
+                models: vec!["safe".into()],
+            },
+        )]);
+        assert_eq!(compile(&routing, [source]).visible_models, vec!["safe"]);
+    }
+
+    #[test]
+    fn include_identity_exact_public_model_outranks_a_sibling_upstream_id() {
+        for reverse in [false, true] {
+            let mut models = vec![
+                json!({"model": "public", "upstreamModel": "wire-a", "contextWindow": 64000}),
+                json!({"model": "sibling", "upstreamModel": "public", "contextWindow": 128000}),
+            ];
+            if reverse {
+                models.reverse();
+            }
+            let source = provider("source", "Source", "openai_responses", json!(models));
+            let providers = HashMap::from([(source.id.clone(), source)]);
+            let routing = plan(vec![route(
+                "source-route",
+                "source",
+                CodexModelSelection::Include {
+                    models: vec![" PUBLIC ".into()],
+                },
+            )]);
+            let compiled = compile_v2_strict(&routing, &providers)
+                .expect("an exact public selection must have one canonical owner");
+            assert_eq!(compiled.visible_models, vec!["public"], "reverse={reverse}");
+            assert_eq!(compiled.routes[0].visible_models, vec!["public"]);
+            assert_eq!(compiled.spawn_agent_models, vec!["public"]);
+            assert_eq!(compiled.model_catalog[0].upstream_model, "wire-a");
+            assert_eq!(
+                compiled.model_catalog[0].capability_summary.context_window,
+                Some(64000)
+            );
+        }
+    }
+
+    #[test]
+    fn include_identity_disabled_public_model_cannot_select_a_sibling_upstream_id() {
+        for reverse in [false, true] {
+            let mut models = vec![
+                json!({"model": "public", "upstreamModel": "wire-a", "enabled": false}),
+                json!({"model": "sibling", "upstreamModel": "public"}),
+            ];
+            if reverse {
+                models.reverse();
+            }
+            let source = provider("source", "Source", "openai_responses", json!(models));
+            let providers = HashMap::from([(source.id.clone(), source)]);
+            let routing = plan(vec![route(
+                "source-route",
+                "source",
+                CodexModelSelection::Include {
+                    models: vec!["public".into()],
+                },
+            )]);
+            let compiled = compile_v2(&routing, &providers)
+                .expect("fact updates retain an unavailable closed selection");
+            assert!(compiled.visible_models.is_empty(), "reverse={reverse}");
+            assert!(compiled.routes[0].visible_models.is_empty());
+            assert!(compiled.spawn_agent_models.is_empty());
+            assert!(compiled.model_catalog.is_empty());
+            assert!(compiled.warnings.iter().any(|warning| {
+                warning.code == "selected_model_unavailable"
+                    && warning.route_id.as_deref() == Some("source-route")
+                    && warning.message.contains("public")
+            }));
+            assert_eq!(
+                compile_v2_strict(&routing, &providers).unwrap_err().code,
+                "selected_model_missing"
+            );
+        }
+    }
+
+    #[test]
+    fn include_identity_ambiguous_upstream_reference_fails_closed() {
+        for reverse in [false, true] {
+            for second_disabled in [false, true] {
+                let mut models = vec![
+                    json!({"model": "first", "upstreamModel": "shared-wire"}),
+                    json!({
+                        "model": "second", "upstreamModel": "shared-wire",
+                        "enabled": !second_disabled
+                    }),
+                ];
+                if reverse {
+                    models.reverse();
+                }
+                let source = provider("source", "Source", "openai_responses", json!(models));
+                let providers = HashMap::from([(source.id.clone(), source)]);
+                let routing = plan(vec![route(
+                    "source-route",
+                    "source",
+                    CodexModelSelection::Include {
+                        models: vec!["shared-wire".into()],
+                    },
+                )]);
+                let error = compile_v2(&routing, &providers)
+                    .expect_err("an ambiguous upstream reference cannot expand a closed selection");
+                assert_eq!(
+                    error.code, "catalog_model_ambiguous",
+                    "reverse={reverse}, second_disabled={second_disabled}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn include_identity_unique_upstream_reference_retains_its_canonical_row() {
+        let source = provider(
+            "source",
+            "Source",
+            "openai_responses",
+            json!([
+                {"model": "public", "upstreamModel": "wire-a"},
+                {"model": "other", "upstreamModel": "wire-b"}
+            ]),
+        );
+        let providers = HashMap::from([(source.id.clone(), source)]);
+        let routing = plan(vec![route(
+            "source-route",
+            "source",
+            CodexModelSelection::Include {
+                models: vec![" WIRE-A ".into()],
+            },
+        )]);
+        let compiled = compile_v2_strict(&routing, &providers)
+            .expect("a unique upstream binding remains supported");
+        assert_eq!(compiled.visible_models, vec!["public"]);
+        assert_eq!(compiled.model_catalog[0].canonical_model, "public");
+        assert_eq!(compiled.model_catalog[0].upstream_model, "wire-a");
+        assert!(compiled.warnings.is_empty());
+    }
+
+    #[test]
+    fn router_duplicate_wire_models_keep_distinct_public_rows_and_provider_owners() {
+        let alpha = provider(
+            "alpha",
+            "Alpha",
+            "openai_chat",
+            json!([
+                {"model": "first", "upstreamModel": "shared-wire"},
+                {"model": "second", "upstreamModel": "shared-wire"}
+            ]),
+        );
+        let beta = provider(
+            "beta",
+            "Beta",
+            "openai_chat",
+            json!([{"model": "first", "upstreamModel": "shared-wire"}]),
+        );
+        let routing = plan(vec![
+            route("alpha-route", "alpha", CodexModelSelection::All),
+            route("beta-route", "beta", CodexModelSelection::All),
+        ]);
+        let compiled = compile(&routing, [alpha, beta]);
+        assert_eq!(
+            compiled.visible_models,
+            vec!["first-alpha", "second", "first-beta"]
+        );
+        assert_eq!(
+            compiled
+                .model_catalog
+                .iter()
+                .map(|model| (
+                    model.target_provider_id.as_str(),
+                    model.upstream_model.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("alpha", "shared-wire"),
+                ("alpha", "shared-wire"),
+                ("beta", "shared-wire")
+            ]
+        );
     }
 
     #[test]
@@ -2576,6 +3106,8 @@ mod tests {
                     });
                     prepare_codex_native_responses_model(&routed, &mut request)
                         .expect("Sublyx Ultra maps on the native Responses boundary");
+                    // Adding native Max does not silently change the independent
+                    // maintained Ultra orchestration target.
                     assert_eq!(request["reasoning"]["effort"], "xhigh");
                     let mut max_request = json!({
                         "model": model_id,
@@ -2620,6 +3152,126 @@ mod tests {
         for (id, settings) in source_settings {
             assert_eq!(providers[&id].settings_config, settings);
         }
+    }
+
+    #[test]
+    fn persisted_scoped_detection_has_one_canonical_identity_across_compile_projection_and_requests(
+    ) {
+        use crate::codex_multirouter::projection::effective_settings_for_candidate_with_providers;
+        use crate::proxy::providers::{
+            codex_reasoning::{capability_fingerprint, CodexModelReasoningCapability},
+            resolve_codex_v2_routed_provider,
+        };
+        use crate::reasoning_capabilities::{
+            reasoning_evidence_scope_for_settings, resolve_codex_model_capability_with_library,
+        };
+
+        let canonical_model = "public-scoped-detection";
+        let wire_model = "wire-scoped-detection";
+        let mut source = provider(
+            "scoped-detection-source",
+            "Scoped detection source",
+            "openai_responses",
+            json!([{
+                "model": canonical_model,
+                "upstreamModel": wire_model,
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "high", "max"],
+                    "defaultEffort": "high",
+                    "disableAllowed": false,
+                    "upstream": {
+                        "format": "string", "parameter": "reasoning_effort",
+                        "effortMap": {"low": "low", "high": "high", "max": "max"}
+                    },
+                    "source": "detection", "confidence": "verified"
+                }
+            }]),
+        );
+        let evidence_scope =
+            reasoning_evidence_scope_for_settings(&source.settings_config, canonical_model)
+                .expect("current endpoint and wire identity provide the detection scope");
+        source.settings_config["modelCatalog"]["models"][0]["reasoning"]["evidenceScope"] =
+            json!(evidence_scope);
+        assert!(
+            source.settings_config["modelCatalog"]["models"][0]["reasoning"]
+                .get("providerKey")
+                .is_none()
+        );
+        let source_settings = source.settings_config.clone();
+        let request_resolution =
+            resolve_codex_model_capability_with_library(&source, canonical_model, None, None);
+        let source_capability = request_resolution
+            .capability
+            .expect("persisted endpoint/model-scoped detection remains usable");
+        assert_eq!(
+            source_capability.provider_key.as_deref(),
+            Some(source.id.as_str())
+        );
+        assert_eq!(
+            source_capability.evidence_scope,
+            Some(evidence_scope.clone())
+        );
+        assert_eq!(evidence_scope.model, wire_model);
+
+        let mut route = route("scoped-route", &source.id, CodexModelSelection::All);
+        route.label = Some("Different display/provider name".into());
+        let routing_plan = plan(vec![route]);
+        let mut router = provider("scoped-router", "Router", "openai_responses", json!([]));
+        router.settings_config["codexRouting"] =
+            serde_json::to_value(&routing_plan).expect("serialize router policy");
+        let providers = HashMap::from([(source.id.clone(), source.clone())]);
+        let compiled = compile_v2(&routing_plan, &providers).expect("compile current detection");
+        let compiled_model = &compiled.model_catalog[0];
+        let canonical_json = serde_json::to_value(&source_capability).unwrap();
+        assert_eq!(
+            compiled_model.capability_summary.reasoning.as_ref(),
+            Some(&canonical_json)
+        );
+
+        let projected = effective_settings_for_candidate_with_providers(&router, true, &providers)
+            .expect("project current target evidence");
+        let projected_capability: CodexModelReasoningCapability =
+            serde_json::from_value(projected["modelCatalog"]["models"][0]["reasoning"].clone())
+                .expect("projected evidence is canonical");
+        assert_eq!(projected_capability, source_capability);
+        let routed = resolve_codex_v2_routed_provider(
+            &router,
+            &json!({"model": compiled_model.visible_model}),
+            &providers,
+        )
+        .expect("route resolves")
+        .expect("declared target is routable");
+        assert_ne!(routed.effective_provider.id, source.id);
+        let routed_resolution = resolve_codex_model_capability_with_library(
+            &routed.effective_provider,
+            &routed.upstream_model,
+            None,
+            None,
+        );
+        let routed_capability = routed_resolution
+            .capability
+            .expect("routed evidence exists");
+        assert_eq!(routed_capability, source_capability);
+        assert_eq!(
+            request_resolution.fingerprint,
+            capability_fingerprint(&source_capability)
+        );
+        assert_eq!(
+            routed_resolution.fingerprint,
+            request_resolution.fingerprint
+        );
+        assert_eq!(
+            capability_fingerprint(&projected_capability),
+            request_resolution.fingerprint
+        );
+        assert_eq!(
+            source.settings_config, source_settings,
+            "derivation must not rewrite the source inventory"
+        );
+        assert_eq!(providers[&source.id].settings_config, source_settings);
     }
 
     #[test]
@@ -2989,6 +3641,70 @@ mod tests {
     }
 
     #[test]
+    fn dependency_fingerprint_tracks_subagent_reasoning_effort_without_changing_main_catalog() {
+        let source = provider(
+            "source",
+            "Source",
+            "openai_responses",
+            json!([{"model": "gpt-5.1", "reasoning": {
+                "supported": true,
+                "supportedEfforts": ["high", "max"],
+                "defaultEffort": "max",
+                "upstream": {"format": "responses", "parameter": "reasoning.effort"}
+            }}]),
+        );
+        let mut routing_plan = plan(vec![route(
+            "source-route",
+            "source",
+            CodexModelSelection::All,
+        )]);
+        routing_plan
+            .extensions
+            .insert("defaultReasoningEffort".into(), json!("max"));
+        routing_plan
+            .extensions
+            .insert("subagentReasoningEffort".into(), json!("high"));
+        let baseline = compile(&routing_plan, [source.clone()]);
+        let mut previous_fingerprint = baseline.dependency_fingerprint.clone();
+
+        for effort in ["max", "profile"] {
+            routing_plan
+                .extensions
+                .insert("subagentReasoningEffort".into(), json!(effort));
+            let serialized = serde_json::to_value(&routing_plan).expect("serialize routing plan");
+            let crate::codex_multirouter::schema::CodexRoutingDocument::V2(reparsed) =
+                crate::codex_multirouter::schema::CodexRoutingDocument::parse(&serialized)
+                    .expect("parse routing plan with Sub-Agent effort")
+            else {
+                panic!("expected schema v2 plan");
+            };
+            assert_eq!(
+                reparsed.extensions.get("subagentReasoningEffort"),
+                Some(&json!(effort))
+            );
+            let compiled = compile(&reparsed, [source.clone()]);
+            assert_ne!(
+                compiled.dependency_fingerprint, previous_fingerprint,
+                "a different Sub-Agent effort must invalidate the role projection"
+            );
+            assert_eq!(
+                compiled.model_catalog, baseline.model_catalog,
+                "the Sub-Agent override must not change the main model catalog"
+            );
+            assert_eq!(compiled.spawn_agent_models, baseline.spawn_agent_models);
+            assert_eq!(
+                reparsed.extensions.get("defaultReasoningEffort"),
+                Some(&json!("max"))
+            );
+            previous_fingerprint = compiled.dependency_fingerprint.clone();
+        }
+        assert_ne!(
+            previous_fingerprint, baseline.dependency_fingerprint,
+            "explicit profile opt-out must differ from the default High policy"
+        );
+    }
+
+    #[test]
     fn router_order_is_independent_and_survives_catalog_rebuilds() {
         let source = provider(
             "source",
@@ -3031,6 +3747,126 @@ mod tests {
         assert_ne!(
             compiled.dependency_fingerprint,
             compile(&ordered, [source]).dependency_fingerprint
+        );
+    }
+
+    #[test]
+    fn router_order_keeps_provider_blocks_when_custom_order_interleaves_and_inventory_grows() {
+        let alpha = provider(
+            "alpha",
+            "Alpha",
+            "openai_responses",
+            json!([
+                {"model": "a1"}, {"model": "a2"}, {"model": "a3-new"},
+                {"model": "a-excluded", "enabled": false}
+            ]),
+        );
+        let beta = provider(
+            "beta",
+            "Beta",
+            "openai_chat",
+            json!([{"model": "b1"}, {"model": "b2"}, {"model": "b3-new"}]),
+        );
+        let mut ordered = plan(vec![
+            route("alpha-route", "alpha", CodexModelSelection::All),
+            route("beta-route", "beta", CodexModelSelection::All),
+        ]);
+        ordered.extensions.insert(
+            "modelOrder".into(),
+            json!(["b1", "a2", "b2", "a1", "removed"]),
+        );
+        let compiled = compile(&ordered, [beta, alpha]);
+        assert_eq!(
+            compiled.visible_models,
+            vec!["a2", "a1", "a3-new", "b1", "b2", "b3-new"]
+        );
+        assert_eq!(
+            compiled
+                .model_catalog
+                .iter()
+                .map(|model| model.target_provider_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "alpha", "alpha", "beta", "beta", "beta"]
+        );
+        assert_eq!(
+            compiled.routes[0].visible_models,
+            vec!["a2", "a1", "a3-new"]
+        );
+        assert_eq!(
+            compiled.routes[1].visible_models,
+            vec!["b1", "b2", "b3-new"]
+        );
+        assert_eq!(
+            compiled
+                .model_catalog
+                .iter()
+                .map(|model| model.sort_index)
+                .collect::<Vec<_>>(),
+            (0..6).map(Some).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn router_order_groups_one_provider_across_routes_without_collapsing_shared_models() {
+        let alpha = provider(
+            "alpha",
+            "Alpha",
+            "openai_responses",
+            json!([{"model": "a1"}, {"model": "a2"}, {"model": "shared"}]),
+        );
+        let beta = provider(
+            "beta",
+            "Beta",
+            "openai_chat",
+            json!([{"model": "b1"}, {"model": "shared"}]),
+        );
+        let ordered = plan(vec![
+            route(
+                "alpha-first",
+                "alpha",
+                CodexModelSelection::Include {
+                    models: vec!["a1".into(), "shared".into()],
+                },
+            ),
+            route("beta-route", "beta", CodexModelSelection::All),
+            route(
+                "alpha-later",
+                "alpha",
+                CodexModelSelection::Include {
+                    models: vec!["a2".into()],
+                },
+            ),
+        ]);
+        let compiled = compile(&ordered, [alpha, beta]);
+        assert_eq!(
+            compiled.visible_models,
+            vec!["a1", "shared-alpha", "a2", "b1", "shared-beta"]
+        );
+        assert_eq!(
+            compiled
+                .model_catalog
+                .iter()
+                .map(|model| model.target_provider_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "alpha", "alpha", "beta", "beta"]
+        );
+        assert_eq!(
+            compiled.routes[0].visible_models,
+            vec!["a1", "shared-alpha"]
+        );
+        assert_eq!(compiled.routes[1].visible_models, vec!["b1", "shared-beta"]);
+        assert_eq!(compiled.routes[2].visible_models, vec!["a2"]);
+        assert!(compiled
+            .model_catalog
+            .iter()
+            .all(|model| model.sort_index.is_none()));
+        assert_eq!(
+            compiled
+                .model_catalog
+                .iter()
+                .filter(|model| model.canonical_model == "shared")
+                .count(),
+            2
         );
     }
 
@@ -3080,13 +3916,21 @@ mod tests {
             supported_router_default_effort(&plan, &compiled.model_catalog),
             Some("high".into())
         );
+        let native_reasoning = compiled.model_catalog[0]
+            .capability_summary
+            .reasoning
+            .as_ref()
+            .expect("provider capability remains available");
         assert_eq!(
-            compiled.model_catalog[0]
-                .capability_summary
-                .reasoning
-                .as_ref()
-                .unwrap()["defaultEffort"],
-            "high"
+            native_reasoning["defaultEffort"], "low",
+            "a main-model high preference must not replace the Provider-native default"
+        );
+        let native_capability: CodexModelReasoningCapability =
+            serde_json::from_value(native_reasoning.clone()).expect("native capability");
+        assert_eq!(
+            resolve_subagent_reasoning_capability(Some(&native_capability)).provider_default_effort,
+            Some(CodexReasoningEffort::Low),
+            "Sub-Agent model_default still resolves to the Provider-native low default"
         );
         plan.extensions
             .insert("defaultReasoningEffort".into(), json!("xhigh"));
@@ -3294,7 +4138,7 @@ mod tests {
     }
 
     #[test]
-    fn router_default_effort_preserves_supported_provider_native_preferences() {
+    fn router_default_effort_keeps_supported_preferences_separate_from_provider_default() {
         let source = provider(
             "source",
             "Source",
@@ -3337,8 +4181,8 @@ mod tests {
                     .reasoning
                     .as_ref()
                     .unwrap()["defaultEffort"],
-                effort,
-                "native preferences retain their existing provider-default behavior"
+                "low",
+                "supported main preferences must not rewrite the Provider-native default"
             );
         }
     }

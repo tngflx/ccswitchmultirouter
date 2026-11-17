@@ -11,6 +11,7 @@ pub mod mcp;
 pub mod model_fetch;
 pub mod model_pricing;
 pub mod omo;
+pub(crate) mod owner_remote;
 pub mod pi_prompt_files;
 pub mod preset_catalog;
 pub mod preset_registry;

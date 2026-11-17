@@ -9,6 +9,34 @@ import { useCodexConfigState } from "@/components/providers/forms/hooks/useCodex
 // 注意：initialData 必须是稳定引用（hook 的 init effect 依赖 [initialData]）。
 // 写成内联字面量会每次 re-render 产生新引用 → effect 反复 setState → 死循环 OOM。
 describe("useCodexConfigState catalog load", () => {
+  it.each(["xiaomi/mimo-v2.6-flash", "xiaomi/mimo-v2.6-pro"])(
+    "retains %s OpenRouter boolean reasoning and wire parameter on editor load",
+    (model) => {
+      const reasoning = {
+        schemaVersion: 2,
+        supportStatus: "confirmed_supported",
+        controlKind: "boolean",
+        supportedEfforts: [],
+        disableAllowed: true,
+        upstream: {
+          format: "boolean",
+          parameter: "reasoning.enabled",
+          effortMap: {},
+        },
+        source: "detection",
+      };
+      const initialData = {
+        settingsConfig: {
+          modelCatalog: { models: [{ model, enabled: true, reasoning }] },
+        },
+      };
+      const { result } = renderHook(() => useCodexConfigState({ initialData }));
+      expect(result.current.codexCatalogModels).toEqual([
+        { model, enabled: true, reasoning },
+      ]);
+    },
+  );
+
   it.each(["modelCatalog", "model_catalog"])(
     "distinguishes an explicitly empty %s from a missing catalog",
     (key) => {

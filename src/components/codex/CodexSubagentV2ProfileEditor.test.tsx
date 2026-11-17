@@ -11,13 +11,16 @@ import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { providersApi } from "@/lib/api/providers";
+import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
 import type { Provider } from "@/types";
+import { createDefaultCodexSubagentV2Config } from "@/types/codexSubagentV2";
 import type {
   CodexSubagentProfilePreview,
   CodexSubagentReasoningCapability,
   CodexSubagentV2Profile,
 } from "@/types/codexSubagentV2";
 import { CodexMultiRouterWizard } from "./CodexMultiRouterWizard";
+import { CodexSubagentProfileEditor } from "./CodexSubagentProfileEditor";
 import { CodexRouterWorkspacePage } from "./CodexRouterWorkspacePage";
 
 const deepseekReasoningCapability: CodexSubagentReasoningCapability = {
@@ -52,7 +55,9 @@ const previewFixture = {
   providerKind: "third_party" as const,
   requestedRoleName: "repository-scout",
   effectiveRoleName: "repository-scout-2",
+  editableDescription: "Read the repository and collect evidence.",
   description: "Read the repository and collect evidence.",
+  editableDeveloperInstructions: "Do not modify source files.",
   developerInstructions: "Do not modify source files.",
   nicknameCandidates: ["Scout", "Reader"],
   model: "deepseek-v4-flash",
@@ -70,7 +75,10 @@ const proPreviewFixture = {
   providerKind: "third_party" as const,
   requestedRoleName: "deep-reviewer",
   effectiveRoleName: "deep-reviewer",
+  editableDescription: "Trace cross-module failures and review risky changes.",
   description: "Trace cross-module failures and review risky changes.",
+  editableDeveloperInstructions:
+    "Investigate root causes before editing files.",
   developerInstructions: "Investigate root causes before editing files.",
   nicknameCandidates: ["Reviewer", "Debugger"],
   model: "deepseek-v4-pro",
@@ -88,7 +96,10 @@ const qwenPreviewFixture = {
   providerKind: "third_party" as const,
   requestedRoleName: "qwen3-6",
   effectiveRoleName: "qwen3-6",
+  editableDescription: "Catalog draft awaiting explicit enablement.",
   description: "Catalog draft awaiting explicit enablement.",
+  editableDeveloperInstructions:
+    "Remain disabled until the user reviews this draft.",
   developerInstructions: "Remain disabled until the user reviews this draft.",
   nicknameCandidates: ["Qwen"],
   model: "qwen3.6",
@@ -106,7 +117,9 @@ const backendDraftPreviewFixture = {
   providerKind: "third_party" as const,
   requestedRoleName: "qwen-draft",
   effectiveRoleName: "qwen-draft",
+  editableDescription: "Backend-created catalog draft.",
   description: "Backend-created catalog draft.",
+  editableDeveloperInstructions: "Keep this backend-created profile disabled.",
   developerInstructions: "Keep this backend-created profile disabled.",
   nicknameCandidates: ["Qwen Draft"],
   model: "QWEN-ＤＲＡＦＴ",
@@ -124,7 +137,10 @@ const officialDraftPreviewFixture = {
   providerKind: "official" as const,
   requestedRoleName: "official-integrator",
   effectiveRoleName: "official-integrator",
+  editableDescription: "Backend-created official catalog draft.",
   description: "Backend-created official catalog draft.",
+  editableDeveloperInstructions:
+    "Keep the official draft disabled until reviewed.",
   developerInstructions: "Keep the official draft disabled until reviewed.",
   nicknameCandidates: ["Integrator"],
   model: "gpt-5.6-sol",
@@ -190,6 +206,15 @@ const statusFixture = {
 const ipcState = vi.hoisted(() => ({
   providers: {} as Record<string, Provider>,
   previewErrors: {} as Record<string, string>,
+  instructionPreviewResponses: null as Record<
+    string,
+    {
+      editableDeveloperInstructions?: string;
+      developerInstructions: string;
+      editableDescription?: string;
+      description?: string;
+    }
+  > | null,
   statusResponse: undefined as unknown,
   reasoningCapabilities: null as Record<
     string,
@@ -548,8 +573,12 @@ vi.mock("@tauri-apps/api/core", () => ({
         if (!fixture) {
           throw new Error(`No preview fixture registered for model: ${model}`);
         }
-        const reasoning = (args?.profile as CodexSubagentV2Profile | undefined)
-          ?.reasoning;
+        const profile = args?.profile as CodexSubagentV2Profile | undefined;
+        const reasoning = profile?.reasoning;
+        const instructionPreview =
+          ipcState.instructionPreviewResponses?.[
+            profile?.questionnaire.writeScope ?? ""
+          ];
         const effort =
           reasoning?.policy === "fixed" ? reasoning.effort : undefined;
         const effectiveEffort =
@@ -564,6 +593,14 @@ vi.mock("@tauri-apps/api/core", () => ({
         );
         const response = {
           ...fixture,
+          ...(instructionPreview
+            ? {
+                editableDeveloperInstructions:
+                  instructionPreview.editableDeveloperInstructions,
+                editableDescription: instructionPreview.editableDescription,
+              }
+            : {}),
+          ...instructionPreview,
           reasoningPolicy: reasoning?.policy ?? "delegated",
           reasoningCapability: deepseekReasoningCapability,
           ...(effectiveEffort
@@ -1047,9 +1084,9 @@ async function expectPreservedValidProfileInUi(user: UserEvent) {
   expect(within(region).getByLabelText("Optimization target")).toHaveValue(
     "quality",
   );
-  expect(within(region).getByLabelText("Write scope")).toHaveValue(
-    "bounded_changes",
-  );
+  expect(
+    within(region).getByLabelText("Write scope (instruction guidance)"),
+  ).toHaveValue("bounded_changes");
   expect(within(region).getByLabelText("Model preference")).toHaveValue(
     "fallback",
   );
@@ -1150,6 +1187,7 @@ async function expectSavedSubagentV2(expected: Record<string, unknown>) {
 beforeEach(() => {
   seedPersistedPlan(true);
   ipcState.previewErrors = {};
+  ipcState.instructionPreviewResponses = null;
   ipcState.statusResponse = JSON.parse(JSON.stringify(statusFixture));
   ipcState.statusError = null;
   ipcState.reasoningCapabilities = null;
@@ -1550,6 +1588,60 @@ describe("Codex Sub-Agent V2 review round 1 regressions", () => {
     },
   );
 
+  it("only previews the open profile and loads another profile on demand", async () => {
+    const user = userEvent.setup();
+    await renderWorkspace();
+
+    const previewModels = () =>
+      vi
+        .mocked(invoke)
+        .mock.calls.filter(
+          ([command]) => command === "preview_codex_subagent_profile",
+        )
+        .map(([, args]) => (args as { model: string }).model);
+
+    await waitFor(() => expect(previewModels()).toEqual(["deepseek-v4-flash"]));
+    expect(previewModels()).not.toContain("deepseek-v4-pro");
+
+    await openProfile(user, "deepseek-v4-pro");
+    await waitFor(() =>
+      expect(previewModels()).toEqual(["deepseek-v4-flash", "deepseek-v4-pro"]),
+    );
+  });
+
+  it("editing the open profile refreshes only that profile preview", async () => {
+    const user = userEvent.setup();
+    await renderWorkspace();
+    const previewModels = () =>
+      vi
+        .mocked(invoke)
+        .mock.calls.filter(
+          ([command]) => command === "preview_codex_subagent_profile",
+        )
+        .map(([, args]) => (args as { model: string }).model);
+
+    await waitFor(() => expect(previewModels()).toEqual(["deepseek-v4-flash"]));
+    const writer = within(await openProfile(user, "deepseek-v4-pro"));
+    await waitFor(() =>
+      expect(previewModels()).toEqual(["deepseek-v4-flash", "deepseek-v4-pro"]),
+    );
+    await chooseOption(
+      user,
+      writer.getByLabelText("Model preference"),
+      "Preferred",
+    );
+    await waitFor(() =>
+      expect(previewModels()).toEqual([
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek-v4-pro",
+      ]),
+    );
+    expect(
+      previewModels().filter((model) => model === "deepseek-v4-flash"),
+    ).toHaveLength(1);
+  });
+
   it("renders preview, authoritative status, and TOML inside each profile region", async () => {
     const user = userEvent.setup();
     await renderWorkspace();
@@ -1723,6 +1815,24 @@ describe("Codex Sub-Agent V2 review round 1 regressions", () => {
 });
 
 describe("Codex Sub-Agent V2 new-plan capability defaults", () => {
+  it("defaults built-in profile templates to fixed high without sharing profile state", () => {
+    const defaults = createDefaultCodexSubagentV2Config();
+    expect(
+      Object.values(defaults.profiles).map((profile) => profile.reasoning),
+    ).toEqual([
+      { policy: "fixed", effort: "high" },
+      { policy: "fixed", effort: "high" },
+    ]);
+    defaults.profiles["deepseek-v4-flash"].reasoning = {
+      policy: "fixed",
+      effort: "low",
+    };
+    expect(
+      createDefaultCodexSubagentV2Config().profiles["deepseek-v4-flash"]
+        .reasoning,
+    ).toEqual({ policy: "fixed", effort: "high" });
+  });
+
   it("states that Workspace V2 selection is best-effort guidance and retains built-in roles", async () => {
     await renderWorkspace();
 
@@ -2720,7 +2830,291 @@ describe("Codex Sub-Agent V2 searchable Accordion workspace", () => {
   });
 });
 
+describe("Codex Sub-Agent V2 reasoning bulk controls and scroll containment", () => {
+  it("selects max only for supported profiles and waits for Save before persistence", async () => {
+    const user = userEvent.setup();
+    ipcState.reasoningCapabilities = {
+      "DEEPSEEK-V4-FLASH": deepseekReasoningCapability,
+      "deepseek-v4-pro": {
+        ...deepseekReasoningCapability,
+        codexSelectableEfforts: ["low", "high"],
+      },
+    };
+    const originalProfiles = JSON.parse(
+      JSON.stringify(
+        ipcState.providers.router.settingsConfig.codexRouting.subagentV2
+          .profiles,
+      ),
+    );
+    await mountWorkspaceFromPersistedPlan();
+    expect(
+      await screen.findByText("Max effort: 0 / 1 supported profiles"),
+    ).toBeVisible();
+    expect(
+      within(flashRegion()).getByText(
+        "New Sub-Agent selections offer only Max or High. High is preferred when supported; Max remains available when explicitly selected. If neither is supported, no fixed effort is invented. Saved legacy choices are kept read-only.",
+      ),
+    ).toBeVisible();
+    const action = screen.getByRole("button", {
+      name: "Use Max where supported",
+    });
+    await waitFor(() => expect(action).toBeEnabled());
+    expect(v2PersistenceCalls()).toHaveLength(0);
+
+    await user.click(action);
+
+    expect(
+      within(flashRegion()).getByLabelText("Model reasoning effort"),
+    ).toHaveValue("max");
+    expect(
+      screen.getByText("Max effort: 1 / 1 supported profiles"),
+    ).toBeVisible();
+    expect(action).toBeDisabled();
+    expect(
+      screen.getByText(
+        "Selected max for supported profiles (1). Save to apply.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(
+        screen.getByRole("button", { name: "Configure deepseek-v4-pro" }),
+      ).getByText("Reasoning high"),
+    ).toBeVisible();
+    expect(v2PersistenceCalls()).toHaveLength(0);
+    expect(
+      ipcState.providers.router.settingsConfig.codexRouting.subagentV2.profiles,
+    ).toEqual(originalProfiles);
+
+    await saveV2(user);
+    await waitFor(() =>
+      expect(
+        latestSavedPlan()?.settingsConfig.codexRouting.subagentV2.profiles,
+      ).toEqual({
+        ...originalProfiles,
+        "repository-scout": {
+          ...originalProfiles["repository-scout"],
+          reasoning: { policy: "fixed", effort: "max" },
+        },
+      }),
+    );
+  });
+
+  it("disables bulk max until the changed draft has a current capability response", async () => {
+    const user = userEvent.setup();
+    await mountWorkspaceFromPersistedPlan();
+    const action = screen.getByRole("button", {
+      name: "Use Max where supported",
+    });
+    await waitFor(() => expect(action).toBeEnabled());
+    let resolveCapabilities!: (
+      result: Record<string, CodexSubagentReasoningCapability>,
+    ) => void;
+    const pendingCapabilities = new Promise<
+      Record<string, CodexSubagentReasoningCapability>
+    >((resolve) => {
+      resolveCapabilities = resolve;
+    });
+    const capabilitySpy = vi
+      .spyOn(codexSubagentV2Api, "getReasoningCapabilities")
+      .mockReturnValueOnce(pendingCapabilities);
+    try {
+      await chooseOption(
+        user,
+        screen.getByLabelText("Third-party sub-agent selection policy"),
+        "third_party_first",
+      );
+      expect(action).toBeDisabled();
+      expect(
+        screen.getByText("Checking current model capabilities…"),
+      ).toBeVisible();
+      await waitFor(() => expect(capabilitySpy).toHaveBeenCalledTimes(1));
+      expect(action).toBeDisabled();
+      resolveCapabilities({
+        "DEEPSEEK-V4-FLASH": unknownReasoningCapability,
+        "DEEPSEEK-V4-PRO": unknownReasoningCapability,
+      });
+      expect(
+        await screen.findByText("No profiles currently advertise max"),
+      ).toBeVisible();
+      expect(action).toBeDisabled();
+      expect(
+        within(flashRegion()).getByLabelText("Model reasoning effort"),
+      ).toHaveValue("medium");
+      expect(v2PersistenceCalls()).toHaveLength(0);
+    } finally {
+      resolveCapabilities({});
+      capabilitySpy.mockRestore();
+    }
+  });
+
+  it("does not touch malformed or unsupported profiles when applying max", async () => {
+    const user = userEvent.setup();
+    const profiles =
+      ipcState.providers.router.settingsConfig.codexRouting.subagentV2.profiles;
+    profiles["broken-profile"] = {
+      model: "deepseek-v4-flash",
+      reasoning: null,
+    };
+    profiles["offline-writer"].reasoning = { policy: "disabled" };
+    ipcState.reasoningCapabilities = {
+      "deepseek-v4-flash": deepseekReasoningCapability,
+      "deepseek-v4-pro": unknownReasoningCapability,
+    };
+    await mountWorkspaceFromPersistedPlan();
+    expect(
+      await screen.findByText("Max effort: 0 / 1 supported profiles"),
+    ).toBeVisible();
+
+    await user.click(
+      screen.getByRole("button", { name: "Use Max where supported" }),
+    );
+
+    expect(
+      screen.getByRole("region", {
+        name: "Invalid capability configuration 1",
+      }),
+    ).toBeVisible();
+    expect(
+      within(
+        screen.getByRole("button", { name: "Configure deepseek-v4-pro" }),
+      ).getByText("Reasoning disabled"),
+    ).toBeVisible();
+    expect(
+      screen.getByText("Max effort: 1 / 1 supported profiles"),
+    ).toBeVisible();
+    expect(profiles["broken-profile"]).toEqual({
+      model: "deepseek-v4-flash",
+      reasoning: null,
+    });
+    expect(v2PersistenceCalls()).toHaveLength(0);
+  });
+
+  it("does not authorize max from preview or status fallback when the current capability map is empty", async () => {
+    ipcState.reasoningCapabilities = {};
+    await mountWorkspaceFromPersistedPlan();
+    expect(
+      await screen.findByText("No profiles currently advertise max"),
+    ).toBeVisible();
+    await waitFor(() =>
+      expect(
+        screen.queryByText("Checking current model capabilities…"),
+      ).not.toBeInTheDocument(),
+    );
+    expect(
+      screen.getByRole("button", { name: "Use Max where supported" }),
+    ).toBeDisabled();
+    expect(
+      within(flashRegion()).getByLabelText("Model reasoning effort"),
+    ).toHaveValue("medium");
+    expect(v2PersistenceCalls()).toHaveLength(0);
+  });
+
+  it("uses the latest case-insensitive capability map instead of stale max diagnostics", async () => {
+    const user = userEvent.setup();
+    await mountWorkspaceFromPersistedPlan();
+    await screen.findByText("Max effort: 0 / 2 supported profiles");
+    ipcState.reasoningCapabilities = {
+      "DEEPSEEK-V4-FLASH": {
+        ...deepseekReasoningCapability,
+        codexSelectableEfforts: ["low", "high"],
+      },
+      "DEEPSEEK-V4-PRO": unknownReasoningCapability,
+    };
+    await chooseOption(
+      user,
+      screen.getByLabelText("Third-party sub-agent selection policy"),
+      "third_party_first",
+    );
+
+    expect(
+      await screen.findByText("No profiles currently advertise max"),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Use Max where supported" }),
+    ).toBeDisabled();
+    expect(
+      within(flashRegion()).getByLabelText("Model reasoning effort"),
+    ).toHaveValue("medium");
+    expect(v2PersistenceCalls()).toHaveLength(0);
+  });
+
+  it("skips offscreen layout only for closed cards and restores the expanded editor", async () => {
+    const user = userEvent.setup();
+    await mountWorkspaceFromPersistedPlan();
+    const flashTrigger = screen.getByRole("button", {
+      name: "Configure deepseek-v4-flash",
+    });
+    const proTrigger = screen.getByRole("button", {
+      name: "Configure deepseek-v4-pro",
+    });
+    const flashCard = flashTrigger.closest<HTMLElement>("[data-profile-tone]")!;
+    const proCard = proTrigger.closest<HTMLElement>("[data-profile-tone]")!;
+    expect(flashCard.style.contentVisibility).toBe("");
+    expect(proCard.style.contentVisibility).toBe("auto");
+    expect(proCard.style.containIntrinsicBlockSize).toBe("auto 9rem");
+
+    await user.click(proTrigger);
+
+    expect(flashTrigger).toHaveAttribute("aria-expanded", "false");
+    expect(proTrigger).toHaveAttribute("aria-expanded", "true");
+    expect(flashCard.style.contentVisibility).toBe("auto");
+    expect(proCard.style.contentVisibility).toBe("");
+    expect(proCard.style.containIntrinsicBlockSize).toBe("");
+    expect(
+      screen.getByRole("region", {
+        name: "deepseek-v4-pro sub-agent configuration",
+      }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("switch", {
+        name: "Enable deepseek-v4-pro as a V2 sub-agent",
+      }),
+    ).toBeChecked();
+  });
+});
+
 describe("Codex Sub-Agent V2 shared editor accessible areas", () => {
+  it.each([
+    ["an authoritative empty projected catalog", { models: [] }],
+    [
+      "a projected catalog containing only an excluded model",
+      {
+        models: [
+          {
+            model: "deepseek-v4-flash",
+            enabled: false,
+            inputModalities: ["text", "image"],
+          },
+        ],
+      },
+    ],
+  ])(
+    "does not infer modalities from stale provider rows with %s",
+    async (_, catalog) => {
+      const selectedPlan = plan(true);
+      selectedPlan.settingsConfig.modelCatalog = {
+        models: [
+          { model: "deepseek-v4-flash", inputModalities: ["text", "image"] },
+        ],
+      };
+      render(
+        <QueryClientProvider client={createQueryClient()}>
+          <CodexSubagentProfileEditor
+            provider={selectedPlan}
+            modelCatalog={catalog}
+          />
+        </QueryClientProvider>,
+      );
+      expect(
+        within(
+          await screen.findByRole("region", {
+            name: "deepseek-v4-flash sub-agent configuration",
+          }),
+        ).getByLabelText("Input capability"),
+      ).toHaveValue("unknown");
+    },
+  );
+
   it("shows catalog-derived text-only capability before the legacy profile is resaved", async () => {
     seedPersistedPlan(true);
     ipcState.providers["third-party"].settingsConfig.modelCatalog.models[0] = {
@@ -2784,6 +3178,261 @@ describe("Codex Sub-Agent V2 shared editor accessible areas", () => {
     expect(
       within(flashBackendRegion()).getByText("Requested role name"),
     ).toBeVisible();
+  });
+});
+
+describe("Codex Sub-Agent V2 governance clarity", () => {
+  it("labels write scope as instruction guidance rather than an enforced sandbox", async () => {
+    await renderWorkspace();
+    const scope = within(flashRegion()).getByRole("combobox", {
+      name: "Write scope (instruction guidance)",
+    });
+    expect(scope).toHaveAccessibleDescription(
+      "Behavioral guidance only; this does not enforce a sandbox or lock tools.",
+    );
+    expect(scope).toHaveValue("read_only");
+    expect(scope).toBeEnabled();
+    expect(
+      vi
+        .mocked(invoke)
+        .mock.calls.some(([command]) => command === "update_codex_subagent_v2"),
+    ).toBe(false);
+  });
+
+  it("explains baseline-preserving custom role text without granting lifecycle or release authority", async () => {
+    const user = userEvent.setup();
+    await renderWorkspace();
+    const instructions = within(await openAdvancedFields(user)).getByLabelText(
+      "Developer instructions",
+    );
+    expect(instructions).toHaveAccessibleDescription(
+      "Custom text supplements the baseline; it cannot replace scope, ownership, or repository instructions. These are behavioral rules, not an execution sandbox.",
+    );
+    expect(
+      screen.getByText(
+        "Delegating a task does not authorize image or release builds, shared-process or container lifecycle changes, installation, publishing, or release. These actions require explicit user authorization and compliance with repository rules. Scoped test compilation is allowed only within authorized work.",
+      ),
+    ).toBeVisible();
+    await user.clear(instructions);
+    await user.type(instructions, "Collect evidence for the parent agent.");
+    await saveV2(user);
+    const savedProfile =
+      latestSavedPlan()?.settingsConfig.codexRouting.subagentV2.profiles[
+        "repository-scout"
+      ];
+    expect(savedProfile.overrides.developerInstructions).toBe(
+      "Collect evidence for the parent agent.",
+    );
+    expect(savedProfile.questionnaire.writeScope).toBe("read_only");
+    expect(savedProfile).not.toHaveProperty("sandbox");
+    expect(savedProfile).not.toHaveProperty("toolPermissions");
+  });
+
+  it("separates inherited host permissions and high/max effort from operational access", async () => {
+    await renderWorkspace();
+    const boundary = screen.getByRole("region", {
+      name: "Guidance and execution permissions",
+    });
+    expect(
+      within(boundary).getByText(
+        "Custom role text supplements generated baseline instructions; it cannot replace baseline scope, ownership, or repository restrictions.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(boundary).getByText(
+        "Host sandbox and tool permissions are inherited separately. High/Max changes reasoning effort, not operational access. Instruction guidance does not guarantee model compliance.",
+      ),
+    ).toBeVisible();
+    expect(
+      vi
+        .mocked(invoke)
+        .mock.calls.some(
+          ([command]) =>
+            command === "update_codex_subagent_v2" ||
+            command === "update_codex_subagent_policy",
+        ),
+    ).toBe(false);
+  });
+});
+
+describe("Codex Sub-Agent V2 editable instruction projection", () => {
+  const editableProse = "Inspect the assigned sources.";
+  const customProse = `${editableProse} Return concrete evidence.`;
+  const oldEffectiveInstructions = `${editableProse}\nOLD_READ_ONLY_SCOPE\nCANONICAL_BASELINE_GOVERNANCE`;
+  const currentEffectiveInstructions = `${customProse}\nCURRENT_BOUNDED_SCOPE\nCANONICAL_BASELINE_GOVERNANCE`;
+
+  async function mountAutomaticInstructionProfile() {
+    seedPersistedPlan(true);
+    delete ipcState.providers.router.settingsConfig.codexRouting.subagentV2
+      .profiles["repository-scout"].overrides.developerInstructions;
+    await mountWorkspaceFromPersistedPlan();
+  }
+
+  it("keeps generated policy out of automatic instruction edits and persisted overrides", async () => {
+    ipcState.instructionPreviewResponses = {
+      read_only: {
+        editableDeveloperInstructions: editableProse,
+        developerInstructions: oldEffectiveInstructions,
+      },
+    };
+    const user = userEvent.setup();
+    await mountAutomaticInstructionProfile();
+    const instructions = within(await openAdvancedFields(user)).getByLabelText(
+      "Developer instructions",
+    );
+    await waitFor(() => expect(instructions).toHaveValue(editableProse));
+    await user.type(instructions, " Return concrete evidence.");
+    await saveV2(user);
+    const saved =
+      latestSavedPlan()?.settingsConfig.codexRouting.subagentV2.profiles[
+        "repository-scout"
+      ];
+    expect(saved.overrides.developerInstructions).toBe(customProse);
+    expect(saved.overrides.developerInstructions).not.toContain(
+      "OLD_READ_ONLY_SCOPE",
+    );
+    expect(saved.overrides.developerInstructions).not.toContain(
+      "CANONICAL_BASELINE_GOVERNANCE",
+    );
+    expect(saved).not.toHaveProperty("editableDeveloperInstructions");
+  });
+
+  it("keeps raw prose clean when a scope change refreshes the full canonical boundary", async () => {
+    ipcState.instructionPreviewResponses = {
+      read_only: {
+        editableDeveloperInstructions: editableProse,
+        developerInstructions: oldEffectiveInstructions,
+      },
+      bounded_changes: {
+        editableDeveloperInstructions: customProse,
+        developerInstructions: currentEffectiveInstructions,
+      },
+    };
+    const user = userEvent.setup();
+    await mountAutomaticInstructionProfile();
+    const region = await openAdvancedFields(user);
+    const instructions = within(region).getByLabelText(
+      "Developer instructions",
+    );
+    await waitFor(() => expect(instructions).toHaveValue(editableProse));
+    await user.type(instructions, " Return concrete evidence.");
+    await user.selectOptions(
+      within(region).getByLabelText("Write scope (instruction guidance)"),
+      "bounded_changes",
+    );
+    await waitFor(() =>
+      expect(
+        vi.mocked(invoke).mock.calls.some(([command, args]) => {
+          const profile = (
+            args as { profile?: CodexSubagentV2Profile } | undefined
+          )?.profile;
+          return (
+            command === "preview_codex_subagent_profile" &&
+            profile?.questionnaire.writeScope === "bounded_changes" &&
+            profile?.overrides?.developerInstructions === customProse
+          );
+        }),
+      ).toBe(true),
+    );
+    await openGeneratedOutput(user);
+    const effective = await within(flashBackendRegion()).findByText(
+      /CURRENT_BOUNDED_SCOPE/,
+    );
+    expect(effective.textContent).toBe(currentEffectiveInstructions);
+    expect(
+      effective.textContent?.match(/CANONICAL_BASELINE_GOVERNANCE/g),
+    ).toHaveLength(1);
+    expect(effective).not.toHaveTextContent("OLD_READ_ONLY_SCOPE");
+    expect(instructions).toHaveValue(customProse);
+    await saveV2(user);
+    const saved =
+      latestSavedPlan()?.settingsConfig.codexRouting.subagentV2.profiles[
+        "repository-scout"
+      ];
+    expect(saved.questionnaire.writeScope).toBe("bounded_changes");
+    expect(saved.overrides.developerInstructions).toBe(customProse);
+    expect(saved.overrides.developerInstructions).not.toContain(
+      "CANONICAL_BASELINE_GOVERNANCE",
+    );
+  });
+
+  it("keeps generated modality guards out of automatic description edits and persisted overrides", async () => {
+    const editableDescription = "A role for repository analysis.";
+    const customDescription = `${editableDescription} Return actionable findings.`;
+    ipcState.instructionPreviewResponses = {
+      read_only: {
+        editableDeveloperInstructions: editableProse,
+        developerInstructions: oldEffectiveInstructions,
+        editableDescription,
+        description: `${editableDescription} CANONICAL_MODALITY_GUARD`,
+      },
+    };
+    const user = userEvent.setup();
+    await mountAutomaticInstructionProfile();
+    const description = within(await openAdvancedFields(user)).getByLabelText(
+      "Role description",
+    );
+    await waitFor(() => expect(description).toHaveValue(editableDescription));
+    await user.type(description, " Return actionable findings.");
+    ipcState.instructionPreviewResponses.read_only = {
+      ...ipcState.instructionPreviewResponses.read_only,
+      editableDescription: customDescription,
+      description: `${customDescription} CANONICAL_MODALITY_GUARD`,
+    };
+    await waitFor(() =>
+      expect(
+        vi.mocked(invoke).mock.calls.some(([command, args]) => {
+          const profile = (
+            args as { profile?: CodexSubagentV2Profile } | undefined
+          )?.profile;
+          return (
+            command === "preview_codex_subagent_profile" &&
+            profile?.overrides?.description === customDescription
+          );
+        }),
+      ).toBe(true),
+    );
+    await openGeneratedOutput(user);
+    const fullDescription = await within(flashBackendRegion()).findByText(
+      /CANONICAL_MODALITY_GUARD/,
+    );
+    expect(fullDescription.textContent).toBe(
+      `${customDescription} CANONICAL_MODALITY_GUARD`,
+    );
+    expect(
+      fullDescription.textContent?.match(/CANONICAL_MODALITY_GUARD/g),
+    ).toHaveLength(1);
+    await saveV2(user);
+    const saved =
+      latestSavedPlan()?.settingsConfig.codexRouting.subagentV2.profiles[
+        "repository-scout"
+      ];
+    expect(saved.overrides.description).toBe(customDescription);
+    expect(saved.overrides.description).not.toContain(
+      "CANONICAL_MODALITY_GUARD",
+    );
+    expect(saved).not.toHaveProperty("editableDescription");
+  });
+
+  it("does not copy full policy when an older preview omits editable instructions", async () => {
+    ipcState.instructionPreviewResponses = {
+      read_only: { developerInstructions: oldEffectiveInstructions },
+    };
+    const user = userEvent.setup();
+    await mountAutomaticInstructionProfile();
+    const instructions = within(await openAdvancedFields(user)).getByLabelText(
+      "Developer instructions",
+    );
+    await openGeneratedOutput(user);
+    await within(flashBackendRegion()).findByText(/OLD_READ_ONLY_SCOPE/);
+    expect(instructions).toHaveValue("");
+    await user.type(instructions, "User-authored role prose.");
+    await saveV2(user);
+    expect(
+      latestSavedPlan()?.settingsConfig.codexRouting.subagentV2.profiles[
+        "repository-scout"
+      ].overrides.developerInstructions,
+    ).toBe("User-authored role prose.");
   });
 });
 
@@ -3201,7 +3850,7 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
       },
     ],
     [
-      "Write scope",
+      "Write scope (instruction guidance)",
       "read_only",
       "bounded_changes",
       {
@@ -3212,7 +3861,7 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
       },
     ],
     [
-      "Write scope",
+      "Write scope (instruction guidance)",
       "bounded_changes",
       "read_only",
       {
@@ -3223,7 +3872,7 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
       },
     ],
     [
-      "Write scope",
+      "Write scope (instruction guidance)",
       "complex_changes",
       "read_only",
       {
@@ -3377,6 +4026,204 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
     },
   );
 
+  it("offers only Max/High for new choices while preserving a saved legacy effort", async () => {
+    const user = userEvent.setup();
+    const firstMount = await renderWorkspace();
+    const flash = within(flashRegion());
+    expect(
+      flash.getByRole("button", { name: "Advanced fields" }),
+    ).toHaveAttribute("aria-expanded", "false");
+    const effort = flash.getByLabelText("Model reasoning effort");
+    expect(effort).toHaveValue("medium");
+    expect(
+      within(effort)
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("value")),
+    ).toEqual(["medium", "high", "max"]);
+    expect(
+      within(effort).getByRole("option", {
+        name: "medium (saved; read-only; not offered for new selections)",
+      }),
+    ).toBeDisabled();
+    await chooseOption(user, effort, "high");
+    await saveV2(user);
+    await waitFor(() =>
+      expect(
+        latestSavedPlan()?.settingsConfig.codexRouting.subagentV2.profiles[
+          "repository-scout"
+        ].reasoning,
+      ).toEqual({ policy: "fixed", effort: "high" }),
+    );
+    firstMount.unmount();
+    await mountWorkspaceFromPersistedPlan();
+    expect(
+      within(flashRegion()).getByLabelText("Model reasoning effort"),
+    ).toHaveValue("high");
+  });
+
+  it("defaults a newly Fixed Sub-Agent to requested High while retaining saved explicit Max", async () => {
+    // New-profile defaults do not turn an omitted global override into High.
+    // This scenario deliberately starts with an explicitly saved High override.
+    ipcState.providers.router.settingsConfig.codexRouting.subagentReasoningEffort =
+      "high";
+    const profiles =
+      ipcState.providers.router.settingsConfig.codexRouting.subagentV2.profiles;
+    profiles["repository-scout"].reasoning = { policy: "delegated" };
+    profiles["offline-writer"].reasoning = { policy: "fixed", effort: "max" };
+    const user = userEvent.setup();
+    const firstMount = await mountWorkspaceFromPersistedPlan();
+    const flash = within(flashRegion());
+    expect(
+      screen.getByRole("combobox", { name: "All Sub-Agent reasoning effort" }),
+    ).toHaveValue("high");
+    await chooseOption(user, flash.getByLabelText("Reasoning policy"), "fixed");
+    expect(flash.getByLabelText("Model reasoning effort")).toHaveValue("high");
+    await saveV2(user);
+    expect(
+      latestSavedPlan()?.settingsConfig.codexRouting.subagentV2.profiles[
+        "repository-scout"
+      ].reasoning,
+    ).toEqual({ policy: "fixed", effort: "high" });
+    expect(
+      latestSavedPlan()?.settingsConfig.codexRouting.subagentV2.profiles[
+        "offline-writer"
+      ].reasoning,
+    ).toEqual({ policy: "fixed", effort: "max" });
+    expect(
+      screen.getByRole("button", { name: "Use Max where supported" }),
+    ).toBeInTheDocument();
+
+    await user.selectOptions(
+      flash.getByLabelText("Model reasoning effort"),
+      "max",
+    );
+    await saveV2(user);
+    firstMount.unmount();
+    await mountWorkspaceFromPersistedPlan();
+    expect(
+      within(flashRegion()).getByLabelText("Model reasoning effort"),
+    ).toHaveValue("max");
+    expect(
+      screen.getByRole("combobox", { name: "All Sub-Agent reasoning effort" }),
+    ).toHaveValue("high");
+  });
+
+  it.each([
+    [["low", "high", "max"], "high"],
+    [["minimal", "low", "medium", "max"], "max"],
+    [["minimal", "max"], "max"],
+    [["high", "xhigh"], "high"],
+    [["max", "xhigh"], "max"],
+  ] as const)(
+    "prefers High, then Max without inventing legacy efforts (%s)",
+    async (selectable, expected) => {
+      ipcState.providers.router.settingsConfig.codexRouting.subagentV2.profiles[
+        "repository-scout"
+      ].reasoning = { policy: "delegated" };
+      ipcState.reasoningCapabilities = {
+        "deepseek-v4-flash": {
+          ...deepseekReasoningCapability,
+          codexSelectableEfforts: [...selectable],
+          providerDefaultEffort: "max",
+        },
+      };
+      const user = userEvent.setup();
+      await mountWorkspaceFromPersistedPlan();
+      const flash = within(flashRegion());
+      await chooseOption(
+        user,
+        flash.getByLabelText("Reasoning policy"),
+        "fixed",
+      );
+      expect(flash.getByLabelText("Model reasoning effort")).toHaveValue(
+        expected,
+      );
+      await saveV2(user);
+      await waitFor(() =>
+        expect(
+          latestSavedPlan()?.settingsConfig.codexRouting.subagentV2.profiles[
+            "repository-scout"
+          ].reasoning,
+        ).toEqual({ policy: "fixed", effort: expected }),
+      );
+    },
+  );
+
+  it("does not invent a fixed effort when the model supports neither Max nor High", async () => {
+    ipcState.providers.router.settingsConfig.codexRouting.subagentV2.profiles[
+      "repository-scout"
+    ].reasoning = { policy: "delegated" };
+    ipcState.reasoningCapabilities = {
+      "deepseek-v4-flash": {
+        ...deepseekReasoningCapability,
+        codexSelectableEfforts: ["minimal", "low", "medium", "xhigh"],
+        providerDefaultEffort: "medium",
+      },
+    };
+    const user = userEvent.setup();
+    await mountWorkspaceFromPersistedPlan();
+    const flash = within(await openProfile(user, "deepseek-v4-flash"));
+    const policy = flash.getByLabelText("Reasoning policy");
+    expect(policy).toHaveValue("delegated");
+    expect(
+      within(policy).queryByRole("option", { name: "Fixed effort" }),
+    ).not.toBeInTheDocument();
+    expect(flash.getByLabelText("Model reasoning effort")).toBeDisabled();
+    expect(
+      flash.getByText(
+        "New Sub-Agent selections offer only Max or High. High is preferred when supported; Max remains available when explicitly selected. If neither is supported, no fixed effort is invented. Saved legacy choices are kept read-only.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("warns that delegated effort can inherit expensive parent settings without changing the saved policy", async () => {
+    ipcState.providers.router.settingsConfig.codexRouting.subagentV2.profiles[
+      "repository-scout"
+    ].reasoning = { policy: "delegated" };
+    const user = userEvent.setup();
+    await mountWorkspaceFromPersistedPlan();
+    const flash = within(await openProfile(user, "deepseek-v4-flash"));
+    expect(
+      flash.getByText(
+        "Delegated effort may inherit the parent’s max or Ultra setting and increase usage. Choose Fixed effort to control this sub-agent’s cost.",
+      ),
+    ).toBeVisible();
+    expect(flash.getByLabelText("Reasoning policy")).toHaveValue("delegated");
+    expect(
+      ipcState.providers.router.settingsConfig.codexRouting.subagentV2.profiles[
+        "repository-scout"
+      ].reasoning,
+    ).toEqual({ policy: "delegated" });
+  });
+
+  it("keeps an existing fixed effort visible when capability data no longer offers it", async () => {
+    ipcState.providers.router.settingsConfig.codexRouting.subagentV2.profiles[
+      "repository-scout"
+    ].reasoning = { policy: "fixed", effort: "ultra" };
+    ipcState.reasoningCapabilities = {
+      "deepseek-v4-flash": {
+        ...deepseekReasoningCapability,
+        codexSelectableEfforts: ["low", "high"],
+      },
+    };
+    const user = userEvent.setup();
+    await mountWorkspaceFromPersistedPlan();
+    const flash = within(await openProfile(user, "deepseek-v4-flash"));
+    expect(flash.getByLabelText("Reasoning policy")).toHaveValue("fixed");
+    const effort = flash.getByLabelText("Model reasoning effort");
+    expect(effort).toHaveValue("ultra");
+    expect(
+      within(effort).getByRole("option", {
+        name: "ultra (saved; read-only; not offered for new selections)",
+      }),
+    ).toBeDisabled();
+    expect(
+      ipcState.providers.router.settingsConfig.codexRouting.subagentV2.profiles[
+        "repository-scout"
+      ].reasoning,
+    ).toEqual({ policy: "fixed", effort: "ultra" });
+  });
+
   it("edits model reasoning effort and preserves all other overrides", async () => {
     const user = userEvent.setup();
     await renderWorkspace();
@@ -3445,9 +4292,22 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
     expect(
       flash.getByText("Capability source:sublyx (confirmed)"),
     ).toBeInTheDocument();
+    const effort = flash.getByLabelText("Model reasoning effort");
+    expect(effort).toHaveValue("medium");
     expect(
-      within(flash.getByLabelText("Model reasoning effort"))
+      within(effort)
         .getAllByRole("option")
+        .map((option) => option.getAttribute("value")),
+    ).toEqual(["medium", "high", "max"]);
+    expect(
+      within(effort).getByRole("option", {
+        name: "medium (saved; read-only; not offered for new selections)",
+      }),
+    ).toBeDisabled();
+    expect(
+      within(effort)
+        .getAllByRole("option")
+        .filter((option) => !(option as HTMLOptionElement).disabled)
         .map((option) => option.getAttribute("value")),
     ).toEqual(["high", "max"]);
   });
@@ -3514,7 +4374,7 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
       within(effort)
         .getAllByRole("option")
         .map((option) => option.getAttribute("value")),
-    ).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    ).toEqual(["medium", "high", "max"]);
   });
 
   it("passes the latest Provider-derived catalog to every V2 diagnostic", async () => {
@@ -3600,8 +4460,10 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
       ["Nickname candidates", "Audit, Reviewer"],
     ]) {
       const input = region.getByLabelText(label);
+      // This setup establishes complete values; restoration, not per-key
+      // editing, is under test. Paste still exercises the normal input path.
       await user.clear(input);
-      await user.type(input, value);
+      await user.paste(value);
     }
     await chooseOption(
       user,
@@ -3714,7 +4576,8 @@ describe("Codex Sub-Agent V2 persisted interactions", () => {
     );
     const roleName = within(flashRegion()).getByLabelText("Role name");
     await workspace.user.clear(roleName);
-    await workspace.user.type(roleName, "workspace-scout");
+    // Persistence/remount is under test, not one render per typed character.
+    await workspace.user.paste("workspace-scout");
     await saveV2(workspace.user);
     await waitFor(() => expect(v2PersistenceCalls()).toHaveLength(1));
     workspace.unmount();
@@ -3867,6 +4730,8 @@ describe("Codex Sub-Agent V2 preview visible output", () => {
         (model: Record<string, unknown>) => ({
           ...model,
           providerName: "DeepSeek",
+          // Diagnostic-only route provenance; source catalogs remain unchanged.
+          targetProviderId: provider().id,
           apiFormatSource: "provider",
         }),
       ),
@@ -3896,6 +4761,13 @@ describe("Codex Sub-Agent V2 preview visible output", () => {
         },
       }),
     );
+    expect(
+      ipcState.providers[provider().id].settingsConfig.modelCatalog.models,
+    ).toEqual([
+      { model: "deepseek-v4-flash", contextWindow: 128000 },
+      { model: "deepseek-v4-pro", contextWindow: 128000 },
+    ]);
+    expect(selectedPlan.settingsConfig).not.toHaveProperty("modelCatalog");
   });
 });
 
@@ -3969,6 +4841,8 @@ describe("Codex Sub-Agent V2 authoritative status visible output", () => {
         (model: Record<string, unknown>) => ({
           ...model,
           providerName: "DeepSeek",
+          // Diagnostic-only route provenance; source catalogs remain unchanged.
+          targetProviderId: provider().id,
           apiFormatSource: "provider",
         }),
       ),
@@ -3985,5 +4859,12 @@ describe("Codex Sub-Agent V2 authoritative status visible output", () => {
         },
       ),
     );
+    expect(
+      ipcState.providers[provider().id].settingsConfig.modelCatalog.models,
+    ).toEqual([
+      { model: "deepseek-v4-flash", contextWindow: 128000 },
+      { model: "deepseek-v4-pro", contextWindow: 128000 },
+    ]);
+    expect(selectedPlan.settingsConfig).not.toHaveProperty("modelCatalog");
   });
 });

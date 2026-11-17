@@ -1,5 +1,6 @@
 import type {
   CodexReasoningEvidenceScope,
+  CodexReasoningEffort,
   CodexModelReasoningCapability,
 } from "@/types";
 
@@ -22,11 +23,12 @@ export type CodexSubagentOptimization = "speed" | "balanced" | "quality";
 export type CodexSubagentWriteScope =
   "read_only" | "bounded_changes" | "complex_changes";
 export type CodexSubagentPreference = "preferred" | "eligible" | "fallback";
-export type CodexSubagentExplicitReasoningEffort =
-  "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export type CodexSubagentExplicitReasoningEffort = Exclude<
+  CodexReasoningEffort,
+  "none"
+>;
 
-export type CodexSubagentReasoningEffort =
-  "none" | CodexSubagentExplicitReasoningEffort;
+export type CodexSubagentReasoningEffort = CodexReasoningEffort;
 
 export interface CodexSubagentReasoningCapability {
   supportKind: "effort_levels" | "boolean_only" | "unsupported" | "unknown";
@@ -106,6 +108,17 @@ export interface CodexModelReasoningDetectionReasoning {
   /** 服务端默认是否开启推理。 */
   defaultEnabled?: boolean | null;
   supportsMaxTokens?: boolean;
+  /** Validated provider control shape, preserved from the backend snapshot. */
+  controlKind?: CodexReasoningControlKind | null;
+  /** Explicit negative evidence must not become confirmed support on adoption. */
+  supportStatus?: CodexReasoningSupportStatus | null;
+  /** Product-level Ultra contract, separate from provider-native efforts/maps. */
+  codexUltraOrchestration?:
+    CodexModelReasoningCapability["codexUltraOrchestration"] | null;
+  /** Provider-native disable contract, independent from mandatory. */
+  disableAllowed?: boolean | null;
+  /** Validated provider-native effort mapping; never contains synthetic Ultra. */
+  effortMap?: Record<string, string> | null;
   upstreamFormat?:
     CodexModelReasoningCapability["upstream"]["format"] | "object" | null;
   upstreamParameter?:
@@ -254,7 +267,13 @@ export interface CodexSubagentProfilePreview {
   providerKind: "official" | "third_party";
   requestedRoleName: string;
   effectiveRoleName: string;
+  /** Raw role prose for editing; excludes derived modality guidance. */
+  editableDescription: string;
+  /** Full generated description for read-only inspection. */
   description: string;
+  /** Raw role prose for editing; excludes derived scope/governance/modality guidance. */
+  editableDeveloperInstructions: string;
+  /** Full effective instructions for read-only inspection and TOML projection. */
   developerInstructions: string;
   nicknameCandidates: string[];
   model: string;
@@ -351,7 +370,7 @@ export const DEFAULT_CODEX_SUBAGENT_V2: CodexSubagentV2Config = {
         writeScope: "read_only",
         preference: "preferred",
       },
-      reasoning: { policy: "delegated" },
+      reasoning: { policy: "fixed", effort: "high" },
     },
     "deepseek-v4-pro": {
       model: "deepseek-v4-pro",
@@ -368,7 +387,7 @@ export const DEFAULT_CODEX_SUBAGENT_V2: CodexSubagentV2Config = {
         writeScope: "complex_changes",
         preference: "preferred",
       },
-      reasoning: { policy: "delegated" },
+      reasoning: { policy: "fixed", effort: "high" },
     },
   },
 };

@@ -593,6 +593,30 @@ pub(crate) fn provider_uses_common_config(
     }
 }
 
+/// Read only the current user-owned Common Config root effort. This is an
+/// ephemeral projection receipt, not persisted Provider state and not inferred
+/// from an effective/live value (which may equal a stale Router pin).
+pub(crate) fn codex_common_reasoning_effort(
+    db: &Database,
+    provider: &Provider,
+) -> Result<Option<crate::proxy::providers::codex_reasoning::CodexReasoningEffort>, AppError> {
+    let snippet = db.get_config_snippet(AppType::Codex.as_str())?;
+    if !provider_uses_common_config(&AppType::Codex, provider, snippet.as_deref()) {
+        return Ok(None);
+    }
+    let Some(document) = snippet
+        .as_deref()
+        .and_then(|snippet| parse_codex_common_config_snippet(snippet).ok())
+    else {
+        // The existing Common Config merge ignores malformed TOML as well.
+        return Ok(None);
+    };
+    Ok(document
+        .get("model_reasoning_effort")
+        .and_then(Item::as_str)
+        .and_then(|effort| effort.trim().parse().ok()))
+}
+
 fn codex_provider_has_enabled_routing(provider: &Provider) -> bool {
     let Some(routing) = provider.settings_config.get("codexRouting") else {
         return false;

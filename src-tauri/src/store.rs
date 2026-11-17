@@ -19,6 +19,7 @@ const PROTOCOL_PROBE_RECEIPT_TTL: Duration = Duration::from_secs(10 * 60);
 pub struct AppState {
     pub db: Arc<Database>,
     pub proxy_service: ProxyService,
+    pub(crate) owner_remote: Arc<crate::services::owner_remote::OwnerRemoteService>,
     pub usage_cache: Arc<UsageCache>,
     protocol_probes_in_flight: Arc<Mutex<HashSet<String>>>,
     protocol_probe_released: Arc<tokio::sync::Notify>,
@@ -216,8 +217,12 @@ impl AppState {
         let proxy_service = ProxyService::new(db.clone());
 
         Self {
-            db,
+            db: db.clone(),
             proxy_service,
+            owner_remote: Arc::new(crate::services::owner_remote::OwnerRemoteService::new(
+                crate::config::get_app_config_dir().join("owner-remote"),
+                db.clone(),
+            )),
             usage_cache: Arc::new(UsageCache::new()),
             protocol_probes_in_flight: Arc::new(Mutex::new(HashSet::new())),
             protocol_probe_released: Arc::new(tokio::sync::Notify::new()),

@@ -2,10 +2,19 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Provider,
+  CodexSubagentVersion,
+  CodexSubagentReasoningEffort,
   UniversalProvider,
   UniversalProvidersMap,
 } from "@/types";
 import type { AppId } from "./types";
+import type { CodexSubagentV2MutationProvider } from "./codexSubagentV2";
+
+export interface CodexSubagentPolicyPatch {
+  subagentVersion?: CodexSubagentVersion;
+  subagentReasoningEffort?: CodexSubagentReasoningEffort;
+  spawnAgentModels?: string[];
+}
 
 export interface ProviderSortUpdate {
   id: string;
@@ -237,6 +246,13 @@ export function normalizeProvidersPayload(
 }
 
 export const providersApi = {
+  async updateCodexSubagentPolicy(
+    providerId: string,
+    patch: CodexSubagentPolicyPatch,
+  ): Promise<CodexSubagentV2MutationProvider> {
+    // No whole-provider fallback: older native builds must fail closed.
+    return invoke("update_codex_subagent_policy", { providerId, patch });
+  },
   async bindCodexPresetReasoningEvidence(
     settingsConfig: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {

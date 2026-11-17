@@ -1030,7 +1030,7 @@ fn apply_min_output_tokens(
     }
 }
 
-fn apply_reasoning_options(
+pub(crate) fn apply_reasoning_options(
     result: &mut Value,
     body: &Value,
     config: Option<&CodexChatReasoningConfig>,
@@ -1074,6 +1074,11 @@ fn apply_reasoning_options(
             }
             "enable_thinking" if emit_switch => {
                 result["enable_thinking"] = json!(reasoning_enabled);
+            }
+            "reasoning.enabled" if emit_switch => {
+                // Binary-only OpenRouter models accept this switch, not a
+                // synthetic low/high effort or a vendor-specific thinking key.
+                result["reasoning"] = json!({ "enabled": reasoning_enabled });
             }
             "chat_template_kwargs.enable_thinking" if emit_switch => {
                 set_chat_template_enable_thinking(result, reasoning_enabled);
@@ -1210,6 +1215,9 @@ fn set_chat_template_enable_thinking(result: &mut Value, enabled: bool) {
 }
 
 fn reasoning_requested(body: &Value) -> Option<bool> {
+    if let Some(enabled) = body.pointer("/reasoning/enabled").and_then(Value::as_bool) {
+        return Some(enabled);
+    }
     if let Some(effort) = body.pointer("/reasoning/effort").and_then(|v| v.as_str()) {
         return Some(!matches!(
             effort.trim().to_ascii_lowercase().as_str(),
@@ -4681,6 +4689,80 @@ mod tests {
 
         assert_eq!(result["thinking"]["type"], "enabled");
         assert!(result.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openrouter_wire_boolean_uses_nested_enabled_without_inventing_efforts() {
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(false),
+            thinking_param: Some("reasoning.enabled".to_string()),
+            effort_param: Some("none".to_string()),
+            effort_value_mode: Some("capability||".to_string()),
+            min_output_tokens: None,
+            default_output_tokens: None,
+            output_format: Some("reasoning".to_string()),
+            disable_contract: true,
+        };
+        for model in ["xiaomi/mimo-v2.6-flash", "xiaomi/mimo-v2.6-pro"] {
+            for (reasoning, enabled) in [
+                (json!({"effort": "high"}), true),
+                (json!({"effort": "none"}), false),
+                (json!({"enabled": true}), true),
+                (json!({"enabled": false}), false),
+                (Value::Null, false),
+            ] {
+                let input = json!({"model": model, "input": "hello", "reasoning": reasoning});
+                let result = responses_to_chat_completions_with_reasoning(input, Some(&config))
+                    .expect("boolean capability conversion");
+                assert_eq!(result["reasoning"], json!({"enabled": enabled}), "{model}");
+                for forbidden in [
+                    "reasoning_effort",
+                    "reasoning.enabled",
+                    "thinking",
+                    "enable_thinking",
+                ] {
+                    assert!(result.get(forbidden).is_none(), "{model}: {forbidden}");
+                }
+            }
+            let result = responses_to_chat_completions_with_reasoning(
+                json!({"model": model, "input": "hello"}),
+                Some(&config),
+            )
+            .unwrap();
+            assert!(
+                result.get("reasoning").is_none(),
+                "no request must retain upstream defaults"
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_wire_boolean_without_disable_contract_keeps_mandatory_reasoning() {
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(false),
+            thinking_param: Some("reasoning.enabled".to_string()),
+            effort_param: Some("none".to_string()),
+            effort_value_mode: Some("capability||".to_string()),
+            min_output_tokens: None,
+            default_output_tokens: None,
+            output_format: None,
+            disable_contract: false,
+        };
+        for reasoning in [
+            json!({"effort": "none"}),
+            json!({"enabled": false}),
+            Value::Null,
+        ] {
+            let result = responses_to_chat_completions_with_reasoning(
+                json!({"model": "budget-model", "input": "hello", "reasoning": reasoning}),
+                Some(&config),
+            )
+            .unwrap();
+            assert!(result.get("reasoning").is_none());
+            assert!(result.get("thinking").is_none());
+        }
     }
 
     #[test]

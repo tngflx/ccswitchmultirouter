@@ -103,6 +103,24 @@ test("manual launch starts a fresh restart budget after a dead owned session", a
   assert.deepEqual(f.actions, []);
 });
 
+test("manual launch ignores a stale PID reused by a foreign protected process", async () => {
+  const f = fixture();
+  const prepared = await prepareDevSessionLaunch({
+    ...f.options,
+    queryProcesses: () => [
+      {
+        ProcessId: f.session.supervisorPid,
+        Name: "svchost.exe",
+        ExecutablePath: null,
+        CommandLine: null,
+        CreationDate: "2026-10-22T00:00:00.000Z",
+      },
+    ],
+  });
+  assert.equal(prepared.previous, f.session);
+  assert.deepEqual(f.actions, []);
+});
+
 function independentWatchdogFixture() {
   const f = fixture();
   const watchdog = {

@@ -117,7 +117,7 @@ describe("Codex reasoning evidence scope preservation", () => {
     "user_confirmed_detection",
     "user",
   ] as const)(
-    "preserves %s scope while respecting Sublyx GPT native max evidence",
+    "preserves %s scope without treating unverified automatic metadata as a manual Max override",
     (source) => {
       const row: CodexCatalogModel = {
         model: "Visible catalog alias",
@@ -128,20 +128,48 @@ describe("Codex reasoning evidence scope preservation", () => {
       const normalized = normalizeCodexCatalogReasoningForProvider(row, {
         baseUrl: "https://api.sublyx.org/v1",
       });
+      const isManualOverride =
+        source === "user" || source === "user_confirmed_detection";
       expect(normalized.reasoning?.supportedEfforts).toEqual(
-        source === "provider"
-          ? ["low", "medium", "high", "xhigh", "max"]
-          : ["high", "max"],
+        isManualOverride ? ["high", "max"] : ["low", "medium", "high", "xhigh"],
       );
       const [saved] = roundtripModels([normalized]);
       expect(saved.reasoning?.evidenceScope).toEqual(scope);
       expect(saved.reasoning?.source).toBe(source);
       expect(saved.reasoning?.providerKey).toBe(
-        source === "provider" ? "sublyx" : undefined,
+        isManualOverride ? undefined : "sublyx",
       );
       expect(row).toEqual(before);
     },
   );
+
+  it("preserves verified current-wire High/Max evidence without widening it to the maintained family levels", () => {
+    const reasoning: CodexModelReasoningCapability = {
+      ...capability("detection"),
+      confidence: "verified",
+    };
+    const row: CodexCatalogModel = {
+      model: "Visible catalog alias",
+      upstreamModel: scope.model,
+      reasoning,
+    };
+    const before = structuredClone(row);
+    const normalized = normalizeCodexCatalogReasoningForProvider(row, {
+      baseUrl: "https://api.sublyx.org/v1",
+    });
+    expect(normalized.reasoning?.supportedEfforts).toEqual(["high", "max"]);
+    expect(normalized.reasoning?.defaultEffort).toBe("max");
+    expect(normalized.reasoning?.upstream.effortMap).toEqual({
+      high: "high",
+      max: "max",
+    });
+    const [saved] = roundtripModels([normalized]);
+    expect(saved.reasoning?.supportedEfforts).toEqual(["high", "max"]);
+    expect(saved.reasoning?.source).toBe("detection");
+    expect(saved.reasoning?.confidence).toBe("verified");
+    expect(saved.reasoning?.evidenceScope).toEqual(scope);
+    expect(row).toEqual(before);
+  });
 
   it("does not rewrite known-other transport evidence from stale Sublyx provenance", () => {
     const reasoning = capability("sublyx");

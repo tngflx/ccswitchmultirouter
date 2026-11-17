@@ -32,7 +32,7 @@
 ### 采集当前机器状态
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/codex-oauth-diagnostics.ps1 -LogTailLines 1200 -SinceMinutes 60
+node scripts/codex-oauth-diagnostics.mjs --log-tail-lines 1200 --since-minutes 60
 ```
 
 输出位于 `scripts/logs/codex-oauth-diagnostics/<timestamp>`，默认包含：
@@ -73,7 +73,7 @@ mock 模式会提供这些环境变量给外部命令：
 
 ## 判断顺序
 
-1. 先用 `codex-oauth-diagnostics.ps1` 确认报错时 route 是否命中官方 OAuth、第三方 route 或本地模型。
+1. 先用 `codex-oauth-diagnostics.mjs` 确认报错时 route 是否命中官方 OAuth、第三方 route 或本地模型。
 2. 若命中官方 OAuth，检查同 trace 的 `service_tier`、request shape、Responses-Lite fallback 和上游 status。
 3. 用 `codex-request-shape-compare.mjs` 比对原生与接管路径的 `service_tier`、`prompt_cache_key`、`client_metadata`、`originator`、account id 和 session/window id。
 4. 只有字段级 diff 无法解释问题，或线上原生与接管行为仍稳定分叉时，再进入 Fiddler/mitmproxy 抓包。

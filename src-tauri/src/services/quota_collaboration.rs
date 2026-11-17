@@ -3,7 +3,7 @@
 //! 这里只保存脱敏账号 scope、官方窗口百分比及 token 聚合值。不得把 OAuth
 //! 凭据、prompt、原始 JSONL、工作目录或请求内容带入协作数据。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use chrono::{Local, TimeZone};
 use rusqlite::params;
@@ -83,7 +83,7 @@ pub fn record_codex_quota_snapshot(
     let captured_at = quota.queried_at.unwrap_or_else(now_seconds);
     let report = build_report(db, account_scope, &config, quota, captured_at)?;
     save_report(db, &report)?;
-    update_window_cache(std::slice::from_ref(&report));
+    update_window_cache(&load_reports(db, &report.account_scope)?);
     Ok(())
 }
 
@@ -100,6 +100,8 @@ pub fn get_overview(db: &Database) -> Result<QuotaCollaborationOverview, AppErro
             ..Default::default()
         });
     };
+    let reports = load_reports(db, &scope)?;
+    let projection = fresh_window_projection(&reports, now_seconds());
     Ok(QuotaCollaborationOverview {
         configured: app_settings
             .webdav_sync
@@ -112,9 +114,9 @@ pub fn get_overview(db: &Database) -> Result<QuotaCollaborationOverview, AppErro
         mode: config.mode,
         enforce_remaining_percent: config.enforce_remaining_percent,
         device_id: config.device_id,
-        reports: load_reports(db, &scope)?,
-        latest_window_utilization: config.latest_window_utilization,
-        latest_window_captured_at: config.latest_window_captured_at,
+        reports,
+        latest_window_utilization: projection.utilization,
+        latest_window_captured_at: projection.captured_at,
         warning: None,
     })
 }
@@ -172,18 +174,47 @@ pub async fn sync_reports(db: &Database) -> Result<QuotaCollaborationOverview, A
     get_overview(db)
 }
 
-/// 代理热路径的约束判定。陈旧或缺失的快照不会造成误拦截。
-pub fn codex_enforcement_reason(now: i64) -> Option<String> {
+/// 代理热路径的约束判定。陈旧、未来或缺失的快照不会造成误拦截。
+///
+/// Per-device database reports are authoritative. Settings retain only a
+/// compatibility projection, never permission to block the current account.
+pub fn codex_enforcement_reason(db: &Database, now: i64) -> Option<String> {
     let config = settings::get_settings().quota_collaboration;
-    codex_enforcement_reason_inner(now, &config)
+    if config.mode != "enforce" {
+        return None;
+    }
+    let scope = codex_account_scope();
+    codex_enforcement_reason_for_scope(db, now, &config, scope.as_deref())
+}
+
+fn codex_enforcement_reason_for_scope(
+    db: &Database,
+    now: i64,
+    config: &QuotaCollaborationSettings,
+    scope: Option<&str>,
+) -> Option<String> {
+    if config.mode != "enforce" {
+        return None;
+    }
+    let reports = load_reports(db, scope?).ok()?;
+    let projection = fresh_window_projection(&reports, now);
+    let projected_config = QuotaCollaborationSettings {
+        latest_window_utilization: projection.utilization,
+        latest_window_captured_at: projection.captured_at,
+        ..config.clone()
+    };
+    codex_enforcement_reason_inner(now, &projected_config)
 }
 
 /// `codex_enforcement_reason` 的纯函数版本，接受显式配置，便于测试。
 ///
 /// 不访问全局状态，不会写入磁盘。
 fn codex_enforcement_reason_inner(now: i64, config: &QuotaCollaborationSettings) -> Option<String> {
+    let captured_at = config.latest_window_captured_at?;
     if config.mode != "enforce"
-        || now.saturating_sub(config.latest_window_captured_at?) > FRESH_WINDOW_MAX_AGE_SECS
+        || captured_at <= 0
+        || captured_at > now
+        || now.saturating_sub(captured_at) > FRESH_WINDOW_MAX_AGE_SECS
     {
         return None;
     }
@@ -270,8 +301,8 @@ fn save_report(db: &Database, report: &QuotaDeviceReport) -> Result<(), AppError
          ON CONFLICT(account_scope, device_id) DO UPDATE SET
              device_name = excluded.device_name,
              captured_at = excluded.captured_at,
-             payload = CASE WHEN excluded.captured_at >= quota_collaboration_reports.captured_at
-                 THEN excluded.payload ELSE quota_collaboration_reports.payload END",
+             payload = excluded.payload
+             WHERE excluded.captured_at >= quota_collaboration_reports.captured_at",
         params![
             report.account_scope,
             report.device_id,
@@ -323,21 +354,47 @@ fn is_valid_report(report: &QuotaDeviceReport, scope: &str) -> bool {
         })
 }
 
-/// 合并所有设备官方窗口时采用最高利用率，避免从旧设备低估总额度消耗。
-fn update_window_cache(reports: &[QuotaDeviceReport]) {
-    let mut values = HashMap::<String, f64>::new();
+#[derive(Debug, Default, PartialEq)]
+struct WindowProjection {
+    utilization: BTreeMap<String, f64>,
+    captured_at: Option<i64>,
+}
+
+/// Build the enforcement/display projection from reports that are fresh for
+/// this request. Each device expires independently; a fresh low-utilization
+/// device must not extend the lifetime of another device's stale high value.
+fn fresh_window_projection(reports: &[QuotaDeviceReport], now: i64) -> WindowProjection {
+    let mut projection = WindowProjection::default();
     for report in reports {
+        if report.captured_at <= 0
+            || report.captured_at > now
+            || now.saturating_sub(report.captured_at) > FRESH_WINDOW_MAX_AGE_SECS
+        {
+            continue;
+        }
         for tier in &report.tiers {
-            values
+            projection
+                .utilization
                 .entry(tier.name.clone())
                 .and_modify(|value| *value = value.max(tier.utilization))
                 .or_insert(tier.utilization);
         }
+        projection.captured_at = Some(
+            projection
+                .captured_at
+                .map_or(report.captured_at, |latest| latest.max(report.captured_at)),
+        );
     }
-    let latest = reports.iter().map(|report| report.captured_at).max();
+    projection
+}
+
+/// Keep legacy settings readers compatible with the current derived display
+/// projection. Enforcement always re-reads the scoped canonical reports.
+fn update_window_cache(reports: &[QuotaDeviceReport]) {
+    let projection = fresh_window_projection(reports, now_seconds());
     let _ = settings::mutate_quota_collaboration(|config| {
-        config.latest_window_utilization = values.into_iter().collect();
-        config.latest_window_captured_at = latest;
+        config.latest_window_utilization = projection.utilization;
+        config.latest_window_captured_at = projection.captured_at;
     });
 }
 
@@ -836,11 +893,21 @@ mod tests {
             seven_day_requests: 7,
             tiers: vec![],
         };
-        merge_remote_reports(&db, &[stale]).expect("merge");
+        save_report(&db, &stale).expect("save stale");
         let loaded = load_reports(&db, "scope").expect("load");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].device_name, "existing");
         assert_eq!(loaded[0].captured_at, 300);
+        let conn = db.conn.lock().expect("lock test db");
+        let metadata: (String, i64) = conn
+            .query_row(
+                "SELECT device_name, captured_at FROM quota_collaboration_reports
+                 WHERE account_scope = 'scope' AND device_id = 'dev'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load metadata");
+        assert_eq!(metadata, ("existing".into(), 300));
     }
 
     // 4. Range Calculation
@@ -935,12 +1002,172 @@ mod tests {
                 ],
             },
         ];
-        update_window_cache(&reports);
+        let projection = fresh_window_projection(&reports, 200);
+        assert_eq!(projection.utilization.get("five_hour"), Some(&60.0));
+        assert_eq!(projection.utilization.get("seven_day"), Some(&20.0));
+        assert_eq!(projection.captured_at, Some(200));
     }
 
     #[test]
     fn window_cache_empty_reports_does_not_panic() {
-        update_window_cache(&[]);
+        assert_eq!(
+            fresh_window_projection(&[], 1000),
+            WindowProjection::default()
+        );
+    }
+
+    fn window_report(device: &str, captured_at: i64, utilization: f64) -> QuotaDeviceReport {
+        QuotaDeviceReport {
+            protocol_version: 1,
+            account_scope: "scope".into(),
+            device_id: device.into(),
+            device_name: device.into(),
+            captured_at,
+            today_tokens: 0,
+            seven_day_tokens: 0,
+            today_requests: 0,
+            seven_day_requests: 0,
+            tiers: vec![QuotaWindowSnapshot {
+                name: "five_hour".into(),
+                utilization,
+                resets_at: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn window_projection_ignores_stale_and_future_reports_per_device() {
+        let now = 10_000;
+        let reports = [
+            window_report("offline", now - FRESH_WINDOW_MAX_AGE_SECS - 1, 95.0),
+            window_report("clock-skewed", now + 1, 99.0),
+            window_report("current", now, 20.0),
+        ];
+        let projection = fresh_window_projection(&reports, now);
+        assert_eq!(projection.utilization.get("five_hour"), Some(&20.0));
+        assert_eq!(projection.captured_at, Some(now));
+    }
+
+    #[test]
+    fn window_projection_expires_each_device_without_needing_another_sync() {
+        let now = 10_000;
+        let reports = [
+            window_report("about-to-expire", now - FRESH_WINDOW_MAX_AGE_SECS, 95.0),
+            window_report("still-current", now - 300, 20.0),
+        ];
+        assert_eq!(
+            fresh_window_projection(&reports, now)
+                .utilization
+                .get("five_hour"),
+            Some(&95.0),
+        );
+        let expired = fresh_window_projection(&reports, now + 1);
+        assert_eq!(expired.utilization.get("five_hour"), Some(&20.0));
+        assert_eq!(expired.captured_at, Some(now - 300));
+    }
+
+    #[test]
+    fn window_projection_with_no_current_reports_has_no_window_timestamp() {
+        let now = 10_000;
+        for reports in [
+            vec![window_report(
+                "expired",
+                now - FRESH_WINDOW_MAX_AGE_SECS - 1,
+                95.0,
+            )],
+            vec![window_report("future", now + 1, 95.0)],
+            Vec::new(),
+        ] {
+            assert_eq!(
+                fresh_window_projection(&reports, now),
+                WindowProjection::default(),
+            );
+        }
+    }
+
+    #[test]
+    fn enforcement_recomputes_each_device_expiration_without_another_sync() {
+        let db = Database::memory().expect("create mem db");
+        let now = 10_000;
+        save_report(
+            &db,
+            &window_report("expires-first", now - FRESH_WINDOW_MAX_AGE_SECS, 95.0),
+        )
+        .expect("save expiring report");
+        save_report(&db, &window_report("current", now, 20.0)).expect("save current report");
+        let config = QuotaCollaborationSettings {
+            mode: "enforce".into(),
+            enforce_remaining_percent: 20.0,
+            latest_window_utilization: BTreeMap::from([("five_hour".into(), 95.0)]),
+            latest_window_captured_at: Some(now),
+            ..Default::default()
+        };
+        assert!(codex_enforcement_reason_for_scope(&db, now, &config, Some("scope")).is_some());
+        assert_eq!(
+            codex_enforcement_reason_for_scope(&db, now + 1, &config, Some("scope")),
+            None,
+        );
+        let reports = load_reports(&db, "scope").expect("load canonical reports");
+        assert_eq!(
+            reports.len(),
+            2,
+            "expired reports remain available for device history"
+        );
+        assert_eq!(
+            fresh_window_projection(&reports, now + 1)
+                .utilization
+                .get("five_hour"),
+            Some(&20.0),
+        );
+    }
+
+    #[test]
+    fn enforcement_uses_only_current_account_reports_not_the_settings_projection() {
+        let db = Database::memory().expect("create mem db");
+        let now = 10_000;
+        save_report(&db, &window_report("current", now, 95.0)).expect("save current report");
+        let config = QuotaCollaborationSettings {
+            mode: "enforce".into(),
+            enforce_remaining_percent: 20.0,
+            latest_window_utilization: BTreeMap::from([("five_hour".into(), 99.0)]),
+            latest_window_captured_at: Some(now),
+            ..Default::default()
+        };
+        assert_eq!(
+            codex_enforcement_reason_for_scope(&db, now, &config, None),
+            None
+        );
+        assert_eq!(
+            codex_enforcement_reason_for_scope(&db, now, &config, Some("other-account")),
+            None,
+        );
+        let stale_low_projection = QuotaCollaborationSettings {
+            latest_window_utilization: BTreeMap::from([("five_hour".into(), 1.0)]),
+            ..config
+        };
+        assert!(
+            codex_enforcement_reason_for_scope(&db, now, &stale_low_projection, Some("scope"),)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn future_dated_reports_cannot_authorize_enforcement() {
+        let db = Database::memory().expect("create mem db");
+        let now = 10_000;
+        save_report(&db, &window_report("future", now + 1, 95.0)).expect("save future report");
+        let config = QuotaCollaborationSettings {
+            mode: "enforce".into(),
+            enforce_remaining_percent: 20.0,
+            latest_window_utilization: BTreeMap::from([("five_hour".into(), 95.0)]),
+            latest_window_captured_at: Some(now + 1),
+            ..Default::default()
+        };
+        assert_eq!(codex_enforcement_reason_inner(now, &config), None);
+        assert_eq!(
+            codex_enforcement_reason_for_scope(&db, now, &config, Some("scope")),
+            None,
+        );
     }
 
     // 6. Enforcement Strategy

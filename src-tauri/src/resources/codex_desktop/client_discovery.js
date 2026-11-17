@@ -1,6 +1,9 @@
 // RpcStub/RpcPromise proxies manufacture a function for every property name.
 // Discover capabilities from declared descriptors so a stub cannot impersonate
 // the app-server client or cause arbitrary RPC calls during object discovery.
+const CODEX_RENDERER_FIBER_SCAN_LIMIT = 30000;
+const CODEX_RENDERER_SCOPE_OBJECT_SCAN_LIMIT = 100000;
+const CODEX_RENDERER_SCOPE_FIELD_SCAN_LIMIT = 500000;
 const codexClientDiscoveryIsCurrent = () =>
   typeof installationIsCurrent !== "function" || installationIsCurrent();
 const codexDeclaredMethod = (value, name) => {
@@ -142,10 +145,11 @@ const codexAppServerClientHasCurrentOwner = (client) => {
     tracked = true;
     if (
       state.scopedAppServerScopeScanComplete === true &&
-      codexRendererScopeSnapshotIsCurrent()
+      codexRendererScopeSnapshotRootsAreCurrent()
     ) {
       const owners = state.scopedAppServerClientOwners;
-      if (!(owners instanceof Map)) return true;
+      if (!(owners instanceof Map))
+        return codexRendererScopeSnapshotIsCurrent();
       for (const current of owners.get(client) || []) {
         try {
           if (current()) return true;
@@ -342,7 +346,51 @@ const codexScopedRegistryInstance = (value) => {
     return false;
   }
 };
-const codexScopeQueryClient = (scope) => {
+// Current numeric Desktop retained nodes expose a narrowly generated forwarding
+// triple. Only this exact, descriptor-safe shape may execute a node getter:
+// each own accessor is configurable/enumerable, has no setter, and forwards
+// from the same captured `n` binding to the matching property. Unknown or
+// malformed accessors remain untrusted and are never invoked.
+const codexForwardedNodeQueryClientDescriptor = (node) => {
+  if (!node || !["object", "function"].includes(typeof node)) return null;
+  try {
+    const fields = ["parent", "queryClient", "value"];
+    const descriptors = fields.map((key) =>
+      Object.getOwnPropertyDescriptor(node, key),
+    );
+    if (
+      descriptors.some(
+        (descriptor, index) =>
+          !descriptor ||
+          "value" in descriptor ||
+          descriptor.configurable !== true ||
+          descriptor.enumerable !== true ||
+          typeof descriptor.get !== "function" ||
+          descriptor.set != null ||
+          Function.prototype.toString
+            .call(descriptor.get)
+            .replace(/\s/g, "") !== `()=>n.${fields[index]}`,
+      )
+    )
+      return null;
+    return descriptors[1];
+  } catch {
+    return null;
+  }
+};
+const codexForwardedNodeQueryClient = (node) => {
+  const clientDescriptor = codexForwardedNodeQueryClientDescriptor(node);
+  if (!clientDescriptor) return null;
+  try {
+    const client = Function.prototype.call.call(clientDescriptor.get, node);
+    return client && ["object", "function"].includes(typeof client)
+      ? client
+      : null;
+  } catch {
+    return null;
+  }
+};
+const codexScopeQueryClient = (scope, knownNodeClient) => {
   if (!codexDeclaredDependencyScope(scope)) return null;
   const node = Object.getOwnPropertyDescriptor(scope, "node")?.value;
   if (node && (typeof node === "object" || typeof node === "function")) {
@@ -350,7 +398,12 @@ const codexScopeQueryClient = (scope) => {
     // Read that initialized own data slot directly: a missing/null client is
     // not permission to invoke an unrelated getter or borrow a stale owner.
     const client = Object.getOwnPropertyDescriptor(node, "queryClient");
-    if (client) return "value" in client ? client.value || null : null;
+    if (client) {
+      if ("value" in client) return client.value || null;
+      if (!codexForwardedNodeQueryClientDescriptor(node)) return null;
+      if (knownNodeClient !== undefined) return knownNodeClient;
+      return codexForwardedNodeQueryClient(node);
+    }
   }
   // Older validated dependency scopes expose the client only through their
   // own queryClient field/accessor. Preserve that established compatibility
@@ -665,6 +718,66 @@ const codexRendererScopeRootIdentities = () => {
   }
   return roots.filter(Boolean);
 };
+// FiberRoot identity is not a commit identity: its two alternate Fibers may
+// contain different dependency providers without producing a DOM childList.
+// Only the exact saved committed Fiber can authorize a retained inventory.
+// Snapshot seed/edge values as well so a reused raw Fiber cannot retroactively
+// change what an asynchronous traversal claims to have inspected.
+const codexRendererFiberSnapshotFields = [
+  "child",
+  "sibling",
+  "memoizedState",
+  "dependencies",
+  "memoizedProps",
+  "pendingProps",
+];
+const codexRendererFiberSnapshot = (fiber) => {
+  const snapshot = {
+    fiber,
+    valid: Boolean(fiber && typeof fiber === "object"),
+  };
+  for (const key of codexRendererFiberSnapshotFields) {
+    const field = Object.getOwnPropertyDescriptor(fiber || {}, key);
+    if (field && !("value" in field)) snapshot.valid = false;
+    snapshot[key] = field?.value;
+  }
+  return snapshot;
+};
+const codexRendererFiberSnapshotIsCurrent = (snapshot) => {
+  if (!snapshot.valid) return false;
+  return codexRendererFiberSnapshotFields.every((key) => {
+    const field = Object.getOwnPropertyDescriptor(snapshot.fiber, key);
+    return (!field || "value" in field) && field?.value === snapshot[key];
+  });
+};
+const codexRendererScopeRootSnapshotMatches = (previous, current) => {
+  // Raw legacy/synthetic snapshots remain usable only for exact identity.
+  if (previous === current) return true;
+  if (!previous || !current) return false;
+  const previousFiber = Object.getOwnPropertyDescriptor(
+    previous,
+    "fiber",
+  )?.value;
+  if (previousFiber !== current) return false;
+  const previousRoot = Object.getOwnPropertyDescriptor(previous, "root")?.value;
+  const currentRoot =
+    Object.getOwnPropertyDescriptor(current, "stateNode")?.value || current;
+  if (previousRoot && previousRoot !== currentRoot) return false;
+  const savedTraversal = Object.getOwnPropertyDescriptor(previous, "valid");
+  // Earlier injected wrappers did not save traversal fields. They still must
+  // match the exact Fiber; never require a synthetic Fiber to have stateNode.
+  return !savedTraversal || codexRendererFiberSnapshotIsCurrent(previous);
+};
+const codexRendererScopeRootSnapshot = (fiber) => ({
+  root:
+    Object.getOwnPropertyDescriptor(fiber || {}, "stateNode")?.value || fiber,
+  ...codexRendererFiberSnapshot(fiber),
+});
+const codexRendererMutationGeneration = () =>
+  Number.isSafeInteger(state.reactMutationGeneration) &&
+  state.reactMutationGeneration >= 0
+    ? state.reactMutationGeneration
+    : 0;
 const codexRendererScopeRootsMatchCurrent = (
   roots = codexRendererScopeRootIdentities(),
 ) => {
@@ -673,7 +786,9 @@ const codexRendererScopeRootsMatchCurrent = (
     Array.isArray(previous) &&
     roots.length > 0 &&
     roots.length === previous.length &&
-    roots.every((identity, index) => identity === previous[index]) &&
+    roots.every((identity, index) =>
+      codexRendererScopeRootSnapshotMatches(previous[index], identity),
+    ) &&
     !(state.pendingReactNodes?.size > 0)
   );
 };
@@ -694,6 +809,66 @@ const codexMountedRetainedScopeCandidates = (candidates) => {
   const mounted = codexRendererMountedNodes(new Set(nodes.keys()));
   return Array.from(mounted, (node) => nodes.get(node));
 };
+// React's element/Fiber debug-owner references are not mounted ownership
+// edges. Do not follow them into an abandoned tree; ordinary application
+// objects with an `_owner` field remain part of the unknown-owner inventory.
+const codexRendererScopeNonBindingLink = (value, key) => {
+  if (
+    [
+      "return",
+      "child",
+      "sibling",
+      "alternate",
+      "ownerDocument",
+      "parentNode",
+      "parentElement",
+      "window",
+    ].includes(key)
+  )
+    return true;
+  if (key !== "_owner" && key !== "_debugOwner") return false;
+  const elementType = Object.getOwnPropertyDescriptor(value, "$$typeof")?.value;
+  if (
+    elementType === Symbol.for("react.element") ||
+    elementType === Symbol.for("react.transitional.element")
+  )
+    return true;
+  if (key !== "_debugOwner") return false;
+  const tag = Object.getOwnPropertyDescriptor(value, "tag")?.value;
+  return (
+    Number.isInteger(tag) &&
+    tag >= 0 &&
+    tag <= 31 &&
+    ["return", "child", "sibling", "memoizedState"].every((name) => {
+      const field = Object.getOwnPropertyDescriptor(value, name);
+      return Boolean(field && "value" in field);
+    })
+  );
+};
+const codexRendererScopeObjectSnapshotIsCurrent = (value, descriptors) => {
+  try {
+    const keys = Object.keys(descriptors);
+    if (Object.getOwnPropertyNames(value).length !== keys.length) return false;
+    return keys.every((key) => {
+      const current = Object.getOwnPropertyDescriptor(value, key);
+      const previous = descriptors[key];
+      if (!current || "value" in current !== "value" in previous) return false;
+      if (codexRendererScopeNonBindingLink(value, key)) return true;
+      return "value" in previous
+        ? current.value === previous.value
+        : current.get === previous.get && current.set === previous.set;
+    });
+  } catch {
+    return false;
+  }
+};
+const codexRendererScopeObjectSnapshotsAreCurrent = (snapshots) => {
+  for (const [value, descriptors] of snapshots) {
+    if (!codexRendererScopeObjectSnapshotIsCurrent(value, descriptors))
+      return false;
+  }
+  return true;
+};
 const codexCurrentAppServerScopeHints = () => {
   const scopesByBrand = new Map();
   for (const atom of state.appServerStatusAtoms || []) {
@@ -705,7 +880,7 @@ const codexCurrentAppServerScopeHints = () => {
   const seen = new Set();
   for (
     let cursor = 0;
-    cursor < fibers.length && seen.size < 25000;
+    cursor < fibers.length && seen.size < CODEX_RENDERER_FIBER_SCAN_LIMIT;
     cursor += 1
   ) {
     const fiber = fibers[cursor];
@@ -750,19 +925,7 @@ const codexCurrentAppServerScopeHints = () => {
         descriptors = Object.getOwnPropertyDescriptors(value);
       } catch {}
       for (const [key, field] of Object.entries(descriptors))
-        if (
-          "value" in field &&
-          ![
-            "return",
-            "child",
-            "sibling",
-            "alternate",
-            "ownerDocument",
-            "parentNode",
-            "parentElement",
-            "window",
-          ].includes(key)
-        )
+        if ("value" in field && !codexRendererScopeNonBindingLink(value, key))
           values.push({ value: field.value, depth: depth + 1 });
     }
   }
@@ -779,7 +942,7 @@ const codexRendererMountedNodes = (targets) => {
   const seenFibers = new Set();
   for (
     let cursor = 0;
-    cursor < fibers.length && seenFibers.size < 25000;
+    cursor < fibers.length && seenFibers.size < CODEX_RENDERER_FIBER_SCAN_LIMIT;
     cursor += 1
   ) {
     const fiber = fibers[cursor];
@@ -830,16 +993,7 @@ const codexRendererMountedNodes = (targets) => {
       for (const [key, descriptor] of Object.entries(descriptors)) {
         if (
           "value" in descriptor &&
-          ![
-            "return",
-            "child",
-            "sibling",
-            "alternate",
-            "ownerDocument",
-            "parentNode",
-            "parentElement",
-            "window",
-          ].includes(key)
+          !codexRendererScopeNonBindingLink(value, key)
         )
           values.push({ value: descriptor.value, depth: depth + 1 });
       }
@@ -847,16 +1001,89 @@ const codexRendererMountedNodes = (targets) => {
   }
   return mounted;
 };
-const codexRendererScopeSnapshotIsCurrent = (
+const codexRendererScopeSnapshotRootsAreCurrent = (
   roots = codexRendererScopeRootIdentities(),
 ) => {
   if (state.scopedAppServerScopeScanComplete !== true) return false;
   if (!codexRendererScopeRootsMatchCurrent(roots)) return false;
+  if (
+    (state.scopedAppServerScopeMutationGeneration ?? 0) !==
+    codexRendererMutationGeneration()
+  )
+    return false;
   // DOM changes can mount new dependency providers before the retained root
   // identity changes. Re-prove ownership before native visibility/continuation.
   return !(state.pendingReactNodes?.size > 0);
 };
-const codexRendererScopeCandidates = async () => {
+// Complete inventories retain their bounded discovery evidence. Root identity
+// alone cannot certify a mutable Hook/ref graph during the 30s reuse window.
+const codexRendererScopeSnapshotIsCurrent = (
+  roots = codexRendererScopeRootIdentities(),
+) => {
+  if (!codexRendererScopeSnapshotRootsAreCurrent(roots)) return false;
+  const provenance = state.scopedAppServerScopeProvenance;
+  if (!provenance) {
+    // Preserve the established raw legacy snapshot contract. Inventories made
+    // by this scanner carry managed root records and must retain their proof.
+    return !state.scopedAppServerRootIdentities.some((snapshot) =>
+      Object.getOwnPropertyDescriptor(snapshot, "valid"),
+    );
+  }
+  try {
+    if (
+      provenance.owner !== codexRendererScopeDiscoveryOwner ||
+      provenance.scopeBindings.size !==
+        Object.getOwnPropertyDescriptor(Set.prototype, "size").get.call(
+          state.scopedAppServerScopeCandidates,
+        )
+    )
+      return false;
+    for (const scope of Set.prototype.values.call(
+      state.scopedAppServerScopeCandidates,
+    ))
+      if (!provenance.scopeBindings.has(scope)) return false;
+    return (
+      provenance.fiberSnapshots.every(codexRendererFiberSnapshotIsCurrent) &&
+      codexRendererScopeObjectSnapshotsAreCurrent(provenance.objectSnapshots)
+    );
+  } catch {
+    return false;
+  }
+};
+// Native reads and request ownership need a positive proof for their own
+// scope, not a whole-graph census on every call. Validate its exact committed
+// structural/own-data path; complete inventories still veto unknown owners.
+const codexRendererScopeBindingIsCurrent = (scope) => {
+  if (!codexRendererScopeSnapshotRootsAreCurrent()) return false;
+  const provenance = state.scopedAppServerScopeProvenance;
+  if (!provenance) return codexRendererScopeSnapshotIsCurrent();
+  try {
+    if (
+      provenance.owner !== codexRendererScopeDiscoveryOwner ||
+      !Set.prototype.has.call(state.scopedAppServerScopeCandidates, scope)
+    )
+      return false;
+    let entry = provenance.scopeBindings.get(scope);
+    if (!entry || entry.value !== scope) return false;
+    for (
+      let depth = 0;
+      entry && depth < CODEX_RENDERER_FIBER_SCAN_LIMIT + 16;
+      depth += 1
+    ) {
+      if (!entry.parent)
+        return codexRendererScopeRootIdentities().includes(entry.value);
+      const field = Object.getOwnPropertyDescriptor(
+        entry.parent.value,
+        entry.key,
+      );
+      if (!field || !("value" in field) || field.value !== entry.value)
+        return false;
+      entry = entry.parent;
+    }
+  } catch {}
+  return false;
+};
+const codexDiscoverRendererScopeCandidates = async () => {
   if (!codexClientDiscoveryIsCurrent()) return [];
   // A retained scope set is only authoritative after a complete React scan.
   // We invalidate the snapshot immediately before a real traversal, while
@@ -868,6 +1095,25 @@ const codexRendererScopeCandidates = async () => {
     state.scopedAppServerRegistryInstances || [],
   ).filter(codexScopedRegistryInstance);
   const scanStartedAt = Date.now();
+  const mutationGeneration = codexRendererMutationGeneration();
+  let visitedFiberCount = 0;
+  let scopeCount = retained.length;
+  const publishTraversal = (status, reason = null) => {
+    state.scopedAppServerScopeScan = {
+      status,
+      visitedFiberCount,
+      fiberLimit: CODEX_RENDERER_FIBER_SCAN_LIMIT,
+      scopeCount,
+      elapsedMs: Math.max(0, Date.now() - scanStartedAt),
+    };
+    // Sequential module fallbacks can start another scan in the same task.
+    // Keep one bounded terminal receipt so polling cannot miss its refusal.
+    if (status !== "scanning")
+      state.scopedAppServerScopeLastSettledScan = {
+        ...state.scopedAppServerScopeScan,
+        ...(reason ? { reason } : {}),
+      };
+  };
   // A retained scope snapshot is usable only while the React root identities
   // that produced it are still current. React may replace the current Fiber
   // during navigation without changing the DOM container, so compare the
@@ -886,22 +1132,56 @@ const codexRendererScopeCandidates = async () => {
     return retained;
   }
   state.scopedAppServerScopeScanComplete = false;
+  state.scopedAppServerScopeProvenance = null;
+  publishTraversal("scanning");
+  const rootSnapshots = currentRootIdentities.map(
+    codexRendererScopeRootSnapshot,
+  );
   const fibers = currentRootIdentities.slice();
   if (!fibers.length) {
     state.scopedAppServerRegistryInstances = new Set(retainedRegistries);
+    publishTraversal("root_unavailable");
     return retained;
   }
+  const fiberSnapshots = [];
+  const fiberPaths = new Map(
+    currentRootIdentities.map((root) => [root, { value: root, parent: null }]),
+  );
+  const scopeBindings = new Map();
+  const retainScope = (scope, binding) => {
+    scopes.add(scope);
+    if (!scopeBindings.has(scope)) scopeBindings.set(scope, binding);
+  };
+  // Retain only bounded, deduplicated descriptor snapshots that this walk
+  // already read. Stable Hook/ref containers may change beneath an unchanged
+  // Fiber seed while discovery yields; their traversed own-data edges must
+  // still match before this inventory can become authoritative.
+  const objectSnapshots = new Map();
+  // A shared React state/props object can be reached from many Fibers.
+  // Snapshot it once, and expand its children only when a later path reaches
+  // it at a shallower depth (which can expose more of the bounded graph).
+  const objectExpansionDepths = new Map();
+  let snapshotFieldCount = 0;
+  let objectScanCapped = false;
+  let objectScanCapReason = null;
+  let objectReadFailed = false;
   const seenFibers = new Set();
   const scopes = new Set();
   const registryInstances = new Set();
   let cursor = 0;
-  for (; cursor < fibers.length && seenFibers.size < 25000;) {
+  for (
+    ;
+    cursor < fibers.length &&
+    seenFibers.size < CODEX_RENDERER_FIBER_SCAN_LIMIT &&
+    !objectScanCapped;
+  ) {
     if (!codexClientDiscoveryIsCurrent()) return [];
     const sliceDeadline = monotonicNow() + 4;
     let inspected = 0;
     while (
       cursor < fibers.length &&
-      seenFibers.size < 25000 &&
+      seenFibers.size < CODEX_RENDERER_FIBER_SCAN_LIMIT &&
+      !objectScanCapped &&
       inspected < 100 &&
       monotonicNow() < sliceDeadline
     ) {
@@ -909,8 +1189,16 @@ const codexRendererScopeCandidates = async () => {
       const fiber = fibers[cursor++];
       if (!fiber || seenFibers.has(fiber)) continue;
       seenFibers.add(fiber);
-      if (fiber.child) fibers.push(fiber.child);
-      if (fiber.sibling) fibers.push(fiber.sibling);
+      const snapshot = codexRendererFiberSnapshot(fiber);
+      fiberSnapshots.push(snapshot);
+      const fiberPath = fiberPaths.get(fiber);
+      for (const key of ["child", "sibling"]) {
+        const next = snapshot[key];
+        if (!next) continue;
+        fibers.push(next);
+        if (!fiberPaths.has(next))
+          fiberPaths.set(next, { value: next, parent: fiberPath, key });
+      }
       // Fiber depth must not consume the object depth budget: the application
       // scope lives below many providers in current Codex Desktop builds.
       const seenValues = new Set();
@@ -919,9 +1207,15 @@ const codexRendererScopeCandidates = async () => {
         "dependencies",
         "memoizedProps",
         "pendingProps",
-      ].map((key) => ({ value: fiber[key], depth: 0 }));
+      ].map((key) => ({
+        value: snapshot[key],
+        depth: 0,
+        parent: fiberPath,
+        key,
+      }));
       for (let index = 0; index < values.length && index < 160; index += 1) {
-        const { value, depth } = values[index];
+        const binding = values[index];
+        const { value, depth } = binding;
         if (
           !value ||
           typeof value !== "object" ||
@@ -938,37 +1232,71 @@ const codexRendererScopeCandidates = async () => {
             "scope",
           )?.value;
           if (codexDeclaredDependencyScope(registryScope))
-            scopes.add(registryScope);
+            retainScope(registryScope, {
+              value: registryScope,
+              parent: binding,
+              key: "scope",
+            });
         }
         if (codexDeclaredDependencyScope(value)) {
-          scopes.add(value);
+          retainScope(value, binding);
           continue;
         }
         if (depth >= 5) continue;
-        let descriptors = {};
-        try {
-          descriptors = Object.getOwnPropertyDescriptors(value);
-        } catch {}
+        const previousExpansionDepth = objectExpansionDepths.get(value);
+        if (
+          previousExpansionDepth !== undefined &&
+          previousExpansionDepth <= depth
+        )
+          continue;
+        objectExpansionDepths.set(value, depth);
+        let descriptors = objectSnapshots.get(value);
+        if (!descriptors) {
+          try {
+            descriptors = Object.getOwnPropertyDescriptors(value);
+          } catch {
+            objectReadFailed = true;
+            continue;
+          }
+          const fieldCount = Object.keys(descriptors).length;
+          if (
+            objectSnapshots.size >= CODEX_RENDERER_SCOPE_OBJECT_SCAN_LIMIT ||
+            snapshotFieldCount + fieldCount >
+              CODEX_RENDERER_SCOPE_FIELD_SCAN_LIMIT
+          ) {
+            objectScanCapped = true;
+            objectScanCapReason =
+              objectSnapshots.size >= CODEX_RENDERER_SCOPE_OBJECT_SCAN_LIMIT
+                ? "object_limit"
+                : "field_limit";
+            break;
+          }
+          objectSnapshots.set(value, descriptors);
+          snapshotFieldCount += fieldCount;
+        }
         for (const [key, descriptor] of Object.entries(descriptors)) {
           if (
             "value" in descriptor &&
-            ![
-              "return",
-              "child",
-              "sibling",
-              "alternate",
-              "ownerDocument",
-              "parentNode",
-              "parentElement",
-              "window",
-            ].includes(key)
+            !codexRendererScopeNonBindingLink(value, key)
           ) {
-            values.push({ value: descriptor.value, depth: depth + 1 });
+            values.push({
+              value: descriptor.value,
+              depth: depth + 1,
+              parent: binding,
+              key,
+            });
           }
         }
       }
     }
-    if (cursor < fibers.length && seenFibers.size < 25000)
+    visitedFiberCount = seenFibers.size;
+    scopeCount = scopes.size;
+    publishTraversal("scanning");
+    if (
+      cursor < fibers.length &&
+      seenFibers.size < CODEX_RENDERER_FIBER_SCAN_LIMIT &&
+      !objectScanCapped
+    )
       await yieldReactDiscovery();
   }
   if (!codexClientDiscoveryIsCurrent()) return [];
@@ -976,19 +1304,88 @@ const codexRendererScopeCandidates = async () => {
   // first scope forever misses the picker, including scopes mounted later. A
   // complete scan with no scopes is authoritative; an incomplete/capped scan
   // must keep previously discovered owners until the next complete scan.
-  const scanWasCapped = seenFibers.size >= 25000 && cursor < fibers.length;
-  const current = scanWasCapped
-    ? Array.from(new Set([...retained, ...scopes]))
-    : Array.from(scopes);
-  const currentRegistries = scanWasCapped
-    ? Array.from(new Set([...retainedRegistries, ...registryInstances]))
-    : Array.from(registryInstances);
+  const scanWasCapped =
+    objectScanCapped ||
+    (seenFibers.size >= CODEX_RENDERER_FIBER_SCAN_LIMIT &&
+      cursor < fibers.length);
+  const finalRoots = codexRendererScopeRootIdentities();
+  let invalidationReason = null;
+  const requireCurrent = (current, reason) => {
+    if (!current) invalidationReason = reason;
+    return current;
+  };
+  // Preserve the exact proof and its short-circuit order. The only addition
+  // is a fixed-enum first refusal reason; no object or error data is retained.
+  const scanStayedCurrent =
+    requireCurrent(
+      finalRoots.length === rootSnapshots.length &&
+        finalRoots.every((root, index) =>
+          codexRendererScopeRootSnapshotMatches(rootSnapshots[index], root),
+        ),
+      "exact_root",
+    ) &&
+    requireCurrent(
+      fiberSnapshots.every(codexRendererFiberSnapshotIsCurrent),
+      "fiber_snapshot",
+    ) &&
+    requireCurrent(!objectReadFailed, "object_read") &&
+    requireCurrent(
+      codexRendererScopeObjectSnapshotsAreCurrent(objectSnapshots),
+      "object_snapshot",
+    ) &&
+    requireCurrent(
+      mutationGeneration === codexRendererMutationGeneration(),
+      "mutation_generation",
+    ) &&
+    requireCurrent(!(state.pendingReactNodes?.size > 0), "pending_nodes");
+  const complete = !scanWasCapped && scanStayedCurrent;
+  const current = complete
+    ? Array.from(scopes)
+    : Array.from(new Set([...retained, ...scopes]));
+  const currentRegistries = complete
+    ? Array.from(registryInstances)
+    : Array.from(new Set([...retainedRegistries, ...registryInstances]));
   state.scopedAppServerScopeCandidates = new Set(current);
+  state.scopedAppServerScopeProvenance = complete
+    ? {
+        owner: codexRendererScopeDiscoveryOwner,
+        fiberSnapshots,
+        objectSnapshots,
+        scopeBindings,
+      }
+    : null;
   state.scopedAppServerRegistryInstances = new Set(currentRegistries);
   state.scopedAppServerScopesScannedAt = scanStartedAt;
-  state.scopedAppServerScopeScanComplete = !scanWasCapped;
-  state.scopedAppServerRootIdentities = currentRootIdentities;
+  state.scopedAppServerScopeScanComplete = complete;
+  state.scopedAppServerScopeMutationGeneration = mutationGeneration;
+  state.scopedAppServerRootIdentities = rootSnapshots;
+  visitedFiberCount = seenFibers.size;
+  scopeCount = current.length;
+  publishTraversal(
+    scanWasCapped ? "capped" : complete ? "complete" : "invalidated",
+    scanWasCapped ? objectScanCapReason || "fiber_limit" : invalidationReason,
+  );
   return current;
+};
+// Module discovery and the native-visibility retry can overlap while a walk
+// yields. They must share one generation-owned inventory, never race to publish
+// different Complete sets. A new runtime closure cannot inherit the old job.
+const codexRendererScopeDiscoveryOwner = {};
+const codexRendererScopeCandidates = async () => {
+  if (!codexClientDiscoveryIsCurrent()) return [];
+  const retained = state.scopedAppServerScopeDiscovery;
+  if (retained?.owner === codexRendererScopeDiscoveryOwner)
+    return await retained.promise;
+  const entry = { owner: codexRendererScopeDiscoveryOwner, promise: null };
+  state.scopedAppServerScopeDiscovery = entry;
+  const discovery = codexDiscoverRendererScopeCandidates();
+  entry.promise = discovery;
+  try {
+    return await discovery;
+  } finally {
+    if (state.scopedAppServerScopeDiscovery === entry)
+      state.scopedAppServerScopeDiscovery = null;
+  }
 };
 const refreshCodexScopedAppServerClients = (
   scopes = state.scopedAppServerScopeCandidates ||
@@ -1033,6 +1430,7 @@ const refreshCodexScopedAppServerClients = (
     const scopeGet = Object.getOwnPropertyDescriptor(scope, "get")?.value;
     verifiedOwners.get(client).push(() => {
       if (
+        !codexRendererScopeBindingIsCurrent(scope) ||
         !Set.prototype.has.call(state.scopedAppServerScopeCandidates, scope) ||
         Object.getOwnPropertyDescriptor(scope, "get")?.value !== scopeGet ||
         Object.getOwnPropertyDescriptor(registry, "scope")?.value !== scope ||

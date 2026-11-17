@@ -14,6 +14,9 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 const PROJECTION_SETTING_PREFIX: &str = "codex_multirouter_projection:";
+// Bump when generated Sub-Agent governance/role templates change. Existing
+// persisted Ready receipts must not suppress regeneration after an app upgrade.
+const SUBAGENT_PROJECTION_TEMPLATE_REVISION: u32 = 1;
 
 fn projection_publish_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -78,6 +81,25 @@ pub struct CodexRoutingProjectionArtifact {
     pub projection_settings: Value,
     pub compiled: CompiledCodexRoutingPlan,
     target_provider_names: HashMap<String, String>,
+    // Private, ephemeral provenance receipt for the aliases derived from the
+    // validated orchestration snapshot. Public projection JSON is mutable for
+    // live config merging, but cannot grant additional model capabilities.
+    orchestration_models: Vec<Value>,
+    // Current Common Config ownership is derived from the DB source, never
+    // inferred from merged TOML or persisted as a competing Router setting.
+    common_reasoning_effort: Option<crate::proxy::providers::codex_reasoning::CodexReasoningEffort>,
+}
+
+impl CodexRoutingProjectionArtifact {
+    pub(crate) fn orchestration_models(&self) -> &[Value] {
+        &self.orchestration_models
+    }
+
+    pub(crate) fn common_reasoning_effort(
+        &self,
+    ) -> Option<crate::proxy::providers::codex_reasoning::CodexReasoningEffort> {
+        self.common_reasoning_effort
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,11 +338,24 @@ pub(crate) fn build_projection_artifact(
     let compiled = compile_v2(&plan, &providers)
         .map_err(|error| AppError::Message(format!("{}: {}", error.code, error.message)))?;
     let orchestration = db.get_orchestration_settings()?.routable_settings(db)?;
-    let dependency_fingerprint =
-        projection_dependency_fingerprint(&router, &compiled, &orchestration);
+    let common_reasoning_effort =
+        crate::services::provider::codex_common_reasoning_effort(db, &router)?;
+    let dependency_fingerprint = projection_dependency_fingerprint(
+        &router,
+        &compiled,
+        &plan,
+        &orchestration,
+        common_reasoning_effort,
+    );
     let mut projection_settings =
         projection_settings(&router, &compiled, &plan, &dependency_fingerprint);
     orchestration.project_settings(&mut projection_settings);
+    let mut orchestration_catalog = json!({"models": []});
+    orchestration.project_catalog(&mut orchestration_catalog);
+    let orchestration_models = orchestration_catalog["models"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let target_provider_names = providers
         .iter()
         .map(|(id, provider)| (id.clone(), provider.name.clone()))
@@ -331,6 +366,8 @@ pub(crate) fn build_projection_artifact(
         projection_settings,
         compiled,
         target_provider_names,
+        orchestration_models,
+        common_reasoning_effort,
     })
 }
 
@@ -376,7 +413,9 @@ pub(crate) fn effective_settings_for_candidate_with_providers(
     let dependency_fingerprint = projection_dependency_fingerprint(
         candidate,
         &compiled,
+        &plan,
         &crate::orchestration::Settings::default(),
+        None,
     );
     Ok(projection_settings(
         candidate,
@@ -389,13 +428,21 @@ pub(crate) fn effective_settings_for_candidate_with_providers(
 fn projection_dependency_fingerprint(
     router: &Provider,
     compiled: &CompiledCodexRoutingPlan,
+    plan: &super::schema::CodexRoutingConfigV2,
     orchestration: &crate::orchestration::Settings,
+    common_reasoning_effort: Option<crate::proxy::providers::codex_reasoning::CodexReasoningEffort>,
 ) -> String {
     short_value_hash(Some(&json!({
         "routing": compiled.dependency_fingerprint,
+        "subagentTemplateRevision": SUBAGENT_PROJECTION_TEMPLATE_REVISION,
+        // Hash the canonical policy, including parent-only selection changes.
+        // Custom role text stays in this hash input, never in diagnostics.
+        "subagentVersion": if plan.subagent_version.as_deref() == Some("v1") { "v1" } else { "v2" },
+        "subagentV2": plan.subagent_v2,
         "webSearchEnabled": router.settings_config.pointer("/hostedTools/webSearch/enabled")
             .and_then(Value::as_bool).unwrap_or(true),
-        "orchestration": orchestration
+        "orchestration": orchestration,
+        "commonReasoningEffort": common_reasoning_effort
     })))
 }
 
@@ -464,6 +511,13 @@ fn projected_model_entry(model: &CompiledCodexModel, sort_index: Option<usize>) 
     entry.insert(
         "apiFormatSource".to_string(),
         Value::String(model.api_format_source.clone()),
+    );
+    // Derived provenance: grouping uses the canonical target identity, never
+    // a display name shared by unrelated providers. Source catalogs do not own
+    // or persist this Router projection field.
+    entry.insert(
+        "targetProviderId".to_string(),
+        Value::String(model.target_provider_id.clone()),
     );
     entry.insert(
         "providerName".to_string(),
@@ -730,6 +784,88 @@ mod tests {
     }
 
     #[test]
+    fn subagent_governance_fingerprint_tracks_canonical_policy_without_changing_catalog() {
+        let db = Database::memory().expect("memory db");
+        save_fixture(&db, "openai_responses");
+        let mut router = router();
+        router.settings_config["codexRouting"]["subagentVersion"] = json!("v1");
+        db.save_provider("codex", &router).expect("save v1");
+        let baseline = build_projection_artifact(&db, "router").expect("baseline");
+        let baseline_settings = router.settings_config.clone();
+        let baseline_catalog = baseline.projection_settings["modelCatalog"].clone();
+        let mut previous = baseline.dependency_fingerprint;
+
+        let policies = [
+            json!({"subagentVersion": "v2"}),
+            json!({"subagentVersion": "v2", "subagentV2": {
+                "schemaVersion": 2, "selectionPolicy": "balanced", "profiles": {}
+            }}),
+            json!({"subagentVersion": "v2", "subagentV2": {
+                "schemaVersion": 2, "selectionPolicy": "official_first", "profiles": {}
+            }}),
+            json!({"subagentVersion": "v2", "subagentV2": {
+                "schemaVersion": 2, "selectionPolicy": "official_first", "profiles": {
+                    "qwen": {
+                        "model": "qwen3.8", "enabled": true,
+                        "questionnaire": {
+                            "taskStrengths": ["repository_exploration"],
+                            "optimization": "balanced", "writeScope": "read_only",
+                            "preference": "eligible"
+                        },
+                        "reasoning": {"policy": "model_default"},
+                        "overrides": {"developerInstructions": "Collect delegated evidence."}
+                    }
+                }
+            }}),
+        ];
+        for policy in policies {
+            router.settings_config = baseline_settings.clone();
+            let routing = router.settings_config["codexRouting"]
+                .as_object_mut()
+                .unwrap();
+            routing.extend(policy.as_object().unwrap().clone());
+            let canonical = router.settings_config.clone();
+            db.save_provider("codex", &router).expect("save policy");
+            let artifact = build_projection_artifact(&db, "router").expect("policy projection");
+            assert_ne!(
+                artifact.dependency_fingerprint, previous,
+                "Sub-Agent policy must invalidate projection"
+            );
+            assert_eq!(
+                artifact.projection_settings["modelCatalog"],
+                baseline_catalog
+            );
+            assert_eq!(
+                router.settings_config, canonical,
+                "fingerprinting must not rewrite canonical profiles"
+            );
+            assert!(!artifact
+                .dependency_fingerprint
+                .contains("Collect delegated evidence."));
+            previous = artifact.dependency_fingerprint;
+        }
+    }
+
+    #[test]
+    fn subagent_governance_fingerprint_invalidates_pre_governance_receipts() {
+        let db = Database::memory().expect("memory db");
+        save_fixture(&db, "openai_responses");
+        let artifact = build_projection_artifact(&db, "router").expect("projection");
+        let router = router();
+        let old_fingerprint = short_value_hash(Some(&json!({
+            "routing": artifact.compiled.dependency_fingerprint,
+            "webSearchEnabled": router.settings_config.pointer("/hostedTools/webSearch/enabled")
+                .and_then(Value::as_bool).unwrap_or(true),
+            "orchestration": db.get_orchestration_settings().unwrap().routable_settings(&db).unwrap(),
+            "commonReasoningEffort": artifact.common_reasoning_effort()
+        })));
+        assert_ne!(
+            artifact.dependency_fingerprint, old_fingerprint,
+            "old ready receipts must not skip the governance template upgrade"
+        );
+    }
+
+    #[test]
     fn fingerprint_mismatch_rebuilds_projection_from_latest_provider() {
         let db = Database::memory().expect("memory db");
         save_fixture(&db, "openai_chat");
@@ -961,6 +1097,8 @@ mod tests {
         assert_eq!(catalog["models"][0]["sortIndex"], 0);
         assert_eq!(catalog["models"][0]["displayName"], "Friendly B");
         assert_eq!(catalog["models"][0]["providerName"], "Qwen");
+        assert_eq!(catalog["models"][0]["targetProviderId"], "qwen");
+        assert_eq!(catalog["models"][1]["targetProviderId"], "qwen");
         assert_eq!(catalog["models"][0]["apiFormatSource"], "provider_model");
         assert_eq!(catalog["displayNameStyle"], "model-provider");
         assert_eq!(catalog["defaultReasoningEffort"], "high");

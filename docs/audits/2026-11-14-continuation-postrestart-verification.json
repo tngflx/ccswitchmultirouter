@@ -1,0 +1,706 @@
+{
+  "recordedAtUtc": "2026-11-14T12:06:02.429Z",
+  "localDate": "2026-11-14",
+  "timezone": "Asia/Singapore",
+  "branch": "main",
+  "activation": {
+    "method": "repository_verified_dev_handoff",
+    "artifactKind": "running_debug_development_executable",
+    "binaryPath": "H:\\repos\\ccswitchmulti-refork\\src-tauri\\target\\debug\\cc-switch.exe",
+    "binarySha256": "6a8fd12b3fd6b9e9b6e124e51fb01acaac85ce206e2e2d4ce5c9f6ee4c6153ff",
+    "binaryModifiedAtUtc": "2026-11-14T11:41:06.847Z",
+    "previousCcswitchPid": 41584,
+    "currentCcswitchPid": 46912,
+    "ccswitchStartedAtUtc": "2026-11-14T11:41:07.0956830Z",
+    "codexPid": 82520,
+    "codexStartedAtUtc": "2026-11-14T11:02:13.7965450Z",
+    "codexProcessUnchanged": true,
+    "sourceRuntimeInjectionUsed": false,
+    "releaseInstallerBuiltOrInstalled": false
+  },
+  "transport": {
+    "selectedLoopbackAddress": "::1",
+    "cdpPort": 9229,
+    "proxyAddress": "127.0.0.1",
+    "proxyPort": 15721,
+    "staleIpv4ListenerPid": 27368,
+    "staleIpv4ListenerStillPresent": true,
+    "selectedEndpointNativeOwnershipVerified": true,
+    "allCoveringOwnersRequired": true
+  },
+  "readiness": {
+    "receipt": "H:\\repos\\ccswitchmulti-refork\\.tmp\\codex-continuation-native-reload-readiness-20261114T114114070Z.json",
+    "evidence": {
+      "verified": false,
+      "readinessVerified": true,
+      "scenario": "overload",
+      "desktopCdpVerified": false,
+      "runtimeFingerprint": "sha256-f9ff21ffd178c7f8d34220170d8f25a3596d9fe30e720bbc2feef12b863b520d",
+      "nativeHost": "::1",
+      "noTestThreadCreated": true,
+      "existingThreadsTouched": false,
+      "verifiedAtUtc": "2026-11-14T11:41:37.259Z"
+    }
+  },
+  "scenarios": [
+    {
+      "scenario": "overload",
+      "receipt": "H:\\repos\\ccswitchmulti-refork\\.tmp\\codex-continuation-installed-overload-diagnostic-20261114-195101.json",
+      "evidence": {
+        "verified": true,
+        "scenario": "overload",
+        "scope": "actual_codex_desktop_cdp_existing_production_runtime",
+        "desktopCdpVerified": true,
+        "automaticNativeSchedulingVerified": false,
+        "runtimeFingerprint": "sha256-f9ff21ffd178c7f8d34220170d8f25a3596d9fe30e720bbc2feef12b863b520d",
+        "ccswitchBinarySha256": "6a8fd12b3fd6b9e9b6e124e51fb01acaac85ce206e2e2d4ce5c9f6ee4c6153ff",
+        "nativeOwnerVerified": true,
+        "nativeHost": "::1",
+        "nativeOwnerPids": [82520],
+        "temporaryDurableTestThread": true,
+        "perThreadLocalFixtureProviderConfirmed": true,
+        "initialFailedTurnObserved": true,
+        "productionGuardsPrepared": true,
+        "appServerAcceptedContinue": true,
+        "upstreamReceivedLiteralContinue": true,
+        "continuedTurnCompleted": true,
+        "exactlyOneContinuation": true,
+        "continuationDiagnostics": {
+          "prepareAck": {
+            "present": true,
+            "status": "unknown",
+            "started": true,
+            "submitted": null,
+            "mutationAttempted": null,
+            "threadMatches": null,
+            "jobMatches": true,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "latestJob": {
+            "present": true,
+            "status": "completed",
+            "started": null,
+            "submitted": true,
+            "mutationAttempted": true,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": true,
+            "reasonCode": "submitted",
+            "runtimeGeneration": 3
+          },
+          "preparedJob": {
+            "present": true,
+            "status": "prepared",
+            "started": null,
+            "submitted": false,
+            "mutationAttempted": false,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "preparedReadinessGeneration": 3,
+          "commitAck": {
+            "present": true,
+            "status": "unknown",
+            "started": true,
+            "submitted": null,
+            "mutationAttempted": null,
+            "threadMatches": null,
+            "jobMatches": true,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "completedJob": {
+            "present": true,
+            "status": "completed",
+            "started": null,
+            "submitted": true,
+            "mutationAttempted": true,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": true,
+            "reasonCode": "submitted",
+            "runtimeGeneration": 3
+          }
+        },
+        "existingThreadsTouched": false,
+        "initialRequests": 1,
+        "continuedRequests": 1,
+        "cleanupArchived": true,
+        "verifiedAtUtc": "2026-11-14T11:51:40.936Z"
+      }
+    },
+    {
+      "scenario": "concurrent_limit",
+      "receipt": "H:\\repos\\ccswitchmulti-refork\\.tmp\\codex-continuation-installed-concurrent_limit-20261114-195233.json",
+      "evidence": {
+        "verified": true,
+        "scenario": "concurrent_limit",
+        "scope": "actual_codex_desktop_cdp_existing_production_runtime",
+        "desktopCdpVerified": true,
+        "automaticNativeSchedulingVerified": false,
+        "runtimeFingerprint": "sha256-f9ff21ffd178c7f8d34220170d8f25a3596d9fe30e720bbc2feef12b863b520d",
+        "ccswitchBinarySha256": "6a8fd12b3fd6b9e9b6e124e51fb01acaac85ce206e2e2d4ce5c9f6ee4c6153ff",
+        "nativeOwnerVerified": true,
+        "nativeHost": "::1",
+        "nativeOwnerPids": [82520],
+        "temporaryDurableTestThread": true,
+        "perThreadLocalFixtureProviderConfirmed": true,
+        "initialFailedTurnObserved": true,
+        "productionGuardsPrepared": true,
+        "appServerAcceptedContinue": true,
+        "upstreamReceivedLiteralContinue": true,
+        "continuedTurnCompleted": true,
+        "exactlyOneContinuation": true,
+        "continuationDiagnostics": {
+          "prepareAck": {
+            "present": true,
+            "status": "unknown",
+            "started": true,
+            "submitted": null,
+            "mutationAttempted": null,
+            "threadMatches": null,
+            "jobMatches": true,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "latestJob": {
+            "present": true,
+            "status": "completed",
+            "started": null,
+            "submitted": true,
+            "mutationAttempted": true,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": true,
+            "reasonCode": "submitted",
+            "runtimeGeneration": 3
+          },
+          "preparedJob": {
+            "present": true,
+            "status": "prepared",
+            "started": null,
+            "submitted": false,
+            "mutationAttempted": false,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "preparedReadinessGeneration": 3,
+          "commitAck": {
+            "present": true,
+            "status": "unknown",
+            "started": true,
+            "submitted": null,
+            "mutationAttempted": null,
+            "threadMatches": null,
+            "jobMatches": true,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "completedJob": {
+            "present": true,
+            "status": "completed",
+            "started": null,
+            "submitted": true,
+            "mutationAttempted": true,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": true,
+            "reasonCode": "submitted",
+            "runtimeGeneration": 3
+          }
+        },
+        "existingThreadsTouched": false,
+        "initialRequests": 1,
+        "continuedRequests": 1,
+        "cleanupArchived": true,
+        "verifiedAtUtc": "2026-11-14T11:53:05.333Z"
+      }
+    },
+    {
+      "scenario": "temporary_usage",
+      "receipt": "H:\\repos\\ccswitchmulti-refork\\.tmp\\codex-continuation-installed-temporary_usage-20261114-195305.json",
+      "evidence": {
+        "verified": true,
+        "scenario": "temporary_usage",
+        "scope": "actual_codex_desktop_cdp_existing_production_runtime",
+        "desktopCdpVerified": true,
+        "automaticNativeSchedulingVerified": false,
+        "runtimeFingerprint": "sha256-f9ff21ffd178c7f8d34220170d8f25a3596d9fe30e720bbc2feef12b863b520d",
+        "ccswitchBinarySha256": "6a8fd12b3fd6b9e9b6e124e51fb01acaac85ce206e2e2d4ce5c9f6ee4c6153ff",
+        "nativeOwnerVerified": true,
+        "nativeHost": "::1",
+        "nativeOwnerPids": [82520],
+        "temporaryDurableTestThread": true,
+        "perThreadLocalFixtureProviderConfirmed": true,
+        "initialFailedTurnObserved": true,
+        "productionGuardsPrepared": true,
+        "appServerAcceptedContinue": true,
+        "upstreamReceivedLiteralContinue": true,
+        "continuedTurnCompleted": true,
+        "exactlyOneContinuation": true,
+        "continuationDiagnostics": {
+          "prepareAck": {
+            "present": true,
+            "status": "unknown",
+            "started": true,
+            "submitted": null,
+            "mutationAttempted": null,
+            "threadMatches": null,
+            "jobMatches": true,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "latestJob": {
+            "present": true,
+            "status": "completed",
+            "started": null,
+            "submitted": true,
+            "mutationAttempted": true,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": true,
+            "reasonCode": "submitted",
+            "runtimeGeneration": 3
+          },
+          "preparedJob": {
+            "present": true,
+            "status": "prepared",
+            "started": null,
+            "submitted": false,
+            "mutationAttempted": false,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "preparedReadinessGeneration": 3,
+          "commitAck": {
+            "present": true,
+            "status": "unknown",
+            "started": true,
+            "submitted": null,
+            "mutationAttempted": null,
+            "threadMatches": null,
+            "jobMatches": true,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "completedJob": {
+            "present": true,
+            "status": "completed",
+            "started": null,
+            "submitted": true,
+            "mutationAttempted": true,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": true,
+            "reasonCode": "submitted",
+            "runtimeGeneration": 3
+          }
+        },
+        "existingThreadsTouched": false,
+        "initialRequests": 1,
+        "continuedRequests": 1,
+        "cleanupArchived": true,
+        "verifiedAtUtc": "2026-11-14T11:53:42.557Z"
+      }
+    },
+    {
+      "scenario": "connection_drop",
+      "receipt": "H:\\repos\\ccswitchmulti-refork\\.tmp\\codex-continuation-installed-connection_drop-20261114-195342.json",
+      "evidence": {
+        "verified": true,
+        "scenario": "connection_drop",
+        "scope": "actual_codex_desktop_cdp_existing_production_runtime",
+        "desktopCdpVerified": true,
+        "automaticNativeSchedulingVerified": false,
+        "runtimeFingerprint": "sha256-f9ff21ffd178c7f8d34220170d8f25a3596d9fe30e720bbc2feef12b863b520d",
+        "ccswitchBinarySha256": "6a8fd12b3fd6b9e9b6e124e51fb01acaac85ce206e2e2d4ce5c9f6ee4c6153ff",
+        "nativeOwnerVerified": true,
+        "nativeHost": "::1",
+        "nativeOwnerPids": [82520],
+        "temporaryDurableTestThread": true,
+        "perThreadLocalFixtureProviderConfirmed": true,
+        "initialFailedTurnObserved": true,
+        "productionGuardsPrepared": true,
+        "appServerAcceptedContinue": true,
+        "upstreamReceivedLiteralContinue": true,
+        "continuedTurnCompleted": true,
+        "exactlyOneContinuation": true,
+        "continuationDiagnostics": {
+          "prepareAck": {
+            "present": true,
+            "status": "unknown",
+            "started": true,
+            "submitted": null,
+            "mutationAttempted": null,
+            "threadMatches": null,
+            "jobMatches": true,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "latestJob": {
+            "present": true,
+            "status": "completed",
+            "started": null,
+            "submitted": true,
+            "mutationAttempted": true,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": true,
+            "reasonCode": "submitted",
+            "runtimeGeneration": 3
+          },
+          "preparedJob": {
+            "present": true,
+            "status": "prepared",
+            "started": null,
+            "submitted": false,
+            "mutationAttempted": false,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "preparedReadinessGeneration": 3,
+          "commitAck": {
+            "present": true,
+            "status": "unknown",
+            "started": true,
+            "submitted": null,
+            "mutationAttempted": null,
+            "threadMatches": null,
+            "jobMatches": true,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "completedJob": {
+            "present": true,
+            "status": "completed",
+            "started": null,
+            "submitted": true,
+            "mutationAttempted": true,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": true,
+            "reasonCode": "submitted",
+            "runtimeGeneration": 3
+          }
+        },
+        "existingThreadsTouched": false,
+        "initialRequests": 1,
+        "continuedRequests": 1,
+        "cleanupArchived": true,
+        "verifiedAtUtc": "2026-11-14T11:54:26.347Z"
+      }
+    },
+    {
+      "scenario": "explicit_no_retry",
+      "receipt": "H:\\repos\\ccswitchmulti-refork\\.tmp\\codex-continuation-installed-explicit_no_retry-20261114-195426.json",
+      "evidence": {
+        "verified": true,
+        "scenario": "explicit_no_retry",
+        "scope": "actual_codex_desktop_cdp_existing_production_renderer_terminal_refusal",
+        "desktopCdpVerified": true,
+        "automaticNativeSchedulingVerified": false,
+        "runtimeFingerprint": "sha256-f9ff21ffd178c7f8d34220170d8f25a3596d9fe30e720bbc2feef12b863b520d",
+        "ccswitchBinarySha256": "6a8fd12b3fd6b9e9b6e124e51fb01acaac85ce206e2e2d4ce5c9f6ee4c6153ff",
+        "nativeOwnerVerified": true,
+        "nativeHost": "::1",
+        "nativeOwnerPids": [82520],
+        "temporaryDurableTestThread": true,
+        "perThreadLocalFixtureProviderConfirmed": true,
+        "initialFailedTurnObserved": true,
+        "terminalRefusalObserved": true,
+        "continuationJobCompleted": true,
+        "continuationSubmitted": false,
+        "continuationMutationAttempted": false,
+        "continuationCommitInvoked": false,
+        "initialFailedTurnUnchanged": true,
+        "exactlyZeroContinuations": true,
+        "continuationDiagnostics": {
+          "prepareAck": {
+            "present": true,
+            "status": "unknown",
+            "started": true,
+            "submitted": null,
+            "mutationAttempted": null,
+            "threadMatches": null,
+            "jobMatches": true,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "latestJob": {
+            "present": true,
+            "status": "completed",
+            "started": null,
+            "submitted": false,
+            "mutationAttempted": false,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": false,
+            "reasonCode": "terminal_user_action",
+            "runtimeGeneration": 3
+          },
+          "preparedJob": {
+            "present": true,
+            "status": "completed",
+            "started": null,
+            "submitted": false,
+            "mutationAttempted": false,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": false,
+            "reasonCode": "terminal_user_action",
+            "runtimeGeneration": 3
+          }
+        },
+        "existingThreadsTouched": false,
+        "initialRequests": 1,
+        "continuedRequests": 0,
+        "cleanupArchived": true,
+        "verifiedAtUtc": "2026-11-14T11:54:58.499Z"
+      }
+    },
+    {
+      "scenario": "hard_quota",
+      "receipt": "H:\\repos\\ccswitchmulti-refork\\.tmp\\codex-continuation-installed-hard_quota-recheck-20261114-195738.json",
+      "evidence": {
+        "verified": true,
+        "scenario": "hard_quota",
+        "scope": "actual_codex_desktop_cdp_existing_production_renderer_terminal_refusal",
+        "desktopCdpVerified": true,
+        "automaticNativeSchedulingVerified": false,
+        "runtimeFingerprint": "sha256-f9ff21ffd178c7f8d34220170d8f25a3596d9fe30e720bbc2feef12b863b520d",
+        "ccswitchBinarySha256": "6a8fd12b3fd6b9e9b6e124e51fb01acaac85ce206e2e2d4ce5c9f6ee4c6153ff",
+        "nativeOwnerVerified": true,
+        "nativeHost": "::1",
+        "nativeOwnerPids": [82520],
+        "temporaryDurableTestThread": true,
+        "perThreadLocalFixtureProviderConfirmed": true,
+        "initialFailedTurnObserved": true,
+        "terminalRefusalObserved": true,
+        "continuationJobCompleted": true,
+        "continuationSubmitted": false,
+        "continuationMutationAttempted": false,
+        "continuationCommitInvoked": false,
+        "initialFailedTurnUnchanged": true,
+        "exactlyZeroContinuations": true,
+        "continuationDiagnostics": {
+          "prepareAck": {
+            "present": true,
+            "status": "unknown",
+            "started": true,
+            "submitted": null,
+            "mutationAttempted": null,
+            "threadMatches": null,
+            "jobMatches": true,
+            "turnIdPresent": false,
+            "reasonCode": "none",
+            "runtimeGeneration": 3
+          },
+          "latestJob": {
+            "present": true,
+            "status": "completed",
+            "started": null,
+            "submitted": false,
+            "mutationAttempted": false,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": false,
+            "reasonCode": "terminal_user_action",
+            "runtimeGeneration": 3
+          },
+          "preparedJob": {
+            "present": true,
+            "status": "completed",
+            "started": null,
+            "submitted": false,
+            "mutationAttempted": false,
+            "threadMatches": true,
+            "jobMatches": null,
+            "turnIdPresent": false,
+            "reasonCode": "terminal_user_action",
+            "runtimeGeneration": 3
+          }
+        },
+        "existingThreadsTouched": false,
+        "initialRequests": 1,
+        "continuedRequests": 0,
+        "cleanupArchived": true,
+        "verifiedAtUtc": "2026-11-14T11:58:02.662Z"
+      }
+    }
+  ],
+  "otherAttempts": [
+    {
+      "receipt": "H:\\repos\\ccswitchmulti-refork\\.tmp\\codex-continuation-postrestart-readiness-20261114-190800.json",
+      "evidence": {
+        "verified": false,
+        "scenario": "overload",
+        "desktopCdpVerified": false,
+        "temporaryDurableTestThread": false,
+        "existingThreadsTouched": false,
+        "initialRequests": 0,
+        "continuedRequests": 0,
+        "stage": "readiness",
+        "failure": "native_identity_query_failed",
+        "verifiedAtUtc": "2026-11-14T11:08:06.172Z"
+      }
+    },
+    {
+      "receipt": "H:\\repos\\ccswitchmulti-refork\\.tmp\\codex-continuation-postrestart-address-readiness-20261114-192143.json",
+      "evidence": {
+        "verified": false,
+        "scenario": "overload",
+        "desktopCdpVerified": false,
+        "temporaryDurableTestThread": false,
+        "existingThreadsTouched": false,
+        "initialRequests": 0,
+        "continuedRequests": 0,
+        "stage": "readiness",
+        "failure": "desktop_bridge_not_ready",
+        "verifiedAtUtc": "2026-11-14T11:22:05.871Z"
+      }
+    },
+    {
+      "receipt": "H:\\repos\\ccswitchmulti-refork\\.tmp\\codex-continuation-installed-overload-20261114-194151.json",
+      "evidence": {
+        "verified": false,
+        "scenario": "overload",
+        "desktopCdpVerified": false,
+        "temporaryDurableTestThread": true,
+        "existingThreadsTouched": false,
+        "initialRequests": 1,
+        "continuedRequests": 0,
+        "cleanupArchived": true,
+        "stage": "production_commit",
+        "failure": "verification_assertion_failed",
+        "verifiedAtUtc": "2026-11-14T11:42:17.082Z"
+      }
+    },
+    {
+      "receipt": "H:\\repos\\ccswitchmulti-refork\\.tmp\\codex-continuation-installed-hard_quota-20261114-195458.json",
+      "evidence": {
+        "verified": false,
+        "scenario": "hard_quota",
+        "desktopCdpVerified": false,
+        "temporaryDurableTestThread": false,
+        "existingThreadsTouched": false,
+        "initialRequests": 0,
+        "continuedRequests": 0,
+        "cleanupArchived": false,
+        "stage": "create_test_thread",
+        "failure": "renderer_operation_rejected",
+        "rendererOperationFailure": {
+          "stage": "create_test_thread",
+          "reason": "client_missing"
+        },
+        "threadCreationUncertain": true,
+        "pendingDirectory": true,
+        "cleanupPending": "temporary_directory_thread_uncertain",
+        "verifiedAtUtc": "2026-11-14T11:55:12.169Z"
+      }
+    }
+  ],
+  "nativeAutomaticScheduling": {
+    "verified": false,
+    "liveFixtureBypassesProxy": true,
+    "fixtureCallsPrepareAndCommitDirectly": true,
+    "productionBackoffMinutes": [5, 10, 20],
+    "persistedRetryMode": "aggressive",
+    "persistedMaxAttempts": 3,
+    "postReloadRecoveryEventCount": 0,
+    "eventCountObservedAtUtc": "2026-11-14T12:00:09.8931910Z",
+    "reason": "No configured safe automatic-native-scheduler fixture exists; existing chats and active provider were not intentionally failed or changed."
+  },
+  "sourceVerification": {
+    "typecheck": "passed",
+    "catalogVerify": {
+      "result": "passed",
+      "files": 18,
+      "tests": 722
+    },
+    "gatedRendererBuild": "passed",
+    "rustDesktop": {
+      "result": "passed",
+      "tests": 151
+    },
+    "rustGuardian": {
+      "result": "passed",
+      "tests": 16
+    },
+    "rustMultirouter": {
+      "result": "passed",
+      "tests": 173
+    },
+    "rustProxy": {
+      "result": "passed",
+      "tests": 2418
+    },
+    "postClippySimplificationFocusedCdp": {
+      "result": "passed",
+      "tests": 18
+    },
+    "declaredPortOnlyGuard": {
+      "result": "passed",
+      "tests": 1
+    },
+    "verifierNodeSuite": {
+      "result": "passed",
+      "tests": 49,
+      "finalRecheck": {
+        "combinedCheckAttempt": {
+          "tests": 49,
+          "passed": 48,
+          "failed": 1,
+          "failingTest": "the native listener query rejects partial snapshots even when their error is ObjectNotFound"
+        },
+        "focusedUnchangedRetry": {
+          "tests": 1,
+          "passed": 1
+        },
+        "fullUnchangedRetry": {
+          "tests": 49,
+          "passed": 49
+        },
+        "sourceChangedBetweenRetries": false,
+        "timeoutsChanged": false,
+        "failureCauseProven": false
+      }
+    },
+    "productionClippyWarningsDenied": "passed",
+    "cargoFormatCheck": "passed",
+    "frontendFormatCheck": "passed",
+    "verifierPrettierCheck": "passed",
+    "gitDiffCheck": "passed"
+  },
+  "boundaries": {
+    "existingChatsPromptedByFixtures": false,
+    "activeProviderChanged": false,
+    "remotePairingPerformed": false,
+    "remoteDebugPortExposed": false,
+    "uiAutomationPerformed": false,
+    "automaticNativeProductionTimersLiveVerified": false,
+    "uncertainSetupDirectoryPreserved": true,
+    "uncertainSetupReceipt": "H:\\repos\\ccswitchmulti-refork\\.tmp\\codex-continuation-installed-hard_quota-20261114-195458.json"
+  }
+}

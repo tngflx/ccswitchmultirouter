@@ -1,4 +1,9 @@
-import type { CodexCatalogModel, CodexModelReasoningCapability } from "@/types";
+import type {
+  CodexCatalogModel,
+  CodexModelReasoningCapability,
+  CodexReasoningEffort,
+} from "@/types";
+import { normalizeCodexReasoning } from "@/lib/codexCatalogSchema";
 import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
 import {
   modelBindingIdentityValues,
@@ -93,6 +98,76 @@ export function isExplicitCodexReasoningCapability(
       capability.source === "user" ||
       capability.source === "user_confirmed_detection"),
   );
+}
+
+// Schema enum membership only, not a provider/model capability declaration.
+// `none` disables reasoning and Ultra is a separate Codex orchestration overlay.
+const nativeReasoningEfforts = {
+  minimal: true,
+  low: true,
+  medium: true,
+  high: true,
+  xhigh: true,
+  max: true,
+} satisfies Record<Exclude<CodexReasoningEffort, "none" | "ultra">, true>;
+
+const isNativeReasoningEffort = (value: unknown): boolean =>
+  typeof value === "string" &&
+  Object.prototype.hasOwnProperty.call(nativeReasoningEfforts, value);
+
+/**
+ * Return whether the catalog declaration actually exposes native graded
+ * effort. Canonical support/control fields outrank residual legacy values;
+ * boolean/budget controls and Codex-only Ultra cannot invent an effort ladder.
+ */
+export function codexCatalogRowHasReasoningEffort(
+  row: Pick<CodexCatalogModel, "reasoning">,
+): boolean {
+  const declaration = row.reasoning;
+  if (
+    !declaration ||
+    typeof declaration !== "object" ||
+    Array.isArray(declaration)
+  )
+    return false;
+  // Older catalog declarations could omit support/control fields altogether.
+  // Preserve that declaration-only compatibility for this inclusion filter;
+  // the shared normalizer still gives every explicit canonical status priority.
+  const capability = normalizeCodexReasoning({
+    ...declaration,
+    supported: declaration.supported ?? true,
+  }) as CodexModelReasoningCapability;
+  if (
+    capability.supportStatus !== "confirmed_supported" ||
+    capability.controlKind !== "graded" ||
+    !["string", "reasoning_object"].includes(capability.upstream?.format) ||
+    !["reasoning_effort", "reasoning.effort"].includes(
+      capability.upstream?.parameter,
+    )
+  ) {
+    return false;
+  }
+  const efforts = capability.supportedEfforts;
+  return (
+    Array.isArray(efforts) &&
+    efforts.every(
+      (effort) => effort === "none" || isNativeReasoningEffort(effort),
+    ) &&
+    efforts.some(isNativeReasoningEffort)
+  );
+}
+
+/**
+ * Enable exactly the catalog rows that advertise a reasoning effort while
+ * retaining every row (including excluded inventory) for later editing.
+ */
+export function selectOnlyCodexCatalogRowsWithReasoningEffort<
+  T extends CodexCatalogModel,
+>(rows: readonly T[]): Array<T & { enabled: boolean }> {
+  return rows.map((row) => ({
+    ...row,
+    enabled: codexCatalogRowHasReasoningEffort(row),
+  }));
 }
 
 function missingCapabilityPatch(

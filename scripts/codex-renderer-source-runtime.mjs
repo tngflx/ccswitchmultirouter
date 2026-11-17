@@ -6,29 +6,60 @@ const resources = new URL(
   "../src-tauri/src/resources/codex_desktop/",
   import.meta.url,
 );
-const fragments = [
-  ["CATALOG_PAYLOAD_SELECTION", "catalog_payload_selection.js"],
-  ["MODEL_PICKER_RELEASE", "model_picker_release.js"],
-  ["QUERY_CACHE_LIFECYCLE", "model_picker_cache_lifecycle.js"],
-  ["MODEL_PATCH", "model_picker_core.js"],
-  ["GUARDIAN_V2_PATCH", "guardian_v2_compatibility.js"],
-  ["REQUEST_NORMALIZATION", "app_server_request_normalization.js"],
-  ["HISTORY_LINEAGE_HYDRATION", "history_lineage_hydration.js"],
-  ["MODULE_CLIENT_DISCOVERY", "client_discovery.js"],
-  ["WEBPACK_DISCOVERY", "webpack_discovery.js"],
-  ["NATIVE_REASONING_VISIBILITY", "native_reasoning_visibility.js"],
-  ["MODEL_PICKER_DIAGNOSTICS", "model_picker_diagnostics.js"],
-  ["REQUEST_HEALTH_WARNING", "request_health_warning.js"],
-  ["SUMMARY_HANDOFF", "summary_handoff.js"],
-  ["CODEX_CONTINUATION", "continuation.js"],
-  ["APP_SERVER_MODEL_LIST_SCOPE", "app_server_model_list_scope.js"],
-];
+// The Rust injector is the assembly authority. Derive the audit's slots,
+// order and resources from its declarations instead of maintaining another list.
+// Fail closed on an unfamiliar assembly shape so an audit cannot silently test
+// a different renderer from the program the desktop actually injects.
+export const readRustRendererFragments = (rust, renderer) => {
+  const assembly = rust.match(
+    /fn assemble_codex_renderer_runtime_script\([\s\S]*?\n}\r?\n/,
+  )?.[0];
+  assert.ok(assembly, "Rust renderer assembly not found");
+  const bindings = new Map();
+  for (const match of assembly.matchAll(
+    /let (\w+)\s*=\s*(?:include_str!\("resources\/codex_desktop\/([^"]+)"\)|([\w]+)\([^;]*?\));/g,
+  )) {
+    let file = match[2];
+    if (!file) {
+      const helper = rust.match(new RegExp(`fn ${match[3]}\\([^]*?\\n}`))?.[0];
+      file = helper?.match(
+        /include_str!\("resources\/codex_desktop\/([^"]+)"\)/,
+      )?.[1];
+    }
+    assert.ok(file, `Rust renderer resource not found: ${match[1]}`);
+    bindings.set(match[1], file);
+  }
+  const fragments = [
+    ...assembly.matchAll(
+      /\.replace\(\s*"\/\*__CCSWITCH_(\w+)_CORE__\*\/",\s*&?(\w+),?\s*\)/g,
+    ),
+  ].map((match) => {
+    const file = bindings.get(match[2]);
+    assert.ok(file, `Rust renderer slot resource not found: ${match[1]}`);
+    return [match[1], file];
+  });
+  const slots = [...renderer.matchAll(/\/\*__CCSWITCH_(\w+)_CORE__\*\//g)].map(
+    (match) => match[1],
+  );
+  assert.equal(new Set(slots).size, slots.length, "Duplicate renderer slots");
+  assert.equal(
+    new Set(fragments.map(([slot]) => slot)).size,
+    fragments.length,
+    "Duplicate Rust renderer replacements",
+  );
+  assert.deepEqual(
+    fragments.map(([slot]) => slot).sort(),
+    [...slots].sort(),
+    "Rust renderer replacements must cover every resource slot exactly once",
+  );
+  return fragments;
+};
 
 // Read the maintained Rust prompt's literal pieces so this verification path
 // cannot silently install a different summary workflow or fingerprint.
 const rustString = (value) => JSON.parse(`"${value}"`);
 export const loadCodexRendererSourceRuntime = async () => {
-  const [renderer, rust, terminalPolicy, ...sources] = await Promise.all([
+  const [renderer, rust, terminalPolicy] = await Promise.all([
     readFile(new URL("renderer_runtime.js", resources), "utf8"),
     readFile(
       new URL("../src-tauri/src/codex_desktop.rs", import.meta.url),
@@ -41,8 +72,11 @@ export const loadCodexRendererSourceRuntime = async () => {
       ),
       "utf8",
     ),
-    ...fragments.map(([, file]) => readFile(new URL(file, resources), "utf8")),
   ]);
+  const fragments = readRustRendererFragments(rust, renderer);
+  const sources = await Promise.all(
+    fragments.map(([, file]) => readFile(new URL(file, resources), "utf8")),
+  );
   const constants = new Map();
   for (const name of [
     "MANUAL_SUMMARY_REQUEST_MARKER",

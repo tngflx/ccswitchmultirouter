@@ -16,12 +16,22 @@ import { spawnDevRecoveryProcess } from "./dev-recovery-output.mjs";
 
 const helperUrl = new URL("./dev-recovery-output.mjs", import.meta.url).href;
 
-function fixture(context) {
+function fixture(context, { removeDirectory = rmSync } = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "ccsm-dev-output-"));
   const cleanupWaiters = [];
   context.after(async () => {
     for (const waiter of cleanupWaiters) await waiter();
-    rmSync(directory, { recursive: true, force: true });
+    // On Windows, kernel/AV handles can briefly outlive process termination.
+    // Retry only bounded removal of this fixture's exact temporary directory;
+    // never replace the owned-exit waiter or suppress a persistent failure.
+    assert.equal(path.dirname(directory), path.resolve(os.tmpdir()));
+    assert.equal(path.basename(directory).startsWith("ccsm-dev-output-"), true);
+    removeDirectory(directory, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 50,
+    });
   });
   return {
     directory,
@@ -29,6 +39,42 @@ function fixture(context) {
     waitForCleanup: (waiter) => cleanupWaiters.push(waiter),
   };
 }
+
+test("fixture cleanup awaits owned exits and bounds transient Windows handle-release retries", async () => {
+  let after;
+  const events = [];
+  const f = fixture(
+    {
+      after: (action) => {
+        after = action;
+      },
+    },
+    {
+      removeDirectory(directory, options) {
+        events.push("remove");
+        assert.equal(path.dirname(directory), path.resolve(os.tmpdir()));
+        assert.equal(
+          path.basename(directory).startsWith("ccsm-dev-output-"),
+          true,
+        );
+        assert.deepEqual(options, {
+          recursive: true,
+          force: true,
+          maxRetries: 10,
+          retryDelay: 50,
+        });
+        rmSync(directory, options);
+      },
+    },
+  );
+  f.waitForCleanup(async () => {
+    await new Promise((resolve) => setImmediate(resolve));
+    events.push("owned-exit");
+  });
+  await after();
+  assert.deepEqual(events, ["owned-exit", "remove"]);
+  assert.equal(existsSync(f.directory), false);
+});
 
 function fakeChild() {
   const child = new EventEmitter();

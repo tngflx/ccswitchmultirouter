@@ -7,6 +7,41 @@ const safeCount = (value: unknown): number =>
     ? value
     : 0;
 
+const verificationIssueKeys = {
+  runtime_not_current: "runtimeNotCurrent",
+  catalog_unavailable: "catalogUnavailable",
+  diagnostics_unavailable: "diagnosticsUnavailable",
+  observer_not_found: "observerNotFound",
+  observer_pending: "observerPending",
+  observer_error: "observerError",
+  observer_unsupported: "observerUnsupported",
+  observer_unreadable: "observerUnreadable",
+  native_visibility_unverified: "nativeVisibilityUnverified",
+  boolean_control_unverified: "booleanControlUnverified",
+  effort_mismatch: "effortMismatch",
+  flag_mismatch: "flagMismatch",
+} as const;
+
+type VerificationIssue = keyof typeof verificationIssueKeys;
+
+const isVerificationIssue = (value: unknown): value is VerificationIssue =>
+  typeof value === "string" &&
+  Object.prototype.hasOwnProperty.call(verificationIssueKeys, value);
+
+const diagnosticCountKeys = {
+  errorObserverCount: "errorQueries",
+  pendingObserverCount: "pendingQueries",
+  unsupportedObserverCount: "unsupportedQueries",
+  unreadableObserverCount: "unreadableQueries",
+  nativeVisibilityUnverifiedObserverCount: "nativeVisibilityCount",
+  booleanControlUnverifiedModelCount: "booleanUnverifiedCount",
+  booleanControlReadyModelCount: "booleanReadyCount",
+  effortMismatchCount: "effortMismatchCount",
+  flagMismatchCount: "flagMismatchCount",
+  missingMaxModelCount: "missingMaxCount",
+  missingUltraModelCount: "missingUltraCount",
+} as const;
+
 /** Installation and live picker verification are intentionally distinct. */
 export function ModelPickerGuardianStatus({
   status,
@@ -42,6 +77,23 @@ export function ModelPickerGuardianStatus({
             ? "ready"
             : observedLabel;
 
+  // Never retain diagnostic evidence after the runtime loses currentness.
+  const diagnostics = current ? status.pickerDiagnostics : null;
+  const verificationIssues =
+    current && !ready && Array.isArray(status.pickerVerificationIssues)
+      ? [
+          ...new Set(
+            status.pickerVerificationIssues.filter(isVerificationIssue),
+          ),
+        ]
+      : [];
+  const showMissingEvidence =
+    current &&
+    !ready &&
+    status.pickerStatus !== "not_required" &&
+    !diagnostics &&
+    verificationIssues.length === 0;
+
   return (
     <div
       role="status"
@@ -70,6 +122,38 @@ export function ModelPickerGuardianStatus({
         {t("modelPickerGuardian.title")} · {t(`modelPickerGuardian.${label}`)}
       </div>
       <div className="mt-1">{status.message}</div>
+      {verificationIssues.length > 0 && (
+        <ul className="mt-1 list-disc space-y-0.5 pl-4">
+          {verificationIssues.map((issue) => (
+            <li key={issue}>
+              {t(`modelPickerGuardian.issues.${verificationIssueKeys[issue]}`)}
+            </li>
+          ))}
+        </ul>
+      )}
+      {showMissingEvidence && (
+        <div className="mt-1">{t("modelPickerGuardian.missingEvidence")}</div>
+      )}
+      {diagnostics && (
+        <div className="mt-1 flex flex-wrap gap-x-3 font-mono text-[11px] opacity-80">
+          <span>
+            {t("modelPickerGuardian.queries", {
+              successful: safeCount(diagnostics.successObserverCount),
+              total: safeCount(diagnostics.pickerObserverCount),
+            })}
+          </span>
+          {Object.entries(diagnosticCountKeys).map(([key, labelKey]) => {
+            const count = safeCount(
+              diagnostics[key as keyof typeof diagnosticCountKeys],
+            );
+            return count > 0 ? (
+              <span key={key}>
+                {t(`modelPickerGuardian.${labelKey}`, { count })}
+              </span>
+            ) : null;
+          })}
+        </div>
+      )}
       <div className="mt-1 font-mono text-[11px] opacity-80">
         {t("modelPickerGuardian.runtime", {
           running: t(

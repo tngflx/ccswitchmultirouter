@@ -27,10 +27,7 @@ import {
   fileSha256,
   tauriNsisPayloadHash,
   guardianIteration,
-  guardianUncleanExit,
-  guardianRestartBudget,
   guardianSafeIteration,
-  guardianRecovery,
 } from "./ccswitchmulti-guardian-core.mjs";
 
 const START = "2026-10-21T12:01:15.7130461Z";
@@ -159,130 +156,6 @@ test("FILETIME numeric source retains exact 100ns identity beyond Number precisi
   assert.throws(
     () => utcTicks("2026-02-30T12:00:00Z"),
     /Invalid UTC timestamp/,
-  );
-});
-
-test("a missing clean-exit marker does not authorize production restart", async (t) => {
-  const { root } = fixture(t);
-  assert.equal(
-    await guardianUncleanExit({
-      configPath: root,
-      expectedExecutable: installed,
-      getProcessIdentity: async () => null,
-    }),
-    false,
-  );
-});
-
-for (const variant of ["string", "numeric"]) {
-  test(`matching ${variant} FILETIME marker keeps exact original process alive`, async (t) => {
-    const f = fixture(t);
-    f.writeMarker();
-    if (variant === "numeric")
-      f.write(
-        "logs/app-run-marker.json",
-        `{"pid":42,"executablePath":${JSON.stringify(installed)},"processStartedAtTicks":${FILETIME}}`,
-      );
-    assert.equal(
-      await guardianUncleanExit({
-        configPath: f.root,
-        expectedExecutable: installed,
-        getProcessIdentity: async () => identity,
-      }),
-      false,
-    );
-  });
-}
-
-for (const [name, observed] of [
-  [
-    "one FILETIME tick of PID reuse",
-    { ...identity, StartTimeUtc: "2026-10-21T12:01:15.7130462Z" },
-  ],
-  ["a different executable", { ...identity, Path: "C:\\Other\\cc-switch.exe" }],
-  ["a different PID", { ...identity, ProcessId: 43 }],
-  ["a disappeared process", null],
-]) {
-  test(`production crash marker authorizes recovery after ${name}`, async (t) => {
-    const f = fixture(t);
-    f.writeMarker();
-    assert.equal(
-      await guardianUncleanExit({
-        configPath: f.root,
-        expectedExecutable: installed,
-        getProcessIdentity: async () => observed,
-      }),
-      true,
-    );
-  });
-}
-
-test("a development crash marker cannot authorize installed recovery", async (t) => {
-  const f = fixture(t);
-  f.writeMarker({
-    executablePath: "C:\\repo\\src-tauri\\target\\debug\\cc-switch.exe",
-  });
-  assert.equal(
-    await guardianUncleanExit({
-      configPath: f.root,
-      expectedExecutable: installed,
-      getProcessIdentity: async () => null,
-    }),
-    false,
-  );
-});
-
-for (const fields of [
-  { processStartedAtTicks: null },
-  { processStartedAtTicks: "-1" },
-  { processStartedAtTicks: "bad" },
-  { processStartedAtTicks: "999999999999999999999999" },
-  { executablePath: "relative.exe" },
-  { executablePath: "\\relative.exe" },
-  { pid: "42" },
-]) {
-  test(`malformed modern crash identity blocks restart: ${JSON.stringify(fields)}`, async (t) => {
-    const f = fixture(t);
-    f.writeMarker(fields);
-    assert.equal(
-      await guardianUncleanExit({
-        configPath: f.root,
-        expectedExecutable: installed,
-        getProcessIdentity: async () => null,
-      }),
-      false,
-    );
-  });
-}
-
-test("PID-only markers preserve conservative legacy behavior", async (t) => {
-  const f = fixture(t);
-  f.write("logs/app-run-marker.json", { pid: 42 });
-  assert.equal(
-    await guardianUncleanExit({
-      configPath: f.root,
-      getProcessIdentity: async () => identity,
-    }),
-    false,
-  );
-  assert.equal(
-    await guardianUncleanExit({
-      configPath: f.root,
-      getProcessIdentity: async () => null,
-    }),
-    true,
-  );
-});
-
-test("a drive-relative modern marker cannot authorize recovery without an expected path", async (t) => {
-  const f = fixture(t);
-  f.writeMarker({ executablePath: "\\relative.exe" });
-  assert.equal(
-    await guardianUncleanExit({
-      configPath: f.root,
-      getProcessIdentity: async () => null,
-    }),
-    false,
   );
 });
 
@@ -708,113 +581,12 @@ test("one failed iteration is redacted and does not terminate following iteratio
   assert.deepEqual(events, [["error", "iteration-failed", null]]);
 });
 
-test("production budget includes the exact window boundary and blocks invalid limits", () => {
-  assert.equal(
-    guardianRestartBudget({
-      restartTimesUtc: [new Date(NOW_MS - 1_800_000)],
-      nowUtc: NOW,
-      windowMinutes: 30,
-      maxRestarts: 1,
-    }),
-    false,
-  );
-  assert.equal(
-    guardianRestartBudget({
-      restartTimesUtc: [new Date(NOW_MS - 1_800_001)],
-      nowUtc: NOW,
-      windowMinutes: 30,
-      maxRestarts: 1,
-    }),
-    true,
-  );
-  assert.equal(
-    guardianRestartBudget({
-      restartTimesUtc: [],
-      nowUtc: NOW,
-      windowMinutes: 0,
-      maxRestarts: 1,
-    }),
-    false,
-  );
-});
-
-function recoveryOptions(overrides = {}) {
-  const calls = [];
-  const events = [];
-  return {
-    calls,
-    events,
-    options: {
-      installedExecutable: installed,
-      isMaintenance: async () => false,
-      installedExecutableExists: async () => true,
-      getListenerOwner: async () => 42,
-      getProcessIdentity: async () => identity,
-      isExpectedProductIdentity: async (value) =>
-        samePath(value.Path, installed),
-      getExpectedProductProcesses: async () => [
-        identity,
-        { ...identity, ProcessId: 43 },
-      ],
-      stopVerifiedProductProcess: async (value) =>
-        calls.push(`stop:${value.ProcessId}`),
-      waitPortFree: async () => {
-        calls.push("port-free");
-        return true;
-      },
-      startProduct: async () => {
-        calls.push("start");
-        return 99;
-      },
-      waitReady: async (pid) => {
-        calls.push(`ready:${pid}`);
-        return true;
-      },
-      writeEvent: async (...event) => events.push(event),
-      ...overrides,
-    },
-  };
-}
-
-test("production recovery blocks a foreign listener without stopping or starting processes", async () => {
-  const f = recoveryOptions({
-    getProcessIdentity: async () => ({
-      ...identity,
-      Path: "C:\\Foreign\\app.exe",
-    }),
-  });
-  await guardianRecovery(f.options);
-  assert.deepEqual(f.calls, []);
-  assert.equal(f.events.at(-1)[1], "foreign-listener-blocked-recovery");
-});
-
-test("production recovery stops each verified stale owner once then waits before launch", async () => {
-  const f = recoveryOptions();
-  await guardianRecovery(f.options);
-  assert.deepEqual(f.calls, [
-    "stop:42",
-    "stop:43",
-    "port-free",
-    "start",
-    "ready:99",
-  ]);
-  assert.equal(f.events.at(-1)[1], "recovery-ready");
-});
-
-test("failed production readiness is reported without claiming ready", async () => {
-  const f = recoveryOptions({ waitReady: async () => false });
-  await guardianRecovery(f.options);
-  assert.deepEqual(f.events.at(-1), [
-    "error",
-    "recovery-not-ready",
-    { ProcessId: 99 },
-  ]);
-});
-
-test("maintenance activated during port release prevents product relaunch", async () => {
-  let checks = 0;
-  const f = recoveryOptions({ isMaintenance: async () => ++checks > 1 });
-  await guardianRecovery(f.options);
-  assert.deepEqual(f.calls, ["stop:42", "stop:43", "port-free"]);
-  assert.equal(f.events.at(-1)[1], "recovery-deferred-maintenance");
+test("retired guardian core cannot export an independent production recovery engine or budget", async () => {
+  const exports = await import("./ccswitchmulti-guardian-core.mjs");
+  for (const name of [
+    "guardianRecovery",
+    "guardianRestartBudget",
+    "guardianUncleanExit",
+  ])
+    assert.equal(Object.hasOwn(exports, name), false, name);
 });

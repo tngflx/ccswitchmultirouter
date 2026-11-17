@@ -203,6 +203,13 @@ function explicitPlatform(
   );
 }
 
+/** Manual wire defaults require the actual API transport, never a display label. */
+export function isOpenRouterReasoningTransport(
+  identity?: CodexReasoningProviderIdentity | null,
+): boolean {
+  return transportPlatform(identity?.baseUrl) === "openrouter";
+}
+
 /** Explicit transport takes priority over stale capability provenance. */
 export function isSublyxReasoningProvider(
   source?: string | null,
@@ -231,27 +238,29 @@ export function usesSublyxGptReasoningContract(
   );
 }
 
-/** Keep explicit native-max evidence authoritative, as the backend resolver does. */
-export function hasExplicitSublyxNativeMaxEvidence(
+/** Explicit manual overrides are distinct from scoped automatic detections. */
+export function hasExplicitSublyxNativeEvidence(
   capability: CodexModelReasoningCapability,
 ): boolean {
   if (
     !(
       capability.source == null ||
-      [
-        "user",
-        "user_confirmed_detection",
-        "openrouter_api",
-        "detection",
-      ].includes(capability.source)
+      ["user", "user_confirmed_detection"].includes(capability.source) ||
+      (capability.source === "provider_config" &&
+        capability.confidence === "authoritative")
     ) ||
-    capability.upstream.effortMap?.max !== "max"
+    (capability.supportStatus !== undefined &&
+      capability.supported !== undefined &&
+      capability.supportStatus !==
+        (capability.supported
+          ? "confirmed_supported"
+          : "confirmed_unsupported"))
   )
     return false;
 
   // The backend validates native declarations before preserving their
   // evidence. Do not let an old native `ultra` or orphaned mapping bypass
-  // maintained repair just because it also contains max -> max. Missing
+  // maintained repair merely because its source is manual. Missing
   // identity entries remain valid here; save/runtime boundaries complete them.
   const nativeEfforts: CodexReasoningEffort[] = [
     "none",
@@ -290,7 +299,7 @@ export function hasExplicitSublyxNativeMaxEvidence(
         "none",
       ].includes(upstreamParameter)
     ) ||
-    !Array.isArray(capability.supportedEfforts) ||
+    capability.supportedEfforts.length === 0 ||
     capability.supportedEfforts.some(
       (effort) => !nativeEfforts.includes(effort),
     ) ||
@@ -298,11 +307,7 @@ export function hasExplicitSublyxNativeMaxEvidence(
       !capability.supportedEfforts.includes(capability.defaultEffort)) ||
     (!capability.disableAllowed &&
       capability.supportedEfforts.includes("none")) ||
-    (capability.supportStatus !== undefined &&
-      capability.supported !== undefined &&
-      (capability.supportStatus === "confirmed_supported") !==
-        capability.supported) ||
-    Object.entries(capability.upstream.effortMap).some(
+    Object.entries(capability.upstream.effortMap ?? {}).some(
       ([source, target]) =>
         !nativeEfforts.includes(source as CodexReasoningEffort) ||
         !nativeEfforts.includes(target as CodexReasoningEffort) ||
@@ -312,11 +317,131 @@ export function hasExplicitSublyxNativeMaxEvidence(
     return false;
   const ultraTarget =
     capability.codexUltraOrchestration?.providerEffort ??
-    capability.upstream.effortMap.max;
+    capability.upstream.effortMap?.max;
   return (
     !capability.codexUltraOrchestration?.enabled ||
-    capability.supportedEfforts.includes(ultraTarget)
+    (ultraTarget !== undefined &&
+      capability.supportedEfforts.includes(ultraTarget))
   );
+}
+
+/** The provider-scoped fallback also owns legacy overlay migration. */
+function maintainedSublyxNativeEfforts(model: string): CodexReasoningEffort[] {
+  const canonicalModel = model
+    .trim()
+    .toLowerCase()
+    .replace(/-sublyx$/, "");
+  // Exact accepted-and-echoed audit rows plus the maintained native models.
+  // An unknown GPT slug does not inherit Max merely from the family name.
+  const knownNativeMaxModels = [
+    "gpt-5.6-terra",
+    "gpt-5.6-sol",
+    "gpt-5.6-luna",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+  ];
+  const supportsNativeMax = knownNativeMaxModels.some(
+    (known) =>
+      canonicalModel === known || canonicalModel.startsWith(`${known}-`),
+  );
+  return [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    ...(supportsNativeMax ? (["max"] as CodexReasoningEffort[]) : []),
+  ];
+}
+
+/**
+ * Preserve only the validated native evidence accepted by the Rust resolver.
+ * Catalog reads normalize the wire tokens and complete identity mappings before
+ * that check; provider labels or a higher-looking confidence are not substitutes
+ * for a verified detection bound to the exact current wire model.
+ */
+function verifiedSublyxNativeEvidence(
+  model: string,
+  capability: CodexModelReasoningCapability,
+): CodexModelReasoningCapability | undefined {
+  const format = capability.upstream.format.trim().toLowerCase();
+  const parameter = capability.upstream.parameter.trim().toLowerCase();
+  if (
+    capability.source !== "detection" ||
+    capability.confidence !== "verified" ||
+    capability.evidenceScope?.model?.toLowerCase() !==
+      model.trim().toLowerCase() ||
+    format !== "reasoning_object" ||
+    parameter !== "reasoning.effort"
+  )
+    return undefined;
+
+  const nativeEfforts = new Set<CodexReasoningEffort>([
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+  ]);
+  const efforts = capability.supportedEfforts;
+  const effortMap = { ...capability.upstream.effortMap };
+  for (const effort of efforts) {
+    if (effort !== "none" && effortMap[effort] === undefined)
+      effortMap[effort] = effort;
+  }
+  const ultra = capability.codexUltraOrchestration;
+  const declaredUltraTarget = ultra?.providerEffort ?? effortMap.max;
+  // Match the backend's validation boundary before preserving a detection.
+  // Invalid drafts may still use the existing maintained-contract migration,
+  // but must never masquerade as authoritative native evidence.
+  if (
+    efforts.length === 0 ||
+    efforts.some((effort) => !nativeEfforts.has(effort)) ||
+    (capability.supportStatus !== undefined &&
+      capability.supported === false) ||
+    (capability.defaultEffort !== undefined &&
+      !efforts.includes(capability.defaultEffort)) ||
+    (!capability.disableAllowed && efforts.includes("none")) ||
+    Object.entries(effortMap).some(
+      ([source, target]) =>
+        !nativeEfforts.has(source as CodexReasoningEffort) ||
+        !nativeEfforts.has(target) ||
+        !efforts.includes(target),
+    ) ||
+    (ultra?.enabled &&
+      (!declaredUltraTarget || !efforts.includes(declaredUltraTarget)))
+  )
+    return undefined;
+
+  // Ultra is a separate product overlay, not an alias for native Max.
+  const defaultUltraTarget: CodexReasoningEffort | undefined = efforts.includes(
+    "xhigh",
+  )
+    ? "xhigh"
+    : efforts.includes("max")
+      ? "max"
+      : undefined;
+  const normalizedUltra: CodexModelReasoningCapability["codexUltraOrchestration"] =
+    ultra
+      ? { ...ultra }
+      : defaultUltraTarget
+        ? { enabled: true, providerEffort: defaultUltraTarget }
+        : undefined;
+  return {
+    ...capability,
+    supportedEfforts: [...efforts],
+    upstream: {
+      ...capability.upstream,
+      format: "reasoning_object",
+      parameter: "reasoning.effort",
+      effortMap,
+    },
+    ...(normalizedUltra ? { codexUltraOrchestration: normalizedUltra } : {}),
+  };
 }
 
 /**
@@ -342,27 +467,52 @@ export function normalizeCodexReasoningCapabilityForProvider(
     !usesSublyxGptReasoningContract(model, identity, capability)
   )
     return capability;
-  if (hasExplicitSublyxNativeMaxEvidence(capability)) return capability;
+  // A current scoped detection is validated before any manual migration.
+  // Automatic evidence must never bypass its model/confidence checks merely
+  // because their source once matched a provider label.
+  const verifiedEvidence = verifiedSublyxNativeEvidence(model, capability);
+  if (verifiedEvidence) return verifiedEvidence;
+  if (hasExplicitSublyxNativeEvidence(capability)) return capability;
 
-  const nativeEfforts: CodexReasoningEffort[] = [
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-  ];
   const savedDefault = capability.defaultEffort?.trim().toLowerCase();
-  const defaultEffort: CodexReasoningEffort =
-    savedDefault === "ultra"
-      ? "xhigh"
-      : nativeEfforts.includes(savedDefault as CodexReasoningEffort)
-        ? (savedDefault as CodexReasoningEffort)
-        : "medium";
-  const savedUltraTarget = capability.codexUltraOrchestration?.providerEffort;
+  const nativeEfforts = maintainedSublyxNativeEfforts(model);
+  // Only the maintained migration path uses the family allowlist; verified
+  // native evidence returned above is never broadened or downgraded by it.
+  const acceptsNativeMax = nativeEfforts.includes("max");
+  const defaultUltraTarget: CodexReasoningEffort = nativeEfforts.includes(
+    "xhigh",
+  )
+    ? "xhigh"
+    : "max";
+  // Preserve a valid explicitly saved target, including the legacy mapped
+  // target. Only an absent/invalid overlay uses the maintained product default;
+  // native Max remains independently selectable and is never downgraded.
+  const savedUltraTarget =
+    capability.codexUltraOrchestration?.providerEffort ??
+    (capability.codexUltraOrchestration?.enabled
+      ? capability.upstream.effortMap?.max
+      : undefined);
   const ultraTarget =
     savedUltraTarget && nativeEfforts.includes(savedUltraTarget)
       ? savedUltraTarget
-      : "xhigh";
+      : defaultUltraTarget;
+  const normalizedSavedDefault: CodexReasoningEffort | undefined =
+    savedDefault === "ultra"
+      ? ultraTarget
+      : savedDefault === "max" && !acceptsNativeMax
+        ? "xhigh"
+        : (savedDefault as CodexReasoningEffort | undefined);
+  const defaultEffort: CodexReasoningEffort =
+    normalizedSavedDefault &&
+    nativeEfforts.includes(normalizedSavedDefault as CodexReasoningEffort)
+      ? (normalizedSavedDefault as CodexReasoningEffort)
+      : nativeEfforts.includes("medium")
+        ? "medium"
+        : nativeEfforts[0];
+  const effortMap = Object.fromEntries(
+    nativeEfforts.map((effort) => [effort, effort]),
+  ) as Partial<Record<CodexReasoningEffort, CodexReasoningEffort>>;
+
   const canonical = { ...capability };
   delete canonical.supported;
   return {
@@ -377,13 +527,7 @@ export function normalizeCodexReasoningCapabilityForProvider(
     upstream: {
       format: "reasoning_object",
       parameter: "reasoning.effort",
-      effortMap: {
-        low: "low",
-        medium: "medium",
-        high: "high",
-        xhigh: "xhigh",
-        max: "max",
-      },
+      effortMap,
     },
     codexUltraOrchestration: {
       enabled: capability.codexUltraOrchestration?.enabled ?? true,
@@ -400,20 +544,27 @@ export function normalizeCodexCatalogReasoningForProvider<
     row.upstreamModel?.trim() || row.upstream_model?.trim() || row.model;
   if (!usesSublyxGptReasoningContract(model, identity, row.reasoning))
     return row;
+  const normalizedReasoning = row.reasoning
+    ? normalizeCodexReasoningCapabilityForProvider(
+        model,
+        row.reasoning,
+        identity,
+      )
+    : undefined;
+  const nativeEfforts =
+    normalizedReasoning?.supportedEfforts ??
+    maintainedSublyxNativeEfforts(model);
   return {
     ...row,
-    ...(row.reasoning
+    ...(normalizedReasoning ? { reasoning: normalizedReasoning } : {}),
+    ...(row.codexUltra?.providerEffort &&
+    !nativeEfforts.includes(row.codexUltra.providerEffort) &&
+    (nativeEfforts.includes("xhigh") || nativeEfforts.includes("max"))
       ? {
-          reasoning: normalizeCodexReasoningCapabilityForProvider(
-            model,
-            row.reasoning,
-            identity,
-          ),
-        }
-      : {}),
-    ...(row.codexUltra?.providerEffort === "ultra"
-      ? {
-          codexUltra: { ...row.codexUltra, providerEffort: "xhigh" },
+          codexUltra: {
+            ...row.codexUltra,
+            providerEffort: nativeEfforts.includes("xhigh") ? "xhigh" : "max",
+          },
         }
       : {}),
   };

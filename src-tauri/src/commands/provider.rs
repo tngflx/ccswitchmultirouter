@@ -1239,6 +1239,17 @@ where
 
 #[tauri::command]
 #[allow(non_snake_case)]
+pub fn update_codex_subagent_policy(
+    state: State<'_, AppState>,
+    providerId: String,
+    patch: crate::services::provider::CodexSubagentPolicyPatch,
+) -> Result<crate::services::CodexSubagentV2MutationResult, String> {
+    ProviderService::update_codex_subagent_policy(state.inner(), &providerId, patch)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
 pub fn update_codex_subagent_v2(
     state: State<'_, AppState>,
     providerId: String,
@@ -3495,7 +3506,9 @@ mod codex_protocol_preflight_save_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn background_refresh_command_accepts_an_unchanged_source_snapshot() {
+        let _home = crate::config::TestHomeGuard::new();
         let db = Arc::new(Database::memory().unwrap());
         let state = AppState::new(db.clone());
         let original = api_declared_codex_provider("openai_responses");

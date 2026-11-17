@@ -51,7 +51,8 @@
         "installerHooks": "nsis/installer-hooks.nsh"
       },
       "wix": {
-        "template": "wix/per-user-main.wxs"
+        "template": "wix/per-user-main.wxs",
+        "enableElevatedUpdateTask": false
       }
     },
     "macOS": {

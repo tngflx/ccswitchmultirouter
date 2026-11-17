@@ -326,10 +326,19 @@ pub async fn send_request(
     let client = global_hyper_client();
     let resp = super::response_grace::await_with_response_grace(
         async {
-            client
-                .request(req)
-                .await
-                .map_err(|e| ProxyError::ForwardFailed(format!("上游请求失败: {e}")))
+            client.request(req).await.map_err(|error| {
+                if error.is_connect() {
+                    // Only a failed connection establishment proves that no
+                    // request body was dispatched and is safe to replay.
+                    ProxyError::ForwardFailed(format!("上游连接失败: {error}"))
+                } else {
+                    // Match the reqwest and raw-write paths: the upstream may
+                    // already have consumed the POST before the response ends.
+                    ProxyError::ResponsePending(format!(
+                        "上游请求发送或响应读取中断（请求可能已在处理中）: {error}"
+                    ))
+                }
+            })
         },
         timeout,
         super::response_grace::RESPONSE_PENDING_GRACE,
@@ -810,6 +819,32 @@ mod tests {
         assert!(buffered_with_content_type(Some("application/problem+json")).is_json());
         assert!(!buffered_with_content_type(Some("text/event-stream")).is_json());
         assert!(!buffered_with_content_type(None).is_json());
+    }
+
+    #[tokio::test]
+    async fn hyper_fallback_connect_failure_remains_safe_to_retry() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Keep a bound, non-listening socket so another fixture cannot claim
+        // the port while the client proves a connection-establishment failure.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let uri: http::Uri = format!("http://{}/fixture", socket.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let result = send_request(
+            uri,
+            "loopback-fixture",
+            http::Method::POST,
+            http::HeaderMap::new(),
+            http::Extensions::new(),
+            b"fixture-body".to_vec(),
+            std::time::Duration::from_secs(5),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProxyError::ForwardFailed(_))));
+        drop(socket);
     }
 
     #[tokio::test]

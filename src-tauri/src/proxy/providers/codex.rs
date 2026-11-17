@@ -3480,21 +3480,35 @@ pub fn resolve_codex_chat_reasoning_config(
     if codex_catalog_request_model_is_blocked(provider, &requested_model) {
         return None;
     }
-    // P1：单一 resolver 入口——用户模型级声明 > 检测候选（TTL）> 能力库 > 内置 > unknown。
-    // 请求路径只读 TTL 缓存，不发起网络请求；检测由 UI/目录层异步触发。
-    // 优先级：用户模型级声明 > 用户 provider 级显式声明（meta）> 检测/能力库/内置 > 推断。
+    // Compiled route aliases belong to the router's public namespace, not the
+    // target catalog. Resolve the canonical target row before mapping its native
+    // controls, while retaining the admission guard for both identities.
+    let capability_model = provider
+        .settings_config
+        .get("codexResolvedRouteId")
+        .and_then(|_| provider.settings_config.get("codexResolvedCanonicalModel"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(&requested_model);
+    if codex_catalog_request_model_is_blocked(provider, capability_model) {
+        return None;
+    }
+    // The shared resolver owns capability precedence across configuration,
+    // projections and requests. Legacy provider-wide transport metadata may
+    // supply a fallback, but cannot replace a current resolved model contract.
+    // Request-time detection remains a read-only TTL lookup; no network probe.
     let detection =
-        crate::reasoning_capabilities::current_detection_for_provider(provider, &requested_model);
+        crate::reasoning_capabilities::current_detection_for_provider(provider, capability_model);
     let resolved = crate::reasoning_capabilities::resolve_codex_model_capability(
         provider,
-        &requested_model,
+        capability_model,
         detection.as_ref(),
     );
     let inferred = infer_codex_chat_reasoning_config(provider, body);
 
-    // 1. 用户模型级声明最高优先级。
-    if resolved.source == crate::reasoning_capabilities::CapabilitySource::UserConfig {
-        let config = codex_chat_reasoning_config_from_capability(resolved.capability.unwrap());
+    if let Some(capability) = resolved.capability {
+        let config = codex_chat_reasoning_config_from_capability(capability);
         // Qwen/vLLM 输出预算安全下限与能力来源正交：能力派生配置同样需要。
         // 注意：这里只补预算下限，不纠正 thinking_param——能力声明是 thinking
         // 开关的权威来源，不得被推断覆盖（见 apply_qwen_vllm_safety_defaults）。
@@ -3504,7 +3518,8 @@ pub fn resolve_codex_chat_reasoning_config(
         });
     }
 
-    // 2. 用户 provider 级显式声明（meta）次之。
+    // Compatibility only: old provider-wide transport settings remain usable
+    // when the shared resolver has no current capability for this model.
     if let Some(config) = provider
         .meta
         .as_ref()
@@ -3519,16 +3534,7 @@ pub fn resolve_codex_chat_reasoning_config(
         });
     }
 
-    // 3. 检测/能力库/内置第三优先级。
-    if let Some(capability) = resolved.capability {
-        let config = codex_chat_reasoning_config_from_capability(capability);
-        return Some(match inferred {
-            Some(inferred) => apply_qwen_vllm_safety_defaults(config, &inferred),
-            None => config,
-        });
-    }
-
-    // 4. 平台/模型推断。
+    // Finally, conservative platform/model transport inference.
     inferred
 }
 
@@ -3625,21 +3631,38 @@ fn codex_chat_reasoning_config_from_capability(
     let resolved = super::codex_reasoning::resolve_subagent_reasoning_capability(Some(&capability));
     let has_efforts =
         resolved.support_kind == super::codex_reasoning::ReasoningSupportKind::EffortLevels;
+    let control_kind = capability.effective_control_kind();
     let boolean_thinking = capability.upstream.format == "boolean";
-    let reasoning_object = capability.upstream.format == "reasoning_object"
-        || capability.upstream.parameter == "reasoning.effort";
+    let has_no_declared_control = matches!(
+        control_kind,
+        super::codex_reasoning::ReasoningControlKind::None
+            | super::codex_reasoning::ReasoningControlKind::Unknown
+    );
+    let nested_reasoning_effort = matches!(
+        capability.upstream.format.as_str(),
+        "object" | "reasoning_object"
+    ) && capability.upstream.parameter == "reasoning.effort";
+    let openrouter_budget = control_kind == super::codex_reasoning::ReasoningControlKind::Budget
+        && capability.upstream.format == "budget"
+        && capability.upstream.parameter == "reasoning.max_tokens";
     let supported = capability.effective_support_status()
         == super::codex_reasoning::ReasoningSupportStatus::ConfirmedSupported;
     CodexChatReasoningConfig {
         supports_thinking: Some(supported),
         supports_effort: Some(has_efforts && !boolean_thinking),
-        thinking_param: Some(if boolean_thinking {
-            capability.upstream.parameter.clone()
-        } else if reasoning_object {
-            // Native Responses-style reasoning objects carry their own effort
-            // and disable controls. Do not add the separate Chat `thinking`
-            // object alongside them.
+        thinking_param: Some(if has_no_declared_control || nested_reasoning_effort {
+            // No-control declarations cannot invent a vendor switch. For the
+            // normalized reasoning object, effort (including declared `none`)
+            // already owns the complete control; a parallel `thinking` object
+            // belongs to a different upstream protocol.
             "none".to_string()
+        } else if boolean_thinking {
+            capability.upstream.parameter.clone()
+        } else if openrouter_budget {
+            // The documented reasoning object supports an independent boolean
+            // switch. Codex effort labels do not specify a token budget: never
+            // invent max_tokens values or emit a foreign `thinking` object.
+            "reasoning.enabled".to_string()
         } else if capability.disable_allowed {
             "thinking".to_string()
         } else {
@@ -8425,6 +8448,251 @@ wire_api = "chat"
     }
 
     #[test]
+    fn openrouter_wire_graded_capability_does_not_emit_vendor_thinking() {
+        let capability: super::super::codex_reasoning::CodexModelReasoningCapability =
+            serde_json::from_value(json!({
+                "schemaVersion": 2, "supportStatus": "confirmed_supported",
+                "controlKind": "graded", "supportedEfforts": ["none", "low", "high"],
+                "disableAllowed": true,
+                "upstream": {
+                    "format": "reasoning_object", "parameter": "reasoning.effort",
+                    "effortMap": {"none": "none", "low": "low", "high": "high"}
+                }
+            }))
+            .unwrap();
+        assert!(capability.validate().is_ok());
+        let config = codex_chat_reasoning_config_from_capability(capability);
+        assert_eq!(config.thinking_param.as_deref(), Some("none"));
+        for effort in ["low", "high", "none"] {
+            let result = super::super::transform_codex_chat::responses_to_chat_completions_with_reasoning(
+                json!({"model": "gateway/graded", "input": "hello", "reasoning": {"effort": effort}}),
+                Some(&config),
+            ).unwrap();
+            assert_eq!(result["reasoning"], json!({"effort": effort}));
+            assert!(result.get("thinking").is_none());
+            assert!(result.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn openrouter_wire_no_control_capability_does_not_invent_a_thinking_switch() {
+        for kind in ["none", "unknown"] {
+            let capability: super::super::codex_reasoning::CodexModelReasoningCapability =
+                serde_json::from_value(json!({
+                    "schemaVersion": 2, "supportStatus": "confirmed_supported",
+                    "controlKind": kind, "supportedEfforts": [], "disableAllowed": true,
+                    "upstream": {"format": "reasoning_object", "parameter": "reasoning.effort"}
+                }))
+                .unwrap();
+            assert!(capability.validate().is_ok());
+            let config = codex_chat_reasoning_config_from_capability(capability);
+            assert_eq!(config.thinking_param.as_deref(), Some("none"), "{kind}");
+            for effort in ["high", "none"] {
+                let result = super::super::transform_codex_chat::responses_to_chat_completions_with_reasoning(
+                    json!({"model": "openrouter/free", "input": "hello", "reasoning": {"effort": effort}}),
+                    Some(&config),
+                ).unwrap();
+                assert!(
+                    result.get("reasoning").is_none(),
+                    "{kind}: no declared wire control"
+                );
+                assert!(result.get("thinking").is_none(), "{kind}");
+                assert!(result.get("reasoning_effort").is_none(), "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn openrouter_wire_all_twenty_included_models_match_actual_request_contracts() {
+        use crate::proxy::providers::codex_reasoning::ReasoningControlKind;
+        use crate::reasoning_capabilities::provider_metadata::openrouter_reasoning_capability_from_model_entry;
+        let fixture: JsonValue = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures/codexIncludedModelReasoning.json"
+        )))
+        .unwrap();
+        let provider = fixture["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["key"] == "openrouter")
+            .unwrap();
+        let models = provider["models"].as_array().unwrap();
+        assert_eq!(
+            models.len(),
+            20,
+            "keep coverage exhaustive for the audited included set"
+        );
+        let mut tested = std::collections::HashSet::new();
+        for model in models {
+            let id = model["apiModel"]["id"].as_str().unwrap();
+            assert!(tested.insert(id));
+            let capability = openrouter_reasoning_capability_from_model_entry(&model["apiModel"])
+                .unwrap_or_else(|| panic!("{id}: public API declaration must parse"));
+            assert!(capability.validate().is_ok(), "{id}");
+            let kind = capability.effective_control_kind();
+            let disable_allowed = capability.disable_allowed;
+            let config = codex_chat_reasoning_config_from_capability(capability);
+            let mut requested_efforts = vec!["high".to_string()];
+            requested_efforts.extend(
+                model["expected"]["pickerEfforts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|effort| effort.as_str().unwrap().to_string()),
+            );
+            if disable_allowed {
+                requested_efforts.push("none".to_string());
+            }
+            requested_efforts.sort();
+            requested_efforts.dedup();
+            for effort in requested_efforts {
+                let result = super::super::transform_codex_chat::responses_to_chat_completions_with_reasoning(
+                    json!({"model": id, "input": "hello", "reasoning": {"effort": effort}}),
+                    Some(&config),
+                ).unwrap_or_else(|error| panic!("{id}: {effort}: {error}"));
+                for forbidden in [
+                    "thinking",
+                    "enable_thinking",
+                    "reasoning_effort",
+                    "reasoning.enabled",
+                    "reasoning.max_tokens",
+                ] {
+                    assert!(
+                        result.get(forbidden).is_none(),
+                        "{id}: {effort}: forbidden field {forbidden}"
+                    );
+                }
+                assert!(
+                    result.pointer("/reasoning/max_tokens").is_none(),
+                    "{id}: no invented budgets"
+                );
+                match kind {
+                    ReasoningControlKind::Graded => {
+                        let expected =
+                            super::super::transform_codex_chat::map_codex_reasoning_effort(
+                                &effort, &config,
+                            )
+                            .unwrap()
+                            .expect("graded mapping");
+                        assert_eq!(
+                            result["reasoning"],
+                            json!({"effort": expected}),
+                            "{id}: {effort}"
+                        );
+                    }
+                    ReasoningControlKind::Boolean | ReasoningControlKind::Budget => {
+                        assert_eq!(
+                            result["reasoning"],
+                            json!({"enabled": effort != "none"}),
+                            "{id}: {effort}"
+                        );
+                    }
+                    ReasoningControlKind::None | ReasoningControlKind::Unknown => {
+                        assert!(
+                            result.get("reasoning").is_none(),
+                            "{id}: no invented controls"
+                        );
+                    }
+                }
+            }
+            let result =
+                super::super::transform_codex_chat::responses_to_chat_completions_with_reasoning(
+                    json!({"model": id, "input": "hello"}),
+                    Some(&config),
+                )
+                .unwrap();
+            assert!(
+                result.get("reasoning").is_none(),
+                "{id}: retain unrequested upstream defaults"
+            );
+            assert!(
+                result.get("thinking").is_none(),
+                "{id}: no unrequested vendor field"
+            );
+            assert!(
+                result.get("max_tokens").is_none(),
+                "{id}: no invented output cap"
+            );
+            assert!(
+                result.get("max_completion_tokens").is_none(),
+                "{id}: no invented output cap"
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_wire_budget_does_not_invent_budget_or_generic_thinking_controls() {
+        for disable_allowed in [false, true] {
+            let capability: super::super::codex_reasoning::CodexModelReasoningCapability =
+                serde_json::from_value(json!({
+                    "schemaVersion": 2, "supportStatus": "confirmed_supported",
+                    "controlKind": "budget", "supportedEfforts": [],
+                    "disableAllowed": disable_allowed,
+                    "upstream": {"format": "budget", "parameter": "reasoning.max_tokens"}
+                }))
+                .unwrap();
+            assert!(capability.validate().is_ok());
+            let config = codex_chat_reasoning_config_from_capability(capability);
+            assert_eq!(config.thinking_param.as_deref(), Some("reasoning.enabled"));
+            assert_eq!(config.supports_effort, Some(false));
+            assert_eq!(config.effort_param.as_deref(), Some("none"));
+            assert_eq!(config.disable_contract, disable_allowed);
+            for effort in ["high", "none"] {
+                let input = json!({
+                    "model": "nvidia/nemotron-budget", "input": "hello",
+                    "reasoning": {"effort": effort}
+                });
+                let result = super::super::transform_codex_chat::responses_to_chat_completions_with_reasoning(
+                    input, Some(&config),
+                ).unwrap();
+                if effort == "none" && !disable_allowed {
+                    assert!(result.get("reasoning").is_none());
+                } else {
+                    assert_eq!(result["reasoning"], json!({"enabled": effort != "none"}));
+                }
+                assert!(result.pointer("/reasoning/max_tokens").is_none());
+                assert!(result.pointer("/reasoning/effort").is_none());
+                assert!(result.get("reasoning_effort").is_none());
+                assert!(result.get("thinking").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn openrouter_wire_changes_do_not_relabel_other_provider_controls() {
+        for (format, parameter, expected_thinking, expected_effort) in [
+            ("boolean", "enable_thinking", "enable_thinking", "none"),
+            ("boolean", "thinking", "thinking", "none"),
+            ("budget", "thinking_budget", "thinking", "none"),
+            ("string", "reasoning_effort", "thinking", "reasoning_effort"),
+        ] {
+            let graded = format == "string";
+            let capability: super::super::codex_reasoning::CodexModelReasoningCapability =
+                serde_json::from_value(json!({
+                    "schemaVersion": 2, "supportStatus": "confirmed_supported",
+                    "controlKind": if graded {"graded"} else if format == "budget" {"budget"} else {"boolean"},
+                    "supportedEfforts": if graded {json!(["high"])} else {json!([])},
+                    "disableAllowed": true,
+                    "upstream": {"format": format, "parameter": parameter, "effortMap": if graded {json!({"high": "high"})} else {json!({})}}
+                })).unwrap();
+            assert!(capability.validate().is_ok());
+            let config = codex_chat_reasoning_config_from_capability(capability);
+            assert_eq!(
+                config.thinking_param.as_deref(),
+                Some(expected_thinking),
+                "{parameter}"
+            );
+            assert_eq!(
+                config.effort_param.as_deref(),
+                Some(expected_effort),
+                "{parameter}"
+            );
+            assert_eq!(config.supports_effort, Some(graded), "{parameter}");
+        }
+    }
+
+    #[test]
     fn declared_glm_capability_drives_request_mapping_config() {
         let provider = create_provider(json!({
             "modelCatalog": {"models": [{
@@ -8722,15 +8990,124 @@ wire_api = "chat"
     }
 
     #[test]
-    fn test_resolve_codex_chat_reasoning_explicit_meta_overrides_inference() {
+    fn canonical_reasoning_capabilities_override_legacy_transport_meta() {
+        use crate::proxy::providers::transform_codex_chat::{
+            map_codex_reasoning_effort, responses_to_chat_completions_with_reasoning,
+        };
+        use crate::reasoning_capabilities::CapabilitySource;
+
+        let inline_openrouter = r#"
+model_provider = "openrouter"
+model = "vendor/explicit-current"
+[model_providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+wire_api = "chat"
+[[model_providers.openrouter.models]]
+model = "vendor/explicit-current"
+[model_providers.openrouter.models.reasoning]
+schemaVersion = 2
+supportStatus = "confirmed_supported"
+controlKind = "graded"
+supportedEfforts = ["low", "high", "max"]
+defaultEffort = "high"
+disableAllowed = false
+[model_providers.openrouter.models.reasoning.upstream]
+format = "reasoning_object"
+parameter = "reasoning.effort"
+[model_providers.openrouter.models.reasoning.upstream.effortMap]
+low = "low"
+high = "high"
+max = "max"
+"#;
+        let cases = [
+            (
+                "vendor/explicit-current",
+                json!({"config": inline_openrouter}),
+                CapabilitySource::ProviderConfig,
+            ),
+            (
+                "glm-5.2",
+                json!({"base_url": "https://open.bigmodel.cn/api/coding/paas/v4"}),
+                CapabilitySource::Library,
+            ),
+            (
+                "deepseek-v4-flash-vision-exp",
+                json!({"base_url": "https://api.deepseek.com/v1"}),
+                CapabilitySource::Builtin,
+            ),
+            (
+                "gpt-6.1-sol",
+                json!({"base_url": "https://api.sublyx.org/v1"}),
+                CapabilitySource::ProviderFallback,
+            ),
+        ];
+        for (model, settings, expected_source) in cases {
+            let mut provider = create_provider(settings);
+            // This legacy provider-wide transport map predates current model
+            // evidence and would otherwise clamp native max to DeepSeek high.
+            provider.meta = Some(crate::provider::ProviderMeta {
+                codex_chat_reasoning: Some(CodexChatReasoningConfig {
+                    supports_thinking: Some(true),
+                    supports_effort: Some(true),
+                    thinking_param: Some("thinking".to_string()),
+                    effort_param: Some("reasoning_effort".to_string()),
+                    effort_value_mode: Some("deepseek".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let resolved = crate::reasoning_capabilities::resolve_codex_model_capability(
+                &provider, model, None,
+            );
+            assert_eq!(resolved.source, expected_source, "{model}");
+            let expected = codex_chat_reasoning_config_from_capability(
+                resolved.capability.expect("current model contract"),
+            );
+            let request = json!({"model": model, "input": "hello", "reasoning": {"effort": "max"}});
+            let actual = resolve_codex_chat_reasoning_config(&provider, &request)
+                .expect("canonical reasoning config");
+            assert_eq!(actual.effort_param, expected.effort_param, "{model}");
+            assert_eq!(actual.thinking_param, expected.thinking_param, "{model}");
+            assert_eq!(
+                actual.effort_value_mode, expected.effort_value_mode,
+                "{model}"
+            );
+            assert_eq!(
+                actual.disable_contract, expected.disable_contract,
+                "{model}"
+            );
+            assert_eq!(
+                map_codex_reasoning_effort("max", &actual).unwrap(),
+                Some("max"),
+                "{model}"
+            );
+            if expected_source == CapabilitySource::ProviderConfig {
+                let wire = responses_to_chat_completions_with_reasoning(request, Some(&actual))
+                    .expect("OpenRouter native effort object");
+                assert_eq!(wire["reasoning"], json!({"effort": "max"}));
+                assert!(wire.get("reasoning_effort").is_none());
+                assert!(wire.get("thinking").is_none());
+            } else if expected_source == CapabilitySource::ProviderFallback {
+                let mut native = request;
+                apply_codex_native_responses_reasoning_effort(&provider, &mut native)
+                    .expect("Sublyx native max remains native max");
+                assert_eq!(native["reasoning"], json!({"effort": "max"}));
+                assert!(native.get("thinking").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_codex_chat_reasoning_explicit_meta_falls_back_for_unknown_model() {
         let mut provider = create_provider(json!({
             "config": r#"
-model_provider = "deepseek"
-model = "deepseek-v4-pro"
+model_provider = "unknown_relay"
+model = "legacy-transport-only"
 
-[model_providers.deepseek]
-name = "DeepSeek"
-base_url = "https://api.deepseek.com"
+[model_providers.unknown_relay]
+name = "Unknown relay"
+base_url = "https://legacy-relay.example/v1"
 wire_api = "chat"
 "#
         }));
@@ -8749,9 +9126,16 @@ wire_api = "chat"
             ..Default::default()
         });
 
-        let config =
-            resolve_codex_chat_reasoning_config(&provider, &json!({ "model": "deepseek-v4-pro" }))
-                .unwrap();
+        let model = "legacy-transport-only";
+        let resolved =
+            crate::reasoning_capabilities::resolve_codex_model_capability(&provider, model, None);
+        assert_eq!(
+            resolved.source,
+            crate::reasoning_capabilities::CapabilitySource::Unknown
+        );
+        assert!(resolved.capability.is_none());
+        let config = resolve_codex_chat_reasoning_config(&provider, &json!({ "model": model }))
+            .expect("legacy transport remains a fallback for an unknown model");
 
         assert_eq!(config.supports_thinking, Some(false));
         assert_eq!(config.supports_effort, Some(false));
@@ -10962,5 +11346,29 @@ wire_api = "chat"
                 .expect("StepFun inference");
         assert_eq!(step_35.supports_effort, Some(false));
         assert_eq!(step_35.thinking_param.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn subagent_reasoning_effort_route_alias_uses_canonical_capability_without_reviving_exclusions()
+    {
+        let mut provider = create_provider(json!({
+            "base_url": "https://relay.example/v1", "codexResolvedRouteId": "graded", "codexResolvedCanonicalModel": "test-graded-model",
+            "modelCatalog": {"models": [{"model": "test-graded-model", "reasoning": {
+                "supported": true, "supportedEfforts": ["high", "max"], "defaultEffort": "max", "disableAllowed": false,
+                "upstream": {"format": "string", "parameter": "reasoning_effort", "effortMap": {"high": "high", "max": "max"}}
+            }}]}
+        }));
+        let request = json!({"model": "router-public-alias"});
+        let config = resolve_codex_chat_reasoning_config(&provider, &request)
+            .expect("route alias must retain target capability");
+        assert_eq!(config.supports_effort, Some(true));
+        provider.settings_config["modelCatalog"]["models"][0]["enabled"] = json!(false);
+        assert!(resolve_codex_chat_reasoning_config(&provider, &request).is_none());
+        provider.settings_config["modelCatalog"]["models"][0]["enabled"] = json!(true);
+        provider.settings_config["modelCatalog"]["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"model": "router-public-alias", "enabled": false}));
+        assert!(resolve_codex_chat_reasoning_config(&provider, &request).is_none());
     }
 }

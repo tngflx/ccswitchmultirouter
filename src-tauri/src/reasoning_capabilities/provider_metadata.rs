@@ -367,14 +367,15 @@ pub async fn discover_openrouter(provider: &Provider, model: &str) -> DiscoveryO
 /// Both discovery paths use the same normalization before building a snapshot.
 fn openrouter_reasoning_snapshot(entry: &Value) -> Option<ReasoningCapabilitySnapshot> {
     let capability = provider_reasoning_capability_from_model_entry(entry, true)?;
-    if capability.effective_support_status() != ReasoningSupportStatus::ConfirmedSupported {
-        return None;
-    }
     let object = entry.as_object()?;
     let mut scopes = metadata_scopes(object);
     if let Some(reasoning) = object.get("reasoning").and_then(Value::as_object) {
         scopes.insert(0, reasoning);
     }
+    let support_status = capability.effective_support_status();
+    let control_kind = capability.effective_control_kind();
+    let disable_allowed = capability.disable_allowed;
+    let effort_map = capability.upstream.effort_map.clone();
     Some(ReasoningCapabilitySnapshot {
         supported_efforts: capability.supported_efforts,
         default_effort: capability.default_effort,
@@ -385,6 +386,11 @@ fn openrouter_reasoning_snapshot(entry: &Value) -> Option<ReasoningCapabilitySna
             .unwrap_or(false),
         upstream_format: Some(capability.upstream.format),
         upstream_parameter: Some(capability.upstream.parameter),
+        support_status: Some(support_status),
+        control_kind: Some(control_kind),
+        disable_allowed: Some(disable_allowed),
+        effort_map: Some(effort_map),
+        codex_ultra_orchestration: capability.codex_ultra_orchestration,
         output_format: capability.output_format,
     })
 }
@@ -518,10 +524,12 @@ pub fn provider_reasoning_capability_from_model_entry(
                 "reasoningFormat",
                 "upstream_format",
                 "upstreamFormat",
+                "format",
                 "reasoning_parameter",
                 "reasoningParameter",
                 "upstream_parameter",
                 "upstreamParameter",
+                "parameter",
             ],
         )
         .is_none();
@@ -581,6 +589,7 @@ pub fn provider_reasoning_capability_from_model_entry(
             "reasoningFormat",
             "upstream_format",
             "upstreamFormat",
+            "format",
         ],
     )?;
     let parameter = lookup_wire_string(
@@ -590,6 +599,7 @@ pub fn provider_reasoning_capability_from_model_entry(
             "reasoningParameter",
             "upstream_parameter",
             "upstreamParameter",
+            "parameter",
         ],
     )?;
     let format = format.or_else(|| {
@@ -615,6 +625,10 @@ fn metadata_scopes(
     const MAX_METADATA_SCOPE_DEPTH: u8 = 8;
     let envelope_keys = [
         "metadata",
+        // Some providers nest capability details as reasoning.effort. Treat
+        // that object as an allow-listed metadata scope rather than dropping
+        // the declaration before the shared parser sees its levels/default.
+        "reasoning",
         "effort",
         "capability",
         "capabilities",
@@ -889,6 +903,7 @@ fn valid_wire_value(key: &str, value: &str) -> bool {
             value,
             "reasoning"
                 | "reasoning.effort"
+                | "reasoning.enabled"
                 | "reasoning_effort"
                 | "enable_thinking"
                 | "thinking"
@@ -910,6 +925,8 @@ fn parse_canonical_provider_reasoning(value: &Value) -> Option<CodexModelReasoni
     capability.fetched_at = None;
     capability.provider_key = None;
     capability.model_revision = None;
+    // Remote provider metadata may describe native wire capability, but cannot
+    // enable Codex product-level delegation policy. Preserve this trust boundary.
     capability.codex_ultra_orchestration = None;
     capability.validate().ok()?;
     Some(capability)
@@ -1004,9 +1021,8 @@ fn build_reasoning_capability(
         return None;
     }
     efforts.retain(|effort| effort != "ultra");
-    let mandatory = lookup_bool(scopes, &["mandatory", "reasoningMandatory"])
-        .ok()?
-        .unwrap_or(false);
+    let declared_mandatory = lookup_bool(scopes, &["mandatory", "reasoningMandatory"]).ok()?;
+    let mandatory = declared_mandatory.unwrap_or(false);
     let default_effort = lookup_effort_string(
         scopes,
         &[
@@ -1054,20 +1070,38 @@ fn build_reasoning_capability(
     if mandatory && disable_allowed {
         return None;
     }
-    let format = format.unwrap_or_else(|| {
+    let mut format = format.unwrap_or_else(|| {
         if openrouter_contract {
             "reasoning_object".to_string()
         } else {
             "string".to_string()
         }
     });
-    let parameter = parameter.unwrap_or_else(|| {
+    let mut parameter = parameter.unwrap_or_else(|| {
         if format == "reasoning_object" || format == "object" {
             "reasoning.effort".to_string()
         } else {
             "reasoning_effort".to_string()
         }
     });
+    // OpenRouter distinguishes native effort selection from its other
+    // reasoning controls. An omitted effort list must not grow a fake ladder,
+    // but explicit optional reasoning still supports the gateway's on/off
+    // switch. Budget-only models use max_tokens, never an effort string.
+    // Do not infer a switch from parameter-only/unknown mandatory metadata.
+    if openrouter_contract
+        && efforts.is_empty()
+        && matches!(format.as_str(), "object" | "reasoning_object")
+        && parameter == "reasoning.effort"
+    {
+        if supports_max_tokens {
+            format = "budget".to_string();
+            parameter = "reasoning.max_tokens".to_string();
+        } else if declared_mandatory == Some(false) && disable_allowed {
+            format = "boolean".to_string();
+            parameter = "reasoning.enabled".to_string();
+        }
+    }
     let mut effort_map = efforts
         .iter()
         .filter(|effort| effort.as_str() != "none")
@@ -1080,8 +1114,10 @@ fn build_reasoning_capability(
         .is_empty()
     {
         ReasoningControlKind::Graded
-    } else if supports_max_tokens {
+    } else if supports_max_tokens || format == "budget" {
         ReasoningControlKind::Budget
+    } else if format == "boolean" {
+        ReasoningControlKind::Boolean
     } else {
         ReasoningControlKind::None
     };
@@ -1948,9 +1984,89 @@ baseUrl = "https://api.sublyx.org/v1""#,
                     "default_enabled": true,
                 },
             }),
+            json!({
+                "id": "provider/canonical-mapped",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "medium", "high"],
+                    "defaultEffort": "medium",
+                    "disableAllowed": false,
+                    "upstream": {
+                        "format": "reasoning_object",
+                        "parameter": "reasoning.effort",
+                        "effortMap": {"low": "low", "medium": "high", "high": "high"}
+                    }
+                }
+            }),
+            json!({
+                "id": "provider/canonical-boolean",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "boolean",
+                    "supportedEfforts": [],
+                    "disableAllowed": true,
+                    "upstream": {"format": "boolean", "parameter": "reasoning"}
+                }
+            }),
+            json!({
+                "id": "provider/canonical-budget",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "budget",
+                    "supportedEfforts": [],
+                    "disableAllowed": true,
+                    "upstream": {"format": "string", "parameter": "max_tokens"}
+                }
+            }),
+            json!({
+                "id": "provider/canonical-unsupported",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_unsupported",
+                    "controlKind": "none",
+                    "supportedEfforts": [],
+                    "disableAllowed": false,
+                    "upstream": {"format": "none", "parameter": "none"}
+                }
+            }),
+            json!({
+                "id": "provider/canonical-ultra-xhigh",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["high", "xhigh"],
+                    "defaultEffort": "high",
+                    "disableAllowed": false,
+                    "upstream": {
+                        "format": "reasoning_object",
+                        "parameter": "reasoning.effort",
+                        "effortMap": {"high": "high", "xhigh": "xhigh"}
+                    },
+                    "codexUltraOrchestration": {"enabled": true, "providerEffort": "xhigh"}
+                }
+            }),
         ] {
             let direct = openrouter_reasoning_capability_from_model_entry(&entry)
                 .expect("direct catalog capability");
+            if entry["id"] == "provider/canonical-unsupported" {
+                assert_eq!(
+                    direct.effective_support_status(),
+                    ReasoningSupportStatus::ConfirmedUnsupported
+                );
+            }
+            if entry["id"] == "provider/canonical-ultra-xhigh" {
+                assert!(direct.codex_ultra_orchestration.is_none());
+                assert!(!direct
+                    .supported_efforts
+                    .iter()
+                    .any(|effort| effort == "ultra"));
+                assert!(!direct.upstream.effort_map.contains_key("ultra"));
+            }
             let snapshot = ProviderCapabilitySnapshot {
                 provider_key: "openrouter-test".to_string(),
                 model: entry["id"].as_str().unwrap().to_string(),
@@ -1978,13 +2094,10 @@ baseUrl = "https://api.sublyx.org/v1""#,
         .expect("reasoning metadata");
         assert!(snapshot.supported_efforts.is_empty());
         assert_eq!(snapshot.default_effort, None);
-        assert_eq!(
-            snapshot.upstream_format.as_deref(),
-            Some("reasoning_object")
-        );
+        assert_eq!(snapshot.upstream_format.as_deref(), Some("boolean"));
         assert_eq!(
             snapshot.upstream_parameter.as_deref(),
-            Some("reasoning.effort")
+            Some("reasoning.enabled")
         );
     }
 
@@ -2057,6 +2170,203 @@ baseUrl = "https://api.sublyx.org/v1""#,
     }
 
     #[test]
+    fn every_included_openrouter_model_keeps_its_exact_declared_reasoning_contract() {
+        use crate::proxy::providers::codex_reasoning::{
+            capability_fingerprint, resolve_subagent_reasoning_capability,
+        };
+        use crate::reasoning_capabilities::{
+            resolve_codex_model_capability_with_library, snapshot_to_capability,
+        };
+
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures/codexIncludedModelReasoning.json"
+        )))
+        .expect("included model fixture");
+        let openrouter = fixture["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["key"] == "openrouter")
+            .expect("OpenRouter fixture");
+        let models = openrouter["models"].as_array().unwrap();
+        assert_eq!(models.len(), 20, "all included OpenRouter rows are audited");
+        let mut counts = std::collections::BTreeMap::<String, usize>::new();
+        for case in models {
+            let entry = &case["apiModel"];
+            let model = entry["id"].as_str().unwrap();
+            let expected = &case["expected"];
+            let direct = openrouter_reasoning_capability_from_model_entry(entry)
+                .unwrap_or_else(|| panic!("missing declared reasoning support for {model}"));
+            let kind = serde_json::to_value(direct.effective_control_kind()).unwrap();
+            assert_eq!(kind, expected["controlKind"], "{model} control");
+            *counts
+                .entry(kind.as_str().unwrap().to_string())
+                .or_default() += 1;
+            assert_eq!(
+                serde_json::to_value(&direct.supported_efforts).unwrap(),
+                expected["nativeEfforts"],
+                "{model} native efforts cannot be invented"
+            );
+            assert_eq!(
+                direct.disable_allowed,
+                expected["disableAllowed"].as_bool().unwrap(),
+                "{model} disable control"
+            );
+            assert_eq!(
+                serde_json::to_value(&direct.default_effort).unwrap(),
+                expected
+                    .get("defaultEffort")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "{model} default"
+            );
+            let picker = resolve_subagent_reasoning_capability(Some(&direct));
+            assert_eq!(
+                serde_json::to_value(&picker.codex_selectable_efforts).unwrap(),
+                expected["pickerEfforts"],
+                "{model} picker must use only verified native levels"
+            );
+            let expected_wire = match kind.as_str().unwrap() {
+                "boolean" => ("boolean", "reasoning.enabled"),
+                "budget" => ("budget", "reasoning.max_tokens"),
+                _ => ("reasoning_object", "reasoning.effort"),
+            };
+            assert_eq!(
+                (
+                    direct.upstream.format.as_str(),
+                    direct.upstream.parameter.as_str()
+                ),
+                expected_wire,
+                "{model} wire control"
+            );
+
+            let mut saved = provider("OpenRouter", "https://openrouter.ai/api/v1");
+            saved.settings_config["modelCatalog"] = json!({"models": [case["catalog"].clone()]});
+            let snapshot = discovery_snapshot(
+                &saved,
+                model,
+                "openrouter_api",
+                openrouter_reasoning_snapshot(entry),
+            )
+            .expect("scoped discovery");
+            let detected = snapshot_to_capability(&snapshot).expect("snapshot capability");
+            let resolved =
+                resolve_codex_model_capability_with_library(&saved, model, Some(&snapshot), None)
+                    .capability
+                    .expect("resolver capability");
+            assert_eq!(
+                capability_fingerprint(&direct),
+                capability_fingerprint(&detected),
+                "{model} fetch/detection parity"
+            );
+            assert_eq!(
+                capability_fingerprint(&direct),
+                capability_fingerprint(&resolved),
+                "{model} fetch/runtime parity"
+            );
+        }
+        assert_eq!(
+            counts,
+            [
+                ("boolean".to_string(), 9),
+                ("budget".to_string(), 1),
+                ("graded".to_string(), 6),
+                ("none".to_string(), 4),
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn openrouter_optional_reasoning_without_efforts_exposes_only_a_boolean_switch() {
+        for model in ["xiaomi/mimo-v2.6-flash", "xiaomi/mimo-v2.6-pro"] {
+            let entry = json!({
+                "id": model,
+                "supported_parameters": ["reasoning", "include_reasoning"],
+                "reasoning": {"mandatory": false}
+            });
+            for capability in [
+                provider_reasoning_capability_from_model_entry(&entry, true),
+                openrouter_reasoning_capability_from_model_entry(&entry),
+            ] {
+                let capability = capability.expect("optional OpenRouter reasoning control");
+                assert_eq!(
+                    capability.effective_control_kind(),
+                    ReasoningControlKind::Boolean,
+                    "{model}"
+                );
+                assert!(
+                    capability.supported_efforts.is_empty(),
+                    "{model} has no native effort selector"
+                );
+                assert!(capability.default_effort.is_none());
+                assert!(capability.disable_allowed);
+                assert_eq!(capability.upstream.format, "boolean");
+                assert_eq!(capability.upstream.parameter, "reasoning.enabled");
+                assert!(capability.upstream.effort_map.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn openrouter_optional_switch_requires_confirmed_optional_gateway_metadata() {
+        for reasoning in [json!({}), json!({"mandatory": true})] {
+            let entry = json!({
+                "id": "provider/fixed-or-unknown",
+                "supported_parameters": ["reasoning"],
+                "reasoning": reasoning
+            });
+            let capability = openrouter_reasoning_capability_from_model_entry(&entry)
+                .expect("reasoning support without optional-control evidence");
+            assert_eq!(
+                capability.effective_control_kind(),
+                ReasoningControlKind::None
+            );
+            assert!(capability.supported_efforts.is_empty());
+            assert_ne!(capability.upstream.parameter, "reasoning.enabled");
+        }
+        let generic_optional = json!({
+            "id": "generic/optional",
+            "supported_parameters": ["reasoning"],
+            "reasoning": {"mandatory": false}
+        });
+        assert!(
+            provider_reasoning_capability_from_model_entry(&generic_optional, false).is_none(),
+            "generic providers cannot inherit OpenRouter's reasoning.enabled wire contract"
+        );
+        assert!(
+            openrouter_reasoning_capability_from_model_entry(&json!({
+                "id": "provider/no-reasoning",
+                "supported_parameters": ["temperature", "tools"]
+            }))
+            .is_none(),
+            "non-reasoning models must not acquire a switch"
+        );
+    }
+
+    #[test]
+    fn openrouter_budget_only_reasoning_uses_the_advertised_budget_wire_not_effort() {
+        let entry = json!({
+            "id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            "supported_parameters": ["reasoning"],
+            "reasoning": {"mandatory": false, "supports_max_tokens": true}
+        });
+        let capability = openrouter_reasoning_capability_from_model_entry(&entry)
+            .expect("budget-only OpenRouter reasoning control");
+        assert_eq!(
+            capability.effective_control_kind(),
+            ReasoningControlKind::Budget
+        );
+        assert!(capability.supported_efforts.is_empty());
+        assert!(capability.default_effort.is_none());
+        assert_eq!(capability.upstream.format, "budget");
+        assert_eq!(capability.upstream.parameter, "reasoning.max_tokens");
+        assert!(capability.upstream.effort_map.is_empty());
+    }
+
+    #[test]
     fn openrouter_reasoning_capability_is_valid_for_mimo_without_advertised_levels() {
         let capability = openrouter_reasoning_capability_from_model_entry(&json!({
             "id": "xiaomi/mimo-v2.6-pro",
@@ -2067,10 +2377,10 @@ baseUrl = "https://api.sublyx.org/v1""#,
         assert!(capability.supported_efforts.is_empty());
         assert_eq!(
             capability.effective_control_kind(),
-            ReasoningControlKind::None
+            ReasoningControlKind::Boolean
         );
-        assert_eq!(capability.upstream.format, "reasoning_object");
-        assert_eq!(capability.upstream.parameter, "reasoning.effort");
+        assert_eq!(capability.upstream.format, "boolean");
+        assert_eq!(capability.upstream.parameter, "reasoning.enabled");
         assert!(capability.disable_allowed);
     }
 
@@ -2137,6 +2447,36 @@ baseUrl = "https://api.sublyx.org/v1""#,
         assert_eq!(capability.upstream.parameter, "reasoning_effort");
         assert_ne!(capability.source.as_deref(), Some("user"));
         capability.validate().expect("valid canonical capability");
+    }
+
+    #[test]
+    fn provider_reasoning_metadata_reads_nested_reasoning_effort_envelope() {
+        let capability = provider_reasoning_capability_from_model_entry(
+            &json!({
+                "id": "gpt-6.1-sol",
+                "reasoning": {
+                    "effort": {
+                        "supported_levels": ["low", "medium", "high", "xhigh", "max"],
+                        "default_level": "max",
+                        "format": "object",
+                        "parameter": "reasoning.effort"
+                    }
+                }
+            }),
+            false,
+        )
+        .expect("nested reasoning.effort declaration");
+        assert_eq!(
+            capability.supported_efforts,
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(capability.default_effort.as_deref(), Some("max"));
+        assert_eq!(capability.upstream.format, "reasoning_object");
+        assert_eq!(capability.upstream.parameter, "reasoning.effort");
+        assert_eq!(
+            capability.upstream.effort_map.get("max"),
+            Some(&"max".to_string())
+        );
     }
 
     #[test]

@@ -1251,6 +1251,16 @@ pub fn run() {
                 app_state.db.clone(),
                 app.handle().clone(),
             );
+            // Owner remote is a separate opt-in loopback service. Construction
+            // never binds; restore reads only its local, non-synced preferences.
+            let owner_remote = app_state.owner_remote.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = owner_remote.restore().await {
+                    // Display contains only a finite error code, not origin,
+                    // passkey/session material, transcript, or host paths.
+                    log::warn!("[OwnerRemote] restore refused: {error}");
+                }
+            });
             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
             app.manage(app_state);
 
@@ -1549,6 +1559,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_providers,
+            commands::get_owner_remote_status,
+            commands::start_owner_remote,
+            commands::stop_owner_remote,
+            commands::create_owner_remote_invite,
             commands::migrate_codex_official_auth_ownership,
             commands::get_codex_editor_providers,
             commands::get_current_provider,
@@ -1558,6 +1572,7 @@ pub fn run() {
             commands::add_provider,
             commands::update_provider,
             commands::update_provider_if_unchanged,
+            commands::update_codex_subagent_policy,
             commands::update_codex_subagent_v2,
             commands::initialize_codex_subagent_v2,
             commands::reconcile_codex_subagent_v2_profiles,
@@ -2183,6 +2198,9 @@ pub fn run() {
 /// 使用 stop_with_restore_keep_state 保留 settings 表中的代理状态，下次启动时自动恢复。
 pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
     if let Some(state) = app_handle.try_state::<store::AppState>() {
+        // Stop accepting remote reads/mutations before changing local providers.
+        // Preserve opt-in preferences and unresolved native mutation evidence.
+        state.owner_remote.shutdown().await;
         let proxy_service = &state.proxy_service;
 
         // 退出时也需要兜底：代理可能已崩溃/未运行，但 Live 接管残留仍在（占位符/备份）。

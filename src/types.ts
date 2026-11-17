@@ -391,8 +391,15 @@ export interface CodexModelReasoningCapability {
   defaultEffort?: CodexReasoningEffort;
   disableAllowed: boolean;
   upstream: {
-    format: "none" | "boolean" | "string" | "reasoning_object";
-    parameter: CodexChatThinkingParam | CodexChatEffortParam;
+    format: "none" | "boolean" | "string" | "reasoning_object" | "budget";
+    parameter:
+      | CodexChatThinkingParam
+      | CodexChatEffortParam
+      | "reasoning"
+      | "thinking_budget"
+      | "max_tokens"
+      | "reasoning.max_tokens"
+      | "reasoning.enabled";
     effortMap?: Partial<Record<CodexReasoningEffort, CodexReasoningEffort>>;
   };
   outputFormat?: CodexChatReasoningOutputFormat;
@@ -446,6 +453,8 @@ export interface CodexCatalogModel {
   display_name?: string;
   providerName?: string;
   provider_name?: string;
+  /** Derived source identity used to keep routed picker models in provider blocks. */
+  targetProviderId?: string;
   contextWindow?: string | number;
   context_window?: string | number;
   inputModalities?: string[];
@@ -607,6 +616,9 @@ export type CodexModelDisplayStyle =
 
 export type CodexSubagentVersion = "v1" | "v2";
 
+/** A reversible projection override; profile restores saved model policies. */
+export type CodexSubagentReasoningEffort = "profile" | CodexReasoningEffort;
+
 export type CodexRoutingAuthSource =
   | "provider_config"
   | "managed_account"
@@ -655,6 +667,7 @@ export interface CodexRoutingConfig {
   defaultRouteId?: string;
   officialAuth?: CodexOfficialAuthConfig;
   subagentVersion?: CodexSubagentVersion;
+  subagentReasoningEffort?: CodexSubagentReasoningEffort;
   subagentV2?: CodexSubagentV2Config;
   modelOrder?: string[];
   modelDisplayStyle?: CodexModelDisplayStyle;
@@ -682,6 +695,7 @@ export interface CodexRoutingConfigV2 {
   defaultRouteId?: string;
   officialAuth?: CodexOfficialAuthConfig;
   subagentVersion?: CodexSubagentVersion;
+  subagentReasoningEffort?: CodexSubagentReasoningEffort;
   subagentV2?: CodexSubagentV2Config;
   spawnAgentModels?: string[];
   modelOrder?: string[];

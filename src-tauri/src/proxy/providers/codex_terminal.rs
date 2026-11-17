@@ -33,6 +33,13 @@ struct TemporaryUsageLimitPolicy {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NonRetryablePolicy {
+    category_code: String,
+    retryable_paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TerminalErrorPolicy {
     schema_version: u8,
     ignored_separators: Vec<char>,
@@ -41,6 +48,7 @@ struct TerminalErrorPolicy {
     cancelled_events: Vec<String>,
     cancelled_code: String,
     temporary_usage_limit: TemporaryUsageLimitPolicy,
+    non_retryable: NonRetryablePolicy,
     categories: Vec<TerminalErrorCategory>,
 }
 
@@ -64,7 +72,10 @@ fn terminal_error_policy() -> &'static TerminalErrorPolicy {
             "unsupported terminal-error policy"
         );
         assert!(
-            !policy.categories.is_empty() && !policy.cancelled_code.is_empty(),
+            !policy.categories.is_empty()
+                && !policy.cancelled_code.is_empty()
+                && !policy.non_retryable.category_code.is_empty()
+                && !policy.non_retryable.retryable_paths.is_empty(),
             "terminal-error policy must preserve permanent guards"
         );
         let mut categories = std::mem::take(&mut policy.categories);
@@ -129,7 +140,59 @@ fn terminal_error_policy() -> &'static TerminalErrorPolicy {
     })
 }
 
+/// Keep the provider's explicit retry decision while normalizing protocol
+/// errors. Only canonical error fields participate; arbitrary request/debug
+/// metadata and non-boolean flags do not become provider retry instructions.
+/// A denial in any known envelope wins over a positive flag in another.
+pub(crate) fn explicit_retry_decision(payload: &Value) -> Option<bool> {
+    explicit_retry_decision_from_policy(terminal_error_policy(), payload)
+}
+
+fn explicit_retry_decision_from_policy(
+    policy: &TerminalErrorPolicy,
+    payload: &Value,
+) -> Option<bool> {
+    let mut decision = None;
+    for flag in policy
+        .non_retryable
+        .retryable_paths
+        .iter()
+        .filter_map(|pointer| payload.pointer(pointer))
+        .filter_map(Value::as_bool)
+    {
+        if !flag {
+            return Some(false);
+        }
+        decision = Some(true);
+    }
+    let text_denies_retry = policy
+        .summary_paths
+        .iter()
+        .filter_map(|pointer| payload.pointer(pointer))
+        .filter_map(Value::as_str)
+        .map(|value| policy.normalize(value))
+        .any(|value| {
+            policy
+                .temporary_usage_limit
+                .retry_denial_markers
+                .iter()
+                .any(|marker| value.contains(marker))
+        });
+    if text_denies_retry {
+        Some(false)
+    } else {
+        decision
+    }
+}
+
+fn explicit_retry_denial_matches(policy: &TerminalErrorPolicy, payload: &Value) -> bool {
+    explicit_retry_decision_from_policy(policy, payload) == Some(false)
+}
+
 fn temporary_usage_limit_matches(policy: &TerminalErrorPolicy, payload: &Value) -> bool {
+    if explicit_retry_denial_matches(policy, payload) {
+        return false;
+    }
     let rule = &policy.temporary_usage_limit;
     let summary: Vec<_> = policy
         .summary_paths
@@ -207,7 +270,7 @@ pub(crate) fn terminal_error_code(event_name: &str, payload: &Value) -> Option<&
         .map(|value| policy.normalize(&value.to_string()))
         .collect();
     let temporary_usage_limit = temporary_usage_limit_matches(policy, payload);
-    policy.categories.iter().find_map(|category| {
+    let category = policy.categories.iter().find_map(|category| {
         // Skip only the ambiguous usage category. Continue checking every
         // other permanent guard so mixed auth/permission/cancellation errors
         // cannot become replayable through a retry message.
@@ -227,6 +290,12 @@ pub(crate) fn terminal_error_code(event_name: &str, payload: &Value) -> Option<&
                     .any(|marker| value.contains(marker))
             }))
         .then_some(category.code.as_str())
+    });
+    // Preserve the established auth/quota/cancellation reason priority while
+    // still stopping unrecognized server errors that explicitly forbid retry.
+    category.or_else(|| {
+        explicit_retry_denial_matches(policy, payload)
+            .then_some(policy.non_retryable.category_code.as_str())
     })
 }
 
@@ -663,6 +732,105 @@ mod tests {
                 case["expectedCode"].as_str(),
                 "{}",
                 case["name"],
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_retry_decision_preserves_only_canonical_boolean_or_denial_signals() {
+        for (payload, expected) in [
+            (json!({"error": {"code": "server_error"}}), None),
+            (json!({"retryable": "false"}), None),
+            (json!({"error": {"retryable": "true"}}), None),
+            (json!({"retryable": 0}), None),
+            (
+                json!({"request": {"retryable": false, "message": "Do not retry"}}),
+                None,
+            ),
+            (
+                json!({"error": {"metadata": {"retryable": false, "message": "Do not retry"}}}),
+                None,
+            ),
+            (json!({"retryable": true}), Some(true)),
+            (json!({"error": {"retryable": true}}), Some(true)),
+            (
+                json!({"response": {"error": {"retryable": true}}}),
+                Some(true),
+            ),
+            (json!({"retryable": false}), Some(false)),
+            (json!({"error": {"retryable": false}}), Some(false)),
+            (
+                json!({"response": {"error": {"retryable": false}}}),
+                Some(false),
+            ),
+            (
+                json!({"retryable": false, "error": {"retryable": true}}),
+                Some(false),
+            ),
+            (
+                json!({"retryable": true, "error": {"retryable": false}}),
+                Some(false),
+            ),
+            (
+                json!({"retryable": true, "error": {"retryable": true}, "response": {"error": {"retryable": false}}}),
+                Some(false),
+            ),
+            (
+                json!({"retryable": true, "error": {"retryable": false}, "response": {"error": {"retryable": true}}}),
+                Some(false),
+            ),
+            (json!({"error": {"code": "not_retryable"}}), Some(false)),
+            (
+                json!({"error": {"retryable": true, "message": "Do not retry this request"}}),
+                Some(false),
+            ),
+            (
+                json!({"error": {"retryable": true}, "response": {"error": {"message": "Do not retry this request"}}}),
+                Some(false),
+            ),
+        ] {
+            assert_eq!(explicit_retry_decision(&payload), expected, "{payload}");
+        }
+    }
+
+    #[test]
+    fn explicit_retry_denials_apply_only_at_known_error_boundaries() {
+        for payload in [
+            json!({"retryable": false, "code": "server_error"}),
+            json!({"error": {"retryable": false, "code": "server_error"}}),
+            json!({"response": {"error": {"retryable": false, "code": "server_error"}}}),
+            json!({"retryable": true, "error": {"retryable": false, "code": "server_error"}}),
+            json!({"retryable": false, "error": {"retryable": true, "code": "server_error"}}),
+            json!({"error": "Service temporarily overloaded. Do not retry this request."}),
+            json!("Service temporarily overloaded. Do not retry this request."),
+        ] {
+            assert_eq!(
+                terminal_error_code("response.failed", &payload),
+                Some("non_retryable_error"),
+                "{payload}"
+            );
+            assert_eq!(
+                terminal_error_code_from_body(&payload.to_string()),
+                Some("non_retryable_error"),
+                "{payload}"
+            );
+        }
+        assert_eq!(
+            terminal_error_code_from_body(
+                "Service temporarily overloaded. Do not retry this request."
+            ),
+            Some("non_retryable_error")
+        );
+        for payload in [
+            json!({"error": {"retryable": true, "code": "server_error"}}),
+            json!({"error": {"retryable": "false", "code": "server_error"}}),
+            json!({"error": {"code": "server_error", "metadata": {"request": {"retryable": false, "prompt": "Do not retry this request"}}}}),
+            json!({"error": {"code": "server_error"}, "request": {"retryable": false, "message": "Do not retry this request"}}),
+        ] {
+            assert_eq!(
+                terminal_error_code("response.failed", &payload),
+                None,
+                "{payload}"
             );
         }
     }

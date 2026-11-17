@@ -3871,6 +3871,138 @@ mod tests {
     }
 
     #[test]
+    fn sublyx_models_effort_metadata_is_scoped_for_catalog_compilation() {
+        let base_url = "https://api.sublyx.org/v1";
+        let models = parse_provider_models_response(
+            &serde_json::json!({"data": [{
+                "id": "gpt-6.1-sol",
+                "effort": {
+                    "supported_levels": ["low", "medium", "high", "xhigh"],
+                    "default_level": "xhigh"
+                }
+            }]})
+            .to_string(),
+            &[],
+            base_url,
+            "https://api.sublyx.org/v1/models",
+        )
+        .expect("parse Sublyx effort metadata");
+        let model = &models[0];
+        let reasoning = model
+            .reasoning
+            .as_ref()
+            .expect("Sublyx effort metadata becomes a canonical capability");
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["low", "medium", "high", "xhigh"])
+        );
+        assert_eq!(reasoning["defaultEffort"], "xhigh");
+        assert_eq!(reasoning["source"], "detection");
+        assert_eq!(
+            reasoning["evidenceScope"],
+            serde_json::to_value(
+                crate::reasoning_capabilities::reasoning_evidence_scope(base_url, "gpt-6.1-sol")
+                    .expect("safe Sublyx transport"),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            model
+                .effort
+                .as_ref()
+                .expect("raw effort remains diagnosable")["default_level"],
+            "xhigh"
+        );
+    }
+
+    #[test]
+    fn sublyx_models_nested_reasoning_effort_metadata_preserves_native_max_for_projection() {
+        let base_url = "https://api.sublyx.org/v1";
+        let models = parse_provider_models_response(
+            &serde_json::json!({"data": [{
+                "id": "gpt-6.1-sol",
+                "reasoning": {
+                    "effort": {
+                        "supported_levels": ["low", "medium", "high", "xhigh", "max"],
+                        "default_level": "medium"
+                    },
+                    "reasoningFormat": "reasoning_object",
+                    "reasoningParameter": "reasoning.effort"
+                }
+            }]})
+            .to_string(),
+            &[],
+            base_url,
+            "https://api.sublyx.org/v1/models",
+        )
+        .expect("parse nested Sublyx reasoning effort metadata");
+        let model = &models[0];
+        let reasoning = model
+            .reasoning
+            .as_ref()
+            .expect("nested reasoning effort becomes a canonical capability");
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["low", "medium", "high", "xhigh", "max"])
+        );
+        assert_eq!(reasoning["defaultEffort"], "medium");
+        assert_eq!(reasoning["upstream"]["format"], "reasoning_object");
+        assert_eq!(reasoning["upstream"]["parameter"], "reasoning.effort");
+        assert_eq!(reasoning["source"], "detection");
+        assert_eq!(
+            reasoning["evidenceScope"],
+            serde_json::to_value(
+                crate::reasoning_capabilities::reasoning_evidence_scope(base_url, "gpt-6.1-sol")
+                    .expect("safe Sublyx transport"),
+            )
+            .unwrap()
+        );
+
+        let capability = serde_json::from_value::<
+            crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability,
+        >(reasoning.clone())
+        .expect("canonical capability");
+        let normalized =
+            crate::proxy::providers::codex_reasoning::normalize_sublyx_reasoning_capability_for_model(
+                "gpt-6.1-sol",
+                capability,
+            );
+        assert_eq!(
+            normalized.supported_efforts,
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(normalized.default_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            normalized
+                .codex_ultra_orchestration
+                .as_ref()
+                .and_then(|ultra| ultra.provider_effort.as_deref()),
+            Some("xhigh"),
+            "native model metadata does not upgrade the independent Ultra fallback"
+        );
+        assert!(normalized
+            .supported_efforts
+            .iter()
+            .any(|effort| effort == "max"));
+        assert_eq!(
+            normalized
+                .upstream
+                .effort_map
+                .get("max")
+                .map(String::as_str),
+            Some("max")
+        );
+        let resolved =
+            crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(Some(
+                &normalized,
+            ));
+        use crate::proxy::providers::codex_reasoning::CodexReasoningEffort as Effort;
+        assert!(resolved.provider_accepted_efforts.contains(&Effort::Max));
+        assert!(resolved.codex_selectable_efforts.contains(&Effort::Max));
+        assert_eq!(resolved.effort_map.get(&Effort::Max), Some(&Effort::Max));
+    }
+
+    #[test]
     fn upstream_metadata_reasoning_evidence_scope_normalizes_transport_and_wire_model() {
         let body = serde_json::json!({"data": [{
             "id": " GPT-6.1-Wire ",
@@ -5758,8 +5890,9 @@ mod tests {
             .and_then(|model| model.reasoning.as_ref())
             .expect("Mimo reasoning");
         assert_eq!(mimo["supportedEfforts"], serde_json::json!([]));
-        assert_eq!(mimo["upstream"]["format"], "reasoning_object");
-        assert_eq!(mimo["upstream"]["parameter"], "reasoning.effort");
+        assert_eq!(mimo["controlKind"], "boolean");
+        assert_eq!(mimo["upstream"]["format"], "boolean");
+        assert_eq!(mimo["upstream"]["parameter"], "reasoning.enabled");
 
         let deepseek = models
             .iter()
@@ -5776,43 +5909,61 @@ mod tests {
     }
 
     #[test]
-    fn parse_models_response_preserves_current_openrouter_per_model_max_effort() {
+    fn parse_models_response_preserves_reasoning_controls_for_every_included_openrouter_model() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures/codexIncludedModelReasoning.json"
+        )))
+        .expect("included reasoning fixture");
+        let cases = fixture["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["key"] == "openrouter")
+            .unwrap()["models"]
+            .as_array()
+            .unwrap();
+        let entries: Vec<_> = cases.iter().map(|case| case["apiModel"].clone()).collect();
         let models = parse_provider_models_response(
-            r#"{"object":"list","data":[{
-                "id":"deepseek/deepseek-v4.1-flash-1017",
-                "canonical_slug":"deepseek/deepseek-v4.1-flash-20261017",
-                "supported_parameters":[
-                    "include_reasoning",
-                    "parallel_tool_calls",
-                    "reasoning",
-                    "reasoning_effort",
-                    "tools"
-                ],
-                "reasoning":{
-                    "mandatory":false,
-                    "default_enabled":true,
-                    "supported_efforts":["max","high","low","none"],
-                    "default_effort":"high"
-                }
-            }]}"#,
+            &serde_json::json!({"data": entries}).to_string(),
             &[],
             "https://openrouter.ai/api/v1",
             "https://openrouter.ai/api/v1/models",
         )
-        .expect("parse current OpenRouter reasoning metadata");
-        let reasoning = models[0].reasoning.as_ref().expect("reasoning metadata");
-        assert_eq!(
-            reasoning["supportedEfforts"],
-            serde_json::json!(["max", "high", "low", "none"])
-        );
-        assert_eq!(reasoning["defaultEffort"], "high");
-        assert_eq!(reasoning["disableAllowed"], true);
-        assert_eq!(reasoning["upstream"]["format"], "reasoning_object");
-        assert_eq!(reasoning["upstream"]["parameter"], "reasoning.effort");
-        assert_eq!(
-            reasoning["upstream"]["effortMap"]["max"],
-            serde_json::json!("max")
-        );
+        .expect("complete included OpenRouter API metadata");
+        assert_eq!(models.len(), 20);
+        for case in cases {
+            let id = case["apiModel"]["id"].as_str().unwrap();
+            let model = models.iter().find(|model| model.id == id).unwrap();
+            let reasoning = model
+                .reasoning
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing reasoning declaration for {id}"));
+            assert_eq!(
+                reasoning["controlKind"], case["expected"]["controlKind"],
+                "{id}"
+            );
+            assert_eq!(
+                reasoning["supportedEfforts"], case["expected"]["nativeEfforts"],
+                "{id}"
+            );
+            assert_eq!(
+                reasoning["disableAllowed"], case["expected"]["disableAllowed"],
+                "{id}"
+            );
+            assert_eq!(
+                reasoning["evidenceScope"],
+                serde_json::to_value(
+                    crate::reasoning_capabilities::reasoning_evidence_scope(
+                        "https://openrouter.ai/api/v1",
+                        id
+                    )
+                    .expect("OpenRouter model scope")
+                )
+                .unwrap(),
+                "{id} metadata must remain bound to its actual provider and wire model"
+            );
+        }
     }
 
     #[test]

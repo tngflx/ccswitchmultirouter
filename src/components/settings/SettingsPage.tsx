@@ -18,6 +18,8 @@ import {
   FlaskConical,
   Code2,
   Puzzle,
+  ArrowRight,
+  Network,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -36,10 +38,18 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { settingsApi } from "@/lib/api";
+import { normalizeSettingsTab } from "@/lib/settingsNavigation";
 import { LanguageSettings } from "@/components/settings/LanguageSettings";
 import { ThemeSettings } from "@/components/settings/ThemeSettings";
 import { WindowSettings } from "@/components/settings/WindowSettings";
-import { WatchdogStatusPanel } from "@/components/settings/WatchdogStatusPanel";
+import {
+  CrashRecoverySettings,
+  useCrashRecoveryController,
+} from "@/components/settings/CrashRecoverySettings";
+import {
+  OwnerRemoteSettings,
+  useOwnerRemoteController,
+} from "@/components/settings/OwnerRemoteSettings";
 import { CodexEgressTimezoneSettings } from "@/components/settings/CodexEgressTimezoneSettings";
 import { AppVisibilitySettings } from "@/components/settings/AppVisibilitySettings";
 import { SkillStorageLocationSettings } from "@/components/settings/SkillStorageLocationSettings";
@@ -73,6 +83,7 @@ interface SettingsDialogProps {
   onOpenChange: (open: boolean) => void;
   onImportSuccess?: () => void | Promise<void>;
   defaultTab?: string;
+  navigationRevision?: number;
 }
 
 export function SettingsPage({
@@ -80,6 +91,7 @@ export function SettingsPage({
   onOpenChange,
   onImportSuccess,
   defaultTab = "general",
+  navigationRevision = 0,
 }: SettingsDialogProps) {
   const { t } = useTranslation();
   const {
@@ -120,6 +132,9 @@ export function SettingsPage({
   const { data: installedSkills } = useInstalledSkills();
 
   const [activeTab, setActiveTab] = useState<string>("general");
+  const ownerRemote = useOwnerRemoteController(
+    open && activeTab === "connections",
+  );
   const [showRestartPrompt, setShowRestartPrompt] = useState(false);
   const tabScrollContainerRef = useRef<HTMLDivElement>(null);
   const {
@@ -132,10 +147,11 @@ export function SettingsPage({
 
   useEffect(() => {
     if (open) {
-      setActiveTab(defaultTab);
+      // Keep existing proxy deep links working after grouping network controls.
+      setActiveTab(normalizeSettingsTab(defaultTab));
       resetStatus();
     }
-  }, [open, resetStatus, defaultTab]);
+  }, [open, resetStatus, defaultTab, navigationRevision]);
 
   useEffect(() => {
     if (requiresRestart) {
@@ -229,6 +245,9 @@ export function SettingsPage({
     [autoSaveSettings, settings, t, updateSettings],
   );
 
+  // Keep pending operations, failures, and post-save refreshes across tab remounts.
+  const crashRecovery = useCrashRecoveryController(handleAutoSave);
+
   const handleEnvInjectionSave = useCallback(
     async (envInjection: EnvInjectionSettingsValue) => {
       const previous = settings?.envInjection;
@@ -262,11 +281,17 @@ export function SettingsPage({
           onValueChange={setActiveTab}
           className="flex flex-col h-full"
         >
-          <TabsList className="grid w-full grid-cols-7 mb-6 glass rounded-lg">
+          <TabsList
+            aria-label={t("settings.title")}
+            className="mb-6 flex w-full shrink-0 flex-wrap justify-start gap-1 glass rounded-lg"
+          >
             <TabsTrigger value="general">
               {t("settings.tabGeneral")}
             </TabsTrigger>
-            <TabsTrigger value="proxy">{t("settings.tabProxy")}</TabsTrigger>
+            <TabsTrigger value="connections" className="gap-2">
+              <Network className="h-4 w-4 shrink-0" aria-hidden="true" />
+              {t("settings.tabConnectionsRecovery")}
+            </TabsTrigger>
             <TabsTrigger value="auth">
               {t("settings.tabAuth", { defaultValue: "认证" })}
             </TabsTrigger>
@@ -293,6 +318,28 @@ export function SettingsPage({
                     transition={{ duration: 0.3 }}
                     className="space-y-6"
                   >
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("connections")}
+                      className="flex w-full items-center gap-3 rounded-xl border border-primary/20 bg-primary/5 p-4 text-left transition-colors hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <Network
+                        className="h-5 w-5 shrink-0 text-primary"
+                        aria-hidden="true"
+                      />
+                      <span className="min-w-0 flex-1 space-y-1">
+                        <span className="block text-sm font-semibold">
+                          {t("settings.connectionsShortcutTitle")}
+                        </span>
+                        <span className="block text-xs text-muted-foreground">
+                          {t("settings.connectionsShortcutDescription")}
+                        </span>
+                      </span>
+                      <ArrowRight
+                        className="h-4 w-4 shrink-0 text-primary"
+                        aria-hidden="true"
+                      />
+                    </button>
                     <LanguageSettings
                       value={settings.language}
                       onChange={(lang) => handleAutoSave({ language: lang })}
@@ -323,13 +370,6 @@ export function SettingsPage({
                       settings={settings}
                       onChange={handleAutoSave}
                     />
-                    <WatchdogStatusPanel />
-                    <CodexEgressTimezoneSettings
-                      value={settings.codexEgressTimezone}
-                      onChange={(codexEgressTimezone) =>
-                        handleAutoSave({ codexEgressTimezone })
-                      }
-                    />
                     <TerminalSettings
                       value={settings.preferredTerminal}
                       onChange={(terminal) =>
@@ -344,12 +384,76 @@ export function SettingsPage({
                 ) : null}
               </TabsContent>
 
-              <TabsContent value="proxy" className="space-y-6 mt-0 pb-4">
+              <TabsContent value="connections" className="space-y-6 mt-0 pb-4">
                 {settings ? (
-                  <ProxyTabContent
-                    settings={settings}
-                    onAutoSave={handleAutoSave}
-                  />
+                  <>
+                    <header className="space-y-1">
+                      <h2 className="text-lg font-semibold">
+                        {t("settings.tabConnectionsRecovery")}
+                      </h2>
+                      <p className="text-sm text-muted-foreground">
+                        {t("settings.connectionsDescription")}
+                      </p>
+                    </header>
+                    <div className="grid items-start gap-6 xl:grid-cols-2">
+                      <OwnerRemoteSettings controller={ownerRemote} />
+                      <CrashRecoverySettings
+                        settings={settings}
+                        controller={crashRecovery}
+                      />
+                    </div>
+                    <section
+                      className="space-y-3"
+                      aria-labelledby="settings-network-heading"
+                    >
+                      <div className="space-y-1">
+                        <h3
+                          id="settings-network-heading"
+                          className="text-sm font-semibold"
+                        >
+                          {t("settings.connectionsNetworkTitle")}
+                        </h3>
+                        <p className="text-xs text-muted-foreground">
+                          {t("settings.connectionsNetworkDescription")}
+                        </p>
+                      </div>
+                      <ProxyTabContent
+                        settings={settings}
+                        onAutoSave={handleAutoSave}
+                      />
+                      <Accordion type="single" collapsible>
+                        <AccordionItem
+                          value="codex-egress"
+                          className="rounded-xl glass-card overflow-hidden"
+                        >
+                          <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50">
+                            <div className="flex items-center gap-3 text-left">
+                              <Network
+                                className="h-5 w-5 shrink-0 text-emerald-500"
+                                aria-hidden="true"
+                              />
+                              <div>
+                                <h4 className="text-base font-semibold">
+                                  {t("settings.connectionsEgressTitle")}
+                                </h4>
+                                <p className="text-sm font-normal text-muted-foreground">
+                                  {t("settings.connectionsEgressDescription")}
+                                </p>
+                              </div>
+                            </div>
+                          </AccordionTrigger>
+                          <AccordionContent className="border-t border-border/50 px-6 pb-6 pt-4">
+                            <CodexEgressTimezoneSettings
+                              value={settings.codexEgressTimezone}
+                              onChange={(codexEgressTimezone) =>
+                                handleAutoSave({ codexEgressTimezone })
+                              }
+                            />
+                          </AccordionContent>
+                        </AccordionItem>
+                      </Accordion>
+                    </section>
+                  </>
                 ) : null}
               </TabsContent>
 

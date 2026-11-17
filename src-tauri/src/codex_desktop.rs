@@ -18,10 +18,16 @@ use tokio_tungstenite::tungstenite::Message;
 #[path = "codex_windows_launch.rs"]
 mod windows_launch;
 
+#[path = "codex_owner_remote.rs"]
+pub(crate) mod owner_remote;
+
 pub(crate) const DEFAULT_CODEX_DEBUG_PORT: u16 = 9229;
 pub(crate) const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
+// Native process/listener probes share the configured monitor's eight-second budget.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const CODEX_NATIVE_QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 const MODEL_PICKER_PATCH_KEY: &str = "__ccSwitchCodexAppCompatibilityV9";
 const REMEMBERED_CODEX_DESKTOP_EXECUTABLE_FILENAME: &str = "codex-desktop-executable.json";
 pub(crate) const MANUAL_SUMMARY_REQUEST_MARKER: &str =
@@ -152,7 +158,7 @@ async fn sync_codex_request_health_warnings() -> Result<usize, String> {
             Ok(targets) => targets,
             Err(_) => continue,
         };
-        let targets = match pick_codex_page_targets(&targets, port) {
+        let targets = match pick_codex_page_targets_async(&targets, port).await {
             Ok(targets) => targets,
             Err(_) => continue,
         };
@@ -238,6 +244,10 @@ pub(crate) struct CodexRendererCompatibilityObservation {
     pub(crate) current: bool,
     pub(crate) picker_status: CodexModelPickerReadiness,
     pub(crate) app_server_ready: bool,
+    #[serde(default)]
+    pub(crate) picker_diagnostics: Option<CodexModelPickerDiagnosticsCounts>,
+    #[serde(default)]
+    pub(crate) picker_verification_issues: Vec<String>,
 }
 
 impl Default for CodexRendererCompatibilityObservation {
@@ -246,6 +256,8 @@ impl Default for CodexRendererCompatibilityObservation {
             current: false,
             picker_status: CodexModelPickerReadiness::Unverified,
             app_server_ready: false,
+            picker_diagnostics: None,
+            picker_verification_issues: Vec::new(),
         }
     }
 }
@@ -261,12 +273,65 @@ pub(crate) struct CodexModelPickerDiagnostics {
     pending_observer_count: usize,
     unsupported_observer_count: usize,
     unreadable_observer_count: usize,
+    native_visibility_unverified_observer_count: usize,
+    boolean_control_unverified_model_count: usize,
+    boolean_control_ready_model_count: usize,
     effort_mismatch_count: usize,
     flag_mismatch_count: usize,
     missing_max_model_count: usize,
     missing_ultra_model_count: usize,
     selected_max_model_count: usize,
     selected_ultra_model_count: usize,
+}
+
+/// Counts-only picker telemetry exposed to the guardian/status page.
+///
+/// Keep this separate from `CodexModelPickerDiagnostics`: the latter also
+/// carries the internal readiness status, while the guardian owns the
+/// aggregate status for all current renderer targets.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelPickerDiagnosticsCounts {
+    pub(crate) picker_observer_count: usize,
+    pub(crate) success_observer_count: usize,
+    pub(crate) error_observer_count: usize,
+    pub(crate) pending_observer_count: usize,
+    pub(crate) unsupported_observer_count: usize,
+    pub(crate) unreadable_observer_count: usize,
+    pub(crate) native_visibility_unverified_observer_count: usize,
+    #[serde(default)]
+    pub(crate) boolean_control_unverified_model_count: usize,
+    #[serde(default)]
+    pub(crate) boolean_control_ready_model_count: usize,
+    pub(crate) effort_mismatch_count: usize,
+    pub(crate) flag_mismatch_count: usize,
+    pub(crate) missing_max_model_count: usize,
+    pub(crate) missing_ultra_model_count: usize,
+    pub(crate) selected_max_model_count: usize,
+    pub(crate) selected_ultra_model_count: usize,
+}
+
+impl CodexModelPickerDiagnostics {
+    fn counts(&self) -> CodexModelPickerDiagnosticsCounts {
+        CodexModelPickerDiagnosticsCounts {
+            picker_observer_count: self.picker_observer_count,
+            success_observer_count: self.success_observer_count,
+            error_observer_count: self.error_observer_count,
+            pending_observer_count: self.pending_observer_count,
+            unsupported_observer_count: self.unsupported_observer_count,
+            unreadable_observer_count: self.unreadable_observer_count,
+            native_visibility_unverified_observer_count: self
+                .native_visibility_unverified_observer_count,
+            boolean_control_unverified_model_count: self.boolean_control_unverified_model_count,
+            boolean_control_ready_model_count: self.boolean_control_ready_model_count,
+            effort_mismatch_count: self.effort_mismatch_count,
+            flag_mismatch_count: self.flag_mismatch_count,
+            missing_max_model_count: self.missing_max_model_count,
+            missing_ultra_model_count: self.missing_ultra_model_count,
+            selected_max_model_count: self.selected_max_model_count,
+            selected_ultra_model_count: self.selected_ultra_model_count,
+        }
+    }
 }
 
 /// 注入脚本需要的模型目录投影，避免把整个 catalog 私有字段泄漏到 renderer。
@@ -316,6 +381,9 @@ pub(crate) struct CdpTarget {
     pub(crate) url: String,
     #[serde(default, rename = "webSocketDebuggerUrl")]
     pub(crate) web_socket_debugger_url: Option<String>,
+    // Local transport provenance, never authority supplied by `/json`.
+    #[serde(skip)]
+    pub(crate) source_endpoint: Option<IpAddr>,
 }
 
 // A failed managed snapshot must leave the renderer untouched. Only a proven
@@ -355,7 +423,7 @@ pub async fn unlock_codex_model_picker() -> Result<CodexModelPickerUnlockResult,
     // with no CDP port so the UI does not tell the user to restart a healthy,
     // injectable process.
     let renderer_port = first_codex_renderer_debug_port(&attempted_ports).await;
-    let running_main = detect_running_codex_main_process();
+    let running_main = detect_running_codex_main_process_async().await;
     if let Some(running_main) = running_main {
         let remembered = remember_codex_desktop_executable(&running_main).ok();
         return Ok(CodexModelPickerUnlockResult {
@@ -451,7 +519,7 @@ async fn first_codex_renderer_debug_port(ports: &[u16]) -> Option<u16> {
         let Ok(targets) = list_cdp_targets(*port).await else {
             continue;
         };
-        if pick_codex_page_targets(&targets, *port).is_ok() {
+        if pick_codex_page_targets_async(&targets, *port).await.is_ok() {
             return Some(*port);
         }
     }
@@ -823,7 +891,7 @@ async fn try_inject_on_candidate_ports_with_state(
             Ok(targets) => targets,
             Err(_) => continue,
         };
-        let targets = match pick_codex_page_targets(&targets, *port) {
+        let targets = match pick_codex_page_targets_async(&targets, *port).await {
             Ok(targets) => targets,
             Err(_) => continue,
         };
@@ -856,7 +924,10 @@ async fn try_inject_on_candidate_ports_with_state(
             diagnostics.map(|value| value.ultra_effort_model_count),
             compatibility_evidence.reasoning_query_cache_count,
             compatibility_evidence.app_server_patch_installed,
-            compatibility_evidence.picker_diagnostics,
+            compatibility_evidence
+                .picker_diagnostics
+                .as_ref()
+                .map(|diagnostics| (diagnostics.status, diagnostics.counts())),
             compatibility_evidence.catalog_payload_preserved,
             catalog.fingerprint(),
             codex_renderer_runtime_fingerprint(),
@@ -871,7 +942,8 @@ async fn try_inject_on_candidate_ports_with_state(
             model_names: catalog.model_names.clone(),
             injected: true,
             launched: false,
-            codex_executable: detect_running_codex_main_process()
+            codex_executable: detect_running_codex_main_process_async()
+                .await
                 .map(|path| path.display().to_string()),
             history_sync_requested: compatibility_evidence.history_sync_requested,
             history_catalog_complete: compatibility_evidence.history_catalog_complete,
@@ -916,40 +988,99 @@ pub(crate) fn candidate_debug_ports(preferred: u16) -> Vec<u16> {
 }
 
 /// 查询 CDP 页面 target。
-pub(crate) async fn list_cdp_targets(debug_port: u16) -> Result<Vec<CdpTarget>, String> {
-    let client = reqwest::Client::builder()
+fn codex_cdp_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         .no_proxy()
+        // Transport provenance would be false after following a redirect.
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(CDP_HTTP_TIMEOUT)
         .build()
-        .map_err(|error| format!("failed to build CDP client: {error}"))?;
-    let urls = [
-        format!("http://127.0.0.1:{debug_port}/json"),
-        format!("http://[::1]:{debug_port}/json"),
+        .map_err(|error| format!("failed to build CDP client: {error}"))
+}
+
+async fn run_codex_native_query<T: Send + 'static>(
+    query: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    // Child deadlines are enforced by the shared runner. Offload native queries
+    // rather than blocking the guardian/CDP executor while that deadline elapses.
+    tokio::task::spawn_blocking(query).await.ok()
+}
+
+pub(crate) async fn list_cdp_targets(debug_port: u16) -> Result<Vec<CdpTarget>, String> {
+    let client = codex_cdp_http_client()?;
+    list_cdp_targets_with_endpoint_checks(
+        debug_port,
+        |endpoint| async move {
+            run_codex_native_query(move || {
+                codex_debug_endpoint_has_verified_desktop_listener(debug_port, endpoint)
+            })
+            .await
+            .unwrap_or(false)
+        },
+        |endpoint| {
+            let client = &client;
+            async move {
+                let address = std::net::SocketAddr::new(endpoint, debug_port);
+                let url = format!("http://{address}/json");
+                client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|error| format!("{url}: {error}"))?
+                    .error_for_status()
+                    .map_err(|error| format!("{url}: {error}"))?
+                    .json::<Vec<CdpTarget>>()
+                    .await
+                    .map_err(|error| format!("{url}: invalid target JSON: {error}"))
+            }
+        },
+    )
+    .await
+}
+
+async fn list_cdp_targets_with_endpoint_checks<V, F, T, U>(
+    debug_port: u16,
+    mut verify_listener: V,
+    mut read_targets: F,
+) -> Result<Vec<CdpTarget>, String>
+where
+    V: FnMut(IpAddr) -> U,
+    F: FnMut(IpAddr) -> T,
+    T: std::future::Future<Output = Result<Vec<CdpTarget>, String>>,
+    U: std::future::Future<Output = bool>,
+{
+    let endpoints = [
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
     ];
     let mut errors = Vec::new();
-    for url in urls {
-        match client.get(&url).send().await {
-            Ok(response) => match response.error_for_status() {
-                Ok(response) => match response.json::<Vec<CdpTarget>>().await {
+    for endpoint in endpoints {
+        // An unknown IPv4 owner cannot authorize HTTP or a WebSocket there,
+        // but must not prevent trying a separately verified IPv6 endpoint.
+        if !verify_listener(endpoint).await {
+            errors.push(format!("{endpoint}: CDP listener ownership is unverified"));
+            continue;
+        }
+        match read_targets(endpoint).await {
+            Ok(mut targets) => {
+                for target in &mut targets {
+                    target.source_endpoint = Some(endpoint);
+                }
+                match pick_codex_page_targets_with_endpoint_identity(&targets, debug_port, |_| true)
+                {
                     Ok(targets) => return Ok(targets),
-                    Err(error) => errors.push(format!("{url}: invalid target JSON: {error}")),
-                },
-                Err(error) => errors.push(format!("{url}: {error}")),
-            },
-            Err(error) => errors.push(format!("{url}: {error}")),
+                    Err(error) => errors.push(format!("{endpoint}: {error}")),
+                }
+            }
+            Err(error) => errors.push(error),
         }
     }
     Err(errors.join("; "))
 }
 
-/// 选择最可能属于 Codex Desktop 的 renderer 页面。
-///
-/// CDP ports can belong to another application, including the default port.
-/// Wait for a positive Codex marker before injecting into any renderer.
-fn cdp_websocket_url_is_local(websocket_url: &str, debug_port: u16) -> bool {
-    let Ok(url) = url::Url::parse(websocket_url) else {
-        return false;
-    };
+/// Return only a concrete loopback WebSocket transport, never a DNS alias.
+fn cdp_websocket_endpoint(websocket_url: &str, debug_port: u16) -> Option<IpAddr> {
+    let url = url::Url::parse(websocket_url).ok()?;
     if url.scheme() != "ws"
         || !url.username().is_empty()
         || url.password().is_some()
@@ -957,46 +1088,75 @@ fn cdp_websocket_url_is_local(websocket_url: &str, debug_port: u16) -> bool {
         || url.fragment().is_some()
         || url.port() != Some(debug_port)
     {
-        return false;
+        return None;
     }
-    url.host_str()
-        .and_then(|host| host.parse::<IpAddr>().ok())
-        .is_some_and(|address| address.is_loopback())
+    let address = match url.host()? {
+        url::Host::Ipv4(address) => IpAddr::V4(address),
+        url::Host::Ipv6(address) => IpAddr::V6(address),
+        url::Host::Domain(_) => return None,
+    };
+    address.is_loopback().then_some(address)
+}
+
+#[cfg(test)]
+fn cdp_websocket_url_is_local(websocket_url: &str, debug_port: u16) -> bool {
+    cdp_websocket_endpoint(websocket_url, debug_port).is_some()
+}
+
+pub(crate) async fn pick_codex_page_targets_async(
+    targets: &[CdpTarget],
+    debug_port: u16,
+) -> Result<Vec<CdpTarget>, String> {
+    let targets = targets.to_vec();
+    run_codex_native_query(move || pick_codex_page_targets(&targets, debug_port))
+        .await
+        .unwrap_or_else(|| Err("Codex native listener query failed".to_string()))
 }
 
 pub(crate) fn pick_codex_page_targets(
     targets: &[CdpTarget],
     debug_port: u16,
 ) -> Result<Vec<CdpTarget>, String> {
-    let needs_listener_identity = targets.iter().any(|target| {
-        target.target_type == "page"
-            && target
-                .web_socket_debugger_url
-                .as_deref()
-                .is_some_and(|url| !url.is_empty())
-            && !target_matches_codex_desktop(target, false)
-            && target_matches_codex_desktop(target, true)
-    });
-    let verified_listener =
-        needs_listener_identity && codex_debug_port_has_verified_desktop_listener(debug_port);
-    pick_codex_page_targets_with_listener_identity(targets, debug_port, verified_listener)
+    pick_codex_page_targets_with_endpoint_identity(targets, debug_port, |endpoint| {
+        codex_debug_endpoint_has_verified_desktop_listener(debug_port, endpoint)
+    })
 }
 
+#[cfg(test)]
 fn pick_codex_page_targets_with_listener_identity(
     targets: &[CdpTarget],
     debug_port: u16,
     verified_listener: bool,
 ) -> Result<Vec<CdpTarget>, String> {
-    let pages = targets.iter().filter(|target| {
-        target.target_type == "page"
-            && target
+    pick_codex_page_targets_with_endpoint_identity(targets, debug_port, |_| verified_listener)
+}
+
+fn pick_codex_page_targets_with_endpoint_identity(
+    targets: &[CdpTarget],
+    debug_port: u16,
+    mut verify_listener: impl FnMut(IpAddr) -> bool,
+) -> Result<Vec<CdpTarget>, String> {
+    let mut verified_endpoints = HashMap::new();
+    let mut codex_pages = Vec::new();
+    for target in targets {
+        let Some(endpoint) = target.source_endpoint else {
+            continue;
+        };
+        if target.target_type != "page"
+            || !target_matches_codex_desktop(target, true)
+            || target
                 .web_socket_debugger_url
                 .as_deref()
-                .is_some_and(|url| cdp_websocket_url_is_local(url, debug_port))
-    });
-    let mut codex_pages = Vec::new();
-    for target in pages {
-        if target_matches_codex_desktop(target, verified_listener) {
+                .is_none_or(|url| cdp_websocket_endpoint(url, debug_port) != Some(endpoint))
+        {
+            continue;
+        }
+        // Recheck native ownership after discovery. A title or the other
+        // loopback family's verified owner is never transport authority.
+        let verified = *verified_endpoints
+            .entry(endpoint)
+            .or_insert_with(|| verify_listener(endpoint));
+        if verified {
             codex_pages.push(target.clone());
         }
     }
@@ -1025,6 +1185,7 @@ fn target_matches_codex_desktop(target: &CdpTarget, verified_listener: bool) -> 
             && matches!(url.path(), "/" | "/index.html"))
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn parse_cdp_listener_process_ids(output: &str) -> Vec<u32> {
     output
         .lines()
@@ -1051,7 +1212,7 @@ fn cdp_listener_belongs_to_verified_codex_shell(
         })
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 fn cdp_listener_queries_verify_codex_shell(
     listener_output: Option<&str>,
     processes: Option<&[crate::commands::CodexAppServerProcessDiagnostics]>,
@@ -1065,30 +1226,103 @@ fn cdp_listener_queries_verify_codex_shell(
     cdp_listener_belongs_to_verified_codex_shell(&listener_pids, processes)
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn cdp_listener_address_covers_endpoint(listener: IpAddr, endpoint: IpAddr) -> bool {
+    if listener == endpoint {
+        return true;
+    }
+    match (listener, endpoint) {
+        (IpAddr::V4(listener), IpAddr::V4(_)) => listener.is_unspecified(),
+        (IpAddr::V6(listener), IpAddr::V4(endpoint)) => {
+            // Without native IPV6_V6ONLY evidence, :: may accept IPv4 too.
+            listener.is_unspecified()
+                || listener
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_unspecified() || mapped == endpoint)
+        }
+        (IpAddr::V6(listener), IpAddr::V6(_)) => listener.is_unspecified(),
+        (IpAddr::V4(_), IpAddr::V6(_)) => false,
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn cdp_endpoint_listener_queries_verify_codex_shell(
+    listener_output: Option<&str>,
+    processes: Option<&[crate::commands::CodexAppServerProcessDiagnostics]>,
+    endpoint: IpAddr,
+) -> bool {
+    let (Some(listener_output), Some(processes)) = (listener_output, processes) else {
+        return false;
+    };
+    if !endpoint.is_loopback() {
+        return false;
+    }
+    let mut listener_pids = BTreeSet::new();
+    for line in listener_output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Some((address, pid)) = line.split_once('|') else {
+            return false;
+        };
+        let (Ok(address), Ok(pid)) = (address.parse::<IpAddr>(), pid.parse::<u32>()) else {
+            return false;
+        };
+        if pid == 0 {
+            return false;
+        }
+        if cdp_listener_address_covers_endpoint(address, endpoint) {
+            listener_pids.insert(pid);
+        }
+    }
+    cdp_listener_belongs_to_verified_codex_shell(
+        &listener_pids.into_iter().collect::<Vec<_>>(),
+        processes,
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn codex_cdp_listener_query_script(debug_port: u16) -> String {
+    format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$listenerErrors = @()
+$listeners = @(Get-NetTCPConnection -State Listen -LocalPort {debug_port} -ErrorAction SilentlyContinue -ErrorVariable listenerErrors)
+if (@($listenerErrors | Where-Object {{ $_.CategoryInfo.Category -ne 'ObjectNotFound' }}).Count -gt 0 -or ($listenerErrors.Count -gt 0 -and $listeners.Count -gt 0)) {{ throw 'listener_query_failed' }}
+$listeners | ForEach-Object {{ '{{0}}|{{1}}' -f $_.LocalAddress, $_.OwningProcess }}
+"#
+    )
+}
+
 #[cfg(target_os = "windows")]
-fn codex_debug_port_has_verified_desktop_listener(debug_port: u16) -> bool {
+fn codex_debug_endpoint_has_verified_desktop_listener(debug_port: u16, endpoint: IpAddr) -> bool {
     use std::os::windows::process::CommandExt;
-    let script = format!(
-        "Get-NetTCPConnection -LocalPort {debug_port} -ErrorAction SilentlyContinue | Where-Object {{ $_.OwningProcess -ne 0 -and $_.RemotePort -eq 0 }} | Select-Object -ExpandProperty OwningProcess -Unique"
-    );
+    let script = codex_cdp_listener_query_script(debug_port);
     let (processes, error) = crate::commands::query_codex_processes();
-    let output = crate::powershell::command()
+    let mut command = crate::powershell::command();
+    command
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .creation_flags(0x08000000)
-        .output()
-        .ok();
+        .creation_flags(0x08000000);
+    let output = command_output_with_timeout(&mut command, CODEX_NATIVE_QUERY_TIMEOUT);
     let listener_output = output
         .as_ref()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout));
-    cdp_listener_queries_verify_codex_shell(
+    cdp_endpoint_listener_queries_verify_codex_shell(
         listener_output.as_deref(),
         error.is_none().then_some(processes.as_slice()),
+        endpoint,
     )
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn codex_debug_port_has_verified_desktop_listener(debug_port: u16) -> bool {
+fn codex_debug_endpoint_has_verified_desktop_listener(debug_port: u16, endpoint: IpAddr) -> bool {
+    // Retain the conservative all-port native authority on non-Windows hosts.
+    if !endpoint.is_loopback() {
+        return false;
+    }
     let Some(output) = command_stdout_trimmed(Command::new("lsof").args([
         "-nP",
         "-a",
@@ -1130,7 +1364,7 @@ fn codex_debug_port_has_verified_desktop_listener(debug_port: u16) -> bool {
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-fn codex_debug_port_has_verified_desktop_listener(_debug_port: u16) -> bool {
+fn codex_debug_endpoint_has_verified_desktop_listener(_debug_port: u16, _endpoint: IpAddr) -> bool {
     false
 }
 
@@ -1186,7 +1420,13 @@ fn codex_renderer_compatibility_probe_script(catalog: &CodexModelCatalogProjecti
     let catalog_payload_selection_core = catalog_payload_selection_core_script();
     format!(
         r#"(() => {{
-          const unavailable = {{current: false, pickerStatus: "unverified", appServerReady: false}};
+          const unavailable = {{
+            current: false,
+            pickerStatus: "unverified",
+            appServerReady: false,
+            pickerDiagnostics: null,
+            pickerVerificationIssues: ["runtime_not_current"],
+          }};
           const state = window[{MODEL_PICKER_PATCH_KEY:?}];
           if (!state || state.rendererRuntimeFingerprint !== {runtime_fingerprint:?}
               || !state.interval || !state.messagePatchInstalled) return unavailable;
@@ -1195,24 +1435,103 @@ fn codex_renderer_compatibility_probe_script(catalog: &CodexModelCatalogProjecti
           if (JSON.stringify(state.payload) !== JSON.stringify(expected)) return unavailable;
           const appServerReady = state.appServerPatchInstalled === true;
           if (state.payload?.catalogAvailable !== true)
-            return {{current: true, pickerStatus: "unverified", appServerReady}};
+            return {{
+              current: true,
+              pickerStatus: "unverified",
+              appServerReady,
+              pickerDiagnostics: null,
+              pickerVerificationIssues: ["catalog_unavailable"],
+            }};
           let pickerStatus = appServerReady ? "unverified" : "pending";
-          if (typeof state.readCodexModelPickerDiagnostics === "function") {{
+          let pickerDiagnostics = null;
+          const pickerVerificationIssues = [];
+          const pushIssue = (issue) => {{
+            if (!pickerVerificationIssues.includes(issue)) pickerVerificationIssues.push(issue);
+          }};
+          const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value : 0;
+          if (typeof state.readCodexModelPickerDiagnostics !== "function") {{
+            pickerStatus = "unverified";
+            pushIssue("diagnostics_unavailable");
+          }} else {{
             try {{
-              const observed = state.readCodexModelPickerDiagnostics()?.status;
-              pickerStatus = ["ready", "pending", "error", "mismatch", "unverified", "not_required"].includes(observed)
-                ? observed : "unverified";
+              const observed = state.readCodexModelPickerDiagnostics();
+              if (!observed || typeof observed !== "object") throw new Error("invalid_picker_diagnostics");
+              const observedStatus = observed.status;
+              const validStatus = ["ready", "pending", "error", "mismatch", "unverified", "not_required"].includes(observedStatus);
+              pickerStatus = validStatus ? observedStatus : "unverified";
+              if (!validStatus) pushIssue("diagnostics_unavailable");
+              pickerDiagnostics = {{
+                pickerObserverCount: count(observed.pickerObserverCount),
+                successObserverCount: count(observed.successObserverCount),
+                errorObserverCount: count(observed.errorObserverCount),
+                pendingObserverCount: count(observed.pendingObserverCount),
+                unsupportedObserverCount: count(observed.unsupportedObserverCount),
+                unreadableObserverCount: count(observed.unreadableObserverCount),
+                nativeVisibilityUnverifiedObserverCount: count(observed.nativeVisibilityUnverifiedObserverCount),
+                booleanControlUnverifiedModelCount: count(observed.booleanControlUnverifiedModelCount),
+                booleanControlReadyModelCount: count(observed.booleanControlReadyModelCount),
+                effortMismatchCount: count(observed.effortMismatchCount),
+                flagMismatchCount: count(observed.flagMismatchCount),
+                missingMaxModelCount: count(observed.missingMaxModelCount),
+                missingUltraModelCount: count(observed.missingUltraModelCount),
+                selectedMaxModelCount: count(observed.selectedMaxModelCount),
+                selectedUltraModelCount: count(observed.selectedUltraModelCount),
+              }};
+              if (pickerStatus !== "not_required" &&
+                  (!Object.prototype.hasOwnProperty.call(observed, "nativeVisibilityUnverifiedObserverCount") ||
+                   !Number.isSafeInteger(observed.nativeVisibilityUnverifiedObserverCount) ||
+                   observed.nativeVisibilityUnverifiedObserverCount < 0)) {{
+                if (pickerStatus === "ready") pickerStatus = "unverified";
+                pushIssue("diagnostics_unavailable");
+              }}
+              for (const key of ["booleanControlUnverifiedModelCount", "booleanControlReadyModelCount"]) {{
+                if (Object.prototype.hasOwnProperty.call(observed, key) &&
+                    (!Number.isSafeInteger(observed[key]) || observed[key] < 0)) {{
+                  if (pickerStatus === "ready") pickerStatus = "unverified";
+                  pushIssue("diagnostics_unavailable");
+                }}
+              }}
+              if (pickerDiagnostics.pickerObserverCount === 0 && pickerStatus !== "not_required")
+                pushIssue("observer_not_found");
+              if (pickerStatus === "pending" || pickerDiagnostics.pendingObserverCount > 0)
+                pushIssue("observer_pending");
+              if (pickerStatus === "error" || pickerDiagnostics.errorObserverCount > 0)
+                pushIssue("observer_error");
+              if (pickerDiagnostics.unsupportedObserverCount > 0)
+                pushIssue("observer_unsupported");
+              if (pickerDiagnostics.unreadableObserverCount > 0)
+                pushIssue("observer_unreadable");
+              if (pickerDiagnostics.nativeVisibilityUnverifiedObserverCount > 0)
+                pushIssue("native_visibility_unverified");
+              if (pickerDiagnostics.booleanControlUnverifiedModelCount > 0)
+                pushIssue("boolean_control_unverified");
+              if (pickerDiagnostics.effortMismatchCount > 0)
+                pushIssue("effort_mismatch");
+              if (pickerDiagnostics.flagMismatchCount > 0)
+                pushIssue("flag_mismatch");
+              if (pickerVerificationIssues.length && pickerStatus === "ready")
+                pickerStatus = "unverified";
             }} catch {{
               pickerStatus = "unverified";
+              pickerDiagnostics = null;
+              pushIssue("diagnostics_unavailable");
             }}
           }}
           if (pickerStatus === "not_required" &&
-              (!Array.isArray(state.payload.modelNames) || state.payload.modelNames.length !== 0))
+              (!Array.isArray(state.payload.modelNames) || state.payload.modelNames.length !== 0)) {{
             pickerStatus = "unverified";
+            pushIssue("observer_not_found");
+          }}
           // The model picker can bind directly to its initialized query cache.
           // Fresh observer diagnostics prove its projection independently of
           // the separately authorized continuation/request-client hook.
-          return {{current: true, pickerStatus, appServerReady}};
+          return {{
+            current: true,
+            pickerStatus,
+            appServerReady,
+            pickerDiagnostics,
+            pickerVerificationIssues,
+          }};
         }})()"#
     )
 }
@@ -1234,7 +1553,10 @@ pub(crate) async fn inspect_codex_renderer_compatibility(
     };
     let observation: CodexRendererCompatibilityObservation = serde_json::from_value(value.clone())
         .map_err(|_| "Codex renderer returned an invalid compatibility observation".to_string())?;
-    if !observation.current {
+    if !observation.current && observation.picker_verification_issues.is_empty() {
+        // Preserve the historical fail-closed behavior for malformed/stale
+        // responses, while retaining an explicit runtime_not_current reason
+        // returned by the probe for guardian diagnostics.
         return Ok(CodexRendererCompatibilityObservation::default());
     }
     // Currentness and strict status/field decoding remain fail-closed. A fresh
@@ -1447,7 +1769,7 @@ pub(crate) async fn inspect_codex_runtime_timezone() -> Result<CodexRuntimeTimez
                 continue;
             }
         };
-        let targets = match pick_codex_page_targets(&targets, port) {
+        let targets = match pick_codex_page_targets_async(&targets, port).await {
             Ok(targets) => targets,
             Err(error) => {
                 errors.push(format!("port {port}: {error}"));
@@ -1464,7 +1786,7 @@ pub(crate) async fn inspect_codex_runtime_timezone() -> Result<CodexRuntimeTimez
             }
         }
     }
-    if detect_running_codex_main_process().is_some() {
+    if detect_running_codex_main_process_async().await.is_some() {
         Err("Codex is running without an injectable CDP port; fully quit it and relaunch it from CCSwitchMulti before verifying the runtime timezone".to_string())
     } else if errors.is_empty() {
         Err("Codex Desktop is not running".to_string())
@@ -1656,7 +1978,7 @@ pub(crate) async fn summarize_and_restart_codex_session(
                 continue;
             }
         };
-        let targets = match pick_codex_page_targets(&targets, port) {
+        let targets = match pick_codex_page_targets_async(&targets, port).await {
             Ok(targets) => targets,
             Err(error) => {
                 diagnostics.push(format!("port {port}: {error}"));
@@ -1918,7 +2240,7 @@ pub(crate) async fn submit_codex_continuation(
                 continue;
             }
         };
-        let targets = match pick_codex_page_targets(&targets, port) {
+        let targets = match pick_codex_page_targets_async(&targets, port).await {
             Ok(value) => value,
             Err(error) => {
                 diagnostics.push(format!("port {port}: {error}"));
@@ -1989,6 +2311,8 @@ async fn submit_codex_continuation_to_targets(
 ) -> Result<Option<CodexContinuationResult>, String> {
     let poll_script =
         codex_continuation_bridge_script("readCodexContinuationJob", recovery_id_json);
+    let confirm_script =
+        codex_continuation_bridge_script("confirmCodexContinuation", recovery_id_json);
     let commit_script =
         codex_continuation_bridge_script("commitCodexContinuation", recovery_id_json);
     let cancel_script =
@@ -2026,6 +2350,7 @@ async fn submit_codex_continuation_to_targets(
                 continue 'targets;
             }
             let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let mut confirmation_requested = false;
             let mut commit_requested = false;
             loop {
                 let evaluation = match evaluate_cdp_expression(websocket_url, &poll_script).await {
@@ -2105,7 +2430,39 @@ async fn submit_codex_continuation_to_targets(
                             message: reason.to_string(),
                         }));
                     }
-                    Some("prepared") if !commit_requested => {
+                    Some("prepared") if !confirmation_requested && !commit_requested => {
+                        // Final renderer reads are preparation only. Complete
+                        // them before native policy and budget authorization;
+                        // the confirmed sender has no await before turn/start.
+                        confirmation_requested = true;
+                        let confirmed =
+                            match evaluate_cdp_expression(websocket_url, &confirm_script).await {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    break 'preparation format!("target {}: {error}", target.id);
+                                }
+                            };
+                        if let Some(exception) = confirmed.pointer("/result/exceptionDetails") {
+                            break 'preparation format!(
+                                "target {}: CDP confirmation failed: {exception}",
+                                target.id
+                            );
+                        }
+                        if confirmed
+                            .pointer("/result/result/value/started")
+                            .and_then(Value::as_bool)
+                            != Some(true)
+                        {
+                            let reason = confirmed
+                                .pointer("/result/result/value/reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Codex continuation confirmation was not started");
+                            break 'preparation format!("target {}: {reason}", target.id);
+                        }
+                    }
+                    Some("confirmed") if confirmation_requested && !commit_requested => {
+                        // Only this invocation's completed confirmation can
+                        // authorize its send; never reuse an older final read.
                         // Set before either authorization or dispatch: losing
                         // any later response must preserve mutation uncertainty.
                         commit_requested = true;
@@ -2165,7 +2522,7 @@ async fn submit_codex_continuation_to_targets(
                         }
                     }
                     Some("pending") | Some("submitting") if commit_requested => {}
-                    Some("pending") => {}
+                    Some("pending") | Some("confirming") if !commit_requested => {}
                     Some("unavailable") if commit_requested => {
                         return Err(format!("target {}: Codex compatibility runtime was replaced after continuation commit; result is uncertain", target.id));
                     }
@@ -2223,6 +2580,8 @@ fn assemble_codex_renderer_runtime_script(
     let catalog_payload_selection_core = catalog_payload_selection_core_script();
     let app_server_model_list_scope_core = app_server_model_list_scope_core_script();
     let model_patch_core = model_picker_patch_core_script();
+    let native_boolean_reasoning_core =
+        include_str!("resources/codex_desktop/native_boolean_reasoning.js");
     let query_cache_lifecycle_core =
         include_str!("resources/codex_desktop/model_picker_cache_lifecycle.js");
     let model_picker_release_core = include_str!("resources/codex_desktop/model_picker_release.js");
@@ -2239,6 +2598,7 @@ fn assemble_codex_renderer_runtime_script(
         request_health_warning_core_script(request_health_warning_suppressed);
     let summary_handoff_core = summary_handoff_core_script();
     let codex_continuation_core = codex_continuation_core_script();
+    let owner_remote_view_core = include_str!("resources/codex_desktop/owner_remote_view.js");
 
     // Resolve executable fragments before inserting opaque provider metadata.
     include_str!("resources/codex_desktop/renderer_runtime.js")
@@ -2255,6 +2615,10 @@ fn assemble_codex_renderer_runtime_script(
             query_cache_lifecycle_core,
         )
         .replace("/*__CCSWITCH_MODEL_PATCH_CORE__*/", model_patch_core)
+        .replace(
+            "/*__CCSWITCH_NATIVE_BOOLEAN_REASONING_CORE__*/",
+            native_boolean_reasoning_core,
+        )
         .replace(
             "/*__CCSWITCH_GUARDIAN_V2_PATCH_CORE__*/",
             guardian_v2_patch_core,
@@ -2294,6 +2658,10 @@ fn assemble_codex_renderer_runtime_script(
         .replace(
             "/*__CCSWITCH_CODEX_CONTINUATION_CORE__*/",
             codex_continuation_core,
+        )
+        .replace(
+            "/*__CCSWITCH_OWNER_REMOTE_VIEW_CORE__*/",
+            owner_remote_view_core,
         )
         .replace(
             "/*__CCSWITCH_APP_SERVER_MODEL_LIST_SCOPE_CORE__*/",
@@ -2438,17 +2806,23 @@ Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'ChatGPT.exe
 "#;
 
 /// 查找 Codex Desktop 主进程路径；已运行但未开放 CDP 时不能原地注入。
+pub(crate) async fn detect_running_codex_main_process_async() -> Option<PathBuf> {
+    run_codex_native_query(detect_running_codex_main_process)
+        .await
+        .flatten()
+}
+
 pub(crate) fn detect_running_codex_main_process() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         let script = DETECT_CODEX_MAIN_PROCESS_SCRIPT;
-        let output = crate::powershell::command()
+        let mut command = crate::powershell::command();
+        command
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .ok()?;
+            .creation_flags(CREATE_NO_WINDOW);
+        let output = command_output_with_timeout(&mut command, CODEX_NATIVE_QUERY_TIMEOUT)?;
         if !output.status.success() {
             return None;
         }
@@ -4311,7 +4685,9 @@ const recordFailure = () => {{}};
 const setTimeout = (callback) => {{ callback(); return 1; }};
 {}
 {}
+{}
 "#,
+            model_picker_patch_core_script(),
             summary_handoff_core_script(),
             probe
         );
@@ -4424,6 +4800,115 @@ void runSummarizeSession("source-thread").then((result) => {
             "the production summary prompt must match the Request Health bypass guard"
         );
         assert_eq!(result["result"]["summary"], "Handoff summary");
+    }
+
+    #[test]
+    fn fresh_summary_handoff_does_not_invent_medium_for_models_without_an_effort() {
+        let result = run_summary_handoff_probe(
+            r#"
+const starts = [];
+const source = {
+  id: "source-thread",
+  projectId: "project",
+  cwd: "C:\\repo",
+  model: "xiaomi/mimo-v2.6-flash",
+  modelProvider: "openrouter",
+  status: { type: "idle" },
+};
+const fresh = {
+  id: "fresh-thread",
+  projectId: source.projectId,
+  cwd: source.cwd,
+  model: source.model,
+  modelProvider: source.modelProvider,
+  name: "Fresh MiMo",
+};
+state.appServerClients = [{ sendRequest: async (method, params) => {
+  if (method === "thread/start") {
+    starts.push(params);
+    return { thread: fresh };
+  }
+  if (method === "turn/start") return { turn: { id: "ack-turn" } };
+  if (method === "thread/read") {
+    const threadId = params.threadId;
+    return threadId === source.id
+      ? { thread: source }
+      : { thread: { ...fresh, turns: [{ id: "ack-turn", status: "completed" }] } };
+  }
+  throw new Error(`unexpected method ${method}`);
+} }];
+void runFreshSessionFromSummary("source-thread", "Continue this work").then((result) => {
+  globalThis.__summaryHandoffResult = JSON.stringify({ result, starts });
+});
+"#,
+        );
+        assert_eq!(result["result"]["newThreadId"], "fresh-thread");
+        assert_eq!(result["starts"][0]["model"], "xiaomi/mimo-v2.6-flash");
+        assert_eq!(result["starts"][0]["modelProvider"], "openrouter");
+        assert_eq!(result["starts"][0]["config"], json!({}));
+    }
+
+    #[test]
+    fn fresh_summary_handoff_preserves_explicit_supported_efforts_only() {
+        let result = run_summary_handoff_probe(
+            r#"
+const cases = [
+  { id: "medium-thread", model: "model-medium", reasoningEffort: "medium" },
+  { id: "high-thread", model: "model-high", reasoningEffort: "high" },
+  { id: "empty-thread", model: "model-empty", reasoningEffort: "" },
+  { id: "invalid-thread", model: "model-invalid", reasoningEffort: "ultra" },
+];
+const sources = Object.fromEntries(cases.map((item) => [item.id, {
+  ...item,
+  projectId: "project",
+  cwd: "C:\\repo",
+  modelProvider: "provider",
+  status: { type: "idle" },
+}]));
+const freshById = new Map();
+const starts = [];
+state.appServerClients = [{ sendRequest: async (method, params) => {
+  if (method === "thread/start") {
+    const source = cases.find((item) => item.model === params.model);
+    const fresh = {
+      ...sources[source.id],
+      id: `${source.id}-fresh`,
+      name: "Fresh handoff",
+    };
+    starts.push(params);
+    freshById.set(fresh.id, fresh);
+    return { thread: fresh };
+  }
+  if (method === "turn/start") return { turn: { id: "ack-turn" } };
+  if (method === "thread/read") {
+    if (sources[params.threadId]) return { thread: sources[params.threadId] };
+    const fresh = freshById.get(params.threadId);
+    return { thread: { ...fresh, turns: [{ id: "ack-turn", status: "completed" }] } };
+  }
+  throw new Error(`unexpected method ${method}`);
+} }];
+void (async () => {
+  for (const item of cases)
+    await runFreshSessionFromSummary(item.id, "Continue this work");
+  globalThis.__summaryHandoffResult = JSON.stringify({ starts });
+})();
+"#,
+        );
+        let configs = result["starts"]
+            .as_array()
+            .expect("thread/start calls")
+            .iter()
+            .map(|start| start["config"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            configs,
+            vec![
+                json!({ "model_reasoning_effort": "medium" }),
+                json!({ "model_reasoning_effort": "high" }),
+                json!({}),
+                json!({}),
+            ]
+        );
     }
 
     #[test]
@@ -4635,6 +5120,8 @@ void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.no
         );
         let poll =
             codex_continuation_bridge_script("readCodexContinuationJob", "'isolated-recovery'");
+        let confirm =
+            codex_continuation_bridge_script("confirmCodexContinuation", "'isolated-recovery'");
         let commit =
             codex_continuation_bridge_script("commitCodexContinuation", "'isolated-recovery'");
         let cancel =
@@ -4644,10 +5131,10 @@ void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.no
             r#"
 const window = {{}};
 const calls = [];
-const operations = [() => {start}, () => {poll}, () => {commit}, () => {cancel}];
+const operations = [() => {start}, () => {poll}, () => {confirm}, () => {commit}, () => {cancel}];
 const missing = operations.map((operation) => operation());
 const state = {{rendererRuntimeFingerprint: 'stale-runtime'}};
-for (const method of ['startCodexContinuation', 'readCodexContinuationJob', 'commitCodexContinuation', 'cancelCodexContinuation']) {{
+for (const method of ['startCodexContinuation', 'readCodexContinuationJob', 'confirmCodexContinuation', 'commitCodexContinuation', 'cancelCodexContinuation']) {{
   state[method] = function(...args) {{ calls.push({{method, args, bound: this === state}}); return {{accepted: true}}; }};
 }}
 window[{MODEL_PICKER_PATCH_KEY:?}] = state;
@@ -4656,7 +5143,7 @@ const staleCalls = calls.length;
 state.rendererRuntimeFingerprint = {runtime_fingerprint:?};
 const current = operations.map((operation) => operation());
 state.rendererRuntimeFingerprint = 'replaced-after-preparation';
-const replaced = [operations[1](), operations[2]()];
+const replaced = [operations[1](), operations[2](), operations[3]()];
 const replacedCalls = calls.length;
 state.rendererRuntimeFingerprint = {runtime_fingerprint:?};
 const inheritedState = Object.create(state);
@@ -4684,11 +5171,11 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                 }
             }
             assert_eq!(result["staleCalls"], 0);
-            assert_eq!(result["replacedCalls"], 4);
+            assert_eq!(result["replacedCalls"], 5);
             assert_eq!(
                 result["current"],
                 json!([
-                    {"accepted": true}, {"accepted": true},
+                    {"accepted": true}, {"accepted": true}, {"accepted": true},
                     {"accepted": true}, {"accepted": true}
                 ])
             );
@@ -4697,6 +5184,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                 json!([
                     {"method": "startCodexContinuation", "args": ["exact-thread", "isolated-recovery", "request-model", 1000], "bound": true},
                     {"method": "readCodexContinuationJob", "args": ["isolated-recovery"], "bound": true},
+                    {"method": "confirmCodexContinuation", "args": ["isolated-recovery"], "bound": true},
                     {"method": "commitCodexContinuation", "args": ["isolated-recovery"], "bound": true},
                     {"method": "cancelCodexContinuation", "args": ["isolated-recovery"], "bound": true}
                 ])
@@ -4742,7 +5230,22 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
                 for method in ["Runtime.enable", "Runtime.evaluate"] {
-                    let command = socket.next().await.unwrap().unwrap();
+                    let command = socket.next().await;
+                    if method == "Runtime.evaluate"
+                        && response.as_ref().is_some_and(|response| {
+                            response
+                                .get("expectAuthorizationRefusal")
+                                .and_then(Value::as_bool)
+                                == Some(true)
+                        })
+                    {
+                        assert!(
+                            !matches!(command, Some(Ok(Message::Text(_)))),
+                            "revoked authorization must not send Runtime.evaluate"
+                        );
+                        break;
+                    }
+                    let command = command.unwrap().unwrap();
                     let command: Value = serde_json::from_str(command.to_text().unwrap()).unwrap();
                     assert_eq!(command["method"], method);
                     let result = if method == "Runtime.evaluate" {
@@ -4810,6 +5313,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                 title: "Codex".to_string(),
                 url: "codex://desktop".to_string(),
                 web_socket_debugger_url: Some(format!("ws://{address}")),
+                source_endpoint: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             })
             .collect();
         (targets, address.port(), expressions, server)
@@ -4826,6 +5330,8 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             json!({"cancelled": true, "mutationAttempted": false}),
             json!({"started": true}),
             json!({"status": "prepared"}),
+            json!({"started": true}),
+            json!({"status": "confirmed"}),
             json!({"started": true}),
             json!({
                 "status": "completed", "submitted": true, "mutationAttempted": true,
@@ -4861,7 +5367,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             vec!["target unready-renderer: Codex Desktop request client was not found"]
         );
         let expressions = expressions.lock().unwrap();
-        assert_eq!(expressions.len(), 7);
+        assert_eq!(expressions.len(), 9);
         assert_eq!(
             expressions
                 .iter()
@@ -4922,6 +5428,8 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             json!({"started": true}),
             json!({"status": "prepared"}),
             json!({"started": true}),
+            json!({"status": "confirmed"}),
+            json!({"started": true}),
             json!({
                 "started": false, "status": "unavailable",
                 "reason": "Codex compatibility layer is not ready"
@@ -4940,7 +5448,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
         server.abort();
         assert!(result.unwrap_err().contains("result is uncertain"));
         let expressions = expressions.lock().unwrap();
-        assert_eq!(expressions.len(), 4);
+        assert_eq!(expressions.len(), 6);
         assert_eq!(
             expressions
                 .iter()
@@ -4963,11 +5471,28 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                 "poll",
                 Some(json!({"exceptionDetails": {"text": "isolated exception"}})),
             ),
+            ("confirm", None),
+            (
+                "confirm",
+                Some(json!({"exceptionDetails": {"text": "isolated exception"}})),
+            ),
+            ("confirmed_poll", None),
+            (
+                "confirmed_poll",
+                Some(json!({"exceptionDetails": {"text": "isolated exception"}})),
+            ),
         ] {
             let mut evaluations = Vec::new();
-            if phase == "poll" {
+            if phase != "start" {
                 evaluations.push(Some(json!({"result": {"value": {"started": true}}})));
             }
+            if matches!(phase, "confirm" | "confirmed_poll") {
+                evaluations.push(Some(json!({"result": {"value": {"status": "prepared"}}})));
+            }
+            if phase == "confirmed_poll" {
+                evaluations.push(Some(json!({"result": {"value": {"started": true}}})));
+            }
+            let read_only_prefix_len = evaluations.len();
             evaluations.push(failure);
             evaluations.push(Some(
                 json!({"result": {"value": {"cancelled": true, "mutationAttempted": false}}}),
@@ -4975,6 +5500,8 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             evaluations.extend([
                 Some(json!({"result": {"value": {"started": true}}})),
                 Some(json!({"result": {"value": {"status": "prepared"}}})),
+                Some(json!({"result": {"value": {"started": true}}})),
+                Some(json!({"result": {"value": {"status": "confirmed"}}})),
                 Some(json!({"result": {"value": {"started": true}}})),
                 Some(json!({"result": {"value": {
                     "status": "completed", "submitted": true, "mutationAttempted": true,
@@ -5014,7 +5541,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             assert_eq!(diagnostics.len(), 1);
             assert!(diagnostics[0].starts_with("target unready-renderer:"));
             let expressions = expressions.lock().unwrap();
-            assert_eq!(expressions.len(), if phase == "poll" { 7 } else { 6 });
+            assert_eq!(expressions.len(), read_only_prefix_len + 8);
             assert_eq!(
                 expressions
                     .iter()
@@ -5023,6 +5550,118 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                 1
             );
         }
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_never_reuses_an_inherited_final_confirmation() {
+        for inherited_statuses in [vec!["confirmed"], vec!["confirming", "confirmed"]] {
+            let mut responses = vec![json!({"started": true})];
+            responses.extend(
+                inherited_statuses
+                    .iter()
+                    .map(|status| json!({"status": status})),
+            );
+            responses.push(json!({"cancelled": true, "mutationAttempted": false}));
+            let (mut targets, port, expressions, server) =
+                codex_continuation_test_targets(responses).await;
+            targets.truncate(1);
+            let mut diagnostics = Vec::new();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                submit_codex_continuation_to_targets(
+                    targets,
+                    port,
+                    "start-exact-continuation",
+                    "\"isolated-recovery\"",
+                    &|_| panic!("an inherited final read must not authorize any mutation"),
+                    &mut diagnostics,
+                ),
+            )
+            .await
+            .expect("an inherited confirmation must be refused without the preparation deadline")
+            .expect("an inherited confirmation can be cancelled without mutation");
+            server
+                .await
+                .expect("the isolated CDP fixture must complete");
+            assert!(result.is_none());
+            assert_eq!(diagnostics.len(), 1);
+            let recorded = expressions.lock().unwrap();
+            assert_eq!(recorded.len(), inherited_statuses.len() + 2);
+            assert!(recorded.last().unwrap().contains("cancelCodexContinuation"));
+            assert_eq!(
+                recorded
+                    .iter()
+                    .filter(|expression| expression.contains("confirmCodexContinuation")
+                        || expression.contains("commitCodexContinuation"))
+                    .count(),
+                0,
+                "another invocation's confirmed closure must not be refreshed or sent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_rechecks_final_authorization_after_renderer_confirmation() {
+        let (targets, port, expressions, server) =
+            codex_continuation_test_targets_with_evaluations(vec![
+                Some(json!({"result": {"value": {"started": true}}})),
+                Some(json!({"result": {"value": {"status": "prepared"}}})),
+                Some(json!({"result": {"value": {"started": true}}})),
+                Some(json!({"result": {"value": {"status": "confirmed"}}})),
+                Some(json!({"expectAuthorizationRefusal": true})),
+                Some(json!({"result": {"value": {"cancelled": true, "mutationAttempted": false}}})),
+            ])
+            .await;
+        let authorization_stages = Mutex::new(Vec::new());
+        let mut diagnostics = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            submit_codex_continuation_to_targets(
+                targets,
+                port,
+                "start-exact-continuation",
+                "\"isolated-recovery\"",
+                &|final_commit| {
+                    authorization_stages.lock().unwrap().push(final_commit);
+                    let recorded = expressions.lock().unwrap();
+                    assert_eq!(
+                        recorded.len(),
+                        4,
+                        "native authorization must wait for the final confirmation response"
+                    );
+                    assert!(recorded[2].contains("confirmCodexContinuation"));
+                    assert!(recorded[3].contains("readCodexContinuationJob"));
+                    // Simulate a canonical policy/provider change after the
+                    // renderer's final await but before native authorization.
+                    !final_commit
+                },
+                &mut diagnostics,
+            ),
+        )
+        .await
+        .expect("authorization refusal and cancellation must remain bounded")
+        .expect("authorization refusal must not become an uncertain mutation")
+        .expect("the exact prepared renderer must report the refusal");
+        server
+            .await
+            .expect("the isolated CDP fixture must complete");
+        assert!(!result.submitted);
+        assert!(!result.mutation_attempted);
+        assert_eq!(result.target_id.as_deref(), Some("unready-renderer"));
+        assert!(result.message.contains("authorization was revoked"));
+        assert_eq!(*authorization_stages.lock().unwrap(), vec![false, true]);
+        assert_eq!(diagnostics.len(), 1);
+        let recorded = expressions.lock().unwrap();
+        assert_eq!(recorded.len(), 5);
+        assert!(recorded[4].contains("cancelCodexContinuation"));
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|expression| expression.contains("commitCodexContinuation"))
+                .count(),
+            0,
+            "revoked final authorization must leave the shared sender untouched"
+        );
     }
 
     #[tokio::test]
@@ -5036,6 +5675,8 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                 codex_continuation_test_targets_with_evaluations(vec![
                     Some(json!({"result": {"value": {"started": true}}})),
                     Some(json!({"result": {"value": {"status": "prepared"}}})),
+                    Some(json!({"result": {"value": {"started": true}}})),
+                    Some(json!({"result": {"value": {"status": "confirmed"}}})),
                     Some(json!({"result": {"value": {"started": true}}})),
                     failure,
                 ])
@@ -5067,7 +5708,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             );
             assert!(diagnostics.is_empty());
             assert_eq!(*authorization_stages.lock().unwrap(), vec![false, true]);
-            assert_eq!(expressions.lock().unwrap().len(), 4);
+            assert_eq!(expressions.lock().unwrap().len(), 6);
         }
     }
 
@@ -5102,6 +5743,8 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                     evaluations.extend([
                         Some(json!({"result": {"value": {"started": true}}})),
                         Some(json!({"result": {"value": {"status": "prepared"}}})),
+                        Some(json!({"result": {"value": {"started": true}}})),
+                        Some(json!({"result": {"value": {"status": "confirmed"}}})),
                         Some(json!({"result": {"value": {"started": true}}})),
                         Some(json!({"result": {"value": {"status": "completed", "submitted": true, "mutationAttempted": true}}})),
                     ]);
@@ -5181,6 +5824,8 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             json!({"started": true}),
             json!({"status": "prepared"}),
             json!({"started": true}),
+            json!({"status": "confirmed"}),
+            json!({"started": true}),
             json!({"status": "submitting", "mutationAttempted": true}),
             json!({"status": "completed", "submitted": true, "mutationAttempted": true}),
         ])
@@ -5203,7 +5848,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
         assert!(result.submitted);
         assert!(result.mutation_attempted);
         assert_eq!(*authorizations.lock().unwrap(), vec![false, true]);
-        assert_eq!(expressions.lock().unwrap().len(), 5);
+        assert_eq!(expressions.lock().unwrap().len(), 7);
     }
 
     async fn codex_continuation_test_pending_deadline(after_commit: bool) {
@@ -5212,6 +5857,8 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             evaluations.extend([
                 Some(json!({"result": {"value": {"status": "prepared"}}})),
                 Some(json!({"result": {"value": {"started": true}}})),
+                Some(json!({"result": {"value": {"status": "confirmed"}}})),
+                Some(json!({"result": {"value": {"started": true}}})),
             ]);
         }
         evaluations.push(Some(json!({"repeatPending": true})));
@@ -5219,6 +5866,8 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             evaluations.extend([
                 Some(json!({"result": {"value": {"started": true}}})),
                 Some(json!({"result": {"value": {"status": "prepared"}}})),
+                Some(json!({"result": {"value": {"started": true}}})),
+                Some(json!({"result": {"value": {"status": "confirmed"}}})),
                 Some(json!({"result": {"value": {"started": true}}})),
                 Some(json!({"result": {"value": {"status": "completed", "submitted": true, "mutationAttempted": true}}})),
             ]);
@@ -5301,7 +5950,12 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             (json!({"status": "completed"}), true),
             (json!({"status": "completed", "submitted": false}), true),
         ] {
-            let mut responses = vec![json!({"started": true}), json!({"status": "prepared"})];
+            let mut responses = vec![
+                json!({"started": true}),
+                json!({"status": "prepared"}),
+                json!({"started": true}),
+                json!({"status": "confirmed"}),
+            ];
             if completion {
                 responses.push(json!({"started": true}));
             }
@@ -5328,12 +5982,14 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             assert_eq!(*authorizations.lock().unwrap(), vec![false, true]);
             assert_eq!(
                 expressions.lock().unwrap().len(),
-                if completion { 4 } else { 3 }
+                if completion { 6 } else { 5 }
             );
         }
         let (targets, port, expressions, server) = codex_continuation_test_targets(vec![
             json!({"started": true}),
             json!({"status": "prepared"}),
+            json!({"started": true}),
+            json!({"status": "confirmed"}),
             json!({"started": false, "reason": "Continuation is not prepared"}),
         ])
         .await;
@@ -5351,7 +6007,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
         assert!(!refused.submitted);
         assert!(!refused.mutation_attempted);
         assert_eq!(refused.target_id.as_deref(), Some("unready-renderer"));
-        assert_eq!(expressions.lock().unwrap().len(), 3);
+        assert_eq!(expressions.lock().unwrap().len(), 5);
     }
 
     #[test]
@@ -7335,7 +7991,7 @@ let scopeScans = 0;
 let rootIdentityReads = 0;
 const patchRequestClient = (client) => {{ patched.push(client.id); return true; }};
 const monotonicNow = () => 1;
-const yieldReactDiscovery = async () => {{}};
+const yieldReactDiscovery = async () => {{ scopeScans += 1; }};
 const recordFailure = (error) => {{ throw error; }};
 const document = {{ getElementById(id) {{ rootIdentityReads += 1; return id === "root" ? root : null; }} }};
 class Client {{
@@ -7348,13 +8004,11 @@ let manager = {{ requestClient: new Client("first") }};
 const scope = {{ chain: {{}}, node: {{}}, get queryClient() {{ queryClientReads += 1; return {{}}; }}, get: () => manager, set() {{}}, watch() {{}} }};
 const current = {{}};
 let leaf = current;
-for (let index = 0; index < 40; index += 1) {{ leaf.child = {{}}; leaf = leaf.child; }}
-// Count deep Fiber traversal separately from mandatory cheap root-identity
-// checks, so the stable-root fast path must still avoid another tree walk.
-Object.defineProperty(leaf, "memoizedState", {{ get() {{
-  scopeScans += 1;
-  return {{ memoizedState: {{ current: scope }} }};
-}} }});
+for (let index = 0; index < 150; index += 1) {{ leaf.child = {{}}; leaf = leaf.child; }}
+// Current Fiber bindings are own-data fields, never arbitrary accessors.
+// One yielded deep traversal distinguishes discovery from cheap exact-root
+// and retained-provenance checks on the subsequent stable-root fast paths.
+leaf.memoizedState = {{ memoizedState: {{ current: scope }} }};
 const root = {{ childNodes: [], __reactContainerTest: {{ stateNode: {{ current }} }} }};
 const window = {{ __codexRoot: {{ _internalRoot: {{ current }} }} }};
 class Registry {{
@@ -7395,9 +8049,9 @@ void (async () => {{
         context.with(|ctx| {
             let result: String = ctx.eval("globalThis.__scopedClientDiscoveryResult").expect("read scoped discovery result");
             let result: Value = serde_json::from_str(&result).expect("parse scoped discovery result");
-            // The legacy registry path reads the current roots once per pass;
-            // canonical RPC scope proofs must not add work to that path.
-            assert_eq!(result, json!({ "firstCount": 1, "secondCount": 1, "remoteCount": 0, "patched": ["first", "second"], "registryMutations": 0, "scopeScans": 1, "rootIdentityReads": 3, "queryClientReads": 3 }));
+            // The initial traversal revalidates its exact root at publication.
+            // Subsequent legacy passes reuse that inventory without another walk.
+            assert_eq!(result, json!({ "firstCount": 1, "secondCount": 1, "remoteCount": 0, "patched": ["first", "second"], "registryMutations": 0, "scopeScans": 1, "rootIdentityReads": 4, "queryClientReads": 3 }));
         });
     }
 
@@ -7626,6 +8280,7 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
             catalog_payload_selection_core_script(),
             app_server_model_list_scope_core_script(),
             model_picker_patch_core_script(),
+            include_str!("resources/codex_desktop/native_boolean_reasoning.js"),
             include_str!("resources/codex_desktop/model_picker_cache_lifecycle.js"),
             include_str!("resources/codex_desktop/model_picker_release.js"),
             guardian_v2_compatibility_patch_core_script(),
@@ -7635,6 +8290,7 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
             include_str!("resources/codex_desktop/request_health_warning.js"),
             include_str!("resources/codex_desktop/summary_handoff.js"),
             codex_continuation_core_script(),
+            include_str!("resources/codex_desktop/owner_remote_view.js"),
             include_str!("resources/codex_desktop/renderer_runtime.js"),
         ];
 
@@ -7658,6 +8314,7 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
         assert!(script.contains("else cancelCodexModelPickerReleaseRefresh();"));
         assert!(script.contains("pickerDiagnostics: codexModelPickerDiagnostics()"));
         assert!(script.contains("state.requestHealthWarningsSuppressed = "));
+        assert!(script.contains("state.readCodexOwnerRemoteView = "));
         assert!(script.contains(&format!(
             "const rendererRuntimeFingerprint = {:?}",
             codex_renderer_runtime_fingerprint()
@@ -7680,6 +8337,8 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
         assert!(template.contains(
             include_str!("resources/codex_desktop/native_reasoning_visibility.js").trim()
         ));
+        assert!(template
+            .contains(include_str!("resources/codex_desktop/native_boolean_reasoning.js").trim()));
 
         let script = build_model_picker_unlock_script(&CodexModelCatalogProjection::empty());
         assert!(!script.contains("rendererSchedulerVersion"));
@@ -7701,6 +8360,7 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
             "/*__CCSWITCH_MODEL_PICKER_RELEASE_CORE__*/",
             "/*__CCSWITCH_QUERY_CACHE_LIFECYCLE_CORE__*/",
             "/*__CCSWITCH_MODEL_PATCH_CORE__*/",
+            "/*__CCSWITCH_NATIVE_BOOLEAN_REASONING_CORE__*/",
             "/*__CCSWITCH_GUARDIAN_V2_PATCH_CORE__*/",
             "/*__CCSWITCH_REQUEST_NORMALIZATION_CORE__*/",
             "/*__CCSWITCH_HISTORY_LINEAGE_HYDRATION_CORE__*/",
@@ -7711,6 +8371,7 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
             "/*__CCSWITCH_REQUEST_HEALTH_WARNING_CORE__*/",
             "/*__CCSWITCH_SUMMARY_HANDOFF_CORE__*/",
             "/*__CCSWITCH_CODEX_CONTINUATION_CORE__*/",
+            "/*__CCSWITCH_OWNER_REMOTE_VIEW_CORE__*/",
             "/*__CCSWITCH_APP_SERVER_MODEL_LIST_SCOPE_CORE__*/",
             "__CCSWITCH_REQUEST_HEALTH_SUPPRESSED__",
             "__CCSWITCH_MANUAL_SUMMARY_PROMPT__",
@@ -7812,7 +8473,19 @@ JSON.stringify({{diagnostic, ready, mismatch, requestHookInvented}});
             assert_eq!(result["diagnostic"]["selectedUltraModelCount"], 1);
             assert_eq!(
                 result["ready"],
-                json!({"current": true, "pickerStatus": "ready", "appServerReady": false})
+                json!({
+                    "current": true,
+                    "pickerStatus": "ready",
+                    "appServerReady": false,
+                    "pickerDiagnostics": CodexModelPickerDiagnosticsCounts {
+                        picker_observer_count: 1,
+                        success_observer_count: 1,
+                        selected_max_model_count: 1,
+                        selected_ultra_model_count: 1,
+                        ..Default::default()
+                    },
+                    "pickerVerificationIssues": []
+                })
             );
             assert_eq!(result["mismatch"]["pickerStatus"], "mismatch");
             assert_eq!(result["mismatch"]["appServerReady"], false);
@@ -7913,11 +8586,26 @@ JSON.stringify({{diagnostic, ready, mismatch, requestHookInvented}});
 const state = {{payload: {payload}, rendererRuntimeFingerprint: {runtime_fingerprint:?}, interval: 1, messagePatchInstalled: true}};
 const window = {{[{MODEL_PICKER_PATCH_KEY:?}]: state}};
 const probe = () => {probe};
+const diagnosticsUnavailable = probe();
+const diagnostics = (status) => ({{status, pickerObserverCount: 1, successObserverCount: 1, nativeVisibilityUnverifiedObserverCount: 0}});
+state.readCodexModelPickerDiagnostics = () => ({{...diagnostics("pending"), successObserverCount: 0, pendingObserverCount: 1}});
 const pending = probe();
-state.readCodexModelPickerDiagnostics = () => ({{status: "ready"}});
+state.readCodexModelPickerDiagnostics = () => diagnostics("ready");
 const cacheOnlyReady = probe();
 state.appServerPatchInstalled = true;
 const ready = probe();
+state.readCodexModelPickerDiagnostics = () => ({{...diagnostics("unverified"), pickerObserverCount: 3, successObserverCount: 3, nativeVisibilityUnverifiedObserverCount: 3, privateDetail: "unserialized_diagnostic_detail"}});
+const nativeUnverified = probe();
+state.readCodexModelPickerDiagnostics = () => ({{...diagnostics("unverified"), pickerObserverCount: 3, successObserverCount: 3, booleanControlUnverifiedModelCount: 2, booleanControlReadyModelCount: 1, privateDetail: "unserialized_boolean_detail"}});
+const booleanUnverified = probe();
+state.readCodexModelPickerDiagnostics = () => ({{...diagnostics("ready"), booleanControlUnverifiedModelCount: 1, booleanControlReadyModelCount: 0}});
+const inconsistentBooleanReady = probe();
+state.readCodexModelPickerDiagnostics = () => ({{...diagnostics("ready"), booleanControlUnverifiedModelCount: -1, booleanControlReadyModelCount: 1}});
+const malformedBooleanCounts = probe();
+state.readCodexModelPickerDiagnostics = () => ({{...diagnostics("ready"), booleanControlUnverifiedModelCount: 0, booleanControlReadyModelCount: 2}});
+const booleanReady = probe();
+state.readCodexModelPickerDiagnostics = () => ({{status: "ready"}});
+const legacyDiagnostics = probe();
 state.readCodexModelPickerDiagnostics = () => ({{status: "mismatch"}});
 const mismatch = probe();
 state.readCodexModelPickerDiagnostics = () => ({{status: "error"}});
@@ -7932,7 +8620,7 @@ state.readCodexModelPickerDiagnostics = () => {{ throw new Error("redacted diagn
 const unreadable = probe();
 state.interval = null;
 const stopped = probe();
-JSON.stringify({{pending, cacheOnlyReady, ready, mismatch, error, unknown, missingStatus, noncanonical, unreadable, stopped}});
+JSON.stringify({{diagnosticsUnavailable, pending, cacheOnlyReady, ready, nativeUnverified, booleanUnverified, inconsistentBooleanReady, malformedBooleanCounts, booleanReady, legacyDiagnostics, mismatch, error, unknown, missingStatus, noncanonical, unreadable, stopped}});
 "#
         );
         context.with(|ctx| {
@@ -7940,15 +8628,112 @@ JSON.stringify({{pending, cacheOnlyReady, ready, mismatch, error, unknown, missi
             let result: Value = serde_json::from_str(&result).expect("parse renderer observation");
             assert_eq!(
                 result["pending"],
-                json!({"current": true, "pickerStatus": "pending", "appServerReady": false})
+                json!({
+                    "current": true, "pickerStatus": "pending", "appServerReady": false,
+                    "pickerDiagnostics": CodexModelPickerDiagnosticsCounts {
+                        picker_observer_count: 1,
+                        pending_observer_count: 1,
+                        ..Default::default()
+                    },
+                    "pickerVerificationIssues": ["observer_pending"]
+                })
             );
             assert_eq!(
                 result["cacheOnlyReady"],
-                json!({"current": true, "pickerStatus": "ready", "appServerReady": false})
+                json!({
+                    "current": true, "pickerStatus": "ready", "appServerReady": false,
+                    "pickerDiagnostics": CodexModelPickerDiagnosticsCounts {
+                        picker_observer_count: 1,
+                        success_observer_count: 1,
+                        ..Default::default()
+                    },
+                    "pickerVerificationIssues": []
+                })
             );
             assert_eq!(
                 result["ready"],
-                json!({"current": true, "pickerStatus": "ready", "appServerReady": true})
+                json!({
+                    "current": true, "pickerStatus": "ready", "appServerReady": true,
+                    "pickerDiagnostics": CodexModelPickerDiagnosticsCounts {
+                        picker_observer_count: 1,
+                        success_observer_count: 1,
+                        ..Default::default()
+                    },
+                    "pickerVerificationIssues": []
+                })
+            );
+            assert_eq!(result["nativeUnverified"]["pickerStatus"], "unverified");
+            assert_eq!(
+                result["nativeUnverified"]["pickerDiagnostics"]["successObserverCount"],
+                3
+            );
+            assert_eq!(
+                result["nativeUnverified"]["pickerDiagnostics"]
+                    ["nativeVisibilityUnverifiedObserverCount"],
+                3
+            );
+            assert_eq!(
+                result["nativeUnverified"]["pickerVerificationIssues"],
+                json!(["native_visibility_unverified"])
+            );
+            assert!(result["nativeUnverified"]["pickerDiagnostics"]
+                .get("status")
+                .is_none());
+            assert!(!result
+                .to_string()
+                .contains("unserialized_diagnostic_detail"));
+            assert_eq!(result["booleanUnverified"]["pickerStatus"], "unverified");
+            assert_eq!(
+                result["booleanUnverified"]["pickerDiagnostics"]
+                    ["booleanControlUnverifiedModelCount"],
+                2
+            );
+            assert_eq!(
+                result["booleanUnverified"]["pickerDiagnostics"]["booleanControlReadyModelCount"],
+                1
+            );
+            assert_eq!(
+                result["booleanUnverified"]["pickerVerificationIssues"],
+                json!(["boolean_control_unverified"])
+            );
+            assert!(!result.to_string().contains("unserialized_boolean_detail"));
+            assert_eq!(
+                result["inconsistentBooleanReady"]["pickerStatus"],
+                "unverified"
+            );
+            assert_eq!(
+                result["inconsistentBooleanReady"]["pickerVerificationIssues"],
+                json!(["boolean_control_unverified"])
+            );
+            assert_eq!(
+                result["malformedBooleanCounts"]["pickerStatus"],
+                "unverified"
+            );
+            assert_eq!(
+                result["malformedBooleanCounts"]["pickerVerificationIssues"],
+                json!(["diagnostics_unavailable"])
+            );
+            assert_eq!(result["booleanReady"]["pickerStatus"], "ready");
+            assert_eq!(
+                result["booleanReady"]["pickerDiagnostics"]["booleanControlReadyModelCount"],
+                2
+            );
+            assert_eq!(
+                result["booleanReady"]["pickerVerificationIssues"],
+                json!([])
+            );
+            assert_eq!(result["legacyDiagnostics"]["pickerStatus"], "unverified");
+            assert!(result["legacyDiagnostics"]["pickerVerificationIssues"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("diagnostics_unavailable")));
+            assert_eq!(
+                result["diagnosticsUnavailable"]["pickerStatus"],
+                "unverified"
+            );
+            assert_eq!(
+                result["diagnosticsUnavailable"]["pickerVerificationIssues"],
+                json!(["diagnostics_unavailable"])
             );
             assert_eq!(result["mismatch"]["pickerStatus"], "mismatch");
             assert_eq!(result["error"]["pickerStatus"], "error");
@@ -7958,7 +8743,11 @@ JSON.stringify({{pending, cacheOnlyReady, ready, mismatch, error, unknown, missi
             }
             assert_eq!(
                 result["stopped"],
-                json!({"current": false, "pickerStatus": "unverified", "appServerReady": false})
+                json!({
+                    "current": false, "pickerStatus": "unverified", "appServerReady": false,
+                    "pickerDiagnostics": null,
+                    "pickerVerificationIssues": ["runtime_not_current"]
+                })
             );
         });
     }
@@ -8004,11 +8793,19 @@ JSON.stringify({{empty, unavailable, staleAfterEmpty}});
                 serde_json::from_str(&result).expect("parse empty/unavailable observation");
             assert_eq!(
                 result["empty"],
-                json!({"current": true, "pickerStatus": "not_required", "appServerReady": false})
+                json!({
+                    "current": true, "pickerStatus": "not_required", "appServerReady": false,
+                    "pickerDiagnostics": CodexModelPickerDiagnosticsCounts::default(),
+                    "pickerVerificationIssues": []
+                })
             );
             assert_eq!(
                 result["unavailable"],
-                json!({"current": true, "pickerStatus": "unverified", "appServerReady": false})
+                json!({
+                    "current": true, "pickerStatus": "unverified", "appServerReady": false,
+                    "pickerDiagnostics": null,
+                    "pickerVerificationIssues": ["catalog_unavailable"]
+                })
             );
             assert_eq!(result["staleAfterEmpty"]["current"], false);
         });
@@ -8284,6 +9081,7 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
             title: "Chrome".to_string(),
             url: "https://example.com".to_string(),
             web_socket_debugger_url: Some("ws://127.0.0.1:9222/devtools/page/1".to_string()),
+            source_endpoint: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         }];
 
         assert!(pick_codex_page_targets(&targets, 9222).is_err());
@@ -8297,6 +9095,7 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
             title: "Other Electron App".to_string(),
             url: "app://codex/index.html".to_string(),
             web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
+            source_endpoint: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         }];
 
         assert!(pick_codex_page_targets(&targets, DEFAULT_CODEX_DEBUG_PORT).is_err());
@@ -8319,6 +9118,7 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
                 title: "Codex".to_string(),
                 url: "app://codex/index.html".to_string(),
                 web_socket_debugger_url: Some(websocket_url.to_string()),
+                source_endpoint: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             }];
 
             assert!(
@@ -8326,6 +9126,373 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
                 "unexpectedly accepted websocket URL {websocket_url}"
             );
         }
+    }
+
+    #[test]
+    fn cdp_endpoint_identity_accepts_numeric_ipv6_loopback_websockets() {
+        assert!(cdp_websocket_url_is_local(
+            "ws://[::1]:9229/devtools/page/1",
+            DEFAULT_CODEX_DEBUG_PORT,
+        ));
+    }
+
+    #[test]
+    fn cdp_endpoint_identity_does_not_trust_an_unverified_codex_title() {
+        let targets = vec![CdpTarget {
+            id: "unverified-shell".to_string(),
+            target_type: "page".to_string(),
+            title: "Codex".to_string(),
+            url: "app://codex/index.html".to_string(),
+            web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
+            source_endpoint: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        }];
+
+        assert!(pick_codex_page_targets_with_listener_identity(
+            &targets,
+            DEFAULT_CODEX_DEBUG_PORT,
+            false,
+        )
+        .is_err());
+    }
+    fn cdp_endpoint_test_target(endpoint: IpAddr) -> CdpTarget {
+        CdpTarget {
+            id: endpoint.to_string(),
+            target_type: "page".to_string(),
+            title: "Codex".to_string(),
+            url: "app://-/index.html".to_string(),
+            web_socket_debugger_url: Some(format!(
+                "ws://{}/devtools/page/1",
+                std::net::SocketAddr::new(endpoint, DEFAULT_CODEX_DEBUG_PORT)
+            )),
+            source_endpoint: Some(endpoint),
+        }
+    }
+
+    fn cdp_endpoint_test_processes() -> Vec<crate::commands::CodexAppServerProcessDiagnostics> {
+        vec![crate::commands::CodexAppServerProcessDiagnostics {
+            pid: 41,
+            name: Some("ChatGPT.exe".to_string()),
+            executable_path: None,
+            command_line: None,
+            started_at: None,
+            is_app_server: false,
+        }]
+    }
+
+    #[test]
+    fn cdp_endpoint_identity_rejects_serialized_origin_authority() {
+        let target: CdpTarget = serde_json::from_value(json!({
+            "id": "untrusted-json",
+            "type": "page",
+            "title": "Codex",
+            "url": "app://-/index.html",
+            "webSocketDebuggerUrl": "ws://[::1]:9229/devtools/page/1",
+            "source_endpoint": "::1",
+            "sourceEndpoint": "::1"
+        }))
+        .expect("parse a target with untrusted extra fields");
+        assert_eq!(target.source_endpoint, None);
+        assert!(pick_codex_page_targets_with_endpoint_identity(
+            &[target],
+            DEFAULT_CODEX_DEBUG_PORT,
+            |_| panic!("unproven transport must not ask another endpoint for authority"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cdp_endpoint_identity_binds_websocket_to_its_http_origin() {
+        let ipv4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let ipv6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        for (origin, socket) in [(ipv4, ipv6), (ipv6, ipv4)] {
+            let mut target = cdp_endpoint_test_target(socket);
+            target.source_endpoint = Some(origin);
+            assert!(pick_codex_page_targets_with_endpoint_identity(
+                &[target],
+                DEFAULT_CODEX_DEBUG_PORT,
+                |_| panic!("a different WebSocket address cannot borrow origin authority"),
+            )
+            .is_err());
+        }
+        for endpoint in [ipv4, ipv6] {
+            let targets = [cdp_endpoint_test_target(endpoint)];
+            let accepted = pick_codex_page_targets_with_endpoint_identity(
+                &targets,
+                DEFAULT_CODEX_DEBUG_PORT,
+                |actual| actual == endpoint,
+            )
+            .expect("exact verified loopback transport");
+            assert_eq!(accepted, targets);
+        }
+    }
+
+    #[test]
+    fn cdp_endpoint_identity_never_borrows_other_loopback_family_ownership() {
+        let ipv4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let ipv6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let targets = [
+            cdp_endpoint_test_target(ipv4),
+            cdp_endpoint_test_target(ipv6),
+        ];
+        for verified_endpoint in [ipv4, ipv6] {
+            let accepted = pick_codex_page_targets_with_endpoint_identity(
+                &targets,
+                DEFAULT_CODEX_DEBUG_PORT,
+                |actual| actual == verified_endpoint,
+            )
+            .expect("only the independently verified endpoint is eligible");
+            assert_eq!(accepted.len(), 1);
+            assert_eq!(accepted[0].source_endpoint, Some(verified_endpoint));
+        }
+        assert!(pick_codex_page_targets_with_endpoint_identity(
+            &targets,
+            DEFAULT_CODEX_DEBUG_PORT,
+            |_| false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cdp_endpoint_identity_scopes_unknown_owners_to_their_covering_address() {
+        let processes = cdp_endpoint_test_processes();
+        let ipv4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let ipv6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        for (listeners, accepted, rejected) in [
+            ("127.0.0.1|99\n::1|41", ipv6, ipv4),
+            ("127.0.0.1|41\n::1|99", ipv4, ipv6),
+        ] {
+            assert!(cdp_endpoint_listener_queries_verify_codex_shell(
+                Some(listeners),
+                Some(&processes),
+                accepted,
+            ));
+            assert!(!cdp_endpoint_listener_queries_verify_codex_shell(
+                Some(listeners),
+                Some(&processes),
+                rejected,
+            ));
+        }
+    }
+
+    #[test]
+    fn cdp_endpoint_identity_listener_coverage_includes_wildcards_and_mapped_ipv4() {
+        let ipv4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let ipv6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        for (listener, covers_ipv4, covers_ipv6) in [
+            ("127.0.0.1", true, false),
+            ("::1", false, true),
+            ("0.0.0.0", true, false),
+            ("::", true, true),
+            ("::ffff:127.0.0.1", true, false),
+            ("::ffff:0.0.0.0", true, false),
+            ("127.0.0.2", false, false),
+            ("192.0.2.1", false, false),
+        ] {
+            let listener = listener.parse().expect("test listener IP");
+            assert_eq!(
+                cdp_listener_address_covers_endpoint(listener, ipv4),
+                covers_ipv4,
+                "IPv4 listener coverage for {listener}",
+            );
+            assert_eq!(
+                cdp_listener_address_covers_endpoint(listener, ipv6),
+                covers_ipv6,
+                "IPv6 listener coverage for {listener}",
+            );
+        }
+    }
+
+    #[test]
+    fn cdp_endpoint_identity_rejects_any_unknown_covering_listener() {
+        let processes = cdp_endpoint_test_processes();
+        let ipv4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let ipv6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        for (endpoint, listeners) in [
+            (ipv4, "127.0.0.1|41\n127.0.0.1|99"),
+            (ipv4, "127.0.0.1|41\n0.0.0.0|99"),
+            (ipv4, "127.0.0.1|41\n::|99"),
+            (ipv4, "127.0.0.1|41\n::ffff:127.0.0.1|99"),
+            (ipv4, "127.0.0.1|41\n::ffff:0.0.0.0|99"),
+            (ipv6, "::1|41\n::1|99"),
+            (ipv6, "::1|41\n::|99"),
+        ] {
+            assert!(!cdp_endpoint_listener_queries_verify_codex_shell(
+                Some(listeners),
+                Some(&processes),
+                endpoint,
+            ));
+        }
+        for (endpoint, listeners) in [
+            (ipv4, "127.0.0.1|41\n0.0.0.0|41\n::|41"),
+            (ipv6, "::1|41\n::|41"),
+        ] {
+            assert!(cdp_endpoint_listener_queries_verify_codex_shell(
+                Some(listeners),
+                Some(&processes),
+                endpoint,
+            ));
+        }
+    }
+
+    #[test]
+    fn cdp_endpoint_identity_keeps_missing_and_malformed_queries_fail_closed() {
+        let processes = cdp_endpoint_test_processes();
+        let ipv6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        for listeners in [
+            None,
+            Some(""),
+            Some("41"),
+            Some("::1|0"),
+            Some("::1|unknown"),
+            Some("not-an-address|41"),
+            Some("::1|41\nmalformed"),
+            Some("127.0.0.1|41"),
+        ] {
+            assert!(!cdp_endpoint_listener_queries_verify_codex_shell(
+                listeners,
+                Some(&processes),
+                ipv6,
+            ));
+        }
+        for processes in [None, Some([].as_slice())] {
+            assert!(!cdp_endpoint_listener_queries_verify_codex_shell(
+                Some("::1|41"),
+                processes,
+                ipv6,
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn cdp_endpoint_identity_discovery_falls_back_without_contacting_unknown_ipv4() {
+        let processes = cdp_endpoint_test_processes();
+        let ipv6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let requests = std::cell::RefCell::new(Vec::new());
+        let selected = list_cdp_targets_with_endpoint_checks(
+            DEFAULT_CODEX_DEBUG_PORT,
+            |endpoint| {
+                futures::future::ready(cdp_endpoint_listener_queries_verify_codex_shell(
+                    Some("127.0.0.1|99\n::1|41"),
+                    Some(&processes),
+                    endpoint,
+                ))
+            },
+            |endpoint| {
+                requests.borrow_mut().push(endpoint);
+                let mut target = cdp_endpoint_test_target(endpoint);
+                target.source_endpoint = None;
+                futures::future::ready(Ok(vec![target]))
+            },
+        )
+        .await
+        .expect("independently verified IPv6 is discoverable");
+        assert_eq!(*requests.borrow(), vec![ipv6]);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].source_endpoint, Some(ipv6));
+        assert_eq!(
+            cdp_websocket_endpoint(
+                selected[0].web_socket_debugger_url.as_deref().unwrap(),
+                DEFAULT_CODEX_DEBUG_PORT,
+            ),
+            Some(ipv6),
+        );
+    }
+
+    #[tokio::test]
+    async fn cdp_endpoint_identity_discovery_rejects_cross_address_websockets_before_fallback() {
+        let ipv4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let ipv6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let requests = std::cell::RefCell::new(Vec::new());
+        let selected = list_cdp_targets_with_endpoint_checks(
+            DEFAULT_CODEX_DEBUG_PORT,
+            |_| futures::future::ready(true),
+            |endpoint| {
+                requests.borrow_mut().push(endpoint);
+                // The IPv4 response cannot redirect authority to its IPv6 WebSocket.
+                futures::future::ready(Ok(vec![cdp_endpoint_test_target(ipv6)]))
+            },
+        )
+        .await
+        .expect("only the independently queried matching IPv6 response is accepted");
+        assert_eq!(*requests.borrow(), vec![ipv4, ipv6]);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].source_endpoint, Some(ipv6));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cdp_endpoint_identity_listener_query_rejects_partial_native_results() {
+        use std::os::windows::process::CommandExt;
+        let query = codex_cdp_listener_query_script(DEFAULT_CODEX_DEBUG_PORT);
+        for (error_category, emit_row, successful) in [
+            ("PermissionDenied", true, false),
+            ("InvalidOperation", true, false),
+            ("ObjectNotFound", true, false),
+            ("ObjectNotFound", false, true),
+        ] {
+            // Shadow the command: this test never inspects the real host ports.
+            let row = if emit_row {
+                "[pscustomobject]@{ LocalAddress = '::1'; OwningProcess = 41 }"
+            } else {
+                ""
+            };
+            let mock = format!(
+                r#"
+function Get-NetTCPConnection {{
+    [CmdletBinding()]
+    param([string]$State, [int]$LocalPort)
+    if ($State -ne 'Listen' -or $LocalPort -ne {DEFAULT_CODEX_DEBUG_PORT}) {{ throw 'unexpected_query_scope' }}
+    {row}
+    Write-Error -Message 'fixture_query_error' -Category {error_category}
+}}
+{query}
+"#
+            );
+            let output = crate::powershell::command()
+                .args(["-NoProfile", "-NonInteractive", "-Command", &mock])
+                .creation_flags(0x08000000)
+                .output()
+                .expect("run mocked listener query");
+            assert_eq!(output.status.success(), successful, "{error_category}");
+            if !successful {
+                assert!(
+                    output.stdout.is_empty(),
+                    "a partial native snapshot cannot emit authorization rows",
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cdp_endpoint_identity_http_client_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind owned redirect fixture");
+        let address = listener.local_addr().expect("redirect fixture address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept owned HTTP request");
+            let mut request = [0; 2048];
+            stream
+                .read(&mut request)
+                .await
+                .expect("read HTTP fixture request");
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{address}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("return redirect");
+        });
+        let response = codex_cdp_http_client()
+            .expect("production CDP HTTP client")
+            .get(format!("http://{address}/json"))
+            .send()
+            .await
+            .expect("return the original response without following it");
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.await.expect("owned redirect fixture stopped");
     }
 
     #[test]
@@ -8426,6 +9593,84 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
             started.elapsed() < Duration::from_secs(5),
             "timed-out PowerShell child must be terminated and reaped promptly"
         );
+    }
+
+    // These fixtures exercise child liveness without enumerating host processes,
+    // opening a provider connection, or relying on PowerShell startup timing.
+    const NATIVE_QUERY_TEST_CHILD_ENV: &str = "CC_SWITCH_NATIVE_QUERY_TEST_CHILD";
+
+    fn native_query_test_child(mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "codex_desktop::tests::native_query_child_fixture",
+                "--nocapture",
+            ])
+            .env(NATIVE_QUERY_TEST_CHILD_ENV, mode);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        command
+    }
+
+    #[test]
+    fn native_query_child_fixture() {
+        match std::env::var(NATIVE_QUERY_TEST_CHILD_ENV).as_deref() {
+            Ok("stall") => std::thread::sleep(Duration::from_secs(30)),
+            Ok("output") => {
+                use std::io::Write;
+                std::io::stdout()
+                    .write_all(b"native-query-stdout")
+                    .expect("fixture stdout");
+                std::io::stderr()
+                    .write_all(b"native-query-stderr")
+                    .expect("fixture stderr");
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn native_query_output_runner_bounds_a_stalled_test_child() {
+        let mut command = native_query_test_child("stall");
+        let started = Instant::now();
+        let output = command_output_with_timeout(&mut command, Duration::from_millis(200));
+        assert!(output.is_none(), "a stalled native child must fail closed");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stalled child cleanup must not block subsequent guardian checks"
+        );
+    }
+
+    #[test]
+    fn native_query_output_runner_preserves_both_output_streams() {
+        let mut command = native_query_test_child("output");
+        let output = command_output_with_timeout(&mut command, CODEX_NATIVE_QUERY_TIMEOUT)
+            .expect("fixture child should finish within the native query budget");
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("native-query-stdout"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("native-query-stderr"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_query_wait_does_not_block_the_guardian_executor() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let query = tokio::spawn(run_codex_native_query(move || {
+            let _ = started_tx.send(());
+            // Even a regressed inline execution is bounded so this test cannot hang.
+            release_rx.recv_timeout(Duration::from_secs(2)).is_ok()
+        }));
+        started_rx.await.expect("native query started");
+        assert!(
+            !query.is_finished(),
+            "the current-thread executor must run while a native query is waiting"
+        );
+        release_tx.send(()).expect("native query is still waiting");
+        assert_eq!(query.await.expect("native query task"), Some(true));
     }
 
     /// 验证只接受平台 Desktop shell，避免把 CLI/app-server `codex` 用于 renderer 解锁。
@@ -8591,6 +9836,7 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
             title: String::new(),
             url: String::new(),
             web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
+            source_endpoint: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         }];
 
         assert!(pick_codex_page_targets(&targets, DEFAULT_CODEX_DEBUG_PORT).is_err());
@@ -8604,6 +9850,7 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
             title: "Other Electron App".to_string(),
             url: "app://other/index.html".to_string(),
             web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
+            source_endpoint: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         }];
         assert!(pick_codex_page_targets(&targets, DEFAULT_CODEX_DEBUG_PORT).is_err());
         assert!(pick_codex_page_targets(&targets, 9222).is_err());
@@ -8617,6 +9864,7 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
             title: "Fix production payment blockers".to_string(),
             url: "app://-/index.html".to_string(),
             web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
+            source_endpoint: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         }];
 
         assert!(pick_codex_page_targets_with_listener_identity(
@@ -8643,6 +9891,7 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
                 title: "Other Electron App".to_string(),
                 url: url.to_string(),
                 web_socket_debugger_url: Some("ws://127.0.0.1:9222/devtools/page/1".to_string()),
+                source_endpoint: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             };
             assert!(!target_matches_codex_desktop(&target, false));
             assert!(target_matches_codex_desktop(&target, true));
@@ -8696,6 +9945,7 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
             title: "Active task".to_string(),
             url: "app://-/index.html".to_string(),
             web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
+            source_endpoint: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         };
         let processes = [crate::commands::CodexAppServerProcessDiagnostics {
             pid: 41,
@@ -8762,6 +10012,7 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
                 title: "Codex".to_string(),
                 url: url.to_string(),
                 web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
+                source_endpoint: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             }];
             assert!(pick_codex_page_targets(&targets, DEFAULT_CODEX_DEBUG_PORT).is_err());
             assert!(pick_codex_page_targets(&targets, 9222).is_err());
@@ -8777,6 +10028,7 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
                 title: "Codex".to_string(),
                 url: "app://codex/index.html".to_string(),
                 web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/1".to_string()),
+                source_endpoint: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             },
             CdpTarget {
                 id: "codex-dialog".to_string(),
@@ -8784,11 +10036,16 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
                 title: "Codex".to_string(),
                 url: "app://codex/dialog.html".to_string(),
                 web_socket_debugger_url: Some("ws://127.0.0.1:9229/devtools/page/2".to_string()),
+                source_endpoint: Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             },
         ];
 
-        let picked = pick_codex_page_targets(&targets, DEFAULT_CODEX_DEBUG_PORT)
-            .expect("all Codex targets should be injectable");
+        let picked = pick_codex_page_targets_with_listener_identity(
+            &targets,
+            DEFAULT_CODEX_DEBUG_PORT,
+            true,
+        )
+        .expect("all Codex targets should be injectable");
         assert_eq!(
             picked
                 .iter()

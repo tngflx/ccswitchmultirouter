@@ -13,7 +13,15 @@ import type {
 type ModelReferenceRecord = Record<string, unknown>;
 
 export interface CodexModelReferenceIndex {
+  /** Includes excluded and ambiguous declarations, which cannot become route aliases. */
+  hasIdentity(value: unknown): boolean;
   resolve(value: unknown): string | undefined;
+  /** Bind an explicit route alias to one enabled, selected public source row. */
+  resolveAlias(
+    visible: unknown,
+    target: unknown,
+    selectedCanonicalModels?: ReadonlySet<string>,
+  ): string | undefined;
   upstreamFor(value: unknown): string | undefined;
 }
 
@@ -33,31 +41,40 @@ const sameIdentity = (left: string, right: string): boolean =>
 /**
  * Build a single source of truth for model references.
  *
- * Only enabled rows should be passed here. If two rows advertise the same
- * alias, it is deliberately treated as ambiguous and pruned rather than
- * silently routing traffic to the wrong model.
+ * Pass the full inventory: excluded public identities remain reserved, and
+ * ambiguous aliases remain closed. Resolution exposes enabled unique owners
+ * only, never a sibling that happens to share an excluded row's wire name.
  */
 export function buildCodexModelReferenceIndex(
   models: CodexCatalogModel[],
 ): CodexModelReferenceIndex {
   const canonicalByIdentity = new Map<string, string>();
   const canonicalIdentities = new Set<string>();
+  const enabledCanonicals = new Set<string>();
   const ambiguousIdentities = new Set<string>();
   const upstreamByCanonical = new Map<string, string>();
+  const canonicalsByUpstream = new Map<string, Set<string>>();
 
-  // A catalog's own picker IDs take precedence over another row's aliases
-  // or shared upstream name.
+  // Public IDs own their identities even when excluded. Never reinterpret an
+  // excluded/duplicate public ID as another row's alias or upstream name.
   for (const model of models) {
     const canonical = trimmed(model.model);
-    if (!canonical || model.enabled === false) continue;
+    if (!canonical) continue;
     const key = normalized(canonical);
+    if (canonicalIdentities.has(key)) {
+      canonicalByIdentity.delete(key);
+      enabledCanonicals.delete(key);
+      ambiguousIdentities.add(key);
+      continue;
+    }
     canonicalByIdentity.set(key, canonical);
     canonicalIdentities.add(key);
+    if (model.enabled !== false) enabledCanonicals.add(key);
   }
 
   for (const model of models) {
     const canonical = trimmed(model.model);
-    if (!canonical || model.enabled === false) continue;
+    if (!canonical) continue;
     const canonicalKey = normalized(canonical);
     if (!canonicalKey) continue;
 
@@ -66,6 +83,12 @@ export function buildCodexModelReferenceIndex(
       trimmed(model.upstream_model) ||
       canonical;
     upstreamByCanonical.set(canonicalKey, upstream);
+    if (model.enabled !== false && enabledCanonicals.has(canonicalKey)) {
+      const upstreamKey = normalized(upstream);
+      const owners = canonicalsByUpstream.get(upstreamKey) ?? new Set<string>();
+      owners.add(canonical);
+      canonicalsByUpstream.set(upstreamKey, owners);
+    }
 
     // Credential-group rows inherit the base row's slug/alias metadata but
     // have their own generated picker id. Re-indexing inherited identities
@@ -89,13 +112,46 @@ export function buildCodexModelReferenceIndex(
 
   const resolve = (value: unknown): string | undefined => {
     const key = normalized(value);
-    return key && !ambiguousIdentities.has(key)
-      ? canonicalByIdentity.get(key)
+    const canonical =
+      key && !ambiguousIdentities.has(key)
+        ? canonicalByIdentity.get(key)
+        : undefined;
+    return canonical && enabledCanonicals.has(normalized(canonical))
+      ? canonical
       : undefined;
   };
 
   return {
+    hasIdentity(value: unknown): boolean {
+      const key = normalized(value);
+      return Boolean(
+        key &&
+        (canonicalIdentities.has(key) ||
+          canonicalByIdentity.has(key) ||
+          ambiguousIdentities.has(key)),
+      );
+    },
     resolve,
+    resolveAlias(visible, target, selectedCanonicalModels) {
+      const isSelected = (canonical: string | undefined): canonical is string =>
+        Boolean(
+          canonical &&
+          (!selectedCanonicalModels || selectedCanonicalModels.has(canonical)),
+        );
+      // Public identities reserve ownership even when excluded, duplicated,
+      // or outside the selection. Metadata aliases never override this tier.
+      for (const publicIdentity of [visible, target]) {
+        if (!canonicalIdentities.has(normalized(publicIdentity))) continue;
+        const canonical = resolve(publicIdentity);
+        return isSelected(canonical) ? canonical : undefined;
+      }
+      // Unlike selection references, an explicit route alias binds against
+      // already-selected wire owners, matching the production compiler.
+      const owners = Array.from(
+        canonicalsByUpstream.get(normalized(target)) ?? [],
+      ).filter(isSelected);
+      return owners.length === 1 ? owners[0] : undefined;
+    },
     upstreamFor(value: unknown): string | undefined {
       const canonical = resolve(value);
       return canonical
@@ -132,7 +188,7 @@ export function resolveCodexRouteModelReference(
   aliases?: ModelReferenceRecord,
 ): string | undefined {
   const direct = index.resolve(value);
-  if (direct) return direct;
+  if (direct || index.hasIdentity(value)) return direct;
   const key = normalized(value);
   if (!key || !aliases) return undefined;
   const targets = new Set(
@@ -198,8 +254,10 @@ function sanitizeLegacyRoute(
       : undefined;
   const canonicalModelForRouteAlias = (value: unknown): string | undefined => {
     const direct = index.resolve(value);
-    if (direct) return direct;
+    if (direct || index.hasIdentity(value)) return direct;
     const rawAlias = trimmed(value);
+    if (upstreamIndex.hasIdentity(rawAlias) && !upstreamIndex.resolve(rawAlias))
+      return undefined;
     if (!rawAlias || !modelMap) return undefined;
     const mapping = Object.entries(modelMap).find(([alias]) =>
       sameIdentity(alias, rawAlias),
@@ -241,7 +299,13 @@ function sanitizeLegacyRoute(
     if (modelMap) {
       const nextModelMap: ModelReferenceRecord = {};
       for (const [rawKey, rawValue] of Object.entries(modelMap)) {
-        const key = index.resolve(rawKey) ?? trimmed(rawKey);
+        const canonicalKey = index.resolve(rawKey);
+        if (
+          (!canonicalKey && index.hasIdentity(rawKey)) ||
+          (upstreamIndex.hasIdentity(rawKey) && !upstreamIndex.resolve(rawKey))
+        )
+          continue;
+        const key = canonicalKey ?? trimmed(rawKey);
         const value = upstreamIndex.upstreamFor(rawValue);
         if (!key || !value) continue;
         const duplicate = Object.keys(nextModelMap).some((existing) =>
@@ -269,15 +333,20 @@ function sanitizeV2Route(
       : undefined;
   const resolveSelection = (value: unknown): string | undefined =>
     resolveCodexRouteModelReference(value, index, aliases);
-  const referenceForSave = (value: unknown): string | undefined => {
-    const canonical = resolveSelection(value);
-    if (!canonical) return undefined;
+  const referenceForCanonicalSave = (
+    value: unknown,
+    canonical: string,
+  ): string => {
     const upstream = index.upstreamFor(canonical);
     return preserveUpstreamReferences &&
       upstream &&
       sameIdentity(trimmed(value), upstream)
       ? trimmed(value)
       : canonical;
+  };
+  const referenceForSave = (value: unknown): string | undefined => {
+    const canonical = resolveSelection(value);
+    return canonical ? referenceForCanonicalSave(value, canonical) : undefined;
   };
   const selection =
     route.modelSelection &&
@@ -316,15 +385,31 @@ function sanitizeV2Route(
 
   if (aliases) {
     const nextAliases: ModelReferenceRecord = {};
+    const selectedCanonicals = selectedModels
+      ? new Set(selectedModels)
+      : undefined;
     for (const [alias, target] of Object.entries(aliases)) {
       const cleanAlias = alias.trim();
-      const canonicalTarget = index.resolve(target);
-      if (
-        cleanAlias &&
+      // Historical target metadata may migrate to its current public owner,
+      // but a declared visible public name may not redirect to another row.
+      const declaredTarget = index.resolve(target);
+      const canonicalTarget = index.resolveAlias(
+        cleanAlias,
+        declaredTarget ?? target,
+        selectedCanonicals,
+      );
+      const targetBelongsToOwner =
         canonicalTarget &&
-        (!selectedModels || selectedModels.includes(canonicalTarget))
-      ) {
-        nextAliases[cleanAlias] = referenceForSave(target);
+        (declaredTarget === canonicalTarget ||
+          sameIdentity(
+            trimmed(target),
+            index.upstreamFor(canonicalTarget) ?? canonicalTarget,
+          ));
+      if (cleanAlias && canonicalTarget && targetBelongsToOwner) {
+        nextAliases[cleanAlias] = referenceForCanonicalSave(
+          target,
+          canonicalTarget,
+        );
       }
     }
     next.aliases = nextAliases;

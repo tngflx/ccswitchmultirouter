@@ -1004,12 +1004,15 @@ impl ChatToResponsesState {
     }
 
     fn failed_event(&mut self, message: String, error_type: Option<String>) -> Bytes {
-        self.completed = true;
         let mut error = json!({ "message": message });
         if let Some(error_type) = error_type.filter(|value| !value.is_empty()) {
             error["type"] = json!(error_type);
         }
+        self.failed_error_event(error)
+    }
 
+    fn failed_error_event(&mut self, error: Value) -> Bytes {
+        self.completed = true;
         let mut response = self.base_response("failed", self.completed_output_items());
         response["error"] = error;
 
@@ -1128,8 +1131,7 @@ pub fn create_responses_sse_stream_from_chat_with_context_and_projection<
                         };
 
                         if event_name.as_deref() == Some("error") || chunk.get("error").is_some() {
-                            let (message, error_type) = extract_chat_sse_error(&chunk);
-                            yield Ok(state.failed_event(message, error_type));
+                            yield Ok(state.failed_error_event(extract_chat_sse_error(&chunk)));
                             stream_failed = true;
                             break;
                         }
@@ -1264,8 +1266,7 @@ where
                                 Err(_) => continue,
                             };
                             if event_name.as_deref() == Some("error") || chunk.get("error").is_some() {
-                                let (message, error_type) = extract_chat_sse_error(&chunk);
-                                yield Ok(state.failed_event(message, error_type));
+                                yield Ok(state.failed_error_event(extract_chat_sse_error(&chunk)));
                                 stream_failed = true;
                                 break;
                             }
@@ -1366,7 +1367,7 @@ where
     }
 }
 
-fn extract_chat_sse_error(value: &Value) -> (String, Option<String>) {
+fn extract_chat_sse_error(value: &Value) -> Value {
     let error = value.get("error").unwrap_or(value);
     let message = error
         .as_str()
@@ -1385,7 +1386,25 @@ fn extract_chat_sse_error(value: &Value) -> (String, Option<String>) {
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
 
-    (message, error_type)
+    let mut converted = json!({ "message": message });
+    if let Some(error_type) = error_type.filter(|value| !value.is_empty()) {
+        converted["type"] = json!(error_type);
+    }
+    if let Some(code) = error
+        .get("code")
+        .or_else(|| value.get("code"))
+        .and_then(Value::as_str)
+        .filter(|code| !code.is_empty())
+    {
+        converted["code"] = json!(code);
+    }
+    // Preserve only canonical retry metadata across known envelopes, never
+    // arbitrary provider fields. A refusal wins over a conflicting true;
+    // a true flag remains metadata, not permission to bypass terminal policy.
+    if let Some(retryable) = super::codex_terminal::explicit_retry_decision(value) {
+        converted["retryable"] = json!(retryable);
+    }
+    converted
 }
 
 #[cfg(test)]
@@ -2591,6 +2610,91 @@ mod tests {
         assert!(output.contains("quota exceeded"));
         assert!(output.contains("rate_limit_exceeded"));
         assert!(!output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn chat_sse_explicit_no_retry_preserves_denial_metadata() {
+        for (nested_retryable, root_retryable, response_retryable) in [
+            (Some(false), None, None),
+            (None, Some(false), None),
+            (Some(true), Some(false), None),
+            (Some(false), Some(true), None),
+            (None, None, Some(false)),
+            (Some(true), Some(true), Some(false)),
+        ] {
+            let mut payload = json!({"error": {
+                "type": "overloaded_error",
+                "code": "provider_capacity_rejected",
+                "message": "Model is at capacity. Please retry later.",
+                "metadata": {"private_detail": "must-not-be-copied"}
+            }});
+            if let Some(retryable) = nested_retryable {
+                payload["error"]["retryable"] = json!(retryable);
+            }
+            if let Some(retryable) = root_retryable {
+                payload["retryable"] = json!(retryable);
+            }
+            if let Some(retryable) = response_retryable {
+                payload["response"] = json!({"error": {"retryable": retryable}});
+            }
+            let input = format!("event: error\ndata: {payload}\n\n");
+            let output = collect(vec![input.as_str()]).await;
+            let events = parse_sse_events(&output);
+            let failed = events
+                .iter()
+                .find(|event| event["type"] == "response.failed")
+                .expect("upstream error must fail the response");
+            assert_eq!(failed["response"]["error"]["retryable"], false);
+            assert_eq!(failed["response"]["error"]["type"], "overloaded_error");
+            assert_eq!(
+                failed["response"]["error"]["code"],
+                "provider_capacity_rejected"
+            );
+            assert!(!output.contains("must-not-be-copied"));
+            assert!(!output.contains("event: response.completed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_chat_sse_explicit_no_retry_preserves_denial_metadata() {
+        let payload = json!({"retryable": true, "response": {
+            "error": {"retryable": false}
+        }, "error": {
+            "type": "server_error",
+            "code": "provider_capacity_rejected",
+            "message": "Model is at capacity. Please retry later.",
+            "retryable": true,
+            "metadata": {"private_detail": "must-not-be-copied"}
+        }});
+        let input = format!("event: error\ndata: {payload}\n\n");
+        let upstream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(input))]);
+        let converted = create_responses_sse_stream_from_chat_with_hosted_loop(
+            Box::pin(upstream),
+            CodexToolContext::default(),
+            None,
+            |_calls, _assistant| async { Ok(None) },
+        );
+        let chunks = converted.collect::<Vec<_>>().await;
+        let output = String::from_utf8(
+            chunks
+                .into_iter()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .concat(),
+        )
+        .unwrap();
+        let events = parse_sse_events(&output);
+        let failed = events
+            .iter()
+            .find(|event| event["type"] == "response.failed")
+            .expect("upstream error must fail the hosted response");
+        assert_eq!(failed["response"]["error"]["retryable"], false);
+        assert_eq!(failed["response"]["error"]["type"], "server_error");
+        assert_eq!(
+            failed["response"]["error"]["code"],
+            "provider_capacity_rejected"
+        );
+        assert!(!output.contains("must-not-be-copied"));
     }
 
     #[tokio::test]

@@ -1,0 +1,1470 @@
+{
+  "schemaVersion": 1,
+  "auditDate": "2026-11-12",
+  "description": "Credential-free, offline regression matrix for every included provider/model binding audited on 2026-11-12. The eight official models belong to a separate profile; the active router includes the remaining 37. This is test input, never persisted application state or a claim of live provider validation.",
+  "sources": [
+    {
+      "source": "canonical included catalog + maintained provider contracts",
+      "date": "2026-11-12"
+    },
+    {
+      "source": "https://openrouter.ai/api/v1/models",
+      "date": "2026-11-12",
+      "fields": ["id", "supported_parameters", "reasoning"]
+    },
+    {
+      "source": "docs/audits/2026-11-13-provider-reasoning-followup.json",
+      "date": "2026-11-13",
+      "fields": ["model", "requestedEffort", "classification", "echoedEffort"]
+    }
+  ],
+  "notes": [
+    "Do not equate Included with graded reasoning. Boolean, budget, fixed mandatory reasoning, and undeclared controls must not acquire invented native effort levels.",
+    "nativeEfforts contains the exact declared controls, including an explicit none token where advertised; pickerEfforts omits none and may include separately configured synthetic Codex ultra.",
+    "Unknown relay controls mean no declared graded contract through that provider, not that the upstream model cannot reason.",
+    "The generic relay fixture hosts are reserved example domains and contain no credentials or private transport settings.",
+    "Relay GPT expectations exercise the existing built-in model fallback, not authenticated endpoint verification. Official rows use canonical saved contracts; Sublyx uses maintained contracts. Public OpenRouter metadata is not a successful inference probe.",
+    "Sublyx Terra/Astra/Luna Max expectations incorporate the incoming November 13 provider-scoped accepted-and-echoed evidence. This does not change unknown GPT contracts or equate native Max with synthetic Ultra or measured quality."
+  ],
+  "providers": [
+    {
+      "key": "official",
+      "id": "codex-official",
+      "name": "OpenAI Official",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiFormat": "openai_responses",
+      "profile": "official",
+      "models": [
+        {
+          "catalog": {
+            "model": "gpt-5.5",
+            "upstreamModel": "gpt-5.5",
+            "displayName": "gpt-5.5",
+            "enabled": true,
+            "reasoning": {
+              "schemaVersion": 2,
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["low", "medium", "high", "xhigh"],
+              "defaultEffort": "medium",
+              "disableAllowed": false,
+              "upstream": {
+                "format": "string",
+                "parameter": "reasoning_effort",
+                "effortMap": {
+                  "high": "high",
+                  "none": "low",
+                  "low": "low",
+                  "medium": "medium",
+                  "minimal": "low",
+                  "xhigh": "xhigh"
+                }
+              },
+              "outputFormat": null,
+              "source": "official",
+              "confidence": "authoritative"
+            }
+          },
+          "pickerModel": "gpt-5.5",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "canonical_saved_official_contract"
+        },
+        {
+          "catalog": {
+            "model": "gpt-5.6-luna",
+            "upstreamModel": "gpt-5.6-luna",
+            "displayName": "gpt-5.6-luna",
+            "enabled": true,
+            "reasoning": {
+              "schemaVersion": 2,
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["low", "medium", "high", "xhigh", "max"],
+              "defaultEffort": "medium",
+              "disableAllowed": false,
+              "upstream": {
+                "format": "string",
+                "parameter": "reasoning_effort",
+                "effortMap": {
+                  "low": "low",
+                  "medium": "medium",
+                  "none": "low",
+                  "minimal": "low",
+                  "xhigh": "xhigh",
+                  "high": "high",
+                  "max": "max"
+                }
+              },
+              "outputFormat": null,
+              "source": "official",
+              "confidence": "authoritative"
+            }
+          },
+          "pickerModel": "gpt-5.6-luna",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "canonical_saved_official_contract"
+        },
+        {
+          "catalog": {
+            "model": "gpt-5.6-sol",
+            "upstreamModel": "gpt-5.6-sol",
+            "displayName": "gpt-5.6-sol",
+            "enabled": true,
+            "reasoning": {
+              "schemaVersion": 2,
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["low", "medium", "high", "xhigh", "max"],
+              "defaultEffort": "low",
+              "disableAllowed": false,
+              "upstream": {
+                "format": "string",
+                "parameter": "reasoning_effort",
+                "effortMap": {
+                  "medium": "medium",
+                  "high": "high",
+                  "minimal": "low",
+                  "low": "low",
+                  "none": "low",
+                  "xhigh": "xhigh",
+                  "max": "max"
+                }
+              },
+              "outputFormat": null,
+              "source": "official",
+              "confidence": "authoritative",
+              "codexUltraOrchestration": {
+                "enabled": true
+              }
+            }
+          },
+          "pickerModel": "gpt-5.6-sol",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "low",
+            "disableAllowed": false
+          },
+          "expectationSource": "canonical_saved_official_contract"
+        },
+        {
+          "catalog": {
+            "model": "gpt-5.6-terra",
+            "upstreamModel": "gpt-5.6-terra",
+            "displayName": "gpt-5.6-terra",
+            "enabled": true,
+            "reasoning": {
+              "schemaVersion": 2,
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["low", "medium", "high", "xhigh", "max"],
+              "defaultEffort": "medium",
+              "disableAllowed": false,
+              "upstream": {
+                "format": "string",
+                "parameter": "reasoning_effort",
+                "effortMap": {
+                  "none": "low",
+                  "xhigh": "xhigh",
+                  "minimal": "low",
+                  "low": "low",
+                  "medium": "medium",
+                  "high": "high",
+                  "max": "max"
+                }
+              },
+              "outputFormat": null,
+              "source": "official",
+              "confidence": "authoritative",
+              "codexUltraOrchestration": {
+                "enabled": true
+              }
+            }
+          },
+          "pickerModel": "gpt-5.6-terra",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "canonical_saved_official_contract"
+        },
+        {
+          "catalog": {
+            "model": "gpt-6-astra",
+            "upstreamModel": "gpt-6-astra",
+            "displayName": "gpt-6-astra",
+            "enabled": true,
+            "reasoning": {
+              "schemaVersion": 2,
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["low", "medium", "high", "xhigh", "max"],
+              "defaultEffort": "low",
+              "disableAllowed": false,
+              "upstream": {
+                "format": "string",
+                "parameter": "reasoning_effort",
+                "effortMap": {
+                  "none": "low",
+                  "minimal": "low",
+                  "low": "low",
+                  "high": "high",
+                  "xhigh": "xhigh",
+                  "medium": "medium",
+                  "max": "max"
+                }
+              },
+              "outputFormat": null,
+              "source": "official",
+              "confidence": "authoritative",
+              "codexUltraOrchestration": {
+                "enabled": true
+              }
+            }
+          },
+          "pickerModel": "gpt-6-astra",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "low",
+            "disableAllowed": false
+          },
+          "expectationSource": "canonical_saved_official_contract"
+        },
+        {
+          "catalog": {
+            "model": "gpt-6-luna",
+            "upstreamModel": "gpt-6-luna",
+            "displayName": "gpt-6-luna",
+            "enabled": true,
+            "reasoning": {
+              "schemaVersion": 2,
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["low", "medium", "high", "xhigh", "max"],
+              "defaultEffort": "medium",
+              "disableAllowed": false,
+              "upstream": {
+                "format": "string",
+                "parameter": "reasoning_effort",
+                "effortMap": {
+                  "max": "max",
+                  "high": "high",
+                  "none": "low",
+                  "minimal": "low",
+                  "low": "low",
+                  "medium": "medium",
+                  "xhigh": "xhigh"
+                }
+              },
+              "outputFormat": null,
+              "source": "official",
+              "confidence": "authoritative"
+            }
+          },
+          "pickerModel": "gpt-6-luna",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "canonical_saved_official_contract"
+        },
+        {
+          "catalog": {
+            "model": "gpt-6-sol",
+            "upstreamModel": "gpt-6-sol",
+            "displayName": "gpt-6-sol",
+            "enabled": true,
+            "reasoning": {
+              "schemaVersion": 2,
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["low", "medium", "high", "xhigh", "max"],
+              "defaultEffort": "medium",
+              "disableAllowed": false,
+              "upstream": {
+                "format": "string",
+                "parameter": "reasoning_effort",
+                "effortMap": {
+                  "low": "low",
+                  "medium": "medium",
+                  "none": "low",
+                  "xhigh": "xhigh",
+                  "max": "max",
+                  "high": "high",
+                  "minimal": "low"
+                }
+              },
+              "outputFormat": null,
+              "source": "official",
+              "confidence": "authoritative",
+              "codexUltraOrchestration": {
+                "enabled": true
+              }
+            }
+          },
+          "pickerModel": "gpt-6-sol",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "canonical_saved_official_contract"
+        },
+        {
+          "catalog": {
+            "model": "gpt-6.1-sol",
+            "upstreamModel": "gpt-6.1-sol",
+            "displayName": "gpt-6.1-sol",
+            "enabled": true,
+            "reasoning": {
+              "schemaVersion": 2,
+              "supportStatus": "confirmed_supported",
+              "controlKind": "graded",
+              "supportedEfforts": ["low", "medium", "high", "xhigh", "max"],
+              "defaultEffort": "low",
+              "disableAllowed": false,
+              "upstream": {
+                "format": "string",
+                "parameter": "reasoning_effort",
+                "effortMap": {
+                  "high": "high",
+                  "xhigh": "xhigh",
+                  "max": "max",
+                  "none": "low",
+                  "minimal": "low",
+                  "low": "low",
+                  "medium": "medium"
+                }
+              },
+              "outputFormat": null,
+              "source": "official",
+              "confidence": "authoritative",
+              "codexUltraOrchestration": {
+                "enabled": true
+              }
+            }
+          },
+          "pickerModel": "gpt-6.1-sol",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "low",
+            "disableAllowed": false
+          },
+          "expectationSource": "canonical_saved_official_contract"
+        }
+      ]
+    },
+    {
+      "key": "sublyx",
+      "id": "sublyx",
+      "name": "Sublyx",
+      "baseUrl": "https://api.sublyx.org/v1",
+      "apiFormat": "openai_responses",
+      "profile": "router",
+      "models": [
+        {
+          "catalog": {
+            "model": "gpt-5.6-luna",
+            "displayName": "GPT-5.6 Luna",
+            "enabled": true
+          },
+          "pickerModel": "gpt-5.6-luna-sublyx",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "maintained_provider_contract"
+        },
+        {
+          "catalog": {
+            "model": "gpt-5.6-openai-compact",
+            "displayName": "gpt-5.6-openai-compact",
+            "enabled": true
+          },
+          "pickerModel": "gpt-5.6-openai-compact",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "ultra"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "maintained_provider_contract"
+        },
+        {
+          "catalog": {
+            "model": "gpt-5.6-sol",
+            "displayName": "GPT-5.6 Sol",
+            "enabled": true
+          },
+          "pickerModel": "gpt-5.6-sol-sublyx",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "maintained_provider_contract"
+        },
+        {
+          "catalog": {
+            "model": "gpt-5.6-terra",
+            "displayName": "GPT-5.6 Terra",
+            "enabled": true
+          },
+          "pickerModel": "gpt-5.6-terra-sublyx",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "maintained_provider_contract_with_2026_11_13_native_max_evidence"
+        },
+        {
+          "catalog": {
+            "model": "gpt-6",
+            "displayName": "GPT-6 (Astra)",
+            "enabled": true
+          },
+          "pickerModel": "gpt-6",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "ultra"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "maintained_provider_contract"
+        },
+        {
+          "catalog": {
+            "model": "gpt-6-astra",
+            "displayName": "GPT-6 Astra",
+            "enabled": true
+          },
+          "pickerModel": "gpt-6-astra-sublyx",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "maintained_provider_contract_with_2026_11_13_native_max_evidence"
+        },
+        {
+          "catalog": {
+            "model": "gpt-6-luna",
+            "displayName": "GPT-6 Luna",
+            "enabled": true
+          },
+          "pickerModel": "gpt-6-luna-sublyx",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "maintained_provider_contract_with_2026_11_13_native_max_evidence"
+        },
+        {
+          "catalog": {
+            "model": "gpt-6-sol",
+            "displayName": "GPT-6 Sol",
+            "enabled": true
+          },
+          "pickerModel": "gpt-6-sol-sublyx",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "maintained_provider_contract"
+        },
+        {
+          "catalog": {
+            "model": "gpt-6.1-sol",
+            "displayName": "GPT-6.1 Sol",
+            "enabled": true
+          },
+          "pickerModel": "gpt-6.1-sol-sublyx",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "maintained_provider_contract"
+        },
+        {
+          "catalog": {
+            "model": "gpt-6.1-terra",
+            "displayName": "GPT-6.1 Terra",
+            "enabled": true
+          },
+          "pickerModel": "gpt-6.1-terra",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "medium",
+            "disableAllowed": false
+          },
+          "expectationSource": "maintained_provider_contract"
+        }
+      ]
+    },
+    {
+      "key": "zmhub",
+      "id": "zmhub",
+      "name": "ZmHub",
+      "baseUrl": "https://zmhub.example/v1",
+      "apiFormat": "openai_chat",
+      "profile": "router",
+      "models": [
+        {
+          "catalog": {
+            "model": "claude-fable-5-1",
+            "displayName": "claude-fable-5-1",
+            "enabled": true
+          },
+          "pickerModel": "claude-fable-5-1-zmhub",
+          "expected": {
+            "controlKind": "unknown",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": false
+          },
+          "expectationSource": "unknown_unverified_relay"
+        },
+        {
+          "catalog": {
+            "model": "gpt-6-astra",
+            "displayName": "gpt-6-astra",
+            "enabled": true
+          },
+          "pickerModel": "gpt-6-astra-zmhub",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "low",
+            "disableAllowed": false
+          },
+          "expectationSource": "builtin_model_fallback_unverified_relay"
+        },
+        {
+          "catalog": {
+            "model": "gpt-6.1-sol",
+            "displayName": "gpt-6.1-sol",
+            "enabled": true
+          },
+          "pickerModel": "gpt-6.1-sol-zmhub",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "low",
+            "disableAllowed": false
+          },
+          "expectationSource": "builtin_model_fallback_unverified_relay"
+        }
+      ]
+    },
+    {
+      "key": "s1a",
+      "id": "s1a",
+      "name": "s1a",
+      "baseUrl": "https://s1a.example/v1",
+      "apiFormat": "openai_chat",
+      "profile": "router",
+      "models": [
+        {
+          "catalog": {
+            "model": "claude-fable-5-1",
+            "displayName": "claude-fable-5-1",
+            "enabled": true
+          },
+          "pickerModel": "claude-fable-5-1-s1a",
+          "expected": {
+            "controlKind": "unknown",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": false
+          },
+          "expectationSource": "unknown_unverified_relay"
+        },
+        {
+          "catalog": {
+            "model": "claude-opus-5-5",
+            "displayName": "claude-opus-5-5",
+            "enabled": true
+          },
+          "pickerModel": "claude-opus-5-5",
+          "expected": {
+            "controlKind": "unknown",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": false
+          },
+          "expectationSource": "unknown_unverified_relay"
+        },
+        {
+          "catalog": {
+            "model": "claude-sonnet-5-5",
+            "displayName": "claude-sonnet-5-5",
+            "enabled": true
+          },
+          "pickerModel": "claude-sonnet-5-5",
+          "expected": {
+            "controlKind": "unknown",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": false
+          },
+          "expectationSource": "unknown_unverified_relay"
+        },
+        {
+          "catalog": {
+            "model": "gpt-6.1-sol",
+            "displayName": "gpt-6.1-sol",
+            "enabled": true
+          },
+          "pickerModel": "gpt-6.1-sol-s1a",
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "defaultEffort": "low",
+            "disableAllowed": false
+          },
+          "expectationSource": "builtin_model_fallback_unverified_relay"
+        }
+      ]
+    },
+    {
+      "key": "openrouter",
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "apiFormat": "openai_chat",
+      "profile": "router",
+      "models": [
+        {
+          "catalog": {
+            "model": "cohere/north-mini-code:free",
+            "displayName": "Cohere: North Mini Code (free)",
+            "enabled": true
+          },
+          "pickerModel": "cohere/north-mini-code:free",
+          "apiModel": {
+            "id": "cohere/north-mini-code:free",
+            "supported_parameters": [
+              "frequency_penalty",
+              "include_reasoning",
+              "max_tokens",
+              "presence_penalty",
+              "reasoning",
+              "seed",
+              "stop",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false
+            }
+          },
+          "expected": {
+            "controlKind": "boolean",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "dots-studio/dots-3-note-preview:free",
+            "displayName": "Dots Studio: Dots3-Note Preview (free)",
+            "enabled": true
+          },
+          "pickerModel": "dots-studio/dots-3-note-preview:free",
+          "apiModel": {
+            "id": "dots-studio/dots-3-note-preview:free",
+            "supported_parameters": [
+              "include_reasoning",
+              "max_tokens",
+              "reasoning",
+              "response_format",
+              "structured_outputs",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false
+            }
+          },
+          "expected": {
+            "controlKind": "boolean",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "google/gemma-4-26b-a4b-it:free",
+            "displayName": "Google: Gemma 4 26B A4B  (free)",
+            "enabled": true
+          },
+          "pickerModel": "google/gemma-4-26b-a4b-it:free",
+          "apiModel": {
+            "id": "google/gemma-4-26b-a4b-it:free",
+            "supported_parameters": [
+              "include_reasoning",
+              "max_tokens",
+              "reasoning",
+              "response_format",
+              "seed",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false,
+              "default_enabled": false
+            }
+          },
+          "expected": {
+            "controlKind": "boolean",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "google/gemma-4-31b-it:free",
+            "displayName": "Google: Gemma 4 31B (free)",
+            "enabled": true
+          },
+          "pickerModel": "google/gemma-4-31b-it:free",
+          "apiModel": {
+            "id": "google/gemma-4-31b-it:free",
+            "supported_parameters": [
+              "include_reasoning",
+              "max_tokens",
+              "reasoning",
+              "response_format",
+              "seed",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false,
+              "default_enabled": false
+            }
+          },
+          "expected": {
+            "controlKind": "boolean",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "liquid/lfm-2.5-2.6b:free",
+            "displayName": "LiquidAI: LFM2.5-2.6B (free)",
+            "enabled": true
+          },
+          "pickerModel": "liquid/lfm-2.5-2.6b:free",
+          "apiModel": {
+            "id": "liquid/lfm-2.5-2.6b:free",
+            "supported_parameters": [
+              "frequency_penalty",
+              "include_reasoning",
+              "logprobs",
+              "max_completion_tokens",
+              "max_tokens",
+              "min_p",
+              "presence_penalty",
+              "reasoning",
+              "repetition_penalty",
+              "response_format",
+              "seed",
+              "stop",
+              "structured_outputs",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_logprobs",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": true
+            }
+          },
+          "expected": {
+            "controlKind": "none",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": false
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "liquid/lfm-3-1.7b:free",
+            "displayName": "LiquidAI: LFM3-1.7B (free)",
+            "enabled": true
+          },
+          "pickerModel": "liquid/lfm-3-1.7b:free",
+          "apiModel": {
+            "id": "liquid/lfm-3-1.7b:free",
+            "supported_parameters": [
+              "frequency_penalty",
+              "include_reasoning",
+              "logprobs",
+              "max_completion_tokens",
+              "max_tokens",
+              "min_p",
+              "presence_penalty",
+              "reasoning",
+              "repetition_penalty",
+              "response_format",
+              "seed",
+              "stop",
+              "structured_outputs",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_logprobs",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": true
+            }
+          },
+          "expected": {
+            "controlKind": "none",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": false
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "minimax/minimax-m3",
+            "displayName": "MiniMax: MiniMax M3",
+            "enabled": true
+          },
+          "pickerModel": "minimax/minimax-m3",
+          "apiModel": {
+            "id": "minimax/minimax-m3",
+            "supported_parameters": [
+              "frequency_penalty",
+              "include_reasoning",
+              "logit_bias",
+              "logprobs",
+              "max_tokens",
+              "min_p",
+              "presence_penalty",
+              "reasoning",
+              "repetition_penalty",
+              "response_format",
+              "seed",
+              "stop",
+              "structured_outputs",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_logprobs",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false
+            }
+          },
+          "expected": {
+            "controlKind": "boolean",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "minimax/minimax-m3.1-flash",
+            "displayName": "MiniMax: MiniMax M3.1 Flash",
+            "enabled": true
+          },
+          "pickerModel": "minimax/minimax-m3.1-flash",
+          "apiModel": {
+            "id": "minimax/minimax-m3.1-flash",
+            "supported_parameters": [
+              "frequency_penalty",
+              "include_reasoning",
+              "logit_bias",
+              "logprobs",
+              "max_tokens",
+              "min_p",
+              "presence_penalty",
+              "reasoning",
+              "reasoning_effort",
+              "repetition_penalty",
+              "response_format",
+              "seed",
+              "stop",
+              "structured_outputs",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_logprobs",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": true,
+              "supported_efforts": ["max", "xhigh", "high", "medium", "low"],
+              "default_effort": "max"
+            }
+          },
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["max", "xhigh", "high", "medium", "low"],
+            "pickerEfforts": ["low", "medium", "high", "xhigh", "max"],
+            "defaultEffort": "max",
+            "disableAllowed": false
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            "displayName": "NVIDIA: Nemotron 3 Nano Omni (free)",
+            "enabled": true
+          },
+          "pickerModel": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+          "apiModel": {
+            "id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            "supported_parameters": [
+              "include_reasoning",
+              "max_tokens",
+              "reasoning",
+              "seed",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false,
+              "default_enabled": true,
+              "supports_max_tokens": true
+            }
+          },
+          "expected": {
+            "controlKind": "budget",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "displayName": "NVIDIA: Nemotron 3 Ultra (free)",
+            "enabled": true
+          },
+          "pickerModel": "nvidia/nemotron-3-ultra-550b-a55b:free",
+          "apiModel": {
+            "id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "supported_parameters": [
+              "include_reasoning",
+              "max_tokens",
+              "reasoning",
+              "reasoning_effort",
+              "seed",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false,
+              "default_enabled": true,
+              "supports_max_tokens": true,
+              "supported_efforts": ["high", "medium", "none"],
+              "default_effort": "high"
+            }
+          },
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["high", "medium", "none"],
+            "pickerEfforts": ["medium", "high"],
+            "defaultEffort": "high",
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "nvidia/nemotron-3.5-lightning:free",
+            "displayName": "NVIDIA: Nemotron 3.5 Lightning (free)",
+            "enabled": true
+          },
+          "pickerModel": "nvidia/nemotron-3.5-lightning:free",
+          "apiModel": {
+            "id": "nvidia/nemotron-3.5-lightning:free",
+            "supported_parameters": [
+              "include_reasoning",
+              "max_tokens",
+              "reasoning",
+              "seed",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false
+            }
+          },
+          "expected": {
+            "controlKind": "boolean",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "nvidia/nemotron-3.5-super-vl:free",
+            "displayName": "NVIDIA: Nemotron 3.5 Super VL (free)",
+            "enabled": true
+          },
+          "pickerModel": "nvidia/nemotron-3.5-super-vl:free",
+          "apiModel": {
+            "id": "nvidia/nemotron-3.5-super-vl:free",
+            "supported_parameters": [
+              "include_reasoning",
+              "max_tokens",
+              "reasoning",
+              "response_format",
+              "seed",
+              "structured_outputs",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false
+            }
+          },
+          "expected": {
+            "controlKind": "boolean",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "openrouter/free",
+            "displayName": "Free Models Router",
+            "enabled": true
+          },
+          "pickerModel": "openrouter/free",
+          "apiModel": {
+            "id": "openrouter/free",
+            "supported_parameters": [
+              "frequency_penalty",
+              "include_reasoning",
+              "logprobs",
+              "max_completion_tokens",
+              "max_tokens",
+              "min_p",
+              "presence_penalty",
+              "reasoning",
+              "reasoning_effort",
+              "repetition_penalty",
+              "response_format",
+              "seed",
+              "stop",
+              "structured_outputs",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_logprobs",
+              "top_p"
+            ]
+          },
+          "expected": {
+            "controlKind": "none",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": true,
+            "supportStatus": "confirmed_supported"
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "recursive/flint-v1.0:free",
+            "displayName": "Recursive: Flint (free)",
+            "enabled": true
+          },
+          "pickerModel": "recursive/flint-v1.0:free",
+          "apiModel": {
+            "id": "recursive/flint-v1.0:free",
+            "supported_parameters": [
+              "include_reasoning",
+              "logprobs",
+              "max_tokens",
+              "reasoning",
+              "response_format",
+              "seed",
+              "stop",
+              "temperature",
+              "tools",
+              "top_logprobs",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": true
+            }
+          },
+          "expected": {
+            "controlKind": "none",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": false
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "thinkingmachines/inkling-2-small:free",
+            "displayName": "Thinking Machines: Inkling 2 Small (free)",
+            "enabled": true
+          },
+          "pickerModel": "thinkingmachines/inkling-2-small:free",
+          "apiModel": {
+            "id": "thinkingmachines/inkling-2-small:free",
+            "supported_parameters": [
+              "include_reasoning",
+              "max_tokens",
+              "reasoning",
+              "reasoning_effort",
+              "seed",
+              "stop",
+              "temperature",
+              "tools",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": true,
+              "default_enabled": true,
+              "supported_efforts": ["max", "high", "medium", "low", "minimal"],
+              "default_effort": "high"
+            }
+          },
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["max", "high", "medium", "low", "minimal"],
+            "pickerEfforts": ["minimal", "low", "medium", "high", "max"],
+            "defaultEffort": "high",
+            "disableAllowed": false
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "xiaomi/mimo-v2.6-flash",
+            "displayName": "Xiaomi: MiMo-V2.6-Flash",
+            "enabled": true
+          },
+          "pickerModel": "xiaomi/mimo-v2.6-flash",
+          "apiModel": {
+            "id": "xiaomi/mimo-v2.6-flash",
+            "supported_parameters": [
+              "frequency_penalty",
+              "include_reasoning",
+              "logit_bias",
+              "logprobs",
+              "max_tokens",
+              "min_p",
+              "parallel_tool_calls",
+              "presence_penalty",
+              "reasoning",
+              "repetition_penalty",
+              "response_format",
+              "seed",
+              "stop",
+              "structured_outputs",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_logprobs",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false
+            }
+          },
+          "expected": {
+            "controlKind": "boolean",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "xiaomi/mimo-v2.6-pro",
+            "displayName": "Xiaomi: MiMo-V2.6-Pro",
+            "enabled": true
+          },
+          "pickerModel": "xiaomi/mimo-v2.6-pro",
+          "apiModel": {
+            "id": "xiaomi/mimo-v2.6-pro",
+            "supported_parameters": [
+              "frequency_penalty",
+              "include_reasoning",
+              "logit_bias",
+              "logprobs",
+              "max_tokens",
+              "min_p",
+              "presence_penalty",
+              "reasoning",
+              "repetition_penalty",
+              "response_format",
+              "seed",
+              "stop",
+              "structured_outputs",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_logprobs",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false
+            }
+          },
+          "expected": {
+            "controlKind": "boolean",
+            "nativeEfforts": [],
+            "pickerEfforts": [],
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "~deepseek/deepseek-flash-latest",
+            "displayName": "DeepSeek: DeepSeek Flash Latest",
+            "enabled": true
+          },
+          "pickerModel": "~deepseek/deepseek-flash-latest",
+          "apiModel": {
+            "id": "~deepseek/deepseek-flash-latest",
+            "supported_parameters": [
+              "frequency_penalty",
+              "include_reasoning",
+              "logit_bias",
+              "logprobs",
+              "max_completion_tokens",
+              "max_tokens",
+              "min_p",
+              "parallel_tool_calls",
+              "presence_penalty",
+              "reasoning",
+              "reasoning_effort",
+              "repetition_penalty",
+              "response_format",
+              "seed",
+              "stop",
+              "structured_outputs",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_logprobs",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false,
+              "default_enabled": true,
+              "supported_efforts": ["max", "high", "low", "none"],
+              "default_effort": "high"
+            }
+          },
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["max", "high", "low", "none"],
+            "pickerEfforts": ["low", "high", "max"],
+            "defaultEffort": "high",
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "~deepseek/deepseek-pro-latest",
+            "displayName": "DeepSeek: DeepSeek Pro Latest",
+            "enabled": true
+          },
+          "pickerModel": "~deepseek/deepseek-pro-latest",
+          "apiModel": {
+            "id": "~deepseek/deepseek-pro-latest",
+            "supported_parameters": [
+              "frequency_penalty",
+              "include_reasoning",
+              "logit_bias",
+              "logprobs",
+              "max_tokens",
+              "min_p",
+              "presence_penalty",
+              "reasoning",
+              "reasoning_effort",
+              "repetition_penalty",
+              "response_format",
+              "seed",
+              "stop",
+              "structured_outputs",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_logprobs",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false,
+              "supported_efforts": ["max", "high", "low", "none"],
+              "default_effort": "high"
+            }
+          },
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["max", "high", "low", "none"],
+            "pickerEfforts": ["low", "high", "max"],
+            "defaultEffort": "high",
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        },
+        {
+          "catalog": {
+            "model": "~deepseek/deepseek-v4-flash-latest",
+            "displayName": "DeepSeek: DeepSeek V4 Flash Latest",
+            "enabled": true
+          },
+          "pickerModel": "~deepseek/deepseek-v4-flash-latest",
+          "apiModel": {
+            "id": "~deepseek/deepseek-v4-flash-latest",
+            "supported_parameters": [
+              "frequency_penalty",
+              "include_reasoning",
+              "logit_bias",
+              "logprobs",
+              "max_tokens",
+              "min_p",
+              "parallel_tool_calls",
+              "presence_penalty",
+              "reasoning",
+              "reasoning_effort",
+              "repetition_penalty",
+              "response_format",
+              "seed",
+              "stop",
+              "structured_outputs",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_a",
+              "top_k",
+              "top_logprobs",
+              "top_p"
+            ],
+            "reasoning": {
+              "mandatory": false,
+              "default_enabled": true,
+              "supported_efforts": ["max", "high", "low", "none"],
+              "default_effort": "high"
+            }
+          },
+          "expected": {
+            "controlKind": "graded",
+            "nativeEfforts": ["max", "high", "low", "none"],
+            "pickerEfforts": ["low", "high", "max"],
+            "defaultEffort": "high",
+            "disableAllowed": true
+          },
+          "expectationSource": "public_api_metadata_2026-11-12"
+        }
+      ]
+    }
+  ]
+}

@@ -20,6 +20,7 @@ import {
   createGuardianRuntime,
   guardianProcessIdentity,
   guardianRecoveryPolicy,
+  legacyProductionGuardianAllowed,
   inspectDevWatchdogProcesses,
   parseGuardianArgs,
   runGuardian,
@@ -165,6 +166,73 @@ test("guardian CLI requires explicit development opt-in and preserves PowerShell
   );
 });
 
+test("guardian compatibility budget follows the canonical dev watchdog policy", () => {
+  const plan = parseGuardianArgs([]);
+  assert.equal(plan.MaxRestartsPerWindow, 5);
+  assert.equal(plan.RestartWindowMinutes, 30);
+});
+
+test("production JavaScript guardian cannot create a second release recovery owner", () => {
+  const plan = parseGuardianArgs([]);
+  assert.equal(legacyProductionGuardianAllowed(plan), false);
+  assert.equal(
+    legacyProductionGuardianAllowed({ ...plan, DevelopmentMode: true }),
+    true,
+  );
+  assert.equal(
+    legacyProductionGuardianAllowed({ ...plan, NoRestart: true }),
+    true,
+  );
+});
+
+test("runtime dev override is honored by both enabled and maintenance checks", async (t) => {
+  const f = fixture(t, { DevelopmentMode: true });
+  writeFileSync(
+    path.join(f.plan.ConfigPath, "settings.json"),
+    '{"watchdogEnabled":false}',
+  );
+  const runtime = createGuardianRuntime(f.plan, {
+    environment: { CC_SWITCH_DEV_WATCHDOG_ENABLED: "true" },
+    query: () => [],
+  });
+  assert.equal(await runtime.watchdogEnabled(), true);
+  assert.equal(await runtime.isMaintenance(), false);
+});
+
+test("detached guardian honors the dev owner's recorded override over persisted disabled setting", async (t) => {
+  const f = fixture(t, { DevelopmentMode: true });
+  f.writeSession({
+    ...f.session,
+    environment: { CC_SWITCH_DEV_WATCHDOG_ENABLED: "true" },
+  });
+  writeFileSync(
+    path.join(f.plan.ConfigPath, "settings.json"),
+    '{"watchdogEnabled":false}',
+  );
+  const runtime = createGuardianRuntime(f.plan, {
+    environment: {},
+    query: (_script, queryName) =>
+      queryName === "guardian process identity" ? null : [],
+  });
+  assert.equal(await runtime.watchdogEnabled(), true);
+  assert.equal(await runtime.isMaintenance(), false);
+});
+
+for (const configured of [true, false])
+  test(`production diagnostics ignore a dev-only override (saved=${configured})`, async (t) => {
+    const f = fixture(t, { DevelopmentMode: false, NoRestart: true });
+    writeFileSync(
+      path.join(f.plan.ConfigPath, "settings.json"),
+      JSON.stringify({ watchdogEnabled: configured }),
+    );
+    const runtime = createGuardianRuntime(f.plan, {
+      environment: { CC_SWITCH_DEV_WATCHDOG_ENABLED: String(!configured) },
+      query: () => [],
+    });
+    assert.equal(await runtime.watchdogEnabled(), configured);
+    assert.equal(await runtime.isMaintenance(), !configured);
+  });
+
 test("guardian CLI rejects invalid or duplicate timing and switch options", () => {
   for (const args of [
     ["-Port", "0"],
@@ -195,8 +263,50 @@ test("guardian custom port updates default health endpoint and preserves explici
   );
 });
 
+test("direct imported recovery policy cannot restart production or charge a second budget", async (t) => {
+  const f = fixture(t, { RestartOnCleanExit: true });
+  const restartTimesUtc = [];
+  await f.policy({
+    restartTimesUtc,
+    core: {
+      ...guardianCore,
+      guardianRecovery: () => {
+        throw new Error("Production recovery must be unreachable");
+      },
+      guardianRestartBudget: () => {
+        throw new Error("Production budget must be unreachable");
+      },
+      guardianUncleanExit: () => {
+        throw new Error("Production restart evidence must be unreachable");
+      },
+    },
+  });
+  assert.equal(f.launches.length, 0);
+  assert.equal(restartTimesUtc.length, 0);
+  assert.ok(
+    f.events.some(({ event }) => event === "production-recovery-owned-by-rust"),
+  );
+});
+
+test("direct imported runner refuses production recovery before lock or native operations", async (t) => {
+  const f = fixture(t);
+  let lockAttempts = 0;
+  await assert.rejects(
+    runGuardian(f.plan, {
+      runtime: f.runtime,
+      acquireLock: async () => {
+        lockAttempts++;
+        throw new Error("Unexpected fixture lock operation");
+      },
+    }),
+    /Production recovery is owned by the built-in Rust watchdog/,
+  );
+  assert.equal(lockAttempts, 0);
+  assert.equal(f.launches.length, 0);
+});
+
 for (const marker of ["missing", "live", "stale", "stopping", "malformed"])
-  test(`production recovery ignores ${marker} development session and launches installed executable`, async (t) => {
+  test(`direct production policy refuses recovery with ${marker} development session`, async (t) => {
     const f = fixture(t);
     if (marker === "malformed") f.writeSession("{");
     else if (marker !== "missing") {
@@ -213,9 +323,12 @@ for (const marker of ["missing", "live", "stale", "stopping", "malformed"])
       },
     };
     await f.policy({ core });
-    assert.deepEqual(f.launches, [
-      { kind: "product", executable: f.plan.InstalledExecutable },
-    ]);
+    assert.deepEqual(f.launches, []);
+    assert.ok(
+      f.events.some(
+        ({ event }) => event === "production-recovery-owned-by-rust",
+      ),
+    );
   });
 
 for (const marker of ["missing", "dev-live", "dev-stale", "foreign"])
@@ -243,11 +356,13 @@ for (const marker of ["missing", "dev-live", "dev-stale", "foreign"])
     });
     assert.equal(f.launches.length, 0);
     assert.ok(
-      f.events.some(({ event }) => event === "restart-skipped-clean-exit"),
+      f.events.some(
+        ({ event }) => event === "production-recovery-owned-by-rust",
+      ),
     );
   });
 
-test("production recovers modern installed marker independently of live development supervisor", async (t) => {
+test("direct production policy cannot restart a modern installed marker even with a live dev supervisor", async (t) => {
   const f = fixture(t);
   f.writeSession();
   f.state.supervisorAlive = true;
@@ -264,10 +379,13 @@ test("production recovers modern installed marker independently of live developm
       },
     },
   });
-  assert.equal(f.launches[0]?.kind, "product");
+  assert.equal(f.launches.length, 0);
+  assert.ok(
+    f.events.some(({ event }) => event === "production-recovery-owned-by-rust"),
+  );
 });
 
-test("production clean-exit opt-in remains bound to installed application", async (t) => {
+test("legacy production clean-exit opt-in cannot reenable competing recovery", async (t) => {
   const f = fixture(t, { RestartOnCleanExit: true });
   f.writeSession();
   f.writeAppMarker({
@@ -289,7 +407,10 @@ test("production clean-exit opt-in remains bound to installed application", asyn
       },
     },
   });
-  assert.equal(f.launches[0]?.kind, "product");
+  assert.equal(f.launches.length, 0);
+  assert.ok(
+    f.events.some(({ event }) => event === "production-recovery-owned-by-rust"),
+  );
 });
 
 test("explicit development mode launches recorded JavaScript entry with saved arguments", async (t) => {
@@ -336,6 +457,37 @@ test("live supervisor defers explicit development recovery", async (t) => {
   );
 });
 
+for (const case_ of ["missing", "nonrecoverable-without-fallback-guard"])
+  test(`explicit development mode cannot use installed recovery for ${case_} session`, async (t) => {
+    const f = fixture(t, { DevelopmentMode: true, RestartOnCleanExit: true });
+    const restartTimesUtc = [];
+    const realDevPlan = await guardianCore.devSessionRecoveryPlan({
+      configPath: f.plan.ConfigPath,
+      getProcessIdentity: f.runtime.getProcessIdentity,
+      inspectWatchdogOwnership: f.runtime.inspectWatchdogOwnership,
+    });
+    await f.policy({
+      restartTimesUtc,
+      core: {
+        ...guardianCore,
+        ...(case_ === "missing"
+          ? {}
+          : {
+              devSessionRecoveryPlan: () => ({
+                ...realDevPlan,
+                PreventInstalledFallback: false,
+                Recoverable: false,
+              }),
+            }),
+      },
+    });
+    assert.equal(f.launches.length, 0);
+    assert.equal(restartTimesUtc.length, 0);
+    assert.ok(
+      f.events.some(({ event }) => event === "dev-session-recovery-required"),
+    );
+  });
+
 for (const marker of ["malformed", "stopping"])
   test(`explicit development mode never falls back to installed app for ${marker} marker`, async (t) => {
     const f = fixture(t, { DevelopmentMode: true });
@@ -347,7 +499,7 @@ for (const marker of ["malformed", "stopping"])
   });
 
 for (const setting of ["disabled", "no-restart", "maintenance", "rate-limited"])
-  test(`product recovery honors ${setting}`, async (t) => {
+  test(`production recovery remains prohibited when ${setting}`, async (t) => {
     const f = fixture(t, { NoRestart: setting === "no-restart" });
     f.state.enabled = setting !== "disabled";
     f.state.maintenance = setting === "maintenance";
@@ -556,7 +708,7 @@ test("native stop checks exact retained handle path/start and optional command/S
 });
 
 test("process stop and launch refuse lost native lock ownership", async (t) => {
-  const f = fixture(t);
+  const f = fixture(t, { DevelopmentMode: true });
   let nativeCalled = false;
   const assertHeld = () => {
     throw new Error("lock lost");
@@ -584,35 +736,23 @@ test("process stop and launch refuse lost native lock ownership", async (t) => {
       nativeCalled = true;
     },
   });
-  await assert.rejects(runtime.startProduct(), /lock lost/);
+  // Installed-app launch capability was removed with the competing owner.
+  assert.equal(runtime.startProduct, undefined);
   await assert.rejects(runtime.startDevSession({}), /lock lost/);
   assert.equal(nativeCalled, false);
 });
 
-test("runtime production launch retains its installed-app output policy without creating a development log", async (t) => {
-  const f = fixture(t);
-  let launch;
+test("runtime diagnostics exposes no installed-product launch capability", (t) => {
+  const f = fixture(t, { NoRestart: true });
+  let launches = 0;
   const runtime = createGuardianRuntime(f.plan, {
-    spawnProcess(executable, args, options) {
-      launch = { executable, args, options };
-      const child = new EventEmitter();
-      child.pid = 8080;
-      child.unref = () => {};
-      queueMicrotask(() => child.emit("spawn"));
-      return child;
+    spawnProcess: () => {
+      launches++;
+      throw new Error("Unexpected production process launch");
     },
   });
-  assert.equal(await runtime.startProduct(), 8080);
-  assert.equal(launch.executable, f.plan.InstalledExecutable);
-  assert.deepEqual(launch.args, []);
-  assert.equal(launch.options.stdio, "ignore");
-  assert.equal(launch.options.detached, true);
-  assert.equal(launch.options.windowsHide, true);
-  assert.throws(
-    () =>
-      readFileSync(path.join(f.plan.ConfigPath, "logs", "dev-recovery.log")),
-    { code: "ENOENT" },
-  );
+  assert.equal(runtime.startProduct, undefined);
+  assert.equal(launches, 0);
 });
 
 test("runtime product inspection combines exact installed identity and healthy response", async (t) => {
@@ -633,22 +773,8 @@ test("runtime product inspection combines exact installed identity and healthy r
   assert.equal((await runtime.inspectRuntime()).Healthy, false);
 });
 
-test("runtime refuses recovery when a product process identity query is incomplete", (t) => {
-  const f = fixture(t);
-  const runtime = createGuardianRuntime(f.plan, {
-    query: (script, name) => {
-      if (name === "guardian owned processes") return [{ ProcessId: 4242 }];
-      throw new Error("Identity access unavailable.");
-    },
-  });
-  assert.throws(
-    () => runtime.getExpectedProductProcesses(),
-    /Identity access unavailable/,
-  );
-});
-
 test("runtime development launcher uses Node argv without a shell or PS1 and filters saved environment", async (t) => {
-  const f = fixture(t);
+  const f = fixture(t, { DevelopmentMode: true });
   let launch;
   const runtime = createGuardianRuntime(f.plan, {
     spawnProcess: (executable, args, options) => {
@@ -701,7 +827,11 @@ test("runtime development launcher uses Node argv without a shell or PS1 and fil
 });
 
 test("runner survives transient iteration failures and releases native lock", async (t) => {
-  const f = fixture(t, { MaxCycles: 3, FailureThresholdSeconds: 1 });
+  const f = fixture(t, {
+    NoRestart: true,
+    MaxCycles: 3,
+    FailureThresholdSeconds: 1,
+  });
   let inspections = 0;
   let released = false;
   let now = 0;
@@ -802,7 +932,7 @@ test("guardian help and plan CLI have no native process or startup side effects"
 });
 
 test("runner cancels pending probes after native lock loss without later recovery", async (t) => {
-  const f = fixture(t, { FailureThresholdSeconds: 1 });
+  const f = fixture(t, { NoRestart: true, FailureThresholdSeconds: 1 });
   let inspections = 0;
   let now = 0;
   let loseLock;
@@ -849,7 +979,7 @@ test(
   "native runner start receipt records its exact retained process identity after lock acquisition",
   { skip: process.platform !== "win32", timeout: 15_000 },
   async (t) => {
-    const f = fixture(t, { MaxCycles: 1 });
+    const f = fixture(t, { NoRestart: true, MaxCycles: 1 });
     const expected = guardianProcessIdentity(process.pid);
     f.runtime.getProcessIdentity = (pid) => guardianProcessIdentity(pid);
     f.runtime.inspectRuntime = () => ({ Healthy: true, ListenerOwner: 1234 });
@@ -923,4 +1053,79 @@ test("runner has no repository PS1 runtime dependency", () => {
   );
   assert.doesNotMatch(source, /["']-File["']/);
   assert.doesNotMatch(source, /spawn(?:Process)?\([^\n]*\.ps1/);
+});
+
+test("retired production runtime exposes no installed-process mutation capabilities", (t) => {
+  const f = fixture(t);
+  const runtime = createGuardianRuntime(f.plan, {
+    query: () => {
+      throw new Error("Read-only capability check must not query native APIs");
+    },
+  });
+  for (const name of [
+    "installedExecutableExists",
+    "getExpectedProductProcesses",
+    "stopVerifiedProductProcess",
+    "waitPortFree",
+    "waitReady",
+    "startProduct",
+  ])
+    assert.equal(Object.hasOwn(runtime, name), false, name);
+});
+
+test("retired production mode cannot be bypassed with truthy non-boolean flags", async (t) => {
+  for (const flag of ["true", "false", 1, {}]) {
+    const f = fixture(t, { DevelopmentMode: flag });
+    assert.equal(legacyProductionGuardianAllowed(f.plan), false);
+    await f.policy({
+      core: {
+        ...guardianCore,
+        devSessionRecoveryPlan: () => {
+          throw new Error("Non-boolean mode cannot inspect development state");
+        },
+      },
+    });
+    assert.equal(f.launches.length, 0);
+    assert.ok(
+      f.events.some(
+        ({ event }) => event === "production-recovery-owned-by-rust",
+      ),
+    );
+    assert.equal(
+      legacyProductionGuardianAllowed({
+        DevelopmentMode: false,
+        NoRestart: flag,
+      }),
+      false,
+    );
+  }
+});
+
+test("direct runtime launch refuses production and explicit no-restart modes before native work", async (t) => {
+  for (const mode of [
+    {},
+    { DevelopmentMode: true, NoRestart: true },
+    { DevelopmentMode: "true" },
+  ]) {
+    const f = fixture(t, mode);
+    let launches = 0;
+    const runtime = createGuardianRuntime(f.plan, {
+      spawnProcess: () => {
+        launches++;
+        throw new Error("Native launch must be blocked");
+      },
+    });
+    await assert.rejects(
+      runtime.startDevSession({
+        Executable: f.node,
+        ScriptPath: f.script,
+        SupervisorPid: 4040,
+        Args: [],
+        RepoRoot: f.repo,
+        Environment: {},
+      }),
+      /explicit development recovery/u,
+    );
+    assert.equal(launches, 0);
+  }
 });

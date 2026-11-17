@@ -39,10 +39,11 @@ pub use live::{
 pub(crate) use live::sanitize_claude_settings_for_live;
 pub(crate) use live::{
     build_codex_live_config_for_provider, build_effective_settings_with_common_config,
-    normalize_provider_common_config_for_storage, provider_exists_in_live_config,
-    strip_common_config_from_live_settings, sync_codex_router_provider,
-    sync_current_provider_for_app_to_live, sync_live_for_provider_respecting_takeover,
-    write_codex_config_only_with_common_config, write_live_with_common_config, LiveSyncOutcome,
+    codex_common_reasoning_effort, normalize_provider_common_config_for_storage,
+    provider_exists_in_live_config, strip_common_config_from_live_settings,
+    sync_codex_router_provider, sync_current_provider_for_app_to_live,
+    sync_live_for_provider_respecting_takeover, write_codex_config_only_with_common_config,
+    write_live_with_common_config, LiveSyncOutcome,
 };
 
 // Internal re-exports
@@ -210,6 +211,38 @@ pub fn reapply_current_codex_official_live(state: &AppState) -> Result<bool, App
 }
 
 /// Provider business logic service
+/// The parent Sub-Agent tab owns its policy fields, never a Provider snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexSubagentPolicyVersion {
+    V1,
+    V2,
+}
+
+/// Reversible per-plan effort overlay. Profile restores each role's saved policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexSubagentReasoningEffort {
+    Profile,
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
+    Ultra,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodexSubagentPolicyPatch {
+    pub subagent_version: Option<CodexSubagentPolicyVersion>,
+    pub subagent_reasoning_effort: Option<CodexSubagentReasoningEffort>,
+    pub spawn_agent_models: Option<Vec<String>>,
+}
+
 pub struct ProviderService;
 
 /// Fail before switching or taking over a Codex provider whose explicit OAuth
@@ -611,26 +644,25 @@ mod tests {
 
     fn with_test_home<T>(test: impl FnOnce(&AppState, &Path) -> T) -> T {
         let _guard = test_guard();
-        let temp = tempfile::tempdir().expect("tempdir");
-        let old_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("CC_SWITCH_TEST_HOME", temp.path());
-        std::env::set_var("HOME", temp.path());
+        struct RestoreHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => env::set_var("HOME", value),
+                    None => env::remove_var("HOME"),
+                }
+            }
+        }
 
+        // The canonical guard reloads the settings cache when entering and
+        // leaving an isolated home. Restore HOME first on normal return and
+        // unwind, before its Drop reloads the previous home's settings.
+        let home = crate::config::TestHomeGuard::new();
+        let _restore_home = RestoreHome(env::var_os("HOME"));
+        env::set_var("HOME", home.path());
         let db = Arc::new(Database::memory().expect("in-memory database"));
         let state = AppState::new(db);
-        let result = test(&state, temp.path());
-
-        match old_test_home {
-            Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
-            None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
-        }
-        match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-
-        result
+        test(&state, home.path())
     }
 
     fn codex_settings(base_url: &str, api_key: &str) -> Value {
@@ -649,6 +681,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn official_context_save_rejects_unverified_million_before_database_mutation() {
         with_test_home(|state, _| {
             let mut provider = Provider::with_id(
@@ -1387,6 +1420,722 @@ mod tests {
                 "reserved roleName must be rejected by the compiler before persistence, got {result:?}"
             );
         });
+    }
+
+    fn subagent_policy_router_fixture(state: &AppState) -> Provider {
+        let source = Provider::with_id(
+            "policy-source".into(),
+            "Policy source".into(),
+            json!({
+                "apiFormat": "openai_responses", "baseUrl": "https://example.invalid/v1",
+                "modelCatalog": {"models": [
+                    {"model": "pro"}, {"model": "flash", "enabled": false}
+                ]}
+            }),
+            None,
+        );
+        state.db.save_provider("codex", &source).unwrap();
+        let router = Provider::with_id(
+            "policy-router".into(),
+            "Policy router".into(),
+            json!({
+                "config": "model = \"removed-model\"\n", "futureProviderField": {"keep": true},
+                "codexRouting": {"schemaVersion": 2, "enabled": true, "subagentVersion": "v2",
+                    "futureRoutingField": {"keep": true}, "modelOrder": ["removed-model", "pro"],
+                    "spawnAgentModels": ["flash", "removed-model", "pro"],
+                    "subagentV2": {"schemaVersion": 2, "selectionPolicy": "balanced", "profiles": {}},
+                    "routes": [{"id": "source", "enabled": true, "targetProviderId": "policy-source",
+                        "modelSelection": {"mode": "include", "models": ["pro", "flash", "removed-model"]},
+                        "aliases": {"stale": "removed-model"}, "authPolicy": {"source": "provider_config"}}]
+                }
+            }),
+            None,
+        );
+        state.db.save_provider("codex", &router).unwrap();
+        router
+    }
+
+    #[test]
+    #[serial]
+    fn with_test_home_isolates_cached_current_provider_from_recreated_fixture_ids() {
+        let outer_home = crate::config::TestHomeGuard::new();
+        let outer_environment_home = env::var_os("HOME");
+        crate::settings::set_current_provider(&AppType::Codex, Some("policy-router")).unwrap();
+
+        with_test_home(|state, _| {
+            // Reusing this ID in a fresh DB must not reactivate an outer test's
+            // cached selection. Do not query before seeding: that would clear
+            // the stale cache and hide the isolation bug.
+            let router = subagent_policy_router_fixture(state);
+            assert_eq!(
+                crate::settings::get_effective_current_provider(&state.db, &AppType::Codex)
+                    .unwrap(),
+                None,
+                "a fresh test home must not inherit the previous home's current provider"
+            );
+            let result = ProviderService::update_codex_subagent_policy(
+                state,
+                &router.id,
+                CodexSubagentPolicyPatch {
+                    subagent_reasoning_effort: None,
+                    subagent_version: Some(CodexSubagentPolicyVersion::V1),
+                    spawn_agent_models: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                result.projection.status,
+                CodexSubagentV2ProjectionStatus::NotRequired
+            );
+            crate::settings::set_current_provider(&AppType::Codex, Some("inner-only")).unwrap();
+        });
+
+        assert_eq!(
+            env::var_os("CC_SWITCH_TEST_HOME"),
+            Some(outer_home.path().as_os_str().to_owned())
+        );
+        assert_eq!(env::var_os("HOME"), outer_environment_home);
+        assert_eq!(
+            crate::settings::get_current_provider(&AppType::Codex).as_deref(),
+            Some("policy-router")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn with_test_home_restores_environment_and_cached_settings_after_unwind() {
+        let outer_home = crate::config::TestHomeGuard::new();
+        let outer_environment_home = env::var_os("HOME");
+        crate::settings::set_current_provider(&AppType::Codex, Some("outer-current")).unwrap();
+
+        let result = std::panic::catch_unwind(|| {
+            with_test_home(|_, _| {
+                crate::settings::set_current_provider(&AppType::Codex, Some("inner-current"))
+                    .unwrap();
+                panic!("intentional fixture panic to verify restoration");
+            });
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            env::var_os("CC_SWITCH_TEST_HOME"),
+            Some(outer_home.path().as_os_str().to_owned())
+        );
+        assert_eq!(env::var_os("HOME"), outer_environment_home);
+        assert_eq!(
+            crate::settings::get_current_provider(&AppType::Codex).as_deref(),
+            Some("outer-current")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn atomic_subagent_policy_patch_preserves_latest_profiles_and_reconciles_stale_references() {
+        with_test_home(|state, _| {
+            let mut router = subagent_policy_router_fixture(state);
+            // A child profile save/new field commits after the parent's stale UI snapshot.
+            router.settings_config["codexRouting"]["subagentV2"]["profiles"]["pro"] = json!({
+                "model": "pro", "enabled": false, "reasoning": {"policy": "delegated"},
+                "questionnaire": {"taskStrengths": ["testing"], "optimization": "speed",
+                    "writeScope": "read_only", "preference": "eligible"}
+            });
+            router.settings_config["newConcurrentField"] = json!({"keep": true});
+            router.name = "Concurrently renamed".into();
+            state.db.save_provider("codex", &router).unwrap();
+            let result = ProviderService::update_codex_subagent_policy(
+                state,
+                &router.id,
+                CodexSubagentPolicyPatch {
+                    subagent_reasoning_effort: None,
+                    subagent_version: Some(CodexSubagentPolicyVersion::V1),
+                    spawn_agent_models: None,
+                },
+            )
+            .expect("focused parent save");
+            let saved = state
+                .db
+                .get_provider_by_id(&router.id, "codex")
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.name, "Concurrently renamed");
+            assert_eq!(
+                saved.settings_config["newConcurrentField"],
+                json!({"keep": true})
+            );
+            assert_eq!(
+                saved.settings_config["futureProviderField"],
+                router.settings_config["futureProviderField"]
+            );
+            let routing = &saved.settings_config["codexRouting"];
+            assert_eq!(
+                routing["futureRoutingField"],
+                router.settings_config["codexRouting"]["futureRoutingField"]
+            );
+            assert_eq!(
+                routing["subagentV2"],
+                router.settings_config["codexRouting"]["subagentV2"]
+            );
+            assert_eq!(routing["subagentVersion"], "v1");
+            assert_eq!(
+                routing["routes"][0]["modelSelection"],
+                json!({"mode": "include", "models": ["pro"]})
+            );
+            assert_eq!(routing["routes"][0]["aliases"], json!({}));
+            assert_eq!(routing["modelOrder"], json!(["pro"]));
+            assert_eq!(routing["spawnAgentModels"], json!(["pro"]));
+            assert_eq!(
+                saved.settings_config["config"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<toml_edit::DocumentMut>()
+                    .unwrap()["model"]
+                    .as_str(),
+                Some("pro")
+            );
+            assert!(saved.settings_config.get("modelCatalog").is_none());
+            assert_eq!(
+                result.projection.status,
+                CodexSubagentV2ProjectionStatus::NotRequired
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn atomic_subagent_policy_patch_subagent_reasoning_effort_switches_without_rewriting_profile_choices(
+    ) {
+        with_test_home(|state, _| {
+            let mut router = subagent_policy_router_fixture(state);
+            router.settings_config["config"] =
+                json!("model = \"pro\"\nmodel_reasoning_effort = \"max\"\n");
+            router.settings_config["codexRouting"]["modelOrder"] = json!(["pro"]);
+            router.settings_config["codexRouting"]["spawnAgentModels"] = json!(["pro"]);
+            router.settings_config["codexRouting"]["routes"][0]["modelSelection"]["models"] =
+                json!(["pro"]);
+            router.settings_config["codexRouting"]["routes"][0]["aliases"] = json!({});
+            router.settings_config["codexRouting"]["subagentV2"]["profiles"]["pro"] = json!({
+                "model": "pro", "enabled": false, "reasoning": {"policy": "fixed", "effort": "max"},
+                "questionnaire": {"taskStrengths": ["testing"], "optimization": "quality",
+                    "writeScope": "read_only", "preference": "eligible"}
+            });
+            state.db.save_provider("codex", &router).unwrap();
+            let original_profiles = router.settings_config["codexRouting"]["subagentV2"].clone();
+            let original_routes = router.settings_config["codexRouting"]["routes"].clone();
+            let original_main_config = router.settings_config["config"].clone();
+            for effort in [
+                "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "profile",
+                "high",
+            ] {
+                let patch = serde_json::from_value(json!({"subagentReasoningEffort": effort}))
+                    .expect("reasoning-only patch must be accepted");
+                let result =
+                    ProviderService::update_codex_subagent_policy(state, &router.id, patch)
+                        .expect("reasoning-only patch must save atomically");
+                let settings = &result.provider.settings_config;
+                let routing = &settings["codexRouting"];
+                assert_eq!(routing["subagentReasoningEffort"], effort);
+                assert_eq!(routing["subagentV2"], original_profiles);
+                assert_eq!(routing["routes"], original_routes);
+                assert_eq!(routing["spawnAgentModels"], json!(["pro"]));
+                assert_eq!(routing["subagentVersion"], "v2");
+                assert_eq!(settings["config"], original_main_config);
+                assert_eq!(settings["futureProviderField"], json!({"keep": true}));
+                assert_eq!(routing["futureRoutingField"], json!({"keep": true}));
+                assert!(result.verification.database_persisted);
+                assert_eq!(
+                    result.projection.status,
+                    CodexSubagentV2ProjectionStatus::NotRequired
+                );
+                let saved = state
+                    .db
+                    .get_provider_by_id(&router.id, "codex")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.settings_config, *settings);
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn atomic_subagent_policy_patch_subagent_reasoning_effort_preserves_initialization_boundary() {
+        with_test_home(|state, _| {
+            let mut router = subagent_policy_router_fixture(state);
+            router.settings_config["codexRouting"]
+                .as_object_mut()
+                .unwrap()
+                .remove("subagentV2");
+            state.db.save_provider("codex", &router).unwrap();
+            for effort in ["high", "max", "profile"] {
+                let patch = serde_json::from_value(json!({"subagentReasoningEffort": effort}))
+                    .expect("reasoning-only patch must be accepted before V2 initialization");
+                let result =
+                    ProviderService::update_codex_subagent_policy(state, &router.id, patch)
+                        .expect("effort policy must not require or initialize V2 profiles");
+                let routing = &result.provider.settings_config["codexRouting"];
+                assert_eq!(routing["subagentReasoningEffort"], effort);
+                assert!(routing.get("subagentV2").is_none());
+                assert!(result.verification.database_persisted);
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn atomic_subagent_policy_patch_subagent_reasoning_effort_survives_other_focused_saves() {
+        with_test_home(|state, _| {
+            let mut router = subagent_policy_router_fixture(state);
+            router.settings_config["codexRouting"]["subagentReasoningEffort"] = json!("high");
+            state.db.save_provider("codex", &router).unwrap();
+            let profiles = json!({"schemaVersion": 2, "selectionPolicy": "balanced", "profiles": {
+                "pro": {"model": "pro", "enabled": false,
+                    "reasoning": {"policy": "fixed", "effort": "max"},
+                    "questionnaire": {"taskStrengths": ["testing"], "optimization": "quality",
+                        "writeScope": "read_only", "preference": "eligible"}}
+            }});
+            let child_result =
+                ProviderService::update_codex_subagent_v2(state, &router.id, profiles.clone())
+                    .expect("focused child save must preserve parent effort policy");
+            assert_eq!(
+                child_result.provider.settings_config["codexRouting"]["subagentReasoningEffort"],
+                "high"
+            );
+            for policy in [
+                json!({"subagentVersion": "v1"}),
+                json!({"spawnAgentModels": ["pro"]}),
+                json!({"subagentVersion": "v2"}),
+            ] {
+                let patch = serde_json::from_value(policy).unwrap();
+                let result =
+                    ProviderService::update_codex_subagent_policy(state, &router.id, patch)
+                        .expect("other parent controls must preserve the effort override");
+                let routing = &result.provider.settings_config["codexRouting"];
+                assert_eq!(routing["subagentReasoningEffort"], "high");
+                assert_eq!(routing["subagentV2"], profiles);
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn atomic_subagent_policy_patch_keeps_empty_candidate_and_include_selections_closed() {
+        with_test_home(|state, _| {
+            let mut router = subagent_policy_router_fixture(state);
+            router.settings_config["codexRouting"]["routes"][0]["modelSelection"]["models"] =
+                json!(["flash", "removed-model"]);
+            state.db.save_provider("codex", &router).unwrap();
+            ProviderService::update_codex_subagent_policy(
+                state,
+                &router.id,
+                CodexSubagentPolicyPatch {
+                    subagent_reasoning_effort: None,
+                    subagent_version: None,
+                    spawn_agent_models: Some(vec![]),
+                },
+            )
+            .expect("closed empty selection is disabled, not widened to all");
+            let saved = state
+                .db
+                .get_provider_by_id(&router.id, "codex")
+                .unwrap()
+                .unwrap();
+            let routing = &saved.settings_config["codexRouting"];
+            assert_eq!(routing["spawnAgentModels"], json!([]));
+            assert_eq!(
+                routing["routes"][0]["modelSelection"],
+                json!({"mode": "include", "models": []})
+            );
+            assert_eq!(routing["routes"][0]["enabled"], false);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn atomic_subagent_policy_patch_respects_canonical_empty_catalog_over_stale_legacy() {
+        with_test_home(|state, _| {
+            let router = subagent_policy_router_fixture(state);
+            let mut source = state
+                .db
+                .get_provider_by_id("policy-source", "codex")
+                .unwrap()
+                .unwrap();
+            source.settings_config["modelCatalog"] = json!({"models": []});
+            source.settings_config["model_catalog"] = json!({"models": [{"model": "pro"}]});
+            state.db.save_provider("codex", &source).unwrap();
+
+            ProviderService::update_codex_subagent_policy(
+                state,
+                &router.id,
+                CodexSubagentPolicyPatch {
+                    subagent_reasoning_effort: None,
+                    subagent_version: Some(CodexSubagentPolicyVersion::V1),
+                    spawn_agent_models: None,
+                },
+            )
+            .expect("canonical empty catalog must close selections without legacy fallback");
+
+            let saved = state
+                .db
+                .get_provider_by_id(&router.id, "codex")
+                .unwrap()
+                .unwrap();
+            let routing = &saved.settings_config["codexRouting"];
+            assert_eq!(
+                routing["routes"][0]["modelSelection"],
+                json!({"mode": "include", "models": []})
+            );
+            assert_eq!(routing["routes"][0]["enabled"], false);
+            assert_eq!(routing["routes"][0]["aliases"], json!({}));
+            assert_eq!(routing["spawnAgentModels"], json!([]));
+            assert_eq!(routing["modelOrder"], json!([]));
+            let config = saved.settings_config["config"]
+                .as_str()
+                .unwrap()
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            assert!(config.get("model").is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn atomic_subagent_policy_patch_rejects_invalid_patches_without_writes() {
+        with_test_home(|state, _| {
+            let router = subagent_policy_router_fixture(state);
+            let before = serde_json::to_value(
+                state
+                    .db
+                    .get_provider_by_id(&router.id, "codex")
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            for (scenario, patch) in [
+                (
+                    "empty patch",
+                    CodexSubagentPolicyPatch {
+                        subagent_reasoning_effort: None,
+                        subagent_version: None,
+                        spawn_agent_models: None,
+                    },
+                ),
+                (
+                    "too many candidates",
+                    CodexSubagentPolicyPatch {
+                        subagent_reasoning_effort: None,
+                        subagent_version: None,
+                        spawn_agent_models: Some(vec!["pro".to_string(); 6]),
+                    },
+                ),
+                (
+                    "blank candidate",
+                    CodexSubagentPolicyPatch {
+                        subagent_reasoning_effort: None,
+                        subagent_version: None,
+                        spawn_agent_models: Some(vec!["pro".to_string(), " \t ".to_string()]),
+                    },
+                ),
+            ] {
+                assert!(
+                    matches!(
+                        ProviderService::update_codex_subagent_policy(state, &router.id, patch),
+                        Err(AppError::InvalidInput(_))
+                    ),
+                    "{scenario} must be rejected"
+                );
+                let saved = state
+                    .db
+                    .get_provider_by_id(&router.id, "codex")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(saved).unwrap(),
+                    before,
+                    "{scenario}: rejected patch must not mutate any provider field"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn atomic_subagent_policy_patch_without_document_preserves_initialization_boundary() {
+        with_test_home(|state, _| {
+            let mut router = subagent_policy_router_fixture(state);
+            router.settings_config["codexRouting"]
+                .as_object_mut()
+                .unwrap()
+                .remove("subagentV2");
+            state.db.save_provider("codex", &router).unwrap();
+            for (patch, expected_version) in [
+                (
+                    CodexSubagentPolicyPatch {
+                        subagent_reasoning_effort: None,
+                        subagent_version: Some(CodexSubagentPolicyVersion::V1),
+                        spawn_agent_models: None,
+                    },
+                    "v1",
+                ),
+                (
+                    CodexSubagentPolicyPatch {
+                        subagent_reasoning_effort: None,
+                        subagent_version: None,
+                        spawn_agent_models: Some(vec!["pro".to_string()]),
+                    },
+                    "v1",
+                ),
+                (
+                    CodexSubagentPolicyPatch {
+                        subagent_reasoning_effort: None,
+                        subagent_version: Some(CodexSubagentPolicyVersion::V2),
+                        spawn_agent_models: None,
+                    },
+                    "v2",
+                ),
+                (
+                    CodexSubagentPolicyPatch {
+                        subagent_reasoning_effort: None,
+                        subagent_version: None,
+                        spawn_agent_models: Some(vec![]),
+                    },
+                    "v2",
+                ),
+            ] {
+                let result =
+                    ProviderService::update_codex_subagent_policy(state, &router.id, patch)
+                        .expect("parent policy is editable before profile initialization");
+                assert_eq!(
+                    result.provider.settings_config["codexRouting"]["subagentVersion"],
+                    expected_version
+                );
+                assert!(result.provider.settings_config["codexRouting"]
+                    .get("subagentV2")
+                    .is_none());
+                assert_eq!(
+                    result.projection.status,
+                    CodexSubagentV2ProjectionStatus::NotRequired
+                );
+                assert!(result.verification.database_persisted);
+                let saved = state
+                    .db
+                    .get_provider_by_id(&router.id, "codex")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.settings_config, result.provider.settings_config);
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn atomic_subagent_policy_patch_without_document_projects_legacy_roles_for_current_router() {
+        with_test_home(|state, _| {
+            let mut router = subagent_policy_router_fixture(state);
+            router.settings_config["auth"] = json!({});
+            router.settings_config["codexRouting"]
+                .as_object_mut()
+                .unwrap()
+                .remove("subagentV2");
+            state.db.save_provider("codex", &router).unwrap();
+            let mut source = state
+                .db
+                .get_provider_by_id("policy-source", "codex")
+                .unwrap()
+                .unwrap();
+            source.settings_config["auth"] = json!({"OPENAI_API_KEY": "test-only"});
+            state.db.save_provider("codex", &source).unwrap();
+            state.db.set_current_provider("codex", &router.id).unwrap();
+            crate::settings::set_current_provider(&AppType::Codex, Some(&router.id)).unwrap();
+
+            let result = ProviderService::update_codex_subagent_policy(
+                state,
+                &router.id,
+                CodexSubagentPolicyPatch {
+                    subagent_reasoning_effort: None,
+                    subagent_version: Some(CodexSubagentPolicyVersion::V2),
+                    spawn_agent_models: Some(vec!["pro".to_string()]),
+                },
+            )
+            .expect("uninitialized current router can still project legacy roles");
+            assert_eq!(
+                result.projection.status,
+                CodexSubagentV2ProjectionStatus::Applied
+            );
+            assert_eq!(
+                result.verification.role_files_status,
+                CodexSubagentV2RoleFilesStatus::Verified
+            );
+            assert!(result.provider.settings_config["codexRouting"]
+                .get("subagentV2")
+                .is_none());
+            let role_path = crate::codex_config::get_codex_agents_dir().join("pro.toml");
+            let role = std::fs::read_to_string(&role_path)
+                .expect("legacy role must be published without initializing a V2 document");
+            let parsed = role.parse::<toml::Value>().unwrap();
+            assert_eq!(
+                parsed.get("model").and_then(toml::Value::as_str),
+                Some("pro")
+            );
+            assert!(role.starts_with("# Managed by CCSwitchMulti. Do not edit this file by hand."));
+
+            let result = ProviderService::update_codex_subagent_policy(
+                state,
+                &router.id,
+                CodexSubagentPolicyPatch {
+                    subagent_reasoning_effort: None,
+                    subagent_version: Some(CodexSubagentPolicyVersion::V1),
+                    spawn_agent_models: None,
+                },
+            )
+            .expect("switching an uninitialized current router to V1 stays supported");
+            assert_eq!(
+                result.projection.status,
+                CodexSubagentV2ProjectionStatus::Applied
+            );
+            assert!(!role_path.exists(), "V1 must prune the managed legacy role");
+            assert!(result.provider.settings_config["codexRouting"]
+                .get("subagentV2")
+                .is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn atomic_subagent_policy_patch_rejects_invalid_router_dependencies_without_writes() {
+        with_test_home(|state, _| {
+            for scenario in [
+                "legacy",
+                "missing-provider",
+                "missing-catalog",
+                "invalid-auth",
+                "invalid-protocol",
+                "ambiguous-model",
+                "invalid-profile-document",
+                "null-profile-document",
+                "not-router",
+            ] {
+                let mut router = subagent_policy_router_fixture(state);
+                match scenario {
+                    "legacy" => router.settings_config["codexRouting"]["schemaVersion"] = json!(1),
+                    "missing-provider" => {
+                        router.settings_config["codexRouting"]["routes"][0]["targetProviderId"] =
+                            json!("absent")
+                    }
+                    "missing-catalog" => {
+                        let mut source = state
+                            .db
+                            .get_provider_by_id("policy-source", "codex")
+                            .unwrap()
+                            .unwrap();
+                        source
+                            .settings_config
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("modelCatalog");
+                        state.db.save_provider("codex", &source).unwrap();
+                    }
+                    "invalid-protocol" => {
+                        let mut source = state
+                            .db
+                            .get_provider_by_id("policy-source", "codex")
+                            .unwrap()
+                            .unwrap();
+                        source.meta = Some(crate::provider::ProviderMeta {
+                            codex_protocol_mode: Some(crate::provider::CodexProtocolMode::Manual),
+                            api_format: Some("invalid-protocol".to_string()),
+                            ..Default::default()
+                        });
+                        state.db.save_provider("codex", &source).unwrap();
+                    }
+                    "ambiguous-model" => {
+                        let mut source = state
+                            .db
+                            .get_provider_by_id("policy-source", "codex")
+                            .unwrap()
+                            .unwrap();
+                        source.settings_config["modelCatalog"]["models"] =
+                            json!([{"model": "pro"}, {"model": "pro", "enabled": false}]);
+                        state.db.save_provider("codex", &source).unwrap();
+                    }
+                    "invalid-profile-document" => {
+                        router.settings_config["codexRouting"]["subagentV2"] =
+                            json!({"schemaVersion": 99, "profiles": {}});
+                    }
+                    "null-profile-document" => {
+                        router.settings_config["codexRouting"]["subagentV2"] = Value::Null;
+                    }
+                    "invalid-auth" => {
+                        router.settings_config["codexRouting"]["routes"][0]["authPolicy"] =
+                            json!({"source": "invalid-protocol"})
+                    }
+                    _ => {
+                        router
+                            .settings_config
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("codexRouting");
+                    }
+                }
+                state.db.save_provider("codex", &router).unwrap();
+                let before = state
+                    .db
+                    .get_provider_by_id(&router.id, "codex")
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    ProviderService::update_codex_subagent_policy(
+                        state,
+                        &router.id,
+                        CodexSubagentPolicyPatch {
+                            subagent_reasoning_effort: None,
+                            subagent_version: Some(CodexSubagentPolicyVersion::V1),
+                            spawn_agent_models: None,
+                        }
+                    )
+                    .is_err(),
+                    "{scenario}"
+                );
+                assert_eq!(
+                    state
+                        .db
+                        .get_provider_by_id(&router.id, "codex")
+                        .unwrap()
+                        .unwrap()
+                        .settings_config,
+                    before.settings_config,
+                    "{scenario}: rejected patch must not mutate DB"
+                );
+            }
+            for provider_id in ["", " policy-router ", "missing"] {
+                assert!(ProviderService::update_codex_subagent_policy(
+                    state,
+                    provider_id,
+                    CodexSubagentPolicyPatch {
+                        subagent_reasoning_effort: None,
+                        subagent_version: Some(CodexSubagentPolicyVersion::V1),
+                        spawn_agent_models: None,
+                    }
+                )
+                .is_err());
+            }
+        });
+    }
+
+    #[test]
+    fn atomic_subagent_policy_patch_types_reject_unsupported_and_extra_fields() {
+        for invalid in [
+            json!({"subagentVersion": "v3"}),
+            json!({"spawnAgentModels": [3]}),
+            json!({"subagentReasoningEffort": "extra-high"}),
+            json!({"subagentReasoningEffort": "HIGH"}),
+            json!({"subagentReasoningEffort": 3}),
+            json!({"subagentReasoningEffort": {"effort": "high"}}),
+            json!({"subagentVersion": "v1", "subagentReasoningEffort": "unknown"}),
+            json!({"subagentV2": {}}),
+            json!({"apiFormat": "bad"}),
+        ] {
+            assert!(serde_json::from_value::<CodexSubagentPolicyPatch>(invalid).is_err());
+        }
     }
 
     #[test]
@@ -6871,6 +7620,169 @@ requires_openai_auth = true
             "V2 Router sync must publish the latest Common Config into live TOML"
         );
     }
+
+    #[test]
+    #[serial]
+    fn codex_v2_router_preserves_same_value_common_effort_and_clears_it_after_removal() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = AppState::new(db.clone());
+        let target = Provider::with_id(
+            "qwen".to_string(),
+            "Qwen".to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "test-key"},
+                "config": "model = \"qwen3.8\"\n",
+                "modelCatalog": {"models": [{"model": "qwen3.8"}]}
+            }),
+            None,
+        );
+        let router = Provider::with_id(
+            "router".to_string(),
+            "Router".to_string(),
+            json!({
+                "auth": {},
+                "config": "model_reasoning_effort = \"high\"\n",
+                "codexRouting": {
+                    "schemaVersion": 2, "enabled": true,
+                    "routes": [{
+                        "id": "route-qwen", "enabled": true,
+                        "targetProviderId": "qwen", "modelSelection": {"mode": "all"},
+                        "authPolicy": {"source": "provider_config"}
+                    }]
+                }
+            }),
+            None,
+        );
+        db.save_provider("codex", &target).expect("save target");
+        db.save_provider("codex", &router).expect("save router");
+        db.set_current_provider("codex", "router")
+            .expect("set current router");
+        crate::settings::set_current_provider(&AppType::Codex, Some("router"))
+            .expect("set local current router");
+        db.set_config_snippet(
+            "codex",
+            Some("model_reasoning_effort = \"high\"\n".to_string()),
+        )
+        .expect("save Common Config matching the old Router value");
+        let owned = crate::codex_multirouter::projection::build_projection_artifact(&db, "router")
+            .expect("derive explicit Common Config ownership");
+        assert_eq!(
+            owned.common_reasoning_effort(),
+            Some(crate::proxy::providers::codex_reasoning::CodexReasoningEffort::High)
+        );
+        ProviderService::sync_current_provider_for_app(&state, AppType::Codex)
+            .expect("sync same-valued Common Config");
+        let live = crate::codex_config::read_codex_config_text().expect("read Common Config live");
+        let parsed = live
+            .parse::<toml::Value>()
+            .expect("parse Common Config live");
+        assert_eq!(
+            parsed
+                .get("model_reasoning_effort")
+                .and_then(toml::Value::as_str),
+            Some("high")
+        );
+
+        db.set_config_snippet("codex", None)
+            .expect("remove Common Config");
+        let released =
+            crate::codex_multirouter::projection::build_projection_artifact(&db, "router")
+                .expect("derive released Common Config ownership");
+        assert_eq!(released.common_reasoning_effort(), None);
+        assert_ne!(
+            owned.dependency_fingerprint, released.dependency_fingerprint,
+            "removing an equal-valued Common Config must invalidate the source receipt"
+        );
+        ProviderService::sync_current_provider_for_app(&state, AppType::Codex)
+            .expect("sync after Common Config removal");
+        let live =
+            crate::codex_config::read_codex_config_text().expect("read released live config");
+        let parsed = live
+            .parse::<toml::Value>()
+            .expect("parse released live config");
+        assert!(
+            parsed.get("model_reasoning_effort").is_none(),
+            "without a current Common Config or canonical Router override the stale pin must clear"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn codex_v2_router_supported_effort_overrides_common_without_overwriting_native_default() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = AppState::new(db.clone());
+        let target = Provider::with_id(
+            "qwen".to_string(),
+            "Qwen".to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "test-key"},
+                "config": "model = \"qwen3.8\"\n",
+                "modelCatalog": {"models": [{"model": "qwen3.8", "reasoning": {
+                    "schemaVersion": 2, "supportStatus": "confirmed_supported",
+                    "controlKind": "graded", "supportedEfforts": ["low", "medium", "high"],
+                    "defaultEffort": "low", "disableAllowed": false,
+                    "upstream": {"format": "reasoning_object", "parameter": "reasoning.effort"},
+                    "source": "user"
+                }}]}
+            }),
+            None,
+        );
+        let mut router = Provider::with_id(
+            "router".to_string(),
+            "Router".to_string(),
+            json!({
+                "auth": {}, "config": "model_reasoning_effort = \"max\"\n",
+                "codexRouting": {
+                    "schemaVersion": 2, "enabled": true,
+                    "routes": [{
+                        "id": "route-qwen", "enabled": true,
+                        "targetProviderId": "qwen", "modelSelection": {"mode": "all"},
+                        "authPolicy": {"source": "provider_config"}
+                    }]
+                }
+            }),
+            None,
+        );
+        db.save_provider("codex", &target).expect("save target");
+        db.save_provider("codex", &router).expect("save router");
+        db.set_current_provider("codex", "router")
+            .expect("set current router");
+        crate::settings::set_current_provider(&AppType::Codex, Some("router"))
+            .expect("set local current router");
+        db.set_config_snippet(
+            "codex",
+            Some("model_reasoning_effort = \"medium\"\n".to_string()),
+        )
+        .expect("save Common Config fallback");
+        for (requested, expected) in [("high", "high"), ("max", "medium")] {
+            router.settings_config["codexRouting"]["defaultReasoningEffort"] = json!(requested);
+            db.save_provider("codex", &router)
+                .expect("save Router preference");
+            let artifact =
+                crate::codex_multirouter::projection::build_projection_artifact(&db, "router")
+                    .expect("compile canonical preference and Common Config receipt");
+            assert_eq!(
+                artifact.projection_settings["modelCatalog"]["models"][0]["reasoning"]
+                    ["defaultEffort"],
+                "low"
+            );
+            ProviderService::sync_current_provider_for_app(&state, AppType::Codex)
+                .expect("sync canonical Router preference before Common Config fallback");
+            let live = crate::codex_config::read_codex_config_text().expect("read live config");
+            let parsed = live.parse::<toml::Value>().expect("parse live config");
+            assert_eq!(
+                parsed
+                    .get("model_reasoning_effort")
+                    .and_then(toml::Value::as_str),
+                Some(expected),
+                "only a supported canonical preference may override current Common Config"
+            );
+        }
+    }
 }
 
 impl ProviderService {
@@ -8891,6 +9803,75 @@ impl ProviderService {
             projection,
             verification,
         })
+    }
+
+    /// Save only parent-tab policy fields against the latest DB-owned router.
+    /// Source reads, reconciliation, validation and the focused write are atomic.
+    pub fn update_codex_subagent_policy(
+        state: &AppState,
+        provider_id: &str,
+        patch: CodexSubagentPolicyPatch,
+    ) -> Result<CodexSubagentV2MutationResult, AppError> {
+        if provider_id.trim().is_empty() || provider_id.trim() != provider_id {
+            return Err(AppError::InvalidInput(
+                "Invalid Codex provider ID".to_string(),
+            ));
+        }
+        if patch.subagent_version.is_none()
+            && patch.subagent_reasoning_effort.is_none()
+            && patch.spawn_agent_models.is_none()
+        {
+            return Err(AppError::InvalidInput(
+                "Sub-Agent policy patch is empty".to_string(),
+            ));
+        }
+        if patch.spawn_agent_models.as_ref().is_some_and(|models| {
+            models.len() > 5 || models.iter().any(|model| model.trim().is_empty())
+        }) {
+            return Err(AppError::InvalidInput(
+                "Invalid Sub-Agent candidate selection".to_string(),
+            ));
+        }
+        let candidate = state.db.update_codex_subagent_policy(provider_id, move |provider, providers| {
+            Self::ensure_codex_provider_is_user_operable(&AppType::Codex, provider)?;
+            let routing = provider.settings_config.get_mut("codexRouting")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| AppError::InvalidInput("Sub-Agent policy requires a schema-v2 Router".to_string()))?;
+            if routing.get("schemaVersion").and_then(Value::as_u64) != Some(2) {
+                return Err(AppError::InvalidInput("Sub-Agent policy requires a schema-v2 Router".to_string()));
+            }
+            if let Some(version) = patch.subagent_version {
+                routing.insert("subagentVersion".to_string(), serde_json::to_value(version)
+                    .map_err(|_| AppError::InvalidInput("Invalid Sub-Agent version".to_string()))?);
+            }
+            if let Some(effort) = patch.subagent_reasoning_effort {
+                routing.insert("subagentReasoningEffort".to_string(), serde_json::to_value(effort)
+                    .map_err(|_| AppError::InvalidInput("Invalid Sub-Agent reasoning effort".to_string()))?);
+            }
+            if let Some(models) = patch.spawn_agent_models {
+                routing.insert("spawnAgentModels".to_string(), serde_json::json!(models));
+            }
+            crate::codex_multirouter::compiler::reconcile_router_policy_references(provider, providers)
+                .map_err(|error| AppError::InvalidInput(format!("{}: {}", error.code, error.message)))?;
+            if let Some(routes) = provider.settings_config.pointer("/codexRouting/routes").and_then(Value::as_array) {
+                for route in routes.iter().filter(|route| route.get("enabled").and_then(Value::as_bool) != Some(false)) {
+                    if let Some(source) = route.get("targetProviderId").and_then(Value::as_str).and_then(|id| providers.get(id)) {
+                        validate_codex_manual_protocol_settings(source)?;
+                    }
+                }
+            }
+            let effective = crate::codex_multirouter::projection::effective_settings_for_candidate_with_providers(
+                provider, true, providers,
+            )?;
+            // Parent policy controls are valid before V2 profiles are initialized.
+            // Existing documents, including malformed/null ones, still fail closed.
+            if effective.pointer("/codexRouting/subagentV2").is_some() {
+                let context = crate::codex_config::ProviderClassificationContext::from_providers(providers.values());
+                crate::codex_config::validate_codex_subagent_v2_candidate(&effective, Some(&context), false)?;
+            }
+            Ok(())
+        })?;
+        Self::finish_codex_subagent_v2_mutation(state, provider_id, candidate)
     }
 
     /// Persist one V2 capability document without replacing the surrounding Provider record.

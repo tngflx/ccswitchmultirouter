@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { CodexCatalogModel, CodexRoutingConfig } from "@/types";
 import {
   buildCodexModelReferenceIndex,
+  resolveCodexRouteModelReference,
   sanitizeCodexApiKeyGroups,
   sanitizeCodexProtocolOverrides,
   sanitizeCodexRoutingConfig,
@@ -19,6 +20,219 @@ const activeCatalog: CodexCatalogModel[] = [
     enabled: false,
   },
 ];
+
+describe("catalog public identity ownership", () => {
+  it.each([false, true])(
+    "reserves a disabled public identity before sibling wire aliases (reverse=%s)",
+    (reverse) => {
+      const models: CodexCatalogModel[] = [
+        { model: "public", upstreamModel: "wire-public", enabled: false },
+        { model: "sibling", upstreamModel: "public" },
+      ];
+      const index = buildCodexModelReferenceIndex(
+        reverse ? models.reverse() : models,
+      );
+      expect(index.resolve("PUBLIC")).toBeUndefined();
+      expect(index.upstreamFor("public")).toBeUndefined();
+      expect(
+        resolveCodexRouteModelReference("public", index, { public: "sibling" }),
+      ).toBeUndefined();
+      expect(
+        resolveCodexRouteModelReference("visible", index, {
+          visible: "public",
+        }),
+      ).toBeUndefined();
+      const routing = sanitizeCodexRoutingConfig(
+        {
+          schemaVersion: 2,
+          routes: [
+            {
+              id: "selected",
+              targetProviderId: "source",
+              enabled: true,
+              modelSelection: { mode: "include", models: ["public"] },
+              aliases: { public: "sibling" },
+            },
+          ],
+        } as unknown as CodexRoutingConfig,
+        index,
+      );
+      expect(routing?.routes?.[0]).toMatchObject({
+        enabled: false,
+        modelSelection: { mode: "include", models: [] },
+        aliases: {},
+      });
+    },
+  );
+
+  it.each([false, true])(
+    "keeps an enabled public owner ahead of a sibling wire alias (reverse=%s)",
+    (reverse) => {
+      const models: CodexCatalogModel[] = [
+        { model: "public", upstreamModel: "wire-public" },
+        { model: "sibling", upstreamModel: "public" },
+      ];
+      const index = buildCodexModelReferenceIndex(
+        reverse ? models.reverse() : models,
+      );
+      expect(index.resolve("PUBLIC")).toBe("public");
+      expect(index.upstreamFor("public")).toBe("wire-public");
+      expect(
+        resolveCodexRouteModelReference("public", index, { public: "sibling" }),
+      ).toBe("public");
+    },
+  );
+
+  it.each([false, true])(
+    "keeps ambiguous inventory wire identities closed even through route aliases (reverse=%s)",
+    (reverse) => {
+      const models: CodexCatalogModel[] = [
+        { model: "disabled", upstreamModel: "wire", enabled: false },
+        { model: "enabled", upstreamModel: "wire" },
+      ];
+      const index = buildCodexModelReferenceIndex(
+        reverse ? models.reverse() : models,
+      );
+      expect(index.resolve("wire")).toBeUndefined();
+      expect(
+        resolveCodexRouteModelReference("wire", index, { wire: "enabled" }),
+      ).toBeUndefined();
+    },
+  );
+
+  it("preserves a unique enabled upstream identity when no public owner exists", () => {
+    const index = buildCodexModelReferenceIndex([
+      { model: "public", upstreamModel: "wire" },
+    ]);
+    expect(index.resolve("wire")).toBe("public");
+    expect(
+      resolveCodexRouteModelReference("visible", index, { visible: "wire" }),
+    ).toBe("public");
+  });
+});
+
+describe("route alias public ownership", () => {
+  it.each(
+    ["disabled", "ambiguous"].flatMap((state) =>
+      [false, true].map((reverse) => ({ state, reverse })),
+    ),
+  )(
+    "does not revive a reserved legacy public identity through modelMap ($state, reverse=$reverse)",
+    ({ state, reverse }) => {
+      const models: CodexCatalogModel[] = [
+        {
+          model: "public",
+          ...(state === "disabled" ? { enabled: false } : {}),
+        },
+        ...(state === "ambiguous" ? [{ model: "PUBLIC" }] : []),
+        { model: "sibling" },
+      ];
+      const index = buildCodexModelReferenceIndex(
+        reverse ? models.reverse() : models,
+      );
+      const routing = {
+        routes: [
+          {
+            id: "legacy-public",
+            match: { models: ["public"] },
+            upstream: { modelMap: { public: "sibling" } },
+          },
+        ],
+      } as unknown as CodexRoutingConfig;
+      const result = sanitizeCodexRoutingConfig(routing, index);
+      expect(result).toHaveProperty("routes.0.match.models", []);
+      expect(result).toHaveProperty("routes.0.upstream.modelMap", {});
+    },
+  );
+
+  it("preserves selected generated public aliases even when their shared wire has no unique indexed owner", () => {
+    const index = buildCodexModelReferenceIndex([
+      {
+        model: "wire--ccg-a",
+        upstreamModel: "wire",
+        apiKeyGroupGenerated: true,
+      },
+      {
+        model: "wire--ccg-b",
+        upstreamModel: "wire",
+        apiKeyGroupGenerated: true,
+      },
+    ]);
+    const routing = {
+      schemaVersion: 2,
+      routes: [
+        {
+          targetProviderId: "source",
+          modelSelection: { mode: "all" },
+          aliases: { "wire--ccg-a": "wire", "wire--ccg-b": "wire" },
+        },
+      ],
+    } as unknown as CodexRoutingConfig;
+    expect(sanitizeCodexRoutingConfig(routing, index)).toHaveProperty(
+      "routes.0.aliases",
+      {
+        "wire--ccg-a": "wire--ccg-a",
+        "wire--ccg-b": "wire--ccg-b",
+      },
+    );
+    expect(
+      sanitizeCodexRoutingConfig(routing, index, undefined, {
+        preserveUpstreamReferences: true,
+      }),
+    ).toHaveProperty("routes.0.aliases", {
+      "wire--ccg-a": "wire",
+      "wire--ccg-b": "wire",
+    });
+  });
+
+  it.each([false, true])(
+    "does not revive a disabled public alias through an enabled target (reverse=%s)",
+    (reverse) => {
+      const models: CodexCatalogModel[] = [
+        { model: "public", enabled: false },
+        { model: "sibling" },
+      ];
+      const index = buildCodexModelReferenceIndex(
+        reverse ? models.reverse() : models,
+      );
+      const routing = {
+        schemaVersion: 2,
+        routes: [
+          {
+            targetProviderId: "source",
+            modelSelection: { mode: "all" },
+            aliases: { public: "sibling" },
+          },
+        ],
+      } as unknown as CodexRoutingConfig;
+      expect(sanitizeCodexRoutingConfig(routing, index)).toHaveProperty(
+        "routes.0.aliases",
+        {},
+      );
+    },
+  );
+
+  it("preserves a unique selected wire alias despite an unselected sibling sharing that wire", () => {
+    const index = buildCodexModelReferenceIndex([
+      { model: "alpha", upstreamModel: "wire" },
+      { model: "beta", upstreamModel: "wire" },
+    ]);
+    const routing = {
+      schemaVersion: 2,
+      routes: [
+        {
+          targetProviderId: "source",
+          modelSelection: { mode: "include", models: ["alpha"] },
+          aliases: { fast: "wire" },
+        },
+      ],
+    } as unknown as CodexRoutingConfig;
+    expect(sanitizeCodexRoutingConfig(routing, index)).toHaveProperty(
+      "routes.0.aliases",
+      { fast: "alpha" },
+    );
+  });
+});
 
 describe("codex config sanitizer", () => {
   it("migrates aliases and removes stale references across legacy routing", () => {

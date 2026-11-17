@@ -65,8 +65,11 @@ export function parseGuardianArgs(argv, { environment = process.env } = {}) {
       environment.USERPROFILE ?? environment.HOME ?? "",
       ".cc-switch",
     ),
-    MaxRestartsPerWindow: 6,
-    RestartWindowMinutes: 30,
+    // Keep compatibility mode on the same bounded budget as the canonical
+    // dev supervisor policy. The Rust supervisor is the release owner; this
+    // JS guardian is only a legacy fallback when explicitly enabled.
+    MaxRestartsPerWindow: DEV_RECOVERY_POLICY.maxRestarts,
+    RestartWindowMinutes: DEV_RECOVERY_POLICY.restartWindowMs / 60_000,
     RestartOnCleanExit: false,
     NoRestart: false,
     DevelopmentMode: false,
@@ -378,6 +381,7 @@ export function createGuardianRuntime(
     now = Date.now,
     wait = sleep,
     assertHeld = () => {},
+    environment = process.env,
   } = {},
 ) {
   const getProcessIdentity = (pid) => guardianProcessIdentity(pid, { query });
@@ -439,35 +443,36 @@ ConvertTo-Json -InputObject $items -Compress`,
         ),
     );
   };
-  const start = async (executable, args, options = {}) => {
-    assertHeld();
-    const child = spawnProcess(executable, args, {
-      windowsHide: true,
-      detached: true,
-      stdio: "ignore",
-      ...options,
+  const readDevSession = async (core) =>
+    plan.DevelopmentMode
+      ? core.devSessionRecoveryPlan({
+          configPath: plan.ConfigPath,
+          getProcessIdentity,
+          inspectWatchdogOwnership,
+        })
+      : null;
+  const effectiveWatchdogEnabled = (core, session) =>
+    core.watchdogEnabled({
+      configPath: plan.ConfigPath,
+      // Match the active owner's contract: release recovery ignores dev-only
+      // variables; a detached dev guardian honors its owner's saved override.
+      environment: plan.DevelopmentMode
+        ? { ...environment, ...session?.Environment }
+        : {},
     });
-    await new Promise((resolve, reject) => {
-      child.once("spawn", resolve);
-      child.once("error", () =>
-        reject(new Error("Guardian process launch failed.")),
-      );
-    });
-    child.unref();
-    return safePid(child.pid);
-  };
   return {
     assertHeld,
     getProcessIdentity,
     getListenerOwner,
     isExpectedProductIdentity,
     inspectWatchdogOwnership,
-    watchdogEnabled: async () =>
-      (await import("./ccswitchmulti-guardian-core.mjs")).watchdogEnabled({
-        configPath: plan.ConfigPath,
-      }),
+    watchdogEnabled: async () => {
+      const core = await import("./ccswitchmulti-guardian-core.mjs");
+      return effectiveWatchdogEnabled(core, await readDevSession(core));
+    },
     isMaintenance: async () => {
       const core = await import("./ccswitchmulti-guardian-core.mjs");
+      const session = await readDevSession(core);
       if (
         (await core.maintenanceLeaseActive({
           markerPath: plan.MaintenanceMarker,
@@ -475,15 +480,10 @@ ConvertTo-Json -InputObject $items -Compress`,
           getProcessIdentity,
         })) ||
         upgradeActive() ||
-        !(await core.watchdogEnabled({ configPath: plan.ConfigPath }))
+        !effectiveWatchdogEnabled(core, session)
       )
         return true;
-      if (!plan.DevelopmentMode) return false;
-      const session = await core.devSessionRecoveryPlan({
-        configPath: plan.ConfigPath,
-        getProcessIdentity,
-        inspectWatchdogOwnership,
-      });
+      if (!session) return false;
       return (
         session.Active ||
         session.WatchdogActive ||
@@ -505,31 +505,11 @@ ConvertTo-Json -InputObject $items -Compress`,
         return { Healthy: false, ListenerOwner: owner };
       }
     },
-    installedExecutableExists: () => existsSync(plan.InstalledExecutable),
-    getExpectedProductProcesses: () =>
-      queryProcesses("Name='cc-switch.exe'").flatMap((item) => {
-        const identity = getProcessIdentity(item.ProcessId);
-        return isExpectedProductIdentity(identity) ? [identity] : [];
-      }),
-    stopVerifiedProductProcess: (identity) => {
-      if (!isExpectedProductIdentity(identity))
-        throw new Error("Unexpected product process identity.");
-      return stopVerifiedWindowsProcess(identity, {
-        query,
-        expectedExecutable: identity.Path,
-        assertHeld,
-      });
-    },
-    waitPortFree: async () => {
-      const deadline = now() + 20_000;
-      while (now() < deadline) {
-        if (getListenerOwner() === null) return true;
-        await wait(500);
-      }
-      return false;
-    },
-    startProduct: () => start(plan.InstalledExecutable, []),
     startDevSession: async (devPlan) => {
+      if (plan.DevelopmentMode !== true || plan.NoRestart === true)
+        throw new Error(
+          "Native launch requires explicit development recovery without --no-restart.",
+        );
       assertHeld();
       const { child } = await spawnDevRecoveryProcess(
         {
@@ -554,16 +534,6 @@ ConvertTo-Json -InputObject $items -Compress`,
       child.unref();
       return safePid(child.pid);
     },
-    waitReady: async (expectedPid) => {
-      const deadline = now() + plan.ReadyTimeoutSeconds * 1000;
-      while (now() < deadline) {
-        const identity = getProcessIdentity(expectedPid);
-        if (!isExpectedProductIdentity(identity)) return false;
-        if (getListenerOwner() === expectedPid && (await health())) return true;
-        await wait(1000);
-      }
-      return false;
-    },
     writeEvent: (level, event, detail = null) =>
       appendFileSync(
         plan.LogPath,
@@ -573,13 +543,13 @@ ConvertTo-Json -InputObject $items -Compress`,
   };
 }
 
-export async function guardianRecoveryPolicy({
-  plan,
-  runtime,
-  restartTimesUtc,
-  core,
-  nowUtc = new Date(),
-}) {
+export async function guardianRecoveryPolicy({ plan, runtime, core }) {
+  // Enforce ownership here too, not only in the CLI. Imported callers cannot
+  // authorize production recovery or consume an independent restart budget.
+  if (plan.DevelopmentMode !== true)
+    return runtime.writeEvent("info", "production-recovery-owned-by-rust", {
+      Port: plan.Port,
+    });
   core ??= await import("./ccswitchmulti-guardian-core.mjs");
   runtime.assertHeld?.();
   const { writeEvent } = runtime;
@@ -589,69 +559,21 @@ export async function guardianRecoveryPolicy({
     });
   if (plan.NoRestart)
     return writeEvent("warning", "restart-suppressed", { Port: plan.Port });
-  let devSession;
-  if (plan.DevelopmentMode) {
-    devSession = await core.devSessionRecoveryPlan({
-      configPath: plan.ConfigPath,
-      getProcessIdentity: runtime.getProcessIdentity,
-      inspectWatchdogOwnership: runtime.inspectWatchdogOwnership,
-    });
-    if (devSession.PreventInstalledFallback && !devSession.Recoverable)
-      return core.devSessionRecovery({
-        plan: devSession,
-        isMaintenance: runtime.isMaintenance,
-        getListenerOwner: runtime.getListenerOwner,
-        getProcessIdentity: runtime.getProcessIdentity,
-        inspectWatchdogOwnership: runtime.inspectWatchdogOwnership,
-        startDevSession: () => {
-          throw new Error("Inactive development plan cannot start a process.");
-        },
-        assertHeld: runtime.assertHeld,
-        writeEvent,
-      });
-  }
-  if (
-    (!plan.DevelopmentMode || !devSession.Recoverable) &&
-    !plan.RestartOnCleanExit &&
-    !(await core.guardianUncleanExit({
-      configPath: plan.ConfigPath,
-      getProcessIdentity: runtime.getProcessIdentity,
-      expectedExecutable: plan.InstalledExecutable,
-    }))
-  )
-    return writeEvent("info", "restart-skipped-clean-exit", {
-      Port: plan.Port,
-    });
-  if (plan.DevelopmentMode && devSession.Recoverable)
-    return core.devSessionRecovery({
-      plan: devSession,
-      isMaintenance: runtime.isMaintenance,
-      getListenerOwner: runtime.getListenerOwner,
-      getProcessIdentity: runtime.getProcessIdentity,
-      inspectWatchdogOwnership: runtime.inspectWatchdogOwnership,
-      startDevSession: runtime.startDevSession,
-      assertHeld: runtime.assertHeld,
-      writeEvent,
-    });
-  if (
-    !(await core.guardianRestartBudget({
-      restartTimesUtc,
-      nowUtc,
-      windowMinutes: plan.RestartWindowMinutes,
-      maxRestarts: plan.MaxRestartsPerWindow,
-    }))
-  )
-    return writeEvent("warning", "restart-rate-limited", {
-      Port: plan.Port,
-      WindowMinutes: plan.RestartWindowMinutes,
-      MaxRestarts: plan.MaxRestartsPerWindow,
-      RestartsInWindow: restartTimesUtc.length,
-    });
-  runtime.assertHeld?.();
-  restartTimesUtc.push(nowUtc);
-  return core.guardianRecovery({
-    installedExecutable: plan.InstalledExecutable,
-    ...runtime,
+  const devSession = await core.devSessionRecoveryPlan({
+    configPath: plan.ConfigPath,
+    getProcessIdentity: runtime.getProcessIdentity,
+    inspectWatchdogOwnership: runtime.inspectWatchdogOwnership,
+  });
+  // Missing or invalid dev evidence must never reach installed-app recovery.
+  return core.devSessionRecovery({
+    plan: devSession,
+    isMaintenance: runtime.isMaintenance,
+    getListenerOwner: runtime.getListenerOwner,
+    getProcessIdentity: runtime.getProcessIdentity,
+    inspectWatchdogOwnership: runtime.inspectWatchdogOwnership,
+    startDevSession: runtime.startDevSession,
+    assertHeld: runtime.assertHeld,
+    writeEvent,
   });
 }
 
@@ -665,6 +587,10 @@ export async function runGuardian(
     wait = sleep,
   } = {},
 ) {
+  if (!legacyProductionGuardianAllowed(plan))
+    throw new Error(
+      "Production recovery is owned by the built-in Rust watchdog. Use --no-restart for read-only diagnostics or --development-mode for a recorded dev session.",
+    );
   core ??= await import("./ccswitchmulti-guardian-core.mjs");
   mkdirSync(path.dirname(plan.LockPath), { recursive: true });
   mkdirSync(path.dirname(plan.LogPath), { recursive: true });
@@ -673,7 +599,6 @@ export async function runGuardian(
     assertHeld: () => lock.assertHeld(),
   });
   const state = { FailureSinceUtc: null };
-  const restartTimesUtc = [];
   let cycles = 0;
   let cancelled = false;
   const runtimeAssertHeld = runtime.assertHeld;
@@ -720,9 +645,7 @@ export async function runGuardian(
                 guardianRecoveryPolicy({
                   plan,
                   runtime,
-                  restartTimesUtc,
                   core,
-                  nowUtc: new Date(now()),
                 }),
               writeEvent: runtime.writeEvent,
             }),
@@ -752,10 +675,16 @@ export async function runGuardian(
   }
 }
 
+export function legacyProductionGuardianAllowed(plan) {
+  // The release app owns its own recovery. Keep this script available for
+  // bounded, read-only production diagnostics and explicit dev recovery only.
+  return plan.DevelopmentMode === true || plan.NoRestart === true;
+}
+
 export async function guardianMain(argv = process.argv.slice(2)) {
   if (argv.length === 1 && ["--help", "-Help", "-h"].includes(argv[0])) {
     process.stdout.write(
-      "Usage: node scripts/watch-ccswitchmulti.mjs [--installed-executable PATH] [--config-path PATH] [--port PORT] [--development-mode] [--plan-only]\nProduction monitors the installed executable. Development recovery requires --development-mode. PowerShell-style named options remain accepted.\n",
+      "Usage: node scripts/watch-ccswitchmulti.mjs [--installed-executable PATH] [--config-path PATH] [--port PORT] [--no-restart | --development-mode] [--plan-only]\nProduction diagnostics require --no-restart; release recovery is owned by the built-in Rust watchdog. Development recovery requires --development-mode and a valid recorded dev session, and never falls back to the installed app. PowerShell-style named options remain accepted.\n",
     );
     return;
   }
@@ -771,6 +700,15 @@ export async function guardianMain(argv = process.argv.slice(2)) {
   }
   if (process.platform !== "win32")
     throw new Error("The installed guardian requires Windows.");
+  // Release recovery is owned by the built-in Rust supervisor. Refuse old
+  // scheduled restart entry points so a stale port or independent restart
+  // budget cannot race the app's settings-controlled recovery owner.
+  if (!legacyProductionGuardianAllowed(plan)) {
+    process.stdout.write(
+      "Production recovery is owned by the built-in Rust watchdog. Use Settings > Connections > Crash recovery; this JavaScript guardian supports --no-restart diagnostics or explicit --development-mode only.\n",
+    );
+    return;
+  }
   await runGuardian(plan);
 }
 

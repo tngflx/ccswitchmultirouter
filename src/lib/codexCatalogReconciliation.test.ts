@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  codexCatalogRowHasReasoningEffort,
   isCompleteCodexCatalogFetch,
   pruneMissingRemoteCodexCatalogRows,
   reconcileFetchedCodexCatalogRows,
+  selectOnlyCodexCatalogRowsWithReasoningEffort,
 } from "./codexCatalogReconciliation";
 import type { CodexCatalogRowLike } from "./codexCatalogReconciliation";
 import type { CodexModelReasoningCapability } from "@/types";
@@ -15,6 +17,209 @@ const createRow = (seed: Record<string, unknown>): CodexCatalogRowLike =>
     enabled: seed.enabled !== false,
     ...seed,
   }) as CodexCatalogRowLike;
+
+describe("selectOnlyCodexCatalogRowsWithReasoningEffort", () => {
+  it("enables rows with a non-none effort and preserves excluded inventory", () => {
+    const rows: CodexCatalogRowLike[] = [
+      createRow({
+        rowId: "reasoning",
+        model: "reasoning-model",
+        enabled: false,
+        reasoning: {
+          supportedEfforts: ["none", "low", "high"],
+          disableAllowed: true,
+          upstream: { format: "string", parameter: "reasoning_effort" },
+        },
+      }),
+      createRow({
+        rowId: "none-only",
+        model: "none-only-model",
+        enabled: true,
+        reasoning: {
+          supportedEfforts: ["none"],
+          disableAllowed: true,
+          upstream: { format: "none", parameter: "reasoning" },
+        },
+      }),
+      createRow({
+        rowId: "unknown",
+        model: "unknown-model",
+        enabled: true,
+      }),
+    ];
+    const result = selectOnlyCodexCatalogRowsWithReasoningEffort(rows);
+
+    expect(result.map((row) => [row.rowId, row.enabled])).toEqual([
+      ["reasoning", true],
+      ["none-only", false],
+      ["unknown", false],
+    ]);
+    expect(result).toHaveLength(rows.length);
+    expect(result[0]).toMatchObject({
+      rowId: "reasoning",
+      model: "reasoning-model",
+      reasoning: rows[0].reasoning,
+    });
+    expect(codexCatalogRowHasReasoningEffort(rows[0])).toBe(true);
+    expect(codexCatalogRowHasReasoningEffort(rows[1])).toBe(false);
+    expect(codexCatalogRowHasReasoningEffort(rows[2])).toBe(false);
+    expect(rows[0].enabled).toBe(false);
+  });
+
+  const gradedDeclaration = {
+    supportStatus: "confirmed_supported",
+    controlKind: "graded",
+    supportedEfforts: ["high"],
+    disableAllowed: false,
+    upstream: { format: "string", parameter: "reasoning_effort" },
+  };
+
+  it.each([
+    {
+      name: "canonical unsupported status despite stale supported true",
+      patch: { supportStatus: "confirmed_unsupported", supported: true },
+    },
+    {
+      name: "canonical unknown status despite stale supported true",
+      patch: { supportStatus: "unknown", supported: true },
+    },
+    {
+      name: "Boolean control with stale graded efforts",
+      patch: { controlKind: "boolean" },
+    },
+    {
+      name: "budget control with stale graded efforts",
+      patch: { controlKind: "budget" },
+    },
+    {
+      name: "none control with stale graded efforts",
+      patch: { controlKind: "none" },
+    },
+    {
+      name: "unknown control with stale graded efforts",
+      patch: { controlKind: "unknown" },
+    },
+    {
+      name: "Boolean wire format despite graded control",
+      patch: {
+        upstream: { format: "boolean", parameter: "reasoning.enabled" },
+      },
+    },
+    {
+      name: "budget wire format despite graded control",
+      patch: { upstream: { format: "budget", parameter: "thinking_budget" } },
+    },
+    {
+      name: "none wire format despite graded control",
+      patch: { upstream: { format: "none", parameter: "reasoning" } },
+    },
+    {
+      name: "non-effort parameter despite a graded string wire format",
+      patch: { upstream: { format: "string", parameter: "reasoning" } },
+    },
+  ])("does not enable $name", ({ patch }) => {
+    const row = createRow({
+      model: "stale-graded-model",
+      enabled: true,
+      reasoning: { ...gradedDeclaration, ...patch },
+    });
+    const before = structuredClone(row);
+
+    expect(codexCatalogRowHasReasoningEffort(row)).toBe(false);
+    expect(selectOnlyCodexCatalogRowsWithReasoningEffort([row])).toEqual([
+      { ...before, enabled: false },
+    ]);
+    expect(row).toEqual(before);
+  });
+
+  it.each([
+    { name: "empty effort token", efforts: [""] },
+    { name: "unknown effort enum", efforts: ["not-a-native-effort"] },
+    { name: "numeric effort token", efforts: [1] },
+    { name: "null effort token", efforts: [null] },
+    { name: "synthetic Ultra only", efforts: ["ultra"] },
+    {
+      name: "synthetic Ultra mixed with a native effort",
+      efforts: ["high", "ultra"],
+    },
+  ])("does not treat $name as a native effort ladder", ({ efforts }) => {
+    const row = createRow({
+      model: "malformed-effort-model",
+      enabled: true,
+      reasoning: { ...gradedDeclaration, supportedEfforts: efforts },
+    });
+    const before = structuredClone(row);
+
+    expect(codexCatalogRowHasReasoningEffort(row)).toBe(false);
+    expect(selectOnlyCodexCatalogRowsWithReasoningEffort([row])).toEqual([
+      { ...before, enabled: false },
+    ]);
+    expect(row).toEqual(before);
+  });
+
+  it.each([
+    {
+      name: "canonical supported graded status over stale supported false",
+      declaration: {
+        ...gradedDeclaration,
+        supported: false,
+        supportedEfforts: ["minimal", "low", "medium", "high", "xhigh", "max"],
+      },
+    },
+    {
+      name: "legacy supported declaration without canonical support or control",
+      declaration: {
+        supported: true,
+        supportedEfforts: ["high"],
+        upstream: { format: "string", parameter: "reasoning_effort" },
+      },
+    },
+    {
+      name: "legacy optional support fields with a none companion",
+      declaration: {
+        supportedEfforts: ["none", "max"],
+        upstream: { format: "string", parameter: "reasoning_effort" },
+      },
+    },
+    {
+      name: "legacy field aliases and object wire format",
+      declaration: {
+        support_status: "confirmed_supported",
+        control_kind: "graded",
+        supported_efforts: ["max"],
+        supported: false,
+        upstream: { format: "object", parameter: "reasoning.effort" },
+      },
+    },
+    {
+      name: "canonical fields over contradictory legacy aliases",
+      declaration: {
+        ...gradedDeclaration,
+        support_status: "confirmed_unsupported",
+        control_kind: "boolean",
+        supported_efforts: ["ultra"],
+        supported: false,
+        upstream: { format: "reasoning_object", parameter: "reasoning.effort" },
+      },
+    },
+  ])("enables $name without mutating its declaration", ({ declaration }) => {
+    const row = createRow({
+      rowId: "retained-manual-row",
+      model: "Visible alias",
+      upstreamModel: "provider/native-model",
+      contextWindow: "128000",
+      enabled: false,
+      reasoning: declaration,
+    });
+    const before = structuredClone(row);
+
+    expect(codexCatalogRowHasReasoningEffort(row)).toBe(true);
+    expect(selectOnlyCodexCatalogRowsWithReasoningEffort([row])).toEqual([
+      { ...before, enabled: true },
+    ]);
+    expect(row).toEqual(before);
+  });
+});
 
 describe("reconcileFetchedCodexCatalogRows", () => {
   it("keeps input/output token budgets separate from total context during refresh", () => {

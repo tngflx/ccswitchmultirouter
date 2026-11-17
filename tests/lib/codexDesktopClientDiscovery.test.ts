@@ -30,6 +30,23 @@ type State = {
   scopedAppServerScopesScannedAt?: number | null;
   scopedAppServerScopeScanComplete?: boolean;
   scopedAppServerRootIdentities?: object[];
+  pendingReactNodes?: Set<object>;
+  reactMutationGeneration?: number;
+  scopedAppServerScopeScan?: {
+    status: string;
+    visitedFiberCount: number;
+    fiberLimit: number;
+    scopeCount: number;
+    elapsedMs: number;
+  };
+  scopedAppServerScopeLastSettledScan?: {
+    status: string;
+    visitedFiberCount: number;
+    fiberLimit: number;
+    scopeCount: number;
+    elapsedMs: number;
+    reason?: string;
+  };
   scopedAppServerDiscovery?: {
     scopeCount: number;
     registryCount: number;
@@ -44,6 +61,8 @@ const createHarness = (
   lifecycle: {
     isCurrent?: () => boolean;
     yieldDiscovery?: () => Promise<void>;
+    objectScanLimit?: number;
+    fieldScanLimit?: number;
   } = {},
 ) => {
   const patchCache = vi.fn(() => true);
@@ -56,6 +75,15 @@ const createHarness = (
   });
   const recordFailure = vi.fn();
   const rememberCodexUserTurnAction = vi.fn();
+  const source = discoveryCore
+    .replace(
+      "CODEX_RENDERER_SCOPE_OBJECT_SCAN_LIMIT = 100000",
+      `CODEX_RENDERER_SCOPE_OBJECT_SCAN_LIMIT = ${lifecycle.objectScanLimit ?? 100000}`,
+    )
+    .replace(
+      "CODEX_RENDERER_SCOPE_FIELD_SCAN_LIMIT = 500000",
+      `CODEX_RENDERER_SCOPE_FIELD_SCAN_LIMIT = ${lifecycle.fieldScanLimit ?? 500000}`,
+    );
   const api = new Function(
     "state",
     "window",
@@ -68,7 +96,7 @@ const createHarness = (
     "yieldReactDiscovery",
     "installationIsCurrent",
     "rememberCodexUserTurnAction",
-    `${discoveryCore}\nreturn { patchAppServerModuleClients, patchCodexScopedAppServerClients, refreshCodexScopedAppServerClients, codexAppServerClientHasCurrentOwner, codexDeclaredDependencyScope, codexScopeQueryClient, codexQueryObserverPrototype };`,
+    `${source}\nreturn { patchAppServerModuleClients, patchCodexScopedAppServerClients, refreshCodexScopedAppServerClients, codexAppServerClientHasCurrentOwner, codexDeclaredDependencyScope, codexScopeQueryClient, codexQueryObserverPrototype, codexRendererScopeRootsMatchCurrent, codexRendererScopeCandidates, codexRendererScopeSnapshotIsCurrent };`,
   )(
     state,
     window,
@@ -93,6 +121,9 @@ const createHarness = (
     codexDeclaredDependencyScope: (value: unknown) => boolean;
     codexScopeQueryClient: (value: object) => QueryClient | null;
     codexQueryObserverPrototype: (value: unknown) => object | null;
+    codexRendererScopeRootsMatchCurrent: () => boolean;
+    codexRendererScopeCandidates: () => Promise<Scope[]>;
+    codexRendererScopeSnapshotIsCurrent: () => boolean;
   };
   return {
     state,
@@ -118,6 +149,421 @@ const createScope = (queryClient: QueryClient): Scope => ({
 
 describe("Codex Desktop declared client discovery", () => {
   afterEach(() => vi.useRealTimers());
+
+  it("rejects an alternate commit as proof that the old scope inventory is current", () => {
+    const fiberRoot = {};
+    const first: Record<string, unknown> = { stateNode: fiberRoot };
+    const second: Record<string, unknown> = { stateNode: fiberRoot };
+    first.alternate = second;
+    second.alternate = first;
+    const state: State = {
+      scopedAppServerRootIdentities: [{ root: fiberRoot, fiber: first }],
+      pendingReactNodes: new Set(),
+    };
+    const window = { __codexRoot: { _internalRoot: { current: first } } };
+    const harness = createHarness(state, window);
+    expect(harness.api.codexRendererScopeRootsMatchCurrent()).toBe(true);
+    first.stateNode = {};
+    expect(harness.api.codexRendererScopeRootsMatchCurrent()).toBe(false);
+    first.stateNode = fiberRoot;
+    window.__codexRoot._internalRoot.current = second;
+    expect(harness.api.codexRendererScopeRootsMatchCurrent()).toBe(false);
+    window.__codexRoot._internalRoot.current = { stateNode: {} };
+    expect(harness.api.codexRendererScopeRootsMatchCurrent()).toBe(false);
+  });
+
+  it("accepts the exact saved synthetic Fiber without requiring a stateNode", () => {
+    const fiber = {};
+    const harness = createHarness(
+      { scopedAppServerRootIdentities: [{ root: fiber, fiber }] },
+      { __codexRoot: { _internalRoot: { current: fiber } } },
+    );
+    expect(harness.api.codexRendererScopeRootsMatchCurrent()).toBe(true);
+  });
+
+  it("rescans an alternate commit with a replaced provider before the cache timeout", async () => {
+    const client = new QueryClient();
+    const oldScope = createScope(client);
+    const newScope = createScope(client);
+    const fiberRoot = {};
+    const first: Record<string, unknown> = {
+      stateNode: fiberRoot,
+      dependencies: { scope: oldScope },
+    };
+    const second: Record<string, unknown> = {
+      stateNode: fiberRoot,
+      dependencies: { scope: newScope },
+      alternate: first,
+    };
+    first.alternate = second;
+    const window = { __codexRoot: { _internalRoot: { current: first } } };
+    const harness = createHarness({}, window);
+    try {
+      await harness.api.codexRendererScopeCandidates();
+      window.__codexRoot._internalRoot.current = second;
+      expect(await harness.api.codexRendererScopeCandidates()).toEqual([
+        newScope,
+      ]);
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(true);
+    } finally {
+      client.clear();
+    }
+  });
+
+  it("does not publish a yielded pre-commit scope inventory as complete", async () => {
+    const client = new QueryClient();
+    const oldScope = createScope(client);
+    const newScope = createScope(client);
+    const fiberRoot = {};
+    const first: Record<string, unknown> = {
+      stateNode: fiberRoot,
+      dependencies: { scope: oldScope },
+    };
+    let child = first;
+    for (let index = 0; index < 150; index += 1) {
+      const next = {};
+      child.child = next;
+      child = next;
+    }
+    const second: Record<string, unknown> = {
+      stateNode: fiberRoot,
+      alternate: first,
+      dependencies: { scope: newScope },
+    };
+    first.alternate = second;
+    const window = { __codexRoot: { _internalRoot: { current: first } } };
+    const harness = createHarness({}, window, {
+      yieldDiscovery: async () => {
+        window.__codexRoot._internalRoot.current = second;
+      },
+    });
+    try {
+      await harness.api.codexRendererScopeCandidates();
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(false);
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(false);
+      expect(await harness.api.codexRendererScopeCandidates()).toEqual([
+        newScope,
+      ]);
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(true);
+    } finally {
+      client.clear();
+    }
+  });
+
+  it("retains the last settled scan while an immediate retry is still scanning", async () => {
+    const root: Record<string, unknown> = {};
+    let child = root;
+    for (let index = 0; index < 150; index += 1) {
+      const next = {};
+      child.child = next;
+      child = next;
+    }
+    const state: State = {};
+    let invalidate = true;
+    let release = () => {};
+    const retryGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const harness = createHarness(
+      state,
+      { __codexRoot: { _internalRoot: { current: root } } },
+      {
+        yieldDiscovery: async () => {
+          if (invalidate) state.reactMutationGeneration = 1;
+          else await retryGate;
+        },
+      },
+    );
+    await harness.api.codexRendererScopeCandidates();
+    const settled = state.scopedAppServerScopeLastSettledScan;
+    expect(settled).toMatchObject({
+      status: "invalidated",
+      reason: "mutation_generation",
+      visitedFiberCount: 151,
+      fiberLimit: 30000,
+      scopeCount: 0,
+      elapsedMs: expect.any(Number),
+    });
+    invalidate = false;
+    const retry = harness.api.codexRendererScopeCandidates();
+    try {
+      expect(state.scopedAppServerScopeScan?.status).toBe("scanning");
+      expect(state.scopedAppServerScopeLastSettledScan).toBe(settled);
+      expect(state.scopedAppServerScopeScanComplete).toBe(false);
+    } finally {
+      release();
+      await retry;
+    }
+    expect(state.scopedAppServerScopeLastSettledScan).toMatchObject({
+      status: "complete",
+      visitedFiberCount: 151,
+      scopeCount: 0,
+    });
+    expect(state.scopedAppServerScopeLastSettledScan).not.toHaveProperty(
+      "reason",
+    );
+  });
+
+  it("rejects a mixed inventory when deep scanned state changes with the same final root", async () => {
+    const client = new QueryClient();
+    const oldScope = createScope(client);
+    const newScope = createScope(client);
+    const root: Record<string, unknown> = {};
+    const owner: Record<string, unknown> = {
+      dependencies: { scope: oldScope },
+    };
+    root.child = owner;
+    let child = owner;
+    for (let index = 0; index < 150; index += 1) {
+      const next = {};
+      child.child = next;
+      child = next;
+    }
+    const harness = createHarness(
+      {},
+      { __codexRoot: { _internalRoot: { current: root } } },
+      {
+        yieldDiscovery: async () => {
+          owner.dependencies = { scope: newScope };
+        },
+      },
+    );
+    try {
+      await harness.api.codexRendererScopeCandidates();
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(false);
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(false);
+    } finally {
+      client.clear();
+    }
+  });
+
+  it("rejects a yielded inventory when a stable nested ref changes its current scope", async () => {
+    const client = new QueryClient();
+    const oldScope = createScope(client);
+    const newScope = createScope(client);
+    const ref = { current: oldScope };
+    const root: Record<string, unknown> = {
+      memoizedState: { memoizedState: ref },
+    };
+    let child = root;
+    for (let index = 0; index < 150; index += 1) {
+      const next = {};
+      child.child = next;
+      child = next;
+    }
+    const harness = createHarness(
+      {},
+      {
+        __codexRoot: { _internalRoot: { current: root } },
+      },
+      {
+        yieldDiscovery: async () => {
+          ref.current = newScope;
+        },
+      },
+    );
+    try {
+      await harness.api.codexRendererScopeCandidates();
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(false);
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(false);
+      expect(harness.state.scopedAppServerScopeScan?.status).toBe(
+        "invalidated",
+      );
+    } finally {
+      client.clear();
+    }
+  });
+
+  it.each(["object", "field"] as const)(
+    "keeps the inventory incomplete when its %s snapshot budget is exhausted",
+    async (budget) => {
+      const root = { memoizedState: { holder: { current: {} } } };
+      const harness = createHarness(
+        {},
+        {
+          __codexRoot: { _internalRoot: { current: root } },
+        },
+        budget === "object" ? { objectScanLimit: 1 } : { fieldScanLimit: 1 },
+      );
+      await harness.api.codexRendererScopeCandidates();
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(false);
+      expect(harness.state.scopedAppServerScopeScan?.status).toBe("capped");
+      expect(harness.state.scopedAppServerScopeLastSettledScan).toMatchObject({
+        status: "capped",
+        reason: budget === "object" ? "object_limit" : "field_limit",
+      });
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(false);
+    },
+  );
+
+  it("rejects newly added nested data edges without invoking existing getters", async () => {
+    const getter = vi.fn(() => {
+      throw new Error("Discovery accessors must not run");
+    });
+    const holder = Object.defineProperty({}, "lazy", {
+      configurable: true,
+      get: getter,
+    });
+    const root: Record<string, unknown> = { memoizedState: { holder } };
+    let child = root;
+    for (let index = 0; index < 150; index += 1) {
+      const next = {};
+      child.child = next;
+      child = next;
+    }
+    const harness = createHarness(
+      {},
+      {
+        __codexRoot: { _internalRoot: { current: root } },
+      },
+      {
+        yieldDiscovery: async () => {
+          Object.defineProperty(holder, "added", { value: {} });
+        },
+      },
+    );
+    await harness.api.codexRendererScopeCandidates();
+    expect(harness.state.scopedAppServerScopeScanComplete).toBe(false);
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it("invalidates retained provenance after publication before reusing a changed nested ref", async () => {
+    const client = new QueryClient();
+    const oldScope = createScope(client);
+    const newScope = createScope(client);
+    const ref = { current: oldScope };
+    const root = { memoizedState: { memoizedState: ref } };
+    const harness = createHarness(
+      {},
+      { __codexRoot: { _internalRoot: { current: root } } },
+    );
+    try {
+      expect((await harness.api.codexRendererScopeCandidates())[0]).toBe(
+        oldScope,
+      );
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(true);
+      ref.current = newScope;
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(false);
+      const refreshed = await harness.api.codexRendererScopeCandidates();
+      expect(refreshed).toHaveLength(1);
+      expect(refreshed[0]).toBe(newScope);
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(true);
+    } finally {
+      client.clear();
+    }
+  });
+
+  it("does not lose a mutation generation change when pending nodes are drained during a scan", async () => {
+    const root: Record<string, unknown> = {};
+    let child = root;
+    for (let index = 0; index < 150; index += 1) {
+      const next = {};
+      child.child = next;
+      child = next;
+    }
+    const state: State = {
+      reactMutationGeneration: 1,
+      pendingReactNodes: new Set(),
+    };
+    const harness = createHarness(
+      state,
+      { __codexRoot: { _internalRoot: { current: root } } },
+      {
+        yieldDiscovery: async () => {
+          state.reactMutationGeneration = 2;
+          state.pendingReactNodes!.clear();
+        },
+      },
+    );
+    await harness.api.codexRendererScopeCandidates();
+    expect(state.scopedAppServerScopeScanComplete).toBe(false);
+  });
+
+  it("shares one in-flight owner inventory instead of racing concurrent walks", async () => {
+    const root: Record<string, unknown> = {};
+    let child = root;
+    for (let index = 0; index < 150; index += 1) {
+      const next = {};
+      child.child = next;
+      child = next;
+    }
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const yieldDiscovery = vi.fn(() => gate);
+    const harness = createHarness(
+      {},
+      { __codexRoot: { _internalRoot: { current: root } } },
+      { yieldDiscovery },
+    );
+    const first = harness.api.codexRendererScopeCandidates();
+    const second = harness.api.codexRendererScopeCandidates();
+    try {
+      expect(yieldDiscovery).toHaveBeenCalledTimes(1);
+    } finally {
+      release!();
+      await Promise.all([first, second]);
+    }
+    expect(harness.state.scopedAppServerScopeScan).toMatchObject({
+      status: "complete",
+      visitedFiberCount: 151,
+      fiberLimit: 30000,
+      scopeCount: 0,
+    });
+  });
+
+  it("does not treat JSX debug owners as current scopes but keeps ordinary nested props", async () => {
+    const client = new QueryClient();
+    const current = createScope(client);
+    const stale = createScope(client);
+    const readAccessor = vi.fn(() => {
+      throw new Error("An uncertain current owner must not be read");
+    });
+    Object.defineProperty(current.node, "queryClient", { get: readAccessor });
+    const root = {
+      memoizedProps: {
+        children: {
+          $$typeof: Symbol.for("react.transitional.element"),
+          props: { provider: current },
+          _owner: { memoizedState: { scope: stale } },
+        },
+      },
+    };
+    const harness = createHarness(
+      {},
+      { __codexRoot: { _internalRoot: { current: root } } },
+    );
+    try {
+      expect(
+        (await harness.api.codexRendererScopeCandidates()).map((value) =>
+          value === current ? "current" : "stale",
+        ),
+      ).toEqual(["current"]);
+      expect(readAccessor).not.toHaveBeenCalled();
+    } finally {
+      client.clear();
+    }
+  });
+
+  it("keeps an unknown application _owner field in the owner inventory", async () => {
+    const client = new QueryClient();
+    const unknown = createScope(client);
+    const root = { memoizedProps: { _owner: { provider: unknown } } };
+    const harness = createHarness(
+      {},
+      {
+        __codexRoot: { _internalRoot: { current: root } },
+      },
+    );
+    try {
+      const found = await harness.api.codexRendererScopeCandidates();
+      expect(found).toHaveLength(1);
+      expect(found[0]).toBe(unknown);
+    } finally {
+      client.clear();
+    }
+  });
 
   it("rediscovers mounted picker scopes instead of permanently retaining only the shell", async () => {
     vi.useFakeTimers();
@@ -637,6 +1083,47 @@ describe("Codex Desktop declared client discovery", () => {
     }
   });
 
+  it("reads the installed retained-node forwarding triple without using a getter's overridden call", () => {
+    const client = new QueryClient();
+    const n = { parent: {}, queryClient: client, value: {} };
+    const queryGetter = () => n.queryClient;
+    const overriddenCall = vi.fn(() => {
+      throw new Error(
+        "Validated forwarding getter call must use the intrinsic",
+      );
+    });
+    Object.defineProperty(queryGetter, "call", { get: overriddenCall });
+    const retainedNode = {};
+    Object.defineProperties(retainedNode, {
+      parent: {
+        get: () => n.parent,
+        configurable: true,
+        enumerable: true,
+      },
+      queryClient: {
+        get: queryGetter,
+        configurable: true,
+        enumerable: true,
+      },
+      value: {
+        get: () => n.value,
+        configurable: true,
+        enumerable: true,
+      },
+    });
+    const scope = {
+      ...createScope(client),
+      node: retainedNode,
+    };
+    const harness = createHarness();
+    try {
+      expect(harness.api.codexScopeQueryClient(scope)).toBe(client);
+      expect(overriddenCall).not.toHaveBeenCalled();
+    } finally {
+      client.clear();
+    }
+  });
+
   it("retains independently discovered query clients when a registry export is absent", async () => {
     const first = new QueryClient();
     const second = new QueryClient();
@@ -899,6 +1386,66 @@ describe("Codex Desktop declared client discovery", () => {
       expect(rawClient.rpc.sendRequest).not.toHaveBeenCalled();
     } finally {
       scope.queryClient.clear();
+    }
+  });
+  it("does not re-expand one shared object for every Fiber", async () => {
+    const client = new QueryClient();
+    const scope = createScope(client);
+    const shared = { __sharedExpansionMarker: { scope } };
+    const root: Record<string, unknown> = {
+      memoizedState: { shared },
+    };
+    let fiber = root;
+    for (let index = 0; index < 64; index += 1) {
+      const next = { memoizedState: { shared } };
+      fiber.child = next;
+      fiber = next;
+    }
+    const harness = createHarness(
+      {},
+      { __codexRoot: { _internalRoot: { current: root } } },
+      { objectScanLimit: 70 },
+    );
+    const originalEntries = Object.entries;
+    let sharedExpansionCount = 0;
+    vi.spyOn(Object, "entries").mockImplementation((value) => {
+      const entries = originalEntries(value);
+      if (entries.some(([key]) => key === "__sharedExpansionMarker"))
+        sharedExpansionCount += 1;
+      return entries;
+    });
+    try {
+      const found = await harness.api.codexRendererScopeCandidates();
+      expect(found).toEqual([scope]);
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(true);
+      expect(sharedExpansionCount).toBe(1);
+    } finally {
+      vi.restoreAllMocks();
+      client.clear();
+    }
+  });
+
+  it("re-expands a shared object reached later at a shallower depth", async () => {
+    const client = new QueryClient();
+    const scope = createScope(client);
+    const shared = { next: { next: { scope } } };
+    const root = {
+      memoizedState: { a: { b: { c: shared } } },
+      child: { memoizedState: shared },
+    };
+    const harness = createHarness(
+      {},
+      { __codexRoot: { _internalRoot: { current: root } } },
+    );
+    try {
+      const found = await harness.api.codexRendererScopeCandidates();
+      expect(found).toEqual([scope]);
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(true);
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(true);
+      shared.next.next.scope = createScope(client);
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(false);
+    } finally {
+      client.clear();
     }
   });
 });

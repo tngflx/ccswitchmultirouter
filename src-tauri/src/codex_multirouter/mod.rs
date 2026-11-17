@@ -2,6 +2,8 @@ pub(crate) mod catalog;
 pub mod compiler;
 pub mod migration;
 pub mod mutation;
+mod owner_scope;
+pub(crate) use owner_scope::owner_scope_fingerprint;
 pub mod projection;
 pub(crate) mod protocol_capability;
 pub mod provider_set;

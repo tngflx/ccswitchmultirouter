@@ -10,6 +10,10 @@ const discovery = readFileSync(
   path.join(resources, "client_discovery.js"),
   "utf8",
 );
+const pickerCore = readFileSync(
+  path.join(resources, "model_picker_core.js"),
+  "utf8",
+);
 const nativePath = path.join(resources, "native_reasoning_visibility.js");
 const native = existsSync(nativePath) ? readFileSync(nativePath, "utf8") : "";
 const allEfforts = ["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -26,15 +30,26 @@ type State = {
   reasoningQueryCaches?: Map<object, object>;
   modelPickerQueryClients?: Map<object, object>;
   nativeReasoningVisibilityPatches?: Map<object, object>;
-  nativeReasoningVisibilityMaxEnabled?: boolean;
-  payload?: { catalogAvailable?: boolean; modelProvider?: string };
+  nativeReasoningVisibilityPowerPatches?: Map<object, object>;
+  nativeReasoningVisibilityEnabled?: boolean;
+  payload?: {
+    catalogAvailable?: boolean;
+    modelProvider?: string;
+    modelNames?: string[];
+    models?: Record<string, unknown>[];
+  };
   pendingReactNodes?: Set<object>;
+  nativeReasoningVisibilityFiberPath?: (button: object) => object[] | null;
 };
 const fixtureRoot = {};
 const fixtureWindow = {
   __codexRoot: { _internalRoot: { current: fixtureRoot } },
 };
-const fixtureDocument = { getElementById: () => null };
+type FixtureDocument = {
+  getElementById: () => null;
+  querySelectorAll?: () => object[];
+};
+const fixtureDocument: FixtureDocument = { getElementById: () => null };
 const createReader = (state: State) =>
   new Function(
     "state",
@@ -53,7 +68,7 @@ const createAtom = () => ({
     throw new Error("The diagnostic must not resolve an atom directly");
   }),
 });
-const createScope = (cache: object, enabled: unknown) => {
+const createScope = <T>(cache: object, enabled: T) => {
   const client = {
     getQueryCache: vi.fn(() => cache),
     getQueryData: vi.fn(),
@@ -80,7 +95,12 @@ const createState = (atom: object, ...scopes: object[]): State => ({
   scopedAppServerScopeCandidates: new Set(scopes),
   scopedAppServerScopeScanComplete: true,
   scopedAppServerRootIdentities: [fixtureRoot],
-  payload: { catalogAvailable: true, modelProvider: "codex_model_router_v2" },
+  payload: {
+    catalogAvailable: true,
+    modelProvider: "codex_model_router_v2",
+    modelNames: ["fixture"],
+    models: [{ model: "fixture", supported_reasoning_levels: [...allEfforts] }],
+  },
 });
 
 describe("Codex Desktop read-only native reasoning visibility", () => {
@@ -358,7 +378,89 @@ describe("Codex Desktop read-only native reasoning visibility", () => {
   });
 });
 
-describe("Codex Desktop managed native Max reconciliation", () => {
+describe("Codex Desktop managed native graded-effort reconciliation", () => {
+  it("notifies the explicit picker refresh boundary without mutating native scope state", () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const enabled = new Set(allEfforts.slice(0, 4));
+    const { scope } = createScope(cache, enabled);
+    const refreshNative = vi.fn();
+    const refreshFallback = vi.fn();
+    const legacyRefresh = vi.fn();
+    const state = createState(atom, scope);
+    state.reasoningQueryCaches = new Map<object, object>([
+      [cache, { refreshNative, refresh: refreshFallback }],
+      [{}, { refresh: legacyRefresh }],
+    ]);
+    const reconcile = createReconciler(state);
+
+    expect(reconcile(["max"])).toMatchObject({
+      status: "known",
+      managed: true,
+      patchedScopes: 1,
+    });
+    expect(refreshNative).toHaveBeenCalledOnce();
+    expect(refreshFallback).not.toHaveBeenCalled();
+    expect(legacyRefresh).toHaveBeenCalledOnce();
+    expect(scope.set).not.toHaveBeenCalled();
+    expect(scope.watch).not.toHaveBeenCalled();
+  });
+
+  it("projects missing graded efforts into mounted native picker props and restores them", () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const enabled = new Set(allEfforts.slice(0, 4));
+    const { scope } = createScope(cache, enabled);
+    const originalSelections = allEfforts
+      .filter((effort) => effort !== "max")
+      .map((reasoningEffort, powerSettingIndex) => ({
+        id: `fixture:${reasoningEffort}`,
+        model: "fixture",
+        modelLabel: "Fixture",
+        reasoningEffort,
+        powerSettingIndex,
+        isLocked: false,
+      }));
+    const props = {
+      selectedLabelCandidate: {
+        id: "fixture:ultra",
+        model: "fixture",
+        modelLabel: "Fixture",
+        reasoningEffort: "ultra",
+      },
+      onSelectPower: vi.fn(),
+      powerSelections: originalSelections,
+      triggerConfig: {},
+    };
+    const fiber = { memoizedProps: props };
+    const button = {
+      isConnected: true,
+      closest: vi.fn(() => button),
+    };
+    const marker = { closest: vi.fn(() => button) };
+    const state = createState(atom, scope);
+    state.nativeReasoningVisibilityFiberPath = () => [fiber];
+    const reconcile = createReconciler(state, {
+      getElementById: () => null,
+      querySelectorAll: () => [marker],
+    });
+
+    expect(reconcile(allEfforts)).toMatchObject({
+      status: "known",
+      managed: true,
+      patchedScopes: 1,
+    });
+    expect(props.powerSelections.map((row) => row.reasoningEffort)).toEqual(
+      allEfforts,
+    );
+    expect(props.powerSelections).not.toBe(originalSelections);
+    expect(state.nativeReasoningVisibilityPowerPatches?.size).toBe(1);
+
+    expect(reconcile([])).toMatchObject({ managed: false, restoredScopes: 1 });
+    expect(props.powerSelections).toBe(originalSelections);
+    expect(state.nativeReasoningVisibilityPowerPatches?.size).toBe(0);
+  });
+
   it("wraps only the exact current managed scope and restores it on release", () => {
     const cache = createManagedCache();
     const atom = createAtom();
@@ -390,6 +492,64 @@ describe("Codex Desktop managed native Max reconciliation", () => {
     expect(state.nativeReasoningVisibilityPatches?.size).toBe(0);
   });
 
+  it.each([
+    {
+      name: "Boolean transport aliases",
+      row: {
+        supported_reasoning_levels: [],
+        ccSwitchReasoningControl: {
+          kind: "boolean",
+          disableAllowed: true,
+          fingerprint: "fixture-boolean",
+        },
+      },
+      requested: ["none", "medium"],
+    },
+    {
+      name: "budget-only control with residual levels",
+      row: {
+        supported_reasoning_levels: ["high"],
+        reasoning: { controlKind: "budget" },
+      },
+      requested: ["high"],
+    },
+    {
+      name: "synthetic Ultra overlay",
+      row: { supported_reasoning_levels: ["ultra"] },
+      requested: ["ultra"],
+    },
+    {
+      name: "reasoning-disabled token",
+      row: { supported_reasoning_levels: ["none"] },
+      requested: ["none"],
+    },
+    {
+      name: "unknown native enum",
+      row: { supported_reasoning_levels: ["fixture-unknown-effort"] },
+      requested: ["fixture-unknown-effort"],
+    },
+  ])(
+    "does not create a graded visibility bridge for $name",
+    ({ row, requested }) => {
+      const cache = createManagedCache();
+      const atom = createAtom();
+      const enabled = new Set<string>();
+      const { scope } = createScope(cache, enabled);
+      const originalGet = scope.get;
+      const state = createState(atom, scope);
+      state.payload!.models = [{ model: "fixture", ...row }];
+      const reconcile = createReconciler(state);
+      expect(reconcile(requested)).toMatchObject({
+        status: "known",
+        managed: false,
+        patchedScopes: 0,
+      });
+      expect(scope.get).toBe(originalGet);
+      expect(scope.get).not.toHaveBeenCalled();
+      expect([...enabled]).toEqual([]);
+    },
+  );
+
   it("does not augment a borrowed getter or a scope whose renderer owner became uncertain", () => {
     const cache = createManagedCache();
     const atom = createAtom();
@@ -405,7 +565,7 @@ describe("Codex Desktop managed native Max reconciliation", () => {
     expect(patchedGet.call(foreignThis, atom)).toBe(enabled);
     state.pendingReactNodes = new Set([{}]);
     expect(scope.get(atom)).toBe(enabled);
-    expect(state.nativeReasoningVisibilityMaxEnabled).toBe(true);
+    expect(state.nativeReasoningVisibilityEnabled).toBe(true);
     expect(originalGet).toHaveBeenCalledTimes(3);
   });
 
@@ -434,7 +594,7 @@ describe("Codex Desktop managed native Max reconciliation", () => {
     expect(incomplete.scope.get).not.toHaveBeenCalled();
   });
 
-  it("restores a Max wrapper when the managed catalog no longer declares Max", () => {
+  it("stops exposing removed efforts and restores the wrapper when no native effort remains", () => {
     const cache = createManagedCache();
     const atom = createAtom();
     const enabled = new Set(allEfforts.slice(0, 4));
@@ -443,36 +603,42 @@ describe("Codex Desktop managed native Max reconciliation", () => {
     const state = createState(atom, scope);
     const reconcile = createReconciler(state);
     expect(reconcile(["max"]).patchedScopes).toBe(1);
+    state.payload!.models![0].supported_reasoning_levels = ["low", "high"];
     expect(reconcile(["low", "high"])).toMatchObject({
-      managed: false,
-      restoredScopes: 1,
+      managed: true,
+      patchedScopes: 1,
     });
+    expect(scope.get(atom)).toBe(enabled);
+    expect(scope.get(atom).has("max")).toBe(false);
+    state.payload!.models![0].supported_reasoning_levels = [];
+    expect(reconcile([])).toMatchObject({ managed: false, restoredScopes: 1 });
     expect(scope.get).toBe(originalGet);
     expect(scope.get(atom)).toBe(enabled);
   });
 });
 
-const createReconciler = (state: State) =>
+const createReconciler = (state: State, document = fixtureDocument) =>
   new Function(
     "state",
     "window",
     "document",
-    `const codexPickerOwnData = (value, key) => {
+    `const nativeBooleanCurrentFiberPath = state.nativeReasoningVisibilityFiberPath;
+    const codexPickerOwnData = (value, key) => {
       if (!value || (typeof value !== "object" && typeof value !== "function")) return undefined;
       const field = Object.getOwnPropertyDescriptor(value, key);
       return field && "value" in field ? field.value : undefined;
     };
     const codexPickerDataArray = (value) => Array.isArray(value) ? Array.from({ length: value.length }, (_, index) => value[index]) : [];
-    const currentPayload = () => state.payload || { catalogAvailable: true, modelProvider: "codex_model_router_v2", modelNames: ["fixture"] };
-    const modelNames = () => ["fixture"];
-    const descriptorFor = () => ({ supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort })) });
-    const isManagedCodexModelQuery = (key) => Array.isArray(key) && key[0] === "models" && key[1] === "list" && key[2] === "local" && ["chatgpt", "apikey", "no-auth"].includes(key[3]) && (key.length < 6 || key.slice(5).includes(currentPayload().modelProvider));
+    ${pickerCore}
     ${discovery}\n${native}\nreturn reconcileCodexNativeReasoningVisibility;`,
-  )(state, fixtureWindow, fixtureDocument) as (efforts: unknown) => {
+  )(state, fixtureWindow, document) as (efforts: unknown) => {
     status: string;
     managed: boolean;
     patchedScopes: number;
     restoredScopes: number;
+    refusalReason: string | null;
+    ownerScopeCount: number;
+    ownerFailureCounts: Record<string, number>;
   };
 const createManagedCache = () => ({
   getAll: () => [
@@ -498,6 +664,136 @@ const createCurrentCacheReader = (state: State) =>
       ? codexCurrentNativeReasoningQueryCaches
       : () => null;`,
   )(state, fixtureWindow, fixtureDocument) as () => Set<object> | null;
+
+const createScannedReconciler = (state: State, root: object) =>
+  new Function(
+    "state",
+    "window",
+    "document",
+    "monotonicNow",
+    "yieldReactDiscovery",
+    `const codexPickerOwnData = (value, key) => {
+      const field = value && Object.getOwnPropertyDescriptor(value, key);
+      return field && "value" in field ? field.value : undefined;
+    };
+    const codexPickerDataArray = (value) => Array.isArray(value) ? [...value] : [];
+    ${pickerCore}
+${discovery}
+${native}
+return {
+      scan: codexRendererScopeCandidates,
+      snapshotCurrent: codexRendererScopeSnapshotIsCurrent,
+      caches: codexCurrentNativeReasoningQueryCaches,
+      reconcile: reconcileCodexNativeReasoningVisibility,
+    };`,
+  )(
+    state,
+    { __codexRoot: { _internalRoot: { current: root } } },
+    fixtureDocument,
+    () => 0,
+    async () => {},
+  ) as {
+    scan: () => Promise<object[]>;
+    snapshotCurrent: () => boolean;
+    caches: () => Set<object> | null;
+    reconcile: ReturnType<typeof createReconciler>;
+  };
+
+describe("Codex Desktop retained native ownership provenance", () => {
+  it("returns the native baseline from a wrapped scope whose retained nested path changed", async () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const enabled = new Set(["high"]);
+    const first = createScope(cache, enabled);
+    const second = createScope(cache, enabled);
+    const ref = { current: first.scope };
+    const api = createScannedReconciler(createState(atom, first.scope), {
+      memoizedState: { memoizedState: ref },
+    });
+    await api.scan();
+    expect(api.reconcile(["max"]).status).toBe("known");
+    expect(first.scope.get(atom).has("max")).toBe(true);
+    ref.current = second.scope;
+    expect(first.scope.get(atom)).toBe(enabled);
+    expect(api.snapshotCurrent()).toBe(false);
+    expect(api.caches()).toBeNull();
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "unverified",
+      restoredScopes: 1,
+    });
+  });
+
+  it("refreshes mounted picker observers after refusing a stale owner snapshot", async () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const enabled = new Set(["high"]);
+    const first = createScope(cache, enabled);
+    const second = createScope(cache, enabled);
+    const ref = { current: first.scope };
+    const refreshNative = vi.fn();
+    const state = createState(atom, first.scope);
+    state.reasoningQueryCaches = new Map([[cache, { refreshNative }]]);
+    const api = createScannedReconciler(state, {
+      memoizedState: { memoizedState: ref },
+    });
+    await api.scan();
+    expect(api.reconcile(["max"]).status).toBe("known");
+    const afterKnown = refreshNative.mock.calls.length;
+    ref.current = second.scope;
+    expect(api.snapshotCurrent()).toBe(false);
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "unverified",
+      restoredScopes: 1,
+    });
+    expect(refreshNative.mock.calls.length).toBeGreaterThan(afterKnown);
+  });
+
+  it("does not certify readiness when an unknown owner is added after publication", async () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const first = createScope(cache, new Set(["high"]));
+    const unknown = createScope(cache, new Set(["high"]));
+    const accessor = vi.fn(() => {
+      throw new Error("Unknown owner getter must not run");
+    });
+    Object.defineProperty(unknown.scope.node, "queryClient", { get: accessor });
+    const holder: Record<string, unknown> = { current: first.scope };
+    const api = createScannedReconciler(createState(atom, first.scope), {
+      memoizedState: { holder },
+    });
+    await api.scan();
+    expect(api.reconcile(["max"]).status).toBe("known");
+    holder.added = unknown.scope;
+    expect(api.snapshotCurrent()).toBe(false);
+    expect(api.caches()).toBeNull();
+    expect(api.reconcile(["max"]).status).toBe("unverified");
+    await api.scan();
+    expect(api.caches()).toBeNull();
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "unverified",
+      patchedScopes: 0,
+      ownerFailureCounts: { node_client_accessor: 1 },
+    });
+    expect(accessor).not.toHaveBeenCalled();
+  });
+
+  it("checks only the wrapped scope path rather than rescanning unrelated provenance per native read", async () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const first = createScope(cache, new Set(["high"]));
+    const ownKeys = vi.fn((target: object) => Reflect.ownKeys(target));
+    const noise = new Proxy({ retained: {} }, { ownKeys });
+    const api = createScannedReconciler(createState(atom, first.scope), {
+      memoizedState: { scope: first.scope, noise },
+    });
+    await api.scan();
+    expect(api.reconcile(["max"]).status).toBe("known");
+    ownKeys.mockClear();
+    for (let index = 0; index < 50; index += 1)
+      expect(first.scope.get(atom).has("max")).toBe(true);
+    expect(ownKeys).not.toHaveBeenCalled();
+  });
+});
 
 describe("Codex Desktop complete current native cache ownership", () => {
   it("follows replacement and removal without reading preferences or retaining historical maps", () => {
@@ -639,4 +935,418 @@ it("does not prove native visibility from a malformed target cache and matching 
     missingEfforts: [],
   });
   expect(scope.get).not.toHaveBeenCalled();
+});
+
+describe("Codex Desktop native visibility refusal evidence", () => {
+  it("reports a known owner without reading extra preferences or changing readiness", () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const { scope, scopeGetter } = createScope(cache, new Set(["high"]));
+    const result = createReconciler(createState(atom, scope))(["max"]);
+    expect(result).toMatchObject({
+      status: "known",
+      refusalReason: null,
+      ownerScopeCount: 1,
+      patchedScopes: 1,
+    });
+    expect(Object.values(result.ownerFailureCounts)).toEqual(Array(13).fill(0));
+    expect(scopeGetter).not.toHaveBeenCalled();
+    expect(atom.resolve).not.toHaveBeenCalled();
+  });
+
+  it("accepts only the installed retained-node forwarding accessor triple", () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const { scope, client } = createScope(cache, new Set(["high"]));
+    const n = { parent: {}, queryClient: client, value: {} };
+    const retainedNode = {};
+    Object.defineProperties(retainedNode, {
+      parent: {
+        get: () => n.parent,
+        configurable: true,
+        enumerable: true,
+      },
+      queryClient: {
+        get: () => n.queryClient,
+        configurable: true,
+        enumerable: true,
+      },
+      value: {
+        get: () => n.value,
+        configurable: true,
+        enumerable: true,
+      },
+    });
+    Object.defineProperty(scope, "node", {
+      value: retainedNode,
+      configurable: true,
+    });
+    const result = createReconciler(createState(atom, scope))(["max"]);
+    expect(result).toMatchObject({
+      status: "known",
+      refusalReason: null,
+      ownerScopeCount: 1,
+      patchedScopes: 1,
+    });
+    expect(result.ownerFailureCounts.node_client_accessor).toBe(0);
+  });
+
+  it.each([
+    "missing parent",
+    "setter",
+    "wrong forwarding source",
+    "non-configurable",
+  ] as const)(
+    "rejects a malformed retained-node accessor triple: %s",
+    (fault) => {
+      const cache = createManagedCache();
+      const atom = createAtom();
+      const { scope, client } = createScope(cache, new Set(["high"]));
+      const n = { parent: {}, queryClient: client, value: {} };
+      const retainedNode = {};
+      const descriptors: PropertyDescriptorMap = {
+        parent: {
+          get: () => n.parent,
+          configurable: true,
+          enumerable: true,
+        },
+        queryClient: {
+          get: () => n.queryClient,
+          configurable: true,
+          enumerable: true,
+        },
+        value: {
+          get: () => n.value,
+          configurable: true,
+          enumerable: true,
+        },
+      };
+      if (fault === "missing parent") delete descriptors.parent;
+      if (fault === "setter") descriptors.queryClient!.set = () => {};
+      if (fault === "wrong forwarding source")
+        descriptors.queryClient!.get = () => n.value;
+      if (fault === "non-configurable") descriptors.value!.configurable = false;
+      Object.defineProperties(retainedNode, descriptors);
+      Object.defineProperty(scope, "node", {
+        value: retainedNode,
+        configurable: true,
+      });
+      const result = createReconciler(createState(atom, scope))(["max"]);
+      expect(result).toMatchObject({
+        status: "unverified",
+        refusalReason: "owner_cache_inventory_unverified",
+        ownerScopeCount: 1,
+        ownerFailureCounts: { node_client_accessor: 1 },
+        patchedScopes: 0,
+      });
+    },
+  );
+
+  it("distinguishes an absent modern slot from an explicitly uninitialized owner and keeps both fail closed", () => {
+    for (const [slot, reason] of [
+      [{}, "node_client_absent"],
+      [{ queryClient: null }, "node_client_uninitialized"],
+    ] as const) {
+      const cache = createManagedCache();
+      const first = createScope(cache, new Set(["high"]));
+      const pending = createScope(cache, new Set(["high"]));
+      Object.defineProperty(pending.scope, "node", { value: slot });
+      const result = createReconciler(
+        createState(createAtom(), first.scope, pending.scope),
+      )(["max"]);
+      expect(result).toMatchObject({
+        status: "unverified",
+        refusalReason: "owner_cache_inventory_unverified",
+        ownerScopeCount: 2,
+        ownerFailureCounts: { [reason]: 1 },
+        patchedScopes: 0,
+      });
+      expect(
+        Object.values(result.ownerFailureCounts).reduce((a, b) => a + b, 0),
+      ).toBe(1);
+      expect(first.scope.get).not.toHaveBeenCalled();
+      expect(pending.scope.get).not.toHaveBeenCalled();
+      expect(pending.scopeGetter).not.toHaveBeenCalled();
+    }
+  });
+
+  it("reports accessor refusal without invoking it or inspecting later owners", () => {
+    const getter = vi.fn(() => {
+      throw new Error("secret-token-must-not-escape");
+    });
+    const first = createScope(createManagedCache(), new Set(["high"]));
+    Object.defineProperty(first.scope.node, "queryClient", { get: getter });
+    const later = createScope(createManagedCache(), new Set(["high"]));
+    const result = createReconciler(
+      createState(createAtom(), first.scope, later.scope),
+    )(["max"]);
+    expect(result).toMatchObject({
+      status: "unverified",
+      refusalReason: "owner_cache_inventory_unverified",
+      ownerScopeCount: 1,
+      ownerFailureCounts: { node_client_accessor: 1 },
+      patchedScopes: 0,
+    });
+    expect(getter).not.toHaveBeenCalled();
+    expect(later.client.getQueryCache).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain("secret-token");
+  });
+
+  it("reduces failing cache reads to a fixed reason without leaking exception data", () => {
+    const { scope, client } = createScope(
+      createManagedCache(),
+      new Set(["high"]),
+    );
+    client.getQueryCache.mockImplementation(() => {
+      throw new Error("secret-token-must-not-escape");
+    });
+    const result = createReconciler(createState(createAtom(), scope))(["max"]);
+    expect(result).toMatchObject({
+      status: "unverified",
+      refusalReason: "owner_cache_inventory_unverified",
+      ownerScopeCount: 1,
+      ownerFailureCounts: { scope_read_failed: 1 },
+      patchedScopes: 0,
+    });
+    expect(scope.get).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain("secret-token");
+  });
+
+  it("keeps a capped inventory unverified and exposes only bounded refusal counts", () => {
+    const { scope } = createScope(createManagedCache(), new Set(["high"]));
+    const aliases = Array.from({ length: 2049 }, () =>
+      Object.defineProperties({}, Object.getOwnPropertyDescriptors(scope)),
+    );
+    const result = createReconciler(createState(createAtom(), ...aliases))([
+      "max",
+    ]);
+    expect(result).toMatchObject({
+      status: "unverified",
+      refusalReason: "owner_cache_inventory_unverified",
+      ownerScopeCount: 2048,
+      ownerFailureCounts: { inventory_capped: 1 },
+      patchedScopes: 0,
+    });
+    expect(scope.get).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes a stale snapshot and an absent managed picker query", () => {
+    const { scope } = createScope({}, new Set(["high"]));
+    const stale = createState(createAtom(), scope);
+    stale.scopedAppServerScopeScanComplete = false;
+    expect(createReconciler(stale)(["max"])).toMatchObject({
+      status: "unverified",
+      refusalReason: "renderer_scope_snapshot_unverified",
+      ownerScopeCount: 0,
+      patchedScopes: 0,
+    });
+    expect(
+      createReconciler(createState(createAtom(), scope))(["max"]),
+    ).toMatchObject({
+      status: "unverified",
+      refusalReason: "no_managed_picker_query",
+      ownerScopeCount: 1,
+      patchedScopes: 0,
+    });
+    expect(scope.get).not.toHaveBeenCalled();
+  });
+});
+
+describe("native graded picker canonical selection authority", () => {
+  const mounted = (
+    rows: Record<string, unknown>[],
+    candidate: Record<string, unknown> = {
+      model: "fixture",
+      reasoningEffort: "high",
+    },
+  ) => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const { scope } = createScope(cache, new Set(allEfforts));
+    const state = createState(atom, scope);
+    state.payload!.models = [
+      { model: "fixture", supported_reasoning_levels: ["low", "high"] },
+      { model: "other", supported_reasoning_levels: ["max"] },
+    ];
+    state.payload!.modelNames = ["fixture", "other"];
+    const props = {
+      selectedLabelCandidate: candidate,
+      onSelectPower: vi.fn(),
+      powerSelections: rows,
+      triggerConfig: {},
+    };
+    state.nativeReasoningVisibilityFiberPath = () => [{ memoizedProps: props }];
+    const button = { isConnected: true };
+    const reconcile = createReconciler(state, {
+      getElementById: () => null,
+      querySelectorAll: () => [{ closest: () => button }],
+    });
+    return { state, props, reconcile };
+  };
+  it("removes stale same-model levels even when another model supports them and no levels are missing", () => {
+    const unrelated = { model: "other", reasoningEffort: "max" };
+    const remote = {
+      model: "fixture",
+      modelProvider: "unrelated_provider",
+      reasoningEffort: "max",
+    };
+    const unscoped = { reasoningEffort: "max" };
+    const rows = [
+      { model: "fixture", reasoningEffort: "low" },
+      { model: "fixture", reasoningEffort: "high" },
+      { model: "fixture", reasoningEffort: "max" },
+      unrelated,
+      remote,
+      unscoped,
+    ];
+    const { props, reconcile } = mounted(rows);
+    reconcile(["low", "high", "max"]);
+    expect(props.powerSelections).toEqual([
+      rows[0],
+      rows[1],
+      unrelated,
+      remote,
+      unscoped,
+    ]);
+    reconcile([]);
+    expect(props.powerSelections).toBe(rows);
+  });
+  it("does not borrow another model's effort as an existing owned selection", () => {
+    const other = { model: "other", reasoningEffort: "high" };
+    const { props, reconcile } = mounted([
+      { model: "fixture", reasoningEffort: "low" },
+      other,
+    ]);
+    reconcile(["low", "high", "max"]);
+    expect(
+      props.powerSelections
+        .filter((row) => row.model === "fixture")
+        .map((row) => row.reasoningEffort),
+    ).toEqual(["low", "high"]);
+    expect(props.powerSelections).toContain(other);
+  });
+  it("does not mutate a selected candidate explicitly owned by another provider", () => {
+    const rows = [
+      { model: "fixture", reasoningEffort: "low" },
+      { model: "fixture", reasoningEffort: "max" },
+    ];
+    const { props, reconcile } = mounted(rows, {
+      model: "fixture",
+      modelProvider: "unrelated_provider",
+      reasoningEffort: "max",
+    });
+    reconcile(["low", "high", "max"]);
+    expect(props.powerSelections).toBe(rows);
+  });
+  it("restores the original native array after more than one canonical narrowing", () => {
+    const rows = [
+      { model: "fixture", reasoningEffort: "low" },
+      { model: "fixture", reasoningEffort: "high" },
+      { model: "fixture", reasoningEffort: "max" },
+    ];
+    const { state, props, reconcile } = mounted(rows);
+    reconcile(["low", "high", "max"]);
+    expect(props.powerSelections.map((row) => row.reasoningEffort)).toEqual([
+      "low",
+      "high",
+    ]);
+    state.payload!.models![0]!.supported_reasoning_levels = ["high"];
+    reconcile(["high", "max"]);
+    expect(props.powerSelections.map((row) => row.reasoningEffort)).toEqual([
+      "high",
+    ]);
+    reconcile([]);
+    expect(props.powerSelections).toBe(rows);
+  });
+  it("leaves ambiguous canonical model identities untouched", () => {
+    const rows = [{ model: "fixture", reasoningEffort: "max" }];
+    const { state, props, reconcile } = mounted(rows);
+    state.payload!.models!.push({
+      model: "fixture",
+      supported_reasoning_levels: ["max"],
+    });
+    reconcile(["low", "high", "max"]);
+    expect(props.powerSelections).toBe(rows);
+  });
+  it("does not invoke accessor provider identities to authorize a mutation", () => {
+    const getter = vi.fn(() => "codex_model_router_v2");
+    const candidate = Object.defineProperty(
+      { model: "fixture", reasoningEffort: "max" },
+      "modelProvider",
+      { get: getter },
+    );
+    const rows = [{ model: "fixture", reasoningEffort: "max" }];
+    const { props, reconcile } = mounted(rows, candidate);
+    reconcile(["low", "high", "max"]);
+    expect(props.powerSelections).toBe(rows);
+    expect(getter).not.toHaveBeenCalled();
+  });
+  it.each(["budget", "none", "unknown"])(
+    "prunes stale same-model graded options after transition to %s without inventing replacements",
+    (controlKind) => {
+      const foreign = { model: "other", reasoningEffort: "max" };
+      const rows = [
+        { model: "fixture", reasoningEffort: "low" },
+        { model: "fixture", reasoningEffort: "high" },
+        foreign,
+      ];
+      const { state, props, reconcile } = mounted(rows);
+      state.payload!.models![0] = {
+        model: "fixture",
+        supported_reasoning_levels: [],
+        reasoning: { controlKind },
+      };
+      reconcile(["max"]);
+      expect(props.powerSelections).toEqual([foreign]);
+      reconcile([]);
+      expect(props.powerSelections).toBe(rows);
+    },
+  );
+  it("preserves canonical Boolean aliases while removing a stale graded option", () => {
+    const rows = [
+      { model: "fixture", reasoningEffort: "none" },
+      { model: "fixture", reasoningEffort: "medium" },
+      { model: "fixture", reasoningEffort: "high" },
+    ];
+    const { state, props, reconcile } = mounted(rows, {
+      model: "fixture",
+      reasoningEffort: "medium",
+    });
+    state.payload!.models![0] = {
+      model: "fixture",
+      supported_reasoning_levels: [],
+      ccSwitchReasoningControl: {
+        kind: "boolean",
+        disableAllowed: true,
+        fingerprint: "boolean-fixture",
+      },
+    };
+    reconcile(["max"]);
+    expect(props.powerSelections).toEqual([rows[0], rows[1]]);
+    expect(
+      props.powerSelections
+        .filter((row) => row.model === "fixture")
+        .map((row) => row.reasoningEffort),
+    ).toEqual(["none", "medium"]);
+  });
+  it("does not fabricate Boolean aliases from another model's graded medium visibility", () => {
+    const rows: Record<string, unknown>[] = [];
+    const { state, props, reconcile } = mounted(rows, {
+      model: "fixture",
+      reasoningEffort: "medium",
+    });
+    state.payload!.models![0] = {
+      model: "fixture",
+      supported_reasoning_levels: [],
+      ccSwitchReasoningControl: {
+        kind: "boolean",
+        disableAllowed: true,
+        fingerprint: "boolean-fixture",
+      },
+    };
+    state.payload!.models![1]!.supported_reasoning_levels = ["medium", "max"];
+    reconcile(["medium", "max"]);
+    expect(props.powerSelections).toBe(rows);
+    expect(props.powerSelections).toEqual([]);
+  });
 });

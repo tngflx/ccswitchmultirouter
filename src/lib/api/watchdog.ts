@@ -10,7 +10,12 @@ export interface WatchdogEventRecord {
 
 /** 设置页“看门狗与端口自检”面板的数据。 */
 export interface WatchdogStatus {
+  /** Effective recovery policy for the current owner. */
   enabled: boolean;
+  /** Saved switch; optional while an older native process is still running. */
+  configuredEnabled?: boolean;
+  /** Explicit pnpm-dev environment policy, not another persisted setting. */
+  enabledOverride?: boolean | null;
   supervisorMode?: "rust" | "pnpm-dev";
   appPid: number;
   supervisorPid?: number | null;

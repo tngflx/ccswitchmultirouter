@@ -116,6 +116,15 @@ clearTimeout(hardStop);
       restartTimesMs: [],
       roots: [],
     };
+    // A recovery claim must read the real canonical record; the former helper
+    // implicitly created one from the caller snapshot. Seed an owned dead
+    // generation and exercise the default reader and real absence probe.
+    assert.equal(
+      processExists(supervisorPid),
+      false,
+      "the fixture's previous owner must be absent",
+    );
+    writeFileSync(markerPath, JSON.stringify(session));
     const events = [];
     const result = await handoffDetachedDevSupervisor({
       supervisorPid,

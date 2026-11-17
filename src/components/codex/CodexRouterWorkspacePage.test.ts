@@ -11,7 +11,10 @@ import userEvent from "@testing-library/user-event";
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { providersApi } from "@/lib/api";
-import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
+import {
+  codexSubagentV2Api,
+  type CodexSubagentV2MutationProvider,
+} from "@/lib/api/codexSubagentV2";
 import { readIncludedCodexModelCatalog } from "@/utils/codexSpawnAgentCandidates";
 import {
   fetchCodexOfficialFallbackModels,
@@ -30,7 +33,10 @@ import type {
   Provider,
 } from "@/types";
 import type { ModelStats, PaginatedLogs, RequestLog } from "@/types/usage";
-import type { RequestHealthSnapshot } from "@/types/proxy";
+import type {
+  CodexMultiRouterDiagnostics,
+  RequestHealthSnapshot,
+} from "@/types/proxy";
 import type { CodexModelReasoningResolution } from "@/types/codexSubagentV2";
 import {
   applyMultiRouterSettingsDraft,
@@ -124,6 +130,7 @@ vi.mock("@/lib/api", () => ({
   providersApi: {
     add: vi.fn(),
     update: vi.fn(),
+    updateCodexSubagentPolicy: vi.fn(),
     getAll: vi.fn(),
     inspectCodexMultiRouterProjection: vi.fn(),
     retryCodexMultiRouterProjection: vi.fn(),
@@ -166,7 +173,8 @@ vi.mock("@/lib/api/codexEgressTimezone", () => ({
   },
 }));
 
-vi.mock("@/lib/api/codexSubagentV2", () => ({
+vi.mock("@/lib/api/codexSubagentV2", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api/codexSubagentV2")>()),
   codexSubagentV2Api: {
     resolveModelReasoningCapability: vi.fn(),
     getReasoningCapabilities: vi.fn().mockResolvedValue({
@@ -198,7 +206,9 @@ vi.mock("@/lib/api/codexSubagentV2", () => ({
       providerKind: "third_party",
       requestedRoleName: "deepseek-v4-flash",
       effectiveRoleName: "deepseek-v4-flash",
+      editableDescription: "Flash profile",
       description: "Flash profile",
+      editableDeveloperInstructions: "Read only",
       developerInstructions: "Read only",
       nicknameCandidates: ["Flash"],
       model: "deepseek-v4-flash",
@@ -608,14 +618,283 @@ describe("Model order real drag sensors", () => {
         onDeletePlan: vi.fn(),
         onCreateProvider: vi.fn(),
       });
+    const initialElement = elementFor([source, plan]);
     return {
       source,
       plan,
       snapshot,
       elementFor,
-      rendered: renderWorkspace(elementFor([source, plan])),
+      initialElement,
+      rendered: renderWorkspace(initialElement),
     };
   }
+
+  describe("Model order save ownership", () => {
+    it.each(["resolve", "reject"] as const)(
+      "isolates an old plan save %s from the current plan and its draft",
+      async (outcome) => {
+        const saving = createDeferred<boolean>();
+        vi.mocked(providersApi.update).mockReturnValueOnce(saving.promise);
+        const { source, plan, elementFor, rendered } = renderModelOrder();
+        await userEvent.selectOptions(
+          screen.getByRole("combobox", { name: "Model display" }),
+          "model",
+        );
+        await userEvent.click(
+          screen.getByRole("button", { name: "Save order" }),
+        );
+        await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+        const nextPlan: Provider = {
+          ...plan,
+          id: "next-order-plan",
+          name: "Next ordering plan",
+          settingsConfig: {
+            ...plan.settingsConfig,
+            codexRouting: {
+              ...plan.settingsConfig.codexRouting,
+              modelOrder: ["order-c", "order-b", "order-a"],
+            },
+          },
+        };
+        rendered.rerenderWorkspace(elementFor([source, nextPlan]));
+        await waitFor(() =>
+          expect(modelOrder()).toEqual(["order-c", "order-b", "order-a"]),
+        );
+        expect(
+          screen.getByRole("combobox", { name: "Model display" }),
+        ).toBeEnabled();
+        await userEvent.selectOptions(
+          screen.getByRole("combobox", { name: "Model display" }),
+          "model-provider",
+        );
+        await act(async () => {
+          if (outcome === "resolve") saving.resolve(true);
+          else saving.reject(new Error("old ordering save failed"));
+          await saving.promise.catch(() => undefined);
+        });
+        expect(modelOrder()).toEqual(["order-c", "order-b", "order-a"]);
+        expect(
+          screen.getByRole("combobox", { name: "Model display" }),
+        ).toHaveValue("model-provider");
+        expect(
+          screen.getByRole("button", { name: "Save order" }),
+        ).toBeEnabled();
+        expect(
+          screen.queryByText(/old ordering save failed/),
+        ).not.toBeInTheDocument();
+        expect(
+          screen.queryByText(/Saved the display order/),
+        ).not.toBeInTheDocument();
+        expect(
+          providersApi.inspectCodexMultiRouterProjection,
+        ).not.toHaveBeenCalled();
+      },
+    );
+
+    it("does not write a captured plan after canonical replacement during reasoning preflight", async () => {
+      const reasoning = createDeferred<CodexModelReasoningResolution>();
+      vi.mocked(
+        codexSubagentV2Api.resolveModelReasoningCapability,
+      ).mockReturnValue(reasoning.promise);
+      const { source, plan, elementFor, rendered } = renderModelOrder();
+      await waitFor(() =>
+        expect(
+          codexSubagentV2Api.resolveModelReasoningCapability,
+        ).toHaveBeenCalled(),
+      );
+      await userEvent.selectOptions(
+        screen.getByRole("combobox", { name: "Model display" }),
+        "model",
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Save order" }));
+      expect(providersApi.update).not.toHaveBeenCalled();
+      const replacement: Provider = {
+        ...plan,
+        settingsConfig: {
+          ...plan.settingsConfig,
+          config: 'model = "order-b"\n',
+          codexRouting: {
+            ...plan.settingsConfig.codexRouting,
+            modelDisplayStyle: "model-provider",
+          },
+        },
+      };
+      rendered.rerenderWorkspace(elementFor([source, replacement]));
+      await waitFor(() =>
+        expect(
+          screen.getByRole("combobox", { name: "Model display" }),
+        ).toHaveValue("model-provider"),
+      );
+      await act(async () => {
+        reasoning.resolve(
+          modelReasoningResolution("order-a", ["high", "max"], "max"),
+        );
+        await reasoning.promise;
+      });
+      expect(providersApi.update).not.toHaveBeenCalled();
+      expect(
+        screen.getByRole("combobox", { name: "Model display" }),
+      ).toHaveValue("model-provider");
+      expect(
+        screen.getByRole("combobox", { name: "Model display" }),
+      ).toBeEnabled();
+      expect(
+        screen.queryByText(/Saved the display order/),
+      ).not.toBeInTheDocument();
+    });
+
+    it.each(["hide", "restore"] as const)(
+      "isolates an old source %s completion and requires source compare-and-set",
+      async (action) => {
+        vi.spyOn(window, "confirm").mockReturnValue(true);
+        const saving = createDeferred<boolean>();
+        vi.mocked(providersApi.update).mockReturnValueOnce(saving.promise);
+        const { source, plan, elementFor, rendered } = renderModelOrder({
+          models: [
+            { model: "order-a" },
+            {
+              model: "order-b",
+              ...(action === "restore" ? { enabled: false } : {}),
+            },
+          ],
+        });
+        if (action === "restore") {
+          await userEvent.click(screen.getByText(/Hidden models \(1\)/));
+          await userEvent.click(
+            screen.getByRole("button", { name: "Restore" }),
+          );
+        } else {
+          await userEvent.click(
+            screen.getByRole("button", { name: "Remove order-a" }),
+          );
+        }
+        await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+        const nextPlan = {
+          ...plan,
+          id: "next-order-plan",
+          name: "Next ordering plan",
+        };
+        rendered.rerenderWorkspace(elementFor([source, nextPlan]));
+        await act(async () => {
+          saving.resolve(true);
+          await saving.promise;
+        });
+        expect(modelOrder()).toContain("order-a");
+        expect(
+          screen.queryByText(/Hidden order-a;|Restored order-b;/),
+        ).not.toBeInTheDocument();
+        expect(
+          screen.getByRole("combobox", { name: "Model display" }),
+        ).toBeEnabled();
+        expect(providersApi.update).toHaveBeenCalledWith(
+          expect.objectContaining({ id: source.id }),
+          "codex",
+          undefined,
+          source,
+        );
+      },
+    );
+
+    it("does not repeat full mutation-context serialization for drag or unrelated parent renders", async () => {
+      const { plan, initialElement, rendered } = renderModelOrder();
+      await waitFor(() =>
+        expect(
+          codexSubagentV2Api.resolveModelReasoningCapability,
+        ).toHaveBeenCalled(),
+      );
+      const serialization = vi.spyOn(JSON, "stringify");
+      try {
+        await userEvent.click(
+          screen.getByRole("button", {
+            name: "Make order-b the favorite model",
+          }),
+        );
+        rendered.rerenderWorkspace(
+          React.cloneElement(initialElement, { isProxyRunning: false }),
+        );
+        const fullContexts = serialization.mock.calls.filter(
+          ([value]) =>
+            Array.isArray(value) &&
+            value.length === 3 &&
+            value[0]?.id === plan.id &&
+            Array.isArray(value[1]?.models) &&
+            Array.isArray(value[2]) &&
+            Array.isArray(value[2][0]) &&
+            value[2][0][0]?.targetProviderId,
+        );
+        expect(fullContexts).toHaveLength(0);
+      } finally {
+        serialization.mockRestore();
+      }
+    });
+
+    it("uses the canonical provider snapshot as a compare-and-set precondition", async () => {
+      const { plan } = renderModelOrder();
+      await userEvent.selectOptions(
+        screen.getByRole("combobox", { name: "Model display" }),
+        "model",
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Save order" }));
+      await screen.findByText(/Saved the display order for 3 models/);
+      expect(providersApi.update).toHaveBeenCalledWith(
+        expect.objectContaining({ id: plan.id }),
+        "codex",
+        undefined,
+        plan,
+      );
+    });
+
+    it("does not finish a newer plan mutation when the old save completes", async () => {
+      const first = createDeferred<boolean>();
+      const second = createDeferred<boolean>();
+      vi.mocked(providersApi.update)
+        .mockReturnValueOnce(first.promise)
+        .mockReturnValueOnce(second.promise);
+      const { source, plan, elementFor, rendered } = renderModelOrder();
+      await userEvent.selectOptions(
+        screen.getByRole("combobox", { name: "Model display" }),
+        "model",
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Save order" }));
+      await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+      const nextPlan = {
+        ...plan,
+        id: "next-order-plan",
+        name: "Next ordering plan",
+      };
+      rendered.rerenderWorkspace(elementFor([source, nextPlan]));
+      await waitFor(() =>
+        expect(
+          screen.getByRole("combobox", { name: "Model display" }),
+        ).toBeEnabled(),
+      );
+      await userEvent.selectOptions(
+        screen.getByRole("combobox", { name: "Model display" }),
+        "model-provider",
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Save order" }));
+      await waitFor(() => expect(providersApi.update).toHaveBeenCalledTimes(2));
+      await act(async () => {
+        first.resolve(true);
+        await first.promise;
+      });
+      expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+      expect(
+        screen.getByRole("combobox", { name: "Model display" }),
+      ).toBeDisabled();
+      expect(
+        screen.queryByText(/Saved the display order/),
+      ).not.toBeInTheDocument();
+      await act(async () => {
+        second.resolve(true);
+        await second.promise;
+      });
+      await screen.findByText(/Saved the display order for 3 models/);
+      expect(
+        screen.getByRole("combobox", { name: "Model display" }),
+      ).toHaveValue("model-provider");
+    });
+  });
 
   it("top-aligns all model-order controls independently of the wrapped effort hint", async () => {
     renderModelOrder({
@@ -705,6 +984,8 @@ describe("Model order real drag sensors", () => {
           }),
         }),
         "codex",
+        undefined,
+        plan,
       );
     });
     const expected = vi.mocked(providersApi.update).mock.calls[0][0];
@@ -747,6 +1028,82 @@ describe("Model order real drag sensors", () => {
     );
     expect(providersApi.update).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Save order" })).toBeEnabled();
+  });
+
+  it("keeps route-owned provider blocks when ranking a later provider model to global rank one", async () => {
+    const first: Provider = {
+      id: "primary-provider",
+      name: "Same provider label",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: { models: [{ model: "a-one" }, { model: "a-two" }] },
+      },
+    };
+    const second: Provider = {
+      id: "secondary-provider",
+      name: "Same provider label",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: { models: [{ model: "b-one" }, { model: "b-two" }] },
+      },
+    };
+    const base = createDraftRoutingPlan([first, second], [first, second]);
+    const routePlans = [first, second].map((provider) =>
+      withEnabledProviderRoute(base, provider),
+    );
+    const routes = routePlans.map((routePlan, index) => ({
+      ...routePlan.settingsConfig.codexRouting.routes[0],
+      id: "group-route-" + index,
+    }));
+    const plan = {
+      ...base,
+      settingsConfig: {
+        ...base.settingsConfig,
+        codexRouting: {
+          ...base.settingsConfig.codexRouting,
+          schemaVersion: 2,
+          enabled: true,
+          defaultRouteId: routes[0].id,
+          routes,
+        },
+      },
+    };
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [first, second, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "model-order",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+    expect(modelOrder()).toEqual(["a-one", "a-two", "b-one", "b-two"]);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Make b-two the favorite model" }),
+    );
+    expect(modelOrder()).toEqual(["a-one", "a-two", "b-two", "b-one"]);
+    await userEvent.click(screen.getByRole("button", { name: "Save order" }));
+    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.settingsConfig.codexRouting.modelOrder).toEqual([
+      "a-one",
+      "a-two",
+      "b-two",
+      "b-one",
+    ]);
+    expect(saved.settingsConfig.config).toMatch(/^model = "a-one"/m);
+    expect(first.settingsConfig.modelCatalog.models).toEqual([
+      { model: "a-one" },
+      { model: "a-two" },
+    ]);
+    expect(second.settingsConfig.modelCatalog.models).toEqual([
+      { model: "b-one" },
+      { model: "b-two" },
+    ]);
   });
 
   it("reconciles stale route references when saving model order after catalog changes", async () => {
@@ -1587,6 +1944,142 @@ describe("Model order real drag sensors", () => {
     expect(saved.settingsConfig.codexRouting.modelOrder).toBeUndefined();
   });
 
+  it("requires saving a no-default high fallback before treating it as the active picker preference", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, _provider, model) => {
+      const resolution = modelReasoningResolution(model, [
+        "max",
+        "low",
+        "high",
+      ]);
+      return {
+        ...resolution,
+        resolved: { ...resolution.resolved, providerDefaultEffort: null },
+      };
+    });
+    const { source, plan, snapshot, elementFor, rendered } = renderModelOrder({
+      models: [{ model: "order-a" }],
+      config: 'model = "order-a"\nmodel_reasoning_effort = "max"\n',
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Top model default effort" }),
+      ).toHaveValue("high"),
+    );
+    expect(screen.getByRole("button", { name: "Save order" })).toBeEnabled();
+    expect(providersApi.update).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Save order" }));
+    await screen.findByText(/Saved the display order for 1 models/);
+    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(saved.settingsConfig.codexRouting.defaultReasoningEffort).toBe(
+      "high",
+    );
+    expect(saved.settingsConfig.codexRouting.modelOrder).toBeUndefined();
+    expect(saved.settingsConfig.config).toBe(plan.settingsConfig.config);
+    expect(saved.settingsConfig.modelCatalog).toBeUndefined();
+    expect(providersApi.inspectCodexMultiRouterProjection).toHaveBeenCalledWith(
+      plan.id,
+    );
+    expect(JSON.stringify({ source, plan })).toBe(snapshot);
+    rendered.unmount();
+    renderWorkspace(elementFor([source, saved]));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Top model default effort" }),
+      ).toHaveValue("high"),
+    );
+    expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+  });
+
+  it.each([
+    {
+      name: "uses high when no provider default is declared even if max is listed first",
+      efforts: ["max", "low", "high"],
+      providerDefault: null,
+      savedDefault: undefined,
+      expected: "high",
+    },
+    {
+      name: "preserves the provider-declared default ahead of the high fallback",
+      efforts: ["max", "low", "high"],
+      providerDefault: "low",
+      savedDefault: undefined,
+      expected: "low",
+    },
+    {
+      name: "preserves an explicit saved max override instead of silently lowering it",
+      efforts: ["max", "low", "high"],
+      providerDefault: "low",
+      savedDefault: "max",
+      expected: "max",
+    },
+    {
+      name: "does not invent high when the current provider does not support it",
+      efforts: ["minimal", "medium"],
+      providerDefault: null,
+      savedDefault: undefined,
+      expected: "minimal",
+    },
+  ] as const)(
+    "$name through model-order save and reload",
+    async ({ efforts, providerDefault, savedDefault, expected }) => {
+      vi.mocked(
+        codexSubagentV2Api.resolveModelReasoningCapability,
+      ).mockImplementation(async (_settings, _provider, model) => {
+        const resolution = modelReasoningResolution(model, [...efforts]);
+        return {
+          ...resolution,
+          resolved: {
+            ...resolution.resolved,
+            providerDefaultEffort: providerDefault,
+          },
+        };
+      });
+      const { source, plan, snapshot, elementFor, rendered } = renderModelOrder(
+        {
+          models: [{ model: "order-a" }, { model: "order-b" }],
+          routing: savedDefault
+            ? { defaultReasoningEffort: savedDefault }
+            : undefined,
+          config: 'model = "order-a"\nmodel_reasoning_effort = "max"\n',
+        },
+      );
+      const effort = screen.getByRole("combobox", {
+        name: "Top model default effort",
+      });
+      await waitFor(() => expect(effort).toHaveValue(expected));
+      expect(
+        within(effort)
+          .getAllByRole("option")
+          .map((option) => option.getAttribute("value")),
+      ).toEqual(efforts);
+      const user = userEvent.setup();
+      await user.click(
+        screen.getByRole("button", { name: "Make order-b the favorite model" }),
+      );
+      await waitFor(() => expect(effort).toHaveValue(expected));
+      await user.click(screen.getByRole("button", { name: "Save order" }));
+      await screen.findByText(/Saved the display order for 2 models/);
+      const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+      expect(saved.settingsConfig.codexRouting).toMatchObject({
+        modelOrder: ["order-b", "order-a"],
+        defaultReasoningEffort: expected,
+      });
+      expect(saved.settingsConfig.config).toBe('model = "order-b"\n');
+      expect(saved.settingsConfig.modelCatalog).toBeUndefined();
+      expect(JSON.stringify({ source, plan })).toBe(snapshot);
+      rendered.unmount();
+      renderWorkspace(elementFor([source, saved]));
+      await waitFor(() =>
+        expect(
+          screen.getByRole("combobox", { name: "Top model default effort" }),
+        ).toHaveValue(expected),
+      );
+      expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+    },
+  );
+
   it.each([
     "catalog product setting",
     "capability orchestration",
@@ -1947,7 +2440,7 @@ describe("Model order real drag sensors", () => {
         codexRouting: {
           ...draft.settingsConfig.codexRouting,
           modelOrder: ["sol-relay", "shared-wire"],
-          routes: providers.map((provider, index) =>
+          routes: [second, first].map((provider, index) =>
             serializeCodexRouteV2(
               normalizeCodexRouteForSave(
                 {
@@ -2338,6 +2831,138 @@ describe("Model order real drag sensors", () => {
     ).not.toBeInTheDocument();
   });
 
+  it.each(["provider", "detection"] as const)(
+    "resolves current canonical capability instead of suppressing stale %s on/off metadata",
+    async (source) => {
+      vi.mocked(
+        codexSubagentV2Api.resolveModelReasoningCapability,
+      ).mockImplementation(async (_settings, _provider, model) =>
+        modelReasoningResolution(model, ["medium", "high"], "high"),
+      );
+      renderModelOrder({
+        models: [
+          {
+            model: "automatic-model",
+            reasoning: {
+              ...reasoning([], "high"),
+              defaultEffort: undefined,
+              controlKind: "boolean",
+              source,
+              upstream: { format: "boolean", parameter: "reasoning.enabled" },
+            },
+          },
+        ],
+      });
+      const effort = screen.getByRole("combobox", {
+        name: "Top model default effort",
+      });
+      await waitFor(() => expect(effort).toHaveValue("high"));
+      expect(
+        within(effort)
+          .getAllByRole("option")
+          .map((option) => option.getAttribute("value")),
+      ).toEqual(["medium", "high"]);
+      expect(
+        codexSubagentV2Api.resolveModelReasoningCapability,
+      ).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    [
+      "boolean",
+      "confirmed_supported",
+      true,
+      "On/off reasoning (no effort levels)",
+    ],
+    [
+      "boolean",
+      "confirmed_supported",
+      false,
+      "Reasoning always on (no effort levels)",
+    ],
+    [
+      "budget",
+      "confirmed_supported",
+      false,
+      "Token-budget reasoning (no effort levels)",
+    ],
+    [
+      "none",
+      "confirmed_supported",
+      false,
+      "Reasoning supported (no adjustable levels)",
+    ],
+    ["none", "confirmed_unsupported", false, "Reasoning is not supported"],
+  ] as const)(
+    "explains %s reasoning with %s support instead of displaying unknown metadata",
+    async (controlKind, supportStatus, disableAllowed, label) => {
+      renderModelOrder({
+        models: [
+          {
+            model: "xiaomi/mimo-v2.6-flash",
+            reasoning: {
+              ...reasoning([], "high"),
+              defaultEffort: undefined,
+              controlKind,
+              supportStatus,
+              disableAllowed,
+              source: "user",
+              upstream: { format: "none", parameter: "none" },
+            },
+          },
+        ],
+      });
+      const effort = screen.getByRole("combobox", {
+        name: "Top model default effort",
+      });
+      expect(effort).toBeDisabled();
+      expect(
+        within(effort).getByRole("option", { selected: true }),
+      ).toHaveTextContent(label);
+      expect(within(effort).getAllByRole("option")).toHaveLength(1);
+      expect(
+        codexSubagentV2Api.resolveModelReasoningCapability,
+      ).not.toHaveBeenCalled();
+    },
+  );
+
+  it("shows a resolved automatic on/off control without inventing native effort tiers", async () => {
+    vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).mockImplementation(async (_settings, _provider, model) => ({
+      ...modelReasoningResolution(model),
+      source: "detection",
+      capability: {
+        schemaVersion: 2,
+        supportStatus: "confirmed_supported",
+        controlKind: "boolean",
+        supportedEfforts: [],
+        disableAllowed: true,
+        upstream: { format: "boolean", parameter: "reasoning.enabled" },
+      },
+      resolved: {
+        ...modelReasoningResolution(model).resolved,
+        supportKind: "boolean_only",
+        disableAllowed: true,
+      },
+    }));
+    renderModelOrder({ models: [{ model: "xiaomi/mimo-v2.6-flash" }] });
+    const effort = screen.getByRole("combobox", {
+      name: "Top model default effort",
+    });
+    await waitFor(() =>
+      expect(
+        within(effort).getByRole("option", { selected: true }),
+      ).toHaveTextContent("On/off reasoning (no effort levels)"),
+    );
+    expect(effort).toBeDisabled();
+    expect(within(effort).getAllByRole("option")).toHaveLength(1);
+    expect(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    ).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["confirmed_unsupported", "boolean", "empty"] as const)(
     "does not override an explicit %s declaration with inferred tiers",
     async (kind) => {
@@ -2461,15 +3086,15 @@ describe("Model order presentation helpers", () => {
     { model: "b", providerName: "Alpha" },
     { model: "a", providerName: "Alpha" },
   ];
-  it("groups providers stably and sorts models only in the requested mode", () => {
+  it("keeps source provider blocks and sorts only inside each requested block", () => {
     expect(
       sortCodexCatalogModels(models, "provider").map((model) => model.model),
-    ).toEqual(["b", "a", "z"]);
+    ).toEqual(["z", "b", "a"]);
     expect(
       sortCodexCatalogModels(models, "provider-model").map(
         (model) => model.model,
       ),
-    ).toEqual(["a", "b", "z"]);
+    ).toEqual(["z", "a", "b"]);
     expect(sortCodexCatalogModels(models, "custom")).toEqual(models);
   });
   it("formats the three picker styles without double provider prefixes", () => {
@@ -5606,6 +6231,22 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
   });
 
+  function confirmedSubagentMutation(
+    provider: Provider,
+    status: "applied" | "not_required" | "pending_retry" = "not_required",
+  ): CodexSubagentV2MutationProvider {
+    return {
+      ...provider,
+      projection: { status },
+      verification: {
+        databasePersisted: true,
+        roleFilesStatus: status === "applied" ? "verified" : status,
+        roleFiles: [],
+        activation: "restart_codex_and_start_new_session",
+      },
+    };
+  }
+
   function createSubagentWorkspaceFixture() {
     const source: Provider = {
       id: "codex-deepseek",
@@ -5661,6 +6302,17 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         },
       },
     };
+    vi.mocked(providersApi.updateCodexSubagentPolicy).mockImplementation(
+      async (providerId, patch) =>
+        confirmedSubagentMutation({
+          ...plan,
+          id: providerId,
+          settingsConfig: {
+            ...plan.settingsConfig,
+            codexRouting: { ...plan.settingsConfig.codexRouting, ...patch },
+          },
+        }),
+    );
     return { source, plan };
   }
 
@@ -5761,6 +6413,20 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         );
       }
 
+      if (action === "candidates" || action === "protocol") {
+        await waitFor(() =>
+          expect(providersApi.updateCodexSubagentPolicy).toHaveBeenCalledOnce(),
+        );
+        expect(providersApi.updateCodexSubagentPolicy).toHaveBeenCalledWith(
+          plan.id,
+          action === "protocol"
+            ? { subagentVersion: "v1" }
+            : { spawnAgentModels: [] },
+        );
+        expect(providersApi.update).not.toHaveBeenCalled();
+        expect(JSON.stringify({ source, plan })).toBe(snapshot);
+        return;
+      }
       await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
       const saved = vi.mocked(providersApi.update).mock.calls[0][0];
       const routing = saved.settingsConfig.codexRouting;
@@ -5865,6 +6531,342 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     ).toBeInTheDocument();
   });
 
+  it.each(["v1", "v2"] as const)(
+    "projects a saved plan with omitted %s reasoning override as High without rewriting it",
+    async (version) => {
+      const { source, plan } = createSubagentWorkspaceFixture();
+      plan.settingsConfig.codexRouting.subagentVersion = version;
+      delete plan.settingsConfig.codexRouting.subagentReasoningEffort;
+      const original = JSON.stringify(plan);
+      await act(async () => {
+        renderWorkspace(subagentWorkspaceElement(source, plan));
+      });
+      expect(
+        screen.getByRole("combobox", {
+          name: "All Sub-Agent reasoning effort",
+        }),
+      ).toHaveValue("high");
+      expect(providersApi.updateCodexSubagentPolicy).not.toHaveBeenCalled();
+      expect(JSON.stringify(plan)).toBe(original);
+    },
+  );
+
+  it.each(["v1", "v2"] as const)(
+    "exposes only Max and High as new Sub-Agent effort choices in %s",
+    (version) => {
+      const { source, plan } = createSubagentWorkspaceFixture();
+      plan.settingsConfig.codexRouting.subagentVersion = version;
+      renderWorkspace(subagentWorkspaceElement(source, plan));
+      const effort = screen.getByRole("combobox", {
+        name: "All Sub-Agent reasoning effort",
+      });
+      expect(
+        within(effort)
+          .getAllByRole("option")
+          .filter((option) => !(option as HTMLOptionElement).disabled)
+          .map((option) => (option as HTMLOptionElement).value),
+      ).toEqual(["profile", "high", "max"]);
+      expect(providersApi.updateCodexSubagentPolicy).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["none", "minimal", "low", "medium", "xhigh", "ultra"] as const)(
+    "preserves legacy saved Sub-Agent %s without offering it as a new choice",
+    async (legacyEffort) => {
+      const { source, plan } = createSubagentWorkspaceFixture();
+      plan.settingsConfig.codexRouting.subagentReasoningEffort = legacyEffort;
+      const original = JSON.stringify(plan);
+      renderWorkspace(subagentWorkspaceElement(source, plan));
+      const effort = screen.getByRole("combobox", {
+        name: "All Sub-Agent reasoning effort",
+      });
+      expect(effort).toHaveValue(legacyEffort);
+      const savedOption = within(effort)
+        .getAllByRole("option")
+        .find((option) => (option as HTMLOptionElement).value === legacyEffort);
+      expect(savedOption).toBeDisabled();
+      expect(providersApi.updateCodexSubagentPolicy).not.toHaveBeenCalled();
+      await userEvent.selectOptions(effort, "max");
+      await waitFor(() => expect(effort).toHaveValue("max"));
+      expect(providersApi.updateCodexSubagentPolicy).toHaveBeenLastCalledWith(
+        plan.id,
+        { subagentReasoningEffort: "max" },
+      );
+      expect(JSON.stringify(plan)).toBe(original);
+    },
+  );
+
+  it.each(["v1", "v2"] as const)(
+    "toggles only Sub-Agent reasoning high, max, and profile settings in %s without rewriting profiles",
+    async (version) => {
+      const { source, plan } = createSubagentWorkspaceFixture();
+      plan.settingsConfig.codexRouting = {
+        ...plan.settingsConfig.codexRouting,
+        subagentVersion: version,
+        subagentReasoningEffort: "high",
+        defaultReasoningEffort: "xhigh",
+      };
+      const original = JSON.stringify(plan);
+      renderWorkspace(subagentWorkspaceElement(source, plan));
+      const user = userEvent.setup();
+      const effort = screen.getByRole("combobox", {
+        name: "All Sub-Agent reasoning effort",
+      });
+      expect(effort).toHaveValue("high");
+
+      const efforts = ["max", "high", "profile"] as const;
+      for (const value of efforts) {
+        await user.selectOptions(effort, value);
+        await waitFor(() => expect(effort).toHaveValue(value));
+        expect(providersApi.updateCodexSubagentPolicy).toHaveBeenLastCalledWith(
+          plan.id,
+          { subagentReasoningEffort: value },
+        );
+        expect(JSON.stringify(plan)).toBe(original);
+      }
+      expect(providersApi.updateCodexSubagentPolicy).toHaveBeenCalledTimes(
+        efforts.length,
+      );
+      expect(providersApi.update).not.toHaveBeenCalled();
+      expect(
+        screen.getByText(
+          /Saved profile choices and the main agent stay unchanged/,
+        ),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          /restart Codex Desktop\/app-server and create a new session/i,
+        ),
+      ).toBeInTheDocument();
+    },
+  );
+
+  it("preserves the Sub-Agent reasoning choice when reading and saving unrelated plan settings", () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    plan.settingsConfig.codexRouting.subagentReasoningEffort = "high";
+    expect(readCodexRouting(plan)?.subagentReasoningEffort).toBe("high");
+    const saved = applyMultiRouterSettingsDraft(
+      reconcileCodexRoutingPlanForSave(
+        plan,
+        new Map([
+          [source.id, source],
+          [plan.id, plan],
+        ]),
+      ),
+      {
+        name: plan.name,
+        notes: "",
+        enabled: true,
+        hostedTools: { webSearch: false, imageGeneration: false },
+      },
+    );
+    expect(saved.settingsConfig.codexRouting.subagentReasoningEffort).toBe(
+      "high",
+    );
+  });
+
+  it.each(["profile", "high", "max"] as const)(
+    "reloads the explicit saved all-Sub-Agent %s choice after remount",
+    (effort) => {
+      const { source, plan } = createSubagentWorkspaceFixture();
+      plan.settingsConfig.codexRouting.subagentReasoningEffort = effort;
+      const view = renderWorkspace(subagentWorkspaceElement(source, plan));
+      expect(
+        screen.getByRole("combobox", {
+          name: "All Sub-Agent reasoning effort",
+        }),
+      ).toHaveValue(effort);
+      view.unmount();
+      renderWorkspace(subagentWorkspaceElement(source, plan));
+      expect(
+        screen.getByRole("combobox", {
+          name: "All Sub-Agent reasoning effort",
+        }),
+      ).toHaveValue(effort);
+    },
+  );
+
+  it.each(["resolve", "reject"] as const)(
+    "isolates a late Sub-Agent reasoning %s from a newly selected plan",
+    async (outcome) => {
+      const { source, plan } = createSubagentWorkspaceFixture();
+      plan.settingsConfig.codexRouting.subagentReasoningEffort = "profile";
+      const saving = createDeferred<Provider>();
+      vi.mocked(providersApi.updateCodexSubagentPolicy).mockReturnValueOnce(
+        saving.promise,
+      );
+      const view = renderWorkspace(subagentWorkspaceElement(source, plan));
+      await userEvent.selectOptions(
+        screen.getByRole("combobox", {
+          name: "All Sub-Agent reasoning effort",
+        }),
+        "high",
+      );
+      expect(providersApi.updateCodexSubagentPolicy).toHaveBeenCalledWith(
+        plan.id,
+        { subagentReasoningEffort: "high" },
+      );
+      expect(
+        screen.getByRole("combobox", {
+          name: "All Sub-Agent reasoning effort",
+        }),
+      ).toBeDisabled();
+      const nextPlan: Provider = {
+        ...plan,
+        id: `${plan.id}-next`,
+        name: "Next router",
+        settingsConfig: {
+          ...plan.settingsConfig,
+          codexRouting: {
+            ...plan.settingsConfig.codexRouting,
+            subagentReasoningEffort: "max",
+          },
+        },
+      };
+      view.rerenderWorkspace(subagentWorkspaceElement(source, nextPlan));
+      await act(async () => {
+        if (outcome === "resolve")
+          saving.resolve(
+            confirmedSubagentMutation({
+              ...plan,
+              settingsConfig: {
+                ...plan.settingsConfig,
+                codexRouting: {
+                  ...plan.settingsConfig.codexRouting,
+                  subagentReasoningEffort: "high",
+                },
+              },
+            }),
+          );
+        else saving.reject(new Error("old plan reasoning save failed"));
+        await saving.promise.catch(() => undefined);
+      });
+      expect(
+        screen.getByRole("combobox", {
+          name: "All Sub-Agent reasoning effort",
+        }),
+      ).toHaveValue("max");
+      expect(
+        screen.getByRole("combobox", {
+          name: "All Sub-Agent reasoning effort",
+        }),
+      ).toBeEnabled();
+      expect(
+        screen.queryByText(/old plan reasoning save failed/),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(/Sub-Agent reasoning effort saved/),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("rejects a verified mutation response that did not save the requested Sub-Agent effort", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    plan.settingsConfig.codexRouting.subagentReasoningEffort = "high";
+    vi.mocked(providersApi.updateCodexSubagentPolicy).mockResolvedValueOnce(
+      confirmedSubagentMutation(plan),
+    );
+    renderWorkspace(subagentWorkspaceElement(source, plan));
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "All Sub-Agent reasoning effort" }),
+      "max",
+    );
+    expect(
+      screen.getByRole("combobox", { name: "All Sub-Agent reasoning effort" }),
+    ).toHaveValue("high");
+    expect(
+      screen.getByText(/codex_subagent_reasoning_not_saved/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Sub-Agent reasoning effort saved/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps a newer same-plan reasoning choice when an older mutation completes", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    const saving = createDeferred<Provider>();
+    vi.mocked(providersApi.updateCodexSubagentPolicy).mockReturnValueOnce(
+      saving.promise,
+    );
+    const view = renderWorkspace(subagentWorkspaceElement(source, plan));
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "All Sub-Agent reasoning effort" }),
+      "max",
+    );
+    const updatedPlan: Provider = {
+      ...plan,
+      settingsConfig: {
+        ...plan.settingsConfig,
+        codexRouting: {
+          ...plan.settingsConfig.codexRouting,
+          subagentReasoningEffort: "high",
+        },
+      },
+    };
+    view.rerenderWorkspace(subagentWorkspaceElement(source, updatedPlan));
+    await act(async () => {
+      saving.resolve(
+        confirmedSubagentMutation({
+          ...plan,
+          settingsConfig: {
+            ...plan.settingsConfig,
+            codexRouting: {
+              ...plan.settingsConfig.codexRouting,
+              subagentReasoningEffort: "high",
+            },
+          },
+        }),
+      );
+      await saving.promise;
+    });
+    expect(
+      screen.getByRole("combobox", { name: "All Sub-Agent reasoning effort" }),
+    ).toHaveValue("high");
+    expect(
+      screen.queryByText(/Sub-Agent reasoning effort saved/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("locks policy actions during a Sub-Agent reasoning write and preserves the prior choice on failure", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    plan.settingsConfig.codexRouting.subagentReasoningEffort = "high";
+    const saving = createDeferred<Provider>();
+    vi.mocked(providersApi.updateCodexSubagentPolicy).mockReturnValueOnce(
+      saving.promise,
+    );
+    renderWorkspace(subagentWorkspaceElement(source, plan));
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "All Sub-Agent reasoning effort" }),
+      "max",
+    );
+    expect(
+      screen.getByRole("combobox", { name: "All Sub-Agent reasoning effort" }),
+    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Enable V1" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Validate candidates" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: /deepseek-v4-pro Top five #1/i }),
+    ).toBeDisabled();
+    await act(async () => {
+      saving.reject(new Error("reasoning write rejected"));
+      await saving.promise.catch(() => undefined);
+    });
+    expect(
+      screen.getByRole("combobox", { name: "All Sub-Agent reasoning effort" }),
+    ).toHaveValue("high");
+    expect(
+      screen.getByRole("combobox", { name: "All Sub-Agent reasoning effort" }),
+    ).toBeEnabled();
+    expect(
+      screen.getByText(
+        `Could not save Sub-Agent reasoning effort: ${workspaceErrorMessage(new Error("reasoning write rejected"))}`,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Enable V1" })).toBeEnabled();
+  });
+
   it("renders the active protocol as disabled and the inactive protocol as actionable", async () => {
     const { source, plan } = createSubagentWorkspaceFixture();
     const existingRoutes = plan.settingsConfig?.codexRouting?.routes ?? [];
@@ -5894,19 +6896,21 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
 
     await user.click(inactiveV1);
 
-    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
-    const [updatedProvider, appType] = vi.mocked(providersApi.update).mock
-      .calls[0];
-    expect(appType).toBe("codex");
-    expect(updatedProvider.settingsConfig?.codexRouting).toMatchObject({
-      subagentVersion: "v1",
+    await waitFor(() =>
+      expect(providersApi.updateCodexSubagentPolicy).toHaveBeenCalledOnce(),
+    );
+    expect(providersApi.updateCodexSubagentPolicy).toHaveBeenCalledWith(
+      plan.id,
+      {
+        subagentVersion: "v1",
+      },
+    );
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(plan.settingsConfig?.codexRouting).toMatchObject({
       routes: existingRoutes,
       subagentV2: existingV2,
+      spawnAgentModels: ["deepseek-v4-pro", "deepseek-v4-flash"],
     });
-    expect(updatedProvider.settingsConfig).not.toHaveProperty("modelCatalog");
-    expect(
-      updatedProvider.settingsConfig?.codexRouting?.spawnAgentModels,
-    ).toEqual(["deepseek-v4-pro", "deepseek-v4-flash"]);
     expect(screen.getByRole("button", { name: "V1 enabled" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Enable V2" })).toBeEnabled();
     expect(
@@ -5955,27 +6959,538 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     );
     await user.click(screen.getByRole("button", { name: "Save ordering" }));
 
-    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
-    const [savedProvider, appType] = vi.mocked(providersApi.update).mock
-      .calls[0];
-    expect(appType).toBe("codex");
-    expect(savedProvider.settingsConfig).not.toHaveProperty("modelCatalog");
-    expect(savedProvider.settingsConfig?.codexRouting).toMatchObject({
-      enabled: existingRouting?.enabled,
-      routes: existingRouting?.routes,
-      subagentVersion: existingRouting?.subagentVersion,
-      subagentV2: existingRouting?.subagentV2,
-      spawnAgentModels: ["deepseek-v4-pro", "qwen3.8"],
-    });
-    expect(savedProvider.settingsConfig?.codexRouting.defaultRouteId).toBe(
-      existingRouting?.defaultRouteId,
+    await waitFor(() =>
+      expect(providersApi.updateCodexSubagentPolicy).toHaveBeenCalledOnce(),
     );
+    expect(providersApi.updateCodexSubagentPolicy).toHaveBeenCalledWith(
+      plan.id,
+      {
+        spawnAgentModels: ["deepseek-v4-pro", "qwen3.8"],
+      },
+    );
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(plan.settingsConfig?.codexRouting).toBe(existingRouting);
+  });
+
+  function candidateDiagnostics(
+    liveConfig: Partial<CodexMultiRouterDiagnostics["liveConfig"]> = {},
+  ): CodexMultiRouterDiagnostics {
+    return {
+      generatedAt: "2026-11-13T00:00:00Z",
+      ready: true,
+      nextAction: "none",
+      blockingIssues: [],
+      warnings: [],
+      checks: [],
+      proxyStatus: {
+        running: true,
+        address: "127.0.0.1",
+        port: 15721,
+        active_connections: 0,
+        total_requests: 0,
+        success_requests: 0,
+        failed_requests: 0,
+        success_rate: 0,
+        uptime_seconds: 0,
+        current_provider: null,
+        current_provider_id: null,
+        last_request_at: null,
+        last_error: null,
+        failover_count: 0,
+      },
+      takeover: {
+        claude: false,
+        codex: true,
+        gemini: false,
+        grokbuild: false,
+        opencode: false,
+        openclaw: false,
+        hermes: false,
+      },
+      liveConfig: {
+        path: "C:/test/codex/config.toml",
+        exists: true,
+        configModifiedAt: null,
+        parseError: null,
+        modelProvider: "codex_model_router_v2",
+        activeBaseUrl: null,
+        openaiBaseUrl: null,
+        providerBaseUrl: null,
+        supportsWebsockets: false,
+        wireApi: "responses",
+        modelCatalogJson: null,
+        modelCatalogPath: null,
+        modelCatalogModifiedAt: null,
+        modelCatalogModelCount: 0,
+        modelCatalogFirstModels: [],
+        spawnAgentVisibleModelLimit: 5,
+        spawnAgentMissingPriorityModels: [],
+        usesBuiltinOpenAIWithLocalBase: false,
+        pointsToLocalProxy: true,
+        ...liveConfig,
+      },
+      desktopRuntime: {
+        running: false,
+        appServerRunning: false,
+        remoteDebuggingEnabled: false,
+        remoteDebuggingPort: null,
+        modelPickerPatchable: false,
+        processCount: 0,
+        appServerCount: 0,
+        processes: [],
+        newestAppServerStartedAt: null,
+        mayHaveStaleModelCatalog: false,
+        staleReason: null,
+        detectionError: null,
+      },
+      routerLog: {
+        path: "C:/test/codex/router.log",
+        exists: false,
+        totalScanned: 0,
+        matchedScanned: 0,
+        hasRecentRequest: false,
+        latestRequestAt: null,
+        latestError: null,
+        latestHostedToolWarning: null,
+        recentEvents: [],
+      },
+      routePlan: {
+        providerId: null,
+        providerName: null,
+        exists: false,
+        routingEnabled: false,
+        routeCount: 0,
+        enabledRouteCount: 0,
+        defaultRouteId: null,
+        routeSummaries: [],
+      },
+    };
+  }
+
+  function subagentWorkspaceElement(source: Provider, plan: Provider) {
+    return React.createElement(CodexRouterWorkspacePage, {
+      providers: [source, plan],
+      isProxyRunning: true,
+      isCodexTakeoverActive: true,
+      activeProviderId: plan.id,
+      initialProviderId: plan.id,
+      initialTab: "subagents",
+      onEditProvider: vi.fn(),
+      onDeletePlan: vi.fn(),
+      onCreateProvider: vi.fn(),
+    });
+  }
+
+  it.each(["resolve", "reject"] as const)(
+    "isolates a late protocol %s from a newly selected Sub-Agent plan",
+    async (outcome) => {
+      const { source, plan } = createSubagentWorkspaceFixture();
+      const switching = createDeferred<Provider>();
+      vi.mocked(providersApi.updateCodexSubagentPolicy).mockReturnValueOnce(
+        switching.promise,
+      );
+      const invalidation = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+      const view = renderWorkspace(subagentWorkspaceElement(source, plan));
+      await userEvent.click(screen.getByRole("button", { name: "Enable V1" }));
+      const nextPlan = { ...plan, id: `${plan.id}-next`, name: "Next router" };
+      view.rerenderWorkspace(subagentWorkspaceElement(source, nextPlan));
+
+      expect(screen.getByRole("button", { name: "Enable V1" })).toBeEnabled();
+      await act(async () => {
+        if (outcome === "resolve")
+          switching.resolve(confirmedSubagentMutation(plan));
+        else switching.reject(new Error("old plan save failed"));
+        await switching.promise.catch(() => undefined);
+      });
+      expect(screen.getByRole("button", { name: "V2 enabled" })).toBeDisabled();
+      expect(
+        screen.queryByText(/Saved V1 protocol settings/),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText(/Switch failed:/)).not.toBeInTheDocument();
+      if (outcome === "resolve") {
+        expect(invalidation).toHaveBeenCalledWith({
+          queryKey: ["providers", "codex"],
+        });
+      }
+      invalidation.mockRestore();
+    },
+  );
+
+  it("keeps a new plan candidate draft when an old ordering save completes", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    const saving = createDeferred<Provider>();
+    vi.mocked(providersApi.updateCodexSubagentPolicy).mockReturnValueOnce(
+      saving.promise,
+    );
+    const view = renderWorkspace(subagentWorkspaceElement(source, plan));
+    await userEvent.click(
+      screen.getByRole("button", { name: /deepseek-v4-flash Top five #2/i }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save ordering" }),
+    );
+    const nextPlan: Provider = {
+      ...plan,
+      id: `${plan.id}-next`,
+      settingsConfig: {
+        ...plan.settingsConfig,
+        codexRouting: {
+          ...plan.settingsConfig.codexRouting,
+          spawnAgentModels: ["qwen3.8"],
+        },
+      },
+    };
+    view.rerenderWorkspace(subagentWorkspaceElement(source, nextPlan));
+    await act(async () => {
+      saving.resolve(confirmedSubagentMutation(plan));
+      await saving.promise;
+    });
+
+    expect(
+      screen.getByRole("button", { name: /qwen3.8 Top five #1/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Saved 1 visible sub-agent/),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Enable V1" })).toBeEnabled();
+  });
+
+  it("discards late candidate diagnostics and resets its busy state on a plan change", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    const validating =
+      createDeferred<
+        Awaited<ReturnType<typeof proxyApi.diagnoseCodexMultiRouter>>
+      >();
+    vi.mocked(proxyApi.diagnoseCodexMultiRouter).mockReturnValueOnce(
+      validating.promise,
+    );
+    const view = renderWorkspace(subagentWorkspaceElement(source, plan));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Validate candidates" }),
+    );
+    const nextPlan = { ...plan, id: `${plan.id}-next` };
+    view.rerenderWorkspace(subagentWorkspaceElement(source, nextPlan));
+    expect(
+      screen.getByRole("button", { name: "Validate candidates" }),
+    ).toBeEnabled();
+    await act(async () => {
+      validating.resolve(
+        candidateDiagnostics({
+          spawnAgentVisibleModelLimit: 1,
+          modelCatalogFirstModels: ["old-plan-observation"],
+          spawnAgentMissingPriorityModels: ["old-plan-missing"],
+        }),
+      );
+      await validating.promise;
+    });
+
+    expect(
+      screen.getByText("Source: Configuration preview"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/old-plan-observation/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/old-plan-missing/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Validation passed:/)).not.toBeInTheDocument();
+  });
+
+  it.each(["not_required", "pending_retry"] as const)(
+    "surfaces %s policy projection without claiming live file verification",
+    async (status) => {
+      const { source, plan } = createSubagentWorkspaceFixture();
+      const result = confirmedSubagentMutation(plan, status);
+      if (status === "pending_retry") {
+        result.projection = {
+          status,
+          warning: {
+            code: "codex_live_projection_pending_retry",
+            message: "Live projection will retry automatically.",
+          },
+        };
+      }
+      vi.mocked(providersApi.updateCodexSubagentPolicy).mockResolvedValueOnce(
+        result,
+      );
+      renderWorkspace(subagentWorkspaceElement(source, plan));
+      await userEvent.click(screen.getByRole("button", { name: "Enable V1" }));
+      const notice = await screen.findByText(
+        status === "pending_retry"
+          ? "Database saved; Codex Agent file projection is pending an automatic retry"
+          : "Database saved; the current plan is inactive, so the Codex Agent file was not changed",
+      );
+      expect(notice).toHaveClass("border-amber-200");
+      expect(
+        screen.queryByText(/file were written and read back successfully/),
+      ).not.toBeInTheDocument();
+      if (status === "pending_retry") {
+        expect(
+          screen.getByText("Live projection will retry automatically."),
+        ).toBeInTheDocument();
+      }
+    },
+  );
+
+  it("rejects an unverified policy response without discarding the pending candidate draft", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    // Deliberately emulate an old backend response missing verification.
+    vi.mocked(providersApi.updateCodexSubagentPolicy).mockResolvedValueOnce(
+      plan,
+    );
+    const invalidation = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+    renderWorkspace(subagentWorkspaceElement(source, plan));
+    await userEvent.click(
+      screen.getByRole("button", { name: /deepseek-v4-flash Top five #2/i }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save ordering" }),
+    );
+    expect(await screen.findByText(/Save failed:/)).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Saved [0-9]+ visible sub-agent/),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save ordering" })).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: /deepseek-v4-pro Top five #1/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /deepseek-v4-flash Top five #2/i }),
+    ).not.toBeInTheDocument();
+    expect(invalidation).toHaveBeenCalledWith({
+      queryKey: ["providers", "codex"],
+    });
+    invalidation.mockRestore();
+  });
+
+  it("clears completed diagnostics when the same plan receives newer canonical settings", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    vi.mocked(proxyApi.diagnoseCodexMultiRouter).mockResolvedValueOnce(
+      candidateDiagnostics({
+        modelCatalogFirstModels: ["deepseek-v4-pro", "deepseek-v4-flash"],
+      }),
+    );
+    const view = renderWorkspace(subagentWorkspaceElement(source, plan));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Validate candidates" }),
+    );
+    expect(
+      await screen.findByText("Source: Diagnostic observation"),
+    ).toBeInTheDocument();
+    view.rerenderWorkspace(
+      subagentWorkspaceElement(source, {
+        ...plan,
+        settingsConfig: {
+          ...plan.settingsConfig,
+          codexRouting: {
+            ...plan.settingsConfig.codexRouting,
+            spawnAgentModels: ["qwen3.8"],
+          },
+        },
+      }),
+    );
+    expect(
+      screen.getByText("Source: Configuration preview"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Validation passed:/)).not.toBeInTheDocument();
+  });
+
+  it("does not apply diagnostics for an externally replaced same-plan candidate selection", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    const validating =
+      createDeferred<
+        Awaited<ReturnType<typeof proxyApi.diagnoseCodexMultiRouter>>
+      >();
+    vi.mocked(proxyApi.diagnoseCodexMultiRouter).mockReturnValueOnce(
+      validating.promise,
+    );
+    const view = renderWorkspace(subagentWorkspaceElement(source, plan));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Validate candidates" }),
+    );
+    const updatedPlan: Provider = {
+      ...plan,
+      settingsConfig: {
+        ...plan.settingsConfig,
+        codexRouting: {
+          ...plan.settingsConfig.codexRouting,
+          spawnAgentModels: ["qwen3.8"],
+        },
+      },
+    };
+    view.rerenderWorkspace(subagentWorkspaceElement(source, updatedPlan));
+    await act(async () => {
+      validating.resolve(
+        candidateDiagnostics({
+          spawnAgentVisibleModelLimit: 5,
+          modelCatalogFirstModels: ["deepseek-v4-pro", "deepseek-v4-flash"],
+          spawnAgentMissingPriorityModels: [],
+        }),
+      );
+      await validating.promise;
+    });
+    expect(
+      screen.getByRole("button", { name: /qwen3.8 Top five #1/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Validation passed:/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Source: Configuration preview"),
+    ).toBeInTheDocument();
+  });
+
+  it("does not replace newer same-plan settings with an older save response", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    const saving = createDeferred<Provider>();
+    vi.mocked(providersApi.updateCodexSubagentPolicy).mockReturnValueOnce(
+      saving.promise,
+    );
+    const view = renderWorkspace(subagentWorkspaceElement(source, plan));
+    await userEvent.click(
+      screen.getByRole("button", { name: /deepseek-v4-flash Top five #2/i }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save ordering" }),
+    );
+    const savedPlan: Provider = {
+      ...plan,
+      settingsConfig: {
+        ...plan.settingsConfig,
+        codexRouting: {
+          ...plan.settingsConfig.codexRouting,
+          spawnAgentModels: ["deepseek-v4-pro"],
+        },
+      },
+    };
+    const newerPlan: Provider = {
+      ...plan,
+      settingsConfig: {
+        ...plan.settingsConfig,
+        codexRouting: {
+          ...plan.settingsConfig.codexRouting,
+          spawnAgentModels: ["qwen3.8"],
+        },
+      },
+    };
+    view.rerenderWorkspace(subagentWorkspaceElement(source, newerPlan));
+    await act(async () => {
+      saving.resolve(confirmedSubagentMutation(savedPlan));
+      await saving.promise;
+    });
+    expect(
+      screen.getByRole("button", { name: /qwen3.8 Top five #1/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Saved 1 visible sub-agent/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("serializes profile initialization with policy actions without losing an unsaved candidate draft", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    const uninitializedPlan: Provider = {
+      ...plan,
+      settingsConfig: {
+        ...plan.settingsConfig,
+        codexRouting: {
+          ...plan.settingsConfig.codexRouting,
+          subagentV2: undefined,
+        },
+      },
+    };
+    const initializing = createDeferred<Provider>();
+    vi.mocked(codexSubagentV2Api.initializeProviderConfig).mockReturnValueOnce(
+      initializing.promise,
+    );
+    renderWorkspace(subagentWorkspaceElement(source, uninitializedPlan));
+    await userEvent.click(
+      screen.getByRole("button", { name: /deepseek-v4-flash Top five #2/i }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", {
+        name: "Initialize V2 sub-agent capabilities",
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Enable V1" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Save ordering" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Validate candidates" }),
+    ).toBeDisabled();
+    expect(providersApi.updateCodexSubagentPolicy).not.toHaveBeenCalled();
+    await act(async () => {
+      initializing.resolve(confirmedSubagentMutation(plan));
+      await initializing.promise;
+    });
+    expect(screen.getByRole("button", { name: "Save ordering" })).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: /deepseek-v4-pro Top five #1/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /deepseek-v4-flash Top five #2/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("locks same-plan candidate edits and protocol writes until ordering is saved", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    const saving = createDeferred<Provider>();
+    vi.mocked(providersApi.updateCodexSubagentPolicy).mockReturnValueOnce(
+      saving.promise,
+    );
+    renderWorkspace(subagentWorkspaceElement(source, plan));
+    await userEvent.click(
+      screen.getByRole("button", { name: /deepseek-v4-flash Top five #2/i }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save ordering" }),
+    );
+
+    expect(screen.getByRole("button", { name: "Enable V1" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: /deepseek-v4-pro Top five #1/i }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Drag deepseek-v4-pro" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Validate candidates" }),
+    ).toBeDisabled();
+    await act(async () => {
+      saving.resolve(confirmedSubagentMutation(plan));
+      await saving.promise;
+    });
+    expect(screen.getByRole("button", { name: "Enable V1" })).toBeEnabled();
+  });
+
+  it("locks candidate edits while validating their captured window", async () => {
+    const { source, plan } = createSubagentWorkspaceFixture();
+    const validating =
+      createDeferred<
+        Awaited<ReturnType<typeof proxyApi.diagnoseCodexMultiRouter>>
+      >();
+    vi.mocked(proxyApi.diagnoseCodexMultiRouter).mockReturnValueOnce(
+      validating.promise,
+    );
+    renderWorkspace(subagentWorkspaceElement(source, plan));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Validate candidates" }),
+    );
+    expect(
+      screen.getByRole("button", { name: /deepseek-v4-flash Top five #2/i }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Drag deepseek-v4-pro" }),
+    ).toBeDisabled();
+    await act(async () => {
+      validating.reject(new Error("diagnostics unavailable"));
+      await validating.promise.catch(() => undefined);
+    });
+    expect(
+      screen.getByRole("button", { name: /deepseek-v4-flash Top five #2/i }),
+    ).toBeEnabled();
   });
 
   it("disables protocol actions while switching and keeps the previous protocol after failure", async () => {
     const { source, plan } = createSubagentWorkspaceFixture();
-    const switching = createDeferred<boolean>();
-    vi.mocked(providersApi.update).mockReturnValueOnce(switching.promise);
+    const switching = createDeferred<Provider>();
+    vi.mocked(providersApi.updateCodexSubagentPolicy).mockReturnValueOnce(
+      switching.promise,
+    );
     renderSubagentWorkspace(source, plan);
     const user = userEvent.setup();
     await user.click(screen.getByRole("tab", { name: "Sub-Agent" }));
@@ -6276,6 +7791,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         apiFormat: "openai_responses",
         apiFormatSource: "provider",
         providerName: thirdParty.name,
+        targetProviderId: thirdParty.id,
       },
     ]);
   });
@@ -6630,6 +8146,84 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       ]);
     },
   );
+  describe("catalog public identity ownership", () => {
+    it.each(
+      ["enabled", "disabled", "absent", "ambiguous"].flatMap((state) =>
+        [false, true].map((reverse) => ({ state, reverse })),
+      ),
+    )(
+      "projects and reconciles a closed public include ($state, reverse=$reverse)",
+      ({ state, reverse }) => {
+        const models: CodexCatalogModel[] = [
+          ...(state === "enabled" || state === "disabled"
+            ? [
+                {
+                  model: "public",
+                  upstreamModel: "wire-public",
+                  ...(state === "disabled" ? { enabled: false } : {}),
+                },
+              ]
+            : []),
+          { model: "sibling", upstreamModel: "public" },
+          ...(state === "ambiguous"
+            ? [{ model: "second-sibling", upstreamModel: "public" }]
+            : []),
+        ];
+        if (reverse) models.reverse();
+        const source: Provider = {
+          id: "identity-source",
+          name: "Identity source",
+          category: "custom",
+          settingsConfig: { modelCatalog: { models } },
+        };
+        const draft = createDraftRoutingPlan([source], [source]);
+        const plan: Provider = {
+          ...draft,
+          settingsConfig: {
+            ...draft.settingsConfig,
+            codexRouting: {
+              schemaVersion: 2,
+              enabled: true,
+              routes: [
+                {
+                  id: "selected",
+                  enabled: true,
+                  targetProviderId: source.id,
+                  modelSelection: { mode: "include", models: ["public"] },
+                },
+              ],
+            },
+          },
+        };
+        const sources = new Map([[source.id, source]]);
+        const projected = buildModelCatalogForRoutes(
+          plan,
+          readCodexRouting(plan)?.routes ?? [],
+          sources,
+        );
+        expect(projected.models.map((model) => model.model)).toEqual(
+          state === "enabled"
+            ? ["public"]
+            : state === "absent"
+              ? ["sibling"]
+              : [],
+        );
+        const reconciled = reconcileCodexRoutingPlanForSave(plan, sources);
+        expect(
+          readCodexRouting(reconciled)?.routes?.[0]?.modelSelection,
+        ).toEqual({
+          mode: "include",
+          models: state === "enabled" || state === "absent" ? ["public"] : [],
+        });
+        if (state === "disabled" || state === "ambiguous") {
+          expect(readCodexRouting(reconciled)?.routes?.[0]?.enabled).toBe(
+            false,
+          );
+        }
+      },
+    );
+  });
+
   it("does not use a stale Router catalog to rewrite schema v2 route policy", () => {
     const source: Provider = {
       id: "relay",
@@ -7053,6 +8647,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         apiFormat: "openai_chat",
         apiFormatSource: "provider",
         providerName: qwen.name,
+        targetProviderId: qwen.id,
       },
       {
         model: "deepseek-v4-flash",
@@ -7063,6 +8658,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         apiFormat: "openai_chat",
         apiFormatSource: "provider",
         providerName: deepseek.name,
+        targetProviderId: deepseek.id,
         capabilities: { inputModalities: ["text"], textOnly: true },
       },
     ]);
@@ -7208,6 +8804,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         contextWindow: 262144,
         apiFormatSource: "provider",
         providerName: qwen.name,
+        targetProviderId: qwen.id,
       },
     ]);
     expect(rebuilt.spawnAgentModels).toEqual(["qwen3.6"]);
@@ -7346,6 +8943,346 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       expect(JSON.stringify(plan)).toBe(snapshot);
     },
   );
+
+  describe("route checkbox canonical identity ownership", () => {
+    it.each([false, true])(
+      "keeps sibling selection separate from its public wire owner (reverse=%s)",
+      async (reverse) => {
+        const models = [
+          { model: "public", upstreamModel: "wire-public" },
+          { model: "sibling", upstreamModel: "public" },
+        ];
+        if (reverse) models.reverse();
+        const source: Provider = {
+          id: "checkbox-owner",
+          name: "Checkbox owner",
+          settingsConfig: { modelCatalog: { models } },
+        };
+        const draft = createDraftRoutingPlan([source], [source]);
+        const plan: Provider = {
+          ...draft,
+          settingsConfig: {
+            ...draft.settingsConfig,
+            codexRouting: {
+              schemaVersion: 2,
+              enabled: true,
+              routes: [
+                {
+                  id: "checkbox-route",
+                  enabled: true,
+                  targetProviderId: source.id,
+                  modelSelection: { mode: "include", models: ["public"] },
+                },
+              ],
+            },
+          },
+        };
+        renderWorkspace(
+          React.createElement(CodexRouterWorkspacePage, {
+            providers: [source, plan],
+            activeProviderId: plan.id,
+            initialProviderId: plan.id,
+            initialTab: "routes",
+            isProxyRunning: true,
+            isCodexTakeoverActive: true,
+            onEditProvider: vi.fn(),
+            onDeletePlan: vi.fn(),
+            onCreateProvider: vi.fn(),
+          }),
+        );
+        expect(
+          screen.getByText("Connected 1/2 models; Not connected: sibling"),
+        ).toBeVisible();
+        await userEvent.click(
+          screen.getByRole("button", { name: "Edit matching rules" }),
+        );
+        const publicCheckbox = screen.getByLabelText(
+          "Select upstream models public",
+        );
+        const siblingCheckbox = screen.getByLabelText(
+          "Select upstream models sibling",
+        );
+        expect(publicCheckbox).toBeChecked();
+        expect(siblingCheckbox).not.toBeChecked();
+        await userEvent.click(siblingCheckbox);
+        expect(publicCheckbox).toBeChecked();
+        expect(siblingCheckbox).toBeChecked();
+        await userEvent.click(siblingCheckbox);
+        expect(publicCheckbox).toBeChecked();
+        expect(siblingCheckbox).not.toBeChecked();
+        await userEvent.click(
+          screen.getByRole("button", { name: "Save rules" }),
+        );
+        await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+        expect(vi.mocked(providersApi.update).mock.calls[0][0]).toHaveProperty(
+          "settingsConfig.codexRouting.routes.0.modelSelection",
+          { mode: "include", models: ["public"] },
+        );
+      },
+    );
+
+    it.each([false, true])(
+      "does not report a disabled public selection as its enabled sibling (reverse=%s)",
+      async (reverse) => {
+        const models = [
+          { model: "public", upstreamModel: "wire-public", enabled: false },
+          { model: "sibling", upstreamModel: "public" },
+        ];
+        if (reverse) models.reverse();
+        const source: Provider = {
+          id: "checkbox-disabled",
+          name: "Checkbox disabled",
+          settingsConfig: { modelCatalog: { models } },
+        };
+        const draft = createDraftRoutingPlan([source], [source]);
+        const plan: Provider = {
+          ...draft,
+          settingsConfig: {
+            ...draft.settingsConfig,
+            codexRouting: {
+              schemaVersion: 2,
+              enabled: true,
+              routes: [
+                {
+                  id: "checkbox-route",
+                  enabled: true,
+                  targetProviderId: source.id,
+                  modelSelection: { mode: "include", models: ["public"] },
+                },
+              ],
+            },
+          },
+        };
+        renderWorkspace(
+          React.createElement(CodexRouterWorkspacePage, {
+            providers: [source, plan],
+            activeProviderId: plan.id,
+            initialProviderId: plan.id,
+            initialTab: "routes",
+            isProxyRunning: true,
+            isCodexTakeoverActive: true,
+            onEditProvider: vi.fn(),
+            onDeletePlan: vi.fn(),
+            onCreateProvider: vi.fn(),
+          }),
+        );
+        expect(
+          screen.getByText(
+            "Connected 0/1 models; Not connected: sibling; No longer available: public",
+          ),
+        ).toBeVisible();
+        await userEvent.click(
+          screen.getByRole("button", { name: "Edit matching rules" }),
+        );
+        expect(
+          screen.getByLabelText("Select upstream models sibling"),
+        ).not.toBeChecked();
+        expect(
+          screen.queryByLabelText("Select upstream models public"),
+        ).not.toBeInTheDocument();
+      },
+    );
+  });
+
+  describe("routed candidate identity ownership", () => {
+    it.each(
+      ["enabled", "disabled", "absent", "ambiguous"].flatMap((state) =>
+        [false, true].map((reverse) => ({ state, reverse })),
+      ),
+    )(
+      "uses canonical include ownership ($state, reverse=$reverse)",
+      ({ state, reverse }) => {
+        const models: CodexCatalogModel[] = [
+          ...(state === "enabled" || state === "disabled"
+            ? [
+                {
+                  model: "public",
+                  upstreamModel: "wire-public",
+                  ...(state === "disabled" ? { enabled: false } : {}),
+                },
+              ]
+            : []),
+          { model: "sibling", upstreamModel: "public" },
+          ...(state === "ambiguous"
+            ? [{ model: "second-sibling", upstreamModel: "public" }]
+            : []),
+        ];
+        if (reverse) models.reverse();
+        const source: Provider = {
+          id: "candidate-owner",
+          name: "Candidate owner",
+          settingsConfig: { modelCatalog: { models } },
+        };
+        const plan = createDraftRoutingPlan([], []);
+        const route = {
+          id: "owned-include",
+          targetProviderId: source.id,
+          modelSelection: { mode: "include" as const, models: ["public"] },
+        };
+        expect(
+          collectRoutedCatalogModels(
+            [{ provider: plan, index: 0, route }],
+            models,
+            new Map([[source.id, source]]),
+          ),
+        ).toEqual(
+          state === "enabled"
+            ? ["public"]
+            : state === "absent"
+              ? ["sibling"]
+              : [],
+        );
+      },
+    );
+
+    it("does not revive a disabled public alias name from an enabled target", () => {
+      const source: Provider = {
+        id: "candidate-alias-owner",
+        name: "Candidate alias owner",
+        settingsConfig: {
+          modelCatalog: {
+            models: [{ model: "public", enabled: false }, { model: "sibling" }],
+          },
+        },
+      };
+      const route = {
+        id: "owned-alias",
+        targetProviderId: source.id,
+        modelSelection: { mode: "all" as const },
+        aliases: { public: "sibling" },
+      };
+      expect(
+        collectRoutedCatalogModels(
+          [{ provider: createDraftRoutingPlan([], []), index: 0, route }],
+          [{ model: "public" }, { model: "sibling" }],
+          new Map([[source.id, source]]),
+        ),
+      ).toEqual(["sibling"]);
+    });
+  });
+
+  describe("route preview identity ownership", () => {
+    it.each(
+      ["include", "all"].flatMap((mode) =>
+        [false, true].map((reverse) => ({ mode, reverse })),
+      ),
+    )(
+      "rejects a disabled public model despite a sibling wire collision ($mode, reverse=$reverse)",
+      async ({ mode, reverse }) => {
+        const models = [
+          { model: "public", upstreamModel: "wire-public", enabled: false },
+          { model: "sibling", upstreamModel: "public" },
+        ];
+        if (reverse) models.reverse();
+        const source: Provider = {
+          id: "preview-owner",
+          name: "Preview owner",
+          settingsConfig: { modelCatalog: { models } },
+        };
+        const draft = createDraftRoutingPlan([source], [source]);
+        const plan: Provider = {
+          ...draft,
+          settingsConfig: {
+            ...draft.settingsConfig,
+            codexRouting: {
+              schemaVersion: 2,
+              enabled: true,
+              routes: [
+                {
+                  id: "owned-preview",
+                  enabled: true,
+                  targetProviderId: source.id,
+                  modelSelection:
+                    mode === "include"
+                      ? { mode: "include", models: ["public"] }
+                      : { mode: "all" },
+                  match: { models: ["public"], prefixes: [] },
+                },
+              ],
+            },
+          },
+        };
+        renderWorkspace(
+          React.createElement(CodexRouterWorkspacePage, {
+            providers: [source, plan],
+            activeProviderId: plan.id,
+            initialProviderId: plan.id,
+            initialTab: "test",
+            isProxyRunning: true,
+            isCodexTakeoverActive: true,
+            onEditProvider: vi.fn(),
+            onDeletePlan: vi.fn(),
+            onCreateProvider: vi.fn(),
+          }),
+        );
+        await userEvent.type(
+          screen.getByPlaceholderText(/gpt-5\.4-mini/),
+          "public",
+        );
+        await userEvent.click(
+          screen.getByRole("button", { name: "Preview match" }),
+        );
+        expect(
+          screen.getByText(
+            "public cannot be routed: it did not match any enabled model rule in the current plan.",
+          ),
+        ).toBeVisible();
+      },
+    );
+
+    it("accepts a visible alias only through its selected enabled canonical owner", async () => {
+      const source: Provider = {
+        id: "preview-alias-owner",
+        name: "Preview alias owner",
+        settingsConfig: {
+          modelCatalog: {
+            models: [{ model: "public", upstreamModel: "wire-public" }],
+          },
+        },
+      };
+      const draft = createDraftRoutingPlan([source], [source]);
+      const plan: Provider = {
+        ...draft,
+        settingsConfig: {
+          ...draft.settingsConfig,
+          codexRouting: {
+            schemaVersion: 2,
+            enabled: true,
+            routes: [
+              {
+                id: "owned-preview",
+                enabled: true,
+                targetProviderId: source.id,
+                modelSelection: { mode: "include", models: ["public"] },
+                aliases: { fast: "wire-public" },
+              },
+            ],
+          },
+        },
+      };
+      renderWorkspace(
+        React.createElement(CodexRouterWorkspacePage, {
+          providers: [source, plan],
+          activeProviderId: plan.id,
+          initialProviderId: plan.id,
+          initialTab: "test",
+          isProxyRunning: true,
+          isCodexTakeoverActive: true,
+          onEditProvider: vi.fn(),
+          onDeletePlan: vi.fn(),
+          onCreateProvider: vi.fn(),
+        }),
+      );
+      await userEvent.type(
+        screen.getByPlaceholderText(/gpt-5\.4-mini/),
+        "fast",
+      );
+      await userEvent.click(
+        screen.getByRole("button", { name: "Preview match" }),
+      );
+      expect(screen.getByText(/fast matches/)).toBeVisible();
+    });
+  });
 
   it("uses target provider catalogs when building routed sub-agent candidates", () => {
     const source: Provider = {
@@ -7563,6 +9500,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       contextWindow: 372000,
       apiFormatSource: "provider",
       providerName: officialBackup.name,
+      targetProviderId: officialBackup.id,
     });
   });
 

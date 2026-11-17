@@ -14,7 +14,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const scriptPath = fileURLToPath(
-  new URL("./check-upstream-updates.ps1", import.meta.url),
+  new URL("./check-upstream-updates.mjs", import.meta.url),
 );
 
 function fixture(t) {
@@ -76,29 +76,16 @@ function fixture(t) {
     globalConfig: () => readFileSync(globalConfig),
     trace: () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : ""),
     run: (...args) => {
-      const result = spawnSync(
-        "pwsh",
-        [
-          "-NoLogo",
-          "-NoProfile",
-          "-NonInteractive",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-File",
-          scriptPath,
-          ...args,
-        ],
-        {
-          cwd: repo,
-          env: { ...env, GIT_TRACE2_EVENT: tracePath },
-          encoding: "utf8",
-          timeout: 30_000,
-        },
-      );
+      const result = spawnSync(process.execPath, [scriptPath, ...args], {
+        cwd: repo,
+        env: { ...env, GIT_TRACE2_EVENT: tracePath },
+        encoding: "utf8",
+        timeout: 30_000,
+      });
       assert.equal(
         result.error,
         undefined,
-        "PowerShell 7 (pwsh) is required for this regression suite",
+        "Node.js is required for this regression suite",
       );
       return { ...result, output: result.stdout + result.stderr };
     },
@@ -147,9 +134,9 @@ for (const name of ["origin", "Origin", "ORIGIN"]) {
     f.git(["remote", "add", "origin", path.join(f.root, "your-fork.git")]);
     const before = f.config();
     const result = f.run(
-      "-RemoteName",
+      "--remote-name",
       name,
-      "-UpstreamUrl",
+      "--upstream-url",
       path.join(f.root, "missing-upstream.git"),
     );
     assert.notEqual(result.status, 0);
@@ -170,9 +157,9 @@ test("mismatching existing upstream fails closed without rewriting or exposing c
   f.git(["remote", "add", "review-upstream", sensitiveUrl]);
   const before = f.config();
   const result = f.run(
-    "-RemoteName",
+    "--remote-name",
     "review-upstream",
-    "-UpstreamUrl",
+    "--upstream-url",
     path.join(f.root, "missing-upstream.git"),
   );
   assert.notEqual(result.status, 0);
@@ -197,9 +184,9 @@ test("ambiguous existing remote URLs fail without mutation or fetch", (t) => {
   ]);
   const before = f.config();
   const result = f.run(
-    "-RemoteName",
+    "--remote-name",
     "review-upstream",
-    "-UpstreamUrl",
+    "--upstream-url",
     expected,
   );
   assert.notEqual(result.status, 0);
@@ -212,9 +199,9 @@ test("new upstream remote becomes fetch-only before even a failed fetch", (t) =>
   const f = fixture(t);
   const missing = path.join(f.root, "missing-upstream.git");
   const result = f.run(
-    "-RemoteName",
+    "--remote-name",
     "review-upstream",
-    "-UpstreamUrl",
+    "--upstream-url",
     missing,
   );
   assert.notEqual(result.status, 0);
@@ -228,7 +215,7 @@ test("new upstream remote becomes fetch-only before even a failed fetch", (t) =>
 test("new default upstream fetches main locally and disables upstream pushes", (t) => {
   const f = fixture(t);
   const upstream = f.createUpstream();
-  const result = f.run("-UpstreamUrl", upstream.bare);
+  const result = f.run("--upstream-url", upstream.bare);
   assert.equal(result.status, 0, result.output);
   assert.equal(
     f.git(["rev-parse", "refs/remotes/ccswitchmulti-upstream/main"]),
@@ -256,11 +243,11 @@ test("correct existing upstream retains config and explicit branch fetch semanti
   ]);
   const before = f.config();
   const result = f.run(
-    "-RemoteName",
+    "--remote-name",
     "review-upstream",
-    "-UpstreamUrl",
+    "--upstream-url",
     upstream.bare,
-    "-Branch",
+    "--branch",
     "preview",
   );
   assert.equal(result.status, 0, result.output);
@@ -298,9 +285,9 @@ for (const useExistingRemote of [false, true]) {
     const localBefore = f.config();
     const globalBefore = f.globalConfig();
     const result = f.run(
-      "-RemoteName",
+      "--remote-name",
       "review-upstream",
-      "-UpstreamUrl",
+      "--upstream-url",
       upstream.bare,
     );
     assert.notEqual(result.status, 0);
@@ -317,9 +304,9 @@ test("matching upstream with no disabled push destination is rejected without mu
   f.git(["remote", "add", "review-upstream", upstream.bare]);
   const before = f.config();
   const result = f.run(
-    "-RemoteName",
+    "--remote-name",
     "review-upstream",
-    "-UpstreamUrl",
+    "--upstream-url",
     upstream.bare,
   );
   assert.notEqual(result.status, 0);
@@ -341,9 +328,9 @@ test("inherited writable upstream push URL is rejected without changing either c
   const localBefore = f.config();
   const globalBefore = f.globalConfig();
   const result = f.run(
-    "-RemoteName",
+    "--remote-name",
     "review-upstream",
-    "-UpstreamUrl",
+    "--upstream-url",
     upstream.bare,
   );
   assert.notEqual(result.status, 0);
@@ -367,9 +354,9 @@ test("local disabled push URL cannot hide inherited additional writable push des
   const localBefore = f.config();
   const globalBefore = f.globalConfig();
   const result = f.run(
-    "-RemoteName",
+    "--remote-name",
     "review-upstream",
-    "-UpstreamUrl",
+    "--upstream-url",
     upstream.bare,
   );
   assert.notEqual(result.status, 0);
@@ -390,9 +377,9 @@ test("explicit disabled push URL remains safe when pushInsteadOf is ignored by G
   ]);
   const globalBefore = f.globalConfig();
   const result = f.run(
-    "-RemoteName",
+    "--remote-name",
     "review-upstream",
-    "-UpstreamUrl",
+    "--upstream-url",
     upstream.bare,
   );
   assert.equal(result.status, 0, result.output);

@@ -60,6 +60,12 @@ function markerMatches(session, { repoRoot, scriptPath, executable }) {
 
 function supervisorMatches(identity, session, ownership) {
   if (!identity) return false;
+  const expectedName = path.basename(ownership.executable).toLowerCase();
+  const observedName = String(identity.Name ?? "").trim().toLowerCase();
+  // A reused PID can belong to a protected Windows service whose executable
+  // metadata is unavailable. Its process name is still enough to prove that
+  // it is not our Node supervisor, so stale session cleanup may proceed.
+  if (observedName && observedName !== expectedName) return false;
   if (
     typeof identity.ExecutablePath !== "string" ||
     typeof identity.CommandLine !== "string" ||
@@ -72,6 +78,16 @@ function supervisorMatches(identity, session, ownership) {
     startedAtMilliseconds(identity) ===
       Date.parse(session.supervisorStartedAtUtc) &&
     supervisorCommandMatches(identity, ownership)
+  );
+}
+
+function isForeignSupervisorProcess(identity, ownership) {
+  const expectedName = path.basename(ownership.executable).toLowerCase();
+  const observedName = String(identity?.Name ?? "").trim().toLowerCase();
+  return (
+    (observedName && observedName !== expectedName) ||
+    (typeof identity?.ExecutablePath === "string" &&
+      !samePath(identity.ExecutablePath, ownership.executable))
   );
 }
 
@@ -220,7 +236,11 @@ export async function prepareDevSessionLaunch({
   const supervisor = processes.find(
     (candidate) => Number(candidate.ProcessId) === previous.supervisorPid,
   );
-  if (supervisor && !supervisorMatches(supervisor, previous, ownership)) {
+  if (
+    supervisor &&
+    !supervisorMatches(supervisor, previous, ownership) &&
+    !isForeignSupervisorProcess(supervisor, ownership)
+  ) {
     throw new Error(
       "The previous development supervisor PID was reused or its process identity changed.",
     );

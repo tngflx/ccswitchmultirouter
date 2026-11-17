@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { Code2, Database, Search, SlidersHorizontal } from "lucide-react";
@@ -20,7 +20,12 @@ import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
 import {
+  normalizeUnavailableFixedReasoningPolicies,
+  SUBAGENT_FIXED_REASONING_EFFORTS,
+} from "@/lib/codexSubagentReasoningPolicy";
+import {
   codexSubagentV2Api,
+  evaluateCodexSubagentMutationResult as evaluateMutationResult,
   type CodexSubagentV2MutationProvider,
   type CodexSubagentV2ReconcileAction,
 } from "@/lib/api/codexSubagentV2";
@@ -66,6 +71,7 @@ const PROFILE_FILTERS: Array<{ value: ProfileFilter; label: string }> = [
 ];
 
 const EXPLICIT_REASONING_EFFORTS = new Set([
+  "minimal",
   "low",
   "medium",
   "high",
@@ -145,69 +151,6 @@ function includedModelCatalog(value: unknown): Record<string, unknown> | null {
   };
 }
 
-function evaluateMutationResult(
-  result: CodexSubagentV2MutationProvider,
-): string {
-  const verification = result.verification;
-  if (!verification) {
-    throw new Error(
-      "Backend did not return Codex Agent file-write verification.",
-    );
-  }
-  if (!verification.databasePersisted) {
-    throw new Error(
-      "Backend did not confirm that the V2 sub-agent configuration was written to the database.",
-    );
-  }
-  if (verification.activation !== "restart_codex_and_start_new_session") {
-    throw new Error(
-      "Backend returned inconsistent Codex Agent activation conditions.",
-    );
-  }
-
-  switch (result.projection?.status) {
-    case "applied": {
-      const filesVerified =
-        Array.isArray(verification.roleFiles) &&
-        verification.roleFiles.every(
-          (file) => file.exists && file.contentMatches,
-        );
-      if (verification.roleFilesStatus !== "verified" || !filesVerified) {
-        throw new Error(
-          "Codex Agent file read-back verification failed after writing.",
-        );
-      }
-      return "Database and Codex Agent file were written and read back successfully; restart Codex/app-server and create a new session to apply";
-    }
-    case "not_required":
-      if (
-        verification.roleFilesStatus !== "not_required" ||
-        !Array.isArray(verification.roleFiles) ||
-        verification.roleFiles.length !== 0
-      ) {
-        throw new Error(
-          "Codex Agent file verification is inconsistent for a non-active plan.",
-        );
-      }
-      return "Database saved; the current plan is inactive, so the Codex Agent file was not changed";
-    case "pending_retry":
-      if (
-        verification.roleFilesStatus !== "pending_retry" ||
-        !Array.isArray(verification.roleFiles) ||
-        verification.roleFiles.length !== 0
-      ) {
-        throw new Error(
-          "Codex Agent pending-retry state failed backend consistency checks.",
-        );
-      }
-      return "Database saved; Codex Agent file projection is pending an automatic retry";
-    default:
-      throw new Error(
-        "Backend did not return a clear Codex Agent projection state.",
-      );
-  }
-}
-
 function isUsableProfile(value: unknown): value is CodexSubagentV2Profile {
   if (!isRecord(value) || typeof value.model !== "string") return false;
   if (typeof value.enabled !== "boolean" || !isRecord(value.questionnaire)) {
@@ -278,6 +221,15 @@ function readRawProfiles(
   config: CodexSubagentV2Config,
 ): Record<string, unknown> {
   return isRecord(config.profiles) ? config.profiles : {};
+}
+
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebounced(value), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [value, delayMs]);
+  return debounced;
 }
 
 function defaultProfileForModel(model: string): CodexSubagentV2Profile | null {
@@ -351,27 +303,9 @@ function readPersistedConfig(provider: Provider): CodexSubagentV2Config | null {
   };
 }
 
-function inferredInputModalities(
-  provider: Provider,
-  profile: CodexSubagentV2Profile,
-  projectedModelCatalog?: unknown,
+function catalogInputModalities(
+  entry: unknown,
 ): CodexSubagentV2Profile["inputModalities"] {
-  if (profile.inputModalities) return profile.inputModalities;
-  const providerModelCatalog = readCodexCatalogSettings(
-    provider.settingsConfig,
-  );
-  const catalog =
-    includedModelCatalog(projectedModelCatalog) ??
-    includedModelCatalog(providerModelCatalog);
-  const models = catalog && Array.isArray(catalog.models) ? catalog.models : [];
-  const entry = models.find(
-    (candidate) =>
-      isRecord(candidate) &&
-      typeof candidate.model === "string" &&
-      candidate.model.localeCompare(profile.model, undefined, {
-        sensitivity: "accent",
-      }) === 0,
-  );
   if (!isRecord(entry)) return undefined;
   const declared = entry.inputModalities ?? entry.input_modalities;
   if (Array.isArray(declared)) {
@@ -507,18 +441,45 @@ function strengthError(profiles: Record<string, unknown>) {
     : null;
 }
 
+type SubagentMutationCoordinator = {
+  acquire: () => boolean;
+  release: () => void;
+};
+
+type SubagentMutationScope = {
+  providerId: string;
+  contextKey: string;
+  adoptedContextKey?: string;
+};
+type SubagentMutationOperation = {
+  scope: SubagentMutationScope;
+  release?: () => void;
+  settled: boolean;
+};
+
 export function CodexSubagentProfileEditor({
   provider,
   modelCatalog,
   onPersisted,
+  mutationCoordinator,
+  mutationDisabled = false,
 }: {
   provider: Provider;
   modelCatalog?: unknown;
   onPersisted?: (provider: Provider) => void;
+  mutationCoordinator?: SubagentMutationCoordinator;
+  mutationDisabled?: boolean;
 }) {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const persistedConfig = readPersistedConfig(provider);
-  const persistedKey = JSON.stringify(persistedConfig);
+  const persistedConfig = useMemo(
+    () => readPersistedConfig(provider),
+    [provider.id, provider.settingsConfig],
+  );
+  const persistedKey = useMemo(
+    () => JSON.stringify(persistedConfig),
+    [persistedConfig],
+  );
   const [draft, setDraft] = useState<CodexSubagentV2Config | null>(
     persistedConfig,
   );
@@ -537,6 +498,11 @@ export function CodexSubagentProfileEditor({
   const [statusError, setStatusError] = useState<string | null>(null);
   const [reasoningCapabilities, setReasoningCapabilities] =
     useState<CodexSubagentReasoningCapabilities>({});
+  // Transient provenance for the capability result, not another persisted
+  // capability source. Mutating actions must not trust an older draft/provider
+  // snapshot while fresh diagnostics are queued or still in flight.
+  const [reasoningCapabilitiesRequest, setReasoningCapabilitiesRequest] =
+    useState<object | null>(null);
   const [strengthLimitMessage, setStrengthLimitMessage] = useState<
     string | null
   >(null);
@@ -545,11 +511,60 @@ export function CodexSubagentProfileEditor({
   const [projectionWarning, setProjectionWarning] = useState<string | null>(
     null,
   );
-  const [isSaving, setIsSaving] = useState(false);
+  const mutationContextKey = useMemo(
+    () => JSON.stringify([provider.settingsConfig, modelCatalog]),
+    [provider.settingsConfig, modelCatalog],
+  );
+  const mutationScope = useRef<SubagentMutationScope>({
+    providerId: provider.id,
+    contextKey: mutationContextKey,
+  });
+  if (
+    mutationScope.current.providerId !== provider.id ||
+    mutationScope.current.contextKey !== mutationContextKey
+  ) {
+    if (
+      mutationScope.current.providerId === provider.id &&
+      mutationScope.current.adoptedContextKey === mutationContextKey
+    ) {
+      // Canonical props acknowledged this operation's exact backend result.
+      // It is not an external edit and must not cancel the pending success UI.
+      mutationScope.current.contextKey = mutationContextKey;
+      delete mutationScope.current.adoptedContextKey;
+    } else {
+      // Invalidate before passive effects, including A -> B -> A and external
+      // same-ID settings/catalog refreshes while a validation/write is pending.
+      mutationScope.current = {
+        providerId: provider.id,
+        contextKey: mutationContextKey,
+      };
+    }
+  }
+  const mutationMounted = useRef(false);
+  const activeMutation = useRef<SubagentMutationOperation | null>(null);
+  const [savingMutation, setSavingMutation] =
+    useState<SubagentMutationOperation | null>(null);
+  const isSaving = savingMutation?.scope === mutationScope.current;
+  const onPersistedRef = useRef(onPersisted);
+  onPersistedRef.current = onPersisted;
+
+  useEffect(() => {
+    mutationMounted.current = true;
+    return () => {
+      mutationMounted.current = false;
+      // Do not release the shared write lock here. A started database mutation
+      // must finish before another editor can write the same provider state.
+      mutationScope.current = { ...mutationScope.current };
+    };
+  }, []);
   const [profileSearch, setProfileSearch] = useState("");
   const [profileFilter, setProfileFilter] = useState<ProfileFilter>("all");
   const [showOfficialProfiles, setShowOfficialProfiles] = useState(false);
   const [openProfileKey, setOpenProfileKey] = useState("");
+  // A preview compiles all configured roles for cross-profile name collisions,
+  // but only the currently open row needs its result. Keep openProfileKey as
+  // the single selection source of truth instead of tracking a second target.
+  const diagnosticsProviderId = useRef(provider.id);
   const backendAdoptedPersistedKey = useRef<{
     providerId: string;
     persistedKey: string;
@@ -564,6 +579,68 @@ export function CodexSubagentProfileEditor({
         : [],
     [draft],
   );
+  // Cache model resolution for the lifetime of this backend snapshot. Preview
+  // updates should not repeat the N-profile case-insensitive capability scan.
+  // Map also keeps model IDs such as "constructor" out of Object's prototype.
+  const reasoningCapabilityForModel = useMemo(() => {
+    const capabilities = Object.entries(reasoningCapabilities);
+    const byModel = new Map<
+      string,
+      CodexSubagentReasoningCapability | undefined
+    >(capabilities);
+    return (model: string) => {
+      if (!byModel.has(model)) {
+        byModel.set(
+          model,
+          capabilities.find(
+            ([candidate]) =>
+              candidate.localeCompare(model, undefined, {
+                sensitivity: "accent",
+              }) === 0,
+          )?.[1],
+        );
+      }
+      return byModel.get(model);
+    };
+  }, [reasoningCapabilities]);
+  const inputModalitiesForModel = useMemo(() => {
+    const catalog =
+      includedModelCatalog(modelCatalog) ??
+      includedModelCatalog(readCodexCatalogSettings(provider.settingsConfig));
+    const models =
+      catalog && Array.isArray(catalog.models) ? catalog.models : [];
+    const byModel = new Map<
+      string,
+      CodexSubagentV2Profile["inputModalities"]
+    >();
+    return (model: string) => {
+      if (!byModel.has(model)) {
+        const entry = models.find(
+          (candidate) =>
+            isRecord(candidate) &&
+            typeof candidate.model === "string" &&
+            candidate.model.localeCompare(model, undefined, {
+              sensitivity: "accent",
+            }) === 0,
+        );
+        byModel.set(model, catalogInputModalities(entry));
+      }
+      return byModel.get(model);
+    };
+  }, [provider.settingsConfig, modelCatalog]);
+  const reasoningCapabilityByProfileKey = useMemo(() => {
+    const statusByKey = new Map(
+      (statuses?.profiles ?? []).map((status) => [status.profileKey, status]),
+    );
+    return new Map(
+      usableProfileEntries.map(([profileKey, profile]) => [
+        profileKey,
+        reasoningCapabilityForModel(profile.model) ??
+          previews[profileKey]?.reasoningCapability ??
+          statusByKey.get(profileKey)?.reasoningCapability,
+      ]),
+    );
+  }, [usableProfileEntries, reasoningCapabilityForModel, previews, statuses]);
   const usableProfileKeySignature = usableProfileEntries
     .map(([profileKey]) => profileKey)
     .join("\n");
@@ -575,8 +652,8 @@ export function CodexSubagentProfileEditor({
     backendAdoptedPersistedKey.current?.providerId === provider.id
       ? backendAdoptedPersistedKey.current.persistedKey
       : persistedKey;
-  const isDirty =
-    draft !== null && JSON.stringify(draft) !== effectivePersistedKey;
+  const draftKey = useMemo(() => JSON.stringify(draft), [draft]);
+  const isDirty = draft !== null && draftKey !== effectivePersistedKey;
 
   useEffect(() => {
     const usableKeys = new Set(
@@ -588,48 +665,101 @@ export function CodexSubagentProfileEditor({
   }, [provider.id, usableProfileKeySignature, defaultOpenProfileKey]);
 
   useEffect(() => {
+    const providerChanged = diagnosticsProviderId.current !== provider.id;
+    diagnosticsProviderId.current = provider.id;
     const adopted = backendAdoptedPersistedKey.current;
     const isBackendAdoptedRefresh =
       adopted?.providerId === provider.id &&
       adopted.persistedKey === persistedKey;
     backendAdoptedPersistedKey.current = null;
-    setDraft(readPersistedConfig(provider));
-    setSaveMessage(null);
-    setSaveError(null);
-    if (!isBackendAdoptedRefresh) setProjectionWarning(null);
+    setDraft(persistedConfig);
+    if (!isBackendAdoptedRefresh) {
+      setSaveMessage(null);
+      setSaveError(null);
+      setProjectionWarning(null);
+    }
     setStrengthLimitMessage(null);
     setNicknameDrafts({});
-    setStatusError(null);
+    // A save/cache refresh may merely make persisted settings catch up to the
+    // already diagnosed draft. Preserve that matching snapshot: its request
+    // key will not change and no replacement diagnostics would be scheduled.
+    // Only a provider switch must discard all per-provider cached results.
+    if (providerChanged) {
+      setPreviews({});
+      setPreviewErrors({});
+      setStatuses(null);
+      setReasoningCapabilities({});
+      setReasoningCapabilitiesRequest(null);
+      setStatusError(null);
+    }
   }, [provider.id, persistedKey]);
 
-  const diagnosticSettings = draft
-    ? settingsForDiagnostics(provider, draft, modelCatalog)
-    : includedModelCatalog(modelCatalog)
-      ? {
-          ...provider.settingsConfig,
-          modelCatalog: includedModelCatalog(modelCatalog),
-        }
-      : provider.settingsConfig;
-  const diagnosticSettingsKey = JSON.stringify(diagnosticSettings);
-
+  const diagnosticSettings = useMemo(
+    () =>
+      draft
+        ? settingsForDiagnostics(provider, draft, modelCatalog)
+        : includedModelCatalog(modelCatalog)
+          ? {
+              ...provider.settingsConfig,
+              modelCatalog: includedModelCatalog(modelCatalog),
+            }
+          : provider.settingsConfig,
+    [provider.settingsConfig, draft, modelCatalog],
+  );
+  // Provider identity is part of the request scope even if two providers have
+  // identical settings. Otherwise an old provider's result can commit after a
+  // switch without any dependency changing.
+  const diagnosticSettingsKey = useMemo(
+    () => JSON.stringify([provider.id, draft !== null, diagnosticSettings]),
+    [provider.id, draft !== null, diagnosticSettings],
+  );
+  // Checkbox/select edits can arrive in quick succession while a user works
+  // through one profile. Debounce the read-only diagnostics so a burst does
+  // not enqueue three backend invocations per keystroke.
+  const diagnosticRequest = useMemo(
+    () => ({ settingsConfig: diagnosticSettings }),
+    [diagnosticSettingsKey],
+  );
+  const debouncedDiagnosticRequest = useDebouncedValue(diagnosticRequest, 120);
+  const reasoningCapabilitiesReady =
+    reasoningCapabilitiesRequest === diagnosticRequest;
   useEffect(() => {
     if (!draft) {
       setReasoningCapabilities({});
+      setReasoningCapabilitiesRequest(null);
       return;
     }
+    // Depend on the immediate key too: cleanup must invalidate old responses
+    // as soon as a draft changes, not 120 ms later when the debounce settles.
+    if (diagnosticRequest !== debouncedDiagnosticRequest) return;
     let ignore = false;
     codexSubagentV2Api
-      .getReasoningCapabilities(diagnosticSettings)
+      .getReasoningCapabilities(diagnosticRequest.settingsConfig)
       .then((result) => {
-        if (!ignore) setReasoningCapabilities(result);
+        if (ignore) return;
+        setReasoningCapabilities(result);
+        setReasoningCapabilitiesRequest(diagnosticRequest);
       })
       .catch(() => {
-        if (!ignore) setReasoningCapabilities({});
+        if (ignore) return;
+        setReasoningCapabilities({});
+        setReasoningCapabilitiesRequest(null);
       });
     return () => {
       ignore = true;
     };
-  }, [diagnosticSettingsKey]);
+  }, [diagnosticRequest, debouncedDiagnosticRequest]);
+
+  useEffect(() => {
+    if (!reasoningCapabilitiesReady) return;
+    setDraft((current) => {
+      if (!current) return current;
+      return normalizeUnavailableFixedReasoningPolicies(
+        current,
+        reasoningCapabilityForModel,
+      );
+    });
+  }, [reasoningCapabilitiesReady, reasoningCapabilityForModel]);
 
   useEffect(() => {
     if (!draft) {
@@ -637,10 +767,11 @@ export function CodexSubagentProfileEditor({
       setStatusError(null);
       return;
     }
+    if (diagnosticRequest !== debouncedDiagnosticRequest) return;
     let ignore = false;
     setStatusError(null);
     codexSubagentV2Api
-      .getProfileStatuses(diagnosticSettings)
+      .getProfileStatuses(diagnosticRequest.settingsConfig)
       .then((result) => {
         if (!ignore) setStatuses(result);
       })
@@ -655,7 +786,7 @@ export function CodexSubagentProfileEditor({
     return () => {
       ignore = true;
     };
-  }, [diagnosticSettingsKey]);
+  }, [diagnosticRequest, debouncedDiagnosticRequest]);
 
   useEffect(() => {
     if (!draft) {
@@ -663,88 +794,152 @@ export function CodexSubagentProfileEditor({
       setPreviewErrors({});
       return;
     }
+    if (diagnosticRequest !== debouncedDiagnosticRequest) return;
+    if (!openProfileKey) return;
+    const profile = readRawProfiles(draft)[openProfileKey];
+    if (!isUsableProfile(profile)) return;
+
     let ignore = false;
-    const entries = Object.entries(readRawProfiles(draft)).filter(
-      (entry): entry is [string, CodexSubagentV2Profile] =>
-        isUsableProfile(entry[1]),
-    );
-    Promise.all(
-      entries.map(async ([profileKey, profile]) => {
-        try {
-          const preview = await codexSubagentV2Api.previewProfile(
-            diagnosticSettings,
-            profile.model,
-            profile,
-          );
-          return { profileKey, preview } as const;
-        } catch (error) {
-          return {
-            profileKey,
-            error: error instanceof Error ? error.message : String(error),
-          } as const;
-        }
-      }),
-    ).then((results) => {
-      if (ignore) return;
-      const nextPreviews: Record<string, CodexSubagentProfilePreview> = {};
-      const nextErrors: Record<string, string> = {};
-      for (const result of results) {
-        if ("preview" in result && result.preview)
-          nextPreviews[result.profileKey] = result.preview;
-        else nextErrors[result.profileKey] = result.error;
-      }
-      setPreviews(nextPreviews);
-      setPreviewErrors(nextErrors);
+    // Clear only the requested row's old error. Other rows remain untouched
+    // because they are not being recomputed in this render.
+    setPreviewErrors((current) => {
+      if (!(openProfileKey in current)) return current;
+      const next = { ...current };
+      delete next[openProfileKey];
+      return next;
     });
+    codexSubagentV2Api
+      .previewProfile(diagnosticRequest.settingsConfig, profile.model, profile)
+      .then((preview) => {
+        if (ignore) return;
+        setPreviews((current) => ({
+          ...current,
+          [openProfileKey]: preview,
+        }));
+      })
+      .catch((error) => {
+        if (ignore) return;
+        setPreviewErrors((current) => ({
+          ...current,
+          [openProfileKey]:
+            error instanceof Error ? error.message : String(error),
+        }));
+      });
     return () => {
+      // Tauri invoke promises cannot be cancelled, so stale responses are
+      // ignored when the user switches rows or edits a newer draft.
       ignore = true;
     };
-  }, [diagnosticSettingsKey]);
+  }, [diagnosticRequest, debouncedDiagnosticRequest, openProfileKey]);
+
+  function isCurrentMutation(operation: SubagentMutationOperation) {
+    return (
+      mutationMounted.current &&
+      mutationScope.current === operation.scope &&
+      activeMutation.current === operation &&
+      !operation.settled
+    );
+  }
+
+  function beginMutation(): SubagentMutationOperation | null {
+    if (
+      !mutationMounted.current ||
+      mutationDisabled ||
+      (activeMutation.current?.scope === mutationScope.current &&
+        !activeMutation.current.settled)
+    ) {
+      return null;
+    }
+    const coordinator = mutationCoordinator;
+    if (coordinator && !coordinator.acquire()) return null;
+    const operation: SubagentMutationOperation = {
+      scope: mutationScope.current,
+      release: coordinator ? () => coordinator.release() : undefined,
+      settled: false,
+    };
+    // Ref ownership closes the same-tick double-click gap before React renders
+    // disabled controls. State is only the current scope's visual projection.
+    activeMutation.current = operation;
+    setSavingMutation(operation);
+    setSaveError(null);
+    setSaveMessage(null);
+    return operation;
+  }
+
+  function finishMutation(operation: SubagentMutationOperation) {
+    if (operation.settled) return;
+    const current = isCurrentMutation(operation);
+    operation.settled = true;
+    if (activeMutation.current === operation) activeMutation.current = null;
+    if (current) setSavingMutation(null);
+    operation.release?.();
+  }
 
   async function adoptBackendProvider(
     nextProvider: CodexSubagentV2MutationProvider,
+    operation: SubagentMutationOperation,
   ) {
-    const nextConfig = readPersistedConfig(nextProvider);
-    if (!nextConfig) {
-      throw new Error(
-        "Backend did not return the saved V2 sub-agent capability configuration.",
-      );
+    try {
+      if (!isCurrentMutation(operation)) return;
+      if (nextProvider.id !== operation.scope.providerId) {
+        throw new Error(
+          "Backend returned a different provider for the saved configuration.",
+        );
+      }
+      const nextConfig = readPersistedConfig(nextProvider);
+      if (!nextConfig) {
+        throw new Error(
+          "Backend did not return the saved V2 sub-agent capability configuration.",
+        );
+      }
+      backendAdoptedPersistedKey.current = {
+        providerId: nextProvider.id,
+        persistedKey: JSON.stringify(nextConfig),
+      };
+      operation.scope.adoptedContextKey = JSON.stringify([
+        nextProvider.settingsConfig,
+        modelCatalog,
+      ]);
+      setDraft(nextConfig);
+      setProjectionWarning(nextProvider.projection?.warning?.message ?? null);
+      onPersistedRef.current?.(nextProvider);
+    } finally {
+      // The write already succeeded. Refresh canonical providers even when its
+      // editor was switched/unmounted or its response cannot safely be adopted.
+      await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
     }
-    backendAdoptedPersistedKey.current = {
-      providerId: nextProvider.id,
-      persistedKey: JSON.stringify(nextConfig),
-    };
-    setDraft(nextConfig);
-    setProjectionWarning(nextProvider.projection?.warning?.message ?? null);
-    onPersisted?.(nextProvider);
-    await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
   }
 
-  async function persist(nextConfig: CodexSubagentV2Config) {
+  async function persist(
+    nextConfig: CodexSubagentV2Config,
+    operation: SubagentMutationOperation,
+  ) {
     const nextProvider = await codexSubagentV2Api.updateProviderConfig(
-      provider.id,
+      operation.scope.providerId,
       nextConfig,
     );
-    await adoptBackendProvider(nextProvider);
+    await adoptBackendProvider(nextProvider, operation);
     return nextProvider;
   }
 
   async function initialize() {
-    setIsSaving(true);
-    setSaveError(null);
-    setSaveMessage(null);
+    const operation = beginMutation();
+    if (!operation) return;
     try {
       const nextProvider = await codexSubagentV2Api.initializeProviderConfig(
-        provider.id,
+        operation.scope.providerId,
       );
-      await adoptBackendProvider(nextProvider);
+      await adoptBackendProvider(nextProvider, operation);
+      if (!isCurrentMutation(operation)) return;
       setSaveMessage(
         `V2 sub-agent capability configuration initialized;${evaluateMutationResult(nextProvider)}`,
       );
     } catch (error) {
-      setSaveError(error instanceof Error ? error.message : String(error));
+      if (isCurrentMutation(operation)) {
+        setSaveError(error instanceof Error ? error.message : String(error));
+      }
     } finally {
-      setIsSaving(false);
+      finishMutation(operation);
     }
   }
 
@@ -752,16 +947,16 @@ export function CodexSubagentProfileEditor({
     action: CodexSubagentV2ReconcileAction,
     currentDraft: CodexSubagentV2Config,
   ) {
-    setIsSaving(true);
-    setSaveError(null);
-    setSaveMessage(null);
+    const operation = beginMutation();
+    if (!operation) return;
     try {
       const nextProvider = await codexSubagentV2Api.reconcileProviderProfiles(
-        provider.id,
+        operation.scope.providerId,
         action,
         currentDraft,
       );
-      await adoptBackendProvider(nextProvider);
+      await adoptBackendProvider(nextProvider, operation);
+      if (!isCurrentMutation(operation)) return;
       const actionMessage =
         action === "sync_catalog"
           ? "Missing model profiles repaired; existing settings were preserved"
@@ -774,9 +969,11 @@ export function CodexSubagentProfileEditor({
         `${actionMessage}; ${evaluateMutationResult(nextProvider)}`,
       );
     } catch (error) {
-      setSaveError(error instanceof Error ? error.message : String(error));
+      if (isCurrentMutation(operation)) {
+        setSaveError(error instanceof Error ? error.message : String(error));
+      }
     } finally {
-      setIsSaving(false);
+      finishMutation(operation);
     }
   }
 
@@ -859,19 +1056,29 @@ export function CodexSubagentProfileEditor({
   }
 
   async function save() {
-    if (!draft) return;
-    const rawProfiles = readRawProfiles(draft);
+    if (!draft || mutationDisabled) return;
+    const draftSnapshot = normalizeUnavailableFixedReasoningPolicies(
+      draft,
+      reasoningCapabilityForModel,
+    );
+    if (draftSnapshot !== draft) setDraft(draftSnapshot);
+    const rawProfiles = readRawProfiles(draftSnapshot);
     const localError = strengthError(rawProfiles) ?? nicknameError(rawProfiles);
     if (localError) {
       setSaveError(localError);
       return;
     }
-    setIsSaving(true);
-    setSaveError(null);
-    setSaveMessage(null);
+    const operation = beginMutation();
+    if (!operation) return;
     try {
-      const authoritativeStatuses =
-        await codexSubagentV2Api.getProfileStatuses(diagnosticSettings);
+      const authoritativeStatuses = await codexSubagentV2Api.getProfileStatuses(
+        draftSnapshot === draft
+          ? diagnosticSettings
+          : settingsForDiagnostics(provider, draftSnapshot, modelCatalog),
+      );
+      // Validation is read-only. Do not start its subsequent write if this
+      // editor stopped owning the provider while diagnostics were in flight.
+      if (!isCurrentMutation(operation)) return;
       setStatuses(authoritativeStatuses);
       setStatusError(null);
       const blocking = authoritativeStatuses.profiles.filter(
@@ -919,12 +1126,15 @@ export function CodexSubagentProfileEditor({
               .join("; "),
         );
       }
-      const result = await persist(draft);
+      const result = await persist(draftSnapshot, operation);
+      if (!isCurrentMutation(operation)) return;
       setSaveMessage(evaluateMutationResult(result));
     } catch (error) {
-      setSaveError(error instanceof Error ? error.message : String(error));
+      if (isCurrentMutation(operation)) {
+        setSaveError(error instanceof Error ? error.message : String(error));
+      }
     } finally {
-      setIsSaving(false);
+      finishMutation(operation);
     }
   }
 
@@ -935,7 +1145,11 @@ export function CodexSubagentProfileEditor({
           The current plan still uses compatibility legacy managed roles.
           Explicit questionnaire input is persisted after initialization.
         </p>
-        <Button className="mt-3" onClick={initialize} disabled={isSaving}>
+        <Button
+          className="mt-3"
+          onClick={initialize}
+          disabled={isSaving || mutationDisabled}
+        >
           Initialize V2 sub-agent capabilities
         </Button>
         {saveError ? (
@@ -1019,6 +1233,52 @@ export function CodexSubagentProfileEditor({
       return haystack.includes(profileSearch.trim().toLocaleLowerCase());
     });
 
+  // Bulk changes require the current catalog capability response itself.
+  // Preview/status fallbacks remain useful for display, but cannot authorize
+  // changing a model that disappeared from the current capability snapshot.
+  const maxSupportedProfileKeys = profileEntries
+    .filter(([, profile]) =>
+      reasoningCapabilityForModel(
+        profile.model,
+      )?.codexSelectableEfforts.includes("max"),
+    )
+    .map(([profileKey]) => profileKey);
+  const maxConfiguredProfileCount = maxSupportedProfileKeys.filter(
+    (profileKey) => {
+      const profile = draft.profiles[profileKey];
+      return (
+        profile.reasoning.policy === "fixed" &&
+        profile.reasoning.effort === "max"
+      );
+    },
+  ).length;
+
+  function useMaxForSupportedProfiles() {
+    const supportedKeys = new Set(maxSupportedProfileKeys);
+    if (!reasoningCapabilitiesReady || supportedKeys.size === 0) return;
+    setSaveError(null);
+    setDraft((current) => {
+      if (!current) return current;
+      const profiles = { ...current.profiles };
+      for (const profileKey of supportedKeys) {
+        const profile = profiles[profileKey];
+        if (!isUsableProfile(profile)) continue;
+        profiles[profileKey] = {
+          ...profile,
+          reasoning: { policy: "fixed", effort: "max" },
+        };
+      }
+      return { ...current, profiles };
+    });
+    setSaveMessage(
+      t("codexSubagentReasoning.bulkMaxApplied", {
+        count: supportedKeys.size,
+        defaultValue:
+          "Selected max for supported profiles ({{count}}). Save to apply.",
+      }),
+    );
+  }
+
   const saveState = saveError ? "error" : isDirty ? "dirty" : "saved";
 
   return (
@@ -1026,7 +1286,38 @@ export function CodexSubagentProfileEditor({
       data-theme-contract="codex-subagent-v2"
       className="space-y-4 rounded-xl border border-blue-200/80 bg-gradient-to-br from-blue-50/80 via-background to-violet-50/70 p-4 shadow-sm dark:border-blue-500/30 dark:from-blue-950/25 dark:via-slate-950/40 dark:to-violet-950/20"
     >
-      <fieldset disabled={isSaving} className="contents">
+      <fieldset disabled={isSaving || mutationDisabled} className="contents">
+        <section
+          aria-labelledby="codex-subagent-governance-title"
+          className="space-y-2 rounded-lg border border-amber-200 bg-amber-50/70 p-3 text-xs leading-5 text-amber-950 dark:border-amber-500/35 dark:bg-amber-950/20 dark:text-amber-100"
+        >
+          <h3
+            id="codex-subagent-governance-title"
+            className="text-sm font-semibold"
+          >
+            {t("codexSubagentGovernance.title", {
+              defaultValue: "Guidance and execution permissions",
+            })}
+          </h3>
+          <p>
+            {t("codexSubagentGovernance.baselineHint", {
+              defaultValue:
+                "Custom role text supplements generated baseline instructions; it cannot replace baseline scope, ownership, or repository restrictions.",
+            })}
+          </p>
+          <p>
+            {t("codexSubagentGovernance.delegationHint", {
+              defaultValue:
+                "Delegating a task does not authorize image or release builds, shared-process or container lifecycle changes, installation, publishing, or release. These actions require explicit user authorization and compliance with repository rules. Scoped test compilation is allowed only within authorized work.",
+            })}
+          </p>
+          <p>
+            {t("codexSubagentGovernance.permissionsHint", {
+              defaultValue:
+                "Host sandbox and tool permissions are inherited separately. High/Max changes reasoning effort, not operational access. Instruction guidance does not guarantee model compliance.",
+            })}
+          </p>
+        </section>
         <section
           data-subagent-panel="strategy"
           className="space-y-3 rounded-lg border border-blue-200 bg-blue-50/70 p-3 dark:border-blue-500/40 dark:bg-blue-950/20"
@@ -1057,6 +1348,51 @@ export function CodexSubagentProfileEditor({
               <option value="third_party_first">Third-party first</option>
             </select>
           </label>
+
+          <div
+            data-subagent-reasoning-summary
+            className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-indigo-200/80 bg-background/60 px-3 py-2 dark:border-indigo-500/30 dark:bg-slate-950/30"
+          >
+            <div className="min-w-0 text-xs">
+              <p className="font-medium text-indigo-950 dark:text-indigo-100">
+                {reasoningCapabilitiesReady &&
+                maxSupportedProfileKeys.length === 0
+                  ? t("codexSubagentReasoning.bulkMaxUnavailable", {
+                      defaultValue: "No profiles currently advertise max",
+                    })
+                  : t("codexSubagentReasoning.bulkMaxStatus", {
+                      configured: maxConfiguredProfileCount,
+                      supported: maxSupportedProfileKeys.length,
+                      defaultValue:
+                        "Max effort: {{configured}} / {{supported}} supported profiles",
+                    })}
+              </p>
+              <p className="mt-1 text-muted-foreground">
+                {reasoningCapabilitiesReady
+                  ? t("codexSubagentReasoning.bulkMaxHint", {
+                      defaultValue:
+                        "Only models that advertise max are changed. Other profiles stay unchanged. Save to apply.",
+                    })
+                  : t("codexSubagentReasoning.bulkMaxChecking", {
+                      defaultValue: "Checking current model capabilities…",
+                    })}
+              </p>
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={useMaxForSupportedProfiles}
+              disabled={
+                !reasoningCapabilitiesReady ||
+                maxConfiguredProfileCount === maxSupportedProfileKeys.length
+              }
+            >
+              {t("codexSubagentReasoning.bulkMaxAction", {
+                defaultValue: "Use Max where supported",
+              })}
+            </Button>
+          </div>
 
           <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
             <label
@@ -1211,45 +1547,68 @@ export function CodexSubagentProfileEditor({
                 const preview = previews[profileKey];
                 const status = statusByProfileKey.get(profileKey);
                 const reasoningCapability =
-                  Object.entries(reasoningCapabilities).find(
-                    ([model]) =>
-                      model.localeCompare(profile.model, undefined, {
-                        sensitivity: "accent",
-                      }) === 0,
-                  )?.[1] ??
-                  preview?.reasoningCapability ??
-                  status?.reasoningCapability;
+                  reasoningCapabilityByProfileKey.get(profileKey);
                 const selectableFixedEfforts = (
                   reasoningCapability?.codexSelectableEfforts ?? []
                 ).filter(
                   (effort): effort is CodexSubagentExplicitReasoningEffort =>
-                    effort !== "none" && EXPLICIT_REASONING_EFFORTS.has(effort),
+                    SUBAGENT_FIXED_REASONING_EFFORTS.includes(
+                      effort as (typeof SUBAGENT_FIXED_REASONING_EFFORTS)[number],
+                    ),
                 );
+                const preferredFixedEffort =
+                  SUBAGENT_FIXED_REASONING_EFFORTS.find((effort) =>
+                    selectableFixedEfforts.includes(effort),
+                  );
+                const savedFixedEffortUnavailable =
+                  profile.reasoning.policy === "fixed" &&
+                  !selectableFixedEfforts.includes(profile.reasoning.effort);
                 const reasoningPolicyOptions: Array<[string, string]> = [
-                  ["delegated", "Allow the parent agent / spawn to specify"],
+                  [
+                    "delegated",
+                    t("codexSubagentReasoning.delegatedOption", {
+                      defaultValue: "Allow the parent agent / spawn to specify",
+                    }),
+                  ],
                 ];
-                if (reasoningCapability?.providerDefaultEffort) {
+                if (
+                  reasoningCapability?.providerDefaultEffort ||
+                  profile.reasoning.policy === "model_default"
+                ) {
                   reasoningPolicyOptions.push([
                     "model_default",
-                    "Use model default (fixed)",
+                    t("codexSubagentReasoning.modelDefaultOption", {
+                      defaultValue: "Use model default (fixed)",
+                    }),
                   ]);
                 }
-                if (selectableFixedEfforts.length > 0) {
-                  reasoningPolicyOptions.push(["fixed", "Fixed effort"]);
+                if (
+                  selectableFixedEfforts.length > 0 ||
+                  profile.reasoning.policy === "fixed"
+                ) {
+                  reasoningPolicyOptions.push([
+                    "fixed",
+                    t("codexSubagentReasoning.fixedOption", {
+                      defaultValue: "Fixed effort",
+                    }),
+                  ]);
                 }
-                if (reasoningCapability?.disableAllowed) {
+                if (
+                  reasoningCapability?.disableAllowed ||
+                  profile.reasoning.policy === "disabled"
+                ) {
                   reasoningPolicyOptions.push([
                     "disabled",
-                    "Disable reasoning",
+                    t("codexSubagentReasoning.disabledOption", {
+                      defaultValue: "Disable reasoning",
+                    }),
                   ]);
                 }
                 const profileTone = profileToneFor(profile, status);
                 const overrides = profile.overrides ?? {};
-                const effectiveInputModalities = inferredInputModalities(
-                  provider,
-                  profile,
-                  modelCatalog,
-                );
+                const effectiveInputModalities =
+                  profile.inputModalities ??
+                  inputModalitiesForModel(profile.model);
                 const nicknameValue =
                   nicknameDrafts[profileKey] ??
                   (
@@ -1262,6 +1621,17 @@ export function CodexSubagentProfileEditor({
                     key={profileKey}
                     value={profileKey}
                     data-profile-tone={profileTone}
+                    // Closed offscreen cards need not participate in painting or
+                    // descendant layout. Keep the active editor uncontained so
+                    // expanding, keyboard focus, and native controls stay normal.
+                    style={
+                      openProfileKey === profileKey
+                        ? undefined
+                        : {
+                            contentVisibility: "auto",
+                            containIntrinsicBlockSize: "auto 9rem",
+                          }
+                    }
                     className={cn(
                       "rounded-xl border px-4 shadow-sm transition-colors",
                       profileToneClassName(profileTone),
@@ -1438,7 +1808,16 @@ export function CodexSubagentProfileEditor({
                           }
                         />
                         <QuestionnaireSelect
-                          label="Write scope"
+                          label={t("codexSubagentGovernance.writeScopeLabel", {
+                            defaultValue: "Write scope (instruction guidance)",
+                          })}
+                          description={t(
+                            "codexSubagentGovernance.writeScopeHint",
+                            {
+                              defaultValue:
+                                "Behavioral guidance only; this does not enforce a sandbox or lock tools.",
+                            },
+                          )}
                           value={profile.questionnaire.writeScope}
                           options={[
                             ["read_only", "Read-only"],
@@ -1475,41 +1854,152 @@ export function CodexSubagentProfileEditor({
                             }))
                           }
                         />
-                        <QuestionnaireSelect
-                          label="Reasoning policy"
-                          value={profile.reasoning.policy}
-                          options={reasoningPolicyOptions}
-                          onChange={(value) =>
-                            updateProfile(profileKey, (current) => ({
-                              ...current,
-                              reasoning:
-                                value === "fixed"
-                                  ? {
+                      </div>
+
+                      <section
+                        aria-label={t("codexSubagentReasoning.title", {
+                          defaultValue: "Reasoning",
+                        })}
+                        className="space-y-3 rounded-lg border border-indigo-200 bg-indigo-50/45 p-3 dark:border-indigo-500/35 dark:bg-indigo-950/20"
+                      >
+                        <h4 className="text-sm font-medium">
+                          {t("codexSubagentReasoning.title", {
+                            defaultValue: "Reasoning",
+                          })}
+                        </h4>
+                        <p className="text-xs text-muted-foreground">
+                          {t("codexSubagentReasoning.defaultHint", {
+                            defaultValue:
+                              "New Sub-Agent selections offer only Max or High. High is preferred when supported; Max remains available when explicitly selected. If neither is supported, no fixed effort is invented. Saved legacy choices are kept read-only.",
+                          })}
+                        </p>
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <QuestionnaireSelect
+                            label={t("codexSubagentReasoning.policyLabel", {
+                              defaultValue: "Reasoning policy",
+                            })}
+                            value={profile.reasoning.policy}
+                            options={reasoningPolicyOptions}
+                            onChange={(value) =>
+                              updateProfile(profileKey, (current) => {
+                                if (value === "fixed") {
+                                  if (
+                                    current.reasoning.policy === "fixed" ||
+                                    !preferredFixedEffort
+                                  ) {
+                                    return current;
+                                  }
+                                  return {
+                                    ...current,
+                                    reasoning: {
                                       policy: "fixed",
-                                      effort:
-                                        current.reasoning.policy === "fixed"
-                                          ? current.reasoning.effort
-                                          : (selectableFixedEfforts.find(
-                                              (effort) =>
-                                                effort ===
-                                                reasoningCapability?.providerDefaultEffort,
-                                            ) ??
-                                            (selectableFixedEfforts[0] as CodexSubagentExplicitReasoningEffort)),
-                                    }
-                                  : {
-                                      policy: value as
-                                        | "delegated"
-                                        | "model_default"
-                                        | "disabled",
+                                      effort: preferredFixedEffort,
                                     },
-                            }))
-                          }
-                        />
+                                  };
+                                }
+                                return {
+                                  ...current,
+                                  reasoning: {
+                                    policy: value as
+                                      | "delegated"
+                                      | "model_default"
+                                      | "disabled",
+                                  },
+                                };
+                              })
+                            }
+                          />
+                          <div className="grid gap-1 text-sm">
+                            <label
+                              htmlFor={`codex-subagent-${profileIndex}-model-reasoning`}
+                            >
+                              {t("codexSubagentReasoning.effortLabel", {
+                                defaultValue: "Model reasoning effort",
+                              })}
+                            </label>
+                            <select
+                              id={`codex-subagent-${profileIndex}-model-reasoning`}
+                              className="min-w-0 rounded-md border bg-background px-3 py-2"
+                              value={
+                                profile.reasoning.policy === "fixed"
+                                  ? profile.reasoning.effort
+                                  : ""
+                              }
+                              disabled={
+                                profile.reasoning.policy !== "fixed" ||
+                                selectableFixedEfforts.length === 0
+                              }
+                              onChange={(event) => {
+                                const effort = selectableFixedEfforts.find(
+                                  (candidate) =>
+                                    candidate === event.target.value,
+                                );
+                                if (!effort) return;
+                                updateProfile(profileKey, (current) => ({
+                                  ...current,
+                                  reasoning: { policy: "fixed", effort },
+                                }));
+                              }}
+                            >
+                              {profile.reasoning.policy !== "fixed" ? (
+                                <option value="" disabled>
+                                  {profile.reasoning.policy === "delegated"
+                                    ? t(
+                                        "codexSubagentReasoning.delegatedPlaceholder",
+                                        {
+                                          defaultValue:
+                                            "Parent/session chooses",
+                                        },
+                                      )
+                                    : profile.reasoning.policy ===
+                                        "model_default"
+                                      ? t(
+                                          "codexSubagentReasoning.modelDefaultPlaceholder",
+                                          { defaultValue: "Use model default" },
+                                        )
+                                      : t(
+                                          "codexSubagentReasoning.disabledPlaceholder",
+                                          {
+                                            defaultValue: "Reasoning disabled",
+                                          },
+                                        )}
+                                </option>
+                              ) : savedFixedEffortUnavailable ? (
+                                <option
+                                  value={profile.reasoning.effort}
+                                  disabled
+                                >
+                                  {t(
+                                    "codexSubagentReasoning.unavailableEffort",
+                                    {
+                                      effort: profile.reasoning.effort,
+                                      defaultValue:
+                                        "{{effort}} (saved; read-only; not offered for new selections)",
+                                    },
+                                  )}
+                                </option>
+                              ) : null}
+                              {selectableFixedEfforts.map((effort) => (
+                                <option key={effort} value={effort}>
+                                  {effort}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        </div>
+                        {profile.reasoning.policy === "delegated" ? (
+                          <p className="text-xs font-medium text-amber-900 dark:text-amber-100">
+                            {t("codexSubagentReasoning.delegatedWarning", {
+                              defaultValue:
+                                "Delegated effort may inherit the parent’s max or Ultra setting and increase usage. Choose Fixed effort to control this sub-agent’s cost.",
+                            })}
+                          </p>
+                        ) : null}
                         <ReasoningCapabilitySummary
                           capability={reasoningCapability}
                           policy={profile.reasoning}
                         />
-                      </div>
+                      </section>
 
                       <Collapsible>
                         <CollapsibleTrigger asChild>
@@ -1548,7 +2038,7 @@ export function CodexSubagentProfileEditor({
                             label="Role description"
                             value={
                               overrides.description ??
-                              preview?.description ??
+                              preview?.editableDescription ??
                               ""
                             }
                             automatic={overrides.description === undefined}
@@ -1564,9 +2054,16 @@ export function CodexSubagentProfileEditor({
                           <OverrideField
                             id={`codex-subagent-${profileIndex}-developer-instructions`}
                             label="Developer instructions"
+                            description={t(
+                              "codexSubagentGovernance.customInstructionsHint",
+                              {
+                                defaultValue:
+                                  "Custom text supplements the baseline; it cannot replace scope, ownership, or repository instructions. These are behavioral rules, not an execution sandbox.",
+                              },
+                            )}
                             value={
                               overrides.developerInstructions ??
-                              preview?.developerInstructions ??
+                              preview?.editableDeveloperInstructions ??
                               ""
                             }
                             automatic={
@@ -1611,65 +2108,6 @@ export function CodexSubagentProfileEditor({
                               restoreOverride(profileKey, "nicknameCandidates")
                             }
                           />
-                          <div className="grid gap-1 text-sm">
-                            <span className="flex items-center justify-between gap-2">
-                              <label
-                                htmlFor={`codex-subagent-${profileIndex}-model-reasoning`}
-                              >
-                                Model reasoning effort
-                              </label>
-                              <span className="text-xs text-muted-foreground">
-                                {profile.reasoning.policy === "fixed"
-                                  ? "Fixed"
-                                  : "Not fixed"}
-                              </span>
-                            </span>
-                            <div className="flex gap-2">
-                              <select
-                                id={`codex-subagent-${profileIndex}-model-reasoning`}
-                                className="min-w-0 flex-1 rounded-md border bg-background px-3 py-2"
-                                value={
-                                  profile.reasoning.policy === "fixed"
-                                    ? profile.reasoning.effort
-                                    : (preview?.modelReasoningEffort ?? "")
-                                }
-                                disabled={profile.reasoning.policy !== "fixed"}
-                                onChange={(event) =>
-                                  updateProfile(profileKey, (current) => ({
-                                    ...current,
-                                    reasoning: {
-                                      policy: "fixed",
-                                      effort: event.target
-                                        .value as CodexSubagentExplicitReasoningEffort,
-                                    },
-                                  }))
-                                }
-                              >
-                                {profile.reasoning.policy !== "fixed" ? (
-                                  <option value="" disabled>
-                                    Waiting for backend capability
-                                  </option>
-                                ) : null}
-                                {selectableFixedEfforts.map((effort) => (
-                                  <option key={effort} value={effort}>
-                                    {effort}
-                                  </option>
-                                ))}
-                              </select>
-                              <Button
-                                type="button"
-                                variant="outline"
-                                onClick={() =>
-                                  updateProfile(profileKey, (current) => ({
-                                    ...current,
-                                    reasoning: { policy: "delegated" },
-                                  }))
-                                }
-                              >
-                                Allow the parent agent / spawn to specify
-                              </Button>
-                            </div>
-                          </div>
                         </CollapsibleContent>
                       </Collapsible>
 
@@ -1815,7 +2253,7 @@ export function CodexSubagentProfileEditor({
         <Button
           className="bg-blue-600 text-white hover:bg-blue-500"
           onClick={save}
-          disabled={isSaving || !isDirty}
+          disabled={isSaving || mutationDisabled || !isDirty}
         >
           {isSaving ? "Saving…" : "Save V2 sub-agent configuration"}
         </Button>
@@ -2165,38 +2603,53 @@ function ProfileBackendOutput({
 
 function QuestionnaireSelect({
   label,
+  description,
   value,
   options,
   onChange,
 }: {
   label: string;
+  description?: string;
   value: string;
   options: Array<[string, string]>;
   onChange: (value: string) => void;
 }) {
+  const descriptionId = useId();
   return (
-    <label className="grid gap-1 rounded-lg border border-violet-200 bg-violet-50/60 p-3 text-sm dark:border-violet-500/35 dark:bg-violet-950/20">
-      <span className="font-medium text-violet-900 dark:text-violet-100">
-        {label}
-      </span>
-      <select
-        className="rounded-md border border-violet-200 bg-background/90 px-3 py-2 dark:border-violet-500/35 dark:bg-slate-950/60"
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      >
-        {options.map(([optionValue, optionLabel]) => (
-          <option key={optionValue} value={optionValue}>
-            {optionLabel}
-          </option>
-        ))}
-      </select>
-    </label>
+    <div className="grid gap-1 rounded-lg border border-violet-200 bg-violet-50/60 p-3 text-sm dark:border-violet-500/35 dark:bg-violet-950/20">
+      <label className="grid gap-1">
+        <span className="font-medium text-violet-900 dark:text-violet-100">
+          {label}
+        </span>
+        <select
+          aria-describedby={description ? descriptionId : undefined}
+          className="rounded-md border border-violet-200 bg-background/90 px-3 py-2 dark:border-violet-500/35 dark:bg-slate-950/60"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        >
+          {options.map(([optionValue, optionLabel]) => (
+            <option key={optionValue} value={optionValue}>
+              {optionLabel}
+            </option>
+          ))}
+        </select>
+      </label>
+      {description ? (
+        <p
+          id={descriptionId}
+          className="text-xs leading-5 text-muted-foreground"
+        >
+          {description}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
 function OverrideField({
   id,
   label,
+  description,
   value,
   automatic,
   restoreLabel,
@@ -2206,6 +2659,7 @@ function OverrideField({
 }: {
   id: string;
   label: string;
+  description?: string;
   value: string;
   automatic: boolean;
   restoreLabel: string;
@@ -2216,6 +2670,7 @@ function OverrideField({
   const control = multiline ? (
     <textarea
       id={id}
+      aria-describedby={description ? `${id}-description` : undefined}
       className="min-h-24 min-w-0 flex-1 rounded-md border bg-background px-3 py-2"
       value={value}
       onChange={(event) => onChange(event.target.value)}
@@ -2223,6 +2678,7 @@ function OverrideField({
   ) : (
     <input
       id={id}
+      aria-describedby={description ? `${id}-description` : undefined}
       className="min-w-0 flex-1 rounded-md border bg-background px-3 py-2"
       value={value}
       onChange={(event) => onChange(event.target.value)}
@@ -2242,6 +2698,14 @@ function OverrideField({
           {restoreLabel}
         </Button>
       </div>
+      {description ? (
+        <p
+          id={`${id}-description`}
+          className="text-xs leading-5 text-muted-foreground"
+        >
+          {description}
+        </p>
+      ) : null}
     </div>
   );
 }

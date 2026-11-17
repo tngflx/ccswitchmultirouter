@@ -49,6 +49,41 @@ describe("CodexEgressTimezoneStatusCard", () => {
     ).toBeInTheDocument();
   });
 
+  it("keeps healthy workspace details collapsed until requested", async () => {
+    vi.mocked(codexEgressTimezoneApi.monitorStatus).mockResolvedValue({
+      state: "ready",
+      detectedTimezone: "Asia/Taipei",
+      detectedEgressIp: "2407:cdc0:…",
+      detectedAt: 2_000,
+      lastAttemptAt: 2_000,
+      lastTrigger: "periodic",
+      nextCheckAt: 2_900,
+      monitorIntervalMinutes: 15,
+      restartRequired: false,
+    });
+
+    const i18n = await createLocalizedTestI18n();
+    render(
+      <I18nextProvider i18n={i18n}>
+        <CodexEgressTimezoneStatusCard compact />
+      </I18nextProvider>,
+    );
+
+    expect(
+      await screen.findByText("Codex egress environment monitoring"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Show details" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Asia\/Taipei/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show details" }));
+    expect(await screen.findByText(/Asia\/Taipei/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Hide details" }),
+    ).toBeInTheDocument();
+  });
+
   it("shows a safe-refresh warning and can recheck without requiring CDP", async () => {
     const onOpenCodexStatus = vi.fn();
     const restartRequired = {

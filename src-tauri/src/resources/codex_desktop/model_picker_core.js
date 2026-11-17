@@ -1,3 +1,14 @@
+// Native Codex transport vocabulary shared by picker compatibility and fresh
+// session handoff. Ultra is a product overlay, never a provider-native token.
+const CODEX_NATIVE_REASONING_EFFORTS = new Set([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
 const currentPayload = () => state.payload || {};
 const normalizedIdentity = (value) =>
   typeof value === "string" && value.trim() ? value.trim().toLowerCase() : null;
@@ -10,6 +21,7 @@ const reasoningDescriptorFields = [
   "supported_reasoning_levels",
   "supported_reasoning_efforts",
   "reasoning",
+  "ccSwitchReasoningControl",
 ];
 const nestedReasoningDescriptorFields = [
   "defaultEffort",
@@ -22,10 +34,12 @@ const catalogRowForName = (name) => {
   const normalizedName = normalizedIdentity(name);
   if (!normalizedName) return null;
   const rows = currentPayload().models || [];
-  const direct = rows.find(
+  const direct = rows.filter(
     (model) => normalizedIdentity(model?.model) === normalizedName,
   );
-  if (direct) return direct;
+  // Conflicting canonical public identities are ambiguous, not first-row-wins.
+  // In particular, an excluded duplicate must never be revived by row order.
+  if (direct.length) return direct.length === 1 ? direct[0] : null;
   const matches = rows.filter((model) =>
     modelVisibleIdentityValues(model).includes(normalizedName),
   );
@@ -37,13 +51,16 @@ const catalogNameIsEnabled = (name) => {
 };
 const modelNames = () => {
   const payload = currentPayload();
-  const ordered = Array.from(
-    new Set(
-      (payload.modelNames || [])
-        .filter((name) => typeof name === "string" && name.trim())
-        .map((name) => name.trim()),
-    ),
-  ).filter(catalogNameIsEnabled);
+  const seen = new Set();
+  const ordered = (payload.modelNames || [])
+    .filter((name) => typeof name === "string" && name.trim())
+    .map((name) => name.trim())
+    .filter((name) => {
+      const identity = normalizedIdentity(name);
+      if (seen.has(identity)) return false;
+      seen.add(identity);
+      return catalogNameIsEnabled(name);
+    });
   if (ordered.length) return ordered;
   if (Array.isArray(payload.modelNames)) return [];
   return typeof payload.defaultModel === "string" &&
@@ -74,6 +91,34 @@ const retiredManagedNames = () => {
 };
 const isRetiredManagedModel = (model, retired = retiredManagedNames()) =>
   modelVisibleIdentityValues(model).some((identity) => retired.has(identity));
+// These are native renderer transport tokens, not provider effort levels. The
+// capability resolver remains the sole owner of Boolean/graded semantics.
+const booleanReasoningControlForDescriptor = (descriptor) => {
+  const payload = currentPayload();
+  if (
+    payload.catalogAvailable !== true ||
+    payload.catalogReleased === true ||
+    state.catalogReleased === true ||
+    typeof payload.modelProvider !== "string" ||
+    !payload.modelProvider.trim() ||
+    payload.modelProvider.trim() === "openai"
+  )
+    return null;
+  const control = descriptor?.ccSwitchReasoningControl;
+  if (
+    !control ||
+    control.kind !== "boolean" ||
+    typeof control.disableAllowed !== "boolean" ||
+    typeof control.fingerprint !== "string" ||
+    !control.fingerprint.trim()
+  )
+    return null;
+  return {
+    kind: "boolean",
+    disableAllowed: control.disableAllowed,
+    fingerprint: control.fingerprint,
+  };
+};
 const normalizeReasoningDescriptor = (descriptor) => {
   if (!descriptor || typeof descriptor !== "object") return descriptor;
   const defaultCandidates = [
@@ -110,6 +155,11 @@ const normalizeReasoningDescriptor = (descriptor) => {
           : level?.reasoningEffort || level?.reasoning_effort || level?.effort;
       if (typeof effort !== "string" || !effort.trim()) return null;
       const value = effort.trim();
+      // Provider/native vocabulary is closed; Ultra is the explicit product
+      // overlay. Unknown strings must not survive projection only to disappear
+      // later from the native visibility gate and diagnostics.
+      if (!CODEX_NATIVE_REASONING_EFFORTS.has(value) && value !== "ultra")
+        return null;
       if (seen.has(value)) return null;
       seen.add(value);
       const description =
@@ -119,6 +169,12 @@ const normalizeReasoningDescriptor = (descriptor) => {
       return { effort: value, description };
     })
     .filter(Boolean);
+  const booleanControl =
+    normalized.length === 0
+      ? booleanReasoningControlForDescriptor(descriptor)
+      : null;
+  // Never retain a Boolean bridge marker on graded or unconfirmed metadata.
+  delete descriptor.ccSwitchReasoningControl;
   if (!normalized.length) {
     for (const key of reasoningDescriptorFields) {
       if (key !== "reasoning") delete descriptor[key];
@@ -134,6 +190,28 @@ const normalizeReasoningDescriptor = (descriptor) => {
     // still carry the canonical empty array, otherwise the select throws and the
     // whole picker renders as an error instead of listing the model.
     descriptor.supportedReasoningEfforts = [];
+    if (booleanControl) {
+      // Codex normalizes even an explicit `none` to `medium` for an empty
+      // effort array. Supply only its binary transport vocabulary here, then
+      // render it as Thinking off/on with the owned native UI bridge. These
+      // aliases never change the persisted capability, ModelInfo effort list,
+      // provider default, or wire adapter. In particular no intensity ladder
+      // or fabricated provider default is introduced.
+      const choices = [
+        ...(booleanControl.disableAllowed
+          ? [{ reasoningEffort: "none", description: "Thinking off" }]
+          : []),
+        { reasoningEffort: "medium", description: "Thinking on" },
+      ];
+      descriptor.ccSwitchReasoningControl = booleanControl;
+      descriptor.supportedReasoningEfforts = choices;
+      descriptor.supportedReasoningLevels = choices.map(
+        ({ reasoningEffort, description }) => ({
+          effort: reasoningEffort,
+          description,
+        }),
+      );
+    }
     return descriptor;
   }
   const requestedDefault =
@@ -209,10 +287,10 @@ const catalogRowForModel = (model) => {
   if (!model || typeof model !== "object") return null;
   const publicName = normalizedIdentity(model.model);
   if (publicName) {
-    const direct = (currentPayload().models || []).find(
+    const direct = (currentPayload().models || []).filter(
       (row) => normalizedIdentity(row?.model) === publicName,
     );
-    if (direct) return direct;
+    if (direct.length) return direct.length === 1 ? direct[0] : null;
     // A shared upstream slug is not a routed public identity. Only explicit
     // aliases may match a selected row that already supplies its model name.
     const aliases = (currentPayload().models || []).filter((row) => {
@@ -583,7 +661,11 @@ const isManagedCodexModelQuery = (key) => {
 const restoreCodexCatalogReasoningSelection = (key, selection) => {
   if (!isManagedCodexModelQuery(key) || !Array.isArray(selection?.models))
     return selection;
-  const names = new Set(modelNames().map(normalizedIdentity));
+  const orderedNames = modelNames();
+  const names = new Set(orderedNames.map(normalizedIdentity));
+  const ranks = new Map(
+    orderedNames.map((name, index) => [normalizedIdentity(name), index]),
+  );
   // An explicit empty catalog is authoritative. A query cache can still
   // contain rows from before this injection, but none can belong to the
   // current managed provider. Every managed selection is restricted to the
@@ -594,7 +676,7 @@ const restoreCodexCatalogReasoningSelection = (key, selection) => {
     names.size === 0;
   const retired = retiredManagedNames();
   let changed = false;
-  const models = selection.models.flatMap((model) => {
+  const selectedModels = selection.models.flatMap((model) => {
     const row = catalogRowForModel(model);
     if (isRetiredManagedModel(model, retired) || row?.enabled === false) {
       changed = true;
@@ -630,6 +712,26 @@ const restoreCodexCatalogReasoningSelection = (key, selection) => {
     changed = true;
     return [next];
   });
+  // Native selection may reorder the query rows or return a duplicate public
+  // identity. Reapply only current catalog ranks to the rows it retained; never
+  // revive a model filtered out for native availability or another host.
+  const seen = new Set();
+  const models = selectedModels.filter((model) => {
+    const identity = normalizedIdentity(catalogRowForModel(model)?.model);
+    if (seen.has(identity)) {
+      changed = true;
+      return false;
+    }
+    seen.add(identity);
+    return true;
+  });
+  models.sort(
+    (left, right) =>
+      ranks.get(normalizedIdentity(catalogRowForModel(left)?.model)) -
+      ranks.get(normalizedIdentity(catalogRowForModel(right)?.model)),
+  );
+  if (models.some((model, index) => model !== selectedModels[index]))
+    changed = true;
   const hasModelSupportingMaxReasoningEffort = models.some((model) =>
     model.supportedReasoningEfforts?.some(
       (level) => level.reasoningEffort === "max",
@@ -716,10 +818,16 @@ const ensureNativeModelReasoningEfforts = (value) => {
   });
   return changed ? { ...value, data } : value;
 };
+const nativeReasoningRefreshOption = "__ccSwitchNativeReasoningRefreshVersion";
+const nativeReasoningRefreshVersionForOptions = (options) => {
+  const value = options?.[nativeReasoningRefreshOption];
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+};
 const projectCodexModelReasoningOptions = (
   record,
   options,
   selectorSources,
+  nativeRefreshVersion = 0,
 ) => {
   const baseSelect = unwrapCodexModelReasoningSelector(options?.select);
   let select = baseSelect;
@@ -731,11 +839,13 @@ const projectCodexModelReasoningOptions = (
     if (
       record.baseSelect !== baseSelect ||
       record.payload !== currentPayload() ||
-      record.queryKey !== queryKey
+      record.queryKey !== queryKey ||
+      record.nativeRefreshVersion !== nativeRefreshVersion
     ) {
       record.baseSelect = baseSelect;
       record.payload = currentPayload();
       record.queryKey = queryKey;
+      record.nativeRefreshVersion = nativeRefreshVersion;
       record.wrappedSelect = function ccSwitchCatalogReasoningSelection(
         ...values
       ) {
@@ -758,6 +868,7 @@ const projectCodexModelReasoningOptions = (
     record.baseSelect = baseSelect;
     record.payload = currentPayload();
     record.queryKey = null;
+    record.nativeRefreshVersion = nativeRefreshVersion;
     record.wrappedSelect = null;
   }
   return select === options?.select ? options : { ...options, select };
@@ -834,6 +945,7 @@ const patchCodexModelReasoningQueryObserverPrototype = (prototype) => {
           record,
           options,
           entry.selectorSources,
+          nativeReasoningRefreshVersionForOptions(options),
         );
       }
     }
@@ -880,9 +992,15 @@ const patchCodexModelReasoningQueryCache = (cache) => {
       observers: new WeakMap(),
       selectorSources: new WeakMap(),
       refreshing: false,
+      pendingNativeRefreshVersion: 0,
+      disposed: false,
     };
     state.reasoningQueryCaches.set(cache, entry);
-    entry.refreshQuery = (query) => {
+    entry.refreshQuery = (
+      query,
+      forceNative = false,
+      nativeRefreshVersion = 0,
+    ) => {
       for (const observer of query?.observers || []) {
         patchCodexModelReasoningObserverPrototype(observer);
         let record = entry.observers.get(observer);
@@ -900,6 +1018,7 @@ const patchCodexModelReasoningQueryCache = (cache) => {
               record,
               options,
               entry.selectorSources,
+              nativeReasoningRefreshVersionForOptions(options),
             );
           // Optimistic reads run before setOptions on a normal render. Both
           // paths must use the same selector or the slider loses its levels again.
@@ -927,23 +1046,101 @@ const patchCodexModelReasoningQueryCache = (cache) => {
           continue;
         // A new selector makes QueryObserver recompute cached data and notify
         // the picker without refetching or mutating the underlying cache.
+        const wantsNativeRefresh =
+          forceNative &&
+          Number.isSafeInteger(nativeRefreshVersion) &&
+          nativeRefreshVersion > 0 &&
+          record.nativeRefreshVersion !== nativeRefreshVersion;
+        const projectedOptions = projectCodexModelReasoningOptions(
+          record,
+          observer.options,
+          entry.selectorSources,
+          wantsNativeRefresh ? nativeRefreshVersion : 0,
+        );
         if (
           record.payload !== currentPayload() ||
-          observer.options?.select !== record.wrappedSelect
-        )
-          observer.setOptions(observer.options);
+          observer.options?.select !== record.wrappedSelect ||
+          wantsNativeRefresh
+        ) {
+          if (wantsNativeRefresh) {
+            // The native scope wrapper is a read-time projection, so its atom
+            // value changes without changing TanStack's cached query data.
+            // One transient structural-sharing opt-out forces the public
+            // observer to publish the already-projected snapshot to mounted
+            // React consumers. Restore the caller's option immediately so
+            // ordinary query updates retain their original semantics.
+            const hadStructuralSharing = Object.prototype.hasOwnProperty.call(
+              observer.options || {},
+              "structuralSharing",
+            );
+            const structuralSharing = observer.options?.structuralSharing;
+            const setOptions =
+              record.methods.get("setOptions")?.original || observer.setOptions;
+            setOptions.call(observer, {
+              ...projectedOptions,
+              [nativeReasoningRefreshOption]: nativeRefreshVersion,
+              structuralSharing: false,
+            });
+            const restoredOptions = { ...observer.options };
+            if (hadStructuralSharing)
+              restoredOptions.structuralSharing = structuralSharing;
+            else delete restoredOptions.structuralSharing;
+            setOptions.call(observer, restoredOptions);
+            // Keep the version in the record for deduplication, but never
+            // retain the private marker on the observer's public options.
+            try {
+              delete observer.options[nativeReasoningRefreshOption];
+            } catch {}
+          } else {
+            observer.setOptions(projectedOptions);
+          }
+        }
+        // Native reasoning visibility is a renderer-local read-time projection.
+        // Once its scope.get wrapper is installed, the mounted picker must
+        // re-read the already-cached query result so React subscribers see the
+        // newly exposed levels. QueryObserver.updateResult is the documented
+        // public recomputation/notification boundary: it performs no fetch and
+        // only notifies when the selected snapshot actually changed. Never call
+        // private listener collections or mutate the native scope preference.
+        if (forceNative && typeof observer.updateResult === "function")
+          observer.updateResult();
       }
     };
-    entry.refresh = (query) => {
-      if (entry.refreshing) return;
+    entry.refresh = (query, forceNative = false, nativeRefreshVersion = 0) => {
+      if (entry.disposed) return;
+      if (entry.refreshing) {
+        if (
+          forceNative &&
+          Number.isSafeInteger(nativeRefreshVersion) &&
+          nativeRefreshVersion > entry.pendingNativeRefreshVersion
+        )
+          entry.pendingNativeRefreshVersion = nativeRefreshVersion;
+        return;
+      }
       entry.refreshing = true;
       try {
         for (const item of query ? [query] : cache.getAll())
-          entry.refreshQuery(item);
+          entry.refreshQuery(item, forceNative, nativeRefreshVersion);
       } finally {
         entry.refreshing = false;
+        const pending = entry.pendingNativeRefreshVersion;
+        entry.pendingNativeRefreshVersion = 0;
+        if (pending > 0 && pending > nativeRefreshVersion) {
+          const schedule =
+            typeof queueMicrotask === "function"
+              ? queueMicrotask
+              : (callback) => setTimeout(callback, 0);
+          schedule(() => {
+            if (!entry.disposed) entry.refresh(undefined, true, pending);
+          });
+        }
       }
     };
+    // Explicit post-install boundary used by native reasoning reconciliation.
+    // Keeping this separate from ordinary cache events prevents accidental
+    // force-notification of unrelated observer updates.
+    entry.refreshNative = (nativeRefreshVersion = 0) =>
+      entry.refresh(undefined, true, nativeRefreshVersion);
     entry.restoreObserver = (observer) => {
       const record = entry.observers.get(observer);
       if (!record) return;
@@ -970,6 +1167,8 @@ const patchCodexModelReasoningQueryCache = (cache) => {
         entry.refresh(event.query);
     });
     entry.dispose = () => {
+      entry.disposed = true;
+      entry.pendingNativeRefreshVersion = 0;
       entry.unsubscribe?.();
       for (const query of cache.getAll()) {
         for (const observer of query?.observers || []) {

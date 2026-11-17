@@ -433,5 +433,97 @@
       "message": "HTTP 429, retry later"
     },
     "expectedCode": null
+  },
+  {
+    "name": "local capacity replay disabled does not disable separate continuation",
+    "event": "response.failed",
+    "error": {
+      "code": "overloaded_error",
+      "message": "The upstream provider is overloaded; automatic capacity retry is disabled."
+    },
+    "expectedCode": null
+  },
+  {
+    "name": "explicit false stops transient server errors",
+    "event": "response.failed",
+    "error": {
+      "code": "server_error",
+      "message": "Service temporarily overloaded; retry later.",
+      "retryable": false
+    },
+    "expectedCode": "non_retryable_error"
+  },
+  {
+    "name": "explicit denial stops overload despite positive retry wording",
+    "event": "response.failed",
+    "error": {
+      "code": "server_error",
+      "message": "Service temporarily overloaded. Do not retry this request; retry another request instead."
+    },
+    "expectedCode": "non_retryable_error"
+  },
+  {
+    "name": "explicit no-retry code stops generic server errors",
+    "event": "response.failed",
+    "error": {
+      "code": "not_retryable",
+      "message": "Service temporarily overloaded."
+    },
+    "expectedCode": "non_retryable_error"
+  },
+  {
+    "name": "explicit false suppresses temporary usage exception",
+    "event": "response.failed",
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "Usage limit reached. Please retry later.",
+      "retryable": false
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "auth category retains priority over explicit false",
+    "event": "response.failed",
+    "error": {
+      "code": "authentication_error",
+      "message": "Sign in again.",
+      "retryable": false
+    },
+    "expectedCode": "authentication_error"
+  },
+  {
+    "name": "boolean true does not hide permanent failure",
+    "event": "response.failed",
+    "error": {
+      "code": "insufficient_quota",
+      "message": "Quota exhausted.",
+      "retryable": true
+    },
+    "expectedCode": "insufficient_quota"
+  },
+  {
+    "name": "string false is not an explicit retry boolean",
+    "event": "response.failed",
+    "error": {
+      "code": "server_error",
+      "message": "Service temporarily overloaded.",
+      "retryable": "false"
+    },
+    "expectedCode": null
+  },
+  {
+    "name": "request details do not manufacture no-retry instruction",
+    "event": "response.failed",
+    "error": {
+      "code": "server_error",
+      "message": "Service temporarily overloaded.",
+      "metadata": {
+        "request": {
+          "retryable": false,
+          "prompt": "Do not retry this request"
+        }
+      }
+    },
+    "expectedCode": null
   }
 ]

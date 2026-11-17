@@ -27,6 +27,106 @@ const MAX_RESTARTS_PER_WINDOW: usize = 5;
 const RUN_MARKER_FILE: &str = "app-run-marker.json";
 const WATCHDOG_LOG_FILE: &str = "watchdog.jsonl";
 const WATCHDOG_STATE_FILE: &str = "watchdog-state.json";
+static SUPERVISOR_SPAWN_LOCK: std::sync::Mutex<Option<SupervisorChildReceipt>> =
+    std::sync::Mutex::new(None);
+
+struct SupervisorChildReceipt {
+    config_dir: PathBuf,
+    parent_pid: u32,
+    child: std::process::Child,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchedParentState {
+    Running,
+    Exited,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisorPollAction {
+    Observe,
+    Recover,
+    Stop,
+}
+
+fn supervisor_poll_action(
+    enabled: Option<bool>,
+    parent: WatchedParentState,
+) -> SupervisorPollAction {
+    match enabled {
+        Some(false) if parent == WatchedParentState::Exited => SupervisorPollAction::Stop,
+        Some(true) if parent == WatchedParentState::Exited => SupervisorPollAction::Recover,
+        None if parent == WatchedParentState::Exited => SupervisorPollAction::Stop,
+        _ => SupervisorPollAction::Observe,
+    }
+}
+
+fn classify_watched_parent_state(
+    expected: &crate::process_identity::ProcessIdentity,
+    identity: Result<
+        crate::process_identity::ProcessIdentity,
+        crate::process_identity::ProcessIdentityError,
+    >,
+    liveness: Result<bool, crate::process_identity::ProcessIdentityError>,
+) -> WatchedParentState {
+    match liveness {
+        Ok(false) => WatchedParentState::Exited,
+        Ok(true) => match identity {
+            Ok(observed) if expected.matches(&observed) => WatchedParentState::Running,
+            Ok(_) => WatchedParentState::Exited,
+            Err(_) => WatchedParentState::Unknown,
+        },
+        Err(_) => WatchedParentState::Unknown,
+    }
+}
+
+fn supervisor_identity_from_receipt(
+    receipt: Option<&mut SupervisorChildReceipt>,
+    config_dir: &Path,
+    parent_pid: u32,
+) -> Option<crate::process_identity::ProcessIdentity> {
+    let receipt = receipt?;
+    if receipt.config_dir != config_dir || receipt.parent_pid != parent_pid {
+        return None;
+    }
+    match receipt.child.try_wait() {
+        Ok(None) => crate::process_identity::process_identity_result(receipt.child.id())
+            .ok()
+            .filter(|identity| {
+                crate::process_identity::executable_matches_current(&identity.executable_path)
+            }),
+        // Neither a failed wait nor diagnostic history can authorize another
+        // child. The retained Child remains the canonical current-app receipt.
+        Ok(Some(_)) | Err(_) => None,
+    }
+}
+
+fn acquire_supervisor_parent_lock(
+    config_dir: &Path,
+    expected: &crate::process_identity::ProcessIdentity,
+) -> std::io::Result<Option<std::fs::File>> {
+    let directory = log_dir(config_dir);
+    std::fs::create_dir_all(&directory)?;
+    use sha2::{Digest, Sha256};
+    let identity = serde_json::to_vec(expected).map_err(std::io::Error::other)?;
+    let executable = hex::encode(Sha256::digest(identity));
+    let path = directory.join(format!(
+        "watchdog-parent-{}-{}-{executable}.lock",
+        expected.pid, expected.started_at_ticks
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuperviseArgs {
@@ -214,6 +314,27 @@ fn classify_parent_outcome_with_identity(
     ParentOutcome::Crashed
 }
 
+fn classify_parent_recovery_outcome(
+    config_dir: &Path,
+    marker_json: Option<&str>,
+    parent_pid: u32,
+    expected_identity: Option<&crate::process_identity::ProcessIdentity>,
+) -> ParentOutcome {
+    let outcome = classify_parent_outcome_with_identity(marker_json, parent_pid, expected_identity);
+    if outcome == ParentOutcome::Crashed
+        && marker_json
+            .zip(expected_identity)
+            .is_some_and(|(marker, expected)| {
+                crate::app_exit_monitor::watchdog_exit_classification(config_dir, marker, expected)
+                    .is_some_and(|classification| !classification.allows_crash_recovery())
+            })
+    {
+        ParentOutcome::CleanExit
+    } else {
+        outcome
+    }
+}
+
 /// 重启频率预算：默认 30 分钟内最多 5 次。
 pub fn restart_budget_allows(now_secs: u64, recent_secs: &[u64]) -> bool {
     let window_start = now_secs.saturating_sub(RESTART_WINDOW_SECS);
@@ -289,37 +410,43 @@ fn process_identity_from_marker(
     })
 }
 
+/// Diagnostic projection only; a status-read failure is not launch authority.
 fn read_recent_restarts(config_dir: &Path) -> Vec<u64> {
-    let path = log_dir(config_dir).join(WATCHDOG_STATE_FILE);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("restarts")
-                .and_then(serde_json::Value::as_array)
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter_map(serde_json::Value::as_u64)
-                        .collect::<Vec<u64>>()
-                })
-        })
-        .unwrap_or_default()
+    read_restart_budget_state(config_dir).unwrap_or_default()
 }
 
-fn write_recent_restarts(config_dir: &Path, restarts: &[u64]) {
-    let directory = log_dir(config_dir);
-    if std::fs::create_dir_all(&directory).is_err() {
-        return;
+fn read_restart_budget_state(config_dir: &Path) -> Result<Vec<u64>, String> {
+    let path = log_dir(config_dir).join(WATCHDOG_STATE_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("读取看门狗重启预算失败: {error}")),
+    };
+    #[derive(serde::Deserialize)]
+    struct RestartBudgetState {
+        restarts: Vec<u64>,
     }
-    let payload = serde_json::json!({ "restarts": restarts });
-    let _ = std::fs::write(
-        directory.join(WATCHDOG_STATE_FILE),
-        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
-    );
+    serde_json::from_str::<RestartBudgetState>(&text)
+        .map(|state| state.restarts)
+        .map_err(|_| "看门狗重启预算格式无效；已拒绝重置历史".to_string())
+}
+
+fn write_restart_budget_state(config_dir: &Path, restarts: &[u64]) -> Result<(), String> {
+    let payload = serde_json::to_vec_pretty(&serde_json::json!({ "restarts": restarts }))
+        .map_err(|_| "无法序列化看门狗重启预算".to_string())?;
+    crate::config::atomic_write_private(&log_dir(config_dir).join(WATCHDOG_STATE_FILE), &payload)
+        .map_err(|error| format!("持久化看门狗重启预算失败: {error}"))
+}
+
+fn authorize_restart_attempt(config_dir: &Path, now: u64) -> Result<bool, String> {
+    let mut restarts = read_restart_budget_state(config_dir)?;
+    if !restart_budget_allows(now, &restarts) {
+        return Ok(false);
+    }
+    restarts.retain(|time| *time >= now.saturating_sub(RESTART_WINDOW_SECS));
+    restarts.push(now);
+    write_restart_budget_state(config_dir, &restarts)?;
+    Ok(true)
 }
 
 /// 主进程可执行文件路径（守护用的就是同一个二进制）。
@@ -353,9 +480,14 @@ fn settings_path() -> Option<PathBuf> {
     crate::settings::AppSettings::settings_path()
 }
 
-fn watched_parent_is_running(expected: &crate::process_identity::ProcessIdentity) -> bool {
-    crate::process_identity::process_identity(expected.pid)
-        .is_some_and(|observed| expected.matches(&observed))
+fn watched_parent_state(expected: &crate::process_identity::ProcessIdentity) -> WatchedParentState {
+    let liveness = crate::process_identity::process_liveness_result(expected.pid);
+    let identity = if matches!(liveness, Ok(true)) {
+        crate::process_identity::process_identity_result(expected.pid)
+    } else {
+        Err(crate::process_identity::ProcessIdentityError::NotFound)
+    };
+    classify_watched_parent_state(expected, identity, liveness)
 }
 
 fn listener_is_ready(
@@ -375,48 +507,20 @@ fn listener_is_ready(
         .is_some_and(|observed| expected.matches(&observed))
 }
 
-fn supervisor_identity_from_event(
-    config_dir: &Path,
-    parent_pid: u32,
-) -> Option<crate::process_identity::ProcessIdentity> {
-    let record = recent_events(config_dir, 64).into_iter().find(|record| {
-        if record.event != "supervisor-spawned" {
-            return false;
-        }
-        record
-            .detail
-            .get("parentPid")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            == Some(parent_pid)
-    })?;
-    let detail = record.detail;
-    let supervisor_pid = detail
-        .get("supervisorPid")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())?;
-    let observed = crate::process_identity::process_identity(supervisor_pid)?;
-    if !crate::process_identity::executable_matches_current(&observed.executable_path) {
-        return None;
-    }
-    if let Some(started_at_ticks) = detail
-        .get("startedAtTicks")
-        .and_then(serde_json::Value::as_u64)
-    {
-        if started_at_ticks != observed.started_at_ticks {
-            return None;
-        }
-    }
-    Some(observed)
-}
-
-/// Return the currently live supervisor only when its PID still refers to the
-/// same executable identity recorded at spawn time.
+/// Project the current app's retained native child receipt for the status UI.
+/// Diagnostic event history is never lifecycle authority.
 pub(crate) fn live_supervisor_identity(
     config_dir: &Path,
     parent_pid: u32,
 ) -> Option<crate::process_identity::ProcessIdentity> {
-    supervisor_identity_from_event(config_dir, parent_pid)
+    let mut receipt = supervisor_spawn_guard();
+    supervisor_identity_from_receipt(receipt.as_mut(), config_dir, parent_pid)
+}
+
+fn supervisor_spawn_guard() -> std::sync::MutexGuard<'static, Option<SupervisorChildReceipt>> {
+    SUPERVISOR_SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Idempotently ensure one supervisor exists for the current app process.
@@ -437,13 +541,26 @@ pub fn ensure_supervisor(config_dir: &Path, port: u16) {
         log::debug!("内置看门狗已关闭，跳过 supervisor 启动");
         return;
     }
+    // Startup and save_settings may race. Serialize check, spawn and receipt.
+    let mut receipt = supervisor_spawn_guard();
     let parent_pid = std::process::id();
-    if let Some(identity) = live_supervisor_identity(config_dir, parent_pid) {
-        log::debug!(
-            "内置看门狗已在运行: supervisorPid={} parentPid={parent_pid}",
-            identity.pid
-        );
-        return;
+    if let Some(tracked) = receipt.as_mut() {
+        match tracked.child.try_wait() {
+            Ok(None) => {
+                log::debug!(
+                    "内置看门狗已在运行: supervisorPid={} parentPid={parent_pid}",
+                    tracked.child.id()
+                );
+                return;
+            }
+            Err(error) => {
+                log::warn!("无法确认已保留的看门狗是否退出，跳过重复启动: {error}");
+                return;
+            }
+            Ok(Some(_)) => {
+                *receipt = None;
+            }
+        }
     }
     let Some(executable) = current_executable() else {
         log::warn!("无法解析当前可执行文件路径，跳过 supervisor 启动");
@@ -475,14 +592,22 @@ pub fn ensure_supervisor(config_dir: &Path, port: u16) {
     }
     match command.spawn() {
         Ok(child) => {
-            let started_at_ticks = crate::process_identity::process_identity(child.id())
+            let child_pid = child.id();
+            // Retain the native child before optional diagnostics. A failed log
+            // write or truncated history must never create a second owner.
+            *receipt = Some(SupervisorChildReceipt {
+                config_dir: config_dir.to_path_buf(),
+                parent_pid,
+                child,
+            });
+            let started_at_ticks = crate::process_identity::process_identity(child_pid)
                 .map(|identity| identity.started_at_ticks);
             append_event(
                 config_dir,
                 "info",
                 "supervisor-spawned",
                 serde_json::json!({
-                    "supervisorPid": child.id(),
+                    "supervisorPid": child_pid,
                     "parentPid": parent_pid,
                     "port": port,
                     "executable": executable.to_string_lossy(),
@@ -491,7 +616,7 @@ pub fn ensure_supervisor(config_dir: &Path, port: u16) {
             );
             log::info!(
                 "已启动内置看门狗: supervisorPid={} parentPid={parent_pid} port={port}",
-                child.id()
+                child_pid
             );
         }
         Err(error) => {
@@ -504,12 +629,6 @@ pub fn ensure_supervisor(config_dir: &Path, port: u16) {
             );
         }
     }
-}
-
-/// Backwards-compatible startup entry point for callers outside the settings
-/// command. New callers should use `ensure_supervisor`.
-pub fn spawn_supervisor(config_dir: &Path, port: u16) {
-    ensure_supervisor(config_dir, port);
 }
 
 /// 守护进程入口：盯住主进程，必要时把它拉起来，然后退出。
@@ -547,6 +666,30 @@ pub fn run_supervisor(args: SuperviseArgs) -> ! {
         );
         std::process::exit(0);
     };
+    // The lock file's existence is not ownership. Keep the native lock handle
+    // for this exact parent generation through accounting, restart and readiness.
+    // A restarted app gets a different key and can arm its own supervisor.
+    let _parent_lock = match acquire_supervisor_parent_lock(&config_dir, &expected) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            append_event(
+                &config_dir,
+                "info",
+                "supervisor-duplicate-skipped",
+                serde_json::json!({ "parentPid": args.parent_pid }),
+            );
+            std::process::exit(0);
+        }
+        Err(error) => {
+            append_event(
+                &config_dir,
+                "error",
+                "supervisor-lock-unavailable",
+                serde_json::json!({ "parentPid": args.parent_pid, "error": error.to_string() }),
+            );
+            std::process::exit(0);
+        }
+    };
     append_event(
         &config_dir,
         "info",
@@ -560,11 +703,83 @@ pub fn run_supervisor(args: SuperviseArgs) -> ! {
 
     let mut unhealthy_logged = false;
     let mut setting_read_error_logged = false;
-    loop {
-        match read_watchdog_enabled(settings_path) {
-            Ok(true) => {
-                setting_read_error_logged = false;
+    let mut parent_unverified_logged = false;
+    'watch_parent: loop {
+        loop {
+            let enabled = match read_watchdog_enabled(settings_path) {
+                Ok(enabled) => {
+                    setting_read_error_logged = false;
+                    Some(enabled)
+                }
+                Err(error) => {
+                    if !setting_read_error_logged {
+                        setting_read_error_logged = true;
+                        append_event(
+                            &config_dir,
+                            "warning",
+                            "supervisor-settings-unreadable",
+                            serde_json::json!({ "parentPid": args.parent_pid, "error": error }),
+                        );
+                    }
+                    None
+                }
+            };
+            let parent = watched_parent_state(&expected);
+            match supervisor_poll_action(enabled, parent) {
+                SupervisorPollAction::Recover => break,
+                SupervisorPollAction::Stop => {
+                    append_event(
+                        &config_dir,
+                        "info",
+                        "supervisor-recovery-disabled",
+                        serde_json::json!({ "parentPid": args.parent_pid }),
+                    );
+                    std::process::exit(0);
+                }
+                SupervisorPollAction::Observe => {}
             }
+            match parent {
+                WatchedParentState::Running => {
+                    parent_unverified_logged = false;
+                    if enabled == Some(true) {
+                        let port_ready = listener_is_ready(args.port, Some(&expected));
+                        if !port_ready && !unhealthy_logged {
+                            unhealthy_logged = true;
+                            append_event(
+                                &config_dir,
+                                "warning",
+                                "supervisor-parent-unhealthy",
+                                serde_json::json!({ "parentPid": args.parent_pid, "port": args.port }),
+                            );
+                        } else if port_ready {
+                            unhealthy_logged = false;
+                        }
+                    } else {
+                        unhealthy_logged = false;
+                    }
+                }
+                WatchedParentState::Unknown => {
+                    if !parent_unverified_logged {
+                        parent_unverified_logged = true;
+                        append_event(
+                            &config_dir,
+                            "warning",
+                            "supervisor-parent-unverified",
+                            serde_json::json!({ "parentPid": args.parent_pid }),
+                        );
+                    }
+                }
+                // Observe never returns for a confirmed exited parent.
+                WatchedParentState::Exited => unreachable!(),
+            }
+            // A disabled supervisor stays passive while its exact parent is
+            // alive. Rapid false->true saves reuse one owner instead of racing
+            // against an already queued disabled-process exit.
+            std::thread::sleep(POLL_INTERVAL);
+        }
+
+        match read_watchdog_enabled(settings_path) {
+            Ok(true) => {}
             Ok(false) => {
                 append_event(
                     &config_dir,
@@ -575,170 +790,144 @@ pub fn run_supervisor(args: SuperviseArgs) -> ! {
                 std::process::exit(0);
             }
             Err(error) => {
-                if !setting_read_error_logged {
-                    setting_read_error_logged = true;
-                    append_event(
-                        &config_dir,
-                        "warning",
-                        "supervisor-settings-unreadable",
-                        serde_json::json!({ "parentPid": args.parent_pid, "error": error }),
-                    );
-                }
+                append_event(
+                    &config_dir,
+                    "error",
+                    "supervisor-restart-skipped",
+                    serde_json::json!({
+                        "parentPid": args.parent_pid,
+                        "error": error,
+                        "reason": "watchdog setting could not be verified",
+                    }),
+                );
+                std::process::exit(0);
             }
         }
-        if watched_parent_is_running(&expected) {
-            let port_ready = listener_is_ready(args.port, Some(&expected));
-            if !port_ready {
-                if !unhealthy_logged {
-                    unhealthy_logged = true;
-                    append_event(
-                        &config_dir,
-                        "warning",
-                        "supervisor-parent-unhealthy",
-                        serde_json::json!({ "parentPid": args.parent_pid, "port": args.port }),
-                    );
-                }
-            } else {
-                unhealthy_logged = false;
-            }
-            std::thread::sleep(POLL_INTERVAL);
-            continue;
-        }
-        break;
-    }
 
-    match read_watchdog_enabled(settings_path) {
-        Ok(true) => {}
-        Ok(false) => {
-            append_event(
-                &config_dir,
-                "info",
-                "supervisor-disabled",
-                serde_json::json!({ "parentPid": args.parent_pid }),
-            );
-            std::process::exit(0);
+        // Read the marker after the parent has stopped. A clean exit removes it;
+        // retaining the startup snapshot here would turn an intentional quit into
+        // a false crash and relaunch.
+        let marker = read_run_marker(&config_dir);
+        match classify_parent_recovery_outcome(
+            &config_dir,
+            marker.as_deref(),
+            args.parent_pid,
+            Some(&expected),
+        ) {
+            ParentOutcome::StillRunning => std::process::exit(0),
+            ParentOutcome::CleanExit => {
+                append_event(
+                    &config_dir,
+                    "info",
+                    "supervisor-clean-exit",
+                    serde_json::json!({ "parentPid": args.parent_pid }),
+                );
+                std::process::exit(0);
+            }
+            ParentOutcome::Crashed => {}
         }
-        Err(error) => {
+
+        let Some(executable) = current_executable() else {
             append_event(
                 &config_dir,
                 "error",
-                "supervisor-restart-skipped",
-                serde_json::json!({
-                    "parentPid": args.parent_pid,
-                    "error": error,
-                    "reason": "watchdog setting could not be verified",
-                }),
+                "supervisor-restart-failed",
+                serde_json::json!({ "error": "current executable unavailable" }),
             );
             std::process::exit(0);
+        };
+        let mut command = std::process::Command::new(&executable);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
         }
-    }
-
-    // Read the marker after the parent has stopped. A clean exit removes it;
-    // retaining the startup snapshot here would turn an intentional quit into
-    // a false crash and relaunch.
-    let marker = read_run_marker(&config_dir);
-    match classify_parent_outcome_with_identity(marker.as_deref(), args.parent_pid, Some(&expected))
-    {
-        ParentOutcome::StillRunning => std::process::exit(0),
-        ParentOutcome::CleanExit => {
+        // Repeat the native absence check at the accounting/launch boundary. A
+        // failed identity or liveness probe must not spend the budget or relaunch.
+        if watched_parent_state(&expected) != WatchedParentState::Exited {
+            std::thread::sleep(POLL_INTERVAL);
+            continue 'watch_parent;
+        }
+        match authorize_restart_attempt(&config_dir, now_secs()) {
+            Ok(true) => {}
+            Ok(false) => {
+                append_event(
+                    &config_dir,
+                    "error",
+                    "supervisor-restart-limited",
+                    serde_json::json!({ "parentPid": args.parent_pid, "windowSecs": RESTART_WINDOW_SECS }),
+                );
+                std::process::exit(0);
+            }
+            Err(error) => {
+                append_event(
+                    &config_dir,
+                    "error",
+                    "supervisor-restart-skipped",
+                    serde_json::json!({ "parentPid": args.parent_pid, "reason": "restart budget could not be committed", "error": error }),
+                );
+                std::process::exit(0);
+            }
+        }
+        let spawned = command.spawn();
+        let Ok(mut child) = spawned else {
+            let error = spawned
+                .err()
+                .map(|value| value.to_string())
+                .unwrap_or_default();
             append_event(
                 &config_dir,
-                "info",
-                "supervisor-clean-exit",
-                serde_json::json!({ "parentPid": args.parent_pid }),
+                "error",
+                "supervisor-restart-failed",
+                serde_json::json!({ "error": error }),
             );
             std::process::exit(0);
-        }
-        ParentOutcome::Crashed => {}
-    }
+        };
+        append_event(
+            &config_dir,
+            "warning",
+            "supervisor-restarted",
+            serde_json::json!({
+                "parentPid": args.parent_pid,
+                "newPid": child.id(),
+                "port": args.port,
+                "executable": executable.to_string_lossy(),
+            }),
+        );
 
-    let mut restarts = read_recent_restarts(&config_dir);
-    let now = now_secs();
-    if !restart_budget_allows(now, &restarts) {
+        let restarted_identity =
+            crate::process_identity::process_identity(child.id()).filter(|identity| {
+                crate::process_identity::executable_matches_current(&identity.executable_path)
+            });
+        let deadline = SystemTime::now() + READY_TIMEOUT;
+        while SystemTime::now() < deadline {
+            if !matches!(child.try_wait(), Ok(None)) {
+                break;
+            }
+            if listener_is_ready(args.port, restarted_identity.as_ref()) {
+                append_event(
+                    &config_dir,
+                    "info",
+                    "supervisor-restart-ready",
+                    serde_json::json!({ "newPid": child.id(), "port": args.port }),
+                );
+                std::process::exit(0);
+            }
+            std::thread::sleep(READY_POLL);
+        }
         append_event(
             &config_dir,
             "error",
-            "supervisor-restart-limited",
-            serde_json::json!({ "parentPid": args.parent_pid, "windowSecs": RESTART_WINDOW_SECS }),
+            "supervisor-restart-not-ready",
+            serde_json::json!({ "newPid": child.id(), "port": args.port }),
         );
         std::process::exit(0);
     }
-    restarts.push(now);
-    write_recent_restarts(&config_dir, &restarts);
-
-    let Some(executable) = current_executable() else {
-        append_event(
-            &config_dir,
-            "error",
-            "supervisor-restart-failed",
-            serde_json::json!({ "error": "current executable unavailable" }),
-        );
-        std::process::exit(0);
-    };
-    let mut command = std::process::Command::new(&executable);
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    let spawned = command.spawn();
-    let Ok(mut child) = spawned else {
-        let error = spawned
-            .err()
-            .map(|value| value.to_string())
-            .unwrap_or_default();
-        append_event(
-            &config_dir,
-            "error",
-            "supervisor-restart-failed",
-            serde_json::json!({ "error": error }),
-        );
-        std::process::exit(0);
-    };
-    append_event(
-        &config_dir,
-        "warning",
-        "supervisor-restarted",
-        serde_json::json!({
-            "parentPid": args.parent_pid,
-            "newPid": child.id(),
-            "port": args.port,
-            "executable": executable.to_string_lossy(),
-        }),
-    );
-
-    let restarted_identity =
-        crate::process_identity::process_identity(child.id()).filter(|identity| {
-            crate::process_identity::executable_matches_current(&identity.executable_path)
-        });
-    let deadline = SystemTime::now() + READY_TIMEOUT;
-    while SystemTime::now() < deadline {
-        if !matches!(child.try_wait(), Ok(None)) {
-            break;
-        }
-        if listener_is_ready(args.port, restarted_identity.as_ref()) {
-            append_event(
-                &config_dir,
-                "info",
-                "supervisor-restart-ready",
-                serde_json::json!({ "newPid": child.id(), "port": args.port }),
-            );
-            std::process::exit(0);
-        }
-        std::thread::sleep(READY_POLL);
-    }
-    append_event(
-        &config_dir,
-        "error",
-        "supervisor-restart-not-ready",
-        serde_json::json!({ "newPid": child.id(), "port": args.port }),
-    );
-    std::process::exit(0);
 }
 
 /// 守护日志里的一条事件（供设置页的“看门狗 / 端口自检”面板展示）。
@@ -821,9 +1010,539 @@ pub fn recent_restart_count(config_dir: &Path) -> usize {
         .count()
 }
 
+/// Status projects the authoritative Node dev ledger, never Rust's ledger.
+pub(crate) struct DevWatchdogStatus {
+    pub enabled: bool,
+    pub enabled_override: Option<bool>,
+    pub supervisor_identity: Option<crate::process_identity::ProcessIdentity>,
+    pub restarts_in_window: usize,
+}
+
+pub(crate) fn parse_dev_watchdog_override(value: Option<&str>) -> Option<bool> {
+    value.map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn dev_restart_count(session: &serde_json::Value, now_ms: u64) -> usize {
+    session
+        .get("restartTimesMs")
+        .filter(|value| value.is_array())
+        .or_else(|| session.get("supervisorRestartTimesMs"))
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |history| {
+            let start = now_ms.saturating_sub(RESTART_WINDOW_SECS * 1000);
+            history
+                .iter()
+                .filter(|value| value.as_u64().is_some_and(|value| value >= start))
+                .count()
+        })
+}
+
+/// Device-local dev markers follow settings.json, not the optionally moved
+/// application database/config directory. This mirrors Node resolveDevSettingsPath.
+pub(crate) fn dev_session_status_dir() -> PathBuf {
+    dev_session_status_dir_from_settings(settings_path().as_deref())
+        .unwrap_or_else(|| crate::config::get_home_dir().join(".cc-switch"))
+}
+
+fn dev_session_status_dir_from_settings(settings: Option<&Path>) -> Option<PathBuf> {
+    settings.and_then(Path::parent).map(Path::to_path_buf)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn dev_supervisor_start_matches(recorded: &str, observed_filetime_ticks: u64) -> bool {
+    let Ok(started) = chrono::DateTime::parse_from_rfc3339(recorded) else {
+        return false;
+    };
+    // Node's windowsProcessStartedAtUtc uses Date/toISOString and intentionally
+    // publishes milliseconds, not native 100ns FILETIME precision. Keep the
+    // start-time check at that documented precision as Node's owner check does.
+    // PID and executable identity are separately required by the caller.
+    let recorded_filetime_ms = i128::from(started.timestamp_millis()) + 11_644_473_600_000;
+    recorded_filetime_ms == i128::from(observed_filetime_ticks / 10_000)
+}
+
+pub(crate) fn dev_watchdog_status(config_dir: &Path, persisted: bool) -> DevWatchdogStatus {
+    let session = std::fs::read(config_dir.join("logs").join("dev-session.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(|session| {
+            session
+                .get("schemaVersion")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+        });
+    let environment_override = std::env::var("CC_SWITCH_DEV_WATCHDOG_ENABLED").ok();
+    let enabled_override = parse_dev_watchdog_override(environment_override.as_deref());
+    let enabled = enabled_override.unwrap_or(persisted);
+    let supervisor_identity = session.as_ref().and_then(|session| {
+        if session.get("state").and_then(serde_json::Value::as_str) != Some("running") {
+            return None;
+        }
+        let pid = u32::try_from(session.get("supervisorPid")?.as_u64()?).ok()?;
+        let observed = crate::process_identity::process_identity(pid)?;
+        let expected_path = session.get("supervisorExecutablePath")?.as_str()?;
+        if !observed.executable_path.eq_ignore_ascii_case(expected_path) {
+            return None;
+        }
+        // PID/path alone cannot verify the recorded supervisor's live identity.
+        #[cfg(target_os = "windows")]
+        {
+            if !dev_supervisor_start_matches(
+                session.get("supervisorStartedAtUtc")?.as_str()?,
+                observed.started_at_ticks,
+            ) {
+                return None;
+            }
+        }
+        Some(observed)
+    });
+    let restarts_in_window = session.as_ref().map_or(0, |session| {
+        dev_restart_count(session, now_secs().saturating_mul(1000))
+    });
+    DevWatchdogStatus {
+        enabled,
+        enabled_override,
+        supervisor_identity,
+        restarts_in_window,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervisor_spawn_guard_serializes_check_then_spawn() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let already_spawned = AtomicBool::new(false);
+        let spawns = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    let _guard = supervisor_spawn_guard();
+                    if !already_spawned.load(Ordering::SeqCst) {
+                        std::thread::yield_now();
+                        spawns.fetch_add(1, Ordering::SeqCst);
+                        already_spawned.store(true, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn watchdog_fixture_waits_for_owned_input() {
+        if std::env::var_os("CCSM_WATCHDOG_DISPOSABLE_FIXTURE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        let mut input = String::new();
+        let _ = std::io::stdin().read_line(&mut input);
+    }
+
+    fn disposable_watchdog_fixture() -> std::process::Child {
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "watchdog::tests::watchdog_fixture_waits_for_owned_input",
+                "--nocapture",
+            ])
+            .env("CCSM_WATCHDOG_DISPOSABLE_FIXTURE", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        command.spawn().expect("disposable watchdog fixture")
+    }
+
+    #[test]
+    fn native_supervisor_receipt_survives_missing_and_flooded_event_logs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let child = disposable_watchdog_fixture();
+        let child_pid = child.id();
+        let parent_pid = std::process::id();
+        let mut receipt = SupervisorChildReceipt {
+            config_dir: dir.path().to_path_buf(),
+            parent_pid,
+            child,
+        };
+        let without_logs =
+            supervisor_identity_from_receipt(Some(&mut receipt), dir.path(), parent_pid)
+                .is_some_and(|identity| identity.pid == child_pid);
+        for _ in 0..80 {
+            append_event(
+                dir.path(),
+                "warning",
+                "supervisor-parent-unhealthy",
+                serde_json::json!({ "parentPid": parent_pid }),
+            );
+        }
+        let flooded = supervisor_identity_from_receipt(Some(&mut receipt), dir.path(), parent_pid)
+            .is_some_and(|identity| identity.pid == child_pid);
+        receipt.child.stdin.take();
+        assert!(receipt.child.wait().expect("fixture exit").success());
+        assert!(
+            without_logs,
+            "native child receipt must not depend on a successful diagnostic write"
+        );
+        assert!(
+            flooded,
+            "bounded diagnostic history must not erase live ownership"
+        );
+    }
+
+    #[test]
+    fn watchdog_fixture_holds_native_parent_lock() {
+        let Some(config) = std::env::var_os("CCSM_WATCHDOG_NATIVE_LOCK_FIXTURE") else {
+            return;
+        };
+        let expected: crate::process_identity::ProcessIdentity = serde_json::from_str(
+            &std::env::var("CCSM_WATCHDOG_NATIVE_LOCK_IDENTITY").expect("fixture identity"),
+        )
+        .expect("valid fixture identity");
+        let _lock = acquire_supervisor_parent_lock(Path::new(&config), &expected)
+            .expect("child native lock")
+            .expect("child owns lock");
+        std::fs::write(Path::new(&config).join("lock-ready"), b"ready").expect("fixture ready");
+        let mut input = String::new();
+        let _ = std::io::stdin().read_line(&mut input);
+    }
+
+    #[test]
+    fn native_parent_lock_excludes_an_independent_process_until_owner_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected =
+            crate::process_identity::current_process_identity().expect("current identity");
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "watchdog::tests::watchdog_fixture_holds_native_parent_lock",
+                "--nocapture",
+            ])
+            .env("CCSM_WATCHDOG_NATIVE_LOCK_FIXTURE", dir.path())
+            .env(
+                "CCSM_WATCHDOG_NATIVE_LOCK_IDENTITY",
+                serde_json::to_string(&expected).unwrap(),
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = command.spawn().expect("disposable lock fixture");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !dir.path().join("lock-ready").is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ready = dir.path().join("lock-ready").is_file();
+        let other_claim =
+            acquire_supervisor_parent_lock(dir.path(), &expected).expect("parent lock attempt");
+        let excluded = other_claim.is_none();
+        drop(other_claim);
+        let next = crate::process_identity::ProcessIdentity {
+            started_at_ticks: expected.started_at_ticks + 1,
+            ..expected.clone()
+        };
+        let next_claim =
+            acquire_supervisor_parent_lock(dir.path(), &next).expect("next generation attempt");
+        let next_allowed = next_claim.is_some();
+        drop(next_claim);
+        child.stdin.take();
+        let exited = child.wait().expect("fixture exit").success();
+        assert!(
+            ready && exited,
+            "native lock fixture must become ready and exit cleanly"
+        );
+        assert!(
+            excluded,
+            "an independent native process must exclude the same exact parent claim"
+        );
+        assert!(
+            next_allowed,
+            "new app generation may arm while old owner waits"
+        );
+        assert!(acquire_supervisor_parent_lock(dir.path(), &expected)
+            .expect("released native lock")
+            .is_some());
+    }
+
+    #[test]
+    fn duplicate_supervisors_cannot_hold_the_same_exact_parent_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected =
+            crate::process_identity::current_process_identity().expect("current identity");
+        let first = acquire_supervisor_parent_lock(dir.path(), &expected)
+            .expect("first lock")
+            .expect("owned first lock");
+        let second =
+            acquire_supervisor_parent_lock(dir.path(), &expected).expect("second lock attempt");
+        let duplicate_rejected = second.is_none();
+        drop(second);
+        drop(first);
+        assert!(
+            duplicate_rejected,
+            "two native supervisors must not charge or restart the same parent"
+        );
+    }
+
+    #[test]
+    fn supervisor_parent_lock_does_not_block_the_restarted_app_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected =
+            crate::process_identity::current_process_identity().expect("current identity");
+        let first = acquire_supervisor_parent_lock(dir.path(), &expected)
+            .expect("first lock")
+            .expect("owned first lock");
+        let next = crate::process_identity::ProcessIdentity {
+            started_at_ticks: expected.started_at_ticks + 1,
+            ..expected.clone()
+        };
+        let next_lock =
+            acquire_supervisor_parent_lock(dir.path(), &next).expect("next generation lock");
+        assert!(
+            next_lock.is_some(),
+            "a restarted app must arm while the old supervisor waits for readiness"
+        );
+        drop(next_lock);
+        drop(first);
+        assert!(acquire_supervisor_parent_lock(dir.path(), &expected)
+            .expect("released lock")
+            .is_some());
+    }
+
+    #[test]
+    fn exact_clean_exit_event_overrides_a_leftover_owned_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(log_dir(dir.path())).expect("logs");
+        let expected = crate::process_identity::current_process_identity().expect("identity");
+        let marker = serde_json::json!({
+            "startedAt": "2026-11-17 10:00:00.000", "pid": expected.pid,
+            "version": "test", "os": "test", "arch": "test", "cwd": "redacted",
+            "executablePath": expected.executable_path, "processStartedAtTicks": expected.started_at_ticks,
+            "configScope": crate::process_identity::config_scope_fingerprint_for(dir.path()),
+        });
+        let event = serde_json::json!({
+            "timestamp": "2026-11-17 10:01:00.000", "kind": "clean_exit", "reason": "user_requested_exit", "exitCode": 0,
+            "version": "test", "os": "test", "arch": "test", "pid": expected.pid,
+            "details": { "startedAt": "2026-11-17 10:00:00.000", "executablePath": expected.executable_path, "processStartedAtTicks": expected.started_at_ticks.to_string(), "configScope": crate::process_identity::config_scope_fingerprint_for(dir.path()) },
+        });
+        std::fs::write(
+            log_dir(dir.path()).join("app-exit-events.jsonl"),
+            format!("{event}\n"),
+        )
+        .expect("event fixture");
+        assert_eq!(
+            classify_parent_recovery_outcome(
+                dir.path(),
+                Some(&marker.to_string()),
+                expected.pid,
+                Some(&expected)
+            ),
+            ParentOutcome::CleanExit
+        );
+    }
+
+    #[test]
+    fn disabled_live_observer_can_reenable_without_replacing_its_owner() {
+        assert_eq!(
+            supervisor_poll_action(Some(false), WatchedParentState::Running),
+            SupervisorPollAction::Observe
+        );
+        assert_eq!(
+            supervisor_poll_action(Some(false), WatchedParentState::Unknown),
+            SupervisorPollAction::Observe
+        );
+        assert_eq!(
+            supervisor_poll_action(Some(true), WatchedParentState::Running),
+            SupervisorPollAction::Observe
+        );
+        assert_eq!(
+            supervisor_poll_action(Some(false), WatchedParentState::Exited),
+            SupervisorPollAction::Stop
+        );
+        assert_eq!(
+            supervisor_poll_action(Some(true), WatchedParentState::Exited),
+            SupervisorPollAction::Recover
+        );
+        assert_eq!(
+            supervisor_poll_action(None, WatchedParentState::Exited),
+            SupervisorPollAction::Stop
+        );
+    }
+
+    #[test]
+    fn malformed_restart_ledger_cannot_authorize_or_erase_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(log_dir(dir.path())).expect("logs");
+        let file = log_dir(dir.path()).join(WATCHDOG_STATE_FILE);
+        for invalid in ["{", "{}", r#"{"restarts":[1,"invalid"]}"#] {
+            std::fs::write(&file, invalid).expect("malformed fixture");
+            let authorized = authorize_restart_attempt(dir.path(), 2_000_000);
+            assert!(
+                authorized.is_err(),
+                "malformed canonical history must not reset the budget"
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), invalid);
+        }
+    }
+
+    #[test]
+    fn unreadable_restart_ledger_cannot_authorize_launch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(log_dir(dir.path()).join(WATCHDOG_STATE_FILE))
+            .expect("unreadable ledger fixture");
+        assert!(authorize_restart_attempt(dir.path(), 2_000_000).is_err());
+    }
+
+    #[test]
+    fn failed_restart_ledger_commit_cannot_authorize_launch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(log_dir(dir.path()).join(WATCHDOG_STATE_FILE))
+            .expect("blocked commit fixture");
+        assert!(write_restart_budget_state(dir.path(), &[2_000_000]).is_err());
+    }
+
+    #[test]
+    fn missing_first_run_ledger_initializes_and_charges_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            read_restart_budget_state(dir.path()).unwrap(),
+            Vec::<u64>::new()
+        );
+        assert_eq!(authorize_restart_attempt(dir.path(), 2_000_000), Ok(true));
+        assert_eq!(
+            read_restart_budget_state(dir.path()).unwrap(),
+            vec![2_000_000]
+        );
+    }
+
+    #[test]
+    fn unknown_parent_identity_or_liveness_cannot_authorize_recovery() {
+        use crate::process_identity::ProcessIdentityError;
+        let expected =
+            crate::process_identity::current_process_identity().expect("current identity");
+        for error in [
+            ProcessIdentityError::AccessDenied,
+            ProcessIdentityError::Unavailable(31),
+        ] {
+            assert_eq!(
+                classify_watched_parent_state(&expected, Err(error), Err(error)),
+                WatchedParentState::Unknown
+            );
+            assert_eq!(
+                classify_watched_parent_state(&expected, Ok(expected.clone()), Err(error)),
+                WatchedParentState::Unknown
+            );
+        }
+        assert_eq!(
+            classify_watched_parent_state(
+                &expected,
+                Err(ProcessIdentityError::NotFound),
+                Ok(false)
+            ),
+            WatchedParentState::Exited
+        );
+        assert_eq!(
+            classify_watched_parent_state(&expected, Err(ProcessIdentityError::NotFound), Ok(true)),
+            WatchedParentState::Unknown
+        );
+        assert_eq!(
+            classify_watched_parent_state(&expected, Ok(expected.clone()), Ok(false)),
+            WatchedParentState::Exited
+        );
+        assert_eq!(
+            classify_watched_parent_state(&expected, Ok(expected.clone()), Ok(true)),
+            WatchedParentState::Running
+        );
+    }
+
+    #[test]
+    fn dev_supervisor_identity_matches_node_millisecond_start_precision() {
+        let recorded = "2026-11-16T03:04:05.123Z";
+        let millis = chrono::DateTime::parse_from_rfc3339(recorded)
+            .unwrap()
+            .timestamp_millis();
+        let ticks = u64::try_from(i128::from(millis) + 11_644_473_600_000).unwrap() * 10_000;
+        assert!(dev_supervisor_start_matches(recorded, ticks));
+        // An ordinary native start carries sub-ms ticks lost by Node Date.
+        assert!(dev_supervisor_start_matches(recorded, ticks + 7_891));
+        assert!(!dev_supervisor_start_matches(recorded, ticks + 10_000));
+        assert!(!dev_supervisor_start_matches(recorded, ticks - 1));
+        assert!(!dev_supervisor_start_matches("malformed", ticks));
+    }
+
+    #[test]
+    fn dev_session_ledger_follows_device_settings_not_custom_database_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let device = root.path().join("home").join(".cc-switch");
+        let custom_database_dir = root.path().join("synced-database");
+        let settings = device.join("settings.json");
+        let dev_dir = dev_session_status_dir_from_settings(Some(&settings)).unwrap();
+        assert_eq!(dev_dir, device);
+        assert_ne!(dev_dir, custom_database_dir);
+        assert_eq!(dev_session_status_dir_from_settings(None), None);
+    }
+
+    #[test]
+    fn dev_status_uses_dev_override_and_canonical_restart_ledger() {
+        for value in ["true", "1", "yes", "on", " ON "] {
+            assert_eq!(parse_dev_watchdog_override(Some(value)), Some(true));
+        }
+        for value in ["false", "0", "off", "invalid", ""] {
+            assert_eq!(parse_dev_watchdog_override(Some(value)), Some(false));
+        }
+        assert_eq!(parse_dev_watchdog_override(None), None);
+        let now = 2_000_000;
+        let session = serde_json::json!({
+            "restartTimesMs": [200_001, 1_999_999],
+            "supervisorRestartTimesMs": [1_999_998, 1_999_999, 2_000_000]
+        });
+        assert_eq!(dev_restart_count(&session, now), 2);
+        assert_eq!(
+            dev_restart_count(
+                &serde_json::json!({"restartTimesMs": [] , "supervisorRestartTimesMs": [now]}),
+                now
+            ),
+            0
+        );
+        assert_eq!(
+            dev_restart_count(&serde_json::json!({"supervisorRestartTimesMs": [now]}), now),
+            1
+        );
+    }
+
+    #[test]
+    fn release_and_dev_watchdog_share_restart_budget_contract() {
+        let policy: serde_json::Value =
+            serde_json::from_str(include_str!("../../scripts/dev-recovery-policy.json"))
+                .expect("canonical dev policy");
+        assert_eq!(
+            policy["maxRestarts"].as_u64(),
+            Some(MAX_RESTARTS_PER_WINDOW as u64)
+        );
+        assert_eq!(
+            policy["restartWindowMs"].as_u64(),
+            Some(RESTART_WINDOW_SECS * 1000)
+        );
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -833,12 +1552,12 @@ mod tests {
     fn watched_parent_liveness_requires_the_exact_process_identity() {
         let current =
             crate::process_identity::current_process_identity().expect("current process identity");
-        assert!(watched_parent_is_running(&current));
+        assert_eq!(watched_parent_state(&current), WatchedParentState::Running);
         let reused = crate::process_identity::ProcessIdentity {
             started_at_ticks: current.started_at_ticks + 1,
             ..current
         };
-        assert!(!watched_parent_is_running(&reused));
+        assert_eq!(watched_parent_state(&reused), WatchedParentState::Exited);
     }
 
     #[test]
@@ -856,7 +1575,7 @@ mod tests {
             .expect("owned test child");
         let expected = crate::process_identity::process_identity(child.id())
             .expect("owned child process identity");
-        assert!(watched_parent_is_running(&expected));
+        assert_eq!(watched_parent_state(&expected), WatchedParentState::Running);
         child
             .stdin
             .take()
@@ -865,7 +1584,7 @@ mod tests {
             .expect("release owned child");
         assert!(child.wait().expect("owned child exit").success());
         assert!(!crate::process_identity::process_exists(child.id()));
-        assert!(!watched_parent_is_running(&expected));
+        assert_eq!(watched_parent_state(&expected), WatchedParentState::Exited);
     }
 
     #[cfg(target_os = "windows")]

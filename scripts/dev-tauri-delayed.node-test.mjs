@@ -43,6 +43,7 @@ import {
   preserveManualTakeoverHandoff,
   retireDevWorkerForManualHandoff,
   parseWindowsJsonQueryOutput,
+  probeDevSupervisorLivenessFallback,
   queryWindowsProcesses,
   readDevRestartTimesMs,
   readDevRunMarkerPresent,
@@ -2910,6 +2911,12 @@ test("Tauri exit observation consumes expected rebuild exits once without recove
   assert.equal(expectedExits.consume(child), false);
 });
 
+async function fixtureDevLaunchLock() {
+  const release = async () => {};
+  release.assertHeld = () => {};
+  return release;
+}
+
 function replacementDevSession() {
   const repoRoot = path.resolve("workspace", "ccswitchmulti");
   return {
@@ -3309,6 +3316,7 @@ test("detached watchdog relaunches the pnpm dev entry point after supervisor dea
   const session = {
     ...replacementDevSession(),
     supervisorPid: 100,
+    supervisorExecutablePath: process.execPath,
     args: ["--delay", "0"],
     environment: { TAURI_DEV_NO_REBUILD: "0" },
   };
@@ -3329,6 +3337,9 @@ test("detached watchdog relaunches the pnpm dev entry point after supervisor dea
     repoRoot: session.repoRoot,
     now: () => 1_000,
     readEnabled: () => true,
+    readSession: () => structuredClone(session),
+    acquireLaunchLock: fixtureDevLaunchLock,
+    isSupervisorAbsent: () => true,
     persistSession: (nextSession) =>
       persisted.push(JSON.parse(JSON.stringify(nextSession))),
     spawnReplacement: async (specification) => {
@@ -3423,6 +3434,8 @@ test("detached watchdog retries when the replacement pnpm dev supervisor dies be
         ...options,
         now: () => nowMs,
         readEnabled: () => true,
+        acquireLaunchLock: fixtureDevLaunchLock,
+        isSupervisorAbsent: () => true,
         persistSession: (next) => {
           session = JSON.parse(JSON.stringify(next));
         },
@@ -3487,6 +3500,7 @@ test("detached watchdog stops failed replacement launches at the shared restart 
   let session = {
     ...replacementDevSession(),
     repoRoot,
+    supervisorExecutablePath: process.execPath,
     scriptPath: path.join(repoRoot, "scripts", "dev-tauri-delayed.mjs"),
     supervisorPid: 100,
     args: [],
@@ -3506,6 +3520,8 @@ test("detached watchdog stops failed replacement launches at the shared restart 
         ...options,
         now: () => 1_000,
         readEnabled: () => true,
+        acquireLaunchLock: fixtureDevLaunchLock,
+        isSupervisorAbsent: () => true,
         persistSession: (next) => {
           session = structuredClone(next);
         },
@@ -3554,6 +3570,7 @@ test("detached watchdog preserves recovery ownership across a failed process que
         throw new Error("PowerShell 7 process query timed out");
       return [];
     },
+    livenessFallback: () => "unknown",
     handoff: async () => {
       handoffs++;
       return { restarted: true };
@@ -3563,7 +3580,179 @@ test("detached watchdog preserves recovery ownership across a failed process que
   assert.equal(handoffs, 1);
   if (process.platform === "win32") {
     assert.equal(queries, 2);
-    assert.deepEqual(events, ["dev-watchdog-iteration-failed"]);
+    assert.deepEqual(events, ["dev-watchdog-liveness-fallback"]);
+  }
+});
+
+test("liveness fallback proves only the exact absent/present/unknown outcomes", () => {
+  assert.equal(
+    probeDevSupervisorLivenessFallback(100, {
+      platform: "win32",
+      kill: () => {
+        const error = new Error("gone");
+        error.code = "ESRCH";
+        throw error;
+      },
+      run: () => {
+        throw new Error("tasklist must not run after ESRCH");
+      },
+    }),
+    "absent",
+  );
+  assert.equal(
+    probeDevSupervisorLivenessFallback(100, {
+      platform: "win32",
+      kill: () => {},
+      run: () => {
+        throw new Error("tasklist must not run when kill proves present");
+      },
+    }),
+    "present",
+  );
+  assert.equal(
+    probeDevSupervisorLivenessFallback(100, {
+      platform: "win32",
+      kill: () => {
+        const error = new Error("invalid probe");
+        error.code = "EINVAL";
+        throw error;
+      },
+      run: () => ({ error: new Error("tasklist timed out"), status: null }),
+    }),
+    "unknown",
+  );
+  assert.equal(
+    probeDevSupervisorLivenessFallback(100, {
+      platform: "win32",
+      kill: () => {
+        const error = new Error("invalid probe");
+        error.code = "EINVAL";
+        throw error;
+      },
+      run: () => ({
+        status: 0,
+        stdout: '"node.exe","100","Console","1","1 K"\n',
+      }),
+    }),
+    "present",
+  );
+  assert.equal(
+    probeDevSupervisorLivenessFallback(100, {
+      platform: "win32",
+      kill: () => {
+        const error = new Error("invalid probe");
+        error.code = "EINVAL";
+        throw error;
+      },
+      run: () => ({
+        status: 0,
+        stdout: '"node.exe","101","Console","1","1 K"\n',
+      }),
+    }),
+    "absent",
+  );
+  assert.equal(
+    probeDevSupervisorLivenessFallback(100, {
+      platform: "win32",
+      kill: () => {
+        const error = new Error("access denied");
+        error.code = "EPERM";
+        throw error;
+      },
+      run: () => ({
+        status: 0,
+        stdout: '"node.exe","100","Console","1","1 K"\n',
+      }),
+    }),
+    "present",
+  );
+});
+
+test("detached watchdog uses absence fallback after repeated process-query timeouts", async () => {
+  if (process.platform !== "win32") return;
+  const session = {
+    ...replacementDevSession(),
+    supervisorPid: 100,
+    repoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."),
+    scriptPath: path.join(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."),
+      "scripts",
+      "dev-tauri-delayed.mjs",
+    ),
+  };
+  let fallbackCalls = 0;
+  let handoffs = 0;
+  const events = [];
+  await runDetachedDevWatchdog(100, {
+    markerPath: path.join("isolated", "dev-session.json"),
+    readSession: () => session,
+    wait: async () => {},
+    queryProcesses: () => {
+      throw new Error("PowerShell 7 process query timed out");
+    },
+    livenessFallback: () => {
+      fallbackCalls++;
+      return "absent";
+    },
+    handoff: async () => {
+      handoffs++;
+      return { restarted: true };
+    },
+    writeEvent: (event, detail) => events.push({ event, detail }),
+  });
+  assert.equal(fallbackCalls, 1);
+  assert.equal(handoffs, 1);
+  assert.deepEqual(events, [
+    {
+      event: "dev-watchdog-liveness-fallback",
+      detail: {
+        supervisorPid: 100,
+        result: "absent",
+        reason: "PowerShell 7 process query timed out",
+      },
+    },
+  ]);
+});
+
+test("detached watchdog never hands off on a present or unknown fallback", async () => {
+  if (process.platform !== "win32") return;
+  const session = {
+    ...replacementDevSession(),
+    supervisorPid: 100,
+    repoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."),
+    scriptPath: path.join(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."),
+      "scripts",
+      "dev-tauri-delayed.mjs",
+    ),
+  };
+  for (const fallback of ["present", "unknown"]) {
+    session.state = "running";
+    let waits = 0;
+    let handoffs = 0;
+    const events = [];
+    await runDetachedDevWatchdog(100, {
+      markerPath: path.join("isolated", "dev-session.json"),
+      readSession: () => session,
+      wait: async () => {
+        assert.ok(++waits <= 2);
+        if (waits === 2) session.state = "stopping";
+      },
+      queryProcesses: () => {
+        throw new Error("PowerShell 7 process query timed out");
+      },
+      livenessFallback: () => fallback,
+      handoff: async () => {
+        handoffs++;
+        return { restarted: true };
+      },
+      writeEvent: (event, detail) => events.push({ event, detail }),
+    });
+    assert.equal(handoffs, 0);
+    assert.equal(events.length, 1);
+    assert.ok(
+      events.every(({ event }) => event === "dev-watchdog-liveness-fallback"),
+    );
   }
 });
 
@@ -4458,3 +4647,263 @@ test(
     }
   },
 );
+
+function detachedRecoveryClaimFixture() {
+  const observed = {
+    ...replacementDevSession(),
+    supervisorPid: 100,
+    args: [],
+    roots: [],
+    environment: {},
+    restartTimesMs: [],
+  };
+  let canonical = structuredClone(observed);
+  let held = false;
+  const evidence = {
+    reads: 0,
+    writes: 0,
+    launches: 0,
+    releases: 0,
+    absenceChecks: 0,
+  };
+  const release = async () => {
+    held = false;
+    evidence.releases++;
+  };
+  release.assertHeld = () => {
+    if (!held) throw new Error("fixture launch ownership lost");
+  };
+  const options = {
+    supervisorPid: observed.supervisorPid,
+    markerPath: path.join("isolated", "dev-session.json"),
+    session: structuredClone(observed),
+    repoRoot: observed.repoRoot,
+    scriptPath: observed.scriptPath,
+    executable: observed.supervisorExecutablePath,
+    now: () => 1_000,
+    readEnabled: () => true,
+    readSession: () => {
+      evidence.reads++;
+      return structuredClone(canonical);
+    },
+    acquireLaunchLock: async () => {
+      held = true;
+      return release;
+    },
+    isSupervisorAbsent: () => {
+      evidence.absenceChecks++;
+      return true;
+    },
+    persistSession: (next) => {
+      evidence.writes++;
+      canonical = structuredClone(next);
+    },
+    spawnReplacement: async () => {
+      evidence.launches++;
+      return { pid: 300, exitCode: null, signalCode: null, unref() {} };
+    },
+    waitForPublication: async () => ({ ...canonical, supervisorPid: 300 }),
+    writeEvent: () => {},
+  };
+  return {
+    options,
+    evidence,
+    release,
+    read: () => structuredClone(canonical),
+    replace: (next) => {
+      canonical = structuredClone(next);
+    },
+    loseLock: () => {
+      held = false;
+    },
+    assertHeld: () => release.assertHeld(),
+    isHeld: () => held,
+  };
+}
+
+test("detached recovery claim cannot overwrite a superseding canonical supervisor", async () => {
+  const f = detachedRecoveryClaimFixture();
+  const newer = { ...f.read(), supervisorPid: 200, restartTimesMs: [900] };
+  f.replace(newer);
+  const result = await handoffDetachedDevSupervisor(f.options);
+  assert.equal(result.restarted, false);
+  assert.equal(result.decision.reason, "superseded-session");
+  assert.deepEqual(f.read(), newer);
+  assert.equal(f.evidence.writes, 0);
+  assert.equal(f.evidence.launches, 0);
+  assert.equal(f.evidence.releases, 1);
+});
+
+test("detached recovery claim cannot revive an intentional canonical stop", async () => {
+  const f = detachedRecoveryClaimFixture();
+  const stopping = { ...f.read(), state: "stopping" };
+  f.replace(stopping);
+  const result = await handoffDetachedDevSupervisor(f.options);
+  assert.equal(result.restarted, false);
+  assert.equal(result.decision.reason, "intentional-stop");
+  assert.deepEqual(f.read(), stopping);
+  assert.equal(f.evidence.writes, 0);
+  assert.equal(f.evidence.launches, 0);
+  assert.equal(f.evidence.releases, 1);
+});
+
+test("detached recovery claim rejects an older snapshot after another claim charges the canonical budget", async () => {
+  const f = detachedRecoveryClaimFixture();
+  assert.equal((await handoffDetachedDevSupervisor(f.options)).restarted, true);
+  const claimed = f.read();
+  assert.deepEqual(claimed.restartTimesMs, [1_000]);
+  const second = await handoffDetachedDevSupervisor(f.options);
+  assert.equal(second.restarted, false);
+  assert.equal(second.decision.reason, "superseded-session");
+  assert.deepEqual(f.read(), claimed);
+  assert.equal(f.evidence.writes, 1);
+  assert.equal(f.evidence.launches, 1);
+  assert.equal(f.evidence.releases, 2);
+});
+
+test("detached recovery claim rechecks old supervisor absence under launch ownership", async () => {
+  const f = detachedRecoveryClaimFixture();
+  f.options.isSupervisorAbsent = () => {
+    f.assertHeld();
+    f.evidence.absenceChecks++;
+    return false;
+  };
+  const result = await handoffDetachedDevSupervisor(f.options);
+  assert.equal(result.restarted, false);
+  assert.equal(result.retry, true);
+  assert.equal(result.decision.reason, "supervisor-present-or-unknown");
+  assert.equal(f.evidence.absenceChecks, 1);
+  assert.equal(f.evidence.writes, 0);
+  assert.equal(f.evidence.launches, 0);
+  assert.equal(f.evidence.releases, 1);
+});
+
+test("detached recovery claim observes a stop published during the absence probe", async () => {
+  const f = detachedRecoveryClaimFixture();
+  f.options.isSupervisorAbsent = () => {
+    f.replace({ ...f.read(), state: "stopping" });
+    return true;
+  };
+  const result = await handoffDetachedDevSupervisor(f.options);
+  assert.equal(result.restarted, false);
+  assert.equal(result.decision.reason, "intentional-stop");
+  assert.equal(f.read().state, "stopping");
+  assert.equal(f.evidence.writes, 0);
+  assert.equal(f.evidence.launches, 0);
+});
+
+test("detached recovery claim rechecks the toggle after waiting for launch ownership", async () => {
+  const f = detachedRecoveryClaimFixture();
+  let enabled = true;
+  const acquire = f.options.acquireLaunchLock;
+  f.options.acquireLaunchLock = async (...args) => {
+    const release = await acquire(...args);
+    enabled = false;
+    return release;
+  };
+  f.options.readEnabled = () => enabled;
+  const result = await handoffDetachedDevSupervisor(f.options);
+  assert.equal(result.restarted, false);
+  assert.equal(result.decision.reason, "disabled");
+  assert.equal(f.evidence.writes, 0);
+  assert.equal(f.evidence.launches, 0);
+  assert.equal(f.evidence.releases, 1);
+});
+
+test("detached recovery claim holds serialization through persist and spawn but releases before publication", async () => {
+  const f = detachedRecoveryClaimFixture();
+  const persist = f.options.persistSession;
+  const spawn = f.options.spawnReplacement;
+  f.options.persistSession = (next) => {
+    f.assertHeld();
+    persist(next);
+  };
+  f.options.spawnReplacement = async (...args) => {
+    f.assertHeld();
+    return spawn(...args);
+  };
+  f.options.waitForPublication = async () => {
+    assert.equal(f.isHeld(), false);
+    return { ...f.read(), supervisorPid: 300 };
+  };
+  const result = await handoffDetachedDevSupervisor(f.options);
+  assert.equal(result.restarted, true);
+  assert.equal(f.evidence.writes, 1);
+  assert.equal(f.evidence.launches, 1);
+  assert.equal(f.evidence.releases, 1);
+});
+
+test("detached recovery claim loses all mutation authority when its launch keeper dies", async () => {
+  const f = detachedRecoveryClaimFixture();
+  f.options.isSupervisorAbsent = () => {
+    f.loseLock();
+    return true;
+  };
+  await assert.rejects(
+    handoffDetachedDevSupervisor(f.options),
+    /fixture launch ownership lost/,
+  );
+  assert.equal(f.evidence.writes, 0);
+  assert.equal(f.evidence.launches, 0);
+  assert.equal(f.evidence.releases, 1);
+});
+
+test("detached recovery claims serialize and a queued stale claimant cannot launch twice", async () => {
+  const f = detachedRecoveryClaimFixture();
+  const acquire = f.options.acquireLaunchLock;
+  let lane = Promise.resolve();
+  f.options.acquireLaunchLock = async () => {
+    const previous = lane;
+    let finish;
+    lane = new Promise((resolve) => {
+      finish = resolve;
+    });
+    await previous;
+    const owned = await acquire();
+    const release = async () => {
+      await owned();
+      finish();
+    };
+    release.assertHeld = owned.assertHeld;
+    return release;
+  };
+  const results = await Promise.all([
+    handoffDetachedDevSupervisor(f.options),
+    handoffDetachedDevSupervisor(f.options),
+  ]);
+  assert.deepEqual(
+    results.map((result) => result.restarted),
+    [true, false],
+  );
+  assert.equal(results[1].decision.reason, "superseded-session");
+  assert.deepEqual(f.read().restartTimesMs, [1_000]);
+  assert.equal(f.evidence.writes, 1);
+  assert.equal(f.evidence.launches, 1);
+  assert.equal(f.evidence.releases, 2);
+});
+
+for (const [code, description] of [
+  ["ENOENT", "missing"],
+  ["EACCES", "unreadable"],
+]) {
+  test(
+    "detached recovery claim cannot recreate a " +
+      description +
+      " canonical marker",
+    async () => {
+      const f = detachedRecoveryClaimFixture();
+      f.options.readSession = () => {
+        throw Object.assign(new Error("fixture marker " + description), {
+          code,
+        });
+      };
+      await assert.rejects(
+        handoffDetachedDevSupervisor(f.options),
+        (error) => error.code === code,
+      );
+      assert.equal(f.evidence.writes, 0);
+      assert.equal(f.evidence.launches, 0);
+      assert.equal(f.evidence.releases, 1);
+    },
+  );
+}

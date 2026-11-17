@@ -675,6 +675,42 @@ impl RequestForwarder {
         ))
     }
 
+    /// Child-only policy is read from the latest canonical router on every
+    /// attempt. Request-local resolved providers must not become another owner
+    /// of the setting, especially across retries or a toggle during a session.
+    fn apply_codex_subagent_reasoning_effort(
+        &self,
+        app_type: &AppType,
+        provider: &Provider,
+        headers: &http::HeaderMap,
+        body: &mut Value,
+        endpoint: &str,
+    ) -> Result<bool, ProxyError> {
+        if !matches!(app_type, AppType::Codex)
+            || !super::codex_subagent_reasoning::is_subagent_request(headers, body)
+        {
+            return Ok(false);
+        }
+        let (router_id, _) = super::providers::codex_route_persistent_provider(provider);
+        let router = self
+            .router
+            .get_provider_by_id(router_id, app_type.as_str())
+            .map_err(|_| {
+                ProxyError::ConfigError(
+                    "Unable to read the current Sub-Agent reasoning policy".to_string(),
+                )
+            })?;
+        Ok(router.is_some_and(|router| {
+            super::codex_subagent_reasoning::apply_subagent_reasoning_effort(
+                &router.settings_config,
+                provider,
+                headers,
+                body,
+                endpoint,
+            )
+        }))
+    }
+
     /// 把 retry 层已经选中的 Codex route 物化为真实目标 provider。
     ///
     /// `resolve_codex_model_routed_providers` 会生成带 `codexResolvedRouteId` 和父路由
@@ -2584,6 +2620,7 @@ impl RequestForwarder {
         // 客户端无法被本地进程拦截，不能把该策略误描述为账号级强制控制。
         if matches!(app_type, AppType::Codex) {
             if let Some(reason) = crate::services::quota_collaboration::codex_enforcement_reason(
+                self.router.database(),
                 chrono::Utc::now().timestamp(),
             ) {
                 return Err(ProxyError::UpstreamError {
@@ -2805,6 +2842,13 @@ impl RequestForwarder {
 
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
         let mut mapped_body = normalize_thinking_type(mapped_body);
+        let subagent_reasoning_overridden = self.apply_codex_subagent_reasoning_effort(
+            app_type,
+            provider,
+            headers,
+            &mut mapped_body,
+            endpoint,
+        )?;
 
         let projected = project_codex_agent_messages_for_effective_provider(
             app_type,
@@ -3430,6 +3474,9 @@ impl RequestForwarder {
                 );
             }
         }
+        let subagent_reasoning_projection = subagent_reasoning_overridden.then(|| {
+            super::codex_subagent_reasoning::SubagentReasoningProjection::capture(&request_body)
+        });
         let mut filtered_body = if let Some(policy) = codex_third_party_request_policy.as_ref() {
             policy.finalize_body(
                 codex_request_transport,
@@ -3457,6 +3504,11 @@ impl RequestForwarder {
             }
             filtered_body
         };
+        if let Some(projection) = subagent_reasoning_projection {
+            // Reject conflicting advanced provider overrides before sending any
+            // request. Never restore controls over a later protocol safety guard.
+            projection.verify(&filtered_body)?;
+        }
         let hosted_tool_loop_config =
             codex_chat_tool_context
                 .as_ref()
@@ -3569,6 +3621,12 @@ impl RequestForwarder {
             if let Some(projection) = hosted_chat_tool_projection.as_ref() {
                 fields.push(("hosted_tool_projection", projection.clone()));
             }
+            fields.extend(super::codex_subagent_reasoning::request_diagnostic_fields(
+                headers,
+                body,
+                &filtered_body,
+                subagent_reasoning_overridden,
+            ));
             super::codex_router_log::append_event("request_prepared", &fields);
         }
 
@@ -10795,6 +10853,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subagent_reasoning_effort_forwarder_uses_current_policy_for_native_and_chat_only_on_children(
+    ) {
+        // Include both flat relay controls and OpenRouter-compatible nested
+        // controls; the same logical High must reach the provider-native wire.
+        for (api_format, endpoint, nested_reasoning) in [
+            ("openai_responses", "/v1/responses", false),
+            ("openai_chat", "/v1/responses", false),
+            ("openai_chat", "/v1/chat/completions", false),
+            ("openai_chat", "/v1/responses", true),
+            ("openai_chat", "/v1/chat/completions", true),
+        ] {
+            for public_model in ["test-graded-model", "router-public-alias"] {
+                for override_kind in ["none", "compatible", "conflict"] {
+                    for (selection, child_marker, incoming, expected) in [
+                        ("unset", "header", "max", "high"),
+                        ("unset", "metadata", "medium", "high"),
+                        ("unset", "main", "max", "max"),
+                        ("high", "header", "low", "high"),
+                        ("high", "metadata", "medium", "high"),
+                        ("high", "header", "max", "high"),
+                        ("high", "metadata", "max", "high"),
+                        ("high", "main", "max", "max"),
+                        ("max", "header", "high", "max"),
+                        ("profile", "header", "max", "max"),
+                    ] {
+                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let upstream = format!("http://{}", listener.local_addr().unwrap());
+                        let capture = tokio::spawn(capture_single_http_request(listener));
+                        let mut target = test_provider_with_type(None);
+                        target.id = "router::route::graded".to_string();
+                        target.settings_config = json!({
+                            "base_url": upstream, "api_key": "REDACTED_TEST_KEY",
+                            "codexRouterParentProviderId": "router", "codexResolvedRouteId": "graded",
+                            "codexResolvedCanonicalModel": "test-graded-model", "codexResolvedUpstreamModelOverride": "test-graded-model",
+                            "codexRouting": {"enabled": true, "subagentReasoningEffort": "max"},
+                            "modelCatalog": {"models": [{"model": "test-graded-model", "reasoning": {
+                                "supported": true, "supportedEfforts": ["low", "high", "max"], "defaultEffort": "max", "disableAllowed": false,
+                                "upstream": {"format": "string", "parameter": "reasoning_effort", "effortMap": {"low": "low", "high": "high", "max": "max"}}
+                            }}]}
+                        });
+                        if nested_reasoning {
+                            target.settings_config["modelCatalog"]["models"][0]["reasoning"]
+                                ["upstream"] = json!({
+                                "format": "object", "parameter": "reasoning.effort",
+                                "effortMap": {"low": "low", "high": "high", "max": "max"}
+                            });
+                        }
+                        target.meta = Some(ProviderMeta {
+                            api_format: Some(api_format.to_string()),
+                            ..Default::default()
+                        });
+                        let override_body = match override_kind {
+                            "conflict" if api_format == "openai_chat" && !nested_reasoning => {
+                                Some(json!({"reasoning_effort": "max"}))
+                            }
+                            "conflict" => Some(json!({"reasoning": {"effort": "max"}})),
+                            "compatible" => Some(json!({"temperature": 0.1})),
+                            _ => None,
+                        };
+                        if let Some(override_body) = override_body {
+                            target.meta.as_mut().unwrap().local_proxy_request_overrides = Some(
+                                serde_json::from_value(json!({"body": override_body})).unwrap(),
+                            );
+                        }
+                        let mut router = Provider::with_id(
+                            "router".into(),
+                            "Router".into(),
+                            json!({"codexRouting": {
+                                "enabled": true, "subagentReasoningEffort": selection, "defaultReasoningEffort": "max",
+                                "subagentV2": {"profiles": {"saved": {"reasoning": {"policy": "fixed", "effort": "max"}}}}
+                            }}),
+                            None,
+                        );
+                        if selection == "unset" {
+                            router.settings_config["codexRouting"]
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("subagentReasoningEffort");
+                        }
+                        let mut forwarder = test_forwarder(Duration::from_secs(5), Duration::ZERO);
+                        forwarder
+                            .router
+                            .database()
+                            .save_provider("codex", &router)
+                            .unwrap();
+                        forwarder.session_id = uuid::Uuid::new_v4().to_string();
+                        forwarder.request_health_trace = uuid::Uuid::new_v4().to_string();
+                        let native_chat = endpoint.contains("chat/completions");
+                        let flat_chat = api_format == "openai_chat" && !nested_reasoning;
+                        let mut body = if native_chat && flat_chat {
+                            json!({"model": public_model, "reasoning_effort": incoming, "messages": [{"role": "user", "content": "Inspect a bounded change"}], "stream": false})
+                        } else if native_chat {
+                            json!({"model": public_model, "reasoning": {"effort": incoming}, "messages": [{"role": "user", "content": "Inspect a bounded change"}], "stream": false})
+                        } else {
+                            json!({"model": public_model, "reasoning": {"effort": incoming}, "input": [{"role": "user", "content": "Inspect a bounded change"}], "tools": [], "stream": false})
+                        };
+                        let mut headers = HeaderMap::new();
+                        match child_marker {
+                            "header" => {
+                                headers.insert(
+                                    "x-openai-subagent",
+                                    HeaderValue::from_static("collab_spawn"),
+                                );
+                            }
+                            "metadata" => {
+                                body["client_metadata"] =
+                                    json!({"x-openai-subagent": "collab_spawn"});
+                            }
+                            _ => {}
+                        }
+                        let adapter = get_adapter(&AppType::Codex);
+                        let outcome = forwarder
+                            .forward(
+                                &AppType::Codex,
+                                &http::Method::POST,
+                                &target,
+                                endpoint,
+                                &body,
+                                &headers,
+                                &Extensions::new(),
+                                adapter.as_ref(),
+                            )
+                            .await;
+                        if override_kind == "conflict"
+                            && matches!(selection, "high" | "unset")
+                            && child_marker != "main"
+                        {
+                            let error = match outcome {
+                                Err(error) => error,
+                                Ok(_) => panic!("conflicting provider Max must never be sent"),
+                            };
+                            assert!(error
+                                .to_string()
+                                .contains("Sub-Agent reasoning override conflicts"));
+                            assert!(!error.to_string().contains("REDACTED_TEST_KEY"));
+                            capture.abort();
+                            continue;
+                        }
+                        outcome.expect("forward reasoning override request");
+                        let (_, bytes) = capture.await.unwrap();
+                        let sent: Value = serde_json::from_slice(&bytes).unwrap();
+                        let effort = if flat_chat {
+                            &sent["reasoning_effort"]
+                        } else {
+                            &sent["reasoning"]["effort"]
+                        };
+                        assert_eq!(effort, expected, "{api_format}/{endpoint}/{public_model}/{selection}/{child_marker}/override={override_kind}");
+                        if native_chat && flat_chat {
+                            assert!(
+                                sent.get("reasoning").is_none(),
+                                "native Chat must not receive a Responses-only reasoning field"
+                            );
+                        }
+                        if api_format == "openai_chat" && nested_reasoning {
+                            assert!(
+                                sent.get("reasoning_effort").is_none(),
+                                "nested Chat must not retain a conflicting flat effort"
+                            );
+                        }
+                        if override_kind == "compatible" {
+                            assert_eq!(sent["temperature"], 0.1);
+                        }
+                        let original_effort = if native_chat && flat_chat {
+                            &body["reasoning_effort"]
+                        } else {
+                            &body["reasoning"]["effort"]
+                        };
+                        assert_eq!(
+                            original_effort, incoming,
+                            "the caller's original request stays immutable"
+                        );
+                        let saved = forwarder
+                            .router
+                            .get_provider_by_id("router", "codex")
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(saved.settings_config, router.settings_config, "request projection never rewrites canonical settings/profiles/main effort");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn search_history_forwarder_repairs_native_gpt_compaction_on_standard_and_lite() {
         for (lite, cached_fallback) in [(false, false), (true, false), (true, true)] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -15806,6 +16048,64 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn upstream_transport_retry_never_replays_consumed_hyper_fallback_post() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri: http::Uri = format!("http://{}/fixture", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let payload = b"{\"model\":\"fixture-model\",\"input\":\"test-only\"}";
+        // Consume the entire POST, then close without response headers. A
+        // retry cannot know whether this operation already ran upstream.
+        let server = tokio::spawn(capture_single_http_request_with_response(
+            listener,
+            Bytes::new(),
+        ));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            send_upstream_request_with_transport_retry("test", true, || {
+                let uri = uri.clone();
+                let attempts = attempts_for_send.clone();
+                async move {
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                        // A second call is already the regression. Finish it
+                        // locally so the failing test never leaves a server.
+                        return Ok(ProxyResponse::buffered(
+                            http::StatusCode::OK,
+                            http::HeaderMap::new(),
+                            Bytes::new(),
+                        ));
+                    }
+                    crate::proxy::hyper_client::send_request(
+                        uri,
+                        "loopback-fixture",
+                        http::Method::POST,
+                        http::HeaderMap::new(),
+                        // No original-case extension selects hyper-util.
+                        http::Extensions::new(),
+                        payload.to_vec(),
+                        Duration::from_secs(5),
+                        None,
+                    )
+                    .await
+                }
+            }),
+        )
+        .await
+        .expect("bounded fixture send");
+        let (_, consumed) = server.await.expect("fixture server completed");
+        assert_eq!(consumed, payload);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a consumed POST with an unknown outcome must not be submitted again"
+        );
+        assert!(matches!(result, Err(ProxyError::ResponsePending(_))));
     }
 
     #[tokio::test(start_paused = true)]

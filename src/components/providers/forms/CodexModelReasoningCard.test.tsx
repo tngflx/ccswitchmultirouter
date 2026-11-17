@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import type { CodexModelReasoningResolution } from "@/types/codexSubagentV2";
 
 import {
+  CodexModelReasoningCard,
   describeFinalBehavior,
   reasoningCardStatus,
   reasoningControlKind,
@@ -52,5 +54,99 @@ describe("CodexModelReasoningCard", () => {
     expect(reasoningControlKind(value)).toBe("graded");
     expect(describeFinalBehavior(value)).toContain("reasoning effort");
     expect(describeFinalBehavior(value)).toContain("low / high");
+  });
+});
+
+function renderCard(value: CodexModelReasoningResolution, redetecting = false) {
+  const actions = {
+    onRedetect: vi.fn(),
+    onAdoptDetection: vi.fn(),
+    onManualDeclare: vi.fn(),
+    onRestoreBuiltin: vi.fn(),
+  };
+  render(
+    <CodexModelReasoningCard
+      resolution={value}
+      hasBuiltinPreset={false}
+      redetecting={redetecting}
+      {...actions}
+    />,
+  );
+  return actions;
+}
+
+describe("CodexModelReasoningCard metadata refresh", () => {
+  it("lets known Boolean MiMo refresh metadata without inventing efforts or changing declarations", () => {
+    const value = resolution("boolean_only");
+    value.model = "xiaomi/mimo-v2.6-pro";
+    value.source = "detection";
+    value.capability = {
+      supportStatus: "confirmed_supported",
+      controlKind: "boolean",
+      supportedEfforts: [],
+      disableAllowed: true,
+      upstream: { format: "boolean", parameter: "reasoning.enabled" },
+    };
+    value.resolved.disableAllowed = true;
+    const before = structuredClone(value);
+    const actions = renderCard(value);
+
+    const refresh = screen.getByRole("button", { name: "Detect again" });
+    expect(refresh).toHaveAttribute(
+      "title",
+      "Refresh provider metadata only; no model response is generated.",
+    );
+    expect(screen.getByText("Boolean toggle")).toBeInTheDocument();
+    expect(screen.getByText("Model default")).toBeInTheDocument();
+    expect(screen.queryByText(/^(low|medium|high|xhigh|max)$/i)).toBeNull();
+
+    fireEvent.click(refresh);
+
+    expect(actions.onRedetect).toHaveBeenCalledOnce();
+    expect(actions.onAdoptDetection).not.toHaveBeenCalled();
+    expect(actions.onManualDeclare).not.toHaveBeenCalled();
+    expect(actions.onRestoreBuiltin).not.toHaveBeenCalled();
+    expect(value).toEqual(before);
+  });
+
+  it("allows a known unsupported automatic result to refresh its metadata", () => {
+    const value = resolution("unsupported");
+    value.source = "detection";
+    const actions = renderCard(value);
+
+    fireEvent.click(screen.getByRole("button", { name: "Detect again" }));
+
+    expect(actions.onRedetect).toHaveBeenCalledOnce();
+    expect(screen.getByText("Reasoning unsupported")).toBeInTheDocument();
+  });
+
+  it("keeps exactly one metadata refresh action for unknown models", () => {
+    renderCard(resolution("unknown"));
+
+    expect(
+      screen.getAllByRole("button", { name: "Detect again" }),
+    ).toHaveLength(1);
+    expect(
+      screen.getByText(/Refreshes provider metadata only/),
+    ).toBeInTheDocument();
+  });
+
+  it("disables the single refresh action while metadata discovery is running", () => {
+    const value = resolution("boolean_only");
+    value.source = "detection";
+    const actions = renderCard(value, true);
+    const refresh = screen.getByRole("button", { name: "Detecting…" });
+
+    expect(refresh).toBeDisabled();
+    fireEvent.click(refresh);
+    expect(actions.onRedetect).not.toHaveBeenCalled();
+  });
+
+  it("does not offer automatic refresh over a known manual declaration", () => {
+    const value = resolution("boolean_only");
+    value.source = "user";
+    renderCard(value);
+
+    expect(screen.queryByRole("button", { name: "Detect again" })).toBeNull();
   });
 });

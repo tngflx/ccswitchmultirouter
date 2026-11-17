@@ -442,6 +442,11 @@ fn normalize_upstream_parameter(value: &str, format: &str) -> Option<String> {
     if parameter.is_empty() && format == "none" {
         return Some(parameter);
     }
+    // OpenRouter's enable/disable flag is a boolean, never an effort enum.
+    // Keep the new nested path closed to incompatible wire declarations.
+    if parameter == "reasoning.enabled" {
+        return (format == "boolean").then_some(parameter);
+    }
     matches!(
         parameter.as_str(),
         "reasoning"
@@ -476,6 +481,15 @@ pub fn capability_fingerprint(capability: &CodexModelReasoningCapability) -> Str
         .iter()
         .map(|(source, target)| (source.as_str(), target.as_str()))
         .collect();
+    // Older catalog/library entries used the wire-format alias `object`, while
+    // live discovery normalizes the same Responses contract to
+    // `reasoning_object`. Canonicalize that alias before hashing so the
+    // fingerprint tracks execution semantics rather than source spelling.
+    let upstream_format = if capability.upstream.format == "object" {
+        "reasoning_object"
+    } else {
+        capability.upstream.format.as_str()
+    };
     let mut canonical = serde_json::json!({
         "supportStatus": capability.effective_support_status(),
         "controlKind": capability.effective_control_kind(),
@@ -483,7 +497,7 @@ pub fn capability_fingerprint(capability: &CodexModelReasoningCapability) -> Str
         "defaultEffort": capability.default_effort,
         "disableAllowed": capability.disable_allowed,
         "upstream": {
-            "format": capability.upstream.format,
+            "format": upstream_format,
             "parameter": capability.upstream.parameter,
             "effortMap": effort_map,
         },
@@ -894,12 +908,13 @@ pub fn builtin_reasoning_capability_for_model(
 /// Return the maintained Sublyx GPT contract for a model exposed through a
 /// Sublyx provider.
 ///
-/// Sublyx uses the OpenAI Responses reasoning object and accepts
-/// `low`, `medium`, `high`, `xhigh`, and `max`. Synthetic Codex Ultra remains
-/// an independent product target of native `xhigh`; it must not rewrite a real
-/// provider `max` capability. The provider identity is checked by the
-/// shared resolver before this helper is called, so a model named
-/// `*-sublyx` on OpenRouter cannot inherit this contract.
+/// Sublyx uses the OpenAI Responses reasoning object. Authenticated Sublyx
+/// probes accept native `low`, `medium`, `high`, `xhigh`, and `max` for the
+/// currently routed GPT rows; `ultra` is rejected
+/// by the upstream API and remains a synthetic Codex selector. The provider
+/// identity is checked by the shared resolver
+/// before this helper is called, so a model named `*-sublyx` on OpenRouter
+/// cannot inherit this contract.
 pub fn sublyx_reasoning_capability_for_model(model: &str) -> Option<CodexModelReasoningCapability> {
     let normalized = model.trim().to_ascii_lowercase();
     let upstream = normalized.strip_suffix("-sublyx").unwrap_or(&normalized);
@@ -907,24 +922,43 @@ pub fn sublyx_reasoning_capability_for_model(model: &str) -> Option<CodexModelRe
         return None;
     }
 
-    let supported_efforts = vec![
+    let mut supported_efforts = vec![
         "low".to_string(),
         "medium".to_string(),
         "high".to_string(),
         "xhigh".to_string(),
-        "max".to_string(),
     ];
-    let effort_map = [
+    // Authenticated Sublyx Responses probes cover the currently routed GPT
+    // rows that are known to accept native `max`. Keep this allowlist explicit;
+    // a GPT-looking third-party row must not inherit a capability we have not
+    // actually observed on this provider.
+    let supports_native_max = [
+        "gpt-5.6-sol",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-6-sol",
+        "gpt-6-astra",
+        "gpt-6-luna",
+        "gpt-6.1-sol",
+        "gpt-6.1-terra",
+    ]
+    .iter()
+    .any(|known| upstream == *known || upstream.starts_with(&format!("{known}-")));
+    if supports_native_max {
+        supported_efforts.push("max".to_string());
+    }
+    let mut effort_map = [
         ("low", "low"),
         ("medium", "medium"),
         ("high", "high"),
         ("xhigh", "xhigh"),
-        ("max", "max"),
     ]
     .into_iter()
     .map(|(source, target)| (source.to_string(), target.to_string()))
-    .collect();
-
+    .collect::<HashMap<_, _>>();
+    if supports_native_max {
+        effort_map.insert("max".to_string(), "max".to_string());
+    }
     let capability = CodexModelReasoningCapability {
         schema_version: Some(2),
         support_status: Some(ReasoningSupportStatus::ConfirmedSupported),
@@ -947,26 +981,73 @@ pub fn sublyx_reasoning_capability_for_model(model: &str) -> Option<CodexModelRe
         model_revision: None,
         codex_ultra_orchestration: Some(CodexUltraOrchestrationCapability {
             enabled: true,
+            // Ultra is an independent product control. Learning native max
+            // must not silently change the established Ultra fallback target;
+            // explicit saved targets are preserved by normalization below.
             provider_effort: Some("xhigh".to_string()),
         }),
     };
     capability.validate().ok().map(|_| capability)
 }
 
-/// Normalize a capability read from a Sublyx provider so legacy catalog rows
-/// use the current native Responses contract. Explicit user declarations and
-/// scoped API/detection evidence remain authoritative, including native max.
+/// Normalize a capability read from a Sublyx provider without erasing verified
+/// provider-native effort declarations or persisting synthetic `ultra`.
 ///
 /// Sublyx's GPT contract is provider-scoped: the same model name may be
 /// advertised by an aggregator with a completely different wire contract, so
 /// callers must invoke this helper only after resolving the provider platform
-/// (the shared resolver does that). User metadata remains the evidence source
-/// and mutable fields such as the fetched timestamp are preserved, while the
-/// provider-native shape is replaced with the maintained Responses contract.
+/// (the shared resolver does that). Verified endpoint/model-scoped evidence
+/// remains authoritative; other supported graded rows use the maintained
+/// Responses contract while preserving user defaults and explicit opt-outs.
 pub fn normalize_sublyx_reasoning_capability_for_model(
     model: &str,
     mut capability: CodexModelReasoningCapability,
 ) -> CodexModelReasoningCapability {
+    // A scoped, verified provider probe is authoritative. In particular, do
+    // not erase a native `max` merely because the /models directory is sparse:
+    // Sublyx accepts max on the Responses endpoint even though it does not
+    // advertise the levels in /v1/models. Ultra is still a Codex-only
+    // selector and must target a native effort explicitly.
+    let verified_detection = capability.source.as_deref() == Some("detection")
+        && capability.confidence == Some(CapabilityConfidence::Verified)
+        && capability
+            .evidence_scope
+            .as_ref()
+            .is_some_and(|scope| scope.model.eq_ignore_ascii_case(model))
+        && capability.upstream.format == "reasoning_object"
+        && capability.upstream.parameter == "reasoning.effort"
+        && capability.validate().is_ok();
+    if verified_detection {
+        let supported_efforts = capability.supported_efforts.clone();
+        let default_ultra_target = || {
+            supported_efforts
+                .iter()
+                .find(|effort| effort.as_str() == "xhigh")
+                .cloned()
+                .or_else(|| {
+                    supported_efforts
+                        .iter()
+                        .find(|effort| effort.as_str() == "max")
+                        .cloned()
+                })
+        };
+        // Validation already proves every enabled legacy declaration's
+        // effortMap.max path. Preserve that explicit target as well as a
+        // saved providerEffort or disabled product opt-out.
+        if capability.codex_ultra_orchestration.is_none() {
+            // An omitted product selector is not an opt-out, but sparse
+            // verified levels may have no usable native Ultra target.
+            // Never invalidate that capability with enabled=true/None:
+            // doing so would erase all reasoning levels from the picker.
+            capability.codex_ultra_orchestration =
+                default_ultra_target().map(|provider_effort| CodexUltraOrchestrationCapability {
+                    enabled: true,
+                    provider_effort: Some(provider_effort),
+                });
+        }
+        return capability;
+    }
+
     // An explicit unsupported/unknown or non-graded declaration remains
     // authoritative. This migration repairs a supported graded GPT contract;
     // it must not invent support or override an explicit user decision.
@@ -975,21 +1056,18 @@ pub fn normalize_sublyx_reasoning_capability_for_model(
     {
         return capability;
     }
-    if capability.source.as_deref().is_none_or(|source| {
-        matches!(
-            source,
-            "user" | "user_confirmed_detection" | "openrouter_api" | "detection"
-        )
-    }) && capability
-        .upstream
-        .effort_map
-        .get("max")
-        .is_some_and(|target| target == "max")
-        && capability.validate().is_ok()
-    {
-        // Current explicit/provider-scoped evidence has already demonstrated
-        // the native value. Do not rewrite it based on an older maintained
-        // fallback contract.
+    let explicit_declaration = capability
+        .source
+        .as_deref()
+        .is_none_or(|source| matches!(source, "user" | "user_confirmed_detection"))
+        || (capability.source.as_deref() == Some("provider_config")
+            && capability.confidence == Some(CapabilityConfidence::Authoritative));
+    if explicit_declaration && capability.validate().is_ok() {
+        // A complete explicit declaration owns its exact native subset,
+        // mappings and wire contract, even when native max is unavailable.
+        // Current inline provider declarations are equally authoritative;
+        // the resolver rejects stale persisted projections before this boundary.
+        // Automatic detections still require the scoped verified branch above.
         return capability;
     }
     let Some(mut maintained) = sublyx_reasoning_capability_for_model(model) else {
@@ -1005,21 +1083,44 @@ pub fn normalize_sublyx_reasoning_capability_for_model(
         if let Some(target) = capability
             .codex_ultra_orchestration
             .as_ref()
-            .and_then(|setting| setting.provider_effort.as_ref())
+            .and_then(|setting| {
+                setting.provider_effort.as_ref().or_else(|| {
+                    setting
+                        .enabled
+                        .then(|| capability.upstream.effort_map.get("max"))
+                        .flatten()
+                })
+            })
             .filter(|target| maintained.supported_efforts.contains(target))
         {
             ultra.provider_effort = Some(target.clone());
         }
     }
 
+    // Only the maintained provider/model contract supplies migration defaults.
+    // Provider identity is already checked by the shared resolver, and unknown
+    // GPT rows do not gain max from unrelated successful model probes.
     let default_effort = capability
         .default_effort
         .as_deref()
         .map(str::trim)
         .map(str::to_ascii_lowercase)
         .and_then(|effort| match effort.as_str() {
-            "max" => Some("max".to_string()),
-            "ultra" => Some("xhigh".to_string()),
+            "max" => Some(
+                if maintained
+                    .supported_efforts
+                    .iter()
+                    .any(|effort| effort == "max")
+                {
+                    "max".to_string()
+                } else {
+                    "xhigh".to_string()
+                },
+            ),
+            "ultra" => maintained
+                .codex_ultra_orchestration
+                .as_ref()
+                .and_then(|ultra| ultra.provider_effort.clone()),
             "low" | "medium" | "high" | "xhigh" => Some(effort),
             _ => None,
         })
@@ -1038,7 +1139,7 @@ pub fn normalize_sublyx_reasoning_capability_for_model(
 
     // The maintained contract is intentionally complete. This should be
     // infallible, but keep the resolver fail-closed if a future edit breaks
-    // the invariant rather than returning another stale max-bearing object.
+    // the invariant rather than returning a malformed capability.
     if capability.validate().is_err() {
         maintained
     } else {
@@ -1694,7 +1795,7 @@ mod tests {
     }
 
     #[test]
-    fn sublyx_gpt_capability_preserves_current_native_max() {
+    fn sublyx_gpt_capability_uses_responses_efforts_with_native_max() {
         let capability = sublyx_reasoning_capability_for_model("GPT-6.1-sol-sublyx")
             .expect("Sublyx GPT capability");
 
@@ -1754,7 +1855,345 @@ mod tests {
             resolved.effort_map.get(&CodexReasoningEffort::Max),
             Some(&CodexReasoningEffort::Max)
         );
-        assert!(capability.upstream.effort_map.contains_key("max"));
+        assert_eq!(
+            capability.upstream.effort_map.get("max"),
+            Some(&"max".to_string())
+        );
+    }
+
+    #[test]
+    fn sublyx_fallback_limits_native_max_to_probed_gpt_rows() {
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+            "gpt-6-sol",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+        ] {
+            for wire_model in [model.to_string(), format!("{model}-sublyx")] {
+                let capability = sublyx_reasoning_capability_for_model(&wire_model)
+                    .expect("maintained model has a valid, deduplicated Sublyx capability");
+                assert_eq!(
+                    capability.supported_efforts,
+                    ["low", "medium", "high", "xhigh", "max"],
+                    "{wire_model}: upstream probes must restore max exactly once"
+                );
+                assert_eq!(
+                    capability.upstream.effort_map.get("max"),
+                    Some(&"max".to_string())
+                );
+                assert_eq!(
+                    capability
+                        .codex_ultra_orchestration
+                        .as_ref()
+                        .and_then(|ultra| ultra.provider_effort.as_deref()),
+                    Some("xhigh"),
+                    "native max does not change the independent Ultra default"
+                );
+            }
+        }
+        for model in ["gpt-6", "gpt-5.4", "gpt-6-unprobed", "gpt-6-lunar"] {
+            let capability = sublyx_reasoning_capability_for_model(model)
+                .expect("legacy graded fallback remains valid");
+            assert!(
+                !capability
+                    .supported_efforts
+                    .iter()
+                    .any(|effort| effort == "max"),
+                "{model}"
+            );
+            assert!(
+                !capability.upstream.effort_map.contains_key("max"),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn sublyx_normalization_migrates_maintained_defaults_without_changing_ultra_target() {
+        for (model, requested, expected) in [
+            ("gpt-5.4", "max", "xhigh"),
+            ("gpt-5.4", "high", "high"),
+            ("gpt-6.1-sol", "max", "max"),
+            ("gpt-6.1-sol", "high", "high"),
+        ] {
+            let capability: CodexModelReasoningCapability = serde_json::from_value(json!({
+                "schemaVersion": 2,
+                "supportStatus": "confirmed_supported",
+                "controlKind": "graded",
+                "supportedEfforts": ["low", "high", "max"],
+                "defaultEffort": requested,
+                "disableAllowed": false,
+                "upstream": {
+                    "format": "reasoning_object", "parameter": "reasoning.effort",
+                    "effortMap": {"low": "low", "high": "high", "max": "max"}
+                },
+                "source": "sublyx"
+            }))
+            .unwrap();
+            capability.validate().expect("valid user declaration");
+            let normalized = normalize_sublyx_reasoning_capability_for_model(model, capability);
+            assert_eq!(
+                normalized.default_effort.as_deref(),
+                Some(expected),
+                "{model}: {requested}"
+            );
+            assert_eq!(
+                normalized.source.as_deref(),
+                Some("sublyx"),
+                "preserve declaration ownership"
+            );
+            assert!(normalized.validate().is_ok(), "{model}: {requested}");
+            let accepts_native_max = normalized
+                .supported_efforts
+                .iter()
+                .any(|effort| effort == "max");
+            assert_eq!(accepts_native_max, model == "gpt-6.1-sol", "{model}");
+            assert_eq!(
+                normalized
+                    .codex_ultra_orchestration
+                    .as_ref()
+                    .and_then(|ultra| ultra.provider_effort.as_deref()),
+                Some("xhigh"),
+                "{model}: Ultra remains a separately mapped product control",
+            );
+        }
+    }
+
+    fn scoped_sublyx_detection(
+        model: &str,
+        supported_efforts: &[&str],
+    ) -> CodexModelReasoningCapability {
+        let mut capability =
+            sublyx_reasoning_capability_for_model(model).expect("Sublyx GPT fixture");
+        capability.supported_efforts = supported_efforts
+            .iter()
+            .map(|effort| effort.to_string())
+            .collect();
+        capability.default_effort = Some("high".to_string());
+        capability.disable_allowed = supported_efforts.contains(&"none");
+        capability.upstream.effort_map = supported_efforts
+            .iter()
+            .filter(|effort| **effort != "none")
+            .map(|effort| (effort.to_string(), effort.to_string()))
+            .collect();
+        capability.codex_ultra_orchestration = None;
+        capability.source = Some("detection".to_string());
+        capability.confidence = Some(CapabilityConfidence::Verified);
+        capability.evidence_scope = Some(ReasoningEvidenceScope {
+            transport_fingerprint: "test-transport".to_string(),
+            model: model.to_string(),
+        });
+        capability
+    }
+
+    #[test]
+    fn sublyx_verified_sparse_efforts_keep_picker_without_synthetic_ultra() {
+        for model in ["gpt-6.1-sol", "gpt-6-astra"] {
+            for native_efforts in [
+                vec!["low", "high"],
+                vec!["minimal", "low", "high"],
+                vec!["none", "low", "high"],
+            ] {
+                let capability = scoped_sublyx_detection(model, &native_efforts);
+                capability
+                    .validate()
+                    .expect("valid scoped native capability");
+                let normalized =
+                    normalize_sublyx_reasoning_capability_for_model(model, capability.clone());
+                assert_eq!(
+                    normalized, capability,
+                    "{model}: sparse verified levels must not invent an unusable Ultra target"
+                );
+                normalized
+                    .validate()
+                    .expect("normalization preserves validity");
+                let resolved = resolve_subagent_reasoning_capability(Some(&normalized));
+                assert_eq!(resolved.support_kind, ReasoningSupportKind::EffortLevels);
+                assert_eq!(resolved.provider_accepted_efforts, efforts(&native_efforts));
+                assert_eq!(
+                    resolved.codex_selectable_efforts,
+                    efforts(
+                        &native_efforts
+                            .iter()
+                            .copied()
+                            .filter(|effort| *effort != "none")
+                            .collect::<Vec<_>>()
+                    )
+                );
+                assert!(!resolved.codex_ultra_orchestration_enabled);
+                assert_eq!(
+                    resolved.provider_default_effort,
+                    Some(CodexReasoningEffort::High)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sublyx_verified_native_max_or_xhigh_gets_valid_ultra_overlay() {
+        for (native_efforts, expected_target) in [
+            (vec!["low", "high", "xhigh"], "xhigh"),
+            (vec!["low", "high", "max"], "max"),
+            (vec!["low", "high", "xhigh", "max"], "xhigh"),
+        ] {
+            let capability = scoped_sublyx_detection("gpt-6.1-sol", &native_efforts);
+            capability
+                .validate()
+                .expect("valid scoped native capability");
+            let normalized =
+                normalize_sublyx_reasoning_capability_for_model("gpt-6.1-sol", capability);
+            normalized.validate().expect("valid synthetic Ultra target");
+            assert_eq!(normalized.supported_efforts, native_efforts);
+            assert_eq!(
+                normalized.codex_ultra_orchestration,
+                Some(CodexUltraOrchestrationCapability {
+                    enabled: true,
+                    provider_effort: Some(expected_target.to_string()),
+                })
+            );
+            let resolved = resolve_subagent_reasoning_capability(Some(&normalized));
+            assert!(resolved.codex_ultra_orchestration_enabled);
+            assert!(resolved
+                .codex_selectable_efforts
+                .contains(&CodexReasoningEffort::Ultra));
+            assert_eq!(
+                resolved.effort_map.get(&CodexReasoningEffort::Ultra),
+                Some(&expected_target.parse().expect("native target"))
+            );
+        }
+    }
+
+    #[test]
+    fn sublyx_verified_declared_ultra_path_is_authoritative() {
+        for (native_efforts, provider_effort) in [
+            (&["minimal", "low", "high", "max"][..], Some("high")),
+            (&["low", "high"][..], Some("high")),
+            (&["low", "high"][..], None),
+            (&["low", "high", "xhigh", "max"][..], None),
+        ] {
+            let mut capability = scoped_sublyx_detection("gpt-6.1-sol", native_efforts);
+            if provider_effort.is_none() {
+                capability
+                    .upstream
+                    .effort_map
+                    .insert("max".to_string(), "high".to_string());
+            }
+            capability.codex_ultra_orchestration = Some(CodexUltraOrchestrationCapability {
+                enabled: true,
+                provider_effort: provider_effort.map(String::from),
+            });
+            capability.validate().expect("valid declared Ultra path");
+            let normalized =
+                normalize_sublyx_reasoning_capability_for_model("gpt-6.1-sol", capability.clone());
+            assert_eq!(normalized, capability);
+            let resolved = resolve_subagent_reasoning_capability(Some(&normalized));
+            assert_eq!(
+                resolved.effort_map.get(&CodexReasoningEffort::Ultra),
+                Some(&CodexReasoningEffort::High),
+                "a valid declared path must not be silently upgraded to max"
+            );
+        }
+    }
+
+    #[test]
+    fn sublyx_manual_native_max_declarations_preserve_exact_subset_and_defaults() {
+        for source in [None, Some("user"), Some("user_confirmed_detection")] {
+            for model in ["gpt-5.4", "gpt-6.1-sol"] {
+                for default in ["high", "max"] {
+                    let mut capability = scoped_sublyx_detection(model, &["low", "high", "max"]);
+                    capability.source = source.map(str::to_string);
+                    capability.confidence = None;
+                    capability.evidence_scope = None;
+                    capability.default_effort = Some(default.to_string());
+                    capability
+                        .validate()
+                        .expect("valid explicit native max declaration");
+                    let normalized =
+                        normalize_sublyx_reasoning_capability_for_model(model, capability.clone());
+                    assert_eq!(normalized, capability, "{source:?} {model} {default}: no maintained fallback may rewrite explicit evidence");
+                    let projected = resolve_subagent_reasoning_capability(Some(&normalized));
+                    assert_eq!(
+                        projected.effort_map.get(&CodexReasoningEffort::Max),
+                        Some(&CodexReasoningEffort::Max)
+                    );
+                    assert!(!projected.codex_ultra_orchestration_enabled);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sublyx_manual_subsets_without_native_max_remain_authoritative() {
+        for source in [
+            None,
+            Some("user"),
+            Some("user_confirmed_detection"),
+            Some("provider_config"),
+        ] {
+            for (format, parameter) in [
+                ("reasoning_object", "reasoning.effort"),
+                ("string", "reasoning_effort"),
+            ] {
+                let mut capability = scoped_sublyx_detection("gpt-6.1-sol", &["low", "high"]);
+                capability.source = source.map(str::to_string);
+                capability.confidence = (source == Some("provider_config"))
+                    .then_some(CapabilityConfidence::Authoritative);
+                capability.evidence_scope = None;
+                capability.upstream.format = format.to_string();
+                capability.upstream.parameter = parameter.to_string();
+                capability
+                    .upstream
+                    .effort_map
+                    .insert("max".to_string(), "high".to_string());
+                capability.codex_ultra_orchestration = Some(CodexUltraOrchestrationCapability {
+                    enabled: true,
+                    provider_effort: Some("high".to_string()),
+                });
+                capability
+                    .validate()
+                    .expect("valid explicit subset and custom effort mapping");
+                let normalized = normalize_sublyx_reasoning_capability_for_model(
+                    "gpt-6.1-sol",
+                    capability.clone(),
+                );
+                assert_eq!(normalized, capability, "{source:?} {format}: explicit subsets and mappings must not be overwritten by provider maintenance");
+            }
+        }
+    }
+
+    #[test]
+    fn sublyx_automatic_max_declarations_require_current_verified_model_scope() {
+        for source in ["detection", "openrouter_api"] {
+            for (confidence, scope_model) in [
+                (Some(CapabilityConfidence::Verified), Some("another-model")),
+                (Some(CapabilityConfidence::Inferred), Some("gpt-5.4")),
+                (Some(CapabilityConfidence::Verified), None),
+            ] {
+                let mut capability = scoped_sublyx_detection("gpt-5.4", &["low", "high", "max"]);
+                capability.source = Some(source.to_string());
+                capability.confidence = confidence;
+                capability.evidence_scope = scope_model.map(|model| ReasoningEvidenceScope {
+                    transport_fingerprint: "test-transport".to_string(),
+                    model: model.to_string(),
+                });
+                capability
+                    .validate()
+                    .expect("structurally valid automatic max declaration");
+                let normalized =
+                    normalize_sublyx_reasoning_capability_for_model("gpt-5.4", capability);
+                assert_eq!(
+                    normalized.supported_efforts,
+                    ["low", "medium", "high", "xhigh"],
+                    "{source} {confidence:?} {scope_model:?}"
+                );
+                assert!(!normalized.upstream.effort_map.contains_key("max"));
+                assert!(normalized.validate().is_ok());
+            }
+        }
     }
 
     #[test]
@@ -2189,6 +2628,39 @@ mod tests {
             capability.validate(),
             Err("effortMap is missing Provider effort(s): low, high, max".to_string())
         );
+    }
+
+    #[test]
+    fn openrouter_wire_boolean_parameter_is_valid_without_native_efforts() {
+        let capability: CodexModelReasoningCapability = serde_json::from_value(json!({
+            "schemaVersion": 2,
+            "supportStatus": "confirmed_supported",
+            "controlKind": "boolean",
+            "supportedEfforts": [],
+            "disableAllowed": true,
+            "upstream": {"format": "boolean", "parameter": "reasoning.enabled"}
+        }))
+        .expect("OpenRouter boolean capability");
+        assert!(capability.validate().is_ok());
+        let resolved = resolve_subagent_reasoning_capability(Some(&capability));
+        assert_eq!(resolved.support_kind, ReasoningSupportKind::BooleanOnly);
+        assert!(resolved.codex_selectable_efforts.is_empty());
+        assert!(resolved.provider_accepted_efforts.is_empty());
+        assert!(resolved.effort_map.is_empty());
+
+        for parameter in ["reasoning.enabled", "REASONING.ENABLED"] {
+            let entry = json!({"reasoning": {
+                "schemaVersion": 2, "supportStatus": "confirmed_supported",
+                "controlKind": "boolean", "supportedEfforts": [],
+                "disableAllowed": true,
+                "upstream": {"format": "boolean", "parameter": parameter}
+            }});
+            let parsed = reasoning_capability_from_model_entry(&entry)
+                .expect("canonical boolean wire should survive read normalization");
+            assert_eq!(parsed.upstream.parameter, "reasoning.enabled");
+        }
+        assert!(validate_upstream_wire_contract("boolean", "reasoning.enabled.extra").is_err());
+        assert!(validate_upstream_wire_contract("string", "reasoning.enabled").is_err());
     }
 
     #[test]

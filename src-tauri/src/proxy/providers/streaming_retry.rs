@@ -107,13 +107,25 @@ impl ReconnectTerminal {
             "context_length_exceeded" => "The upstream request exceeds the context limit; reduce its context before retrying.",
             "response_pending" => "The upstream request may still be running; automatic replay stopped because its outcome is unknown.",
             "overloaded_error" => "The upstream provider is overloaded; automatic capacity retry is disabled.",
+            "capacity_retry_stopped" => "Upstream capacity recovery stopped because the reconnect did not produce another confirmed capacity response",
             _ => "The upstream request or reconnect configuration was rejected; review it before retrying.",
         };
         Self { code, message }
     }
 
+    fn error(self) -> Value {
+        let mut error = json!({"type":self.code,"code":self.code,"message":self.message});
+        // Disabling safe same-request capacity replay does not disable the
+        // separately configured Aggressive Desktop continuation. Only actual
+        // permanent failures or an unknown reconnect outcome prohibit both.
+        if self.code != "overloaded_error" {
+            error["retryable"] = json!(false);
+        }
+        error
+    }
+
     fn native(self, response_id: Option<&str>) -> Bytes {
-        let payload = json!({"type":"error","error":{"type":self.code,"code":self.code,"message":self.message,"retryable":false}});
+        let payload = json!({"type":"error","error":self.error()});
         native_responses_client_failure(
             Bytes::from(format!("event: error\ndata: {payload}\n\n")),
             response_id,
@@ -121,12 +133,12 @@ impl ReconnectTerminal {
     }
 
     fn chat(self) -> Bytes {
-        let payload = json!({"error":{"type":self.code,"code":self.code,"message":self.message,"retryable":false}});
+        let payload = json!({"error":self.error()});
         Bytes::from(format!("data: {payload}\n\ndata: [DONE]\n\n"))
     }
 
     fn anthropic(self) -> Bytes {
-        anthropic_error_sse(self.message, self.code)
+        anthropic_sse("error", &json!({"type":"error","error":self.error()}))
     }
 }
 
@@ -850,6 +862,11 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                             yield Ok(terminal.anthropic());
                             break 'attempts;
                         }
+                        if is_capacity_retry && !failure.capacity_retryable {
+                            retry_activity.finish();
+                            yield Ok(ReconnectTerminal::new("capacity_retry_stopped").anthropic());
+                            break 'attempts;
+                        }
                     }
                 }
             }
@@ -869,16 +886,18 @@ fn backoff_delay(attempt: u32) -> Duration {
 /// passthrough 字节；只有取得完整 SSE block 后才用 UTF-8 读取事件名。
 fn take_raw_sse_block(buffer: &mut BytesMut) -> Option<Bytes> {
     let bytes = buffer.as_ref();
-    let boundary = bytes
+    let lf_boundary = bytes
         .windows(2)
         .position(|window| window == b"\n\n")
-        .map(|index| index + 2)
-        .or_else(|| {
-            bytes
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .map(|index| index + 4)
-        })?;
+        .map(|index| index + 2);
+    let crlf_boundary = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4);
+    // Providers may switch legal line endings between events. Never merge an
+    // earlier CRLF event into a later LF event and hide semantic output behind
+    // the first event's scaffolding classification.
+    let boundary = lf_boundary.into_iter().chain(crlf_boundary).min()?;
     Some(buffer.split_to(boundary).freeze())
 }
 
@@ -916,8 +935,17 @@ fn raw_responses_sse_payload(block: &[u8]) -> Option<Value> {
 /// 判断上游错误是否明确属于模型容量/服务器过载，而不是额度、认证或一般参数错误。
 ///
 /// 类型码是强信号；文案只接受明确的容量语义。泛化的 `please try again later`
-/// 只有与 overload 类型或 5xx HTTP 状态组合时才成立，避免把业务错误误重放。
-pub(crate) fn is_capacity_error_payload(payload: &Value, status: Option<http::StatusCode>) -> bool {
+/// 或 5xx HTTP 状态不足以证明容量压力，避免把未知网关故障或业务错误误重放。
+pub(crate) fn is_capacity_error_payload(
+    payload: &Value,
+    _status: Option<http::StatusCode>,
+) -> bool {
+    // The shared terminal classifier owns all permanent-error precedence,
+    // including the narrow temporary-usage exception. Never let capacity text
+    // reinterpret an authentication, permission, cancellation, or hard quota.
+    if permanent_reconnect_payload(payload).is_some() {
+        return false;
+    }
     let temporary_usage_limit = is_retryable_usage_limit_payload(payload);
     let error = payload
         .pointer("/response/error")
@@ -965,22 +993,25 @@ pub(crate) fn is_capacity_error_payload(payload: &Value, status: Option<http::St
     ]
     .iter()
     .any(|marker| message.contains(marker));
-    // Shared terminal policy has precedence over message-level capacity hints.
-    // A credential, permission, cancellation, or hard-quota failure must not
-    // become replayable merely because a provider included concurrency wording.
-    if permanent_reconnect_payload(payload).is_some() && !temporary_usage_limit {
-        return false;
-    }
     if temporary_usage_limit {
         return true;
     }
-    let retry_later_with_server_signal = message.contains("please try again later")
-        && (overload_type || status.is_some_and(|status| status.is_server_error()));
-
     overload_type
+        || has_gateway_concurrency_limit_code(error)
         || explicit_capacity_message
         || explicit_concurrency_message
-        || retry_later_with_server_signal
+}
+
+/// Only the exact typed gateway code proves concurrency pressure without an
+/// English message. Permanent-error checks remain ahead of every caller.
+fn has_gateway_concurrency_limit_code(error: &Value) -> bool {
+    error
+        .get("code")
+        .and_then(Value::as_str)
+        .is_some_and(|code| {
+            code.trim()
+                .eq_ignore_ascii_case("gateway_concurrency_limit")
+        })
 }
 
 /// Use the same narrow temporary-usage exception as the terminal classifier
@@ -1009,6 +1040,9 @@ pub(crate) fn capacity_error_requires_long_wait(payload: &Value) -> bool {
         .pointer("/response/error")
         .or_else(|| payload.get("error"))
         .unwrap_or(payload);
+    if has_gateway_concurrency_limit_code(error) {
+        return true;
+    }
     let message = error
         .get("message")
         .and_then(Value::as_str)
@@ -1042,26 +1076,15 @@ pub(crate) fn capacity_error_body_requires_long_wait(body: Option<&str>) -> bool
 }
 
 pub(crate) fn is_capacity_error_response(status: http::StatusCode, body: Option<&str>) -> bool {
-    let server_load_status = matches!(
-        status,
-        http::StatusCode::BAD_GATEWAY
-            | http::StatusCode::SERVICE_UNAVAILABLE
-            | http::StatusCode::GATEWAY_TIMEOUT
-    );
     let Some(body) = body.filter(|body| !body.trim().is_empty()) else {
-        return server_load_status;
+        // A gateway status alone does not identify capacity pressure. Replaying
+        // a bodyless 502/503/504 can amplify an outage and may replay a request
+        // whose processing state is unknown.
+        return false;
     };
     let payload =
         serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({ "message": body }));
-    if is_capacity_error_payload(&payload, Some(status)) {
-        return true;
-    }
-
-    server_load_status && !is_explicit_non_replayable_error_payload(&payload)
-}
-
-fn is_explicit_non_replayable_error_payload(payload: &Value) -> bool {
-    permanent_reconnect_payload(payload).is_some()
+    is_capacity_error_payload(&payload, Some(status))
 }
 
 struct NativeResponsesSseErrorDiagnostic {
@@ -1220,6 +1243,11 @@ fn native_responses_client_failure(block: Bytes, response_id: Option<&str>) -> B
         if let Some(value) = original.get(field) {
             error.insert(field.to_string(), value.clone());
         }
+    }
+    // Preserve a refusal from any canonical envelope even when a different
+    // envelope supplies the selected display message or a permissive flag.
+    if let Some(retryable) = super::codex_terminal::explicit_retry_decision(&payload) {
+        error.insert("retryable".to_string(), json!(retryable));
     }
     let mut response = json!({"status":"failed","error":error});
     for field in ["id", "model", "usage"] {
@@ -1410,11 +1438,20 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                         } else {
                             None
                         };
+                    // A header alone cannot confer replay eligibility. Codex
+                    // dispatches by payload type, so malformed or mismatched
+                    // created blocks may already have entered its output state.
+                    let verified_created = payload.as_ref().is_some_and(|payload| {
+                        payload.get("response").is_some_and(Value::is_object)
+                            && payload.get("type").is_none_or(|kind| {
+                                kind.as_str() == Some("response.created")
+                            })
+                    });
                     match (event_name.as_deref(), terminal_disposition) {
-                        (Some("response.created"), _) if created_forwarded => {
+                        (Some("response.created"), _) if verified_created && created_forwarded => {
                             // 新连接会再次宣告 response.created；客户端已经见过它。
                         }
-                        (Some("response.created"), _) => {
+                        (Some("response.created"), _) if verified_created => {
                             created_forwarded = true;
                             response_id = payload.as_ref().and_then(|value| value.pointer("/response/id")).and_then(Value::as_str).map(str::to_string);
                             yield Ok(block);
@@ -1572,17 +1609,13 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                             break 'attempts;
                         }
                         if retrying_capacity && !failure.capacity_retryable {
-                            let message =
-                                "Upstream capacity recovery stopped because the reconnect did not produce another confirmed capacity response";
+                            let terminal = ReconnectTerminal::new("capacity_retry_stopped");
                             log::warn!(
-                                "[Codex/Responses] {message}: {reason}; client_message=capacity_retry_stopped"
+                                "[Codex/Responses] {}: {reason}; client_message=capacity_retry_stopped",
+                                terminal.message,
                             );
                             retry_activity.finish();
-                            yield Ok(native_responses_failed_terminal_sse(
-                                response_id.as_deref(),
-                                "capacity_retry_stopped",
-                                message,
-                            ));
+                            yield Ok(terminal.native(response_id.as_deref()));
                             break 'attempts;
                         }
                     }
@@ -1852,6 +1885,11 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                             if let Some(terminal) = failure.terminal {
                                 retry_activity.finish();
                                 yield Ok(terminal.chat());
+                                break 'attempts;
+                            }
+                            if capacity_retry && !failure.capacity_retryable {
+                                retry_activity.finish();
+                                yield Ok(ReconnectTerminal::new("capacity_retry_stopped").chat());
                                 break 'attempts;
                             }
                         }
@@ -3226,10 +3264,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn native_capacity_recovery_continues_only_for_readable_capacity_rejection() {
-        for body in [
-            Bytes::new(),
-            Bytes::from_static(
-                br#"{"error":{"type":"overloaded_error","message":"Model is at capacity"}}"#,
+        for (body, expected_calls, should_recover) in [
+            (Bytes::new(), 1, false),
+            (
+                Bytes::from_static(
+                    br#"{"error":{"type":"overloaded_error","message":"Model is at capacity"}}"#,
+                ),
+                2,
+                true,
             ),
         ] {
             let recovered = [created(), text_delta("capacity-recovered"), completed()].concat();
@@ -3251,9 +3293,9 @@ mod tests {
                 true,
             ))
             .await;
-            assert_eq!(calls.load(Ordering::SeqCst), 2);
-            assert!(out.contains("capacity-recovered"));
-            assert!(!out.contains("capacity_retry_stopped"));
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+            assert_eq!(out.contains("capacity-recovered"), should_recover);
+            assert_eq!(out.contains("capacity_retry_stopped"), !should_recover);
         }
     }
 
@@ -3326,7 +3368,11 @@ mod tests {
         );
         let (reconnector, calls) = scripted_reconnector(vec![
             Ok(streamed_response(&[retry])),
-            Err(ProxyError::ForwardFailed("mock reconnect failure".into())),
+            Ok(ProxyResponse::buffered(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                http::HeaderMap::new(),
+                Bytes::from_static(br#"{"error":{"type":"capacity_exceeded","message":"Currently experiencing high demand"}}"#),
+            )),
         ]);
         let started_at = tokio::time::Instant::now();
         let initial = ok_chunks(&[
@@ -3516,6 +3562,183 @@ mod tests {
             DevWatchdogProtocol::Translated => Box::pin(
                 create_resilient_anthropic_sse_stream_from_responses(initial, Some(reconnector)),
             ),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_recovery_stops_on_ambiguous_reconnect_for_every_upstream_protocol() {
+        for protocol in [
+            DevWatchdogProtocol::Responses,
+            DevWatchdogProtocol::Chat,
+            DevWatchdogProtocol::Anthropic,
+        ] {
+            for (label, rejected) in [
+                ("transport", Err(ProxyError::ForwardFailed("redacted transport failure".into()))),
+                ("timeout", Err(ProxyError::Timeout("redacted reconnect timeout".into()))),
+                ("unclassified-http", Ok(ProxyResponse::buffered(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    http::HeaderMap::new(),
+                    Bytes::from_static(br#"{"error":{"type":"server_error","message":"transient application failure"}}"#),
+                ))),
+                ("bodyless-http", Ok(ProxyResponse::buffered(
+                    http::StatusCode::BAD_GATEWAY,
+                    http::HeaderMap::new(),
+                    Bytes::new(),
+                ))),
+            ] {
+                let (head, text, terminal) = dev_watchdog_frames(protocol);
+                let recovered = [head.clone(), text, terminal].concat();
+                let capacity = match protocol {
+                    DevWatchdogProtocol::Responses => capacity_failed("model_at_capacity", "Model is at capacity"),
+                    DevWatchdogProtocol::Chat => sse("error", json!({"error":{"type":"model_at_capacity","message":"Model is at capacity"}})),
+                    DevWatchdogProtocol::Anthropic => sse("error", json!({"type":"error","error":{"type":"overloaded_error","message":"Model is at capacity"}})),
+                    DevWatchdogProtocol::Translated => unreachable!(),
+                };
+                let (reconnector, calls) = scripted_reconnector(vec![
+                    Ok(streamed_response(&[&recovered])), rejected,
+                ]);
+                let out = collect(reconnect_test_stream(
+                    protocol,
+                    ok_chunks(&[&head, &capacity]),
+                    reconnector.with_capacity_retry(true),
+                )).await;
+
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "{protocol:?}/{label}: {out}");
+                assert!(out.contains("capacity_retry_stopped"), "{protocol:?}/{label}: {out}");
+                assert!(out.contains("\"retryable\":false"), "{protocol:?}/{label} lost its no-replay guard: {out}");
+                assert!(!out.contains("redacted-output"), "{protocol:?}/{label}: {out}");
+                assert!(!out.contains("redacted transport failure"));
+                assert!(!out.contains("redacted reconnect timeout"));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_sse_splitter_preserves_earliest_mixed_line_ending_boundary() {
+        let first = "event: response.created\r\ndata: {\"type\":\"response.created\",\"response\":{}}\r\n\r\n";
+        let second = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"redacted-output\"}\n\n";
+        let mut buffer = BytesMut::from([first, second].concat().as_bytes());
+
+        assert_eq!(take_raw_sse_block(&mut buffer).unwrap(), first);
+        assert_eq!(take_raw_sse_block(&mut buffer).unwrap(), second);
+        assert!(buffer.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mixed_line_ending_semantic_frames_never_replay() {
+        for protocol in [
+            DevWatchdogProtocol::Responses,
+            DevWatchdogProtocol::Anthropic,
+        ] {
+            let (head, text, terminal) = dev_watchdog_frames(protocol);
+            let recovered = [head.clone(), text.clone(), terminal].concat();
+            let first_chunk = [head.replace('\n', "\r\n"), text].concat();
+            let (reconnector, calls) =
+                scripted_reconnector(vec![Ok(streamed_response(&[&recovered]))]);
+            let mut stream = reconnect_test_stream(
+                protocol,
+                chunks_then_error(&[&first_chunk]),
+                reconnector.with_capacity_retry(true),
+            );
+            let mut out = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(bytes) => out.push_str(&String::from_utf8_lossy(&bytes)),
+                    Err(_) => break,
+                }
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{protocol:?} replayed mixed-line-ending output: {out}"
+            );
+            assert_eq!(
+                out.matches("redacted-output").count(),
+                1,
+                "{protocol:?}: {out}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_unverified_created_frames_never_replay() {
+        for frame in [
+            "event: response.created\ndata: not-json\n\n".to_string(),
+            sse(
+                "response.created",
+                json!({"type":"response.output_text.delta","delta":"redacted-output"}),
+            ),
+            sse(
+                "response.created",
+                json!({"type":"response.created","unexpected":"redacted-output"}),
+            ),
+        ] {
+            let recovered = [created(), text_delta("must-not-replay"), completed()].concat();
+            let (reconnector, calls) =
+                scripted_reconnector(vec![Ok(streamed_response(&[&recovered]))]);
+            let out = collect(create_resilient_responses_sse_stream(
+                chunks_then_error(&[&frame]),
+                Some(reconnector),
+            ))
+            .await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "replayed unverified created frame: {frame}"
+            );
+            assert!(out.contains(&frame));
+            assert!(!out.contains("must-not-replay"));
+        }
+    }
+
+    #[test]
+    fn generated_capacity_disabled_errors_preserve_independent_continuation_policy() {
+        for terminal_code in [
+            "overloaded_error",
+            "capacity_retry_stopped",
+            "authentication_error",
+        ] {
+            let terminal = ReconnectTerminal::new(terminal_code);
+            for wire in [terminal.native(None), terminal.chat(), terminal.anthropic()] {
+                let mut buffer = BytesMut::from(wire.as_ref());
+                let block = take_raw_sse_block(&mut buffer).unwrap();
+                let payload = raw_responses_sse_payload(&block).unwrap();
+                let error = payload
+                    .pointer("/response/error")
+                    .or_else(|| payload.get("error"))
+                    .unwrap();
+                if terminal_code == "overloaded_error" {
+                    assert!(error.get("retryable").is_none(), "safe replay disabled must not prohibit independent continuation: {payload}");
+                    assert!(permanent_reconnect_payload(&payload).is_none());
+                    assert!(is_capacity_error_payload(&payload, None));
+                } else {
+                    assert_eq!(
+                        error.get("retryable"),
+                        Some(&json!(false)),
+                        "permanent/ambiguous outcomes must stop both recovery paths: {payload}"
+                    );
+                    assert!(!is_capacity_error_payload(&payload, None));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_error_normalization_preserves_explicit_retry_refusal() {
+        for payload in [
+            json!({"type":"error","error":{"code":"server_error","message":"redacted rejection","retryable":false}}),
+            json!({"type":"error","retryable":false,"error":{"code":"server_error","message":"redacted rejection"}}),
+            json!({"type":"error","retryable":false,"error":{"code":"server_error","message":"redacted rejection","retryable":true}}),
+            json!({"type":"error","response":{"error":{"code":"server_error","message":"redacted rejection","retryable":false}}}),
+            json!({"type":"error","response":{"error":{"code":"server_error","message":"redacted rejection","retryable":true}},"error":{"retryable":false}}),
+            json!({"type":"error","response":{"error":{"code":"server_error","message":"redacted rejection","retryable":true}},"error":{"message":"Do not retry this request."}}),
+        ] {
+            let out = native_responses_client_failure(Bytes::from(sse("error", payload)), None);
+            let normalized = raw_responses_sse_payload(&out).unwrap();
+            assert_eq!(
+                normalized.pointer("/response/error/retryable"),
+                Some(&json!(false))
+            );
         }
     }
 
@@ -4109,10 +4332,16 @@ mod tests {
         ] {
             assert!(!is_capacity_error_payload(&payload, None), "{payload}");
         }
-        assert!(is_capacity_error_payload(
-            &json!({"error":{"type":"server_error","message":"Please try again later"}}),
-            Some(http::StatusCode::SERVICE_UNAVAILABLE),
-        ));
+        for status in [
+            http::StatusCode::BAD_GATEWAY,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            http::StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(!is_capacity_error_payload(
+                &json!({"error":{"type":"server_error","message":"Please try again later"}}),
+                Some(status),
+            ));
+        }
     }
 
     #[test]
@@ -4149,6 +4378,46 @@ mod tests {
     }
 
     #[test]
+    fn capacity_classifier_accepts_explicit_gateway_concurrency_code_without_message_markers() {
+        for payload in [
+            json!({"error":{"code":"gateway_concurrency_limit","message":"Gateway is busy"}}),
+            json!({"response":{"error":{"code":"gateway_concurrency_limit","message":"Gateway is busy"}}}),
+            json!({"code":" GATEWAY_CONCURRENCY_LIMIT ","message":"Gateway is busy"}),
+        ] {
+            assert!(is_capacity_error_payload(&payload, None));
+            assert!(capacity_error_requires_long_wait(&payload));
+            assert!(is_capacity_error_response(
+                http::StatusCode::OK,
+                Some(&payload.to_string())
+            ));
+        }
+        for code in [
+            "unknown_limit",
+            "not_gateway_concurrency_limit",
+            "gateway_concurrency_limit_unknown",
+        ] {
+            let payload = json!({"error":{"code":code,"message":"Gateway is busy"}});
+            assert!(!is_capacity_error_payload(&payload, None));
+            assert!(!capacity_error_requires_long_wait(&payload));
+        }
+    }
+
+    #[test]
+    fn capacity_classifier_gateway_concurrency_code_keeps_permanent_guards() {
+        for payload in [
+            json!({"error":{"code":"gateway_concurrency_limit","type":"authentication_error","message":"Authentication rejected"}}),
+            json!({"error":{"code":"gateway_concurrency_limit","type":"permission_denied","message":"Permission denied"}}),
+            json!({"response":{"error":{"code":"gateway_concurrency_limit","message":"Daily quota exhausted"}}}),
+            json!({"error":{"code":"gateway_concurrency_limit","retryable":false,"message":"Gateway is busy"}}),
+            json!({"error":{"code":"gateway_concurrency_limit","message":"Do not retry this request"}}),
+        ] {
+            assert!(permanent_reconnect_payload(&payload).is_some());
+            assert!(!is_capacity_error_payload(&payload, None));
+            assert!(!capacity_error_requires_long_wait(&payload));
+        }
+    }
+
+    #[test]
     fn capacity_classifier_preserves_terminal_categories_with_concurrency_wording() {
         for error_type in [
             "authentication_error",
@@ -4161,6 +4430,17 @@ mod tests {
             }});
             assert!(!is_capacity_error_payload(&payload, None), "{error_type}");
             assert!(!capacity_error_requires_long_wait(&payload), "{error_type}");
+
+            // A positive retry-window phrase must not turn the narrow usage
+            // exception into permission to bypass another terminal category.
+            let with_retry_window = json!({"error": {
+                "type": error_type,
+                "message": "Concurrent usage limit reached. Please try again later"
+            }});
+            assert!(permanent_reconnect_payload(&with_retry_window).is_some());
+            assert!(!is_retryable_usage_limit_payload(&with_retry_window));
+            assert!(!is_capacity_error_payload(&with_retry_window, None));
+            assert!(!capacity_error_requires_long_wait(&with_retry_window));
         }
 
         let payload = json!({"error": {
@@ -4217,13 +4497,18 @@ mod tests {
     }
 
     #[test]
-    fn capacity_classifier_accepts_bodyless_server_load_statuses() {
+    fn capacity_classifier_rejects_unclassified_server_load_statuses() {
         for status in [
             http::StatusCode::BAD_GATEWAY,
             http::StatusCode::SERVICE_UNAVAILABLE,
             http::StatusCode::GATEWAY_TIMEOUT,
         ] {
-            assert!(is_capacity_error_response(status, None), "status={status}");
+            for body in [None, Some(""), Some(" \n\t"), Some("{}"), Some("null")] {
+                assert!(
+                    !is_capacity_error_response(status, body),
+                    "status={status}, body={body:?}"
+                );
+            }
         }
         assert!(!is_capacity_error_response(
             http::StatusCode::TOO_MANY_REQUESTS,
@@ -4240,6 +4525,10 @@ mod tests {
                 Some(body),
             ));
         }
+        assert!(is_capacity_error_response(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            Some("Our servers are currently overloaded. Please try again later."),
+        ));
     }
 
     #[tokio::test(start_paused = true)]

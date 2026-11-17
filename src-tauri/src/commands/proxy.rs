@@ -1345,13 +1345,21 @@ $all = @(Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'co
 $all |
   ConvertTo-Json -Compress
 "#;
-        let output = match crate::powershell::command()
+        let mut command = crate::powershell::command();
+        command
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            Ok(output) => output,
-            Err(err) => return (Vec::new(), Some(format!("PowerShell failed: {err}"))),
+            .creation_flags(CREATE_NO_WINDOW);
+        let output = match crate::codex_desktop::command_output_with_timeout(
+            &mut command,
+            crate::codex_desktop::CODEX_NATIVE_QUERY_TIMEOUT,
+        ) {
+            Some(output) => output,
+            None => {
+                return (
+                    Vec::new(),
+                    Some("PowerShell native process query timed out or failed".to_string()),
+                )
+            }
         };
         if !output.status.success() {
             return (

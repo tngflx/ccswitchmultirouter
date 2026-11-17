@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { Provider } from "@/types";
 import {
   buildCodexMultiRouterWizardPlan,
+  buildWizardRoutesFromSources,
+  collectWizardRouteAliasSelectionIssues,
   initialWizardCatalogModelOrder,
   initialWizardSelectedSourceIds,
   initialWizardSpawnAgentModels,
@@ -246,6 +248,35 @@ describe("buildCodexMultiRouterWizardPlan subagent version", () => {
       "deepseek-v4-pro",
     ]);
   });
+
+  it.each([undefined, 2] as const)(
+    "preserves the reversible Sub-Agent effort when rebuilding schema %s plans",
+    (schemaVersion) => {
+      const existingPlan: Provider = {
+        id: "existing-effort-plan",
+        name: "Existing effort plan",
+        settingsConfig: {
+          codexRouting: {
+            ...(schemaVersion ? { schemaVersion } : {}),
+            enabled: true,
+            routes: [],
+            subagentReasoningEffort: "high",
+          },
+        },
+      };
+      const { plan } = buildCodexMultiRouterWizardPlan(
+        [deepseekSource, existingPlan],
+        [deepseekSource],
+        existingPlan,
+      );
+      expect(plan.settingsConfig.codexRouting.subagentReasoningEffort).toBe(
+        "high",
+      );
+      expect(
+        existingPlan.settingsConfig.codexRouting.subagentReasoningEffort,
+      ).toBe("high");
+    },
+  );
 
   it("writes V2 when a legacy plan has no explicit subagent version", () => {
     const legacyPlan: Provider = {
@@ -686,5 +717,261 @@ describe("buildCodexMultiRouterWizardPlan subagent profile rekey", () => {
     ).subagentV2.profiles;
 
     expect(profiles["removed-model"]).toEqual(removedProfile);
+  });
+});
+
+describe("wizard excluded public identity authority", () => {
+  function source(
+    excludedPosition: "first" | "last" | "absent",
+    publicEnabled = false,
+  ): Provider {
+    const excluded = {
+      model: "public-model",
+      upstreamModel: "disabled-wire",
+      enabled: publicEnabled,
+    };
+    const included = [
+      { model: "sibling-model", upstreamModel: "public-model" },
+      { model: "live-model", upstreamModel: "unique-wire" },
+    ];
+    return {
+      id: "relay",
+      name: "Relay",
+      settingsConfig: {
+        modelCatalog: {
+          models:
+            excludedPosition === "first"
+              ? [excluded, ...included]
+              : excludedPosition === "last"
+                ? [...included, excluded]
+                : included,
+        },
+      },
+    };
+  }
+
+  it.each(["first", "last"] as const)(
+    "reports aliases targeting an excluded public identity (%s row)",
+    (position) => {
+      const route = {
+        id: "route",
+        targetProviderId: "relay",
+        modelSelection: { mode: "all" as const },
+        aliases: { blocked: "public-model", kept: "unique-wire" },
+      };
+      expect(
+        collectWizardRouteAliasSelectionIssues([route], [source(position)]),
+      ).toEqual([
+        expect.objectContaining({
+          alias: "blocked",
+          canonicalModel: "public-model",
+        }),
+      ]);
+    },
+  );
+
+  it.each(["first", "last"] as const)(
+    "does not revive a saved alias through an excluded public identity (%s row)",
+    (position) => {
+      const [route] = buildWizardRoutesFromSources(
+        [source(position)],
+        [
+          {
+            id: "route",
+            targetProviderId: "relay",
+            modelSelection: { mode: "all" },
+            aliases: { blocked: "public-model", kept: "unique-wire" },
+          },
+        ],
+      );
+      expect(route.aliases).not.toHaveProperty("blocked");
+      expect(route.aliases).toHaveProperty("kept", "unique-wire");
+      expect(route.modelSelection).toEqual({ mode: "all" });
+    },
+  );
+
+  it.each(["first", "last"] as const)(
+    "keeps an excluded public include selection closed (%s row)",
+    (position) => {
+      const plan: Provider = {
+        id: "router",
+        name: "Router",
+        settingsConfig: {
+          codexRouting: {
+            schemaVersion: 2,
+            routes: [
+              {
+                id: "route",
+                targetProviderId: "relay",
+                modelSelection: { mode: "include", models: ["public-model"] },
+                aliases: { "public-model": "sibling-model" },
+              },
+            ],
+          },
+        },
+      };
+      expect(initialWizardCatalogModelOrder(plan, [source(position)])).toEqual(
+        [],
+      );
+    },
+  );
+
+  it.each(["first", "last"] as const)(
+    "projects an enabled public owner instead of its sibling wire match (%s row)",
+    (position) => {
+      const relay = source(position, true);
+      const [route] = buildWizardRoutesFromSources(
+        [relay],
+        [
+          {
+            id: "route",
+            targetProviderId: "relay",
+            modelSelection: { mode: "all" },
+            aliases: { "public-choice": "public-model", kept: "unique-wire" },
+          },
+        ],
+      );
+      expect(route.aliases).toHaveProperty("public-choice", "disabled-wire");
+      expect(route.aliases).toHaveProperty("kept", "unique-wire");
+    },
+  );
+
+  it.each([
+    ["first", false],
+    ["last", false],
+    ["first", true],
+    ["last", true],
+  ] as const)(
+    "keeps raw public ownership through the plan boundary (%s row, enabled %s)",
+    (position, publicEnabled) => {
+      const relay = source(position, publicEnabled);
+      const plan: Provider = {
+        id: "router",
+        name: "Router",
+        settingsConfig: {
+          codexRouting: {
+            schemaVersion: 2,
+            routes: [
+              {
+                id: "route",
+                targetProviderId: "relay",
+                modelSelection: { mode: "all" },
+                aliases: { "public-choice": "public-model" },
+              },
+            ],
+          },
+        },
+      };
+      const result = buildCodexMultiRouterWizardPlan(
+        [relay, plan],
+        [relay],
+        plan,
+      );
+      const aliases = result.plan.settingsConfig.codexRouting.routes[0].aliases;
+      if (publicEnabled) {
+        expect(aliases).toHaveProperty("public-choice", "public-model");
+      } else {
+        expect(aliases).not.toHaveProperty("public-choice");
+      }
+    },
+  );
+
+  it("retains an exact current public target after visible collision projection", () => {
+    const providers: Provider[] = [
+      {
+        id: "canonical",
+        name: "Canonical",
+        category: "official",
+        settingsConfig: {
+          modelCatalog: { models: [{ model: "shared-wire" }] },
+        },
+      },
+      {
+        id: "relay",
+        name: "Renamed Relay",
+        settingsConfig: {
+          modelCatalog: {
+            models: [{ model: "current-public", upstreamModel: "shared-wire" }],
+          },
+        },
+      },
+    ];
+    const plan: Provider = {
+      id: "router",
+      name: "Router",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          routes: [
+            {
+              id: "route",
+              targetProviderId: "relay",
+              modelSelection: { mode: "include", models: ["current-public"] },
+              aliases: { "prior-visible": "current-public" },
+            },
+          ],
+        },
+      },
+    };
+    const result = buildCodexMultiRouterWizardPlan(
+      [...providers, plan],
+      providers,
+      plan,
+    );
+    expect(
+      result.plan.settingsConfig.codexRouting.routes.find(
+        (route: { targetProviderId: string }) =>
+          route.targetProviderId === "relay",
+      ).aliases,
+    ).toEqual({ "prior-visible": "current-public" });
+  });
+
+  it("retains a unique wire alias when no catalog public identity reserves it", () => {
+    const relay = source("absent");
+    const plan: Provider = {
+      id: "router",
+      name: "Router",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          routes: [
+            {
+              id: "route",
+              targetProviderId: "relay",
+              modelSelection: { mode: "include", models: ["public-model"] },
+            },
+          ],
+        },
+      },
+    };
+    expect(initialWizardCatalogModelOrder(plan, [relay])).toEqual([
+      "sibling-model",
+    ]);
+    expect(
+      collectWizardRouteAliasSelectionIssues(
+        [
+          {
+            id: "route",
+            targetProviderId: "relay",
+            modelSelection: { mode: "all" },
+            aliases: { legacy: "public-model" },
+          },
+        ],
+        [relay],
+      ),
+    ).toEqual([]);
+    expect(
+      buildWizardRoutesFromSources(
+        [relay],
+        [
+          {
+            id: "route",
+            targetProviderId: "relay",
+            modelSelection: { mode: "all" },
+            aliases: { legacy: "public-model" },
+          },
+        ],
+      )[0].aliases,
+    ).toHaveProperty("legacy", "public-model");
   });
 });

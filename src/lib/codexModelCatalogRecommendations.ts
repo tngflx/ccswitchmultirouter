@@ -2,9 +2,10 @@ import type { CodexCatalogModel } from "@/types";
 import type { ModelStats } from "@/types/usage";
 import { parseCodexCatalogRelease } from "@/lib/codexCatalogVersionPruning";
 import { modelIdentityValues } from "@/lib/modelIdentities";
+import { codexCatalogModelProviderKey } from "@/lib/codexModelCatalogOrder";
 
 const key = (value?: string) => value?.trim().toLowerCase() ?? "";
-const providerKey = (model: CodexCatalogModel) =>
+const providerDisplayKey = (model: CodexCatalogModel) =>
   key(model.providerName || model.provider_name);
 
 /** Provider and family groups retain their source order; releases sort newest first. */
@@ -14,11 +15,12 @@ export function defaultCodexCatalogModelOrder<T extends CodexCatalogModel>(
   const providers = new Map<string, number>();
   const families = new Map<string, number>();
   const ranked = models.map((model, index) => {
-    const provider = providerKey(model);
+    const provider = codexCatalogModelProviderKey(model);
+    const providerDisplay = providerDisplayKey(model);
     const release = parseCodexCatalogRelease({
       ...model,
-      providerName: provider,
-      provider_name: provider,
+      providerName: providerDisplay,
+      provider_name: providerDisplay,
       apiKeyGroupId: undefined,
       api_key_group_id: undefined,
     });
@@ -100,7 +102,7 @@ export function codexCatalogModelUsage(
         (provider === "codex (session)" || provider === "_codex_session");
       const eligible = (candidates: CodexCatalogModel[]) =>
         candidates.filter(
-          (model) => session || providerKey(model) === provider,
+          (model) => session || providerDisplayKey(model) === provider,
         );
       const exact = eligible(visible.get(key(row.model)) ?? []);
       const matches = exact.length

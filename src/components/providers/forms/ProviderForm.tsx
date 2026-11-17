@@ -423,7 +423,7 @@ const normalizeCodexSpawnAgentModelsForSave = (
   catalogModels: CodexCatalogModel[],
 ): string[] => {
   const enabledModels = catalogModels.filter((item) => item.enabled !== false);
-  const index = buildCodexModelReferenceIndex(enabledModels);
+  const index = buildCodexModelReferenceIndex(catalogModels);
   const normalized = canonicalizeCodexModelReferences(selectedModels, index, 5);
   if (normalized.length >= 5) return normalized;
 
@@ -1915,11 +1915,11 @@ function ProviderFormFull({
               .filter(Boolean),
           }))
           .filter((group) => group.id && group.apiKeys.length > 0);
-        const enabledCatalogModels = normalizedCatalogModels.filter(
-          (item) => item.enabled !== false,
+        // Excluded public IDs still own their identity. Filter candidates only
+        // after shared reference resolution, never before building its index.
+        const baseCatalogIndex = buildCodexModelReferenceIndex(
+          normalizedCatalogModels,
         );
-        const baseCatalogIndex =
-          buildCodexModelReferenceIndex(enabledCatalogModels);
         const normalizedApiKeyGroups = shouldPersistCodexCatalog
           ? sanitizeCodexApiKeyGroups(cleanedApiKeyGroups, baseCatalogIndex)
           : cleanedApiKeyGroups;
@@ -1932,7 +1932,7 @@ function ProviderFormFull({
           (item) => item.enabled !== false,
         );
         const catalogIndex = buildCodexModelReferenceIndex(
-          enabledProjectedCatalogModels,
+          projectedCatalogModels,
         );
         if (shouldPersistCodexCatalog) {
           codexProtocolOverridesForSave = sanitizeCodexProtocolOverrides(
@@ -1944,7 +1944,7 @@ function ProviderFormFull({
           projectedCatalogModels.length > 0
             ? normalizeCodexSpawnAgentModelsForSave(
                 codexSpawnAgentModels,
-                enabledProjectedCatalogModels,
+                projectedCatalogModels,
               )
             : [];
         const sanitizedCodexRouting = shouldPersistCodexCatalog

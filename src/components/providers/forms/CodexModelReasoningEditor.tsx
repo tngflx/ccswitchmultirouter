@@ -5,13 +5,15 @@ import type {
   CodexReasoningEffort,
 } from "@/types";
 import {
-  hasExplicitSublyxNativeMaxEvidence,
+  hasExplicitSublyxNativeEvidence,
+  isOpenRouterReasoningTransport,
   normalizeCodexReasoningCapabilityForProvider,
   usesSublyxGptReasoningContract,
   type CodexReasoningProviderIdentity,
 } from "@/lib/codexReasoningProviderIdentity";
 
 const PROVIDER_EFFORTS: CodexReasoningEffort[] = [
+  "none",
   "minimal",
   "low",
   "medium",
@@ -71,13 +73,21 @@ export function CodexModelReasoningEditor({
     isSublyx &&
     isGraded &&
     capability.supportStatus === "confirmed_supported" &&
-    !hasExplicitSublyxNativeMaxEvidence(savedCapability);
+    !hasExplicitSublyxNativeEvidence(savedCapability);
   const nativeEfforts = capability.supportedEfforts;
+  const hasVerifiedSublyxNativeMax =
+    nativeEfforts.includes("max") &&
+    capability.source === "detection" &&
+    capability.confidence === "verified" &&
+    capability.evidenceScope?.model?.toLowerCase() ===
+      contractModel.trim().toLowerCase();
   const completedMap = identityCompleteMap(capability, nativeEfforts);
   const addableEfforts = hasMaintainedNativeContract
     ? []
     : PROVIDER_EFFORTS.filter(
-        (effort) => !capability.supportedEfforts.includes(effort),
+        (effort) =>
+          !capability.supportedEfforts.includes(effort) &&
+          (effort !== "none" || capability.disableAllowed),
       );
 
   const update = (next: CodexModelReasoningCapability) => {
@@ -130,6 +140,16 @@ export function CodexModelReasoningEditor({
   const updateControlKind = (controlKind: CodexReasoningControlKind) => {
     const graded = controlKind === "graded";
     const boolean = controlKind === "boolean";
+    // Reconfirming a discovered budget control is a no-op on its native wire
+    // contract. Other mode changes must not invent a provider budget parameter.
+    const openRouterEffortObject =
+      isOpenRouterReasoningTransport(providerIdentity) &&
+      capability.upstream.format !== "string" &&
+      capability.upstream.format !== "reasoning_object";
+    const preserveBudget =
+      controlKind === "budget" &&
+      capability.controlKind === "budget" &&
+      capability.upstream.format === "budget";
     update({
       ...capability,
       supportStatus:
@@ -141,7 +161,8 @@ export function CodexModelReasoningEditor({
       controlKind,
       supportedEfforts: graded ? capability.supportedEfforts : [],
       defaultEffort: graded ? capability.defaultEffort : undefined,
-      disableAllowed: boolean ? capability.disableAllowed : false,
+      disableAllowed:
+        boolean || preserveBudget ? capability.disableAllowed : false,
       upstream: graded
         ? {
             ...capability.upstream,
@@ -149,8 +170,11 @@ export function CodexModelReasoningEditor({
               capability.upstream.format === "string" ||
               capability.upstream.format === "reasoning_object"
                 ? capability.upstream.format
-                : "string",
+                : openRouterEffortObject
+                  ? "reasoning_object"
+                  : "string",
             parameter:
+              openRouterEffortObject ||
               capability.upstream.parameter === "reasoning.effort"
                 ? "reasoning.effort"
                 : "reasoning_effort",
@@ -159,10 +183,17 @@ export function CodexModelReasoningEditor({
         : boolean
           ? {
               format: "boolean",
-              parameter: "enable_thinking",
+              parameter:
+                capability.upstream.format === "boolean"
+                  ? capability.upstream.parameter
+                  : isOpenRouterReasoningTransport(providerIdentity)
+                    ? "reasoning.enabled"
+                    : "enable_thinking",
               effortMap: {},
             }
-          : { format: "none", parameter: "none", effortMap: {} },
+          : preserveBudget
+            ? { ...capability.upstream, effortMap: {} }
+            : { format: "none", parameter: "none", effortMap: {} },
     });
   };
 
@@ -201,8 +232,14 @@ export function CodexModelReasoningEditor({
               <p className="rounded-md bg-muted/30 p-2 text-muted-foreground">
                 {t("codexConfig.sublyxMaintainedReasoningContract", {
                   defaultValue:
-                    "Sublyx GPT native levels and wire settings are maintained automatically: low, medium, high, xhigh, max; Ultra defaults to xhigh with Codex orchestration. You can change the default, disable Ultra, or choose a different support control mode.",
+                    "Sublyx GPT native levels and wire settings follow the maintained model contract or verified model evidence. Max is shown only when supported. Ultra is a separate Codex selector mapped to a validated native level. You can change the default, disable Ultra, or choose a different support control mode.",
                 })}
+                {hasVerifiedSublyxNativeMax ? (
+                  <span className="ml-1">
+                    Live, endpoint-scoped metadata confirms native max for this
+                    model.
+                  </span>
+                ) : null}
               </p>
             ) : null}
             <p className="text-muted-foreground">

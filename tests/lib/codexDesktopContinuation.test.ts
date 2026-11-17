@@ -41,6 +41,7 @@ type Job = {
 };
 type ContinuationState = {
   appServerClients: object[];
+  runtimeGeneration: number;
   codexContinuationJobs: Record<string, Job>;
   scopedAppServerDiscoveryPromise?: Promise<void>;
   startCodexContinuation: (
@@ -49,6 +50,12 @@ type ContinuationState = {
     model: string,
     observedAt: number,
   ) => unknown;
+  startCodexOwnerContinuation: (
+    viewReference: string,
+    operation: string,
+  ) => unknown;
+  confirmCodexContinuation: (operation: string) => unknown;
+  confirmCodexOwnerContinuation: (operation: string) => unknown;
   commitCodexContinuation: (recovery: string) => unknown;
   cancelCodexContinuation: (recovery: string) => unknown;
   readCodexContinuationJob: (recovery: string) => Job;
@@ -68,10 +75,25 @@ const createHarness = (
     retainClient?: boolean;
     requestHook?: "verified" | "unverified" | "stale-version";
     pauseCommitRead?: boolean;
+    readError?: Error;
+    boundedHistoryUnavailable?: boolean;
+    boundedHistoryPage?: unknown;
+    noCrypto?: boolean;
   } = {},
 ) => {
-  const state = {} as ContinuationState;
+  const state = { runtimeGeneration: 1 } as ContinuationState;
+  const ownerReferences = new Map<string, Record<string, unknown>>();
+  let randomIndex = 0;
+  const crypto = discoveryOptions.noCrypto
+    ? undefined
+    : {
+        getRandomValues: (bytes: Uint8Array) => {
+          bytes.fill(++randomIndex);
+          return bytes;
+        },
+      };
   const storage = new Map<string, string>();
+  let markerWritesUnavailable = false;
   let reads = 0;
   let releaseRead!: () => void;
   let releaseCommitRead!: () => void;
@@ -81,7 +103,24 @@ const createHarness = (
   const startTurn = vi.fn((_params?: unknown) => ({
     turn: { id: "continued-turn" },
   }));
-  const failedThread = {
+  const failedThread: {
+    id: string;
+    model: string;
+    modelProvider?: string;
+    status?: unknown;
+    turns: Array<{
+      id: string;
+      status: string;
+      error: unknown;
+      model?: string;
+    }>;
+    pendingApprovals?: unknown;
+    pendingApproval?: unknown;
+    pendingOperation?: unknown;
+    waitingOnApproval?: unknown;
+    waitingOnUserInput?: unknown;
+    pendingOperations?: unknown;
+  } = {
     id: "exact-thread",
     model: "request-model",
     turns: [
@@ -95,12 +134,38 @@ const createHarness = (
       },
     ],
   };
+  const requestCalls: Array<[string, unknown]> = [];
   const client = {
     hostId: "local",
     getCompatibleThreadSortKey() {},
     supportsPaginatedThreadHistory() {},
     async sendRequest(method: string, params: unknown) {
+      requestCalls.push([method, params]);
       if (method === "turn/start") return startTurn(params);
+      if (discoveryOptions.readError) throw discoveryOptions.readError;
+      if (method === "thread/turns/list") {
+        if (discoveryOptions.boundedHistoryUnavailable)
+          throw new Error("Unsupported bounded history");
+        if (
+          Object.prototype.hasOwnProperty.call(
+            discoveryOptions,
+            "boundedHistoryPage",
+          )
+        )
+          return discoveryOptions.boundedHistoryPage;
+        const data = failedThread.turns
+          .slice(-1)
+          .reverse()
+          .map((turn) => {
+            const metadata = { items: [], itemsView: "notLoaded" };
+            for (const key of ["id", "status", "model"]) {
+              const descriptor = Object.getOwnPropertyDescriptor(turn, key);
+              if (descriptor) Object.defineProperty(metadata, key, descriptor);
+            }
+            return metadata;
+          });
+        return { data, nextCursor: null };
+      }
       reads += 1;
       if (pauseSecondRead && reads === 2)
         await new Promise<void>((resolve) => {
@@ -110,6 +175,15 @@ const createHarness = (
         await new Promise<void>((resolve) => {
           releaseCommitRead = resolve;
         });
+      if ((params as { includeTurns?: boolean }).includeTurns === false) {
+        const metadata: Record<string, unknown> = { turns: [] };
+        for (const [key, descriptor] of Object.entries(
+          Object.getOwnPropertyDescriptors(failedThread),
+        )) {
+          if (key !== "turns") Object.defineProperty(metadata, key, descriptor);
+        }
+        return { thread: metadata };
+      }
       return { thread: failedThread };
     },
   };
@@ -120,12 +194,22 @@ const createHarness = (
     "installAppServerPatch",
     "recordFailure",
     "installationIsCurrent",
-    `${discovery}\n${continuation}\nreturn { rememberCodexUserTurnAction, readCodexContinuationMarkers, codexContinuationTerminalErrorCode, classifyCodexContinuationThread };`,
+    "resolveCodexOwnerRemoteViewReference",
+    "codexOwnerRemoteViewReferenceIsCurrent",
+    "crypto",
+    `${discovery}\n${continuation}\nreturn { rememberCodexUserTurnAction, readCodexContinuationMarkers, codexContinuationTerminalErrorCode, classifyCodexContinuationThread, captureCodexOwnerUserActionEvidence, codexOwnerUserActionEvidenceIsCurrent };`,
   )(
     state,
     {
       getItem: (key: string) => storage.get(key) ?? null,
-      setItem: (key: string, value: string) => storage.set(key, value),
+      setItem: (key: string, value: string) => {
+        if (
+          markerWritesUnavailable &&
+          key === "ccswitch-codex-continuations-v1"
+        )
+          throw new Error("Storage unavailable");
+        storage.set(key, value);
+      },
     },
     async () => {
       if (discoveryOptions.pauseInstallation) {
@@ -144,8 +228,20 @@ const createHarness = (
     },
     () => {},
     () => currentInstallation,
+    (reference: string) => ownerReferences.get(reference) ?? null,
+    (reference: string, binding: Record<string, unknown>) =>
+      currentInstallation &&
+      ownerReferences.get(reference) === binding &&
+      binding.runtimeGeneration === state.runtimeGeneration &&
+      Number(binding.expiresAtMs) > Date.now(),
+    crypto,
   ) as {
     rememberCodexUserTurnAction: (method: string, params: unknown) => void;
+    captureCodexOwnerUserActionEvidence: (thread: string) => object | null;
+    codexOwnerUserActionEvidenceIsCurrent: (
+      thread: string,
+      evidence: object | null,
+    ) => boolean;
     readCodexContinuationMarkers: () => object;
     classifyCodexContinuationThread: (
       thread: object,
@@ -187,7 +283,37 @@ const createHarness = (
     state,
     api,
     startTurn,
+    failedThread,
+    seedMarkers: (markers: object) =>
+      storage.set("ccswitch-codex-continuations-v1", JSON.stringify(markers)),
+    refuseMarkerWrites: () => {
+      markerWritesUnavailable = true;
+    },
+    ownerView: (reference = "owner-view", observedAtMs = Date.now() - 100) => {
+      failedThread.status = { type: "idle" };
+      failedThread.modelProvider = "owned-provider";
+      const binding = Object.freeze({
+        threadId: failedThread.id,
+        latestTurnId: failedThread.turns.at(-1)?.id,
+        expectedModel: failedThread.model,
+        expectedModelProvider: failedThread.modelProvider,
+        observedAtMs,
+        userActionEvidence: api.captureCodexOwnerUserActionEvidence(
+          failedThread.id,
+        ),
+        runtimeGeneration: state.runtimeGeneration,
+        client,
+        request: original,
+        expiresAtMs: Date.now() + 30_000,
+      });
+      ownerReferences.set(reference, binding);
+      return reference;
+    },
+    expireOwnerView: (reference = "owner-view") => {
+      ownerReferences.delete(reference);
+    },
     readCount: () => reads,
+    requestCalls,
     releaseRead: () => releaseRead(),
     releaseCommitRead: () => releaseCommitRead(),
     releaseDiscovery: () => releaseDiscovery(),
@@ -668,6 +794,55 @@ describe("Codex Desktop continuation authorization", () => {
     },
   );
 
+  it.each([
+    { retryable: false, code: "server_error" },
+    { error: { retryable: false, code: "server_error" } },
+    { response: { error: { retryable: false, code: "server_error" } } },
+    { retryable: true, error: { retryable: false, code: "server_error" } },
+    { retryable: false, error: { retryable: true, code: "server_error" } },
+    { error: "Service temporarily overloaded. Do not retry this request." },
+    "Service temporarily overloaded. Do not retry this request.",
+  ])(
+    "honors explicit retry denial at the known payload boundary: %j",
+    (payload) => {
+      const harness = createHarness();
+      expect(
+        harness.api.codexContinuationTerminalErrorCode(
+          "response.failed",
+          payload,
+        ),
+      ).toBe("non_retryable_error");
+    },
+  );
+
+  it.each([
+    { error: { retryable: true, code: "server_error" } },
+    { error: { retryable: "false", code: "server_error" } },
+    {
+      error: {
+        code: "server_error",
+        metadata: {
+          request: { retryable: false, prompt: "Do not retry this request" },
+        },
+      },
+    },
+    {
+      error: { code: "server_error" },
+      request: { retryable: false, message: "Do not retry this request" },
+    },
+  ])(
+    "does not infer a retry denial from unrelated request metadata: %j",
+    (payload) => {
+      const harness = createHarness();
+      expect(
+        harness.api.codexContinuationTerminalErrorCode(
+          "response.failed",
+          payload,
+        ),
+      ).toBeNull();
+    },
+  );
+
   it("does not continue an upstream operation whose outcome is still pending", async () => {
     const harness = createHarness(false, {
       code: "response_pending",
@@ -937,6 +1112,1182 @@ describe("Codex Desktop continuation authorization", () => {
     harness.state.commitCodexContinuation("recovery-id");
     await flushJobs();
 
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+  });
+});
+
+describe("explicit owner Codex continuation preparation", () => {
+  it("refuses a prepared owner commit until final-read confirmation finishes", async () => {
+    const harness = createHarness(false, undefined, "completed");
+    harness.state.startCodexOwnerContinuation(
+      harness.ownerView(),
+      "owner-confirm-contract",
+    );
+    await flushJobs();
+    expect(
+      harness.state.commitCodexContinuation("owner-confirm-contract"),
+    ).toMatchObject({ started: false });
+    expect(
+      harness.state.readCodexContinuationJob("owner-confirm-contract"),
+    ).toMatchObject({
+      status: "prepared",
+      submitted: false,
+      mutationAttempted: false,
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+    harness.state.confirmCodexOwnerContinuation("owner-confirm-contract");
+    await flushJobs();
+    expect(
+      harness.state.readCodexContinuationJob("owner-confirm-contract"),
+    ).toMatchObject({
+      status: "confirmed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+    const reads = harness.readCount();
+    harness.state.commitCodexContinuation("owner-confirm-contract");
+    // There is no awaited read after native authorization: dispatch happens
+    // synchronously in the same call, before flushing an acknowledgement.
+    expect(harness.readCount()).toBe(reads);
+    expect(harness.startTurn).toHaveBeenCalledTimes(1);
+    await flushJobs();
+    expect(
+      harness.state.readCodexContinuationJob("owner-confirm-contract"),
+    ).toMatchObject({
+      status: "completed",
+      submitted: true,
+      mutationAttempted: true,
+    });
+  });
+  it("cancels final-read confirmation without leaving a late owner sender", async () => {
+    const harness = createHarness(false, undefined, "completed", {
+      pauseCommitRead: true,
+    });
+    harness.state.startCodexOwnerContinuation(
+      harness.ownerView(),
+      "owner-confirm-cancel",
+    );
+    await flushJobs();
+    harness.state.confirmCodexOwnerContinuation("owner-confirm-cancel");
+    await flushJobs();
+    expect(
+      harness.state.readCodexContinuationJob("owner-confirm-cancel").status,
+    ).toBe("confirming");
+    expect(
+      harness.state.cancelCodexContinuation("owner-confirm-cancel"),
+    ).toMatchObject({ cancelled: true, mutationAttempted: false });
+    harness.releaseCommitRead();
+    await flushJobs();
+    expect(
+      harness.state.commitCodexContinuation("owner-confirm-cancel"),
+    ).toMatchObject({ started: false });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+  });
+  it.each([
+    "turn_getter",
+    "id_getter",
+    "id_coercion",
+    "same_base",
+    "thread_getter",
+  ])(
+    "keeps mutation evidence uncertain for unreadable acknowledgement %s without getters or coercion",
+    async (shape) => {
+      const harness = createHarness(false, undefined, "completed");
+      const effect = vi.fn(() => "continued-turn");
+      const response: Record<string, unknown> = {
+        turn: { id: "continued-turn" },
+      };
+      if (shape === "turn_getter")
+        Object.defineProperty(response, "turn", {
+          get: () => {
+            effect();
+            return { id: "continued-turn" };
+          },
+        });
+      if (shape === "id_getter")
+        Object.defineProperty(response.turn, "id", { get: effect });
+      if (shape === "id_coercion") response.turn = { id: { toString: effect } };
+      if (shape === "same_base") response.turn = { id: "failed-turn" };
+      if (shape === "thread_getter")
+        Object.defineProperty(response, "thread", {
+          get: () => {
+            effect();
+            return { id: "exact-thread" };
+          },
+        });
+      harness.startTurn.mockImplementationOnce(
+        () => response as ReturnType<typeof harness.startTurn>,
+      );
+      const reference = harness.ownerView();
+      harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+      await flushJobs();
+      harness.state.confirmCodexOwnerContinuation("owner-operation");
+      await flushJobs();
+      harness.state.commitCodexContinuation("owner-operation");
+      await flushJobs();
+      expect(
+        harness.state.readCodexContinuationJob("owner-operation"),
+      ).toMatchObject({
+        status: "completed",
+        submitted: false,
+        mutationAttempted: true,
+      });
+      expect(harness.startTurn).toHaveBeenCalledTimes(1);
+      expect(effect).not.toHaveBeenCalled();
+      expect(Object.values(harness.api.readCodexContinuationMarkers())).toEqual(
+        [
+          expect.objectContaining({
+            status: "attempted",
+            intent: "OwnerContinue",
+          }),
+        ],
+      );
+    },
+  );
+  it("projects only inert canonical owner job evidence for native reservation", async () => {
+    const harness = createHarness(false, undefined, "completed");
+    const reference = harness.ownerView();
+    harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+    await flushJobs();
+    const retained = harness.state.codexContinuationJobs["owner-operation"];
+    const getter = vi.fn(() => "must-not-read");
+    Object.defineProperty(retained, "privateTransport", {
+      enumerable: true,
+      get: getter,
+    });
+    expect(
+      harness.state.readCodexContinuationJob("owner-operation"),
+    ).toMatchObject({
+      status: "prepared",
+      intent: "OwnerContinue",
+      threadId: "exact-thread",
+      expectedBaseTurnId: "failed-turn",
+      baseTurnId: "failed-turn",
+      runtimeGeneration: 1,
+      submitted: false,
+      mutationAttempted: false,
+    });
+    expect(
+      harness.state.readCodexContinuationJob("owner-operation"),
+    ).not.toHaveProperty("privateTransport");
+    expect(
+      harness.state.readCodexContinuationJob("owner-operation"),
+    ).not.toHaveProperty("ownerViewReference");
+    expect(
+      harness.state.readCodexContinuationJob("owner-operation"),
+    ).not.toHaveProperty("commit");
+    expect(getter).not.toHaveBeenCalled();
+    harness.state.confirmCodexOwnerContinuation("owner-operation");
+    await flushJobs();
+    harness.state.commitCodexContinuation("owner-operation");
+    await flushJobs();
+    expect(
+      harness.state.readCodexContinuationJob("owner-operation"),
+    ).toMatchObject({
+      status: "completed",
+      intent: "OwnerContinue",
+      baseTurnId: "failed-turn",
+      submitted: true,
+      mutationAttempted: true,
+      turnId: "continued-turn",
+    });
+  });
+  it.each([
+    { status: "completed", error: undefined },
+    {
+      status: "failed",
+      error: { message: "Daily quota exhausted", retryable: false },
+    },
+    {
+      status: "interrupted",
+      error: { message: "The user cancelled the request" },
+    },
+  ])(
+    "prepares one explicit idle owner action without relaxing auto policy: $status",
+    async ({ status, error }) => {
+      const harness = createHarness(false, error, status);
+      const reference = harness.ownerView();
+      expect(
+        harness.api.classifyCodexContinuationThread(
+          harness.failedThread,
+          "exact-thread",
+          "request-model",
+        ).ready,
+      ).toBe(false);
+      expect(
+        harness.state.startCodexOwnerContinuation(reference, "owner-operation"),
+      ).toMatchObject({ started: true });
+      await flushJobs();
+      expect(
+        harness.state.readCodexContinuationJob("owner-operation"),
+      ).toMatchObject({
+        status: "prepared",
+        intent: "OwnerContinue",
+        submitted: false,
+        mutationAttempted: false,
+      });
+      expect(harness.startTurn).not.toHaveBeenCalled();
+      harness.state.confirmCodexOwnerContinuation("owner-operation");
+      await flushJobs();
+      harness.state.commitCodexContinuation("owner-operation");
+      await flushJobs();
+      expect(harness.startTurn).toHaveBeenCalledTimes(1);
+      expect(harness.startTurn).toHaveBeenCalledWith({
+        threadId: "exact-thread",
+        input: [{ type: "text", text: "continue" }],
+      });
+    },
+  );
+
+  it.each(["failed", "interrupted"])(
+    "allows one explicit continuation from loaded systemError with terminal %s",
+    async (turnStatus) => {
+      const harness = createHarness(false, { retryable: false }, turnStatus);
+      const reference = harness.ownerView();
+      harness.failedThread.status = { type: "systemError", activeFlags: [] };
+      expect(
+        harness.api.classifyCodexContinuationThread(
+          harness.failedThread,
+          "exact-thread",
+          "request-model",
+        ).ready,
+      ).toBe(false);
+      harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+      await flushJobs();
+      expect(
+        harness.state.readCodexContinuationJob("owner-operation"),
+      ).toMatchObject({
+        status: "prepared",
+        submitted: false,
+        mutationAttempted: false,
+      });
+      harness.state.confirmCodexOwnerContinuation("owner-operation");
+      await flushJobs();
+      harness.state.commitCodexContinuation("owner-operation");
+      await flushJobs();
+      expect(harness.startTurn).toHaveBeenCalledTimes(1);
+      expect(harness.startTurn).toHaveBeenCalledWith({
+        threadId: "exact-thread",
+        input: [{ type: "text", text: "continue" }],
+      });
+    },
+  );
+
+  it.each(["completed", "inProgress", "unknown"])(
+    "rejects loaded systemError without a failed/interrupted latest turn: %s",
+    async (turnStatus) => {
+      const harness = createHarness(false, undefined, turnStatus);
+      const reference = harness.ownerView();
+      harness.failedThread.status = { type: "systemError", activeFlags: [] };
+      harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+      await flushJobs();
+      expect(
+        harness.state.readCodexContinuationJob("owner-operation"),
+      ).toMatchObject({
+        status: "completed",
+        submitted: false,
+        mutationAttempted: false,
+      });
+      expect(harness.startTurn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(
+    ["failed", "interrupted"].flatMap((turnStatus) =>
+      [
+        { status: { type: "systemError", activeFlags: ["waitingOnApproval"] } },
+        {
+          status: { type: "systemError", activeFlags: ["waitingOnUserInput"] },
+        },
+        { pendingApprovals: ["pending"] },
+        { pendingOperations: ["pending"] },
+        { pendingRequests: ["pending"] },
+        { pendingApproval: true },
+        { pendingOperation: true },
+        { waitingOnApproval: true },
+        { waitingOnUserInput: true },
+        { pendingApprovals: null },
+        { status: { type: "systemError", activeFlags: null } },
+      ].map((pending) => ({ turnStatus, pending })),
+    ),
+  )(
+    "rejects loaded systemError with conflicting or unreadable pending state: %j",
+    async ({ turnStatus, pending }) => {
+      const harness = createHarness(false, undefined, turnStatus);
+      const reference = harness.ownerView();
+      harness.failedThread.status = { type: "systemError", activeFlags: [] };
+      Object.assign(harness.failedThread, pending);
+      harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+      await flushJobs();
+      expect(
+        harness.state.readCodexContinuationJob("owner-operation"),
+      ).toMatchObject({
+        status: "completed",
+        submitted: false,
+        mutationAttempted: false,
+      });
+      expect(harness.startTurn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["active", "completed"])(
+    "rechecks loaded systemError eligibility at final commit: %s",
+    async (change) => {
+      const harness = createHarness(false, undefined, "failed", {
+        pauseCommitRead: true,
+      });
+      const reference = harness.ownerView();
+      harness.failedThread.status = { type: "systemError", activeFlags: [] };
+      harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+      await flushJobs();
+      expect(
+        harness.state.readCodexContinuationJob("owner-operation").status,
+      ).toBe("prepared");
+      harness.state.confirmCodexOwnerContinuation("owner-operation");
+      await flushJobs();
+      harness.state.commitCodexContinuation("owner-operation");
+      await flushJobs();
+      if (change === "active")
+        harness.failedThread.status = { type: "active", activeFlags: [] };
+      else harness.failedThread.turns[0].status = "completed";
+      harness.releaseCommitRead();
+      await flushJobs();
+      expect(harness.startTurn).not.toHaveBeenCalled();
+      expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+    },
+  );
+
+  it.each([
+    undefined,
+    "idle",
+    { type: "active", activeFlags: [] },
+    { type: "active", activeFlags: ["waitingOnApproval"] },
+    { type: "active", activeFlags: ["waitingOnUserInput"] },
+    { type: "notLoaded" },
+    { type: "systemError" },
+    { type: "idle", activeFlags: ["waitingOnApproval"] },
+  ])(
+    "refuses unknown/nonquiescent native state including systemError with completed turn: %j",
+    async (status) => {
+      const harness = createHarness(false, undefined, "completed");
+      const reference = harness.ownerView();
+      harness.failedThread.status = status;
+      harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+      await flushJobs();
+      expect(
+        harness.state.readCodexContinuationJob("owner-operation"),
+      ).toMatchObject({
+        status: "completed",
+        submitted: false,
+        mutationAttempted: false,
+      });
+      expect(harness.startTurn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["pendingApprovals", "pendingOperations"] as const)(
+    "refuses conflicting native pending state: %s",
+    async (field) => {
+      const harness = createHarness(false, undefined, "completed");
+      const reference = harness.ownerView();
+      harness.failedThread[field] = ["pending"];
+      harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+      await flushJobs();
+      expect(
+        harness.state.readCodexContinuationJob("owner-operation"),
+      ).toMatchObject({
+        status: "completed",
+        submitted: false,
+        mutationAttempted: false,
+      });
+      expect(harness.startTurn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects an absent or forged view reference without reading a thread", () => {
+    const harness = createHarness();
+    expect(
+      harness.state.startCodexOwnerContinuation(
+        "not-issued",
+        "owner-operation",
+      ),
+    ).toMatchObject({ started: false });
+    expect(harness.readCount()).toBe(0);
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it("does not invoke arbitrary coercions or accept an arbitrary content object", () => {
+    const harness = createHarness();
+    const coercion = vi.fn(() => "owner-view");
+    expect(
+      harness.state.startCodexOwnerContinuation(
+        { toString: coercion } as unknown as string,
+        "owner-operation",
+      ),
+    ).toMatchObject({ started: false });
+    expect(coercion).not.toHaveBeenCalled();
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stale latest-turn binding before preparation", async () => {
+    const harness = createHarness(false, undefined, "completed");
+    const reference = harness.ownerView();
+    harness.changeFailedTurn("newer-turn");
+    harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+    await flushJobs();
+    expect(
+      harness.state.readCodexContinuationJob("owner-operation"),
+    ).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "turn",
+    "provider",
+    "view",
+    "user-action",
+    "runtime",
+    "client",
+  ] as const)("rechecks owner binding after final read: %s", async (change) => {
+    const harness = createHarness(false, undefined, "completed", {
+      pauseCommitRead: true,
+    });
+    const reference = harness.ownerView();
+    harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+    await flushJobs();
+    expect(
+      harness.state.readCodexContinuationJob("owner-operation").status,
+    ).toBe("prepared");
+    harness.state.confirmCodexOwnerContinuation("owner-operation");
+    await flushJobs();
+    harness.state.commitCodexContinuation("owner-operation");
+    await flushJobs();
+    if (change === "turn") harness.changeFailedTurn("newer-turn");
+    else if (change === "provider")
+      harness.failedThread.modelProvider = "another-provider";
+    else if (change === "view") harness.expireOwnerView();
+    else if (change === "runtime") harness.replaceInstallation();
+    else if (change === "client") harness.replaceHook();
+    else
+      harness.api.rememberCodexUserTurnAction("turn/interrupt", {
+        threadId: "exact-thread",
+      });
+    harness.releaseCommitRead();
+    await flushJobs();
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+    expect(
+      harness.state.readCodexContinuationJob("owner-operation"),
+    ).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+  });
+
+  it("shares the base-turn mutation marker across owner and automatic jobs", async () => {
+    const harness = createHarness();
+    const reference = harness.ownerView();
+    harness.start();
+    harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+    await flushJobs();
+    expect(harness.job().status).toBe("prepared");
+    expect(
+      harness.state.readCodexContinuationJob("owner-operation").status,
+    ).toBe("prepared");
+    harness.state.commitCodexContinuation("recovery-id");
+    harness.state.confirmCodexOwnerContinuation("owner-operation");
+    await flushJobs();
+    harness.state.commitCodexContinuation("owner-operation");
+    await flushJobs();
+    expect(harness.startTurn).toHaveBeenCalledTimes(1);
+    expect(harness.api.readCodexContinuationMarkers()).toMatchObject({
+      "exact-thread:failed-turn": { status: "submitted" },
+    });
+  });
+
+  it("does not replay an uncertain owner mutation under a new operation id", async () => {
+    const harness = createHarness(false, undefined, "completed");
+    const reference = harness.ownerView();
+    harness.startTurn.mockImplementation(() => {
+      throw new Error("Connection lost after dispatch");
+    });
+    harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+    await flushJobs();
+    harness.state.confirmCodexOwnerContinuation("owner-operation");
+    await flushJobs();
+    harness.state.commitCodexContinuation("owner-operation");
+    await flushJobs();
+    expect(
+      harness.state.readCodexContinuationJob("owner-operation"),
+    ).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: true,
+    });
+    harness.state.startCodexOwnerContinuation(
+      reference,
+      "second-owner-operation",
+    );
+    await flushJobs();
+    harness.state.confirmCodexOwnerContinuation("second-owner-operation");
+    await flushJobs();
+    harness.state.commitCodexContinuation("second-owner-operation");
+    await flushJobs();
+    expect(harness.startTurn).toHaveBeenCalledTimes(1);
+    expect(harness.api.readCodexContinuationMarkers()).toMatchObject({
+      "exact-thread:failed-turn": { status: "attempted" },
+    });
+  });
+
+  it("reuses one owner operation but refuses rebinding its id to another snapshot", async () => {
+    const harness = createHarness(false, undefined, "completed");
+    const reference = harness.ownerView();
+    harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+    await flushJobs();
+    expect(
+      harness.state.startCodexOwnerContinuation(reference, "owner-operation"),
+    ).toMatchObject({ started: true });
+    const otherReference = harness.ownerView("another-owner-view");
+    expect(
+      harness.state.startCodexOwnerContinuation(
+        otherReference,
+        "owner-operation",
+      ),
+    ).toMatchObject({ started: false });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it("rejects getter-backed native thread identity without evaluating it", async () => {
+    const harness = createHarness();
+    const idGetter = vi.fn(() => "exact-thread");
+    Object.defineProperty(harness.failedThread, "id", { get: idGetter });
+    harness.start();
+    await flushJobs();
+    expect(idGetter).not.toHaveBeenCalled();
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+  });
+});
+
+describe("durable shared continuation evidence", () => {
+  it.each(["attempted", "submitted"])(
+    "does not age out old %s evidence when writing another turn",
+    async (status) => {
+      const harness = createHarness();
+      const oldWrittenAt = Date.now() - 48 * 60 * 60 * 1000;
+      harness.seedMarkers({
+        "exact-thread:older-base-turn": {
+          recoveryId: "older-operation",
+          status,
+          writtenAt: oldWrittenAt,
+        },
+      });
+      harness.start();
+      await flushJobs();
+      harness.state.commitCodexContinuation("recovery-id");
+      await flushJobs();
+      expect(harness.startTurn).toHaveBeenCalledTimes(1);
+      expect(harness.api.readCodexContinuationMarkers()).toMatchObject({
+        "exact-thread:older-base-turn": { status, writtenAt: oldWrittenAt },
+      });
+      harness.changeFailedTurn("older-base-turn");
+      harness.state.startCodexContinuation(
+        "exact-thread",
+        "another-operation",
+        "request-model",
+        Date.now() - 1000,
+      );
+      await flushJobs();
+      harness.state.commitCodexContinuation("another-operation");
+      await flushJobs();
+      expect(harness.startTurn).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("refuses without sending when attempted evidence cannot be persisted", async () => {
+    const harness = createHarness(false, undefined, "completed");
+    const reference = harness.ownerView();
+    harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+    await flushJobs();
+    harness.refuseMarkerWrites();
+    harness.state.confirmCodexOwnerContinuation("owner-operation");
+    await flushJobs();
+    harness.state.commitCodexContinuation("owner-operation");
+    await flushJobs();
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(
+      harness.state.readCodexContinuationJob("owner-operation"),
+    ).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+  });
+});
+
+describe("owner continuation exact-client and inert-input boundaries", () => {
+  it("never discovers or falls back to another client for an issued owner view", async () => {
+    const harness = createHarness(false, undefined, "completed");
+    const reference = harness.ownerView();
+    const otherRead = vi.fn();
+    harness.state.appServerClients = [
+      { hostId: "local", sendRequest: otherRead },
+    ];
+    harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+    await flushJobs();
+    expect(harness.readCount()).toBe(0);
+    expect(otherRead).not.toHaveBeenCalled();
+    expect(
+      harness.state.readCodexContinuationJob("owner-operation"),
+    ).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it("does not read any client for a revoked view reference", () => {
+    const harness = createHarness(false, undefined, "completed");
+    const reference = harness.ownerView();
+    harness.expireOwnerView();
+    expect(
+      harness.state.startCodexOwnerContinuation(reference, "owner-operation"),
+    ).toMatchObject({ started: false });
+    expect(harness.readCount()).toBe(0);
+  });
+
+  it("rejects a reference revoked while its first exact read is pending", async () => {
+    const harness = createHarness(true, undefined, "completed");
+    const reference = harness.ownerView();
+    harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+    await flushJobs();
+    harness.expireOwnerView();
+    harness.releaseRead();
+    await flushJobs();
+    expect(
+      harness.state.readCodexContinuationJob("owner-operation"),
+    ).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it.each(["status", "pendingApprovals"] as const)(
+    "does not invoke getter-backed native owner state: %s",
+    async (field) => {
+      const harness = createHarness(false, undefined, "completed");
+      const reference = harness.ownerView();
+      const getter = vi.fn(() => (field === "status" ? { type: "idle" } : []));
+      Object.defineProperty(harness.failedThread, field, { get: getter });
+      harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+      await flushJobs();
+      expect(getter).not.toHaveBeenCalled();
+      expect(
+        harness.state.readCodexContinuationJob("owner-operation"),
+      ).toMatchObject({
+        status: "completed",
+        submitted: false,
+        mutationAttempted: false,
+      });
+      expect(harness.startTurn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("ignores arbitrary extra prompt/RPC arguments and only prepares literal continue", async () => {
+    const harness = createHarness(false, undefined, "completed");
+    const reference = harness.ownerView();
+    const getter = vi.fn(() => "arbitrary-command");
+    const arbitrary = Object.defineProperty({}, "input", { get: getter });
+    (
+      harness.state.startCodexOwnerContinuation as (
+        ...args: unknown[]
+      ) => unknown
+    )(reference, "owner-operation", arbitrary);
+    await flushJobs();
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    harness.state.confirmCodexOwnerContinuation("owner-operation");
+    await flushJobs();
+    harness.state.commitCodexContinuation("owner-operation");
+    await flushJobs();
+    expect(getter).not.toHaveBeenCalled();
+    expect(harness.startTurn).toHaveBeenCalledTimes(1);
+    expect(harness.startTurn).toHaveBeenCalledWith({
+      threadId: "exact-thread",
+      input: [{ type: "text", text: "continue" }],
+    });
+  });
+
+  it("does not reuse one job id across automatic and owner intents", async () => {
+    const harness = createHarness();
+    const reference = harness.ownerView();
+    harness.start();
+    await flushJobs();
+    expect(
+      harness.state.startCodexOwnerContinuation(reference, "recovery-id"),
+    ).toMatchObject({ started: false });
+    expect(harness.job()).toMatchObject({
+      intent: "AutoRecovery",
+      status: "prepared",
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+});
+
+describe("owner continuation shared pending-state proof", () => {
+  it.each([
+    "pendingApproval",
+    "pendingOperation",
+    "waitingOnApproval",
+    "waitingOnUserInput",
+  ] as const)(
+    "rejects affirmative pending flag %s despite an idle status",
+    async (field) => {
+      const harness = createHarness(false, undefined, "completed");
+      const reference = harness.ownerView();
+      harness.failedThread[field] = true;
+      harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+      await flushJobs();
+      expect(
+        harness.state.readCodexContinuationJob("owner-operation"),
+      ).toMatchObject({
+        status: "completed",
+        submitted: false,
+        mutationAttempted: false,
+      });
+      expect(harness.startTurn).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe("malformed continuation evidence fails closed", () => {
+  it("does not treat a malformed persisted marker document as an empty history", async () => {
+    const harness = createHarness();
+    harness.seedMarkers([]);
+    harness.start();
+    await flushJobs();
+    harness.state.commitCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+  });
+
+  it("does not erase an exact-base-turn marker merely because its payload is malformed", async () => {
+    const harness = createHarness();
+    harness.seedMarkers({ "exact-thread:failed-turn": null });
+    harness.start();
+    await flushJobs();
+    harness.state.commitCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: true,
+    });
+  });
+});
+
+it("refuses an optional latest-turn model accessor instead of treating it as absent", async () => {
+  const harness = createHarness(false, undefined, "completed");
+  const reference = harness.ownerView();
+  const getter = vi.fn(() => "another-model");
+  Object.defineProperty(harness.failedThread.turns[0], "model", {
+    get: getter,
+  });
+  harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+  await flushJobs();
+  expect(getter).not.toHaveBeenCalled();
+  expect(
+    harness.state.readCodexContinuationJob("owner-operation"),
+  ).toMatchObject({
+    status: "completed",
+    submitted: false,
+    mutationAttempted: false,
+  });
+  expect(harness.startTurn).not.toHaveBeenCalled();
+});
+
+describe("owner continuation finite diagnostics", () => {
+  it("does not serialize raw exact-read transport errors into owner jobs", async () => {
+    const marker = "redacted-provider-error-marker";
+    const harness = createHarness(false, undefined, "completed", {
+      readError: new Error(marker),
+    });
+    const reference = harness.ownerView();
+    harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+    await flushJobs();
+    const job = harness.state.readCodexContinuationJob("owner-operation");
+    expect(job).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+    expect(JSON.stringify(job)).not.toContain(marker);
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it("reports an uncertain owner send without serializing its raw error", async () => {
+    const marker = "redacted-provider-error-marker";
+    const harness = createHarness(false, undefined, "completed");
+    const reference = harness.ownerView();
+    harness.startTurn.mockImplementation(() => {
+      throw new Error(marker);
+    });
+    harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+    await flushJobs();
+    harness.state.confirmCodexOwnerContinuation("owner-operation");
+    await flushJobs();
+    harness.state.commitCodexContinuation("owner-operation");
+    await flushJobs();
+    const job = harness.state.readCodexContinuationJob("owner-operation");
+    expect(job).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: true,
+    });
+    expect(JSON.stringify(job)).not.toContain(marker);
+    expect(harness.startTurn).toHaveBeenCalledTimes(1);
+  });
+});
+
+it("refuses an owner action when a user stop shares the snapshot millisecond", async () => {
+  const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+  try {
+    const harness = createHarness(false, undefined, "completed");
+    const reference = harness.ownerView("owner-view", Date.now());
+    harness.api.rememberCodexUserTurnAction("turn/interrupt", {
+      threadId: "exact-thread",
+    });
+    harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+    await flushJobs();
+    harness.state.confirmCodexOwnerContinuation("owner-operation");
+    await flushJobs();
+    harness.state.commitCodexContinuation("owner-operation");
+    await flushJobs();
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+describe("owner canonical user-action evidence", () => {
+  it("rejects clock rollback and catch-up without relying on wall-clock ordering", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    try {
+      const harness = createHarness(false, undefined, "completed");
+      const reference = harness.ownerView("owner-view", Date.now());
+      harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+      await flushJobs();
+      clock.mockReturnValue(900_000);
+      harness.api.rememberCodexUserTurnAction("turn/interrupt", {
+        threadId: "exact-thread",
+      });
+      clock.mockReturnValue(1_000_000);
+      harness.state.confirmCodexOwnerContinuation("owner-operation");
+      await flushJobs();
+      harness.state.commitCodexContinuation("owner-operation");
+      await flushJobs();
+      expect(harness.startTurn).not.toHaveBeenCalled();
+      expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("allows a fresh owner view captured after a prior action in the same millisecond", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    try {
+      const harness = createHarness(false, undefined, "completed");
+      harness.api.rememberCodexUserTurnAction("turn/interrupt", {
+        threadId: "exact-thread",
+      });
+      const reference = harness.ownerView("owner-view", Date.now());
+      harness.state.startCodexOwnerContinuation(reference, "owner-operation");
+      await flushJobs();
+      expect(
+        harness.state.readCodexContinuationJob("owner-operation").status,
+      ).toBe("prepared");
+      harness.state.confirmCodexOwnerContinuation("owner-operation");
+      await flushJobs();
+      harness.state.commitCodexContinuation("owner-operation");
+      await flushJobs();
+      expect(harness.startTurn).toHaveBeenCalledTimes(1);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("makes owner evidence unavailable without secure randomness but preserves automatic preparation", async () => {
+    const harness = createHarness(false, undefined, "failed", {
+      noCrypto: true,
+    });
+    expect(
+      harness.api.captureCodexOwnerUserActionEvidence("exact-thread"),
+    ).toBeNull();
+    harness.start();
+    await flushJobs();
+    expect(harness.job().status).toBe("prepared");
+    harness.state.commitCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.startTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps action evidence stable across reads but changes on every same-tick action", () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    try {
+      const harness = createHarness();
+      harness.api.rememberCodexUserTurnAction("turn/interrupt", {
+        threadId: "exact-thread",
+      });
+      const first =
+        harness.api.captureCodexOwnerUserActionEvidence("exact-thread");
+      expect(first).not.toBeNull();
+      expect(
+        harness.api.codexOwnerUserActionEvidenceIsCurrent(
+          "exact-thread",
+          first,
+        ),
+      ).toBe(true);
+      harness.api.rememberCodexUserTurnAction("turn/interrupt", {
+        threadId: "exact-thread",
+      });
+      expect(
+        harness.api.codexOwnerUserActionEvidenceIsCurrent(
+          "exact-thread",
+          first,
+        ),
+      ).toBe(false);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+});
+
+describe("owner continuation bounded source contract", () => {
+  it("uses only metadata and latest-turn pages throughout preparation and commit", async () => {
+    const harness = createHarness(false, undefined, "completed");
+    const reference = harness.ownerView();
+    harness.state.startCodexOwnerContinuation(
+      reference,
+      "bounded-owner-operation",
+    );
+    await flushJobs();
+    expect(
+      harness.state.readCodexContinuationJob("bounded-owner-operation").status,
+    ).toBe("prepared");
+    harness.state.confirmCodexOwnerContinuation("bounded-owner-operation");
+    await flushJobs();
+    harness.state.commitCodexContinuation("bounded-owner-operation");
+    await flushJobs();
+    expect(harness.startTurn).toHaveBeenCalledTimes(1);
+    const reads = harness.requestCalls.filter(
+      ([method]) => method !== "turn/start",
+    );
+    expect(reads).toHaveLength(6);
+    for (const [method, params] of reads) {
+      expect(params).toEqual(
+        method === "thread/read"
+          ? { threadId: "exact-thread", includeTurns: false }
+          : {
+              threadId: "exact-thread",
+              cursor: null,
+              limit: 1,
+              sortDirection: "desc",
+              itemsView: "notLoaded",
+            },
+      );
+    }
+  });
+
+  it("refuses unavailable pagination without falling back to a full owner transcript read", async () => {
+    const harness = createHarness(false, undefined, "completed", {
+      boundedHistoryUnavailable: true,
+    });
+    const reference = harness.ownerView();
+    harness.state.startCodexOwnerContinuation(
+      reference,
+      "unsupported-owner-operation",
+    );
+    await flushJobs();
+    expect(
+      harness.state.readCodexContinuationJob("unsupported-owner-operation"),
+    ).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.requestCalls).toEqual([
+      ["thread/read", { threadId: "exact-thread", includeTurns: false }],
+      [
+        "thread/turns/list",
+        {
+          threadId: "exact-thread",
+          cursor: null,
+          limit: 1,
+          sortDirection: "desc",
+          itemsView: "notLoaded",
+        },
+      ],
+    ]);
+  });
+});
+
+it.each([
+  {
+    data: [
+      { id: "failed-turn", status: "completed", itemsView: "full", items: [] },
+    ],
+    nextCursor: null,
+  },
+  {
+    data: [
+      {
+        id: "failed-turn",
+        status: "completed",
+        itemsView: "notLoaded",
+        items: [{ text: "raw-history-marker" }],
+      },
+    ],
+    nextCursor: null,
+  },
+  {
+    data: Array.from({ length: 2 }, () => ({
+      id: "failed-turn",
+      status: "completed",
+      itemsView: "notLoaded",
+      items: [],
+    })),
+    nextCursor: null,
+  },
+])(
+  "refuses owner turn metadata when the server ignores source bounds",
+  async (boundedHistoryPage) => {
+    const harness = createHarness(false, undefined, "completed", {
+      boundedHistoryPage,
+    });
+    const reference = harness.ownerView();
+    harness.state.startCodexOwnerContinuation(
+      reference,
+      "unbounded-owner-operation",
+    );
+    await flushJobs();
+    const job = harness.state.readCodexContinuationJob(
+      "unbounded-owner-operation",
+    );
+    expect(job).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+    expect(JSON.stringify(job)).not.toContain("raw-history-marker");
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  },
+);
+
+describe("explicit automatic Codex continuation confirmation", () => {
+  it("finishes the final read before exposing an immediate guarded sender", async () => {
+    const harness = createHarness(false, undefined, "failed", {
+      pauseCommitRead: true,
+    });
+    harness.start();
+    await flushJobs();
+    expect(harness.job().status).toBe("prepared");
+    expect(harness.state.confirmCodexContinuation("recovery-id")).toMatchObject(
+      { started: true },
+    );
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "confirming",
+      submitted: false,
+      mutationAttempted: false,
+    });
+    expect(harness.readCount()).toBe(3);
+    expect(harness.state.commitCodexContinuation("recovery-id")).toMatchObject({
+      started: false,
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+    harness.releaseCommitRead();
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "confirmed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+    const reads = harness.readCount();
+    harness.state.commitCodexContinuation("recovery-id");
+    // Native authorization has now run: the confirmed sender performs no
+    // awaited read between the native final check and the original request.
+    expect(harness.readCount()).toBe(reads);
+    expect(harness.startTurn).toHaveBeenCalledTimes(1);
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: true,
+      mutationAttempted: true,
+    });
+  });
+
+  it("does not revive an automatic sender cancelled during confirmation", async () => {
+    const harness = createHarness(false, undefined, "failed", {
+      pauseCommitRead: true,
+    });
+    harness.start();
+    await flushJobs();
+    harness.state.confirmCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.job().status).toBe("confirming");
+    harness.state.cancelCodexContinuation("recovery-id");
+    harness.releaseCommitRead();
+    await flushJobs();
+    expect(harness.state.commitCodexContinuation("recovery-id")).toMatchObject({
+      started: false,
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+  });
+
+  it("rechecks automatic user-action evidence synchronously after confirmation", async () => {
+    const harness = createHarness();
+    harness.start();
+    await flushJobs();
+    harness.state.confirmCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.job().status).toBe("confirmed");
+    harness.api.rememberCodexUserTurnAction("turn/interrupt", {
+      threadId: "exact-thread",
+    });
+    harness.state.commitCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
     expect(harness.startTurn).not.toHaveBeenCalled();
     expect(harness.api.readCodexContinuationMarkers()).toEqual({});
   });

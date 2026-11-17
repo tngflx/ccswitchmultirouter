@@ -54,6 +54,31 @@ describe("default Codex catalog model order", () => {
     expect(JSON.stringify(models)).toBe(snapshot);
   });
 
+  it("keeps same-name providers in separate stable target blocks", () => {
+    const models = [
+      {
+        model: "gpt-5.6-sol-old",
+        upstreamModel: "gpt-5.6-sol",
+        providerName: "Shared Gateway",
+        targetProviderId: "provider-a",
+      },
+      {
+        model: "gpt-7.0",
+        upstreamModel: "gpt-7.0",
+        providerName: "Shared Gateway",
+        targetProviderId: "provider-b",
+      },
+      {
+        model: "gpt-6.1-sol",
+        upstreamModel: "gpt-6.1-sol",
+        providerName: "Shared Gateway",
+        targetProviderId: "provider-a",
+      },
+    ];
+    expect(
+      defaultCodexCatalogModelOrder(models).map((model) => model.model),
+    ).toEqual(["gpt-6.1-sol", "gpt-5.6-sol-old", "gpt-7.0"]);
+  });
   it("does not mistake parameter sizes or custom dates for model generations", () => {
     const models = ["qwen-72b", "gpt-oss-120b", "custom-2026", "unknown"].map(
       (model) => ({ model }),

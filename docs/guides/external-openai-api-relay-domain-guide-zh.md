@@ -1,5 +1,11 @@
 # 第三方 Agent API 域名中转配置指南
 
+> 范围：本页只配置模型推理 API，不提供 Codex 当前会话查看、远程 Continue 或屏幕共享。
+> 自有设备的无人值守查看与 Continue 采用单独的
+> [Owner Remote 指南](codex-owner-remote-access.md)。Owner Remote 已实现独立的本机控制服务，
+> 可在 **设置 → 连接与恢复 → 远程连接（所有者访问）** 中启用；默认关闭，需另行配置私有 HTTPS 链路并配对设备。
+> 第三方 Agent API 的域名与 API Key 不会启用或授权 Owner Remote；源码与本机测试通过也不等于已完成你当前远程链路的端到端验证。
+
 本文说明如何把 CC Switch 的“第三方 Agent API”通过一台有公网 IP 的中转机暴露成域名访问，例如：
 
 ```text
@@ -32,16 +38,17 @@ CC Switch 本机建议使用独立的第三方 Agent API 端口，例如 `15722`
 
 - 第三方 Agent API 已启用。
 - 服务来源已选择，例如 `OpenAI Official Backup (codex)`。
-- 监听地址设置为 `0.0.0.0` 或指定网卡地址。
+- SSH 反向隧道使用 `127.0.0.1`；私有 mesh 链路优先绑定指定私有网卡地址。
+- 不要仅为远程访问就开放所有网卡；如果必须使用 `0.0.0.0`，防火墙须只允许经过验证的私有链路。
 - 监听端口设置为 `15722`。
 - 已生成 `ccsw_...` 访问 Key。
-- 本机访问通过：
+- 在本机验证与监听地址一致的 endpoint。SSH 方案使用 loopback：
 
 ```powershell
 curl.exe http://127.0.0.1:15722/health
 ```
 
-局域网或私有链路访问通过：
+若只绑定私有网卡，loopback 不会监听；本机和中转机均验证该私有地址：
 
 ```powershell
 curl.exe http://<CC_SWITCH_HOST_IP>:15722/health
@@ -49,7 +56,8 @@ curl.exe http://<CC_SWITCH_HOST_IP>:15722/health
 
 ## 方案 A：中转机通过 Tailscale 回连 CC Switch
 
-这是最稳的方案。家宽没有公网 IP、运营商 CGNAT、路由器不能端口转发时，优先用这个。
+家宽没有公网 IP、运营商 CGNAT、路由器不能端口转发时，可采用此私有链路。
+按 owner/device 配置 mesh 访问策略，不要把加入同一网络当成所有设备都可以访问 API 的理由。
 
 1. 在 Windows 机器和中转机上都安装并登录 Tailscale。
 2. 在 Windows 机器上确认 Tailscale IP：
@@ -133,6 +141,9 @@ sudo certbot --nginx -d llm.example.com
 ## 方案 B：中转机通过 SSH 反向隧道回连 CC Switch
 
 适合不想安装 Tailscale，但 Windows 机器可以主动连到中转机的场景。
+此方案中 CC Switch 监听必须保持 `127.0.0.1:15722`；不需要开放 Windows 入站端口。
+在 Windows SSH 客户端验证并固定中转机 host key，禁止关闭 host-key 验证；
+为隧道使用独立、最小权限的 SSH 身份，不要复制上游模型凭据到中转机。
 
 在 Windows 机器上执行：
 
@@ -168,28 +179,13 @@ proxy_pass http://127.0.0.1:15722;
 
 生产使用建议把 SSH 隧道做成 Windows 计划任务或服务，并启用自动重连工具，例如 `autossh`。
 
-## 方案 C：中转机通过路由器端口转发访问 CC Switch
+## 不采用公网明文端口转发
 
-只有在你确实有可入站公网 IP 时才推荐。
+不要配置公网 `15722 -> Windows:15722`。当前监听器没有内置 TLS，
+即使前面还有一个 HTTPS 中转域名，域名到 Windows 的公网 HTTP 一跳仍会暴露
+请求内容和 `ccsw_...` 凭据。改用方案 A 的私有加密链路或方案 B 的 SSH 反向隧道。
 
-路由器上配置：
-
-```text
-公网 TCP 15722 -> Windows 机器内网 IP:15722
-```
-
-中转机测试：
-
-```bash
-curl -i http://<你的公网IP>:15722/health
-```
-
-如果公网 IP 访问超时，但局域网 IP 能访问，通常不是 CC Switch 问题，而是：
-
-- 运营商 CGNAT。
-- 路由器没有端口转发。
-- 防火墙没有放行。
-- 查询到的公网 IP 不是这条入站链路的真实地址。
+同样不要发布接管端口 `15721`、CDP `9229`、Tauri IPC 或 Codex app-server。
 
 ## 域名 DNS
 
@@ -272,7 +268,8 @@ print(response.choices[0].message.content)
 ## 安全建议
 
 - 不要把 `15722` 直接裸露到公网，优先放在 Tailscale、SSH 隧道或反代后面。
-- `ccsw_...` Key 只保护 CC Switch 本地 endpoint，但仍要当作真实凭据保管。
+- `ccsw_...` Key 只保护模型 API endpoint，不能授权远程控制；仍要当作真实凭据保管。
+- 当前可复制的多 Key 记录在设置数据库中保留明文，并非只有 hash；保护数据库、备份和同步副本，泄漏后撤销/轮换。
 - 反代层可以额外加 IP allowlist、Basic Auth、mTLS 或 Cloudflare Access。
 - 不要在 Caddy/Nginx 日志里记录完整 Authorization header。
 - 不要把 CC Switch 的 OAuth token、refresh token、真实上游 API Key 复制到中转机。
@@ -282,25 +279,25 @@ print(response.choices[0].message.content)
 
 按这条链路从近到远排查：
 
-1. Windows 本机：
+1. Windows 本机（SSH/loopback 方案；只绑定私有网卡时跳过此项）：
 
 ```powershell
 curl.exe http://127.0.0.1:15722/health
 ```
 
-2. Windows 网卡地址：
+2. Windows 私有网卡地址（mesh 方案；SSH/loopback 方案不开放此项）：
 
 ```powershell
 curl.exe http://<Windows局域网IP>:15722/health
 ```
 
-3. 中转机到 Windows 私有地址：
+3. 中转机到 Windows 私有地址（mesh 方案）：
 
 ```bash
 curl -i http://<Tailscale或内网IP>:15722/health
 ```
 
-4. 中转机本地反代 upstream：
+4. 中转机本地反代 upstream（SSH 方案）：
 
 ```bash
 curl -i http://127.0.0.1:15722/health
@@ -314,7 +311,7 @@ curl -i https://llm.example.com/health
 
 常见现象：
 
-- 本机通、局域网不通：检查 CC Switch 是否监听 `0.0.0.0`，以及 Windows 防火墙。
-- 局域网通、中转机不通：检查 Tailscale/SSH/端口转发链路。
+- mesh 方案本机通、私有链路不通：检查选定私有网卡监听地址、mesh ACL 和 Windows 防火墙。SSH 方案无需开放 LAN 监听。
+- 私有网卡通、中转机不通：检查 Tailscale ACL/SSH 隧道，不要改成公网明文端口转发。
 - 中转机 upstream 通、域名不通：检查 DNS、Caddy/Nginx、TLS 证书和安全组。
 - 非流式通、流式卡住：关闭反代缓存，增加 `proxy_read_timeout`，确认客户端支持 SSE。

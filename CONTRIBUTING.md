@@ -65,20 +65,43 @@ and supported environment overrides, and is limited to five restarts per
 rebuilds from edits; crash recovery remains enabled. Launcher recovery events
 are recorded in `<config-dir>/logs/dev-watchdog.jsonl`.
 
+Find the existing watchdog switch in **Settings → Connections & recovery →
+Crash recovery** (also linked at the top of General). It still writes the same
+device-local `watchdogEnabled` setting; it is independent of remote access. Worker
+restarts reuse the inherited terminal streams. If the launcher itself exits,
+whole-session recovery runs detached and appends output to `dev-recovery.log`
+rather than reopening the original terminal. An explicit
+`CC_SWITCH_DEV_WATCHDOG_ENABLED` environment override still takes precedence;
+unset it to let the UI switch control development recovery.
+
 The Node restart/rebuild supervisor runs only through the development commands.
 Release builds ignore `CC_SWITCH_DEV_SUPERVISOR` and use the app's Rust watchdog
-to relaunch the installed executable after a crash. The external guardian is
-JavaScript too; it monitors the installed executable by default, and development
-recovery requires its explicit `--development-mode` flag. Windows identity
-probes and task registration use inline PowerShell 7 commands.
+to relaunch the installed executable after a crash. Rust is the sole supported production
+recovery owner. The JavaScript compatibility guardian refuses production
+restart operation; `--no-restart` permits non-restarting monitoring (it still
+writes its own lock/log), and development recovery requires its explicit
+`--development-mode` flag. Windows identity
+probes and legacy task inspection use inline PowerShell 7 commands; the repository does not ship PowerShell script files.
 
-Use `pnpm watchdog:run --plan-only` to inspect its options without monitoring
-or restarting anything. `pnpm watchdog:install --dry-run` previews the
-scheduled task migration; `pnpm watchdog:install` installs it for the current
-user, and `pnpm watchdog:uninstall` removes that task. The installed guardian
-uses the absolute Node executable that ran the installer, so Node 22.12 or
-newer and PowerShell 7 must remain available. The previous `.ps1` entry points
-only forward to the corresponding JavaScript files.
+The obsolete `watchdog:run` and `watchdog:install` package commands are removed.
+Use `node scripts/watch-ccswitchmulti.mjs --plan-only` for a side-effect-free
+compatibility-option preview. Enable production crash recovery in Settings.
+`pnpm watchdog:legacy:inspect` previews the exact owned legacy task/process
+removal without changing it; `pnpm watchdog:uninstall` performs that explicit
+removal. Both require Node 22.12 or newer and retain identity/ownership checks.
+
+An old scheduled task may still invoke a copy staged outside this repository.
+Updating source does not retire that copy, and a healthy Rust status does not
+prove it is absent. Inspect/remove the owned legacy task explicitly before
+claiming that a previously installed environment has no competing recovery owner.
+No automatic task deletion or installed-app mutation is part of a source audit.
+There are no repository PowerShell script entry points.
+
+The recovery status panel reports the effective policy and the active owner's
+restart ledger. In a development session with an explicit
+`CC_SWITCH_DEV_WATCHDOG_ENABLED` override, it shows both the effective policy
+and saved switch value. Changing the saved switch does not replace an explicit
+environment override; unset it and relaunch `pnpm dev` to use the switch.
 
 Stream retry is available in both development and production. Safe mode
 reconnects before output is delivered. Aggressive mode also resumes a failed
@@ -151,6 +174,22 @@ worktree. `pnpm release:local:skip-build` re-exports compiled release artifacts
 from `CARGO_TARGET_DIR/release` or `src-tauri/target/release`; it does not consume
 the `pnpm build` export directory.
 The release pipeline writes to the configured release root and reports its path.
+All repository build/release/cache/diagnostic entry points are JavaScript; run
+`pnpm scripts:check` to enforce the no-PowerShell-script policy (also enforced in
+CI and the renderer build). Dependency-generated launch shims are not source.
+
+Release output must be a safe external directory or a strict child of
+`output/`. Nonempty output is replaced only when its complete canonical ownership
+inventory validates, or when an old complete release's checksums and artifact
+identity validate for migration. A legacy `LOCAL-BUILD.json` name alone does not
+authorize replacement: keep that directory and choose a new empty output path.
+Release-hook installation never overwrites another hook or a configured
+`core.hooksPath`; integrate the command manually when an existing hook is present.
+
+The unused historical scripted reinstall/rollback command and obsolete one-off
+Windows helpers were retired, not replaced by an incomplete executable adapter.
+Ordinary development, packaging, and NSIS installation do not call them.
+See `docs/audits/2026-11-17-no-powershell-script-migration.md` for exact boundaries.
 
 ### Useful Commands
 
@@ -303,17 +342,33 @@ pnpm dev
 `--no-rebuild` 只抑制文件编辑触发的构建，崩溃恢复仍然有效。
 启动器恢复事件保存在 `<配置目录>/logs/dev-watchdog.jsonl`。
 
-Node 重启与重新构建守护只由开发命令启动。发布版忽略
-`CC_SWITCH_DEV_SUPERVISOR`，崩溃后由 Rust 看门狗重新启动安装态程序。
-外部守护也已改为 JavaScript，默认只监控安装态程序；要恢复开发会话，必须
-显式使用 `--development-mode`。Windows 身份查询和计划任务注册使用内联
-PowerShell 7 命令。
+现有看门狗开关位于 **设置 → 连接与恢复 → 崩溃恢复**，也可从“常规”顶部的快捷入口进入。
+它仍写入同一设备本地 `watchdogEnabled` 设置，与远程访问互不影响。工作进程重启时沿用
+原终端输出；启动器本身退出后，完整会话恢复在后台运行，并将输出追加到
+`dev-recovery.log`，不会重新打开原终端。显式设置的
+`CC_SWITCH_DEV_WATCHDOG_ENABLED` 环境变量仍具有更高优先级；取消该变量后才由 UI 开关控制开发恢复。
 
-`pnpm watchdog:run --plan-only` 只查看配置；
-`pnpm watchdog:install --dry-run` 预览当前用户的计划任务迁移；
-`pnpm watchdog:install` 安装，`pnpm watchdog:uninstall` 卸载该任务。
-安装后的任务使用安装时的绝对 Node 路径，因此需要保留 Node 22.12 或更新版本
-以及 PowerShell 7。旧 `.ps1` 入口仅转发到对应 JavaScript 文件。
+Node 重启与重新构建守护只由开发命令启动。发布版忽略
+`CC_SWITCH_DEV_SUPERVISOR`，崩溃后仅由 Rust 看门狗重新启动安装态程序。
+JavaScript 兼容守护拒绝执行生产环境重启；使用 `--no-restart` 可进行不重启应用的监控，
+但仍会写入自身的锁与诊断日志。开发恢复必须显式使用 `--development-mode`，
+且不会回退到启动安装态程序。
+Windows 身份查询与旧计划任务检查使用内联 PowerShell 7 命令；仓库不再提供 PowerShell 脚本文件。
+
+旧的 `watchdog:run` 与 `watchdog:install` 包命令已移除。
+使用 `node scripts/watch-ccswitchmulti.mjs --plan-only` 只预览兼容参数，
+生产环境恢复请使用设置中的开关。`pnpm watchdog:legacy:inspect` 只预览本用户
+拥有的旧任务/进程移除计划；`pnpm watchdog:uninstall` 执行明确的移除操作。
+两者需要 Node 22.12 或更新版本，保留精确身份与所有权校验。
+
+仓库外曾暂存的旧守护副本仍可能由已安装的计划任务启动。更新源码不会自动移除
+该副本，Rust 状态正常也不能证明它不存在。必须明确检查/移除本用户拥有的旧任务，
+才能确认旧安装环境不存在竞争恢复责任方。源码审计不会自动删除计划任务或修改安装态应用。
+仓库不再提供 PowerShell 脚本入口。
+
+恢复状态面板显示实际生效的策略及当前恢复责任方的重启记录。开发会话显式设置
+`CC_SWITCH_DEV_WATCHDOG_ENABLED` 时，面板同时显示生效策略和已保存的开关值。
+修改开关不会替换显式环境变量；取消该变量并重新启动 `pnpm dev` 后才会使用开关。
 
 开发版与生产版都支持流重试。Safe 模式只在尚未交付输出时重新连接；Aggressive
 模式还会在配置的次数限制内向发生失败的 Codex Desktop 对话发送 `continue`。
@@ -373,7 +428,18 @@ pnpm build
 在已提交所有跟踪文件修改的工作区运行 `pnpm release:local`。
 `pnpm release:local:skip-build` 从 `CARGO_TARGET_DIR/release` 或
 `src-tauri/target/release` 重新导出现有编译产物，不读取 `pnpm build` 的导出目录。
-脚本会报告配置的发布目录。
+脚本会报告配置的发布目录。构建、发布、缓存清理和诊断入口均使用 JavaScript；
+`pnpm scripts:check` 检查仓库不含 PowerShell 脚本，并在 CI 与前端构建前强制执行。
+依赖管理器自动生成的启动 shim 不属于仓库源码。
+
+发布输出只能位于安全的外部目录或 `output/` 的严格子目录。非空输出必须通过完整的
+规范所有权清单校验，或通过旧版完整发布的校验和及产物身份迁移校验。只有旧
+`LOCAL-BUILD.json` 名称的目录不会自动覆盖；请保留原目录并选择新的空输出路径。
+发布 hook 安装不会覆盖已有 hook 或 `core.hooksPath`；已有 hook 需要手动集成命令。
+
+无人调用的旧脚本事务重装/回滚命令和一次性 Windows 辅助脚本已退役，未用不完整的
+执行适配器冒充替代实现；日常开发、打包及 NSIS 安装并不调用这些旧工具。
+详情见 `docs/audits/2026-11-17-no-powershell-script-migration.md`。
 
 ### 常用命令
 

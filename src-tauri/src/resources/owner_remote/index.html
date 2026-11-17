@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="robots" content="noindex, nofollow, noarchive" />
+    <title data-i18n="page.title">Codex · Owner remote</title>
+    <link rel="stylesheet" href="/remote/console.css" />
+    <script defer src="/remote/i18next.js"></script>
+    <script type="module" src="/remote/console.js"></script>
+  </head>
+  <body>
+    <div id="owner-remote-console" data-owner-remote-auto>
+      <header class="site-header">
+        <a
+          class="brand"
+          href="/remote/"
+          aria-label="Codex owner remote home"
+          data-i18n-aria-label="page.brandHome"
+        >
+          <span class="brand-mark" aria-hidden="true">C</span>
+          <span
+            ><span data-i18n="page.brand">Codex</span>
+            <span class="brand-detail" data-i18n="page.brandDetail"
+              >owner remote</span
+            ></span
+          >
+        </a>
+        <span
+          id="connection-state"
+          class="connection-state"
+          data-i18n="status.notConnected"
+          >Not connected</span
+        >
+      </header>
+      <main>
+        <section class="intro">
+          <p class="eyebrow" data-i18n="page.eyebrow">
+            Your machine. Your conversation.
+          </p>
+          <h1 data-i18n="page.headline">Pick up where Codex left off.</h1>
+          <p class="intro-copy" data-i18n="page.intro">
+            Read a selected conversation and send <code>continue</code> from
+            your own device. Enrolled owners do not need approval at the host.
+          </p>
+        </section>
+        <p id="feedback" class="feedback" role="status" aria-live="polite"></p>
+        <section
+          id="auth-panel"
+          class="card auth-card"
+          aria-labelledby="auth-title"
+        >
+          <div>
+            <p class="eyebrow" data-i18n="page.privateAccess">
+              Private owner access
+            </p>
+            <h2 id="auth-title" data-i18n="page.signInTitle">
+              Sign in with your passkey
+            </h2>
+            <p data-i18n="page.signInDescription">
+              Use the passkey you enrolled for this host. Sessions can be
+              renewed here without visiting the other machine.
+            </p>
+          </div>
+          <button
+            id="sign-in"
+            class="button primary"
+            type="button"
+            data-i18n="page.signIn"
+          >
+            Sign in with passkey
+          </button>
+          <p id="auth-note" class="muted small" data-i18n="page.authNote">
+            Open your configured HTTPS address through your private connection.
+            This page does not bypass Codex usage limits or native approvals.
+          </p>
+          <form id="enroll-form" class="enroll-panel" hidden>
+            <h3 data-i18n="page.enrollTitle">Enroll this browser</h3>
+            <p data-i18n="page.enrollDescription">
+              Your one-use invitation is ready. Create a passkey before it
+              expires.
+            </p>
+            <label for="device-label" data-i18n="page.browserLabel"
+              >Browser label</label
+            >
+            <input
+              id="device-label"
+              name="device-label"
+              maxlength="80"
+              autocomplete="off"
+              placeholder="My tablet"
+              data-i18n-placeholder="page.browserPlaceholder"
+              required
+            />
+            <button
+              id="enroll"
+              class="button primary"
+              type="submit"
+              data-i18n="page.createPasskey"
+            >
+              Create owner passkey
+            </button>
+          </form>
+        </section>
+        <section id="workspace" hidden>
+          <div class="session-bar">
+            <div>
+              <span class="session-dot" aria-hidden="true"></span>
+              <strong data-i18n="page.ownerSession">Owner session</strong>
+              <span id="host-name" class="muted small"></span>
+            </div>
+            <button
+              id="logout"
+              class="button quiet"
+              type="button"
+              data-i18n="page.signOut"
+            >
+              Sign out
+            </button>
+          </div>
+          <section
+            class="card conversation-picker"
+            aria-labelledby="choose-title"
+          >
+            <div>
+              <p class="eyebrow" data-i18n="page.chooseExplicitly">
+                Choose explicitly
+              </p>
+              <h2 id="choose-title" data-i18n="page.selectedConversation">
+                Selected conversation
+              </h2>
+              <p class="muted small" data-i18n="page.viewerDisclaimer">
+                This is a conversation viewer, not a screen share. The host's
+                currently displayed window is not verified.
+              </p>
+            </div>
+            <form id="thread-form" class="thread-form">
+              <label
+                for="conversation-choice"
+                data-i18n="page.recentConversations"
+                >Recent conversations</label
+              >
+              <select id="conversation-choice">
+                <option value="" data-i18n="page.chooseConversation">
+                  Choose a conversation or enter its ID
+                </option>
+              </select>
+              <label for="thread-id" data-i18n="page.conversationId"
+                >Conversation ID</label
+              >
+              <div class="input-action">
+                <input
+                  id="thread-id"
+                  name="thread-id"
+                  maxlength="256"
+                  autocomplete="off"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  placeholder="Exact Codex conversation ID"
+                  data-i18n-placeholder="page.conversationPlaceholder"
+                  required
+                />
+                <button
+                  id="open-thread"
+                  class="button secondary"
+                  type="submit"
+                  data-i18n="page.open"
+                >
+                  Open
+                </button>
+              </div>
+            </form>
+          </section>
+          <section class="card viewer" aria-labelledby="view-heading">
+            <div class="viewer-header">
+              <div>
+                <p class="eyebrow" data-i18n="page.snapshot">
+                  Bounded recent snapshot
+                </p>
+                <h2 id="view-heading" data-i18n="page.noConversation">
+                  No conversation selected
+                </h2>
+                <div class="view-metadata">
+                  <span
+                    id="view-status"
+                    class="status-badge"
+                    data-i18n="page.notLoaded"
+                    >Not loaded</span
+                  >
+                  <span id="view-model" class="muted small"></span>
+                  <span id="view-time" class="muted small"></span>
+                </div>
+              </div>
+              <button
+                id="refresh"
+                class="button quiet"
+                type="button"
+                data-i18n="page.refresh"
+              >
+                Refresh
+              </button>
+            </div>
+            <p
+              id="view-note"
+              class="viewer-note small"
+              data-i18n="page.contentPolicy"
+            >
+              Only recent supported content is shown. Hidden reasoning,
+              credentials, and arbitrary tool data are never requested by this
+              page.
+            </p>
+            <div
+              id="transcript"
+              class="transcript"
+              aria-label="Conversation content"
+              data-i18n-aria-label="page.conversationContent"
+            >
+              <p class="empty-state" data-i18n="page.chooseToRead">
+                Choose a conversation to read its current snapshot.
+              </p>
+            </div>
+            <div class="continue-bar">
+              <div>
+                <p
+                  id="action-message"
+                  class="action-message"
+                  role="status"
+                  aria-live="polite"
+                  data-i18n="page.freshIdleRequired"
+                >
+                  A fresh, positively idle conversation is required.
+                </p>
+                <p class="muted small" data-i18n="page.continueDescription">
+                  Sends only the literal message <code>continue</code>. Native
+                  tool approvals remain on Codex.
+                </p>
+              </div>
+              <button
+                id="continue"
+                class="button primary"
+                type="button"
+                disabled
+                data-i18n="page.sendContinue"
+              >
+                Send Continue
+              </button>
+            </div>
+          </section>
+          <details class="card devices-card">
+            <summary data-i18n="page.devicesTitle">
+              Owner devices and recovery
+            </summary>
+            <p class="muted small" data-i18n="page.devicesDescription">
+              Invite another browser or revoke a passkey using a passkey check
+              on this device. These checks are not required for Continue.
+              Revoking a synced passkey also revokes its synced copies and
+              sessions.
+            </p>
+            <button
+              id="invite-device"
+              class="button secondary"
+              type="button"
+              data-i18n="page.inviteDevice"
+            >
+              Invite another device
+            </button>
+            <div id="invitation-result" class="invitation-result" hidden>
+              <label for="invitation-link" data-i18n="page.invitationLink"
+                >One-use enrollment link</label
+              >
+              <input
+                id="invitation-link"
+                readonly
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <p class="muted small" data-i18n="page.invitationWarning">
+                Share privately with your own device. Expires in 60 seconds; do
+                not post it.
+              </p>
+              <button
+                id="copy-invitation"
+                class="button quiet"
+                type="button"
+                data-i18n="page.copyLink"
+              >
+                Copy link
+              </button>
+            </div>
+            <ul id="devices-list" class="devices-list"></ul>
+          </details>
+        </section>
+      </main>
+      <footer class="site-footer" data-i18n="page.footer">
+        Private HTTPS · Owner-only · No remote shell or settings access
+      </footer>
+      <noscript
+        ><p class="noscript" data-i18n="page.javascriptRequired">
+          JavaScript is required for this private viewer and passkey sign-in.
+        </p></noscript
+      >
+    </div>
+  </body>
+</html>

@@ -1403,6 +1403,92 @@ describe("ProviderForm Codex preset selection", () => {
     );
   });
 
+  it.each(["first", "last"])(
+    "reserves an excluded public identity before saving dependent references (%s row)",
+    async (excludedPosition) => {
+      const onSubmit = vi.fn();
+      const safeModels = Array.from({ length: 5 }, (_, index) => ({
+        model: `safe-${index + 1}`,
+      }));
+      const excluded: CodexCatalogModel = {
+        model: "public-model",
+        upstreamModel: "disabled-wire",
+        enabled: false,
+      };
+      const included: CodexCatalogModel[] = [
+        ...safeModels,
+        { model: "sibling-model", upstreamModel: "public-model" },
+      ];
+      const models =
+        excludedPosition === "first"
+          ? [excluded, ...included]
+          : [...included, excluded];
+      renderProviderForm({
+        providerId: "relay",
+        showButtons: true,
+        submitLabel: "Save",
+        onSubmit,
+        initialData: {
+          name: "Relay",
+          category: "custom",
+          settingsConfig: {
+            auth: { OPENAI_API_KEY: "fixture-only-key" },
+            config:
+              'model_provider = "relay"\nmodel = "public-model"\n[model_providers.relay]\nbase_url = "https://relay.example/v1"\nwire_api = "responses"\n',
+            modelCatalog: { models, spawnAgentModels: ["public-model"] },
+            codexApiKeyGroups: [
+              {
+                id: "group",
+                apiKeys: ["fixture-only-group-key"],
+                models: ["public-model"],
+              },
+            ],
+            codexRouting: {
+              schemaVersion: 2,
+              enabled: true,
+              modelOrder: ["public-model"],
+              spawnAgentModels: ["public-model"],
+              routes: [
+                {
+                  id: "self",
+                  targetProviderId: "relay",
+                  modelSelection: { mode: "include", models: ["public-model"] },
+                  aliases: { previous: "public-model" },
+                },
+              ],
+            },
+          },
+          meta: {
+            apiFormat: "openai_responses",
+            codexProtocolOverrides: { "public-model": "openai_chat" },
+          },
+        },
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+      const payload = onSubmit.mock.calls[0][0];
+      const saved = JSON.parse(payload.settingsConfig);
+      expect(saved.modelCatalog.models).toEqual(models);
+      expect(saved.modelCatalog.spawnAgentModels).toEqual(
+        safeModels.map((model) => model.model),
+      );
+      expect(saved.codexApiKeyGroups[0].models).toEqual([]);
+      expect(saved.codexRouting.modelOrder).toEqual([]);
+      expect(saved.codexRouting.spawnAgentModels).toEqual([]);
+      expect(saved.codexRouting.routes[0].modelSelection).toEqual({
+        mode: "include",
+        models: [],
+      });
+      expect(saved.codexRouting.routes[0].enabled).toBe(false);
+      expect(saved.codexRouting.routes[0].aliases).toEqual({});
+      expect(payload.meta.codexProtocolOverrides).toBeUndefined();
+      expect(providerConfigUtils.extractCodexModelName(saved.config)).toBe(
+        "safe-1",
+      );
+    },
+  );
+
   it("cleans removed defaults and dependent model references when saving a changed catalog", async () => {
     const onSubmit = vi.fn();
     renderProviderForm({

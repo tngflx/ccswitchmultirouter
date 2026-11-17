@@ -1,0 +1,464 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { ownerRemoteApi, type OwnerRemoteStatus } from "@/lib/api/ownerRemote";
+
+function normalizeHttpsOrigin(value: string): string | null {
+  try {
+    const url = new URL(value.trim());
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      url.pathname !== "/"
+    ) {
+      return null;
+    }
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+type PendingAction = "status" | "start" | "stop" | "invite";
+
+/** Own native status and operations above the tab-mounted view. */
+export function useOwnerRemoteController(active: boolean) {
+  const [status, setStatus] = useState<OwnerRemoteStatus | null>(null);
+  const [origin, setOrigin] = useState("");
+  const [pendingAction, setPendingAction] = useState<PendingAction | null>(
+    "status",
+  );
+  const [statusFailed, setStatusFailed] = useState(false);
+  const [error, setError] = useState(false);
+  const [invite, setInvite] = useState<{
+    url: string;
+    expiresAt: number;
+  } | null>(null);
+  const [secondsLeft, setSecondsLeft] = useState(0);
+  const mounted = useRef(false);
+  const requestVersion = useRef(0);
+  const inFlight = useRef(false);
+  const statusInFlight = useRef(false);
+  const refreshQueued = useRef(false);
+  const refreshStatusRef = useRef<(() => Promise<void>) | null>(null);
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const inviteViewVersion = useRef(0);
+
+  const run = useCallback(
+    async <T,>(
+      actionName: PendingAction,
+      action: () => Promise<T>,
+      onSuccess: (result: T) => void,
+      onFailure?: () => void,
+    ) => {
+      // Lock synchronously: two clicks in the same render must not start two
+      // listeners or overlap a status read with a configuration mutation.
+      if (!mounted.current || inFlight.current) return;
+      inFlight.current = true;
+      statusInFlight.current = actionName === "status";
+      if (statusInFlight.current) refreshQueued.current = false;
+      const version = ++requestVersion.current;
+      const isCurrent = () =>
+        mounted.current && version === requestVersion.current;
+      setPendingAction(actionName);
+      setError(false);
+      setInvite(null);
+      try {
+        const result = await action();
+        if (isCurrent()) onSuccess(result);
+      } catch {
+        // Never log or reflect native exceptions: enrollment can carry secrets.
+        if (isCurrent()) {
+          setError(true);
+          if (actionName === "start" || actionName === "stop") {
+            // A rejected mutation is not a rollback: stop closes the listener
+            // even when persisting opt-out fails. Keep the action lock until
+            // native status has reconciled both intent and runtime readiness.
+            setStatusFailed(true);
+            // Activation already refreshes status. Do not issue inactive-tab
+            // reconciliation IPC after a rejected mutation; keep the status
+            // unavailable until the next active read succeeds.
+            if (activeRef.current) {
+              try {
+                const next = await ownerRemoteApi.getStatus();
+                if (isCurrent()) {
+                  setStatus(next);
+                  setStatusFailed(false);
+                  if (next.httpsOrigin) setOrigin(next.httpsOrigin);
+                }
+              } catch {
+                if (isCurrent()) setStatusFailed(true);
+              }
+            }
+          } else {
+            onFailure?.();
+          }
+        }
+      } finally {
+        if (isCurrent()) {
+          inFlight.current = false;
+          statusInFlight.current = false;
+          setPendingAction(null);
+          if (refreshQueued.current && activeRef.current) {
+            refreshQueued.current = false;
+            void refreshStatusRef.current?.();
+          }
+        }
+      }
+    },
+    [],
+  );
+
+  const refreshStatus = useCallback(() => {
+    // A read dispatched before leaving Connections may complete after a return.
+    // Coalesce that reactivation into one fresh read, never overlap native IPC.
+    if (inFlight.current && statusInFlight.current)
+      refreshQueued.current = true;
+    return run(
+      "status",
+      () => ownerRemoteApi.getStatus(),
+      (next) => {
+        setStatus(next);
+        setOrigin(next.httpsOrigin ?? "");
+        setStatusFailed(false);
+        setError(Boolean(next.error));
+      },
+      () => setStatusFailed(true),
+    );
+  }, [run]);
+  refreshStatusRef.current = refreshStatus;
+
+  // Only actual owner teardown invalidates mutations; hiding a tab does not.
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      requestVersion.current += 1;
+      inFlight.current = false;
+      statusInFlight.current = false;
+      refreshQueued.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (active) {
+      // run() retains a pending mutation's lock instead of racing its IPC.
+      void refreshStatus();
+    } else {
+      // Enrollment material is view-scoped, unlike status and mutations.
+      inviteViewVersion.current += 1;
+      setInvite(null);
+    }
+  }, [active, refreshStatus]);
+
+  useEffect(() => {
+    if (!invite) return;
+    const update = () => {
+      const seconds = Math.max(
+        0,
+        Math.ceil((invite.expiresAt - Date.now()) / 1000),
+      );
+      setSecondsLeft(seconds);
+      if (!seconds) setInvite(null);
+    };
+    update();
+    const timer = window.setInterval(update, 500);
+    return () => window.clearInterval(timer);
+  }, [invite]);
+
+  const busy = pendingAction !== null;
+  const originPinned = Boolean(status?.httpsOrigin);
+  const normalizedOrigin = normalizeHttpsOrigin(status?.httpsOrigin ?? origin);
+  const enabled = status?.enabled === true;
+  const running = status?.running === true && !statusFailed;
+  const needsStatusRetry = statusFailed || (!enabled && Boolean(status?.error));
+  const statusUnavailable = !status || needsStatusRetry;
+  const applyStatus = (next: OwnerRemoteStatus) => {
+    setStatus(next);
+    setStatusFailed(false);
+    setError(Boolean(next.error));
+  };
+  const start = () => {
+    if (!normalizedOrigin) return;
+    void run(
+      "start",
+      () => ownerRemoteApi.start(normalizedOrigin),
+      (next) => {
+        applyStatus(next);
+        setOrigin(next.httpsOrigin ?? normalizedOrigin);
+      },
+    );
+  };
+
+  const stop = () => void run("stop", () => ownerRemoteApi.stop(), applyStatus);
+  const changeOrigin = (value: string) => {
+    if (originPinned) return;
+    setOrigin(value);
+    setInvite(null);
+  };
+  const createInvite = () => {
+    const viewVersion = inviteViewVersion.current;
+    void run(
+      "invite",
+      () => ownerRemoteApi.createInvite(),
+      (invitation) => {
+        if (
+          !activeRef.current ||
+          viewVersion !== inviteViewVersion.current ||
+          !status?.httpsOrigin
+        )
+          return;
+        if (
+          !/^[A-Za-z0-9_-]{22,256}$/.test(invitation.invitationSecret) ||
+          !Number.isFinite(invitation.expiresInSeconds) ||
+          invitation.expiresInSeconds <= 0 ||
+          invitation.expiresInSeconds > 60
+        ) {
+          throw new Error("invalid_invitation");
+        }
+        setInvite({
+          url: `${status.httpsOrigin}/remote/#invite=${invitation.invitationSecret}`,
+          expiresAt: Date.now() + invitation.expiresInSeconds * 1000,
+        });
+      },
+    );
+  };
+
+  return {
+    status,
+    origin,
+    pendingAction,
+    error,
+    invite,
+    secondsLeft,
+    busy,
+    originPinned,
+    normalizedOrigin,
+    enabled,
+    running,
+    needsStatusRetry,
+    statusUnavailable,
+    refreshStatus,
+    start,
+    stop,
+    changeOrigin,
+    createInvite,
+  };
+}
+
+interface OwnerRemoteSettingsProps {
+  controller: ReturnType<typeof useOwnerRemoteController>;
+}
+
+/** Local enrollment/setup only; deliberately no per-action approval controls. */
+export function OwnerRemoteSettings({ controller }: OwnerRemoteSettingsProps) {
+  const { t } = useTranslation();
+  const {
+    status,
+    origin,
+    pendingAction,
+    error,
+    invite,
+    secondsLeft,
+    busy,
+    originPinned,
+    normalizedOrigin,
+    enabled,
+    running,
+    needsStatusRetry,
+    statusUnavailable,
+    refreshStatus,
+    start,
+    stop,
+    changeOrigin,
+    createInvite,
+  } = controller;
+
+  return (
+    <section
+      className="rounded-lg border border-border p-4 space-y-3"
+      aria-busy={busy}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="space-y-1">
+          <h3 id="owner-remote-title" className="text-sm font-medium">
+            {t("settings.ownerRemote.title")}
+          </h3>
+          <p
+            id="owner-remote-description"
+            className="text-xs text-muted-foreground"
+          >
+            {t("settings.ownerRemote.description")}
+          </p>
+        </div>
+        <Switch
+          id="owner-remote-enabled"
+          aria-labelledby="owner-remote-title"
+          aria-describedby="owner-remote-description owner-remote-state"
+          checked={enabled}
+          disabled={
+            busy || (!enabled && (statusUnavailable || !normalizedOrigin))
+          }
+          onCheckedChange={(checked) => {
+            if (checked) {
+              start();
+            } else {
+              stop();
+            }
+          }}
+        />
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span id="owner-remote-state" className="text-xs" role="status">
+          {pendingAction === "status"
+            ? t("settings.ownerRemote.loading", {
+                defaultValue: "Checking remote access…",
+              })
+            : statusUnavailable
+              ? t("settings.ownerRemote.statusUnavailable", {
+                  defaultValue: "Status unavailable",
+                })
+              : t(
+                  running
+                    ? "settings.ownerRemote.running"
+                    : enabled
+                      ? "settings.ownerRemote.unavailable"
+                      : "settings.ownerRemote.off",
+                )}
+        </span>
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={busy}
+          onClick={() => void refreshStatus()}
+        >
+          {needsStatusRetry
+            ? t("settings.ownerRemote.retryStatus", {
+                defaultValue: "Retry status",
+              })
+            : t("settings.ownerRemote.refreshStatus", {
+                defaultValue: "Refresh status",
+              })}
+        </Button>
+      </div>
+      {!enabled && !normalizedOrigin ? (
+        <p className="text-xs text-muted-foreground">
+          {t("settings.ownerRemote.setupRequired", {
+            defaultValue:
+              "Set up a private HTTPS website below before turning on remote access.",
+          })}
+        </p>
+      ) : null}
+      <details className="space-y-3" open={!status?.httpsOrigin || enabled}>
+        <summary className="cursor-pointer text-sm">
+          {t("settings.ownerRemote.setup")}
+        </summary>
+        <div className="space-y-3 pt-2">
+          <p className="text-xs text-muted-foreground">
+            {t("settings.ownerRemote.privateNetwork")}
+          </p>
+          <pre className="overflow-auto rounded-md bg-muted p-2 text-xs">
+            tailscale serve --bg http://127.0.0.1:15723
+          </pre>
+          <div className="space-y-1">
+            <Label htmlFor="owner-remote-origin">
+              {t("settings.ownerRemote.origin")}
+            </Label>
+            <Input
+              id="owner-remote-origin"
+              type="url"
+              autoComplete="off"
+              spellCheck={false}
+              value={origin}
+              placeholder="https://your-machine.your-tailnet.ts.net"
+              disabled={busy}
+              readOnly={originPinned}
+              aria-describedby={
+                originPinned ? "owner-remote-origin-pinned" : undefined
+              }
+              onChange={(event) => changeOrigin(event.target.value)}
+            />
+          </div>
+          {originPinned ? (
+            <p
+              id="owner-remote-origin-pinned"
+              className="text-xs text-muted-foreground"
+            >
+              {t("settings.ownerRemote.originPinned", {
+                defaultValue:
+                  "This deployment is pinned to its HTTPS website. Changing it requires a separate explicit reset and browser re-enrollment; it cannot be changed here.",
+              })}
+            </p>
+          ) : null}
+          <p className="text-xs text-muted-foreground">
+            {t("settings.ownerRemote.security")}
+          </p>
+          {enabled && !statusUnavailable && !running ? (
+            <Button
+              size="sm"
+              disabled={busy || !normalizedOrigin}
+              onClick={start}
+            >
+              {t("settings.ownerRemote.retryListener", {
+                defaultValue: "Retry listener",
+              })}
+            </Button>
+          ) : null}
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={
+                busy || statusUnavailable || !running || !normalizedOrigin
+              }
+              onClick={createInvite}
+            >
+              {t("settings.ownerRemote.invite")}
+            </Button>
+          </div>
+          {invite ? (
+            <div className="space-y-2 rounded-md border border-border p-3">
+              <Label htmlFor="owner-remote-invite">
+                {t("settings.ownerRemote.inviteExpires", {
+                  seconds: secondsLeft,
+                })}
+              </Label>
+              <Input
+                id="owner-remote-invite"
+                readOnly
+                value={invite.url}
+                autoComplete="off"
+                spellCheck={false}
+                onFocus={(event) => event.currentTarget.select()}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t("settings.ownerRemote.inviteWarning")}
+              </p>
+            </div>
+          ) : null}
+          {running && status?.httpsOrigin ? (
+            <p className="break-all text-xs text-muted-foreground">
+              {t("settings.ownerRemote.consoleAddress")}: {status.httpsOrigin}
+              /remote/
+            </p>
+          ) : null}
+          <p className="text-xs text-muted-foreground">
+            {t("settings.ownerRemote.boundary")}
+          </p>
+        </div>
+      </details>
+      {error ? (
+        <p role="alert" className="text-xs text-destructive">
+          {t("settings.ownerRemote.error")}
+        </p>
+      ) : null}
+    </section>
+  );
+}

@@ -894,9 +894,9 @@ fn finalize_aggressive_recovery(
     }
 }
 
-/// Identify only the literal recovery command CCSM injects. Prompts that merely
-/// contain the word "continue", tool results, and mixed-media messages do not
-/// identify that command; request-turn bookkeeping is handled separately.
+/// Recognize only literal continue for conservative budget retention. Text is
+/// never proof of automatic/owner provenance or authorization. An unregistered
+/// manual continue is still a new user action and invalidates old view epochs.
 fn request_is_literal_continue(body: &Value) -> bool {
     // Tool results and assistant items can follow CCSM's injected user turn.
     // They are transport bookkeeping, so find the most recent actual user
@@ -928,7 +928,7 @@ fn request_is_literal_continue(body: &Value) -> bool {
 // Keep request-turn bookkeeping at the boundary where the original Desktop
 // input is still available, before any history enrichment or conversion.
 fn begin_recovery_request(thread_id: &str, body: &Value) {
-    let is_continuation = request_is_literal_continue(body);
+    let preserve_spent_budget = request_is_literal_continue(body);
     let has_user_input = match body.get("input") {
         Some(Value::String(text)) => !text.trim().is_empty(),
         Some(Value::Array(items)) => items
@@ -946,8 +946,10 @@ fn begin_recovery_request(thread_id: &str, body: &Value) {
     // tool step. Absence of a user message is not evidence of a new user turn:
     // preserve the existing attempt budget instead of granting fresh retries.
     // Unknown/empty input also cannot prove that the user started a new turn.
-    if is_continuation || has_user_input {
-        begin_turn(thread_id, is_continuation);
+    if has_user_input {
+        // Charge automatic transactions at durable native precommit, not when
+        // a potentially concurrent manual continue arrives at this boundary.
+        begin_turn(thread_id, preserve_spent_budget);
     }
 }
 
@@ -7512,10 +7514,10 @@ mod tests {
             },
         };
         let initial = Bytes::from_static(
-            b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_initial\",\"status\":\"in_progress\"}}\n\n",
         );
         let replay = Bytes::from_static(concat!(
-            "event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_replay\",\"status\":\"in_progress\"}}\n\n",
             "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n",
             "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
         ).as_bytes());
@@ -8514,6 +8516,52 @@ data: [DONE]\n\n";
                 "unexpected match: {body}"
             );
         }
+    }
+
+    #[test]
+    fn unregistered_manual_continue_invalidates_owner_view_without_claiming_owner_submission() {
+        use crate::proxy::codex_turn_recovery::{
+            capture_owner_continuation_epoch, finish_owner_continuation,
+            owner_continuation_epoch_is_current, owner_continuation_is_reserved,
+            reserve_owner_continuation, OwnerContinuationOutcome, OwnerContinuationReservation,
+            OwnerContinuationStatus,
+        };
+        let thread_id = format!("manual-continue-epoch-{}", uuid::Uuid::new_v4());
+        let epoch = capture_owner_continuation_epoch(&thread_id).unwrap();
+        let OwnerContinuationReservation::Reserved(operation) =
+            reserve_owner_continuation(&epoch, "viewed-base", "owner-operation").unwrap()
+        else {
+            panic!("first exact owner view must reserve");
+        };
+        super::begin_recovery_request(
+            &thread_id,
+            &json!({"input": [{"role": "user", "content": "continue"}]}),
+        );
+        assert!(!owner_continuation_epoch_is_current(&epoch));
+        assert!(!owner_continuation_is_reserved(&operation));
+        let receipt = finish_owner_continuation(&operation, OwnerContinuationOutcome::Uncertain);
+        assert_eq!(receipt.status, OwnerContinuationStatus::Refused);
+        assert!(!receipt.submitted);
+        assert!(
+            !receipt.mutation_attempted,
+            "literal text cannot manufacture an owner commit"
+        );
+    }
+
+    #[test]
+    fn tool_only_bookkeeping_does_not_manufacture_a_new_user_action_epoch() {
+        use crate::proxy::codex_turn_recovery::{
+            capture_owner_continuation_epoch, owner_continuation_epoch_is_current,
+        };
+        let thread_id = format!("tool-only-epoch-{}", uuid::Uuid::new_v4());
+        let epoch = capture_owner_continuation_epoch(&thread_id).unwrap();
+        super::begin_recovery_request(
+            &thread_id,
+            &json!({"previous_response_id": "response-id", "input": [{"type": "function_call_output", "call_id": "call-id", "output": "done"}]}),
+        );
+        assert!(owner_continuation_epoch_is_current(&epoch));
+        // A subsequent track_turn marks the new transport request active; this
+        // boundary alone must not reset logical recovery as if it were a user.
     }
 
     fn final_recovery_context(label: &str) -> super::TurnRecoveryContext {

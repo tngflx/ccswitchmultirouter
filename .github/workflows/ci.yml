@@ -145,21 +145,22 @@ jobs:
         with:
           node-version-file: .node-version
 
-      - name: Require PowerShell 7 and Git
+      - name: Verify repository script policy
         if: needs.scope.outputs.scope != 'docs'
-        shell: pwsh
+        run: node scripts/no-powershell-scripts.mjs
+
+      - name: Require Node.js and Git
+        if: needs.scope.outputs.scope != 'docs'
+        shell: bash
         run: |
-          if ($PSVersionTable.PSEdition -ne "Core" -or $PSVersionTable.PSVersion.Major -lt 7) {
-            throw "PowerShell 7 is required for Git remote safety regression checks."
-          }
-          Get-Command pwsh -ErrorAction Stop | Out-Null
-          Get-Command git -ErrorAction Stop | Out-Null
-          $PSVersionTable.PSVersion.ToString()
+          command -v node
+          command -v git
+          node --version
           git --version
-          if ($LASTEXITCODE -ne 0) { throw "Git must be available for remote safety regression checks." }
 
       - name: Git remote safety regression checks
         if: needs.scope.outputs.scope != 'docs'
+        shell: bash
         run: node --test scripts/git-remote-safety.node-test.mjs scripts/check-upstream-updates.node-test.mjs
 
   rustfmt:

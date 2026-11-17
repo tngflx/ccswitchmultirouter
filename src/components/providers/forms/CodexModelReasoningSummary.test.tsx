@@ -4,6 +4,79 @@ import { describe, expect, it, vi } from "vitest";
 import { CodexModelReasoningSummary } from "./CodexModelReasoningSummary";
 
 describe("CodexModelReasoningSummary", () => {
+  it.each(["xiaomi/mimo-v2.6-flash", "xiaomi/mimo-v2.6-pro"])(
+    "labels known Boolean %s as thinking on/off instead of undeclared effort",
+    (model) => {
+      render(
+        <CodexModelReasoningSummary
+          model={model}
+          source="detection"
+          supportKind="boolean_only"
+          selectableEfforts={[]}
+          defaultEffort="medium"
+          ultraEnabled={false}
+          ultraEfforts={[]}
+          onUltraChange={vi.fn()}
+          expanded={false}
+          onToggle={vi.fn()}
+        />,
+      );
+
+      expect(
+        screen.getByText("Reasoning control: Thinking on/off"),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/Not declared/)).toBeNull();
+      expect(screen.queryByText(/Default: medium/)).toBeNull();
+      expect(screen.queryByText(/Codex levels:/)).toBeNull();
+      expect(
+        screen.getByText("Capability source: Automatic detection"),
+      ).toBeInTheDocument();
+    },
+  );
+
+  it("keeps unknown capability distinct from known Boolean reasoning", () => {
+    render(
+      <CodexModelReasoningSummary
+        model="unknown-model"
+        source="automatic"
+        supportKind="unknown"
+        selectableEfforts={[]}
+        ultraEnabled={false}
+        ultraEfforts={[]}
+        onUltraChange={vi.fn()}
+        expanded={false}
+        onToggle={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Codex levels: Not declared")).toBeInTheDocument();
+    expect(screen.getByText("Default: Model default")).toBeInTheDocument();
+    expect(screen.queryByText(/Thinking on\/off/)).toBeNull();
+  });
+
+  it("preserves explicit graded levels and their provider default", () => {
+    render(
+      <CodexModelReasoningSummary
+        model="graded-model"
+        source="library"
+        supportKind="effort_levels"
+        selectableEfforts={["low", "high", "max"]}
+        defaultEffort="high"
+        ultraEnabled={false}
+        ultraEfforts={["low", "high", "max"]}
+        onUltraChange={vi.fn()}
+        expanded={false}
+        onToggle={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText("Codex levels: low / high / max"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Default: high")).toBeInTheDocument();
+    expect(screen.queryByText(/Thinking on\/off/)).toBeNull();
+  });
+
   it("keeps each model concise until the user opens its configuration", () => {
     const onToggle = vi.fn();
     const onUltraChange = vi.fn();

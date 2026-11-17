@@ -1,7 +1,62 @@
 import { describe, expect, it } from "vitest";
-import { applyCodexCatalogModelOrder } from "@/lib/codexModelCatalogOrder";
+import {
+  applyCodexCatalogModelOrder,
+  groupCodexCatalogModelsByProvider,
+} from "@/lib/codexModelCatalogOrder";
 
 describe("applyCodexCatalogModelOrder", () => {
+  it("keeps route-owned provider blocks contiguous when saved ranks interleave and inventory grows", () => {
+    const models = [
+      { model: "a1", targetProviderId: "alpha", providerName: "Alpha" },
+      { model: "a2", targetProviderId: "alpha", providerName: "Alpha" },
+      { model: "a-new", targetProviderId: "alpha", providerName: "Alpha" },
+      { model: "b1", targetProviderId: "beta", providerName: "Beta" },
+      { model: "b2", targetProviderId: "beta", providerName: "Beta" },
+      { model: "b-new", targetProviderId: "beta", providerName: "Beta" },
+    ];
+    expect(
+      applyCodexCatalogModelOrder(models, [
+        "b2",
+        "a2",
+        "b1",
+        "a1",
+        "removed",
+      ]).map((row) => row.model),
+    ).toEqual(["a2", "a1", "a-new", "b2", "b1", "b-new"]);
+  });
+
+  it("groups repeated routes by provider ID without merging providers sharing a display name", () => {
+    const models = [
+      { model: "a1", targetProviderId: "alpha", providerName: "Same name" },
+      { model: "b1", targetProviderId: "beta", providerName: "Same name" },
+      { model: "a2", targetProviderId: "alpha", providerName: "Renamed Alpha" },
+    ];
+    expect(
+      applyCodexCatalogModelOrder(models, []).map((row) => row.model),
+    ).toEqual(["a1", "a2", "b1"]);
+  });
+
+  it("normalizes an arbitrary UI reorder against canonical route-owned provider order", () => {
+    const reference = [
+      { model: "a1", targetProviderId: "alpha" },
+      { model: "a2", targetProviderId: "alpha" },
+      { model: "b1", targetProviderId: "beta" },
+      { model: "b2", targetProviderId: "beta" },
+    ];
+    const reordered = [reference[3], reference[1], reference[2], reference[0]];
+    expect(
+      groupCodexCatalogModelsByProvider(reordered, reference).map(
+        (row) => row.model,
+      ),
+    ).toEqual(["a2", "a1", "b2", "b1"]);
+    expect(
+      applyCodexCatalogModelOrder(reordered, [], reference).map(
+        (row) => row.model,
+      ),
+    ).toEqual(["a2", "a1", "b2", "b1"]);
+    expect(reordered.map((row) => row.model)).toEqual(["b2", "a2", "b1", "a1"]);
+  });
+
   it("preserves router ordering and compresses deleted ranks", () => {
     const previous = ["e", "c", "a", "d", "b"];
     // 删除某个供应商后重建结果只剩它以外的模型，且顺序来自 route 迭代。
@@ -91,7 +146,7 @@ describe("applyCodexCatalogModelOrder", () => {
     expect(applyCodexCatalogModelOrder(models, ["wire"])).toEqual(models);
   });
 
-  it("recovers old provider suffixes without conflating providers", () => {
+  it("recovers old provider suffixes without moving their provider block", () => {
     expect(
       applyCodexCatalogModelOrder(
         [
@@ -104,6 +159,6 @@ describe("applyCodexCatalogModelOrder", () => {
         ],
         ["WIRE-SECOND-SOURCE"],
       ).map((model) => model.model),
-    ).toEqual(["two", "one"]);
+    ).toEqual(["one", "two"]);
   });
 });

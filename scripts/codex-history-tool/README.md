@@ -69,3 +69,13 @@ Useful overrides:
 - `--state-db <path>`: force a specific state SQLite file for `list`/`repair`. Without an explicit path, the tool follows `sqlite_home` from `config.toml` or `CODEX_SQLITE_HOME`, then prefers the current root `~/.codex/state_5.sqlite`, and only falls back to the legacy `~/.codex/sqlite/state_5.sqlite`. `reconcile` scans all discovered `state_*.sqlite` files under every known location.
 - `--target-provider <id>`: default is the live `config.toml` provider, falling back to `codex_model_router_v2`.
 - `--max-per-project 10 --max-total 300`: balanced recent-window caps.
+
+## Validation and Packaging
+
+The supported entry point is the Python tool itself; the normal repository check is:
+
+```powershell
+pnpm history:tool:check
+```
+
+Release export includes `codex_history_tool.py`. A standalone Windows executable builder is not part of the active lifecycle, so use the Python entry point directly rather than relying on an extra packaging wrapper.

@@ -88,7 +88,12 @@ const createScope = (
 });
 const createHarness = (
   root: Record<string, unknown> | undefined,
-  options: { state?: State; realProjection?: boolean; module?: object } = {},
+  options: {
+    state?: State;
+    realProjection?: boolean;
+    module?: object;
+    yieldDiscovery?: () => Promise<void>;
+  } = {},
 ) => {
   const state: State = {
     payload: {
@@ -155,7 +160,7 @@ const createHarness = (
     patchRequest,
     recordFailure,
     () => 0,
-    async () => {},
+    options.yieldDiscovery ?? (async () => {}),
     () => true,
     async (name: string) =>
       name === "app-shared-" ? (options.module ?? {}) : {},
@@ -349,6 +354,41 @@ describe("Codex Desktop scope ownership and production heartbeat", () => {
     }
   });
 
+  it("completes the bounded scope scan for a renderer tree just above the former limit", async () => {
+    const client = new QueryClient();
+    const scope = createScope(() => client);
+    const root: Record<string, unknown> = { dependencies: { scope } };
+    let fiber = root;
+    for (let depth = 0; depth < 26_001; depth += 1) {
+      fiber.child = {};
+      fiber = fiber.child as Record<string, unknown>;
+    }
+    fiber.dependencies = { scope };
+    const harness = createHarness(root, {
+      state: {
+        scopedAppServerScopeCandidates: new Set(),
+        scopedAppServerScopeScanComplete: false,
+      },
+    });
+    try {
+      await harness.api.patchCodexScopedAppServerClients({});
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(true);
+      expect(harness.state.scopedAppServerScopeScan).toMatchObject({
+        status: "complete",
+        visitedFiberCount: 26_002,
+        fiberLimit: 30000,
+        scopeCount: 1,
+      });
+      expect(harness.state.scopedAppServerScopeCandidates).toEqual(
+        new Set([scope]),
+      );
+      expect(harness.recordFailure).not.toHaveBeenCalled();
+    } finally {
+      harness.dispose();
+      client.clear();
+    }
+  });
+
   it("keeps 691 lightweight alias owners while patching one cache per heartbeat", async () => {
     const client = new QueryClient();
     const reads = Array.from({ length: 691 }, () => vi.fn(() => client));
@@ -459,6 +499,57 @@ describe("Codex Desktop scope ownership and production heartbeat", () => {
     }
   });
 
+  it("keeps restoration caches but not complete ownership after a scan is invalidated", async () => {
+    const oldClient = new QueryClient();
+    const newClient = new QueryClient();
+    const oldScope = createScope(() => oldClient);
+    const newScope = createScope(() => newClient);
+    const root: Record<string, unknown> = { dependencies: { scope: newScope } };
+    let child = root;
+    for (let index = 0; index < 150; index += 1) {
+      const next = {};
+      child.child = next;
+      child = next;
+    }
+    let invalidate = true;
+    const state: State = {
+      scopedAppServerScopeCandidates: new Set([oldScope]),
+      reasoningQueryCaches: new Map([[oldClient.getQueryCache(), {}]]),
+      reactMutationGeneration: 0,
+    };
+    const harness = createHarness(root, {
+      state,
+      yieldDiscovery: async () => {
+        if (invalidate) {
+          harness.state.reactMutationGeneration = 1;
+          invalidate = false;
+        }
+      },
+    });
+    try {
+      await harness.api.patchCodexScopedAppServerClients({});
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(false);
+      expect(harness.state.scopedAppServerScopeCandidates).toEqual(
+        new Set([oldScope, newScope]),
+      );
+      await harness.api.patchCodexScopedAppServerClients({});
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(true);
+      expect(harness.state.scopedAppServerScopeCandidates).toEqual(
+        new Set([newScope]),
+      );
+      expect(
+        harness.state.reasoningQueryCaches?.has(oldClient.getQueryCache()),
+      ).toBe(true);
+      expect(
+        harness.state.reasoningQueryCaches?.has(newClient.getQueryCache()),
+      ).toBe(true);
+    } finally {
+      harness.dispose();
+      oldClient.clear();
+      newClient.clear();
+    }
+  });
+
   it("preserves lightweight scope owners while renderer roots are unavailable", async () => {
     const client = new QueryClient();
     const scope = createScope(() => client);
@@ -471,6 +562,12 @@ describe("Codex Desktop scope ownership and production heartbeat", () => {
         new Set([scope]),
       );
       expect(harness.state.scopedAppServerScopes).toEqual(new Set([scope]));
+      expect(harness.state.scopedAppServerScopeScan).toMatchObject({
+        status: "root_unavailable",
+        visitedFiberCount: 0,
+        fiberLimit: 30000,
+        scopeCount: 1,
+      });
       expect(harness.patchCache).toHaveBeenCalledTimes(1);
     } finally {
       harness.dispose();
@@ -485,7 +582,7 @@ describe("Codex Desktop scope ownership and production heartbeat", () => {
     const visible = createScope(() => second);
     const root: Record<string, unknown> = { dependencies: { scope: visible } };
     let fiber = root;
-    for (let depth = 0; depth < 25_001; depth += 1) {
+    for (let depth = 0; depth < 30_001; depth += 1) {
       fiber.child = {};
       fiber = fiber.child as Record<string, unknown>;
     }
@@ -498,6 +595,12 @@ describe("Codex Desktop scope ownership and production heartbeat", () => {
       expect(harness.state.scopedAppServerScopeCandidates).toEqual(
         new Set([unseen, visible]),
       );
+      expect(harness.state.scopedAppServerScopeScan).toMatchObject({
+        status: "capped",
+        visitedFiberCount: 30000,
+        fiberLimit: 30000,
+        scopeCount: 2,
+      });
       expect(harness.patchCache).toHaveBeenCalledTimes(2);
       expect(harness.recordFailure).not.toHaveBeenCalled();
     } finally {

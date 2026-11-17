@@ -20,6 +20,7 @@ pub struct CodexRoutingParseError {
 
 impl CodexRoutingDocument {
     pub fn parse(value: &Value) -> Result<Self, CodexRoutingParseError> {
+        validate_subagent_reasoning_effort(value.get("subagentReasoningEffort"))?;
         let schema_version = value.get("schemaVersion").and_then(Value::as_u64);
         match schema_version {
             None | Some(1) => Ok(Self::Legacy(value.clone())),
@@ -40,6 +41,28 @@ impl CodexRoutingDocument {
             }
         }
     }
+}
+
+/// Both routing schemas share the same reversible Sub-Agent effort contract.
+/// An explicit invalid value must never silently become profile/default mode.
+pub(crate) fn validate_subagent_reasoning_effort(
+    value: Option<&Value>,
+) -> Result<(), CodexRoutingParseError> {
+    if value.is_none()
+        || value.and_then(Value::as_str).is_some_and(|effort| {
+            effort == "profile"
+                || effort
+                    .parse::<crate::proxy::providers::codex_reasoning::CodexReasoningEffort>()
+                    .is_ok()
+        })
+    {
+        return Ok(());
+    }
+    Err(CodexRoutingParseError {
+        code: "invalid_subagent_reasoning_effort".to_string(),
+        message: "subagentReasoningEffort must be profile or a canonical reasoning effort"
+            .to_string(),
+    })
 }
 
 /// schema v2 routes only reference a Provider and selection policy. These v1
@@ -202,6 +225,11 @@ pub fn validate_v2(
     providers: &HashMap<String, Provider>,
 ) -> Result<(), Vec<CodexRoutingValidationIssue>> {
     let mut issues = Vec::new();
+    if let Err(error) =
+        validate_subagent_reasoning_effort(plan.extensions.get("subagentReasoningEffort"))
+    {
+        push_issue(&mut issues, &error.code, None, &error.message);
+    }
     let mut route_ids = HashSet::new();
     for route in &plan.routes {
         let route_id = route.id.trim();
@@ -379,6 +407,65 @@ mod tests {
             "aliases": {"qwen-fast": "qwen3.8"},
             "authPolicy": {"source": "provider_config"}
         })
+    }
+
+    #[test]
+    fn subagent_reasoning_effort_parsing_rejects_invalid_legacy_and_v2_values() {
+        for schema_version in [None, Some(2)] {
+            let mut base = json!({"enabled": true, "routes": []});
+            if let Some(schema_version) = schema_version {
+                base["schemaVersion"] = json!(schema_version);
+            }
+            assert!(CodexRoutingDocument::parse(&base).is_ok());
+            for effort in [
+                "profile", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+            ] {
+                let mut value = base.clone();
+                value["subagentReasoningEffort"] = json!(effort);
+                assert!(CodexRoutingDocument::parse(&value).is_ok());
+            }
+            for effort in [
+                json!("extra-high"),
+                json!("HIGH"),
+                Value::Null,
+                json!(true),
+                json!(7),
+                json!({}),
+                json!([]),
+            ] {
+                let mut value = base.clone();
+                value["subagentReasoningEffort"] = effort;
+                let error = CodexRoutingDocument::parse(&value).expect_err(
+                    "an invalid override must not silently disable the Sub-Agent policy",
+                );
+                assert_eq!(error.code, "invalid_subagent_reasoning_effort");
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_reasoning_effort_validation_rejects_invalid_constructed_plans() {
+        let mut plan: CodexRoutingConfigV2 = serde_json::from_value(json!({
+            "schemaVersion": 2, "enabled": true, "routes": []
+        }))
+        .expect("empty v2 plan");
+        assert!(validate_v2(&plan, &HashMap::new()).is_ok());
+        for effort in [
+            "profile", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ] {
+            plan.extensions
+                .insert("subagentReasoningEffort".into(), json!(effort));
+            assert!(validate_v2(&plan, &HashMap::new()).is_ok());
+        }
+        for effort in [json!("extra-high"), Value::Null, json!(false), json!({})] {
+            plan.extensions
+                .insert("subagentReasoningEffort".into(), effort);
+            let issues = validate_v2(&plan, &HashMap::new())
+                .expect_err("constructed plans must share the persisted policy validation");
+            assert!(issues
+                .iter()
+                .any(|issue| issue.code == "invalid_subagent_reasoning_effort"));
+        }
     }
 
     #[test]

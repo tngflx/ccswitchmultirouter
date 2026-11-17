@@ -1,0 +1,51 @@
+{
+  "verified": false,
+  "scenario": "overload",
+  "desktopCdpVerified": false,
+  "stage": "picker_inspection",
+  "failure": "picker_inspection_unavailable",
+  "initialRequests": 0,
+  "continuedRequests": 0,
+  "pickerInspectionPerformed": false,
+  "renderedMenuVerified": false,
+  "pickerTargetInspections": {
+    "scope": "pinned_native_verified_endpoint",
+    "host": "127.0.0.1",
+    "port": 9229,
+    "renderedMenuVerified": false,
+    "targetLimit": 8,
+    "eligibleTargetCount": 1,
+    "uniqueTargetCount": 1,
+    "duplicateTargetCount": 0,
+    "attemptedTargetCount": 0,
+    "inspectedTargetCount": 0,
+    "unavailableTargetCount": 1,
+    "truncated": false,
+    "complete": false,
+    "selectedTargetId": null,
+    "selectedTargetRef": null,
+    "targets": [
+      {
+        "targetId": "98c3765d1a69d27f8dcdc9e85acdf533",
+        "targetRef": "sha256-194ae5edaf2b08bca785f1613ce6c2e9eed20e27fb7f18e5dac50cb7c1d1aa16",
+        "status": "unavailable",
+        "failure": "picker_target_unavailable"
+      }
+    ],
+    "sampling": {
+      "scope": "same_pinned_target_session",
+      "requestedSampleCount": 3,
+      "intervalMs": 1000,
+      "complete": false,
+      "ownershipVerified": false,
+      "renderedMenuVerified": false,
+      "targetId": null,
+      "targetRef": null,
+      "samples": [],
+      "failure": "picker_target_unavailable"
+    }
+  },
+  "temporaryDurableTestThread": false,
+  "existingThreadsTouched": false,
+  "verifiedAtUtc": "2026-11-16T08:39:31.009Z"
+}

@@ -500,14 +500,18 @@ impl AnthropicToResponsesState {
     }
 
     fn failed_event(&mut self, message: String, error_type: Option<String>) -> Option<Bytes> {
-        if self.completed {
-            return None;
-        }
-        self.completed = true;
         let mut error = json!({ "message": message });
         if let Some(error_type) = error_type.filter(|value| !value.is_empty()) {
             error["type"] = json!(error_type);
         }
+        self.failed_error_event(error)
+    }
+
+    fn failed_error_event(&mut self, error: Value) -> Option<Bytes> {
+        if self.completed {
+            return None;
+        }
+        self.completed = true;
         let mut output = self.output_items.clone();
         output.sort_by_key(|(output_index, _)| *output_index);
         let output: Vec<Value> = output.into_iter().map(|(_, item)| item).collect();
@@ -517,7 +521,7 @@ impl AnthropicToResponsesState {
     }
 }
 
-fn extract_anthropic_sse_error(value: &Value) -> (String, Option<String>) {
+fn extract_anthropic_sse_error(value: &Value) -> Value {
     let error = value.get("error").unwrap_or(value);
     let message = error
         .as_str()
@@ -533,7 +537,24 @@ fn extract_anthropic_sse_error(value: &Value) -> (String, Option<String>) {
         .get("type")
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
-    (message, error_type)
+    let mut converted = json!({ "message": message });
+    if let Some(error_type) = error_type.filter(|value| !value.is_empty()) {
+        converted["type"] = json!(error_type);
+    }
+    if let Some(code) = error
+        .get("code")
+        .or_else(|| value.get("code"))
+        .and_then(Value::as_str)
+        .filter(|code| !code.is_empty())
+    {
+        converted["code"] = json!(code);
+    }
+    // Preserve canonical retry metadata through SSE and JSON conversion. A
+    // refusal wins over true, and arbitrary provider metadata is not copied.
+    if let Some(retryable) = super::codex_terminal::explicit_retry_decision(value) {
+        converted["retryable"] = json!(retryable);
+    }
+    converted
 }
 
 fn process_anthropic_sse_block(
@@ -577,10 +598,9 @@ fn process_anthropic_sse_block(
         "message_delta" => state.handle_message_delta(&data),
         "message_stop" => state.finalize(),
         "error" => {
-            let (message, error_type) = extract_anthropic_sse_error(&data);
             return (
                 state
-                    .failed_event(message, error_type)
+                    .failed_error_event(extract_anthropic_sse_error(&data))
                     .into_iter()
                     .collect(),
                 true,
@@ -620,9 +640,8 @@ pub(crate) fn responses_sse_events_from_anthropic_message(
     }
 
     if body.get("type").and_then(Value::as_str) == Some("error") || body.get("error").is_some() {
-        let (message, error_type) = extract_anthropic_sse_error(body);
         return state
-            .failed_event(message, error_type)
+            .failed_error_event(extract_anthropic_sse_error(body))
             .into_iter()
             .collect();
     }
@@ -847,6 +866,55 @@ mod tests {
         assert!(merged.contains("authentication_error"));
         assert!(merged.contains("bad key"));
         assert!(!merged.contains("stream_truncated"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_sse_and_json_explicit_no_retry_preserve_denial_metadata() {
+        for (nested_retryable, root_retryable, response_retryable) in [
+            (Some(false), None, None),
+            (None, Some(false), None),
+            (Some(true), Some(false), None),
+            (Some(false), Some(true), None),
+            (None, None, Some(false)),
+            (Some(true), Some(true), Some(false)),
+        ] {
+            let mut payload = json!({"type": "error", "error": {
+                "type": "overloaded_error",
+                "code": "provider_capacity_rejected",
+                "message": "Model is at capacity. Please retry later.",
+                "metadata": {"private_detail": "must-not-be-copied"}
+            }});
+            if let Some(retryable) = nested_retryable {
+                payload["error"]["retryable"] = json!(retryable);
+            }
+            if let Some(retryable) = root_retryable {
+                payload["retryable"] = json!(retryable);
+            }
+            if let Some(retryable) = response_retryable {
+                payload["response"] = json!({"error": {"retryable": retryable}});
+            }
+            let input = format!("event: error\ndata: {payload}\n\n");
+            for output in [
+                run(&input).await,
+                run(&payload.to_string()).await,
+                render_message_events(&payload),
+            ] {
+                let failed: Value = output
+                    .split("\n\n")
+                    .find(|block| block.starts_with("event: response.failed\n"))
+                    .and_then(|block| block.split_once("data: "))
+                    .map(|(_, data)| serde_json::from_str(data).unwrap())
+                    .expect("upstream error must fail the response");
+                assert_eq!(failed["response"]["error"]["retryable"], false);
+                assert_eq!(failed["response"]["error"]["type"], "overloaded_error");
+                assert_eq!(
+                    failed["response"]["error"]["code"],
+                    "provider_capacity_rejected"
+                );
+                assert!(!output.contains("must-not-be-copied"));
+                assert!(!output.contains("event: response.completed"));
+            }
+        }
     }
 
     #[test]

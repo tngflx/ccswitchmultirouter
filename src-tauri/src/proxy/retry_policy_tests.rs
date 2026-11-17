@@ -216,3 +216,89 @@ async fn capacity_api_retries_concurrent_limit_then_recovers_after_five_minutes(
         "explicit concurrent-limit responses use the five-minute initial tier"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn generic_gateway_503_is_not_replayed_by_capacity_policy() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_send = attempts.clone();
+
+    let result = send_codex_request_with_rate_limit_retry(
+        "retry-policy-test",
+        true,
+        safe_test_codex_traffic_policy(),
+        move || {
+            let attempts = attempts_for_send.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(ProxyResponse::buffered(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    HeaderMap::new(),
+                    Bytes::from_static(b"Service temporarily unavailable"),
+                ))
+            }
+        },
+    )
+    .await
+    .expect("generic gateway failure should be returned");
+
+    assert_eq!(result.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn bodyless_gateway_502_is_not_replayed_by_capacity_policy() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_send = attempts.clone();
+
+    let result = send_codex_request_with_rate_limit_retry(
+        "retry-policy-test",
+        true,
+        safe_test_codex_traffic_policy(),
+        move || {
+            let attempts = attempts_for_send.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(ProxyResponse::buffered(
+                    StatusCode::BAD_GATEWAY,
+                    HeaderMap::new(),
+                    Bytes::new(),
+                ))
+            }
+        },
+    )
+    .await
+    .expect("bodyless gateway failure should be returned");
+
+    assert_eq!(result.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn gateway_authentication_failure_is_not_replayed_by_capacity_policy() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_send = attempts.clone();
+
+    let result = send_codex_request_with_rate_limit_retry(
+        "retry-policy-test",
+        true,
+        safe_test_codex_traffic_policy(),
+        move || {
+            let attempts = attempts_for_send.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(ProxyResponse::buffered(
+                    StatusCode::BAD_GATEWAY,
+                    HeaderMap::new(),
+                    Bytes::from_static(
+                        b"Upstream authentication failed, please contact administrator",
+                    ),
+                ))
+            }
+        },
+    )
+    .await
+    .expect("authentication failure should be returned");
+
+    assert_eq!(result.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}

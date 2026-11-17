@@ -7,6 +7,8 @@
   // the new code resolves their current mounted scope before rebinding.
   const previousAppServerStatusAtoms = state.appServerStatusAtoms || [];
   const previousAppServerStatusBindings = state.appServerStatusBindings || [];
+  // DOM controls and event closures belong to this exact installation.
+  state.nativeBooleanReasoningRestore?.();
   /*__CCSWITCH_CATALOG_PAYLOAD_SELECTION_CORE__*/
   const previousPayload = state.payload;
   /*__CCSWITCH_MODEL_PICKER_RELEASE_CORE__*/
@@ -25,8 +27,29 @@
   const installationIsCurrent = () =>
     state.runtimeGeneration === installationGeneration;
   state.runPromise = null;
+  // Numeric discovery belongs to this installation generation too. A pending
+  // import from a previous (even same-fingerprint) injection cannot own or
+  // clear the replacement job after it eventually settles.
+  state.webpackPickerDiscoveryPromise = null;
+  state.webpackPickerDiscoveryRetryAt = 0;
   state.reactDiscoveryPromise = null;
   state.scopedAppServerDiscoveryPromise = null;
+  // Root-observer callbacks capture this installation generation too. Rebind
+  // even for an unchanged fingerprint; retaining the old observer would leave
+  // a truthy but permanently inert callback after installationIsCurrent fails.
+  try {
+    const pendingMutations = state.reactRootObserver?.takeRecords?.();
+    if (pendingMutations?.length) {
+      state.reactMutationGeneration = (state.reactMutationGeneration || 0) + 1;
+      state.scopedAppServerScopeScanComplete = false;
+    }
+  } catch {
+    state.scopedAppServerScopeScanComplete = false;
+  }
+  try {
+    state.reactRootObserver?.disconnect();
+  } catch {}
+  state.reactRootObserver = null;
   if (state.interval) clearInterval(state.interval);
   state.interval = null;
   state.catalogReleased = incomingPayload?.catalogReleased === true;
@@ -84,6 +107,8 @@
     state.requestIds = new Map();
     state.modelListRequestScopes = new Map();
     state.appServerModuleRetryAt = 0;
+    state.nativeReasoningScopeRetryAt = 0;
+    state.webpackPickerNamespaces = new Map();
     // Semantic module URLs can resolve to different renderer chunks after a
     // reinjection/navigation. Drop in-flight and fulfilled discovery promises
     // so the new fingerprint cannot reuse a stale module namespace or scope.
@@ -105,6 +130,7 @@
       state.nativeReasoningVisibilityRequired === true;
     state.nativeReasoningVisibilityAtoms = [];
     state.pendingReactNodes = new Set();
+    state.reactMutationGeneration = 0;
     state.lastReactFullScanAt = 0;
     state.lastReactIncrementalScanAt = 0;
     state.reactInitialDiscoveryCompleted = false;
@@ -122,8 +148,10 @@
     state.requestIds instanceof Map ? state.requestIds : new Map();
   state.modelListRequestScopes = state.modelListRequestScopes || new Map();
   state.modulePromises = state.modulePromises || new Map();
+  state.webpackPickerNamespaces = state.webpackPickerNamespaces || new Map();
   state.failures = state.failures || [];
   state.pendingReactNodes = state.pendingReactNodes || new Set();
+  state.reactMutationGeneration = state.reactMutationGeneration || 0;
   state.historyManagerCandidates = state.historyManagerCandidates || new Set();
   const recordFailure = (error) => {
     const message = String(error?.message || error);
@@ -132,6 +160,7 @@
   };
   window[patchKey] = state;
   /*__CCSWITCH_MODEL_PATCH_CORE__*/
+  /*__CCSWITCH_NATIVE_BOOLEAN_REASONING_CORE__*/
   for (const cache of reasoningQueryCachesToRebind) {
     try {
       patchCodexModelReasoningQueryCache(cache);
@@ -153,7 +182,13 @@
   const mountedPreviousScopes = previousAppServerStatusAtoms.length
     ? codexCurrentAppServerScopeHints()
     : [];
-  state.scopedAppServerScopeCandidates = new Set(mountedPreviousScopes);
+  // Canonical RPC brands are only a warm subset, never a replacement for
+  // a complete current picker-owner inventory on same-fingerprint injection.
+  // An old or incomplete snapshot must instead be proved by a fresh tree scan.
+  if (!codexRendererScopeSnapshotIsCurrent()) {
+    state.scopedAppServerScopeScanComplete = false;
+    state.scopedAppServerScopeCandidates = new Set(mountedPreviousScopes);
+  }
   state.scopedAppServerSeedRefreshPending = mountedPreviousScopes.length > 0;
   /*__CCSWITCH_WEBPACK_DISCOVERY_CORE__*/
   /*__CCSWITCH_NATIVE_REASONING_VISIBILITY_CORE__*/
@@ -162,6 +197,7 @@
   /*__CCSWITCH_REQUEST_HEALTH_WARNING_CORE__*/
   /*__CCSWITCH_SUMMARY_HANDOFF_CORE__*/
   /*__CCSWITCH_CODEX_CONTINUATION_CORE__*/
+  /*__CCSWITCH_OWNER_REMOTE_VIEW_CORE__*/
   const patchStatsigConfig = (name, config, repairLegacyPollution = false) => {
     const prepared = prepareStatsigDynamicConfig(
       name,
@@ -352,21 +388,38 @@
       state.nativeReasoningVisibilityRequired === true || entryUrls.length > 0;
     state.nativeReasoningVisibilityAtoms = [];
     const namespaces = [];
+    // Keep exact, previously imported namespaces as read-only inspection roots.
+    // Re-awaiting a fulfilled ESM import used to publish an empty atom list on
+    // every routine scan, allowing a concurrent guardian probe to see a false
+    // Unverified transition. Cached entries can be inspected synchronously;
+    // new/failed entries still clear proof until their fresh scan completes.
+    const initializedNamespaces = state.webpackPickerNamespaces;
+    for (const url of initializedNamespaces.keys()) {
+      if (!entryUrls.includes(url)) initializedNamespaces.delete(url);
+    }
     for (const url of entryUrls) {
       if (!installationIsCurrent()) return [];
       const key = `webpack-entry:${url}`;
-      if (!state.modulePromises.has(key)) {
-        state.modulePromises.set(
-          key,
-          import(url).catch((error) => {
-            state.modulePromises.delete(key);
-            throw error;
-          }),
-        );
+      const modulePromises = state.modulePromises;
+      if (!modulePromises.has(key)) {
+        const promise = import(url).catch((error) => {
+          // Reinjection can replace the promise map or this exact entry. A
+          // failed old import must not evict a successor installation's job.
+          if (modulePromises.get(key) === promise) modulePromises.delete(key);
+          throw error;
+        });
+        modulePromises.set(key, promise);
       }
       try {
-        namespaces.push(await state.modulePromises.get(key));
+        let namespace = initializedNamespaces.get(url);
+        if (!namespace) {
+          namespace = await modulePromises.get(key);
+          if (!installationIsCurrent()) return [];
+          initializedNamespaces.set(url, namespace);
+        }
+        namespaces.push(namespace);
       } catch (error) {
+        if (!installationIsCurrent()) return [];
         recordFailure(error);
       }
     }
@@ -827,14 +880,53 @@
         state.historyLineageHydrationPromise = null;
       });
   };
-  const yieldReactDiscovery = () =>
-    new Promise((resolve) => {
+  // Discovery already has a 4ms/100-Fiber work budget. Wait for another
+  // public task, not an idle window: recurring unrelated React commits can
+  // otherwise invalidate a large inventory before its idle slices complete.
+  const yieldReactDiscovery = async () => {
+    const scheduler = globalThis.scheduler;
+    if (typeof scheduler?.yield === "function") {
+      try {
+        await scheduler.yield();
+        return;
+      } catch {
+        // A denied/unavailable scheduler must not strand an in-flight walk.
+      }
+    }
+    await new Promise((resolve) => {
+      let channel;
+      const closeOwnedPorts = () => {
+        for (const port of [channel?.port1, channel?.port2]) {
+          if (!port) continue;
+          try {
+            port.onmessage = null;
+          } catch {}
+          try {
+            port.close();
+          } catch {}
+        }
+      };
+      if (typeof globalThis.MessageChannel === "function") {
+        try {
+          channel = new globalThis.MessageChannel();
+          channel.port1.onmessage = () => {
+            closeOwnedPorts();
+            resolve();
+          };
+          channel.port2.postMessage(null);
+          return;
+        } catch {
+          closeOwnedPorts();
+        }
+      }
+      // Preserve the established fallback on older renderer platforms.
       if (typeof globalThis.requestIdleCallback === "function") {
         globalThis.requestIdleCallback(() => resolve(), { timeout: 50 });
       } else {
         setTimeout(resolve, 0);
       }
     });
+  };
   const monotonicNow = () =>
     typeof performance?.now === "function" ? performance.now() : Date.now();
   const patchReactAppServerClients = async (startingNodes, patchedCaches) => {
@@ -1048,8 +1140,18 @@
     const target = document.documentElement || document.body;
     if (!target) return;
     state.reactRootObserver = new MutationObserver((records) => {
+      if (!installationIsCurrent()) return;
+      let mutated = false;
       for (const record of records) {
-        for (const node of record.addedNodes || []) {
+        const added = record.addedNodes || [];
+        const removed = record.removedNodes || [];
+        if (!added.length && !removed.length) continue;
+        mutated = true;
+        // A removal can replace a dependency provider without adding a DOM
+        // node. Queue its still-current parent as well; never keep a completed
+        // ownership snapshot just because the pending-node set was drained.
+        const nodes = added.length ? added : [record.target];
+        for (const node of nodes) {
           if (!node || (typeof node !== "object" && typeof node !== "function"))
             continue;
           state.pendingReactNodes.add(node);
@@ -1061,11 +1163,33 @@
           }
         }
       }
+      if (mutated) state.reactMutationGeneration += 1;
     });
     state.reactRootObserver.observe(target, { childList: true, subtree: true });
   };
   const installAppServerPatch = async () => {
     if (!installationIsCurrent()) return;
+    const refreshMountedAppServerScopeHints = (patchedCaches) => {
+      if (!installationIsCurrent()) return 0;
+      const warmScopes = codexCurrentAppServerScopeHints();
+      if (!warmScopes.length) return 0;
+      state.appServerScopeHints = warmScopes;
+      // A canonical status brand can authorize its exact mounted RPC owner,
+      // but it is not a complete inventory of native picker cache owners. Keep
+      // a current complete snapshot; otherwise mark the warm subset incomplete
+      // until the independent current-tree inventory has proved every owner.
+      if (!codexRendererScopeSnapshotIsCurrent()) {
+        state.scopedAppServerScopeScanComplete = false;
+        state.scopedAppServerScopeCandidates = new Set(warmScopes);
+      }
+      const patched = refreshCodexScopedAppServerClients(
+        state.scopedAppServerScopeCandidates,
+        state.scopedAppServerRegistryClasses || [],
+        patchedCaches,
+      );
+      if (patched > 0) state.appServerPatchInstalled = true;
+      return patched;
+    };
     const patchedCaches = new Set();
     // Rebinding a known, positively mounted family client is synchronous. Do
     // it before async Webpack/Fiber inventory so reinjection immediately
@@ -1084,6 +1208,45 @@
     let patched = modulePatched;
     if (modulePatched > 0) state.appServerPatchInstalled = true;
     const wallNow = Date.now();
+    // Picker proof must not wait for continuation/request-client discovery.
+    // Numeric modules may initialize after installation even when no RPC client
+    // can be authorized. Retry unresolved native bindings in a bounded 5s loop;
+    // a known initialized atom only needs the regular 30s inventory refresh.
+    if (
+      !state.webpackPickerDiscoveryPromise &&
+      (!state.webpackPickerDiscoveryRetryAt ||
+        wallNow >= state.webpackPickerDiscoveryRetryAt)
+    ) {
+      state.webpackPickerDiscoveryRetryAt = wallNow + 5000;
+      // Execute cached inspection synchronously, but never await browser module
+      // imports here: a renderer-owned import may remain pending indefinitely.
+      // It must not prevent compatibility installation or its heartbeat.
+      const discovery = discoverCodexWebpackModelPicker(patchedCaches);
+      state.webpackPickerDiscoveryPromise = discovery;
+      const ownsDiscovery = () =>
+        installationIsCurrent() &&
+        state.webpackPickerDiscoveryPromise === discovery;
+      void discovery
+        .then(() => {
+          if (!ownsDiscovery()) return;
+          // New initialized status atoms can bind the exact current manager
+          // immediately, without gating the canonical tree scan on this import.
+          refreshMountedAppServerScopeHints(patchedCaches);
+          const known =
+            Array.isArray(state.nativeReasoningVisibilityAtoms) &&
+            state.nativeReasoningVisibilityAtoms.length === 1;
+          state.webpackPickerDiscoveryRetryAt =
+            Date.now() + (known ? 30000 : 5000);
+        })
+        .catch((error) => {
+          if (!ownsDiscovery()) return;
+          state.webpackPickerDiscoveryRetryAt = Date.now() + 5000;
+          recordFailure(error);
+        })
+        .finally(() => {
+          if (ownsDiscovery()) state.webpackPickerDiscoveryPromise = null;
+        });
+    }
     if (
       !state.appServerModuleRetryAt ||
       wallNow >= state.appServerModuleRetryAt
@@ -1095,27 +1258,9 @@
         // Discover the explicit hook chunk first, then retain both fallbacks.
         const discoverScopedModules = async () => {
           let scopedPatched = 0;
-          try {
-            await discoverCodexWebpackModelPicker(patchedCaches);
-          } catch (error) {
-            recordFailure(error);
-          }
-          // Numeric cache discovery can reveal the canonical status atom
-          // before the full Fiber inventory finishes. Bind it immediately
-          // through already positively mounted retained nodes.
-          if (!(state.scopedAppServerDiscovery?.clientCount > 0)) {
-            const warmScopes = codexCurrentAppServerScopeHints();
-            if (warmScopes.length) {
-              state.appServerScopeHints = warmScopes;
-              state.scopedAppServerScopeCandidates = new Set(warmScopes);
-              scopedPatched = refreshCodexScopedAppServerClients(
-                warmScopes,
-                state.scopedAppServerRegistryClasses || [],
-                patchedCaches,
-              );
-              if (scopedPatched > 0) state.appServerPatchInstalled = true;
-            }
-          }
+          // The picker scheduler owns numeric inventory independently. Never
+          // await its import here or launch a competing discovery: current
+          // scope ownership can be proved while that renderer import is pending.
           // Scope/cache discovery must not depend on finding an obsolete named
           // bundle. The current React provider retains the initialized scope
           // even when every semantic Vite import is unavailable.
@@ -1212,6 +1357,33 @@
       state.pendingReactNodes.clear();
     }
     if (!installationIsCurrent()) return;
+    // React swaps its current Fiber during ordinary commits. That correctly
+    // invalidates native proof immediately, but refreshing the owner snapshot
+    // used to be trapped behind the unrelated 30s continuation-module cooldown.
+    // Re-establish exact current scope ownership on the next bounded retry,
+    // without accepting stale roots or turning a cache into RPC authorization.
+    // Pending DOM nodes remain owned by the throttled React work above.
+    if (
+      state.nativeReasoningVisibilityRequired === true &&
+      !state.pendingReactNodes.size &&
+      !codexRendererScopeSnapshotIsCurrent() &&
+      (!state.nativeReasoningScopeRetryAt ||
+        wallNow >= state.nativeReasoningScopeRetryAt)
+    ) {
+      state.nativeReasoningScopeRetryAt = wallNow + 5000;
+      try {
+        const rendererScopes = await codexRendererScopeCandidates();
+        if (!installationIsCurrent()) return;
+        state.scopedAppServerScopeCandidates = new Set(rendererScopes);
+        patched += refreshCodexScopedAppServerClients(
+          rendererScopes,
+          undefined,
+          patchedCaches,
+        );
+      } catch (error) {
+        recordFailure(error);
+      }
+    }
     // History refresh is optional and may wait on a renderer-owned request that
     // never settles during startup. It must not gate model-list patching or the
     // heartbeat interval; its promise already records completion/failure above.
@@ -1387,6 +1559,7 @@
       void triggerLocalThreadCatalogSync();
       if (!state.catalogReleased) patchStatsig();
       patchReactState();
+      syncNativeBooleanReasoningControls();
     })();
     state.runPromise = job;
     try {

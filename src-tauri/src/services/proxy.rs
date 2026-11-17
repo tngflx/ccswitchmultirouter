@@ -412,6 +412,8 @@ impl ProxyService {
                 injected: false,
                 picker_ready_target_count: 0,
                 picker_status: crate::codex_desktop::CodexModelPickerReadiness::Unverified,
+                picker_diagnostics: None,
+                picker_verification_issues: Vec::new(),
                 last_event: String::new(),
                 message: String::new(),
             })),

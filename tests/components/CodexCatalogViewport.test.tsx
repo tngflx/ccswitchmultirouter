@@ -90,6 +90,62 @@ describe("large catalog viewport", () => {
     },
   );
 
+  it("offers reasoning-effort inclusion in the sticky catalog toolbar", async () => {
+    const user = userEvent.setup();
+    const onUseOnlyReasoningEffort = vi.fn();
+    render(
+      <CodexCatalogViewport
+        items={[
+          {
+            row: { rowId: "reasoning", model: "reasoning", enabled: true },
+            index: 0,
+          },
+        ]}
+        compact={false}
+        selected={new Set()}
+        onSelect={vi.fn()}
+        onToggleEnabled={vi.fn()}
+        onUseOnlyReasoningEffort={onUseOnlyReasoningEffort}
+        reasoningEffortModelCount={1}
+      >
+        {({ row }) => <span>{row.model}</span>}
+      </CodexCatalogViewport>,
+    );
+
+    const toolbar = screen.getByRole("group", {
+      name: "Model selection actions",
+    });
+    const action = within(toolbar).getByRole("button", {
+      name: "Enable only models with reasoning effort (1)",
+    });
+    expect(action).toBeEnabled();
+    await user.click(action);
+    expect(onUseOnlyReasoningEffort).toHaveBeenCalledOnce();
+  });
+
+  it("does not enable the reasoning-only action when no model advertises an effort", () => {
+    const onUseOnlyReasoningEffort = vi.fn();
+    render(
+      <CodexCatalogViewport
+        items={[{ row: { rowId: "none", model: "none" }, index: 0 }]}
+        compact={false}
+        selected={new Set()}
+        onSelect={vi.fn()}
+        onToggleEnabled={vi.fn()}
+        onUseOnlyReasoningEffort={onUseOnlyReasoningEffort}
+        reasoningEffortModelCount={0}
+      >
+        {({ row }) => <span>{row.model}</span>}
+      </CodexCatalogViewport>,
+    );
+
+    expect(
+      screen.getByRole("button", {
+        name: "Enable only models with reasoning effort (0)",
+      }),
+    ).toBeDisabled();
+  });
+
   it("does not add an inclusion toolbar to generic or selection-free viewports", () => {
     const props = {
       items: [{ row: { rowId: "first", model: "first" }, index: 0 }],

@@ -44,6 +44,42 @@ subtree, but must not silently weaken these repository invariants.
 - Do not remove, bypass, or weaken a guard, test, or build gate to make a
   change pass. If a check cannot run, report the exact command and reason.
 
+## Sub-Agent Delegation and Shared Runtime Ownership
+
+- These guardrails apply to the main agent and every Sub-Agent. Each delegation
+  must repeat the applicable repository/user restrictions, assigned files or
+  read-only scope, allowed verification, shared-resource owner, and forbidden
+  side effects; do not rely on the child receiving the full parent history.
+- Delegate bounded source work and scoped tests, not independent ownership of
+  the running application, providers, deployment, or release. One main agent
+  coordinates shared runtime and artifact lifecycle changes. A child reports
+  the need for such a change instead of independently starting another app,
+  server, container, deployment, or release build.
+- Delegation and parent approval do not create human authorization. Respect
+  any requirement for an explicit user request before image/build/tag/pull,
+  deployment, installation, restart, cleanup, publishing, or permission changes.
+  Routine source compilation and the verification commands required below are
+  not authorization to replace an installed app or mutate a live provider.
+- Keep selected scope and ownership rules in generated instructions even when
+  custom role text is supplied. Describe instruction guidance honestly: it is
+  not an OS sandbox, Docker access restriction, or guaranteed tool lock.
+  Preserve user-owned host sandbox, approval, and tool configuration.
+
+## Tooling Language Policy
+
+- Repository-owned PowerShell script files (`.ps1`, `.psm1`, `.psd1`,
+  case-insensitive) are prohibited. Implement new tooling in Rust or JavaScript;
+  do not hide a migrated script in an embedded PowerShell string.
+- The installed application's recovery lifecycle remains Rust-owned. Node owns
+  development supervision and build/release tooling; legacy scheduled guardians
+  may only be inspected or uninstalled, not installed as a second owner.
+- Run `pnpm scripts:check` after tooling changes. The guard includes non-ignored
+  untracked sources and bundle/workflow entry points. It also runs before renderer
+  builds. Do not remove generated dependency launch shims under node_modules.
+- Existing inline Windows API probes are not equivalent to migrated script-file
+  entry points. Preserve their identity/ownership guards until replaced by a
+  tested native Rust boundary; do not claim a zero-PowerShell-process runtime.
+
 ## Codex Catalog Authority
 
 Treat these as cross-layer invariants, not UI-only behavior:

@@ -11,6 +11,11 @@ import {
 
 import { Button } from "@/components/ui/button";
 import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import {
   codexEgressTimezoneApi,
   type CodexEgressMonitorStatus,
 } from "@/lib/api/codexEgressTimezone";
@@ -96,10 +101,13 @@ function triggerLabel(t: TFunction, trigger?: string) {
 
 interface CodexEgressTimezoneStatusCardProps {
   onOpenCodexStatus?: () => void;
+  /** Keep the workspace summary compact while preserving full details on demand. */
+  compact?: boolean;
 }
 
 export function CodexEgressTimezoneStatusCard({
   onOpenCodexStatus,
+  compact = false,
 }: CodexEgressTimezoneStatusCardProps) {
   const { t } = useTranslation();
   const [status, setStatus] = useState<CodexEgressMonitorStatus | null>(null);
@@ -137,6 +145,142 @@ export function CodexEgressTimezoneStatusCard({
 
   const warning = status?.state === "restart_required";
   const failed = status?.state === "error" || Boolean(requestError);
+  const [detailsOpen, setDetailsOpen] = useState(!compact);
+
+  useEffect(() => {
+    if (warning || failed) setDetailsOpen(true);
+  }, [failed, warning]);
+
+  const title = (
+    <div className="flex items-center gap-2 text-sm font-semibold">
+      {warning || failed ? (
+        <TriangleAlert className="h-4 w-4 text-amber-500" />
+      ) : (
+        <Network className="h-4 w-4 text-emerald-500" />
+      )}
+      {translate(
+        t,
+        "codexEgressTimezone.statusCard.title",
+        "Codex egress environment monitoring",
+      )}
+      <span className="rounded-full border bg-background/70 px-2 py-0.5 text-xs font-normal">
+        {loading && !status
+          ? translate(t, "codexEgressTimezone.statusCard.loading", "Loading")
+          : status
+            ? stateLabel(t, status)
+            : translate(
+                t,
+                "codexEgressTimezone.statusCard.unavailable",
+                "Unavailable",
+              )}
+      </span>
+    </div>
+  );
+  const details = (
+    <>
+      <p className="text-xs leading-5 text-muted-foreground">
+        {status?.state === "disabled"
+          ? translate(
+              t,
+              "codexEgressTimezone.statusCard.descriptionDisabled",
+              "Enable “Automatic egress monitoring” in Settings → Connections & recovery → Codex egress environment. It checks at startup, after proxy or network recovery, and on the configured schedule.",
+            )
+          : status?.detectedTimezone
+            ? translate(
+                t,
+                "codexEgressTimezone.statusCard.descriptionDetected",
+                "Current egress {{ip}} · {{timezone}}; {{trigger}}, with a fallback check every {{minutes}} minutes.",
+                {
+                  ip:
+                    status.detectedEgressIp ??
+                    translate(
+                      t,
+                      "codexEgressTimezone.values.unknown",
+                      "unknown",
+                    ),
+                  timezone: status.detectedTimezone,
+                  trigger: triggerLabel(t, status.lastTrigger),
+                  minutes: status.monitorIntervalMinutes,
+                },
+              )
+            : translate(
+                t,
+                "codexEgressTimezone.statusCard.descriptionNoTimezone",
+                "No egress timezone has been detected; automatic monitoring does not block model requests.",
+              )}
+      </p>
+      {warning && (
+        <p className="text-xs font-medium text-amber-800 dark:text-amber-200">
+          {translate(
+            t,
+            "codexEgressTimezone.statusCard.warning",
+            "A new result is saved, but the running app-server still uses the old TZ. CCSM will not force-stop tasks; use the safe refresh on the Codex status page when no task is running.",
+          )}
+        </p>
+      )}
+      {(requestError || status?.lastError) && (
+        <p
+          className="text-xs text-destructive"
+          role="status"
+          aria-live="polite"
+        >
+          {requestError || status?.lastError}
+        </p>
+      )}
+      <p className="flex items-center gap-1 text-[11px] text-muted-foreground">
+        <Clock3 className="h-3 w-3" />
+        {translate(
+          t,
+          "codexEgressTimezone.statusCard.cdpNote",
+          "Detection does not depend on CDP; CDP is only used for optional Codex page timezone synchronization and verification.",
+        )}
+      </p>
+    </>
+  );
+  const actions = (
+    <div className="flex flex-wrap gap-2">
+      {compact && (
+        <CollapsibleTrigger asChild>
+          <Button type="button" size="sm" variant="ghost" className="gap-2">
+            {detailsOpen
+              ? translate(
+                  t,
+                  "codexEgressTimezone.statusCard.hideDetails",
+                  "Hide details",
+                )
+              : translate(
+                  t,
+                  "codexEgressTimezone.statusCard.showDetails",
+                  "Show details",
+                )}
+          </Button>
+        </CollapsibleTrigger>
+      )}
+      {warning && onOpenCodexStatus && (
+        <Button type="button" size="sm" onClick={onOpenCodexStatus}>
+          {translate(
+            t,
+            "codexEgressTimezone.statusCard.openSafeRefresh",
+            "Open safe refresh",
+          )}
+        </Button>
+      )}
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        disabled={loading || status?.state === "disabled"}
+        onClick={() => void probeNow()}
+      >
+        {loading ? (
+          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+        ) : (
+          <RefreshCw className="mr-2 h-4 w-4" />
+        )}
+        {translate(t, "codexEgressTimezone.statusCard.checkNow", "Check now")}
+      </Button>
+    </div>
+  );
   return (
     <section
       className={`rounded-lg border px-4 py-3 ${
@@ -147,123 +291,23 @@ export function CodexEgressTimezoneStatusCard({
             : "border-border bg-card"
       }`}
     >
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0 space-y-2">
-          <div className="flex items-center gap-2 text-sm font-semibold">
-            {warning || failed ? (
-              <TriangleAlert className="h-4 w-4 text-amber-500" />
-            ) : (
-              <Network className="h-4 w-4 text-emerald-500" />
-            )}
-            {translate(
-              t,
-              "codexEgressTimezone.statusCard.title",
-              "Codex egress environment monitoring",
-            )}
-            <span className="rounded-full border bg-background/70 px-2 py-0.5 text-xs font-normal">
-              {loading && !status
-                ? translate(
-                    t,
-                    "codexEgressTimezone.statusCard.loading",
-                    "Loading",
-                  )
-                : status
-                  ? stateLabel(t, status)
-                  : translate(
-                      t,
-                      "codexEgressTimezone.statusCard.unavailable",
-                      "Unavailable",
-                    )}
-            </span>
+      <Collapsible
+        open={compact ? detailsOpen : true}
+        onOpenChange={compact ? setDetailsOpen : undefined}
+      >
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            {title}
+            {!compact && <div className="mt-2 space-y-2">{details}</div>}
           </div>
-          <p className="text-xs leading-5 text-muted-foreground">
-            {status?.state === "disabled"
-              ? translate(
-                  t,
-                  "codexEgressTimezone.statusCard.descriptionDisabled",
-                  "Enable “Automatic egress monitoring” in Settings → General. It checks at startup, after proxy or network recovery, and on the configured schedule.",
-                )
-              : status?.detectedTimezone
-                ? translate(
-                    t,
-                    "codexEgressTimezone.statusCard.descriptionDetected",
-                    "Current egress {{ip}} · {{timezone}}; {{trigger}}, with a fallback check every {{minutes}} minutes.",
-                    {
-                      ip:
-                        status.detectedEgressIp ??
-                        translate(
-                          t,
-                          "codexEgressTimezone.values.unknown",
-                          "unknown",
-                        ),
-                      timezone: status.detectedTimezone,
-                      trigger: triggerLabel(t, status.lastTrigger),
-                      minutes: status.monitorIntervalMinutes,
-                    },
-                  )
-                : translate(
-                    t,
-                    "codexEgressTimezone.statusCard.descriptionNoTimezone",
-                    "No egress timezone has been detected; automatic monitoring does not block model requests.",
-                  )}
-          </p>
-          {warning && (
-            <p className="text-xs font-medium text-amber-800 dark:text-amber-200">
-              {translate(
-                t,
-                "codexEgressTimezone.statusCard.warning",
-                "A new result is saved, but the running app-server still uses the old TZ. CCSM will not force-stop tasks; use the safe refresh on the Codex status page when no task is running.",
-              )}
-            </p>
-          )}
-          {(requestError || status?.lastError) && (
-            <p
-              className="text-xs text-destructive"
-              role="status"
-              aria-live="polite"
-            >
-              {requestError || status?.lastError}
-            </p>
-          )}
-          <p className="flex items-center gap-1 text-[11px] text-muted-foreground">
-            <Clock3 className="h-3 w-3" />
-            {translate(
-              t,
-              "codexEgressTimezone.statusCard.cdpNote",
-              "Detection does not depend on CDP; CDP is only used for optional Codex page timezone synchronization and verification.",
-            )}
-          </p>
+          {actions}
         </div>
-        <div className="flex flex-wrap gap-2">
-          {warning && onOpenCodexStatus && (
-            <Button type="button" size="sm" onClick={onOpenCodexStatus}>
-              {translate(
-                t,
-                "codexEgressTimezone.statusCard.openSafeRefresh",
-                "Open safe refresh",
-              )}
-            </Button>
-          )}
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            disabled={loading || status?.state === "disabled"}
-            onClick={() => void probeNow()}
-          >
-            {loading ? (
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            ) : (
-              <RefreshCw className="mr-2 h-4 w-4" />
-            )}
-            {translate(
-              t,
-              "codexEgressTimezone.statusCard.checkNow",
-              "Check now",
-            )}
-          </Button>
-        </div>
-      </div>
+        {compact && (
+          <CollapsibleContent className="mt-2 space-y-2 border-t pt-2">
+            {details}
+          </CollapsibleContent>
+        )}
+      </Collapsible>
     </section>
   );
 }

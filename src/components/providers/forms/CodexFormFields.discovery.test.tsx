@@ -1,5 +1,5 @@
 import type { ComponentProps, ReactNode } from "react";
-import { act, render, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import type { CodexCatalogModel } from "@/types";
@@ -29,6 +29,19 @@ vi.mock("@/components/ui/form", () => ({
     <label>{children}</label>
   ),
 }));
+// Observe existing default-model options without a removed readiness counter
+// or opening the dropdown's unrelated popup implementation.
+vi.mock("./shared", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./shared")>();
+  return {
+    ...original,
+    ModelDropdown: ({ models }: { models: FetchedModel[] }) => (
+      <output aria-label="Available default models">
+        {JSON.stringify(models)}
+      </output>
+    ),
+  };
+});
 vi.mock("./XaiOAuthSection", () => ({ XaiOAuthSection: () => null }));
 vi.mock("./CodexKeyGroupModels", () => ({
   CodexKeyGroupModels: () => null,
@@ -59,6 +72,16 @@ vi.mock("sonner", () => ({
 function readiness(): ReadinessProps {
   if (!view.readiness) throw new Error("Readiness mock has not rendered");
   return view.readiness;
+}
+
+function catalogModelIds(): string[] {
+  return readiness().models.map((model) => model.model);
+}
+
+function availableDefaultModels(): FetchedModel[] {
+  return JSON.parse(
+    screen.getByLabelText("Available default models").textContent ?? "[]",
+  ) as FetchedModel[];
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -147,19 +170,36 @@ describe("Codex form discovery request ownership", () => {
       rerender(<CodexFormFields {...props} {...changed} />);
       await act(async () => pending.resolve(response));
       expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
-      expect(readiness().discoveredModelCount).toBe(0);
+      expect(catalogModelIds()).toEqual(["wire-old"]);
     },
   );
 
   it("does not revive A's directory after changing A to B to A", async () => {
-    vi.mocked(fetchModelsForConfig).mockResolvedValue(response);
-    const props = formProps();
+    // The canonical model remains configured across provider identity changes.
+    // Its free flag is discovery-only dropdown metadata, so it proves whether
+    // the old fetch cache survives without confusing it with catalog rows.
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([
+      { id: "wire-old", ownedBy: null, isFree: true },
+    ]);
+    const props = formProps({ onModelChange: vi.fn() });
     const { rerender } = render(<CodexFormFields {...props} />);
     act(() => readiness().onSyncModels());
-    await waitFor(() => expect(readiness().discoveredModelCount).toBe(1));
+    await waitFor(() =>
+      expect(availableDefaultModels()).toContainEqual(
+        expect.objectContaining({ id: "wire-old", isFree: true }),
+      ),
+    );
+    expect(catalogModelIds()).toEqual(["wire-old"]);
     rerender(<CodexFormFields {...props} providerId="provider-b" />);
+    expect(availableDefaultModels()).toEqual([
+      { id: "wire-old", ownedBy: null },
+    ]);
     rerender(<CodexFormFields {...props} />);
-    expect(readiness().discoveredModelCount).toBe(0);
+    expect(availableDefaultModels()).toEqual([
+      { id: "wire-old", ownedBy: null },
+    ]);
+    expect(catalogModelIds()).toEqual(["wire-old"]);
+    expect(fetchModelsForConfig).toHaveBeenCalledTimes(1);
   });
 
   it("rejects a stale sync callback after provider identity changes", () => {
@@ -312,7 +352,10 @@ describe("Codex form discovery lifecycle", () => {
 
     await act(async () => newer.resolve(response));
     expect(readiness().isSyncingModels).toBe(false);
-    expect(readiness().discoveredModelCount).toBe(1);
+    expect(catalogModelIds()).toEqual(["wire-old", "wire-new"]);
+    expect(
+      readiness().models.find((model) => model.model === "wire-new"),
+    ).toMatchObject({ enabled: false });
     expect(props.onCatalogModelsChange).toHaveBeenCalledTimes(1);
     expect(toast.success).toHaveBeenCalledTimes(1);
   });
@@ -330,7 +373,7 @@ describe("Codex form discovery lifecycle", () => {
 
     await act(async () => pending.resolve(response));
     expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
-    expect(readiness().discoveredModelCount).toBe(0);
+    expect(catalogModelIds()).toEqual(["wire-old"]);
     expect(readiness().models).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ model: "wire-old", enabled: true }),
@@ -366,7 +409,7 @@ describe("Codex OAuth discovery identity", () => {
 
       await act(async () => pending.resolve(response));
       expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
-      expect(readiness().discoveredModelCount).toBe(0);
+      expect(catalogModelIds()).toEqual(["wire-old"]);
       expect(toast.success).not.toHaveBeenCalled();
     },
   );
@@ -392,7 +435,7 @@ describe("Codex OAuth discovery identity", () => {
 
       await act(async () => pending.resolve(response));
       expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
-      expect(readiness().discoveredModelCount).toBe(0);
+      expect(catalogModelIds()).toEqual(["wire-old"]);
       expect(toast.success).not.toHaveBeenCalled();
     },
   );
@@ -419,7 +462,7 @@ describe("Codex OAuth discovery identity", () => {
 
     await act(async () => pending.resolve(response));
     expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
-    expect(readiness().discoveredModelCount).toBe(0);
+    expect(catalogModelIds()).toEqual(["wire-old"]);
     expect(toast.success).not.toHaveBeenCalled();
   });
 });
@@ -538,7 +581,14 @@ describe("Codex xAI OAuth maintained reasoning regeneration", () => {
       rows.find((row) => row.model === "my-grok-choice")?.reasoning,
     ).toEqual(explicit.reasoning);
     expect(stale.reasoning?.supportedEfforts).toEqual(["max"]);
-    expect(readiness().discoveredModelCount).toBe(2);
+    expect(catalogModelIds()).toEqual([
+      "grok-4.5",
+      "my-grok-choice",
+      "wire-new",
+    ]);
+    expect(
+      readiness().models.find((row) => row.model === "wire-new"),
+    ).toMatchObject({ enabled: false });
   });
 
   it("rejects a bound baseline when the xAI account changes while binding is pending", async () => {
@@ -564,7 +614,7 @@ describe("Codex xAI OAuth maintained reasoning regeneration", () => {
 
     await act(async () => pending.resolve(baseline.settings));
     expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
-    expect(readiness().discoveredModelCount).toBe(0);
+    expect(catalogModelIds()).toEqual(["wire-old"]);
     expect(readiness().isSyncingModels).toBe(false);
     expect(toast.success).not.toHaveBeenCalled();
     expect(showFetchModelsError).not.toHaveBeenCalled();
@@ -597,7 +647,7 @@ describe("Codex xAI OAuth maintained reasoning regeneration", () => {
         }),
       ]),
     );
-    expect(readiness().discoveredModelCount).toBe(0);
+    expect(catalogModelIds()).toEqual(["grok-4.5"]);
     expect(readiness().isSyncingModels).toBe(false);
     expect(toast.success).not.toHaveBeenCalled();
     expect(warning).toHaveBeenCalledWith("[XaiOAuth] Failed to fetch models");

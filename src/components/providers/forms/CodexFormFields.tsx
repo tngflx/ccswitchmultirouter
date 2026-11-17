@@ -89,9 +89,11 @@ import {
 import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
 import {
   catalogModelIdentity,
+  codexCatalogRowHasReasoningEffort,
   isCompleteCodexCatalogFetch,
   isExplicitCodexReasoningCapability,
   reconcileFetchedCodexCatalogRows,
+  selectOnlyCodexCatalogRowsWithReasoningEffort,
 } from "@/lib/codexCatalogReconciliation";
 import { enableOnlyConfirmedFreeCatalogModels } from "@/lib/freeModelCatalog";
 import { pruneOutdatedCodexCatalogModels } from "@/lib/codexCatalogVersionPruning";
@@ -153,6 +155,7 @@ interface EndpointCandidate {
 }
 
 const PROVIDER_REASONING_EFFORT_CHOICES: CodexReasoningEffort[] = [
+  "none",
   "minimal",
   "low",
   "medium",
@@ -231,9 +234,88 @@ export function validateCodexReasoningCapabilityDraft(
     throw new Error("Whether reasoning can be disabled must be a boolean");
   }
   if (
+    !capability.disableAllowed &&
+    capability.supportedEfforts.includes("none")
+  ) {
+    throw new Error("The none effort requires explicit disabling support");
+  }
+  const controlKind =
+    capability.controlKind ??
+    (capability.supportedEfforts.length > 0
+      ? "graded"
+      : capability.upstream.format === "boolean"
+        ? "boolean"
+        : capability.upstream.format === "none"
+          ? "none"
+          : "unknown");
+  if (controlKind === "graded" && capability.supportedEfforts.length === 0) {
+    throw new Error("Graded reasoning requires supported efforts");
+  }
+  if (
+    (controlKind === "boolean" || controlKind === "none") &&
+    capability.supportedEfforts.length > 0
+  ) {
+    throw new Error("Boolean/none reasoning cannot advertise effort levels");
+  }
+  const unsupported =
+    capability.supportStatus === "confirmed_unsupported" ||
+    (capability.supportStatus === undefined && capability.supported === false);
+  if (
+    unsupported &&
+    (capability.supportedEfforts.length > 0 || capability.disableAllowed)
+  ) {
+    throw new Error(
+      "Unsupported reasoning cannot advertise efforts or disabling",
+    );
+  }
+  const formats = [
+    "auto",
+    "text",
+    "summary",
+    "object",
+    "reasoning_object",
+    "string",
+    "boolean",
+    "none",
+    "budget",
+  ];
+  const parameter: string = capability.upstream.parameter;
+  const parameters = [
+    "reasoning",
+    "reasoning.effort",
+    "reasoning_effort",
+    "enable_thinking",
+    "thinking",
+    "thinking_budget",
+    "max_tokens",
+    "reasoning.max_tokens",
+    "none",
+  ];
+  if (
+    !formats.includes(capability.upstream.format) ||
+    !(
+      parameters.includes(parameter) ||
+      (parameter === "reasoning.enabled" &&
+        capability.upstream.format === "boolean") ||
+      (parameter === "" && capability.upstream.format === "none")
+    )
+  ) {
+    throw new Error("The upstream reasoning wire contract is not supported");
+  }
+  if (
+    Object.keys(capability.upstream.effortMap ?? {}).some(
+      (effort) => !allowed.has(effort as CodexReasoningEffort),
+    )
+  ) {
+    throw new Error(
+      "Reasoning mapping contains an unknown or Codex-only effort",
+    );
+  }
+  if (
     !capability.upstream ||
     typeof capability.upstream.parameter !== "string" ||
-    !capability.upstream.parameter.trim()
+    (!capability.upstream.parameter.trim() &&
+      capability.upstream.format !== "none")
   ) {
     throw new Error("The upstream reasoning parameter name cannot be empty");
   }
@@ -431,36 +513,103 @@ export function capabilityFromReasoningDetection(
   if (typeof outcome !== "object" || !("found" in outcome)) return undefined;
   const reasoning = outcome.found.reasoning;
   if (!reasoning) return undefined;
+  const providerEfforts = new Set<CodexReasoningEffort>([
+    "none",
+    ...PROVIDER_REASONING_EFFORT_CHOICES,
+  ]);
   const supportedEfforts = reasoning.supportedEfforts.filter(
     (effort): effort is CodexReasoningEffort =>
-      ["none", ...PROVIDER_REASONING_EFFORT_CHOICES].includes(effort),
+      providerEfforts.has(effort as CodexReasoningEffort),
   );
-  // A provider can advertise reasoning output without advertising any
-  // selectable effort. That is not enough evidence to persist a Codex
-  // effort-capability declaration or to guess a boolean wire parameter.
-  if (!supportedEfforts.some((effort) => effort !== "none")) return undefined;
+  if (
+    supportedEfforts.length !== reasoning.supportedEfforts.length ||
+    new Set(supportedEfforts).size !== supportedEfforts.length
+  ) {
+    return undefined;
+  }
+  const disableAllowed = reasoning.disableAllowed ?? !reasoning.mandatory;
+  if (
+    (reasoning.mandatory &&
+      (disableAllowed || reasoning.defaultEnabled === false)) ||
+    (!disableAllowed && supportedEfforts.includes("none"))
+  ) {
+    return undefined;
+  }
+  const defaultEffort = reasoning.defaultEffort as
+    CodexReasoningEffort | null | undefined;
+  if (defaultEffort != null && !supportedEfforts.includes(defaultEffort)) {
+    return undefined;
+  }
+  const gradedEfforts = supportedEfforts.filter((effort) => effort !== "none");
+  const controlKind =
+    reasoning.controlKind ?? (gradedEfforts.length ? "graded" : undefined);
+  // Empty output-only/legacy metadata cannot invent a switch or effort ladder.
+  // A canonical no-effort control is adoptable only with its explicit wire shape.
+  if (
+    !controlKind ||
+    controlKind === "unknown" ||
+    (controlKind === "graded" && !gradedEfforts.length) ||
+    (controlKind !== "graded" &&
+      (supportedEfforts.length > 0 ||
+        !reasoning.upstreamFormat ||
+        !reasoning.upstreamParameter))
+  ) {
+    return undefined;
+  }
+  const supportStatus = reasoning.supportStatus ?? "confirmed_supported";
+  if (
+    supportStatus === "confirmed_unsupported" &&
+    (supportedEfforts.length > 0 || disableAllowed)
+  ) {
+    return undefined;
+  }
+  const explicitEffortMap = reasoning.effortMap;
+  if (explicitEffortMap) {
+    for (const [source, target] of Object.entries(explicitEffortMap)) {
+      if (
+        !providerEfforts.has(source as CodexReasoningEffort) ||
+        !providerEfforts.has(target as CodexReasoningEffort) ||
+        !supportedEfforts.includes(target as CodexReasoningEffort)
+      ) {
+        return undefined;
+      }
+    }
+    if (
+      controlKind === "graded" &&
+      gradedEfforts.some(
+        (effort) =>
+          !Object.prototype.hasOwnProperty.call(explicitEffortMap, effort),
+      )
+    ) {
+      return undefined;
+    }
+  }
+  const ultra = reasoning.codexUltraOrchestration;
+  if (ultra?.enabled) {
+    const target = ultra.providerEffort ?? explicitEffortMap?.max;
+    if (!target || !gradedEfforts.some((effort) => effort === target)) {
+      return undefined;
+    }
+  }
   return {
     schemaVersion: 2,
-    supportStatus: "confirmed_supported",
-    controlKind: supportedEfforts.length > 0 ? "graded" : "boolean",
+    supportStatus,
+    controlKind,
     supportedEfforts,
-    defaultEffort: supportedEfforts.includes(
-      reasoning.defaultEffort as CodexReasoningEffort,
-    )
-      ? (reasoning.defaultEffort as CodexReasoningEffort)
-      : undefined,
-    disableAllowed: !reasoning.mandatory,
+    defaultEffort: defaultEffort ?? undefined,
+    disableAllowed,
     upstream: {
       format:
         reasoning.upstreamFormat === "object"
           ? "reasoning_object"
           : (reasoning.upstreamFormat ?? "reasoning_object"),
       parameter: reasoning.upstreamParameter ?? "reasoning.effort",
-      effortMap: Object.fromEntries(
-        supportedEfforts.map((effort) => [effort, effort]),
-      ),
+      effortMap:
+        explicitEffortMap ??
+        Object.fromEntries(gradedEfforts.map((effort) => [effort, effort])),
     },
     outputFormat: reasoning.outputFormat ?? undefined,
+    codexUltraOrchestration: ultra ?? undefined,
     source: "user_confirmed_detection",
     confidence: "authoritative",
     providerKey: outcome.found.providerKey,
@@ -1892,100 +2041,32 @@ export function CodexFormFields({
     );
   }, [fetchedModels, onCatalogModelsChange, commitCatalogRows, t]);
 
-  const handleUseOnlyDiscoveredModels = useCallback(() => {
+  const reasoningEffortModelCount = useMemo(
+    () => catalogRows.filter(codexCatalogRowHasReasoningEffort).length,
+    [catalogRows],
+  );
+  const handleUseOnlyReasoningEffort = useCallback(() => {
     if (!onCatalogModelsChange) return;
-    if (!isCompleteCodexCatalogFetch(apiKeyGroupsRef.current)) {
-      toast.info(
-        t("codexConfig.discoveredModelsRequiresCompleteFetch", {
-          defaultValue:
-            "Use this action only after syncing a complete provider catalog; grouped credentials may expose different model lists.",
-        }),
-      );
-      return;
-    }
-    const discoveredIds = fetchedModels
-      .flatMap((model) => modelIdentityValues(model))
-      .filter(Boolean);
-    if (discoveredIds.length === 0) {
-      toast.info(
-        t("codexConfig.noDiscoveredModels", {
-          defaultValue: "Sync a model list first.",
-        }),
-      );
-      return;
-    }
-
-    const nextRows = selectOnlyDiscoveredCodexCatalogRows(
+    const nextRows = selectOnlyCodexCatalogRowsWithReasoningEffort(
       catalogRowsRef.current,
-      discoveredIds,
     );
     const enabledCount = nextRows.filter((row) => row.enabled !== false).length;
+    if (enabledCount === 0) {
+      toast.info(
+        t("codexConfig.noReasoningEffortModels", {
+          defaultValue: "No catalog models advertise a reasoning effort.",
+        }),
+      );
+      return;
+    }
     commitCatalogRows(() => nextRows, { repairDefault: true });
     toast.success(
-      t("codexConfig.useOnlyDiscoveredModelsApplied", {
+      t("codexConfig.reasoningEffortModelsOnlyApplied", {
         count: enabledCount,
-        defaultValue:
-          "Enabled {{count}} model(s) returned by the latest API sync; older rows remain excluded in the catalog.",
+        defaultValue: "Enabled {{count}} model(s) with reasoning effort.",
       }),
     );
-  }, [fetchedModels, onCatalogModelsChange, commitCatalogRows, t]);
-
-  const handleReplaceCatalogFromDiscovery = useCallback(() => {
-    if (!onCatalogModelsChange) return;
-    if (!isCompleteCodexCatalogFetch(apiKeyGroupsRef.current)) {
-      toast.info(
-        t("codexConfig.discoveredModelsRequiresCompleteFetch", {
-          defaultValue:
-            "Use this action only after syncing a complete provider catalog; grouped credentials may expose different model lists.",
-        }),
-      );
-      return;
-    }
-    if (fetchedModels.length === 0) {
-      toast.info(
-        t("codexConfig.noDiscoveredModels", {
-          defaultValue: "Sync a model list first.",
-        }),
-      );
-      return;
-    }
-
-    const result = reconcileFetchedCodexCatalogRows(
-      [],
-      fetchedModels,
-      { providerId, providerName, baseUrl: codexBaseUrl, websiteUrl },
-      {
-        appendNew: true,
-        createRow: (seed) => createCatalogRow(seed),
-        existingMetadataMode: "refresh",
-        removeMissingRemote: true,
-        includeUnboundRemoteRows: true,
-        markMissingRemoteDisabled: false,
-        newRowEnabled: true,
-        contextWindowFormat: "string",
-        inferContextWindow: false,
-      },
-    );
-    const nextRows = commitCatalogRows(() => result.rows, {
-      repairDefault: true,
-      reconcileProtocolOverrides: true,
-    });
-    toast.success(
-      t("codexConfig.replaceCatalogApplied", {
-        count: nextRows.length,
-        defaultValue: "Rebuilt the catalog from {{count}} synced model(s).",
-      }),
-    );
-  }, [
-    codexBaseUrl,
-    fetchedModels,
-    onCatalogModelsChange,
-    providerId,
-    providerName,
-    commitCatalogRows,
-    t,
-    websiteUrl,
-  ]);
+  }, [commitCatalogRows, onCatalogModelsChange, t]);
 
   const handleProtocolProbe = useCallback(async () => {
     if (!codexBaseUrl || !codexApiKey) {
@@ -2923,14 +3004,6 @@ export function CodexFormFields({
           adaptation={displayedAdaptation}
           isMaintainedPreset={isMaintainedPreset}
           isSyncingModels={isFetchingModels}
-          confirmedFreeModelCount={confirmedFreeModelCount}
-          canUseFreeModelsOnly={canUseFreeModelsOnly}
-          onUseFreeModelsOnly={handleUseFreeModelsOnly}
-          discoveredModelCount={fetchedModels.length}
-          canUseOnlyDiscoveredModels={isCompleteCodexCatalogFetch(apiKeyGroups)}
-          onUseOnlyDiscoveredModels={handleUseOnlyDiscoveredModels}
-          canReplaceCatalog={isCompleteCodexCatalogFetch(apiKeyGroups)}
-          onReplaceCatalog={handleReplaceCatalogFromDiscovery}
           isValidatingConnection={
             isProbingProtocol && isProtocolProbeStateCurrent
           }
@@ -3087,6 +3160,7 @@ export function CodexFormFields({
                           row.displayName?.trim() || model || "Unnamed model"
                         }
                         source={reasoningSourceLabel}
+                        supportKind={reasoningResolution?.resolved.supportKind}
                         selectableEfforts={selectableEfforts}
                         defaultEffort={defaultEffort}
                         ultraEnabled={effectiveUltra.enabled}
@@ -3651,7 +3725,7 @@ export function CodexFormFields({
                   <p className="text-xs leading-relaxed text-muted-foreground">
                     {t("codexConfig.modelMappingInventoryHint", {
                       defaultValue:
-                        "All includes retained excluded inventory for editing. Only Included models enter routes and model pickers; use “Enable only synced models” after a complete API sync when you want the latest fetched set enabled.",
+                        "All includes retained excluded inventory for editing. Only Included models enter routes and model pickers; use the fixed catalog action bar for bulk inclusion filters while keeping older rows available to edit.",
                     })}
                   </p>
                 </div>
@@ -3715,6 +3789,16 @@ export function CodexFormFields({
                         );
                       }}
                       onPruneOutdated={handlePruneOutdatedCatalogRows}
+                      onUseOnlyFreeModels={
+                        canUseFreeModelsOnly
+                          ? handleUseFreeModelsOnly
+                          : undefined
+                      }
+                      freeModelCount={
+                        canUseFreeModelsOnly ? confirmedFreeModelCount : 0
+                      }
+                      onUseOnlyReasoningEffort={handleUseOnlyReasoningEffort}
+                      reasoningEffortModelCount={reasoningEffortModelCount}
                     >
                       {({ row, index }) => {
                         const model = row.model.trim();

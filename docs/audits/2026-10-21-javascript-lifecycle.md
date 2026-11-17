@@ -1,5 +1,17 @@
 # JavaScript watchdog and local production build
 
+> November 17 follow-up: obsolete production JS recovery/staging APIs and the run/install package aliases are removed. Previously deployed external copies are not automatically retired; see [the recovery ownership re-audit](2026-11-17-recovery-ownership-reaudit.md).
+
+> Historical audit: retained PowerShell helper/wrapper descriptions below record the state at that time. The script-file retirement and new verification boundaries are documented in [the November 17 migration audit](2026-11-17-no-powershell-script-migration.md).
+
+> Historical audit, superseded for production recovery on November 16, 2026.
+> The built-in Rust watchdog is now the sole production restart owner. The
+> JavaScript guardian supports read-only production diagnostics (`--no-restart`)
+> and explicit development recovery, not installed-app relaunch. New scheduled
+> guardian installations are refused; owned legacy tasks can still be uninstalled.
+> See `CONTRIBUTING.md` for the current operational contract. The results below
+> describe the implementation and verification at the original audit date.
+
 The previous recovery fix kept the development supervisor in JavaScript but
 left the external watchdog, scheduled-task installer, and local production
 build in PowerShell files. The user then requested the JavaScript migration.

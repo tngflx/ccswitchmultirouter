@@ -1,4 +1,4 @@
-/** Global picker order belongs to the router, never to source catalog ranks. */
+/** Router-owned provider blocks contain model ranks, never source catalog ranks. */
 export interface CodexOrderableCatalogModel {
   model?: string;
   sortIndex?: number;
@@ -11,9 +11,56 @@ export interface CodexOrderableCatalogModel {
   targetProviderId?: string;
 }
 
+/** Stable provider identity wins over mutable display names. */
+export function codexCatalogModelProviderKey(
+  model: CodexOrderableCatalogModel,
+): string {
+  const id = model.targetProviderId?.trim();
+  if (id) return `id:${id}`;
+  const name = (model.providerName || model.provider_name)
+    ?.trim()
+    .toLowerCase();
+  return name ? `name:${name}` : "unknown";
+}
+
+function providerRanks(
+  models: readonly CodexOrderableCatalogModel[],
+  referenceModels: readonly CodexOrderableCatalogModel[],
+): Map<string, number> {
+  const ranks = new Map<string, number>();
+  for (const model of [...referenceModels, ...models]) {
+    const provider = codexCatalogModelProviderKey(model);
+    if (!ranks.has(provider)) ranks.set(provider, ranks.size);
+  }
+  return ranks;
+}
+
+/** Normalize arbitrary UI ranks against the current route-owned provider blocks. */
+export function groupCodexCatalogModelsByProvider<
+  T extends CodexOrderableCatalogModel,
+>(
+  models: readonly T[],
+  referenceModels: readonly CodexOrderableCatalogModel[] = models,
+): T[] {
+  const groups = providerRanks(models, referenceModels);
+  return models
+    .map((model, index) => ({ model, index }))
+    .sort(
+      (left, right) =>
+        groups.get(codexCatalogModelProviderKey(left.model))! -
+          groups.get(codexCatalogModelProviderKey(right.model))! ||
+        left.index - right.index,
+    )
+    .map(({ model }) => model);
+}
+
 export function applyCodexCatalogModelOrder<
   T extends CodexOrderableCatalogModel,
->(models: readonly T[], savedOrder: readonly string[]): T[] {
+>(
+  models: readonly T[],
+  savedOrder: readonly string[],
+  referenceModels: readonly CodexOrderableCatalogModel[] = models,
+): T[] {
   const key = (value?: string) => value?.trim().toLowerCase() ?? "";
   const visible = new Set(models.map((model) => key(model.model)));
   const ranks = new Map<string, number>();
@@ -55,10 +102,13 @@ export function applyCodexCatalogModelOrder<
     if (!ranks.has(recovered)) ranks.set(recovered, rank);
   });
   const custom = ranks.size > 0;
+  const groups = providerRanks(models, referenceModels);
   return models
     .map((model, index) => ({ model, index }))
     .sort(
       (left, right) =>
+        groups.get(codexCatalogModelProviderKey(left.model))! -
+          groups.get(codexCatalogModelProviderKey(right.model))! ||
         (ranks.get(key(left.model.model)) ?? Number.MAX_SAFE_INTEGER) -
           (ranks.get(key(right.model.model)) ?? Number.MAX_SAFE_INTEGER) ||
         left.index - right.index,

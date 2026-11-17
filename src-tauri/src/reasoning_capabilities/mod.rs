@@ -110,6 +110,26 @@ pub struct ReasoningCapabilitySnapshot {
     pub upstream_format: Option<String>,
     /// 上游参数名。
     pub upstream_parameter: Option<String>,
+    /// Explicit support status from canonical provider metadata. Omitted by
+    /// legacy snapshots, whose positive capability objects imply support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_status: Option<ReasoningSupportStatus>,
+    /// Validated provider control shape. Optional for legacy snapshots; when
+    /// present it must be preserved instead of being inferred from efforts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_kind: Option<ReasoningControlKind>,
+    /// Provider-native disable contract, independent from `mandatory`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_allowed: Option<bool>,
+    /// Validated provider-native effort mapping. Synthetic Codex Ultra is
+    /// deliberately not part of this map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_map: Option<HashMap<String, String>>,
+    /// Product-level Ultra projection with its explicit native target, kept
+    /// separate from provider-native efforts and the provider effort map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_ultra_orchestration:
+        Option<crate::proxy::providers::codex_reasoning::CodexUltraOrchestrationCapability>,
     /// reasoning 内容回传字段形态。
     pub output_format: Option<String>,
 }
@@ -371,6 +391,7 @@ pub fn resolve_codex_model_capability(
     resolve_codex_model_capability_for_settings(
         &provider.settings_config,
         platform,
+        Some(reasoning_provider_key(provider)),
         model,
         catalog::global_library().as_ref(),
         &official_models,
@@ -429,6 +450,7 @@ pub fn resolve_codex_model_capability_with_library(
     resolve_codex_model_capability_for_settings(
         &provider.settings_config,
         platform,
+        Some(reasoning_provider_key(provider)),
         model,
         library,
         &[],
@@ -455,6 +477,7 @@ pub fn resolve_codex_model_capability_with_library(
 pub(crate) fn resolve_codex_model_capability_for_settings(
     settings: &Value,
     platform: Option<&str>,
+    provider_key: Option<&str>,
     model: &str,
     library: Option<&catalog::CapabilityLibrary>,
     official_models: &[Value],
@@ -499,6 +522,22 @@ pub(crate) fn resolve_codex_model_capability_for_settings(
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .unwrap_or(canonical_model);
+    let normalize_selected_capability = |capability| {
+        let mut capability =
+            normalize_provider_reasoning_capability(platform, upstream_model, capability);
+        // The shared selection boundary has already checked this automatic
+        // declaration's current transport/model scope. Attach missing display
+        // provenance here, not in one compiler projection, so source, routed
+        // requests and picker publication all receive the same capability.
+        // A settings-only caller cannot invent an actual provider identity.
+        if capability.source.as_deref() == Some("detection") && capability.provider_key.is_none() {
+            capability.provider_key = provider_key
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string);
+        }
+        capability
+    };
     // A non-wire alias names this canonical row too. Preserve a snapshot
     // explicitly supplied for that alias before consulting the canonical key;
     // a wire snapshot must remain on the later upstream-evidence step.
@@ -540,7 +579,7 @@ pub(crate) fn resolve_codex_model_capability_for_settings(
             settings,
             canonical_model,
             resolved.source,
-            normalize_provider_reasoning_capability(platform, upstream_model, capability),
+            normalize_selected_capability(capability),
         );
     }
     let provider_reasoning = ["reasoning", "codexChatReasoning", "codex_chat_reasoning"]
@@ -559,7 +598,7 @@ pub(crate) fn resolve_codex_model_capability_for_settings(
             settings,
             canonical_model,
             CapabilitySource::ProviderFallback,
-            normalize_provider_reasoning_capability(platform, upstream_model, capability),
+            normalize_selected_capability(capability),
         )
     })
 }
@@ -657,6 +696,50 @@ fn resolved_with_catalog_ultra_setting(
         fingerprint: capability_fingerprint(&capability),
         capability: Some(capability),
         source,
+    }
+}
+
+/// The desktop cache is shared with generated third-party picker catalogs.
+/// A matching slug alone therefore cannot prove an OpenAI wire contract for
+/// arbitrary relay models. Keep the historical OpenAI-family fallback, while
+/// accepting future official names only behind an exact, safe native endpoint.
+fn official_cache_fallback_matches_context(settings: &Value, wire_model: &str) -> bool {
+    let model = wire_model.trim().to_ascii_lowercase();
+    let model = model.strip_prefix("openai/").unwrap_or(&model);
+    let openai_family = model.starts_with("gpt-")
+        || model.starts_with("chatgpt-")
+        || model.starts_with("codex-")
+        || model.strip_prefix('o').is_some_and(|suffix| {
+            let digits = suffix.bytes().take_while(u8::is_ascii_digit).count();
+            digits > 0
+                && suffix[digits..]
+                    .chars()
+                    .next()
+                    .is_none_or(|boundary| matches!(boundary, '-' | '.'))
+        });
+    if openai_family {
+        return true;
+    }
+    let Some(base_url) = provider_metadata::base_url_from_settings(settings)
+        .and_then(|base_url| {
+            crate::codex_multirouter::protocol_capability::normalize_protocol_capability_base_url(
+                &base_url,
+            )
+        })
+        .and_then(|base_url| url::Url::parse(&base_url).ok())
+    else {
+        return false;
+    };
+    if base_url.scheme() != "https" || base_url.port().is_some() {
+        return false;
+    }
+    match base_url.host_str() {
+        Some("api.openai.com") => true,
+        Some("chatgpt.com" | "chat.openai.com") => {
+            let path = base_url.path().trim_end_matches('/');
+            path == "/backend-api/codex" || path.starts_with("/backend-api/codex/")
+        }
+        _ => false,
     }
 }
 
@@ -787,9 +870,12 @@ pub fn resolve_codex_model_capability_core(
     // request instead of failing closed.
     if platform.is_none()
         || (platform == Some("deepseek")
-            && model.trim().to_ascii_lowercase().starts_with("deepseek-"))
+            && wire_model
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("deepseek-"))
     {
-        if let Some(capability) = builtin_reasoning_capability_for_model(model) {
+        if let Some(capability) = builtin_reasoning_capability_for_model(wire_model) {
             return resolved_with_catalog_ultra_setting(
                 settings,
                 model,
@@ -799,9 +885,13 @@ pub fn resolve_codex_model_capability_core(
         }
     }
 
-    // 6. Codex 官方模型缓存（仅未知平台生效）
-    if platform.is_none() {
-        if let Some(capability) = official_reasoning_capability_for_model(model, official_models) {
+    // 6. The shared desktop cache may contain generated third-party rows.
+    // Unknown relay models cannot inherit OpenAI controls from a matching slug;
+    // require an OpenAI-family identity or trusted native endpoint provenance.
+    if platform.is_none() && official_cache_fallback_matches_context(settings, wire_model) {
+        if let Some(capability) =
+            official_reasoning_capability_for_model(wire_model, official_models)
+        {
             return resolved_with_catalog_ultra_setting(
                 settings,
                 model,
@@ -885,7 +975,13 @@ pub fn snapshot_to_capability(
         .filter(|effort| !effort.is_empty())
         .collect();
     let codex_ultra_enabled = efforts.iter().any(|effort| effort == "ultra");
-    if codex_ultra_enabled && !efforts.iter().any(|effort| effort == "max") {
+    if codex_ultra_enabled
+        && (reasoning.codex_ultra_orchestration.is_some()
+            || !efforts.iter().any(|effort| effort == "max"))
+    {
+        // Only legacy snapshots may encode the synthetic selector in the
+        // effort list. Explicit canonical metadata keeps it out of native
+        // efforts and supplies the provider target in its separate overlay.
         return None;
     }
     let efforts = efforts
@@ -908,21 +1004,28 @@ pub fn snapshot_to_capability(
         return None;
     }
     let default_effort = default_effort.map(|effort| {
-        if effort == "ultra" {
+        if effort == "ultra" && reasoning.codex_ultra_orchestration.is_none() {
             "max".to_string()
         } else {
             effort
         }
     });
 
-    let disable_allowed = !reasoning.mandatory || efforts.iter().any(|effort| effort == "none");
+    let inferred_disable_allowed =
+        !reasoning.mandatory || efforts.iter().any(|effort| effort == "none");
+    let disable_allowed = reasoning
+        .disable_allowed
+        .unwrap_or(inferred_disable_allowed);
+    if reasoning.mandatory && disable_allowed {
+        return None;
+    }
     let graded_efforts: Vec<String> = efforts
         .iter()
         .filter(|effort| **effort != "none")
         .cloned()
         .collect();
 
-    let control_kind = if !graded_efforts.is_empty() {
+    let inferred_control_kind = if !graded_efforts.is_empty() {
         ReasoningControlKind::Graded
     } else if reasoning.supports_max_tokens {
         ReasoningControlKind::Budget
@@ -933,6 +1036,7 @@ pub fn snapshot_to_capability(
         // reasoning is present while still using the server default.
         ReasoningControlKind::None
     };
+    let control_kind = reasoning.control_kind.unwrap_or(inferred_control_kind);
 
     // `none` is a Codex control sentinel, not an OpenRouter/provider effort.
     // Preserve it only when the provider explicitly advertised it; do not add
@@ -943,27 +1047,40 @@ pub fn snapshot_to_capability(
         supported_efforts.insert(0, "none".to_string());
     }
 
+    let upstream_format = reasoning
+        .upstream_format
+        .clone()
+        .unwrap_or_else(|| "object".to_string());
+    let upstream_format = if upstream_format == "object" {
+        "reasoning_object".to_string()
+    } else {
+        upstream_format
+    };
+
     let capability = CodexModelReasoningCapability {
         schema_version: Some(2),
-        support_status: Some(ReasoningSupportStatus::ConfirmedSupported),
+        support_status: Some(
+            reasoning
+                .support_status
+                .unwrap_or(ReasoningSupportStatus::ConfirmedSupported),
+        ),
         control_kind: Some(control_kind),
         supported: None,
         supported_efforts,
         default_effort,
         disable_allowed,
         upstream: CodexModelReasoningUpstream {
-            format: reasoning
-                .upstream_format
-                .clone()
-                .unwrap_or_else(|| "object".to_string()),
+            format: upstream_format,
             parameter: reasoning
                 .upstream_parameter
                 .clone()
                 .unwrap_or_else(|| "reasoning.effort".to_string()),
-            effort_map: graded_efforts
-                .iter()
-                .map(|effort| (effort.clone(), effort.clone()))
-                .collect(),
+            effort_map: reasoning.effort_map.clone().unwrap_or_else(|| {
+                graded_efforts
+                    .iter()
+                    .map(|effort| (effort.clone(), effort.clone()))
+                    .collect()
+            }),
         },
         output_format: reasoning.output_format.clone(),
         source: Some("detection".to_string()),
@@ -972,12 +1089,14 @@ pub fn snapshot_to_capability(
         provider_key: Some(snapshot.provider_key.clone()),
         evidence_scope: snapshot.evidence_scope.clone(),
         model_revision: None,
-        codex_ultra_orchestration: codex_ultra_enabled.then_some(
-            crate::proxy::providers::codex_reasoning::CodexUltraOrchestrationCapability {
-                enabled: true,
-                provider_effort: None,
-            },
-        ),
+        codex_ultra_orchestration: reasoning.codex_ultra_orchestration.clone().or_else(|| {
+            codex_ultra_enabled.then_some(
+                crate::proxy::providers::codex_reasoning::CodexUltraOrchestrationCapability {
+                    enabled: true,
+                    provider_effort: None,
+                },
+            )
+        }),
     };
 
     capability.validate().ok().map(|_| capability)
@@ -1090,6 +1209,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn authorized_persisted_detection_gets_one_canonical_provider_identity() {
+        let mut provider = plain_provider("Scoped provider", "https://relay.example/v1");
+        provider.id = "source-provider".to_string();
+        let mut capability = automatic_capability("detection");
+        capability.confidence = Some(CapabilityConfidence::Verified);
+        capability.evidence_scope =
+            reasoning_evidence_scope("https://relay.example/v1", "wire-model");
+        provider.settings_config["modelCatalog"] = json!({"models": [{
+            "model": "public-model", "upstreamModel": "wire-model", "aliases": ["friendly-model"],
+            "reasoning": capability,
+        }]});
+        let original_settings = provider.settings_config.clone();
+        let expected_fingerprint = capability_fingerprint(&capability);
+        for requested in ["public-model", "friendly-model", "wire-model"] {
+            let resolved =
+                resolve_codex_model_capability_with_library(&provider, requested, None, None);
+            let source = resolved
+                .capability
+                .expect("current scoped persisted detection");
+            assert_eq!(source.provider_key.as_deref(), Some("source-provider"));
+            assert_eq!(source.supported_efforts, capability.supported_efforts);
+            assert_eq!(source.evidence_scope, capability.evidence_scope);
+            assert_eq!(resolved.fingerprint, expected_fingerprint);
+            let mut routed = provider.clone();
+            routed.id = "router-visible-provider".to_string();
+            routed.settings_config["codexResolvedTargetProviderId"] = json!("source-provider");
+            let routed_resolution =
+                resolve_codex_model_capability_with_library(&routed, requested, None, None);
+            assert_eq!(routed_resolution.capability, Some(source));
+            assert_eq!(routed_resolution.fingerprint, expected_fingerprint);
+        }
+        assert_eq!(
+            provider.settings_config, original_settings,
+            "derived identity is not persisted by a reader"
+        );
+
+        let without_identity = resolve_codex_model_capability_for_settings(
+            &provider.settings_config,
+            None,
+            None,
+            "public-model",
+            None,
+            &[],
+            |_| None,
+        );
+        assert_eq!(
+            without_identity.capability.unwrap().provider_key,
+            None,
+            "settings-only inspection must not invent an identity"
+        );
+        provider.settings_config["base_url"] = json!("https://other-relay.example/v1");
+        let stale =
+            resolve_codex_model_capability_with_library(&provider, "public-model", None, None);
+        assert!(
+            stale.capability.is_none(),
+            "missing identity enrichment cannot revive stale transport evidence"
+        );
     }
 
     #[test]
@@ -1464,12 +1643,16 @@ mod tests {
         assert_eq!(runtime_alias.fingerprint, alias.fingerprint);
 
         // Resolving a wire identity still checks its public row's stronger
-        // canonical evidence before using the wire-only snapshot.
-        provider.settings_config["modelCatalog"]["models"][0]["model"] = json!("deepseek-v4-pro");
-        detection.model = "provider-fallback-detection-wire".into();
+        // canonical evidence before using the wire-only snapshot. The builtin
+        // is evidence about the actual wire model, never a public-name guess.
+        provider.settings_config["modelCatalog"]["models"][0]["upstreamModel"] =
+            json!("deepseek-v4-pro");
+        detection.model = "deepseek-v4-pro".into();
+        detection.evidence_scope =
+            reasoning_evidence_scope_for_settings(&provider.settings_config, &detection.model);
         let wire = resolve_codex_model_capability_with_library(
             &provider,
-            "provider-fallback-detection-wire",
+            "deepseek-v4-pro",
             Some(&detection),
             None,
         );
@@ -1496,6 +1679,7 @@ mod tests {
         let resolved = resolve_codex_model_capability_for_settings(
             &provider.settings_config,
             None,
+            Some(reasoning_provider_key(&provider)),
             "provider-fallback-wire-public",
             None,
             &[],
@@ -1607,6 +1791,7 @@ mod tests {
                 upstream_format: Some("object".into()),
                 upstream_parameter: Some("reasoning.effort".into()),
                 output_format: Some("auto".into()),
+                ..Default::default()
             }),
         }
     }
@@ -1777,6 +1962,53 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_to_capability_preserves_internal_ultra_overlay_without_native_max() {
+        let snapshot = ProviderCapabilitySnapshot {
+            provider_key: "test-provider".into(),
+            model: "gpt-6.1-sol".into(),
+            fetched_at: 1,
+            source: "test".into(),
+            evidence_scope: None,
+            reasoning: Some(ReasoningCapabilitySnapshot {
+                supported_efforts: vec!["high".into(), "xhigh".into()],
+                default_effort: Some("xhigh".into()),
+                mandatory: true,
+                disable_allowed: Some(false),
+                support_status: Some(ReasoningSupportStatus::ConfirmedSupported),
+                control_kind: Some(ReasoningControlKind::Graded),
+                upstream_format: Some("reasoning_object".into()),
+                upstream_parameter: Some("reasoning.effort".into()),
+                effort_map: Some(
+                    [
+                        ("high".into(), "high".into()),
+                        ("xhigh".into(), "xhigh".into()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                codex_ultra_orchestration: Some(
+                    crate::proxy::providers::codex_reasoning::CodexUltraOrchestrationCapability {
+                        enabled: true,
+                        provider_effort: Some("xhigh".into()),
+                    },
+                ),
+                ..Default::default()
+            }),
+        };
+        let capability = snapshot_to_capability(&snapshot).expect("valid internal overlay");
+        assert_eq!(capability.supported_efforts, ["high", "xhigh"]);
+        assert_eq!(
+            capability
+                .codex_ultra_orchestration
+                .as_ref()
+                .and_then(|ultra| ultra.provider_effort.as_deref()),
+            Some("xhigh")
+        );
+        assert!(!capability.upstream.effort_map.contains_key("ultra"));
+        assert!(!capability.upstream.effort_map.contains_key("max"));
+    }
+
+    #[test]
     fn snapshot_to_capability_graded_with_none_is_disable_allowed() {
         let mut snapshot = openrouter_detection_snapshot();
         snapshot.reasoning.as_mut().unwrap().supported_efforts = vec!["high".into(), "none".into()];
@@ -1846,6 +2078,7 @@ mod tests {
                 upstream_format: None,
                 upstream_parameter: None,
                 output_format: None,
+                ..Default::default()
             }),
         };
         let capability = snapshot_to_capability(&snapshot).expect("budget snapshot");
@@ -2027,6 +2260,7 @@ mod tests {
                 let resolved = resolve_codex_model_capability_for_settings(
                     &settings,
                     Some("sublyx"),
+                    None,
                     requested,
                     None,
                     &[],
@@ -2157,7 +2391,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_core_preserves_current_sublyx_user_max_without_affecting_openrouter() {
+    fn resolver_core_preserves_sublyx_native_max_without_affecting_openrouter() {
         let settings = json!({
             "modelCatalog": {
                 "models": [{
@@ -2215,7 +2449,12 @@ mod tests {
         use crate::proxy::providers::codex_reasoning::CodexReasoningEffort as Effort;
         assert!(projected.provider_accepted_efforts.contains(&Effort::Max));
         assert_eq!(projected.effort_map.get(&Effort::Max), Some(&Effort::Max));
+        assert!(!projected.codex_ultra_orchestration_enabled);
         assert!(!projected.codex_selectable_efforts.contains(&Effort::Ultra));
+        // The resolver retains a nearest-native compatibility map for stale
+        // requested tokens, independently of which controls the UI may expose.
+        // Such a map must not enable the synthetic Ultra product selector.
+        assert_eq!(projected.effort_map.get(&Effort::Ultra), Some(&Effort::Max));
 
         // Platform identity, not the model suffix, controls normalization.
         let openrouter = resolve_codex_model_capability_core(
@@ -2233,6 +2472,7 @@ mod tests {
             .iter()
             .any(|effort| effort == "max"));
         assert_eq!(openrouter_capability.provider_key, None);
+        assert_eq!(openrouter_capability, capability, "a complete manual declaration is not widened or given a synthetic selector by either provider");
     }
 
     #[test]
@@ -2254,6 +2494,187 @@ mod tests {
         // 官方 GPT 走 OpenAI 顶层 reasoning_effort 字段，effort_map 用 identity。
         assert_eq!(capability.upstream.format, "string");
         assert_eq!(capability.upstream.parameter, "reasoning_effort");
+    }
+
+    #[test]
+    fn resolver_core_shared_official_cache_cannot_add_controls_to_unknown_relay_models() {
+        for model in [
+            "claude-fable-5-1",
+            "xiaomi/mimo-v2.6-flash",
+            "future-relay-model",
+        ] {
+            let cache = vec![json!({
+                "slug": model,
+                "supported_reasoning_levels": ["low", "high"],
+                "default_reasoning_level": "high"
+            })];
+            for settings in [
+                json!({}),
+                json!({"base_url": "https://relay.example/v1", "providerName": "OpenAI Official"}),
+                json!({"config": "model_provider = \"official\"\n[model_providers.official]\nname = \"OpenAI Official\"\nbase_url = \"https://relay.example/v1\""}),
+            ] {
+                let resolved =
+                    resolve_codex_model_capability_core(&settings, None, model, None, None, &cache);
+                assert_eq!(resolved.source, CapabilitySource::Unknown, "{model}");
+                assert!(
+                    resolved.capability.is_none(),
+                    "relay/cache identity is not native capability evidence: {model}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolver_core_official_cache_allows_future_names_only_on_safe_native_transport() {
+        let model = "future-official-model";
+        let cache = vec![json!({
+            "slug": model, "supported_reasoning_levels": ["low", "high"],
+            "default_reasoning_level": "high"
+        })];
+        for base_url in [
+            "https://api.openai.com/v1",
+            "https://chatgpt.com/backend-api/codex",
+            "https://chat.openai.com/backend-api/codex/responses",
+        ] {
+            let resolved = resolve_codex_model_capability_core(
+                &json!({"base_url": base_url}),
+                None,
+                model,
+                None,
+                None,
+                &cache,
+            );
+            assert_eq!(resolved.source, CapabilitySource::Official, "{base_url}");
+            assert_eq!(
+                resolved
+                    .capability
+                    .expect("native cache evidence")
+                    .supported_efforts,
+                ["low", "high"]
+            );
+        }
+        let selected_native = json!({"config": "model_provider = \"native\"\n[model_providers.native]\nbase_url = \"https://api.openai.com/v1\"\n[model_providers.relay]\nbase_url = \"https://relay.example/v1\""});
+        assert_eq!(
+            resolve_codex_model_capability_core(&selected_native, None, model, None, None, &cache)
+                .source,
+            CapabilitySource::Official,
+            "the selected TOML transport owns native provenance"
+        );
+        let selected_relay = json!({"config": "model_provider = \"relay\"\n[model_providers.native]\nbase_url = \"https://api.openai.com/v1\"\n[model_providers.relay]\nbase_url = \"https://relay.example/v1\""});
+        assert_eq!(
+            resolve_codex_model_capability_core(&selected_relay, None, model, None, None, &cache)
+                .source,
+            CapabilitySource::Unknown,
+            "an inactive OpenAI table cannot authorize a relay's models"
+        );
+        for base_url in [
+            "http://api.openai.com/v1",
+            "https://api.openai.com.evil.example/v1",
+            "https://api.openai.com:444/v1",
+            "https://user@api.openai.com/v1",
+            "https://api.openai.com/v1?scope=other",
+            "https://api.openai.com/v1#other",
+            "https://chatgpt.com/not-codex",
+        ] {
+            let resolved = resolve_codex_model_capability_core(
+                &json!({"base_url": base_url}),
+                None,
+                model,
+                None,
+                None,
+                &cache,
+            );
+            assert_eq!(
+                resolved.source,
+                CapabilitySource::Unknown,
+                "unsafe or foreign transport must not authorize cache evidence"
+            );
+            assert!(resolved.capability.is_none());
+        }
+    }
+
+    #[test]
+    fn resolver_core_explicit_relay_reasoning_still_overrides_shared_official_cache() {
+        let model = "claude-fable-5-1";
+        let settings = json!({
+            "base_url": "https://relay.example/v1",
+            "modelCatalog": {"models": [{"model": model, "reasoning": user_declared_reasoning()}]}
+        });
+        let cache = vec![json!({"slug": model, "supported_reasoning_levels": ["max"]})];
+        let resolved =
+            resolve_codex_model_capability_core(&settings, None, model, None, None, &cache);
+        assert_eq!(resolved.source, CapabilitySource::UserConfig);
+        assert_eq!(
+            resolved
+                .capability
+                .expect("explicit declaration")
+                .supported_efforts,
+            ["low", "high"]
+        );
+    }
+
+    #[test]
+    fn resolver_official_cache_keeps_openai_families_and_public_alias_wire_bindings() {
+        for model in [
+            "gpt-future",
+            "chatgpt-future",
+            "codex-future",
+            "o1",
+            "o12-future",
+        ] {
+            let cache = vec![json!({
+                "slug": model, "supported_reasoning_levels": ["low", "high"],
+                "default_reasoning_level": "high"
+            })];
+            let settings = json!({
+                "base_url": "https://relay.example/v1",
+                "modelCatalog": {"models": [{"model": "friendly-label", "upstreamModel": model}]}
+            });
+            let resolved = resolve_codex_model_capability_for_settings(
+                &settings,
+                None,
+                None,
+                "friendly-label",
+                None,
+                &cache,
+                |_| None,
+            );
+            assert_eq!(resolved.source, CapabilitySource::Official, "{model}");
+            assert_eq!(
+                resolved
+                    .capability
+                    .expect("wire-bound cache evidence")
+                    .supported_efforts,
+                ["low", "high"]
+            );
+        }
+        let cache = vec![json!({"slug": "o1foreign", "supported_reasoning_levels": ["high"]})];
+        let resolved =
+            resolve_codex_model_capability_core(&json!({}), None, "o1foreign", None, None, &cache);
+        assert_eq!(
+            resolved.source,
+            CapabilitySource::Unknown,
+            "OpenAI family prefixes require a token boundary"
+        );
+    }
+
+    #[test]
+    fn resolver_core_official_cache_gate_follows_wire_binding_not_a_public_gpt_alias() {
+        let settings = json!({
+            "base_url": "https://relay.example/v1",
+            "modelCatalog": {"models": [{"model": "gpt-menu-alias", "upstreamModel": "claude-fable-5-1"}]}
+        });
+        let cache = vec![json!({"slug": "gpt-menu-alias", "supported_reasoning_levels": ["high"]})];
+        let resolved = resolve_codex_model_capability_core(
+            &settings,
+            None,
+            "gpt-menu-alias",
+            None,
+            None,
+            &cache,
+        );
+        assert_eq!(resolved.source, CapabilitySource::Unknown);
+        assert!(resolved.capability.is_none());
     }
 
     #[test]
@@ -2288,6 +2709,115 @@ mod tests {
         );
         assert_eq!(resolved.source, CapabilitySource::Unknown);
         assert!(resolved.capability.is_none());
+    }
+
+    #[test]
+    fn resolver_static_fallbacks_builtin_follows_current_wire_binding_not_public_name() {
+        for platform in [None, Some("deepseek")] {
+            for public_model in ["deepseek-v4-pro", "gpt-6.1-sol"] {
+                let settings = json!({
+                    "base_url": "https://relay.example/v1",
+                    "modelCatalog": {"models": [{
+                        "model": public_model, "upstreamModel": "claude-fable-5-1"
+                    }]}
+                });
+                let resolved = resolve_codex_model_capability_core(
+                    &settings,
+                    platform,
+                    public_model,
+                    None,
+                    None,
+                    &[],
+                );
+                assert_eq!(resolved.source, CapabilitySource::Unknown, "{public_model}");
+                assert!(
+                    resolved.capability.is_none(),
+                    "a known public alias must not lend its contract to another wire model"
+                );
+            }
+            let settings = json!({
+                "base_url": "https://api.deepseek.com/v1",
+                "modelCatalog": {"models": [{
+                    "model": "friendly-model", "upstreamModel": "deepseek-v4-pro"
+                }]}
+            });
+            let resolved = resolve_codex_model_capability_core(
+                &settings,
+                platform,
+                "friendly-model",
+                None,
+                None,
+                &[],
+            );
+            assert_eq!(resolved.source, CapabilitySource::Builtin);
+            let capability = resolved
+                .capability
+                .expect("maintained wire-model capability");
+            assert_eq!(capability.supported_efforts, ["low", "high", "max"]);
+            assert_eq!(capability.upstream.parameter, "reasoning_effort");
+        }
+        let settings = json!({"modelCatalog": {"models": [{
+            "model": "deepseek-v4-pro", "upstreamModel": "k3"
+        }]}});
+        let resolved = resolve_codex_model_capability_core(
+            &settings,
+            Some("deepseek"),
+            "deepseek-v4-pro",
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(
+            resolved.source,
+            CapabilitySource::Unknown,
+            "the official DeepSeek scope cannot authorize another vendor's builtin by alias"
+        );
+    }
+
+    #[test]
+    fn resolver_static_fallbacks_official_cache_uses_wire_contract_not_public_gpt_identity() {
+        let public_model = "gpt-5.5";
+        let wire_model = "gpt-5.6-sol";
+        let cache = vec![
+            json!({
+                "slug": public_model, "supported_reasoning_levels": ["low"],
+                "default_reasoning_level": "low"
+            }),
+            json!({
+                "slug": wire_model, "supported_reasoning_levels": ["high", "xhigh"],
+                "default_reasoning_level": "xhigh"
+            }),
+        ];
+        for public_alias in [public_model, "friendly-public-label"] {
+            let settings = json!({
+                "base_url": "https://relay.example/v1",
+                "modelCatalog": {"models": [{
+                    "model": public_alias, "upstreamModel": wire_model
+                }]}
+            });
+            let resolved = resolve_codex_model_capability_core(
+                &settings,
+                None,
+                public_alias,
+                None,
+                None,
+                &cache,
+            );
+            assert_eq!(
+                resolved.source,
+                CapabilitySource::Official,
+                "{public_alias}"
+            );
+            let capability = resolved
+                .capability
+                .expect("actual wire model cache evidence");
+            assert_eq!(
+                capability.supported_efforts,
+                ["high", "xhigh"],
+                "the public name must never select another model's cache contract"
+            );
+            assert_eq!(capability.default_effort.as_deref(), Some("xhigh"));
+        }
     }
 
     #[test]
@@ -2409,6 +2939,40 @@ default_reasoning_level = "high"
     }
 
     #[test]
+    fn sublyx_active_inline_subset_survives_provider_normalization() {
+        let settings = json!({
+            "base_url": "https://api.sublyx.org/v1",
+            "modelCatalog": {"models": [{"model": "gpt-6.1-sol"}]},
+            "config": r#"
+model_provider = "active"
+[model_providers.active]
+base_url = "https://api.sublyx.org/v1"
+[[model_providers.active.models]]
+id = "gpt-6.1-sol"
+supported_reasoning_levels = ["low", "high"]
+default_reasoning_level = "high"
+"#
+        });
+        let resolved = resolve_codex_model_capability_core(
+            &settings,
+            Some("sublyx"),
+            "gpt-6.1-sol",
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(resolved.source, CapabilitySource::ProviderConfig);
+        let capability = resolved
+            .capability
+            .expect("active explicit inline declaration");
+        assert_eq!(capability.supported_efforts, ["low", "high"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("high"));
+        assert_eq!(capability.upstream.format, "string");
+        assert_eq!(capability.upstream.parameter, "reasoning_effort");
+        assert!(capability.codex_ultra_orchestration.is_none());
+    }
+
+    #[test]
     fn resolver_does_not_guess_an_active_inline_provider() {
         for config in [
             r#"
@@ -2464,7 +3028,7 @@ supported_reasoning_levels = ["max"]
     #[test]
     fn ultra_overlay_follows_catalog_authority_and_identity_aliases() {
         let entry = json!({
-            "model": "public-model", "aliases": ["gpt-5.4"],
+            "model": "public-model", "upstreamModel": "gpt-5.4", "aliases": ["gpt-5.4"],
             "codexUltra": {"enabled": true, "providerEffort": "high"}
         });
         let mut settings = json!({"model_catalog": {"models": [entry]}});

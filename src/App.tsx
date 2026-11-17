@@ -85,7 +85,11 @@ import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SettingsPage } from "@/components/settings/SettingsPage";
 import { LanguageSwitcher } from "@/components/settings/LanguageSwitcher";
-import { OPEN_SETTINGS_TAB_EVENT } from "@/lib/settingsNavigation";
+import {
+  normalizeSettingsTab,
+  OPEN_SETTINGS_TAB_EVENT,
+  type SettingsTab,
+} from "@/lib/settingsNavigation";
 import { UpdateBadge } from "@/components/UpdateBadge";
 import { CCSWITCHMULTI_REPOSITORY_URL } from "@/config/productLinks";
 import { EnvWarningBanner } from "@/components/env/EnvWarningBanner";
@@ -367,7 +371,10 @@ function App() {
   const [currentView, setCurrentView] = useState<View>(getInitialView);
   const [skillsDiscoverySource, setSkillsDiscoverySource] =
     useState<SkillsPageSource>("repos");
-  const [settingsDefaultTab, setSettingsDefaultTab] = useState("general");
+  const [settingsDefaultTab, setSettingsDefaultTab] =
+    useState<SettingsTab>("general");
+  const [settingsNavigationRevision, setSettingsNavigationRevision] =
+    useState(0);
   const [codexRouterWorkspaceTarget, setCodexRouterWorkspaceTarget] = useState<{
     providerId?: string | null;
     tab: WorkspaceTab;
@@ -958,7 +965,8 @@ function App() {
     const openSettingsTab = (event: Event) => {
       const tab = (event as CustomEvent<{ tab?: string }>).detail?.tab;
       setEditingProvider(null);
-      setSettingsDefaultTab(tab || "general");
+      setSettingsDefaultTab(normalizeSettingsTab(tab));
+      setSettingsNavigationRevision((revision) => revision + 1);
       setCurrentView("settings");
     };
     window.addEventListener(OPEN_SETTINGS_TAB_EVENT, openSettingsTab);
@@ -1470,6 +1478,7 @@ function App() {
               onOpenChange={() => setCurrentView("providers")}
               onImportSuccess={handleImportSuccess}
               defaultTab={settingsDefaultTab}
+              navigationRevision={settingsNavigationRevision}
             />
           );
         case "prompts":

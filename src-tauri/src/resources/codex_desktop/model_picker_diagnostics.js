@@ -14,6 +14,15 @@ const codexPickerDataArray = (value) => {
     throw new Error("unreadable_picker_array");
   return Array.from({ length }, (_, index) => codexPickerOwnData(value, index));
 };
+// Match the bounded monitor allowlist so legitimate public aliases such as
+// ~deepseek/... survive both diagnostic boundaries without admitting secrets.
+const codexPickerModelIdentityIsSafe = (value) =>
+  typeof value === "string" &&
+  value.length <= 256 &&
+  /^~?[A-Za-z0-9][A-Za-z0-9._/:@+ -]*$/.test(value) &&
+  !value.includes("://") &&
+  !/^~?(?:sk|rk|pk)[-_]/i.test(value) &&
+  !/(?:api_key|apikey|token|secret)=/i.test(value);
 const codexPickerModelSnapshot = (model) => {
   const snapshot = Object.create(null);
   for (const key of [
@@ -43,7 +52,32 @@ const codexPickerModelSnapshot = (model) => {
   }
   return snapshot;
 };
-const codexModelPickerDiagnostics = () => {
+const codexModelPickerDiagnostics = (options) => {
+  let includeModelObservations = false;
+  try {
+    includeModelObservations =
+      codexPickerOwnData(options, "includeModelObservations") === true;
+  } catch {}
+  // Opt-in, bounded evidence from the same current-owner inspection below.
+  // A successful native query row is not proof of a mounted/visible menu.
+  const modelObservations = includeModelObservations
+    ? {
+        renderedMenuVerified: false,
+        queryRowsVerified: false,
+        truncated: false,
+        unavailable: false,
+        unavailableReasons: [],
+        rows: [],
+      }
+    : null;
+  const observationReasons = new Set();
+  const observedRows = new Set();
+  const observationUnavailable = (reason) => {
+    if (modelObservations) observationReasons.add(reason);
+  };
+  const observationEffortIsSafe = (effort) =>
+    CODEX_NATIVE_REASONING_EFFORTS.has(effort) || effort === "ultra";
+
   const diagnostics = {
     status: "pending",
     pickerObserverCount: 0,
@@ -53,6 +87,8 @@ const codexModelPickerDiagnostics = () => {
     unsupportedObserverCount: 0,
     unreadableObserverCount: 0,
     nativeVisibilityUnverifiedObserverCount: 0,
+    booleanControlUnverifiedModelCount: 0,
+    booleanControlReadyModelCount: 0,
     effortMismatchCount: 0,
     flagMismatchCount: 0,
     missingMaxModelCount: 0,
@@ -60,12 +96,25 @@ const codexModelPickerDiagnostics = () => {
     selectedMaxModelCount: 0,
     selectedUltraModelCount: 0,
   };
+  const finishDiagnostics = () => {
+    if (modelObservations) {
+      if (!modelObservations.rows.length)
+        observationUnavailable("no_verified_query_rows");
+      modelObservations.unavailableReasons = [...observationReasons];
+      modelObservations.unavailable = observationReasons.size > 0;
+      modelObservations.queryRowsVerified =
+        modelObservations.rows.length > 0 && !modelObservations.unavailable;
+      diagnostics.modelObservations = modelObservations;
+    }
+    return diagnostics;
+  };
   const catalog = currentPayload();
   // An unavailable catalog cannot establish picker compatibility. In contrast,
   // an explicit available empty catalog deliberately has no models to select.
   if (catalog.catalogAvailable !== true) {
     diagnostics.status = "unverified";
-    return diagnostics;
+    observationUnavailable("catalog_unavailable");
+    return finishDiagnostics();
   }
   const authoritativeEmptyCatalog =
     Array.isArray(catalog.modelNames) && catalog.modelNames.length === 0;
@@ -75,6 +124,8 @@ const codexModelPickerDiagnostics = () => {
   const missingUltra = new Set();
   const selectedMax = new Set();
   const selectedUltra = new Set();
+  const booleanReadyModels = new Set();
+  const booleanUnverifiedModels = new Set();
   // Keep old hooks for orderly release, but a complete current owner snapshot
   // can exclude orphaned cache observers from readiness after navigation. An
   // incomplete/unloaded snapshot is unknown, never an authoritative empty set.
@@ -83,9 +134,18 @@ const codexModelPickerDiagnostics = () => {
     typeof codexCurrentNativeReasoningQueryCaches === "function"
       ? codexCurrentNativeReasoningQueryCaches()
       : null;
+  if (modelObservations && !currentNativeCaches)
+    observationUnavailable("native_owner_unverified");
   for (const cache of state.reasoningQueryCaches?.keys() || []) {
     if (currentNativeCaches && !currentNativeCaches.has(cache)) continue;
-    let nativeVisibility = { status: "not_required", missingEfforts: [] };
+    let nativeVisibility = {
+      status:
+        state.nativeReasoningVisibilityRequired === true &&
+        !authoritativeEmptyCatalog
+          ? "unverified"
+          : "not_required",
+      missingEfforts: [],
+    };
     let nativeHiddenEfforts = new Set();
     let queries;
     try {
@@ -95,6 +155,7 @@ const codexModelPickerDiagnostics = () => {
       if (!queries) throw new Error("unreadable_picker_cache");
     } catch {
       diagnostics.unreadableObserverCount += 1;
+      observationUnavailable("unreadable_picker_evidence");
       continue;
     }
     const hasManagedQuery = queries.some((query) => {
@@ -114,19 +175,22 @@ const codexModelPickerDiagnostics = () => {
       // A null current-owner snapshot is unknown, never permission to trust an
       // older cache. Avoid reading the native signal at all for caches with no
       // managed local picker query (remote/empty owners remain Pending).
-      if (currentNativeCaches === null) {
-        diagnostics.nativeVisibilityUnverifiedObserverCount += 1;
-      } else if (typeof readCodexNativeReasoningVisibility === "function") {
+      if (
+        currentNativeCaches !== null &&
+        typeof readCodexNativeReasoningVisibility === "function"
+      ) {
         try {
-          const efforts = Array.from(
-            new Set(
-              modelNames().flatMap((model) =>
-                (descriptorFor(model).supportedReasoningEfforts || []).map(
-                  (level) => level.reasoningEffort,
+          const efforts = modelObservations
+            ? [...CODEX_NATIVE_REASONING_EFFORTS, "ultra"]
+            : Array.from(
+                new Set(
+                  modelNames().flatMap((model) =>
+                    (descriptorFor(model).supportedReasoningEfforts || []).map(
+                      (level) => level.reasoningEffort,
+                    ),
+                  ),
                 ),
-              ),
-            ),
-          );
+              );
           nativeVisibility = readCodexNativeReasoningVisibility(cache, efforts);
         } catch {}
       }
@@ -143,6 +207,7 @@ const codexModelPickerDiagnostics = () => {
         if (!observers) throw new Error("unreadable_picker_observers");
       } catch {
         diagnostics.unreadableObserverCount += 1;
+        observationUnavailable("unreadable_picker_evidence");
         continue;
       }
       for (const observer of observers) {
@@ -164,10 +229,12 @@ const codexModelPickerDiagnostics = () => {
           const status = codexPickerOwnData(result, "status");
           if (status === "error") {
             diagnostics.errorObserverCount += 1;
+            observationUnavailable("picker_query_error");
             continue;
           }
           if (status !== "success") {
             diagnostics.pendingObserverCount += 1;
+            observationUnavailable("picker_query_pending");
             continue;
           }
           diagnostics.successObserverCount += 1;
@@ -177,12 +244,16 @@ const codexModelPickerDiagnostics = () => {
           );
           if (!models) {
             diagnostics.unsupportedObserverCount += 1;
+            observationUnavailable("unsupported_picker_selection");
             continue;
           }
           if (!models.length && modelNames().length) {
             diagnostics.pendingObserverCount += 1;
+            observationUnavailable("picker_query_pending");
             continue;
           }
+          if (modelObservations && nativeVisibility.status !== "known")
+            observationUnavailable("native_visibility_unverified");
           if (nativeVisibility.status === "unverified")
             diagnostics.nativeVisibilityUnverifiedObserverCount += 1;
           let hasMax = false;
@@ -196,10 +267,49 @@ const codexModelPickerDiagnostics = () => {
               !modelNames().includes(row.model)
             ) {
               unsupported = true;
+              observationUnavailable("unsupported_picker_selection");
               continue;
             }
+            const descriptor = descriptorFor(row.model);
+            const control = descriptor.ccSwitchReasoningControl;
+            if (control?.kind === "boolean") {
+              try {
+                const readControl = codexPickerOwnData(
+                  state,
+                  "readNativeBooleanReasoningControlDiagnostics",
+                );
+                const proof =
+                  typeof readControl === "function"
+                    ? readControl(row.model)
+                    : null;
+                const visibleStates = codexPickerDataArray(
+                  codexPickerOwnData(proof, "visibleStates"),
+                );
+                const selectedState = codexPickerOwnData(
+                  proof,
+                  "selectedState",
+                );
+                const binaryUiReady =
+                  codexPickerOwnData(proof, "status") === "ready" &&
+                  codexPickerOwnData(proof, "model") === row.model &&
+                  (selectedState === "on" ||
+                    (control.disableAllowed && selectedState === "off")) &&
+                  Array.isArray(visibleStates) &&
+                  JSON.stringify(visibleStates) ===
+                    JSON.stringify(
+                      control.disableAllowed ? ["off", "on"] : ["on"],
+                    );
+                if (binaryUiReady) booleanReadyModels.add(row.model);
+                else booleanUnverifiedModels.add(row.model);
+              } catch (error) {
+                // An unreadable later proof must not leave a previous observer's
+                // positive result counted as current control readiness.
+                booleanUnverifiedModels.add(row.model);
+                throw error;
+              }
+            }
             const expected = new Set(
-              (descriptorFor(row.model).supportedReasoningEfforts || []).map(
+              (descriptor.supportedReasoningEfforts || []).map(
                 (level) => level.reasoningEffort,
               ),
             );
@@ -214,11 +324,62 @@ const codexModelPickerDiagnostics = () => {
               else actual.add(effort.trim());
             }
             if (
+              modelObservations &&
+              currentNativeCaches?.has(cache) &&
+              nativeVisibility.status === "known"
+            ) {
+              const modelIdentity = row.model;
+              const canonicalExpected =
+                control?.kind === "boolean" ? [] : [...expected];
+              const observedEfforts = [...actual];
+              if (
+                invalid ||
+                !codexPickerModelIdentityIsSafe(modelIdentity) ||
+                !canonicalExpected.every(observationEffortIsSafe) ||
+                !observedEfforts.every(observationEffortIsSafe)
+              ) {
+                observationUnavailable("invalid_model_observation");
+              } else {
+                const nativeVisibleEfforts = observedEfforts.filter(
+                  (effort) => !nativeHiddenEfforts.has(effort),
+                );
+                const observation = {
+                  model: modelIdentity,
+                  expectedEfforts: canonicalExpected,
+                  observedEfforts,
+                  nativeVisibleEfforts,
+                  missingEfforts: canonicalExpected.filter(
+                    (effort) =>
+                      !actual.has(effort) || nativeHiddenEfforts.has(effort),
+                  ),
+                };
+                const identity = JSON.stringify(observation);
+                if (!observedRows.has(identity)) {
+                  if (modelObservations.rows.length < 64) {
+                    observedRows.add(identity);
+                    modelObservations.rows.push(observation);
+                  } else {
+                    modelObservations.truncated = true;
+                    observationUnavailable("row_limit");
+                  }
+                }
+              }
+            }
+            if (
               invalid ||
               actual.size !== expected.size ||
               [...expected].some(
                 (effort) =>
-                  !actual.has(effort) || nativeHiddenEfforts.has(effort),
+                  !actual.has(effort) ||
+                  (nativeHiddenEfforts.has(effort) &&
+                    // Binary transport aliases are not graded levels. Their
+                    // presence is still checked strictly; missing independent
+                    // UI proof remains Unverified through the Boolean counters
+                    // above, not a fabricated graded-preference mismatch.
+                    !(
+                      control?.kind === "boolean" &&
+                      ["none", "medium"].includes(effort)
+                    )),
               )
             )
               mismatches.add(row.model);
@@ -254,6 +415,7 @@ const codexModelPickerDiagnostics = () => {
           }
         } catch {
           diagnostics.unreadableObserverCount += 1;
+          observationUnavailable("unreadable_picker_evidence");
         }
       }
     }
@@ -263,18 +425,25 @@ const codexModelPickerDiagnostics = () => {
   diagnostics.missingUltraModelCount = missingUltra.size;
   diagnostics.selectedMaxModelCount = selectedMax.size;
   diagnostics.selectedUltraModelCount = selectedUltra.size;
+  diagnostics.booleanControlUnverifiedModelCount = booleanUnverifiedModels.size;
+  // Proofs remain per observer; counts are per canonical public model. Any
+  // uncertain proof wins regardless of observer order, never last-proof-wins.
+  diagnostics.booleanControlReadyModelCount = [...booleanReadyModels].filter(
+    (model) => !booleanUnverifiedModels.has(model),
+  ).length;
   if (diagnostics.errorObserverCount) diagnostics.status = "error";
   else if (diagnostics.effortMismatchCount || diagnostics.flagMismatchCount)
     diagnostics.status = "mismatch";
   else if (
     diagnostics.unreadableObserverCount ||
     diagnostics.unsupportedObserverCount ||
-    diagnostics.nativeVisibilityUnverifiedObserverCount
+    diagnostics.nativeVisibilityUnverifiedObserverCount ||
+    diagnostics.booleanControlUnverifiedModelCount
   )
     diagnostics.status = "unverified";
   else if (authoritativeEmptyCatalog && !diagnostics.successObserverCount)
     diagnostics.status = "not_required";
   else if (diagnostics.pickerObserverCount && !diagnostics.pendingObserverCount)
     diagnostics.status = "ready";
-  return diagnostics;
+  return finishDiagnostics();
 };

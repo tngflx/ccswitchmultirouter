@@ -75,7 +75,7 @@ const createHarness = (client = createClient()) => {
     "installationIsCurrent",
     "localStorage",
     "installAppServerPatch",
-    `${resource("client_discovery.js")}\n${renderer.slice(reactStart, reactEnd)}\n${continuation}\nreturn { patchReactAppServerClients, patchAppServerModuleClients, patchCodexScopedAppServerClients, current: codexContinuationClientIsCurrent };`,
+    `${resource("client_discovery.js")}\n${renderer.slice(reactStart, reactEnd)}\n${continuation}\nreturn { patchReactAppServerClients, patchAppServerModuleClients, patchCodexScopedAppServerClients, current: codexContinuationClientIsCurrent, snapshotCurrent: codexRendererScopeSnapshotIsCurrent };`,
   )(
     state,
     { getElementById: () => root, body: null, documentElement: null },
@@ -94,6 +94,7 @@ const createHarness = (client = createClient()) => {
     patchAppServerModuleClients: (module: object) => number;
     patchCodexScopedAppServerClients: (module: object) => Promise<number>;
     current: (client: object) => boolean;
+    snapshotCurrent: () => boolean;
   };
   return {
     state,
@@ -181,6 +182,70 @@ describe("Codex Desktop live request-client source ownership", () => {
     expect(h.api.current(h.client)).toBe(true);
     h.manager.requestClient = createClient();
     expect(h.api.current(h.client)).toBe(false);
+  });
+
+  it("authorizes its own request hook only while the exact nested scope binding stays mounted", async () => {
+    const h = createHarness();
+    const original = h.client.sendRequest;
+    const queryClient = {
+      getQueryCache: () => ({}),
+      getQueryData() {},
+      setQueryData() {},
+    };
+    const scope = {
+      chain: {},
+      node: { queryClient },
+      queryClient,
+      get: (_host: string) => h.manager,
+      set() {},
+      watch() {},
+    };
+    type Scope = typeof scope;
+    class Registry {
+      scope: Scope;
+      constructor(scope: Scope) {
+        this.scope = scope;
+      }
+      getForHostId(host: string) {
+        return this.scope.get(host);
+      }
+      getAll() {
+        return [];
+      }
+      getImplForHostId() {
+        return null;
+      }
+    }
+    const holder: { current: Scope | null } = { current: scope };
+    Object.assign(h.fiber.memoizedState, { holder });
+    await h.api.patchCodexScopedAppServerClients({ Registry });
+
+    // Installing our own request hook changes whole-inventory evidence, not
+    // this scope's exact committed path or current registry/client ownership.
+    expect(h.client.sendRequest).not.toBe(original);
+    expect(h.api.snapshotCurrent()).toBe(false);
+    expect(h.api.current(h.client)).toBe(true);
+    const owners = h.state.scopedAppServerClientOwners;
+    h.state.scopedAppServerClientOwners = null;
+    expect(h.api.current(h.client)).toBe(false);
+    h.state.scopedAppServerClientOwners = owners;
+    expect(h.api.current(h.client)).toBe(true);
+
+    // One bounded rediscovery incorporates the installed hook. Subsequent
+    // idempotent installation must reuse the complete inventory, not loop.
+    await h.api.patchCodexScopedAppServerClients({ Registry });
+    expect(h.api.snapshotCurrent()).toBe(true);
+    const scan = h.state.scopedAppServerScopeScan;
+    await h.api.patchCodexScopedAppServerClients({ Registry });
+    expect(h.state.scopedAppServerScopeScan).toBe(scan);
+    expect(h.api.snapshotCurrent()).toBe(true);
+    expect(h.api.current(h.client)).toBe(true);
+
+    // The root and manager/client remain live, but the scope's exact nested
+    // binding was detached. Revoke it immediately, without waiting to rescan.
+    holder.current = null;
+    expect(h.api.current(h.client)).toBe(false);
+    expect(h.api.snapshotCurrent()).toBe(false);
   });
 
   it("checks the exact legacy signal value before the next module discovery pass", () => {

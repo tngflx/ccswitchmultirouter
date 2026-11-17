@@ -1272,7 +1272,7 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
   });
 
-  it("can switch a complete sync to API-only enabled models without deleting inventory", async () => {
+  it("enables discovered inventory only through explicit catalog selection without deleting omitted rows", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "primary", ownedBy: null },
       { id: "fresh", ownedBy: null },
@@ -1284,21 +1284,24 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
-    await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: /Enable only synced models/ }),
-      ).toBeVisible(),
-    );
+    await waitFor(() => expect(latestCatalog()).toHaveLength(3));
     expect(latestCatalog()).toEqual([
       expect.objectContaining({ model: "primary" }),
       expect.objectContaining({ model: "other-key-model", enabled: false }),
       expect.objectContaining({ model: "fresh", enabled: false }),
     ]);
     expect(latestCatalog()[0].enabled).not.toBe(false);
+    expect(
+      screen.queryByRole("button", {
+        name: /Enable only synced models|^Replace catalog/,
+      }),
+    ).not.toBeInTheDocument();
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /Enable only synced models/ }),
-    );
+    // Sync owns inventory, not permission to include newly discovered models.
+    // The supported canonical table requires an explicit user selection.
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select primary" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select fresh" }));
+    fireEvent.click(screen.getByRole("button", { name: "Include selected" }));
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
         expect.objectContaining({ model: "primary", enabled: true }),
@@ -1310,39 +1313,364 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
   });
 
-  it("can explicitly replace the catalog from a complete sync", async () => {
+  it("enables only models with reasoning efforts from the fixed catalog action bar", async () => {
+    const reasoning: NonNullable<CodexCatalogModel["reasoning"]> = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: ["none", "low", "high"],
+      defaultEffort: "high",
+      disableAllowed: true,
+      upstream: { format: "string", parameter: "reasoning_effort" },
+      source: "user",
+    };
+    const noneOnly: NonNullable<CodexCatalogModel["reasoning"]> = {
+      supportedEfforts: ["none"],
+      disableAllowed: true,
+      upstream: { format: "none", parameter: "reasoning" },
+      source: "user",
+    };
+    const { latestCatalog, latestDefaultModel } = renderCatalogHarness(
+      [
+        {
+          model: "reasoning-model",
+          displayName: "My reasoning model",
+          enabled: false,
+          reasoning,
+        },
+        { model: "none-only-model", reasoning: noneOnly },
+        { model: "unknown-model" },
+      ],
+      { defaultModel: "unknown-model" },
+    );
+    await waitForReasoningResolution();
+
+    const toolbar = screen.getByRole("group", {
+      name: "Model selection actions",
+    });
+    expect(toolbar).toHaveClass("sticky", "bottom-0");
+    const action = within(toolbar).getByRole("button", {
+      name: "Enable only models with reasoning effort (1)",
+    });
+    const readiness = screen
+      .getByRole("heading", { name: "Models and compatibility" })
+      .closest("section");
+    expect(readiness).not.toBeNull();
+    expect(
+      within(readiness!).queryByRole("button", {
+        name: /Enable only models with reasoning effort/,
+      }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(action);
+
+    await waitFor(() => {
+      expect(latestCatalog()).toEqual([
+        expect.objectContaining({
+          model: "reasoning-model",
+          displayName: "My reasoning model",
+          enabled: true,
+          reasoning,
+        }),
+        expect.objectContaining({ model: "none-only-model", enabled: false }),
+        expect.objectContaining({ model: "unknown-model", enabled: false }),
+      ]);
+    });
+    expect(latestDefaultModel()).toBe("reasoning-model");
+    expect(within(toolbar).getByText("0 selected")).toBeVisible();
+    await waitForReasoningResolution();
+  });
+  it("refreshes the catalog without replacing curated inclusion, aliases, or default", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
-      { id: "fresh", ownedBy: null, contextWindow: 256000 },
+      { id: "wire-kept", ownedBy: null, contextWindow: 256000 },
+      { id: "wire-hidden", ownedBy: null, contextWindow: 512000 },
       { id: "new", ownedBy: null },
     ]);
-    const { latestCatalog } = renderCatalogHarness([
-      { model: "old", displayName: "Old custom label" },
-      { model: "kept", enabled: false },
-    ]);
+    const { latestCatalog, latestDefaultModel } = renderCatalogHarness(
+      [
+        {
+          model: "favorite",
+          upstreamModel: "wire-kept",
+          displayName: "My chosen model",
+          aliases: ["my-public-alias"],
+          contextWindow: "128000",
+          enabled: true,
+        },
+        {
+          model: "hidden-favorite",
+          upstreamModel: "wire-hidden",
+          displayName: "My excluded model",
+          enabled: false,
+        },
+        { model: "removed", displayName: "Retained old model" },
+        {
+          model: "manual-only",
+          displayName: "Retained custom model",
+          enabled: false,
+        },
+      ],
+      { defaultModel: "favorite" },
+    );
     await waitForReasoningResolution();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
-    await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: /^Replace catalog/ }),
-      ).toBeVisible(),
-    );
-    expect(latestCatalog().some((model) => model.model === "old")).toBe(true);
+    await waitFor(() => expect(latestCatalog()).toHaveLength(5));
+    expect(latestCatalog()[0].enabled).toBe(true);
+    expect(
+      latestCatalog()
+        .slice(1)
+        .every((row) => row.enabled === false),
+    ).toBe(true);
 
-    fireEvent.click(screen.getByRole("button", { name: /^Replace catalog/ }));
-    const dialog = screen.getByRole("dialog");
-    fireEvent.click(
-      within(dialog).getByRole("button", { name: "Replace catalog" }),
-    );
+    expect(
+      screen.queryByRole("button", {
+        name: /Enable only synced models|^Replace catalog/,
+      }),
+    ).not.toBeInTheDocument();
     await waitFor(() => {
-      expect(latestCatalog().map((model) => model.model)).toEqual([
-        "fresh",
-        "new",
+      expect(latestCatalog()).toEqual([
+        expect.objectContaining({
+          model: "favorite",
+          upstreamModel: "wire-kept",
+          displayName: "My chosen model",
+          aliases: ["my-public-alias"],
+          contextWindow: "256000",
+          enabled: true,
+        }),
+        expect.objectContaining({
+          model: "hidden-favorite",
+          upstreamModel: "wire-hidden",
+          displayName: "My excluded model",
+          enabled: false,
+        }),
+        expect.objectContaining({
+          model: "removed",
+          displayName: "Retained old model",
+          enabled: false,
+        }),
+        expect.objectContaining({
+          model: "manual-only",
+          displayName: "Retained custom model",
+          enabled: false,
+        }),
+        expect.objectContaining({ model: "new", enabled: false }),
       ]);
-      expect(latestCatalog().every((model) => model.enabled !== false)).toBe(
-        true,
-      );
     });
+    expect(fetchModelsForConfig).toHaveBeenCalledOnce();
+    expect(latestDefaultModel()).toBe("favorite");
+    await waitForReasoningResolution();
+  });
+
+  it("uses current exclusions and edits when an in-flight repeat sync completes", async () => {
+    const repeatedSync =
+      deferred<Array<{ id: string; ownedBy: null; contextWindow?: number }>>();
+    vi.mocked(fetchModelsForConfig)
+      .mockResolvedValueOnce([
+        { id: "wire-kept", ownedBy: null },
+        { id: "new", ownedBy: null },
+      ])
+      .mockReturnValueOnce(repeatedSync.promise);
+    const { latestCatalog, updateCatalog, latestDefaultModel } =
+      renderCatalogHarness(
+        [
+          {
+            model: "favorite",
+            upstreamModel: "wire-kept",
+            aliases: ["keep-this-alias"],
+            displayName: "Original label",
+            enabled: true,
+          },
+        ],
+        { defaultModel: "" },
+      );
+    await waitForReasoningResolution();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() => expect(latestCatalog()).toHaveLength(2));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Sync models" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(2));
+    await updateCatalog(
+      latestCatalog().map((row) => ({
+        ...row,
+        ...(row.model === "favorite"
+          ? { displayName: "Edited while sync is pending" }
+          : {}),
+        enabled: false,
+      })),
+    );
+    await waitForReasoningResolution();
+    expect(screen.getByText("No included models")).toBeVisible();
+    expect(
+      screen.queryByRole("button", {
+        name: /Enable only synced models|^Replace catalog/,
+      }),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      repeatedSync.resolve([
+        { id: "wire-kept", ownedBy: null, contextWindow: 256000 },
+        { id: "new", ownedBy: null },
+      ]);
+      await repeatedSync.promise;
+    });
+    await waitFor(() => {
+      expect(latestCatalog()).toEqual([
+        expect.objectContaining({
+          model: "favorite",
+          upstreamModel: "wire-kept",
+          aliases: ["keep-this-alias"],
+          displayName: "Edited while sync is pending",
+          contextWindow: "256000",
+          enabled: false,
+        }),
+        expect.objectContaining({ model: "new", enabled: false }),
+      ]);
+    });
+    expect(latestDefaultModel()).toBe("");
+    expect(screen.getByText("No included models")).toBeVisible();
+    await waitForReasoningResolution();
+  });
+
+  it("preserves manually included custom and missing models when a later sync fails", async () => {
+    vi.mocked(fetchModelsForConfig)
+      .mockResolvedValueOnce([
+        { id: "wire-kept", ownedBy: null },
+        { id: "new", ownedBy: null },
+      ])
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce([
+        { id: "wire-kept", ownedBy: null },
+        { id: "new", ownedBy: null },
+      ]);
+    const { latestCatalog, updateCatalog, latestDefaultModel } =
+      renderCatalogHarness(
+        [
+          { model: "favorite", upstreamModel: "wire-kept", enabled: true },
+          { model: "missing", enabled: true },
+        ],
+        { defaultModel: "favorite" },
+      );
+    await waitForReasoningResolution();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() => {
+      expect(latestCatalog()).toEqual([
+        expect.objectContaining({ model: "favorite", enabled: true }),
+        expect.objectContaining({ model: "missing", enabled: false }),
+        expect.objectContaining({ model: "new", enabled: false }),
+      ]);
+    });
+    await updateCatalog([
+      ...latestCatalog().map((row) =>
+        row.model === "missing" ? { ...row, enabled: true } : row,
+      ),
+      {
+        model: "custom-after-sync",
+        upstreamModel: "",
+        contextWindow: "",
+        displayName: "My manually included custom model",
+        aliases: ["custom-alias"],
+        enabled: true,
+      },
+    ]);
+    await waitForReasoningResolution();
+    expect(latestCatalog().filter((row) => row.enabled !== false)).toHaveLength(
+      3,
+    );
+    expect(
+      screen.queryByRole("button", {
+        name: /Enable only synced models|^Replace catalog/,
+      }),
+    ).not.toBeInTheDocument();
+    const beforeFailure = structuredClone(latestCatalog());
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Sync models" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Sync models" })).toBeEnabled(),
+    );
+    expect(latestCatalog()).toEqual(beforeFailure);
+
+    // A later successful, complete refresh is authoritative about remote
+    // availability, but it retains every row for editing. Restore explicit
+    // custom/missing inclusions through the canonical table, not a second
+    // Readiness replacement operation with a stale saved snapshot.
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(3));
+    await waitFor(() => {
+      expect(latestCatalog()).toEqual([
+        expect.objectContaining({ model: "favorite", enabled: true }),
+        expect.objectContaining({ model: "missing", enabled: false }),
+        expect.objectContaining({ model: "new", enabled: false }),
+        expect.objectContaining({
+          model: "custom-after-sync",
+          displayName: "My manually included custom model",
+          aliases: ["custom-alias"],
+          enabled: false,
+        }),
+      ]);
+    });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select missing" }));
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Select custom-after-sync" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Include selected" }));
+    await waitFor(() => expect(latestCatalog()).toEqual(beforeFailure));
+    expect(latestCatalog()).toEqual([
+      expect.objectContaining({ model: "favorite", enabled: true }),
+      expect.objectContaining({ model: "missing", enabled: true }),
+      expect.objectContaining({ model: "new", enabled: false }),
+      expect.objectContaining({
+        model: "custom-after-sync",
+        displayName: "My manually included custom model",
+        aliases: ["custom-alias"],
+        enabled: true,
+      }),
+    ]);
+    expect(latestDefaultModel()).toBe("favorite");
+    await waitForReasoningResolution();
+  });
+
+  it("keeps new inventory excluded across repeat syncs of an initially empty catalog", async () => {
+    vi.mocked(fetchModelsForConfig)
+      .mockResolvedValueOnce([{ id: "new", ownedBy: null }])
+      .mockResolvedValueOnce([
+        { id: "new", ownedBy: null, contextWindow: 256000 },
+      ]);
+    const { latestCatalog, latestDefaultModel } = renderCatalogHarness([], {
+      defaultModel: "",
+    });
+    await waitForReasoningResolution();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() => expect(latestCatalog()).toHaveLength(1));
+    expect(latestCatalog()[0].enabled).toBe(false);
+    expect(
+      screen.queryByRole("button", {
+        name: /Enable only synced models|^Replace catalog/,
+      }),
+    ).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Sync models" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      expect(latestCatalog()).toEqual([
+        expect.objectContaining({
+          model: "new",
+          contextWindow: "256000",
+          enabled: false,
+        }),
+      ]);
+    });
+    expect(latestDefaultModel()).toBe("");
+    expect(screen.getByText("No included models")).toBeVisible();
     await waitForReasoningResolution();
   });
 
@@ -1942,7 +2270,9 @@ describe("CodexFormFields local model routing", () => {
   ] as const)(
     "displays effective Ultra state for %s",
     async (_case, codexUltra, enabled) => {
-      const model = "gpt-shared";
+      // An explicit native Max target is valid for this maintained/audited
+      // model; an unknown GPT slug must not inherit that capability.
+      const model = "gpt-6.1-sol";
       reasoningApiMocks.resolve.mockImplementation(
         async (_settings, _provider, requestedModel) => {
           const resolution = createSupportedReasoningResolution(

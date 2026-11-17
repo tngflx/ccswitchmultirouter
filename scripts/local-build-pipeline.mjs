@@ -2,7 +2,6 @@ import {
   cpSync,
   existsSync,
   lstatSync,
-  readFileSync,
   readdirSync,
   rmSync,
   writeFileSync,
@@ -11,6 +10,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   assertLocalTauriCliVersion,
+  assertReleaseOutputRoot,
   assertUnlinkedDirectories,
   cleanupLocalReleaseCargoTarget,
   createLocalReleaseCargoTarget,
@@ -23,7 +23,6 @@ import {
 
 const SCRIPT_REPO = fileURLToPath(new URL("../", import.meta.url));
 const CURRENT_OWNER = "local-build-pipeline.mjs";
-const OUTPUT_OWNERS = new Set([CURRENT_OWNER, "local-build-pipeline.ps1"]);
 
 export function parseLocalBuildOptions(args) {
   const options = { outputDir: "", help: false };
@@ -52,46 +51,14 @@ export function resolveLocalProductionOutputRoot(repoRoot, requested = "") {
   );
 }
 
-function isInside(target, parent) {
-  const relative = path.relative(parent, target);
-  return (
-    relative === "" ||
-    (!relative.startsWith(`..${path.sep}`) &&
-      relative !== ".." &&
-      !path.isAbsolute(relative))
-  );
-}
-
-export function assertLocalProductionOutputRoot(repoRoot, outputRoot) {
-  const repo = path.resolve(repoRoot);
-  const output = path.resolve(outputRoot);
-  if (output === path.parse(output).root)
-    throw new Error("local production output must not be a filesystem root");
-  const allowed = path.join(repo, "output");
-  if (
-    isInside(repo, output) ||
-    (isInside(output, repo) &&
-      (!isInside(output, allowed) || path.relative(allowed, output) === ""))
-  ) {
-    throw new Error(
-      "local production output inside the repository must be a child of its output directory",
-    );
-  }
-  assertUnlinkedDirectories(output);
-  if (existsSync(output) && readdirSync(output).length > 0) {
-    let marker;
-    try {
-      marker = JSON.parse(
-        readFileSync(path.join(output, "LOCAL-BUILD.json"), "utf8"),
-      );
-    } catch {}
-    if (!OUTPUT_OWNERS.has(marker?.generatedBy)) {
-      throw new Error(
-        "local production output is not owned by this build pipeline; choose an empty output directory",
-      );
-    }
-  }
-  return output;
+// Output location and replacement ownership have one shared contract across
+// local builds and signed releases. LOCAL-BUILD.json is informational only.
+export function assertLocalProductionOutputRoot(
+  repoRoot,
+  outputRoot,
+  options = {},
+) {
+  return assertReleaseOutputRoot(repoRoot, outputRoot, options);
 }
 
 // Inputs may contain nested resources. Refuse links instead of following them
@@ -114,6 +81,7 @@ export function exportLocalProductionArtifacts(
   cargoTargetDir,
   outputRoot,
   {
+    environment = process.env,
     copy = cpSync,
     promote = replaceReleaseRootFromStage,
     now = () => new Date(),
@@ -121,7 +89,8 @@ export function exportLocalProductionArtifacts(
     warn = console.warn,
   } = {},
 ) {
-  const output = assertLocalProductionOutputRoot(repoRoot, outputRoot);
+  const context = { environment, cargoTargetDir };
+  const output = assertLocalProductionOutputRoot(repoRoot, outputRoot, context);
   const release = path.join(cargoTargetDir, "release");
   const executable = path.join(release, "cc-switch.exe");
   const bundle = path.join(release, "bundle");
@@ -155,8 +124,8 @@ export function exportLocalProductionArtifacts(
       `${JSON.stringify({ generatedBy: CURRENT_OWNER, generatedAt: now().toISOString(), updaterSigned: false }, null, 2)}\n`,
       "utf8",
     );
-    assertLocalProductionOutputRoot(repoRoot, output);
-    promote(stage, output);
+    assertLocalProductionOutputRoot(repoRoot, output, context);
+    promote(stage, output, { repoRoot, ...context, warn });
   } finally {
     // createReleaseStage owns this unique, validated sibling path.
     if (existsSync(stage)) {
@@ -223,7 +192,9 @@ export function invokeLocalProductionBuild(
   } = {},
 ) {
   const repo = path.resolve(repoRoot);
-  const output = assertLocalProductionOutputRoot(repo, outputRoot);
+  const output = assertLocalProductionOutputRoot(repo, outputRoot, {
+    environment,
+  });
   // Invoke the pinned package's JS entry point directly. No shell, global Tauri
   // binary, PowerShell script, or interpolated command string is involved.
   const cliPath = assertLocalTauriCliVersion(repo, { run, environment });
@@ -245,7 +216,10 @@ export function invokeLocalProductionBuild(
       ),
       "tauri build",
     );
-    return exportLocalProductionArtifacts(repo, target, output, exportOptions);
+    return exportLocalProductionArtifacts(repo, target, output, {
+      ...exportOptions,
+      environment,
+    });
   } finally {
     try {
       config?.remove();

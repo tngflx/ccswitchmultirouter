@@ -537,7 +537,10 @@ fn build_migration(
             .map(str::to_string),
         subagent_v2: legacy.get("subagentV2").cloned(),
         spawn_agent_models,
-        extensions: BTreeMap::new(),
+        extensions: legacy
+            .get("subagentReasoningEffort")
+            .map(|effort| BTreeMap::from([("subagentReasoningEffort".to_string(), effort.clone())]))
+            .unwrap_or_default(),
     };
     let mut migrated_router = router.clone();
     migrated_router.settings_config["codexRouting"] =
@@ -974,6 +977,61 @@ mod tests {
         route["match"]["models"] = json!([]);
         route["match"]["prefixes"] = json!(prefixes);
         route
+    }
+
+    #[test]
+    fn migration_preserves_subagent_reasoning_effort_and_saved_profiles() {
+        let provider = target();
+        let providers = [(provider.id.clone(), provider)].into_iter().collect();
+        let profiles = json!({
+            "schemaVersion": 2,
+            "selectionPolicy": "balanced",
+            "profiles": {
+                "scout": {
+                    "model": "qwen3.8",
+                    "enabled": false,
+                    "questionnaire": {
+                        "taskStrengths": ["repository_exploration"],
+                        "optimization": "balanced",
+                        "writeScope": "read_only",
+                        "preference": "eligible"
+                    },
+                    "reasoning": {"policy": "fixed", "effort": "max"}
+                }
+            }
+        });
+        for effort in [None, Some("profile"), Some("high"), Some("max")] {
+            let mut router = legacy_router(legacy_route(json!({
+                "apiFormat": "openai_responses",
+                "apiFormatSource": "provider",
+                "auth": {"source": "provider_config"}
+            })));
+            router.settings_config["codexRouting"]["subagentV2"] = profiles.clone();
+            if let Some(effort) = effort {
+                router.settings_config["codexRouting"]["subagentReasoningEffort"] = json!(effort);
+            }
+            let built = build_migration(&router, &providers).expect("build migration");
+            let routing = &built.migrated_router.settings_config["codexRouting"];
+            assert_eq!(
+                routing.get("subagentReasoningEffort"),
+                effort.map(|value| json!(value)).as_ref(),
+                "routing migration must preserve the reversible Sub-Agent policy"
+            );
+            assert_eq!(
+                routing["subagentV2"], profiles,
+                "migration must not replace the saved per-profile reasoning choices"
+            );
+            let crate::codex_multirouter::schema::CodexRoutingDocument::V2(reparsed) =
+                crate::codex_multirouter::schema::CodexRoutingDocument::parse(routing)
+                    .expect("parse migrated routing plan")
+            else {
+                panic!("expected schema v2 migration");
+            };
+            assert_eq!(
+                reparsed.extensions.get("subagentReasoningEffort"),
+                effort.map(|value| json!(value)).as_ref()
+            );
+        }
     }
 
     #[test]
