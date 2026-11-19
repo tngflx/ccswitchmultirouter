@@ -338,36 +338,38 @@ pub async fn discover_openrouter(provider: &Provider, model: &str) -> DiscoveryO
         return DiscoveryOutcome::Unavailable;
     }
 
-    let Ok(payload) = response.json::<Value>().await else {
+    let final_url = response.url().clone();
+    let Ok(body) = response.bytes().await else {
         return DiscoveryOutcome::Invalid;
     };
-    let Some(models) = payload.get("data").and_then(Value::as_array) else {
+    let Ok(body) = std::str::from_utf8(&body) else {
         return DiscoveryOutcome::Invalid;
     };
-
-    let normalized = wire_model.to_ascii_lowercase();
-    let entry = models.iter().find(|candidate| {
-        ["id", "canonical_slug", "slug"]
-            .into_iter()
-            .filter_map(|field| candidate.get(field).and_then(Value::as_str))
-            .any(|value| value.trim().eq_ignore_ascii_case(&normalized))
-    });
-
-    let Some(entry) = entry else {
-        // 端点可达但模型未列出：NotAdvertised（不是 Unavailable）。
-        return DiscoveryOutcome::NotAdvertised;
-    };
-
-    let Some(reasoning) = openrouter_reasoning_snapshot(entry) else {
-        return DiscoveryOutcome::NotAdvertised;
-    };
+    let reasoning =
+        match openrouter_catalog_reasoning_snapshot(body, &base, final_url.as_str(), &wire_model) {
+            Ok(Some(reasoning)) => reasoning,
+            Ok(None) => return DiscoveryOutcome::NotAdvertised,
+            Err(()) => return DiscoveryOutcome::Invalid,
+        };
 
     discovery_snapshot(provider, model, "openrouter_api", Some(reasoning))
         .map(DiscoveryOutcome::Found)
         .unwrap_or(DiscoveryOutcome::Invalid)
 }
 
-/// Both discovery paths use the same normalization before building a snapshot.
+fn openrouter_catalog_reasoning_snapshot(
+    body: &str,
+    base_url: &str,
+    models_url: &str,
+    wire_model: &str,
+) -> Result<Option<ReasoningCapabilitySnapshot>, ()> {
+    let entry = crate::services::model_fetch::openrouter_discovery_model_entry(
+        body, base_url, models_url, wire_model,
+    )?;
+    Ok(entry.as_ref().and_then(openrouter_reasoning_snapshot))
+}
+
+/// Detection and catalog refresh use the same per-model normalization.
 fn openrouter_reasoning_snapshot(entry: &Value) -> Option<ReasoningCapabilitySnapshot> {
     let capability = provider_reasoning_capability_from_model_entry(entry, true)?;
     let object = entry.as_object()?;
@@ -476,10 +478,6 @@ pub fn provider_reasoning_capability_from_model_entry(
         return None;
     }
 
-    let supported_efforts = match collect_effort_declaration(&scopes) {
-        Ok(value) => value,
-        Err(()) => return None,
-    };
     let supported_parameters = match collect_string_array_declaration(
         &scopes,
         &["supported_parameters", "supportedParameters"],
@@ -491,6 +489,8 @@ pub fn provider_reasoning_capability_from_model_entry(
         Ok(value) => value,
         Err(()) => return None,
     };
+    let supported_efforts =
+        collect_effort_declaration(&scopes, openrouter_contract, mandatory).ok()?;
     let has_explicit_controls = supported_efforts.is_some()
         || !supported_parameters.is_empty()
         || has_declared_key(
@@ -551,26 +551,27 @@ pub fn provider_reasoning_capability_from_model_entry(
         return build_boolean_or_unknown_capability(true, mandatory);
     }
 
-    if supported_efforts.is_none() {
-        if openrouter_contract
-            && supported_parameters
-                .iter()
-                .any(|parameter| matches!(parameter.as_str(), "reasoning" | "reasoning_effort"))
-        {
-            let efforts = if has_null_effort_declaration(&scopes) {
-                let mut efforts = ["max", "xhigh", "high", "medium", "low", "minimal"]
-                    .into_iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>();
-                if mandatory != Some(true) {
-                    efforts.push("none".to_string());
-                }
-                efforts
-            } else {
-                Vec::new()
-            };
+    let Some(efforts) = supported_efforts else {
+        let has_reasoning_parameters = supported_parameters
+            .iter()
+            .any(|parameter| matches!(parameter.as_str(), "reasoning" | "reasoning_effort"));
+        let has_gateway_controls = declared_reasoning_values
+            .iter()
+            .any(|value| value.is_object())
+            && has_declared_key(
+                &scopes,
+                &[
+                    "mandatory",
+                    "reasoningMandatory",
+                    "default_enabled",
+                    "defaultEnabled",
+                    "supports_max_tokens",
+                    "supportsMaxTokens",
+                ],
+            );
+        if openrouter_contract && (has_reasoning_parameters || has_gateway_controls) {
             return build_reasoning_capability(
-                efforts,
+                Vec::new(),
                 &scopes,
                 true,
                 Some("reasoning_object".to_string()),
@@ -582,9 +583,8 @@ pub fn provider_reasoning_capability_from_model_entry(
         } else {
             None
         };
-    }
+    };
 
-    let efforts = supported_efforts.expect("checked above");
     let format = lookup_wire_string(
         &scopes,
         &[
@@ -733,6 +733,8 @@ fn collect_string_array_declaration(
 
 fn collect_effort_declaration(
     scopes: &[&serde_json::Map<String, Value>],
+    openrouter_contract: bool,
+    mandatory: Option<bool>,
 ) -> Result<Option<Vec<String>>, ()> {
     let keys = [
         "supported_efforts",
@@ -746,12 +748,14 @@ fn collect_effort_declaration(
         "supportedReasoningEfforts",
     ];
     let mut found = None;
+    let mut gateway_vocabulary = false;
     for scope in scopes {
         for key in keys {
             let Some(value) = scope.get(key) else {
                 continue;
             };
             if value.is_null() {
+                gateway_vocabulary |= openrouter_contract;
                 continue;
             }
             let Some(items) = value.as_array() else {
@@ -801,27 +805,22 @@ fn collect_effort_declaration(
             found = Some(normalized);
         }
     }
-    Ok(found)
-}
-
-fn has_null_effort_declaration(scopes: &[&serde_json::Map<String, Value>]) -> bool {
-    [
-        "supported_efforts",
-        "supportedEfforts",
-        "supported_levels",
-        "supportedLevels",
-        "efforts",
-        "supported_reasoning_levels",
-        "supportedReasoningLevels",
-        "supported_reasoning_efforts",
-        "supportedReasoningEfforts",
-    ]
-    .iter()
-    .any(|key| {
-        scopes
-            .iter()
-            .any(|scope| scope.get(*key).is_some_and(Value::is_null))
-    })
+    if !gateway_vocabulary {
+        return Ok(found);
+    }
+    // OpenRouter uses an explicit null for every gateway effort; an omitted
+    // property does not announce effort selection. A second, finite list
+    // cannot silently replace that declaration.
+    if found.is_some() {
+        return Err(());
+    }
+    let mut efforts = ["max", "xhigh", "high", "medium", "low", "minimal"]
+        .map(ToString::to_string)
+        .to_vec();
+    if mandatory != Some(true) {
+        efforts.push("none".to_string());
+    }
+    Ok(Some(efforts))
 }
 
 fn has_declared_key(scopes: &[&serde_json::Map<String, Value>], keys: &[&str]) -> bool {
@@ -935,7 +934,7 @@ fn parse_canonical_provider_reasoning(value: &Value) -> Option<CodexModelReasoni
     Some(capability)
 }
 
-fn looks_like_canonical_reasoning(value: &Value) -> bool {
+pub(crate) fn looks_like_canonical_reasoning(value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
@@ -2002,6 +2001,67 @@ baseUrl = "https://api.sublyx.org/v1""#,
     }
 
     #[test]
+    fn openrouter_detection_uses_the_enriched_inventory_before_normalizing() {
+        let body = json!({
+            "data": [{
+                "id": "provider/selected-model",
+                "canonical_slug": "provider/canonical-model",
+                "supported_parameters": ["reasoning", "reasoning_effort"],
+                "reasoning": { "mandatory": false },
+            }],
+            "models": {
+                "provider/canonical-model": {
+                    "reasoning": {
+                        "supported_efforts": ["high", "medium", "low"],
+                        "default_effort": "medium",
+                    },
+                },
+            },
+        })
+        .to_string();
+
+        let snapshot = openrouter_catalog_reasoning_snapshot(
+            &body,
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/models",
+            "provider/selected-model",
+        )
+        .expect("valid complete inventory")
+        .expect("selected model advertised reasoning");
+
+        assert_eq!(snapshot.control_kind, Some(ReasoningControlKind::Graded));
+        assert_eq!(snapshot.supported_efforts, ["high", "medium", "low"]);
+        assert_eq!(snapshot.default_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn openrouter_detection_rejects_incomplete_or_out_of_scope_inventories() {
+        let base = "https://openrouter.ai/api/v1";
+        let models_url = "https://openrouter.ai/api/v1/models";
+        let model = "provider/model";
+        let body = r#"{"data":[{"id":"provider/model","supported_parameters":["reasoning"],"reasoning":{"mandatory":false,"supported_efforts":null}}]}"#;
+        assert!(openrouter_catalog_reasoning_snapshot(
+            body,
+            base,
+            "https://directory.example.test/api/v1/models",
+            model,
+        )
+        .is_err());
+        assert!(openrouter_catalog_reasoning_snapshot(
+            r#"{"data":[{"id":"provider/model"}],"has_more":true}"#,
+            base,
+            models_url,
+            model,
+        )
+        .is_err());
+        assert!(
+            openrouter_catalog_reasoning_snapshot(body, base, models_url, "missing-model")
+                .expect("valid complete inventory")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn openrouter_catalog_and_detection_paths_share_the_same_capability_fingerprint() {
         use crate::proxy::providers::codex_reasoning::capability_fingerprint;
         use crate::reasoning_capabilities::snapshot_to_capability;
@@ -2831,7 +2891,6 @@ baseUrl = "https://api.sublyx.org/v1""#,
         for mandatory in [false, true] {
             let entry = json!({
                 "id": "provider/model",
-                "supported_parameters": ["reasoning"],
                 "reasoning": {
                     "supported_efforts": null,
                     "default_effort": "max",
@@ -2859,6 +2918,21 @@ baseUrl = "https://api.sublyx.org/v1""#,
     }
 
     #[test]
+    fn openrouter_null_efforts_conflict_with_a_finite_declaration() {
+        let entry = json!({
+            "id": "provider/model",
+            "supported_parameters": ["reasoning"],
+            "supportedReasoningEfforts": ["high"],
+            "reasoning": {"supported_efforts": null, "mandatory": false}
+        });
+        assert!(openrouter_reasoning_capability_from_model_entry(&entry).is_none());
+        assert!(openrouter_reasoning_snapshot(&entry).is_none());
+        let generic = provider_reasoning_capability_from_model_entry(&entry, false)
+            .expect("generic provider null does not declare a gateway vocabulary");
+        assert_eq!(generic.supported_efforts, ["high"]);
+    }
+
+    #[test]
     fn openrouter_explicit_effort_allowlists_remain_exact_across_entry_points() {
         for efforts in [json!(["max", "high"]), json!([])] {
             let entry = json!({
@@ -2882,7 +2956,6 @@ baseUrl = "https://api.sublyx.org/v1""#,
     fn openrouter_omitted_efforts_preserve_budget_only_reasoning_without_graded_defaults() {
         let entry = json!({
             "id": "anthropic/model",
-            "supported_parameters": ["reasoning"],
             "reasoning": {
                 "mandatory": false,
                 "supports_max_tokens": true,
@@ -2912,7 +2985,6 @@ baseUrl = "https://api.sublyx.org/v1""#,
         for efforts in [None, Some(json!(["high", "low"])), Some(Value::Null)] {
             let mut entry = json!({
                 "id": "provider/model",
-                "supported_parameters": ["reasoning"],
                 "reasoning": {
                     "mandatory": false,
                     "default_effort": "none",

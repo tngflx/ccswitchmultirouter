@@ -59,6 +59,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import i18n from "@/i18n";
 import { confirmDialog } from "@/lib/dialog";
 import { Input } from "@/components/ui/input";
@@ -3339,8 +3340,10 @@ export function CodexRouterWorkspacePage({
   const [isApplyingMigration, setIsApplyingMigration] = useState(false);
   const [migrationError, setMigrationError] = useState<string | null>(null);
   const [routePickerSelectAll, setRoutePickerSelectAll] = useState(false);
-  const [optimisticRoutingPlan, setOptimisticRoutingPlan] =
-    useState<Provider | null>(null);
+  const [routingPlanOverlay, setRoutingPlanOverlay] = useState<{
+    baseline: Provider | null;
+    provider: Provider;
+  } | null>(null);
   const [optimisticModelSourcesById, setOptimisticModelSourcesById] = useState<
     Record<string, { baseline: Provider; provider: Provider }>
   >({});
@@ -3381,6 +3384,20 @@ export function CodexRouterWorkspacePage({
     }
   }
 
+  const optimisticRoutingPlan = useMemo(() => {
+    if (!routingPlanOverlay) return null;
+    const { provider, baseline } = routingPlanOverlay;
+    const persisted =
+      providers.find((entry) => entry.id === provider.id) ?? null;
+    // Never let an optimistic edit mask a newer persisted router, including
+    // a normalized readback that differs from the submitted provider.
+    const snapshot = JSON.stringify(persisted);
+    return snapshot === JSON.stringify(baseline) &&
+      snapshot !== JSON.stringify(provider)
+      ? provider
+      : null;
+  }, [providers, routingPlanOverlay]);
+
   const effectiveProviders = useMemo(() => {
     const optimisticSourceEntries = Object.entries(optimisticModelSourcesById);
     const hasOptimisticSources = optimisticSourceEntries.length > 0;
@@ -3418,10 +3435,6 @@ export function CodexRouterWorkspacePage({
     () => effectiveProviders.filter((provider) => !isRoutingPlan(provider)),
     [effectiveProviders],
   );
-  const routableModelSources = useMemo(
-    () => resolveWizardModelNameCollisions(modelSources),
-    [modelSources],
-  );
   const providersById = useMemo(
     () =>
       new Map(effectiveProviders.map((provider) => [provider.id, provider])),
@@ -3437,15 +3450,6 @@ export function CodexRouterWorkspacePage({
       providers.map((provider) => [provider.id, provider]),
     );
   }, [providers]);
-  const routableProvidersById = useMemo(() => {
-    const byId = new Map(
-      effectiveProviders.map((provider) => [provider.id, provider]),
-    );
-    for (const source of routableModelSources) {
-      byId.set(source.id, source);
-    }
-    return byId;
-  }, [effectiveProviders, routableModelSources]);
   // 模型刷新目标必须来自当前方案的启用 route；旧 inline route 仅做语义定位，
   // 不能因缺少 targetProviderId 退回到刷新全部候选 Provider。
   const selectedPlanForModelRefresh =
@@ -3710,12 +3714,24 @@ export function CodexRouterWorkspacePage({
     routingPlans[0] ??
     null;
   const selectedRouting = selectedPlan ? readCodexRouting(selectedPlan) : null;
+  const needsProjectedCatalog =
+    activeTab === "model-order" ||
+    activeTab === "subagents" ||
+    activeTab === "test";
   const selectedProjectedCatalog = useMemo(
-    () => projectCodexModelCatalog(selectedPlan, providersById),
-    [selectedPlan, providersById],
+    () =>
+      projectCodexModelCatalog(
+        needsProjectedCatalog ? selectedPlan : null,
+        providersById,
+      ),
+    [needsProjectedCatalog, selectedPlan, providersById],
   );
-  const routeModels = selectedProjectedCatalog.models.map(
-    (model) => model.model,
+  const routeModels = useMemo(
+    () =>
+      activeTab === "test"
+        ? selectedProjectedCatalog.models.map((model) => model.model)
+        : [],
+    [activeTab, selectedProjectedCatalog],
   );
   const selectedPlanRouteEntries = useMemo(
     () =>
@@ -3750,21 +3766,12 @@ export function CodexRouterWorkspacePage({
   }, [activeTab]);
 
   useEffect(() => {
-    const persistedPlan = optimisticRoutingPlan
-      ? providers.find((provider) => provider.id === optimisticRoutingPlan.id)
-      : null;
-    if (
-      persistedPlan &&
-      JSON.stringify(persistedPlan.settingsConfig?.codexRouting) ===
-        JSON.stringify(optimisticRoutingPlan?.settingsConfig?.codexRouting) &&
-      JSON.stringify(readCodexCatalogSettings(persistedPlan.settingsConfig)) ===
-        JSON.stringify(
-          readCodexCatalogSettings(optimisticRoutingPlan?.settingsConfig),
-        )
-    ) {
-      setOptimisticRoutingPlan(null);
+    if (routingPlanOverlay && !optimisticRoutingPlan) {
+      setRoutingPlanOverlay((current) =>
+        current === routingPlanOverlay ? null : current,
+      );
     }
-  }, [optimisticRoutingPlan, providers]);
+  }, [optimisticRoutingPlan, routingPlanOverlay]);
 
   // 普通 provider 的 /models 刷新会先写 DB，再等待父级 query refetch；这里保留短期覆盖层，
   // 确保候选 router 和空 match route 立即消费新 catalog，同时在配置变化或父级追上后自动释放。
@@ -3821,7 +3828,7 @@ export function CodexRouterWorkspacePage({
         queryKey: ["providers", "codex"],
         type: "active",
       });
-      setOptimisticRoutingPlan(initializedPlan);
+      setRoutingPlanOverlay({ baseline: null, provider: initializedPlan });
       setSelectedPlanId(initializedPlan.id);
       setSelectedRouteKey(null);
       setActiveTab("routes");
@@ -3880,7 +3887,10 @@ export function CodexRouterWorkspacePage({
         queryKey: ["providers", "codex"],
         type: "active",
       });
-      setOptimisticRoutingPlan(nextProvider);
+      setRoutingPlanOverlay({
+        baseline: providers.find((provider) => provider.id === plan.id) ?? null,
+        provider: nextProvider,
+      });
       setSelectedPlanId(nextProvider.id);
       setIsPlanSettingsOpen(false);
       setRoutePickerMessage(
@@ -3896,6 +3906,11 @@ export function CodexRouterWorkspacePage({
   /// 路由规则编辑只更新 codexRouting.routes，不再进入通用 Provider 表单，避免“添加 router”卡死路径。
   async function handleSaveRoutingRoutes(plan: Provider, routes: CodexRoute[]) {
     const currentRouting = readCodexRouting(plan) ?? {};
+    const routableModelSources = resolveWizardModelNameCollisions(modelSources);
+    const routableProvidersById = new Map(providersById);
+    for (const source of routableModelSources) {
+      routableProvidersById.set(source.id, source);
+    }
     const usedRouteIds = new Set<string>();
     const normalizedRouteDrafts = dedupeCodexRoutesBySemanticProvider(
       routes.map((route, index) =>
@@ -3935,7 +3950,11 @@ export function CodexRouterWorkspacePage({
     // 必须在持久化前同步失效旧 attempt；否则保存等待期间迟到的 /models
     // 结果仍会按旧 routingPlans 写回 provider 和 plan catalog。
     invalidateModelRefreshesOutside(nextEnabledProviderIds);
-    setOptimisticRoutingPlan(nextProvider);
+    const overlay = {
+      baseline: providers.find((provider) => provider.id === plan.id) ?? null,
+      provider: nextProvider,
+    };
+    setRoutingPlanOverlay(overlay);
     setSelectedPlanId(plan.id);
     setIsSavingRoutes(true);
     setRoutePickerError(null);
@@ -3968,7 +3987,9 @@ export function CodexRouterWorkspacePage({
       setIsRoutePickerOpen(false);
     } catch (error) {
       // 保存失败时回滚原方案；启用集合恢复后刷新 effect 会重新读取被失效的 Provider。
-      setOptimisticRoutingPlan(plan);
+      setRoutingPlanOverlay((current) =>
+        current === overlay ? routingPlanOverlay : current,
+      );
       setRoutePickerError(workspaceErrorMessage(error));
     } finally {
       setIsSavingRoutes(false);
@@ -4031,7 +4052,11 @@ export function CodexRouterWorkspacePage({
       ) {
         throw new Error("migration_readback_failed");
       }
-      setOptimisticRoutingPlan(migratedPlan);
+      setRoutingPlanOverlay({
+        baseline:
+          providers.find((provider) => provider.id === migratedPlan.id) ?? null,
+        provider: migratedPlan,
+      });
       setSelectedPlanId(migratedPlan.id);
       const action = migrationPendingAction;
       setMigrationPreview(null);
@@ -5256,6 +5281,24 @@ function modelOrderReasoningQueryOptions(
   };
 }
 
+function moveCodexOrderModel(
+  models: CodexCatalogModel[],
+  providerGroupReference: CodexCatalogModel[],
+  modelId: string,
+  position: number,
+) {
+  const index = models.findIndex((model) => model.model?.trim() === modelId);
+  const targetIndex = Math.min(
+    Math.max(Math.trunc(position) - 1, 0),
+    models.length - 1,
+  );
+  if (index < 0 || index === targetIndex) return models;
+  const reordered = [...models];
+  const [model] = reordered.splice(index, 1);
+  reordered.splice(targetIndex, 0, model);
+  return groupCodexCatalogModelsByProvider(reordered, providerGroupReference);
+}
+
 export function ModelOrderTab({
   selectedPlan,
   catalog,
@@ -5274,6 +5317,10 @@ export function ModelOrderTab({
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [draftModels, setDraftModels] = useState<CodexCatalogModel[]>([]);
+  const [pendingRank, setPendingRank] = useState<{
+    modelId: string;
+    value: string;
+  } | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isRecommending, setIsRecommending] = useState(false);
   const [recommendationUsage, setRecommendationUsage] =
@@ -5282,6 +5329,13 @@ export function ModelOrderTab({
   const mountedRef = useRef(true);
   const operationTokenRef = useRef<symbol | null>(null);
   const operationGenerationRef = useRef(0);
+  const savedOrderFeedbackRouter = useRef<string | null>(null);
+  const selectedPlanId = selectedPlan?.id;
+  const clearFeedback = useCallback(() => {
+    savedOrderFeedbackRouter.current = null;
+    setMessage(null);
+    setError(null);
+  }, []);
   const operationContextKey = useMemo(
     () =>
       JSON.stringify([
@@ -5295,14 +5349,14 @@ export function ModelOrderTab({
     [selectedPlan, catalog, selectedRoutes, providersById],
   );
   useLayoutEffect(() => {
-    // A different plan or canonical source snapshot cannot inherit an old
-    // writer's busy state, preflight result, or completion feedback.
+    // Invalidate in-flight work on any snapshot change. Feedback about a
+    // completed write stays visible when its own router is refreshed.
     operationGenerationRef.current += 1;
     operationTokenRef.current = null;
     setIsSaving(false);
-    setMessage(null);
-    setError(null);
-  }, [operationContextKey]);
+    setPendingRank(null);
+    if (savedOrderFeedbackRouter.current !== selectedPlanId) clearFeedback();
+  }, [operationContextKey, selectedPlanId, clearFeedback]);
   useLayoutEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -5422,6 +5476,19 @@ export function ModelOrderTab({
       ),
     [draftModels, providerNamesByModel, sortMode, providerGroupReference],
   );
+  const pendingPosition = Number.parseInt(pendingRank?.value ?? "", 10);
+  const modelsWithPendingRank = useMemo(
+    () =>
+      pendingRank && Number.isFinite(pendingPosition)
+        ? moveCodexOrderModel(
+            orderedDraftModels,
+            providerGroupReference,
+            pendingRank.modelId,
+            pendingPosition,
+          )
+        : orderedDraftModels,
+    [orderedDraftModels, providerGroupReference, pendingRank, pendingPosition],
+  );
   const visibleDraftModels = useMemo(() => {
     const query = modelSearch.trim().toLocaleLowerCase();
     if (!query) return orderedDraftModels;
@@ -5475,7 +5542,7 @@ export function ModelOrderTab({
       ),
     [orderedDraftModels, providersById, selectedRoutes, recommendationUsage],
   );
-  const topModel = orderedDraftModels[0];
+  const topModel = modelsWithPendingRank[0];
   const topReasoningQuery = useQuery(
     modelOrderReasoningQueryOptions(
       topModel,
@@ -5516,7 +5583,7 @@ export function ModelOrderTab({
   const hasChanges =
     styleDirty ||
     effortDirty ||
-    orderedDraftModels.map((model) => model.model).join("\n") !==
+    modelsWithPendingRank.map((model) => model.model).join("\n") !==
       catalog.models.map((model) => model.model).join("\n");
 
   useEffect(() => {
@@ -5524,8 +5591,6 @@ export function ModelOrderTab({
     setIsRecommending(false);
     setRecommendationUsage(undefined);
     setSortMode("custom");
-    setMessage(null);
-    setError(null);
     setDisplayStyle(
       catalog.displayNameStyle ?? DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
     );
@@ -5581,6 +5646,7 @@ export function ModelOrderTab({
     const activeModel = String(event.active.id);
     const overModel = event.over ? String(event.over.id) : "";
     if (!overModel || activeModel === overModel) return;
+    clearFeedback();
     // A manual drag is an explicit custom order. Switching back to custom here
     // prevents the selected alphabetical/provider sort from immediately undoing it.
     setSortMode("custom");
@@ -5603,8 +5669,7 @@ export function ModelOrderTab({
     if (isRecommending || isSaving) return;
     const request = ++recommendationRequest.current;
     setIsRecommending(true);
-    setMessage(null);
-    setError(null);
+    clearFeedback();
     try {
       let syncIncomplete = false;
       try {
@@ -5690,23 +5755,32 @@ export function ModelOrderTab({
   }
 
   function moveModelToPosition(modelId: string, position: number) {
-    const target = modelId.trim();
-    if (!target) return;
-    const targetIndex = Math.min(
-      Math.max(Math.trunc(position) - 1, 0),
-      Math.max(orderedDraftModels.length - 1, 0),
-    );
+    if (!modelId) return;
+    clearFeedback();
+    setPendingRank(null);
     setSortMode("custom");
-    setDraftModels((current) => {
-      const ordered = sortCodexCatalogModels(current, sortMode);
-      const index = ordered.findIndex(
-        (model) => model.model?.trim() === target,
-      );
-      if (index < 0 || index === targetIndex) return ordered;
-      const [moved] = ordered.splice(index, 1);
-      ordered.splice(targetIndex, 0, moved);
-      return groupCodexCatalogModelsByProvider(ordered, providerGroupReference);
-    });
+    setDraftModels(
+      moveCodexOrderModel(
+        orderedDraftModels,
+        providerGroupReference,
+        modelId,
+        position,
+      ),
+    );
+  }
+
+  function editRank(modelId: string, value: string) {
+    clearFeedback();
+    setPendingRank({ modelId, value });
+  }
+
+  function commitRank(modelId: string) {
+    if (pendingRank?.modelId !== modelId) return;
+    if (Number.isFinite(pendingPosition)) {
+      moveModelToPosition(modelId, pendingPosition);
+    } else {
+      setPendingRank(null);
+    }
   }
 
   function moveModelToTop(modelId: string) {
@@ -5715,14 +5789,23 @@ export function ModelOrderTab({
 
   async function saveOrder(reset = false) {
     if (!selectedPlan) return;
+    if (readCodexRouting(selectedPlan)?.schemaVersion !== 2) {
+      clearFeedback();
+      const notice = tr("codexRouterWorkspace.legacyRouteRequiresMigration", {
+        defaultValue:
+          "This is a legacy route configuration; complete migration before saving",
+      });
+      setError(notice);
+      toast.error(notice, { closeButton: true });
+      return;
+    }
     const token = beginOperation();
     if (!token) return;
     const generation = operationGenerationRef.current;
-    setMessage(null);
-    setError(null);
+    clearFeedback();
     try {
       const models = groupCodexCatalogModelsByProvider(
-        reset ? defaultModels : orderedDraftModels,
+        reset ? defaultModels : modelsWithPendingRank,
         providerGroupReference,
       );
       const orderChanged =
@@ -5764,7 +5847,7 @@ export function ModelOrderTab({
           : serializeCodexRoutingV2(readCodexRouting(selectedPlan) ?? {});
       if (persistOrder || effortDirty)
         delete routingBase.defaultReasoningEffort;
-      await providersApi.update(
+      await providersApi.updateCodexRouterIfUnchanged(
         reconcileCodexRoutingPlanForSave(
           {
             ...selectedPlan,
@@ -5799,69 +5882,70 @@ export function ModelOrderTab({
           },
           providersById,
         ),
-        "codex",
-        undefined,
         selectedPlan,
       );
       try {
         if (!isCurrentOperation(token, generation)) return;
-        if (reset) setSortMode("custom");
+        if (reset || pendingRank) setSortMode("custom");
+        setPendingRank(null);
         setDraftModels(models);
+        // A provider refresh can supersede the projection check, but it
+        // cannot undo a completed database write.
+        savedOrderFeedbackRouter.current = selectedPlan.id;
+        const notice = reset
+          ? tr("codexRouterWorkspace.modelOrderDefaultsRestored", {
+              defaultValue:
+                "Restored newest-first model order within each provider.",
+            })
+          : tr("codexRouterWorkspace.s128", {
+              defaultValue:
+                "Saved the display order for {{arg0}} models to this router.",
+              arg0: models.length,
+            });
+        setMessage(notice);
+        const toastId = toast.success(notice, { closeButton: true });
         try {
-          let projection = await providersApi.inspectCodexMultiRouterProjection(
-            selectedPlan.id,
-          );
-          if (!isCurrentOperation(token, generation)) return;
-          if (projection.state === "pending") {
-            projection = await providersApi.retryCodexMultiRouterProjection(
+          const projection =
+            await providersApi.inspectCodexMultiRouterProjection(
               selectedPlan.id,
             );
-          }
           if (!isCurrentOperation(token, generation)) return;
           queryClient.setQueryData(
             ["codexMultiRouterProjection", selectedPlan.id],
             projection,
           );
           if (projection.state === "pending") {
-            setMessage(
-              tr("codexRouterWorkspace.modelOrderPending", {
-                defaultValue:
-                  "Order saved, but live projection is still pending. Retry projection from Status.",
-              }),
-            );
+            const pending = tr("codexRouterWorkspace.modelOrderPending", {
+              defaultValue:
+                "Order saved, but live projection is still pending. Retry projection from Status.",
+            });
+            setMessage(pending);
+            toast.warning(pending, { id: toastId, closeButton: true });
             return;
           }
           if (projection.state === "not_required") {
-            setMessage(
-              tr("codexRouterWorkspace.modelOrderInactive", {
-                defaultValue:
-                  "Order saved for this router. It will be projected when this router is activated.",
-              }),
-            );
+            const inactive = tr("codexRouterWorkspace.modelOrderInactive", {
+              defaultValue:
+                "Order saved for this router. It will be projected when this router is activated.",
+            });
+            setMessage(inactive);
+            toast.success(inactive, { id: toastId, closeButton: true });
             return;
           }
         } catch (projectionError) {
           if (!isCurrentOperation(token, generation)) return;
-          setError(
-            tr("codexRouterWorkspace.modelOrderProjectionFailed", {
+          const pending = tr(
+            "codexRouterWorkspace.modelOrderProjectionFailed",
+            {
               defaultValue: "Order saved, but projection is pending: {{error}}",
               error: workspaceErrorMessage(projectionError),
-            }),
+            },
           );
+          setMessage(null);
+          setError(pending);
+          toast.warning(pending, { id: toastId, closeButton: true });
           return;
         }
-        setMessage(
-          reset
-            ? tr("codexRouterWorkspace.modelOrderDefaultsRestored", {
-                defaultValue:
-                  "Restored newest-first model order within each provider.",
-              })
-            : tr("codexRouterWorkspace.s128", {
-                defaultValue:
-                  "Saved the display order for {{arg0}} models to this router.",
-                arg0: models.length,
-              }),
-        );
       } finally {
         // A completed write still needs refreshing after navigation, but it
         // must not publish its old draft or feedback into the current scope.
@@ -5871,12 +5955,12 @@ export function ModelOrderTab({
       }
     } catch (saveError) {
       if (!isCurrentOperation(token, generation)) return;
-      setError(
-        tr("codexRouterWorkspace.s129", {
-          defaultValue: "Failed to save model order:{{arg0}}",
-          arg0: workspaceErrorMessage(saveError),
-        }),
-      );
+      const notice = tr("codexRouterWorkspace.s129", {
+        defaultValue: "Failed to save model order:{{arg0}}",
+        arg0: workspaceErrorMessage(saveError),
+      });
+      setError(notice);
+      toast.error(notice, { closeButton: true });
     } finally {
       finishOperation(token);
     }
@@ -5888,8 +5972,7 @@ export function ModelOrderTab({
     const token = beginOperation();
     if (!token) return;
     const generation = operationGenerationRef.current;
-    setMessage(null);
-    setError(null);
+    clearFeedback();
     try {
       const confirmed = await confirmDialog(
         tr("codexRouterWorkspace.hideModelConfirm", {
@@ -5996,8 +6079,7 @@ export function ModelOrderTab({
     const token = beginOperation();
     if (!token) return;
     const generation = operationGenerationRef.current;
-    setMessage(null);
-    setError(null);
+    clearFeedback();
     try {
       const models = readCodexModelCatalog(source).models.map((model) => {
         if (
@@ -6142,6 +6224,23 @@ export function ModelOrderTab({
         }
       />
 
+      {message ? (
+        <p
+          role="status"
+          className="mt-3 text-xs text-emerald-700 dark:text-emerald-200"
+        >
+          {message}
+        </p>
+      ) : null}
+      {error ? (
+        <p
+          role="alert"
+          className="mt-3 text-xs text-rose-700 dark:text-rose-200"
+        >
+          {error}
+        </p>
+      ) : null}
+
       <div className="mt-4 flex flex-wrap items-start gap-3 rounded-md border border-blue-200/70 bg-background/60 p-3 dark:border-blue-800/50 dark:bg-slate-950/30">
         <label className="grid min-w-0 max-w-full gap-1 text-xs font-medium text-muted-foreground">
           <span>
@@ -6152,9 +6251,10 @@ export function ModelOrderTab({
           <select
             value={displayStyle}
             disabled={isSaving || isRecommending}
-            onChange={(event) =>
-              setDisplayStyle(event.target.value as CodexModelDisplayStyle)
-            }
+            onChange={(event) => {
+              clearFeedback();
+              setDisplayStyle(event.target.value as CodexModelDisplayStyle);
+            }}
             className="h-8 min-w-0 rounded border border-input bg-background px-2 text-sm text-foreground"
           >
             <option value="model">
@@ -6183,9 +6283,10 @@ export function ModelOrderTab({
           <select
             value={sortMode}
             disabled={isSaving || isRecommending}
-            onChange={(event) =>
-              setSortMode(event.target.value as CodexModelSortMode)
-            }
+            onChange={(event) => {
+              clearFeedback();
+              setSortMode(event.target.value as CodexModelSortMode);
+            }}
             className="h-8 min-w-0 rounded border border-input bg-background px-2 text-sm text-foreground"
           >
             <option value="custom">
@@ -6221,11 +6322,12 @@ export function ModelOrderTab({
             disabled={
               isSaving || isRecommending || topReasoningEfforts.length === 0
             }
-            onChange={(event) =>
+            onChange={(event) => {
+              clearFeedback();
               setDefaultReasoningEffort(
                 event.target.value as CodexReasoningEffort,
-              )
-            }
+              );
+            }}
             aria-label={tr("codexRouterWorkspace.topModelDefaultEffort", {
               defaultValue: "Top model default effort",
             })}
@@ -6369,7 +6471,9 @@ export function ModelOrderTab({
                     displayStyle={displayStyle}
                     onDelete={(modelId) => void hideModel(modelId)}
                     onMoveToTop={moveModelToTop}
-                    onMoveToPosition={moveModelToPosition}
+                    pendingRank={pendingRank}
+                    onRankChange={editRank}
+                    onRankCommit={commitRank}
                     dragDisabled={isSaving || isRecommending}
                     modelCount={orderedDraftModels.length}
                     isTop={index === 0}
@@ -6409,7 +6513,9 @@ export function ModelOrderTab({
                       displayStyle={displayStyle}
                       onDelete={(modelId) => void hideModel(modelId)}
                       onMoveToTop={moveModelToTop}
-                      onMoveToPosition={moveModelToPosition}
+                      pendingRank={pendingRank}
+                      onRankChange={editRank}
+                      onRankCommit={commitRank}
                       dragDisabled={isSaving || isRecommending}
                       modelCount={orderedDraftModels.length}
                       isTop={false}
@@ -6472,15 +6578,6 @@ export function ModelOrderTab({
             ))}
           </ul>
         </details>
-      ) : null}
-
-      {message ? (
-        <p className="mt-3 text-xs text-emerald-700 dark:text-emerald-200">
-          {message}
-        </p>
-      ) : null}
-      {error ? (
-        <p className="mt-3 text-xs text-rose-700 dark:text-rose-200">{error}</p>
       ) : null}
     </section>
   );
@@ -8151,23 +8248,25 @@ function SpawnAgentCandidatesPanel({
   >(null);
   const savedReasoningEffort =
     readCodexRouting(selectedPlan)?.subagentReasoningEffort;
-  const persistedReasoningEffort: CodexSubagentReasoningEffort =
-    savedReasoningEffort &&
-    [
-      "profile",
-      "none",
-      "minimal",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max",
-      "ultra",
-    ].includes(savedReasoningEffort)
-      ? savedReasoningEffort
-      : "high";
-  const [activeReasoningEffort, setActiveReasoningEffort] =
-    useState<CodexSubagentReasoningEffort>(persistedReasoningEffort);
+  const persistedReasoningEffort: CodexSubagentReasoningEffort | "invalid" =
+    savedReasoningEffort === undefined
+      ? "high"
+      : [
+            "profile",
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra",
+          ].includes(savedReasoningEffort)
+        ? savedReasoningEffort
+        : "invalid";
+  const [activeReasoningEffort, setActiveReasoningEffort] = useState<
+    typeof persistedReasoningEffort
+  >(persistedReasoningEffort);
   const [reasoningError, setReasoningError] = useState<string | null>(null);
   const [reasoningMessage, setReasoningMessage] = useState<string | null>(null);
   const queryClient = useQueryClient();
@@ -8454,7 +8553,7 @@ function SpawnAgentCandidatesPanel({
         if (!isCurrentOperation(token, generation)) return;
         const description = evaluateCodexSubagentMutationResult(savedProvider);
         const savedEffort =
-          readCodexRouting(savedProvider)?.subagentReasoningEffort ?? "profile";
+          readCodexRouting(savedProvider)?.subagentReasoningEffort;
         if (savedEffort !== effort) {
           throw new Error("codex_subagent_reasoning_not_saved");
         }
@@ -8578,9 +8677,15 @@ function SpawnAgentCandidatesPanel({
               defaultValue: "Profile settings (override off)",
             })}
           </option>
-          {!(
-            ["profile", ...SUBAGENT_FIXED_REASONING_EFFORTS] as string[]
-          ).includes(activeReasoningEffort) ? (
+          {activeReasoningEffort === "invalid" ? (
+            <option value="invalid" disabled>
+              {t("codexSubagentReasoning.globalInvalidOption", {
+                defaultValue: "Invalid saved reasoning effort",
+              })}
+            </option>
+          ) : !(
+              ["profile", ...SUBAGENT_FIXED_REASONING_EFFORTS] as string[]
+            ).includes(activeReasoningEffort) ? (
             <option value={activeReasoningEffort} disabled>
               {t("codexSubagentReasoning.globalLegacyOption", {
                 effort: activeReasoningEffort,
@@ -9279,6 +9384,7 @@ function StatusTab({
   const { data: guardianStatus } = useQuery<CodexGuardianStatus | null>({
     queryKey: ["codexGuardianStatus"],
     queryFn: () => proxyApi.getCodexGuardianStatus(),
+    enabled: statusView === "link",
     refetchInterval: 10_000,
   });
   const {
@@ -9289,7 +9395,7 @@ function StatusTab({
     queryKey: ["codexMultiRouterProjection", selectedPlan?.id],
     queryFn: () =>
       providersApi.inspectCodexMultiRouterProjection(selectedPlan!.id),
-    enabled: Boolean(selectedPlan?.id),
+    enabled: statusView === "link" && Boolean(selectedPlan?.id),
     retry: false,
     refetchInterval: 15_000,
   });
@@ -9310,17 +9416,25 @@ function StatusTab({
     null,
   );
 
-  const logs = requestLogs?.data ?? [];
-  const proxyLogs = logs.filter(
-    (log) => (log.dataSource ?? "proxy") === "proxy",
+  const logRows = requestLogs?.data;
+  const { logs, proxyLogs } = useMemo(() => {
+    const logs = logRows ?? [];
+    return {
+      logs,
+      proxyLogs: logs.filter((log) => (log.dataSource ?? "proxy") === "proxy"),
+    };
+  }, [logRows]);
+  const selectedRoutes = useMemo(
+    () =>
+      selectedPlan
+        ? routeEntries.filter(({ provider }) => provider.id === selectedPlan.id)
+        : routeEntries,
+    [routeEntries, selectedPlan],
   );
-  const sessionLogs = logs.filter(
-    (log) => (log.dataSource ?? "proxy") !== "proxy",
+  const routerEvents = useMemo(
+    () => diagnostics?.routerLog.recentEvents ?? [],
+    [diagnostics],
   );
-  const selectedRoutes = selectedPlan
-    ? routeEntries.filter(({ provider }) => provider.id === selectedPlan.id)
-    : routeEntries;
-  const routerEvents = diagnostics?.routerLog.recentEvents ?? [];
   const routerRequestEvents = routerEvents.filter((event) =>
     [
       "route_resolved",
@@ -9340,25 +9454,32 @@ function StatusTab({
     () => buildRouteSummaryMap(diagnostics),
     [diagnostics],
   );
-  const trafficRows = buildRouteTrafficRows({
-    logs: proxyLogs,
-    routerEvents,
-    routes: routeEntries,
-    selectedPlan,
-    providersById,
-    routeSummaries: routeSummaryMap,
-  });
   // The traffic section's request/token/latency metrics must come only from request_log;
   // diagnostic events have no usage or latency and would distort recent samples.
-  // Keep the diagnostic-backed rows above for link/protocol evidence.
-  const requestTrafficRows = buildRouteTrafficRows({
-    logs: proxyLogs,
-    routerEvents: [],
-    routes: routeEntries,
+  const { trafficRows, requestTrafficRows } = useMemo(() => {
+    const input = {
+      logs: proxyLogs,
+      routes: routeEntries,
+      selectedPlan,
+      providersById,
+      routeSummaries: routeSummaryMap,
+    };
+    const requestTrafficRows = buildRouteTrafficRows(input);
+    return {
+      requestTrafficRows,
+      trafficRows:
+        routerEvents.length > 0
+          ? buildRouteTrafficRows({ ...input, routerEvents })
+          : requestTrafficRows,
+    };
+  }, [
+    proxyLogs,
+    routeEntries,
     selectedPlan,
     providersById,
-    routeSummaries: routeSummaryMap,
-  });
+    routeSummaryMap,
+    routerEvents,
+  ]);
   const protocolRows = trafficRows.filter(
     (row) =>
       row.configuredProtocol ||
@@ -9366,13 +9487,16 @@ function StatusTab({
       row.requestCount > 0,
   );
   const routerLogs = routerEvents;
-  const routedLogs = proxyLogs.filter((log) =>
-    trafficRows.some(
-      (row) =>
-        row.providerId === log.providerId ||
-        row.model === (log.requestModel || log.model),
-    ),
-  );
+  const routedLogs =
+    statusView === "traffic"
+      ? proxyLogs.filter((log) =>
+          trafficRows.some(
+            (row) =>
+              row.providerId === log.providerId ||
+              row.model === (log.requestModel || log.model),
+          ),
+        )
+      : [];
   const latestLog = proxyLogs[0];
   const latestForwardOk = latestLog
     ? latestLog.statusCode >= 200 && latestLog.statusCode < 400
@@ -10223,8 +10347,8 @@ function StatusTab({
                   No request logs can currently be attributed to child
                   providers. Today’s Codex logs contain
                   {logs.length} entries, including {proxyLogs.length} real
-                  proxy-forwarding entries, {sessionLogs.length} Codex
-                  session-sync entries, and outer MultiRouter logs (
+                  proxy-forwarding entries, {logs.length - proxyLogs.length}{" "}
+                  Codex session-sync entries, and outer MultiRouter logs (
                   {routerLogs.length}); target provider count:
                   {routeTargetCount}.
                 </div>
@@ -11111,7 +11235,9 @@ function SortableCatalogModel({
   displayStyle = "model",
   onDelete,
   onMoveToTop,
-  onMoveToPosition,
+  pendingRank,
+  onRankChange,
+  onRankCommit,
   modelCount = 1,
   dragDisabled = false,
   isTop = false,
@@ -11122,7 +11248,9 @@ function SortableCatalogModel({
   displayStyle?: CodexModelDisplayStyle;
   onDelete?: (modelId: string) => void;
   onMoveToTop?: (modelId: string) => void;
-  onMoveToPosition?: (modelId: string, position: number) => void;
+  pendingRank: { modelId: string; value: string } | null;
+  onRankChange: (modelId: string, value: string) => void;
+  onRankCommit: (modelId: string) => void;
   modelCount?: number;
   dragDisabled?: boolean;
   isTop?: boolean;
@@ -11152,8 +11280,8 @@ function SortableCatalogModel({
       : tr("codexRouterWorkspace.protocolPerModel", {
           defaultValue: "per model",
         });
-  const [rankValue, setRankValue] = useState(String(index + 1));
-  useEffect(() => setRankValue(String(index + 1)), [index]);
+  const rankValue =
+    pendingRank?.modelId === modelId ? pendingRank.value : String(index + 1);
   const {
     attributes,
     listeners,
@@ -11231,49 +11359,49 @@ function SortableCatalogModel({
           </div>
         ) : null}
       </div>
-      {onMoveToPosition ? (
-        <form
-          className="flex shrink-0 items-center gap-1"
-          onSubmit={(event) => {
-            event.preventDefault();
-            const position = Number.parseInt(rankValue, 10);
-            if (Number.isFinite(position)) {
-              onMoveToPosition(modelId, position);
-            }
-          }}
+      <form
+        className="flex shrink-0 items-center gap-1"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onRankCommit(modelId);
+        }}
+        onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget)) {
+            onRankCommit(modelId);
+          }
+        }}
+      >
+        <Input
+          disabled={dragDisabled}
+          type="number"
+          min={1}
+          max={modelCount}
+          value={rankValue}
+          onChange={(event) => onRankChange(modelId, event.target.value)}
+          aria-label={tr("codexRouterWorkspace.rankModel", {
+            defaultValue: "Rank for {{model}}",
+            model: modelId,
+          })}
+          className="h-7 w-16 px-2 text-center text-xs tabular-nums"
+        />
+        <Button
+          disabled={dragDisabled}
+          type="submit"
+          size="icon"
+          variant="ghost"
+          className="h-7 w-7"
+          aria-label={tr("codexRouterWorkspace.applyRank", {
+            defaultValue: "Move {{model}} to rank {{rank}}",
+            model: modelId,
+            rank: rankValue,
+          })}
+          title={tr("codexRouterWorkspace.applyRankHint", {
+            defaultValue: "Apply rank within this provider",
+          })}
         >
-          <Input
-            disabled={dragDisabled}
-            type="number"
-            min={1}
-            max={modelCount}
-            value={rankValue}
-            onChange={(event) => setRankValue(event.target.value)}
-            aria-label={tr("codexRouterWorkspace.rankModel", {
-              defaultValue: "Rank for {{model}}",
-              model: modelId,
-            })}
-            className="h-7 w-16 px-2 text-center text-xs tabular-nums"
-          />
-          <Button
-            disabled={dragDisabled}
-            type="submit"
-            size="icon"
-            variant="ghost"
-            className="h-7 w-7"
-            aria-label={tr("codexRouterWorkspace.applyRank", {
-              defaultValue: "Move {{model}} to rank {{rank}}",
-              model: modelId,
-              rank: rankValue,
-            })}
-            title={tr("codexRouterWorkspace.applyRankHint", {
-              defaultValue: "Apply rank within this provider",
-            })}
-          >
-            <ArrowRight className="h-4 w-4" />
-          </Button>
-        </form>
-      ) : null}
+          <ArrowRight className="h-4 w-4" />
+        </Button>
+      </form>
       {onMoveToTop ? (
         <Button
           type="button"

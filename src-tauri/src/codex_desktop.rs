@@ -276,6 +276,7 @@ pub(crate) struct CodexModelPickerDiagnostics {
     native_visibility_unverified_observer_count: usize,
     boolean_control_unverified_model_count: usize,
     boolean_control_ready_model_count: usize,
+    boolean_control_not_observed_model_count: usize,
     effort_mismatch_count: usize,
     flag_mismatch_count: usize,
     missing_max_model_count: usize,
@@ -303,6 +304,8 @@ pub struct CodexModelPickerDiagnosticsCounts {
     pub(crate) boolean_control_unverified_model_count: usize,
     #[serde(default)]
     pub(crate) boolean_control_ready_model_count: usize,
+    #[serde(default)]
+    pub(crate) boolean_control_not_observed_model_count: usize,
     pub(crate) effort_mismatch_count: usize,
     pub(crate) flag_mismatch_count: usize,
     pub(crate) missing_max_model_count: usize,
@@ -324,6 +327,7 @@ impl CodexModelPickerDiagnostics {
                 .native_visibility_unverified_observer_count,
             boolean_control_unverified_model_count: self.boolean_control_unverified_model_count,
             boolean_control_ready_model_count: self.boolean_control_ready_model_count,
+            boolean_control_not_observed_model_count: self.boolean_control_not_observed_model_count,
             effort_mismatch_count: self.effort_mismatch_count,
             flag_mismatch_count: self.flag_mismatch_count,
             missing_max_model_count: self.missing_max_model_count,
@@ -1460,6 +1464,29 @@ fn codex_renderer_compatibility_probe_script(catalog: &CodexModelCatalogProjecti
               const validStatus = ["ready", "pending", "error", "mismatch", "unverified", "not_required"].includes(observedStatus);
               pickerStatus = validStatus ? observedStatus : "unverified";
               if (!validStatus) pushIssue("diagnostics_unavailable");
+              const diagnosticCountKeys = [
+                "pickerObserverCount",
+                "successObserverCount",
+                "errorObserverCount",
+                "pendingObserverCount",
+                "unsupportedObserverCount",
+                "unreadableObserverCount",
+                "nativeVisibilityUnverifiedObserverCount",
+                "booleanControlUnverifiedModelCount",
+                "booleanControlReadyModelCount",
+                "booleanControlNotObservedModelCount",
+                "effortMismatchCount",
+                "flagMismatchCount",
+                "missingMaxModelCount",
+                "missingUltraModelCount",
+                "selectedMaxModelCount",
+                "selectedUltraModelCount",
+              ];
+              const hasMalformedCount = diagnosticCountKeys.some((key) =>
+                (Object.prototype.hasOwnProperty.call(observed, key) ||
+                  observed[key] !== undefined) &&
+                (!Number.isSafeInteger(observed[key]) || observed[key] < 0)
+              );
               pickerDiagnostics = {{
                 pickerObserverCount: count(observed.pickerObserverCount),
                 successObserverCount: count(observed.successObserverCount),
@@ -1470,6 +1497,7 @@ fn codex_renderer_compatibility_probe_script(catalog: &CodexModelCatalogProjecti
                 nativeVisibilityUnverifiedObserverCount: count(observed.nativeVisibilityUnverifiedObserverCount),
                 booleanControlUnverifiedModelCount: count(observed.booleanControlUnverifiedModelCount),
                 booleanControlReadyModelCount: count(observed.booleanControlReadyModelCount),
+                booleanControlNotObservedModelCount: count(observed.booleanControlNotObservedModelCount),
                 effortMismatchCount: count(observed.effortMismatchCount),
                 flagMismatchCount: count(observed.flagMismatchCount),
                 missingMaxModelCount: count(observed.missingMaxModelCount),
@@ -1484,12 +1512,9 @@ fn codex_renderer_compatibility_probe_script(catalog: &CodexModelCatalogProjecti
                 if (pickerStatus === "ready") pickerStatus = "unverified";
                 pushIssue("diagnostics_unavailable");
               }}
-              for (const key of ["booleanControlUnverifiedModelCount", "booleanControlReadyModelCount"]) {{
-                if (Object.prototype.hasOwnProperty.call(observed, key) &&
-                    (!Number.isSafeInteger(observed[key]) || observed[key] < 0)) {{
-                  if (pickerStatus === "ready") pickerStatus = "unverified";
-                  pushIssue("diagnostics_unavailable");
-                }}
+              if (hasMalformedCount) {{
+                if (pickerStatus === "ready") pickerStatus = "unverified";
+                pushIssue("diagnostics_unavailable");
               }}
               if (pickerDiagnostics.pickerObserverCount === 0 && pickerStatus !== "not_required")
                 pushIssue("observer_not_found");
@@ -4390,8 +4415,8 @@ JSON.stringify({{
         assert!(script.contains("if (true) incomingPayload.catalogReleased = true"));
         assert!(script.contains("await installAppServerPatch()"));
         assert!(script.contains("void triggerLocalThreadCatalogSync()"));
-        assert!(!script.contains("const historySync = await triggerLocalThreadCatalogSync()"));
-        assert!(!script.contains("await catalog.requestStartupSync()"));
+        assert!(!script.contains("await triggerLocalThreadCatalogSync("));
+        assert!(!script.contains("await state.historySyncPromise"));
         assert!(script.contains("if (!state.catalogReleased) patchStatsig()"));
     }
 
@@ -4683,6 +4708,12 @@ const state = {{}};
 const installAppServerPatch = async () => {{}};
 const recordFailure = () => {{}};
 const setTimeout = (callback) => {{ callback(); return 1; }};
+const historySyncCalls = [];
+const triggerLocalThreadCatalogSync = (options) => {{
+  historySyncCalls.push(options);
+  state.historySyncPromise ??= new Promise(() => {{}});
+  return state.historySyncPromise;
+}};
 {}
 {}
 {}
@@ -4838,11 +4869,12 @@ state.appServerClients = [{ sendRequest: async (method, params) => {
   throw new Error(`unexpected method ${method}`);
 } }];
 void runFreshSessionFromSummary("source-thread", "Continue this work").then((result) => {
-  globalThis.__summaryHandoffResult = JSON.stringify({ result, starts });
+  globalThis.__summaryHandoffResult = JSON.stringify({ result, starts, historySyncCalls });
 });
 "#,
         );
         assert_eq!(result["result"]["newThreadId"], "fresh-thread");
+        assert_eq!(result["historySyncCalls"], json!([{ "explicit": true }]));
         assert_eq!(result["starts"][0]["model"], "xiaomi/mimo-v2.6-flash");
         assert_eq!(result["starts"][0]["modelProvider"], "openrouter");
         assert_eq!(result["starts"][0]["config"], json!({}));
@@ -7424,8 +7456,8 @@ JSON.stringify({
         assert!(script.contains("requestStartupSync"));
         assert!(script.contains("readStatus"));
         assert!(script.contains("void triggerLocalThreadCatalogSync()"));
-        assert!(!script.contains("const historySync = await triggerLocalThreadCatalogSync()"));
-        assert!(!script.contains("await catalog.requestStartupSync()"));
+        assert!(!script.contains("await triggerLocalThreadCatalogSync("));
+        assert!(script.contains("state.historySyncPromise = job"));
         assert!(script.contains("params?.modelProviders == null"));
         assert!(script.contains("if (params == null) return { modelProviders: [] }"));
         assert!(script.contains("modelProviders: []"));
@@ -7443,7 +7475,6 @@ JSON.stringify({
         assert!(!script.contains("await state.historyQueryRefreshPromise"));
         assert!(!script.contains("await state.historyLineageHydrationPromise"));
         assert!(!script.contains("await state.historySyncPromise"));
-        assert!(!script.contains("await catalog.requestStartupSync()"));
         assert!(script.contains("state.historyQueryRefreshCompleted = true"));
     }
 
@@ -7456,7 +7487,7 @@ JSON.stringify({
         assert!(!script.contains("await state.historyQueryRefreshPromise"));
         assert!(!script.contains("await state.historyLineageHydrationPromise"));
         assert!(!script.contains("await state.historySyncPromise"));
-        assert!(!script.contains("const historySync = await triggerLocalThreadCatalogSync()"));
+        assert!(!script.contains("await triggerLocalThreadCatalogSync("));
         assert!(script.contains("void triggerLocalThreadCatalogSync()"));
         assert!(script.contains(
             "if (state.runtimeGeneration === installationGeneration && !state.interval)"
@@ -7508,6 +7539,56 @@ const setTimeout = callback => {
 };
 const clearTimeout = () => {};
 "#
+    }
+
+    #[test]
+    fn stalled_native_history_rpc_does_not_block_renderer_installation() {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let fingerprint = "stalled-native-history-test";
+        let payload = r#"{"modelProvider":"codex_model_router_v2","catalogAvailable":true,"modelNames":["worker"],"models":[{"model":"worker"}]}"#;
+        let script = assemble_codex_renderer_runtime_script(payload, false, true, fingerprint);
+        let setup = renderer_lifecycle_test_setup();
+        context.with(|ctx| {
+            ctx.eval::<(), _>(format!(
+                r#"{setup}
+let nativeSyncCalls = 0;
+const localThreadCatalog = {{
+  readStatus: async () => ({{ hosts: [{{ hostId: "local", isComplete: false }}] }}),
+  requestStartupSync: () => {{
+    nativeSyncCalls += 1;
+    return new Promise(() => {{}});
+  }},
+}};
+window[{MODEL_PICKER_PATCH_KEY:?}] = {{
+  rendererRuntimeFingerprint: {fingerprint:?},
+  modulePromises: new Map([
+    ["rpc-", Promise.resolve({{ appServices: {{ localThreadCatalog }} }})],
+  ]),
+}};
+const installation = {script};
+void installation.then(
+  (result) => {{ globalThis.__installationStatus = result.status; }},
+  (error) => {{ globalThis.__installationStatus = String(error); }},
+);
+"#
+            ))
+            .expect("start renderer with a stalled history RPC");
+        });
+        while runtime
+            .execute_pending_job()
+            .expect("run renderer and native history jobs")
+        {}
+        context.with(|ctx| {
+            let installed: Option<String> = ctx.eval("globalThis.__installationStatus").unwrap();
+            assert_eq!(installed.as_deref(), Some("ok"));
+            assert_eq!(ctx.eval::<u32, _>("nativeSyncCalls").unwrap(), 1);
+            assert!(ctx
+                .eval::<bool, _>(format!(
+                    "Boolean(window[{MODEL_PICKER_PATCH_KEY:?}].historySyncPromise) && typeof globalThis.__heartbeat === 'function'"
+                ))
+                .unwrap());
+        });
     }
 
     #[test]
@@ -8748,6 +8829,91 @@ JSON.stringify({{diagnosticsUnavailable, pending, cacheOnlyReady, ready, nativeU
                     "pickerDiagnostics": null,
                     "pickerVerificationIssues": ["runtime_not_current"]
                 })
+            );
+        });
+    }
+
+    #[test]
+    fn renderer_compatibility_probe_rejects_malformed_diagnostic_counts() {
+        let catalog = CodexModelCatalogProjection {
+            default_model: Some("relay".to_string()),
+            model_provider: Some("codex_model_router_v2".to_string()),
+            catalog_available: true,
+            model_names: vec!["relay".to_string()],
+            models: vec![json!({"model": "relay"})],
+        };
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let payload = serde_json::to_string(&catalog).expect("serialize catalog");
+        let runtime_fingerprint = codex_renderer_runtime_fingerprint();
+        let probe = codex_renderer_compatibility_probe_script(&catalog);
+        let script = format!(
+            r#"
+const state = {{payload: {payload}, rendererRuntimeFingerprint: {runtime_fingerprint:?}, interval: 1, messagePatchInstalled: true}};
+const window = {{[{MODEL_PICKER_PATCH_KEY:?}]: state}};
+const probe = () => {probe};
+const baseDiagnostics = {{status: "ready", pickerObserverCount: 1, successObserverCount: 1, nativeVisibilityUnverifiedObserverCount: 0}};
+const malformedCountKeys = [
+  "pickerObserverCount",
+  "successObserverCount",
+  "errorObserverCount",
+  "pendingObserverCount",
+  "unsupportedObserverCount",
+  "unreadableObserverCount",
+  "nativeVisibilityUnverifiedObserverCount",
+  "booleanControlUnverifiedModelCount",
+  "booleanControlReadyModelCount",
+  "booleanControlNotObservedModelCount",
+  "effortMismatchCount",
+  "flagMismatchCount",
+  "missingMaxModelCount",
+  "missingUltraModelCount",
+  "selectedMaxModelCount",
+  "selectedUltraModelCount",
+];
+const malformed = {{}};
+for (const key of malformedCountKeys) {{
+  state.readCodexModelPickerDiagnostics = () => ({{...baseDiagnostics, [key]: -1}});
+  malformed[key] = probe();
+}}
+state.readCodexModelPickerDiagnostics = () => ({{...baseDiagnostics, status: "error", errorObserverCount: -1}});
+const malformedError = probe();
+JSON.stringify({{malformed, malformedError}});
+"#
+        );
+        context.with(|ctx| {
+            let result: String = ctx
+                .eval(script)
+                .expect("execute malformed diagnostics observation");
+            let result: Value =
+                serde_json::from_str(&result).expect("parse malformed diagnostics observation");
+            for key in [
+                "pickerObserverCount",
+                "successObserverCount",
+                "errorObserverCount",
+                "pendingObserverCount",
+                "unsupportedObserverCount",
+                "unreadableObserverCount",
+                "nativeVisibilityUnverifiedObserverCount",
+                "booleanControlUnverifiedModelCount",
+                "booleanControlReadyModelCount",
+                "booleanControlNotObservedModelCount",
+                "effortMismatchCount",
+                "flagMismatchCount",
+                "missingMaxModelCount",
+                "missingUltraModelCount",
+                "selectedMaxModelCount",
+                "selectedUltraModelCount",
+            ] {
+                assert_eq!(result["malformed"][key]["pickerStatus"], "unverified");
+                assert!(result["malformed"][key]["pickerVerificationIssues"]
+                    .as_array()
+                    .is_some_and(|issues| issues.contains(&json!("diagnostics_unavailable"))));
+            }
+            assert_eq!(result["malformedError"]["pickerStatus"], "error");
+            assert_eq!(
+                result["malformedError"]["pickerVerificationIssues"],
+                json!(["diagnostics_unavailable", "observer_error"])
             );
         });
     }

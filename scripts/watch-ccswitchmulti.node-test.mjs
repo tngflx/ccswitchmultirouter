@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import {
+import fs, {
   mkdtempSync,
   mkdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -15,6 +16,10 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import * as guardianCore from "./ccswitchmulti-guardian-core.mjs";
 import { quoteWindowsProcessArgument } from "./dev-independent-watchdog.mjs";
+import {
+  RECOVERY_LOG_ENV,
+  RECOVERY_PRELOAD_OPTION,
+} from "./dev-recovery-output.mjs";
 import {
   acquireGuardianLock,
   createGuardianRuntime,
@@ -814,9 +819,12 @@ test("runtime development launcher uses Node argv without a shell or PS1 and fil
   );
   assert.equal(launch.options.windowsHide, true);
   assert.equal(launch.options.detached, true);
-  assert.equal(launch.options.stdio[0], "ignore");
-  assert.equal(typeof launch.options.stdio[1], "number");
-  assert.equal(launch.options.stdio[1], launch.options.stdio[2]);
+  assert.deepEqual(launch.options.stdio, ["ignore", "ignore", "ignore"]);
+  assert.ok(launch.options.env.NODE_OPTIONS.endsWith(RECOVERY_PRELOAD_OPTION));
+  assert.equal(
+    launch.options.env[RECOVERY_LOG_ENV],
+    path.join(f.plan.ConfigPath, "logs", "dev-recovery.log"),
+  );
   assert.match(
     readFileSync(
       path.join(f.plan.ConfigPath, "logs", "dev-recovery.log"),
@@ -893,6 +901,118 @@ test("native lock uses legacy-compatible exclusive file sharing and releases kee
   await lock.release();
   assert.equal(exited, true);
   assert.throws(() => lock.assertHeld(), /ownership was lost/);
+});
+
+test("failed native lock acquisition terminates and waits for its keeper", async (t) => {
+  const f = fixture(t);
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.exitCode = null;
+  child.signalCode = null;
+  let killed = false;
+  child.kill = () => {
+    killed = true;
+    child.exitCode = 1;
+    child.emit("exit", 1, null);
+    return true;
+  };
+
+  await assert.rejects(
+    acquireGuardianLock(f.plan.LockPath, {
+      timeoutMs: 20,
+      spawnProcess: () => child,
+    }),
+    /Guardian lock acquisition timed out/,
+  );
+  assert.equal(killed, true);
+  assert.equal(child.exitCode, 1);
+  assert.equal(child.listenerCount("exit"), 0);
+  assert.equal(child.listenerCount("close"), 0);
+});
+
+test("lock keeper kill error does not count as process exit", async (t) => {
+  const f = fixture(t);
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.exitCode = null;
+  child.signalCode = null;
+  child.kill = () => {
+    child.emit("error", new Error("fixture refused termination"));
+    return false;
+  };
+
+  await assert.rejects(
+    acquireGuardianLock(f.plan.LockPath, {
+      timeoutMs: 20,
+      spawnProcess: () => child,
+    }),
+    /Guardian lock acquisition timed out.*keeper did not exit/,
+  );
+  assert.equal(child.listenerCount("exit"), 0);
+  assert.equal(child.listenerCount("close"), 0);
+  assert.equal(child.listenerCount("error"), 0);
+});
+
+test("guardian journal compacts repeated events instead of growing without bound", (t) => {
+  const f = fixture(t);
+  const runtime = createGuardianRuntime(f.plan, {
+    query: () => null,
+    now: () => 0,
+  });
+  for (let index = 0; index < 200; index++) {
+    runtime.writeEvent("warning", "repeated-diagnostic", {
+      index,
+      payload: "x".repeat(8_192),
+    });
+  }
+  const journal = readFileSync(f.plan.LogPath, "utf8");
+  assert.ok(Buffer.byteLength(journal) <= 1024 * 1024);
+  const records = journal.trimEnd().split("\n").map(JSON.parse);
+  assert.equal(records.at(-1).detail.index, 199);
+});
+
+test("guardian journal reads only a bounded suffix of a legacy log", (t) => {
+  const f = fixture(t);
+  mkdirSync(path.dirname(f.plan.LogPath), { recursive: true });
+  writeFileSync(
+    f.plan.LogPath,
+    `${"x".repeat(3 * 1024 * 1024)}\n{"event":"legacy"}\n{"torn":`,
+  );
+  const runtime = createGuardianRuntime(f.plan, {
+    query: () => null,
+    now: () => 0,
+  });
+  const originalRead = fs.readSync;
+  const originalReadFile = fs.readFileSync;
+  let requestedBytes = 0;
+  const wholeFile = t.mock.method(fs, "readFileSync", (file, ...args) => {
+    assert.notEqual(file, f.plan.LogPath, "must not read the whole journal");
+    return originalReadFile(file, ...args);
+  });
+  const bounded = t.mock.method(fs, "readSync", (...args) => {
+    requestedBytes += args[3];
+    return originalRead(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    runtime.writeEvent("info", "after-compaction");
+  } finally {
+    wholeFile.mock.restore();
+    bounded.mock.restore();
+    syncBuiltinESMExports();
+  }
+
+  assert.ok(requestedBytes > 0 && requestedBytes <= 512 * 1024 + 1);
+  const journal = readFileSync(f.plan.LogPath, "utf8");
+  const lines = journal.trimEnd().split("\n");
+  assert.equal(lines.length, 3);
+  assert.equal(JSON.parse(lines[0]).event, "legacy");
+  assert.equal(lines[1], '{"torn":');
+  assert.equal(JSON.parse(lines[2]).event, "after-compaction");
 });
 
 test(

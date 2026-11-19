@@ -722,6 +722,74 @@ describe("CodexModelReasoningEditor", () => {
     );
   });
 
+  it("shows Not declared for a manual Sublyx capability without a default", () => {
+    const onChange = vi.fn();
+    render(
+      <CodexModelReasoningEditor
+        model="gpt-6.1-sol"
+        providerIdentity={{ baseUrl: "https://api.sublyx.org/v1" }}
+        capability={{
+          ...sublyxCapability,
+          source: "user",
+          defaultEffort: undefined,
+        }}
+        readOnly={false}
+        onChange={onChange}
+      />,
+    );
+
+    const defaultEffort = screen.getByLabelText(
+      "gpt-6.1-sol provider default effort",
+    );
+    expect(defaultEffort).toHaveValue("");
+    expect(defaultEffort).toHaveDisplayValue("Not declared");
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("keeps a cleared manual Sublyx default Not declared after rerender", () => {
+    const onChange = vi.fn();
+    const capability: CodexModelReasoningCapability = {
+      ...sublyxCapability,
+      source: "user",
+      defaultEffort: "high",
+    };
+    const { rerender } = render(
+      <CodexModelReasoningEditor
+        model="gpt-6.1-sol"
+        providerIdentity={{ baseUrl: "https://api.sublyx.org/v1" }}
+        capability={capability}
+        readOnly={false}
+        onChange={onChange}
+      />,
+    );
+
+    fireEvent.change(
+      screen.getByLabelText("gpt-6.1-sol provider default effort"),
+      { target: { value: "" } },
+    );
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith({
+      ...capability,
+      defaultEffort: undefined,
+    });
+    rerender(
+      <CodexModelReasoningEditor
+        model="gpt-6.1-sol"
+        providerIdentity={{ baseUrl: "https://api.sublyx.org/v1" }}
+        capability={onChange.mock.calls[0][0]}
+        readOnly={false}
+        onChange={onChange}
+      />,
+    );
+
+    const defaultEffort = screen.getByLabelText(
+      "gpt-6.1-sol provider default effort",
+    );
+    expect(defaultEffort).toHaveValue("");
+    expect(defaultEffort).toHaveDisplayValue("Not declared");
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps explicit Sublyx effort subsets editable and preserves their native max target", () => {
     const onChange = vi.fn();
     render(
@@ -821,7 +889,7 @@ describe("CodexModelReasoningEditor", () => {
     );
   });
 
-  it("keeps Sublyx max provider-scoped and exposes Ultra as xhigh", () => {
+  it("keeps Sublyx max provider-scoped and exposes Ultra as max", () => {
     const onChange = vi.fn();
     render(
       <CodexModelReasoningEditor
@@ -858,7 +926,7 @@ describe("CodexModelReasoningEditor", () => {
         defaultEffort: "xhigh",
         codexUltraOrchestration: {
           enabled: true,
-          providerEffort: "xhigh",
+          providerEffort: "max",
         },
         upstream: expect.objectContaining({
           effortMap: expect.objectContaining({ max: "max" }),

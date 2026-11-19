@@ -1165,18 +1165,6 @@ fn effective_capability_summary(
             &["inputModalities", "input_modalities"],
         ),
     );
-    let provider_reasoning = value_field(
-        &provider.settings_config,
-        &["reasoning", "codexChatReasoning", "codex_chat_reasoning"],
-    )
-    .and_then(validated_legacy_provider_reasoning)
-    .or_else(|| {
-        provider
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.codex_chat_reasoning.as_ref())
-            .and_then(|reasoning| serde_json::to_value(reasoning).ok())
-    });
     let declared_model_reasoning = value_field(
         model_entry,
         &["reasoning", "codexChatReasoning", "codex_chat_reasoning"],
@@ -1184,7 +1172,7 @@ fn effective_capability_summary(
     .filter(|value| !value.is_null())
     .cloned();
     let (reasoning, reasoning_source) =
-        effective_reasoning_capability(provider, model_entry, provider_reasoning, official_models);
+        effective_reasoning_capability(provider, model_entry, official_models);
     // Keep a sanitized copy of an otherwise-unparseable model declaration in
     // the compile diagnostic. It remains separate from `reasoning`, so the
     // invalid declaration can never become a routable picker capability.
@@ -1210,6 +1198,7 @@ fn effective_capability_summary(
 
     let (reasoning_summary_format, default_reasoning_summary) =
         effective_reasoning_summary_metadata(provider, model_entry);
+    let codex_ultra = effective_codex_ultra_overlay(model_entry, reasoning.as_ref());
 
     CodexModelCapabilitySummary {
         context_window,
@@ -1223,8 +1212,7 @@ fn effective_capability_summary(
         ),
         base_instructions: string_field(model_entry, &["baseInstructions", "base_instructions"])
             .map(ToString::to_string),
-        codex_ultra: value_field(model_entry, &["codexUltra", "codex_ultra"])
-            .map(sanitize_capability_value),
+        codex_ultra,
         reasoning_summary_format,
         default_reasoning_summary,
         context_window_source,
@@ -1234,12 +1222,49 @@ fn effective_capability_summary(
     }
 }
 
-/// Model capabilities share the request/inspector resolver. Legacy provider
-/// transport settings are only a fallback, never a replacement for that chain.
+/// Keep the top-level catalog overlay consistent with the resolved capability.
+/// Legacy automatic Sublyx rows used `xhigh` for Ultra before native `max` was
+/// exposed. The resolver repairs that target, so the projection must repair the
+/// matching raw overlay while retaining explicit user selections verbatim.
+fn effective_codex_ultra_overlay(model_entry: &Value, reasoning: Option<&Value>) -> Option<Value> {
+    let mut overlay =
+        value_field(model_entry, &["codexUltra", "codex_ultra"]).map(sanitize_capability_value)?;
+    let Some(overlay_object) = overlay.as_object_mut() else {
+        return Some(overlay);
+    };
+    let is_legacy_automatic_target = overlay_object.get("enabled").and_then(Value::as_bool)
+        == Some(true)
+        && overlay_object.get("providerEffort").and_then(Value::as_str) == Some("xhigh")
+        && overlay_object
+            .get("providerEffortSource")
+            .and_then(Value::as_str)
+            != Some("user");
+    if !is_legacy_automatic_target {
+        return Some(overlay);
+    }
+
+    let resolved_native_max = reasoning
+        .and_then(|value| {
+            value
+                .get("codexUltraOrchestration")
+                .or_else(|| value.get("codex_ultra_orchestration"))
+        })
+        .and_then(Value::as_object)
+        .is_some_and(|ultra| {
+            ultra.get("enabled").and_then(Value::as_bool) == Some(true)
+                && ultra.get("providerEffort").and_then(Value::as_str) == Some("max")
+        });
+    if resolved_native_max {
+        overlay_object.insert("providerEffort".to_string(), Value::String("max".into()));
+    }
+    Some(overlay)
+}
+
+/// Publish only what the shared resolver recognizes as a model capability.
+/// Legacy transport settings belong to the request adapter, not the catalog.
 fn effective_reasoning_capability(
     provider: &Provider,
     model_entry: &Value,
-    provider_reasoning: Option<Value>,
     official_models: &[Value],
 ) -> (Option<Value>, String) {
     let canonical_model = string_field(model_entry, &["model", "id", "slug"]).unwrap_or("");
@@ -1267,45 +1292,7 @@ fn effective_reasoning_capability(
         return (serde_json::to_value(capability).ok(), source);
     }
 
-    if let Some(reasoning) = provider_reasoning {
-        return (Some(reasoning), "provider".to_string());
-    }
-
     (None, "unknown".to_string())
-}
-
-fn validated_legacy_provider_reasoning(value: &Value) -> Option<Value> {
-    let object = value.as_object()?;
-    let legacy_fields = [
-        "supportsThinking",
-        "supportsEffort",
-        "thinkingParam",
-        "effortParam",
-        "effortValueMode",
-        "minOutputTokens",
-        "defaultOutputTokens",
-        "outputFormat",
-        "disableContract",
-    ];
-    if !legacy_fields.iter().any(|key| object.contains_key(*key))
-        || [
-            "schemaVersion",
-            "supportStatus",
-            "controlKind",
-            "supported",
-            "supportedEfforts",
-            "defaultEffort",
-            "disableAllowed",
-            "upstream",
-        ]
-        .iter()
-        .any(|key| object.contains_key(*key))
-    {
-        return None;
-    }
-    serde_json::from_value::<crate::provider::CodexChatReasoningConfig>(value.clone())
-        .ok()
-        .and_then(|reasoning| serde_json::to_value(reasoning).ok())
 }
 
 /// Preserve the Codex picker metadata that distinguishes native raw reasoning
@@ -1335,8 +1322,8 @@ fn effective_reasoning_summary_metadata(
         .to_ascii_lowercase();
     let official_deepseek_responses = effective_api_format(provider, model_entry).0
         == "openai_responses"
-        && provider_connection_url(provider)
-            .is_some_and(|url| url.to_ascii_lowercase().contains("api.deepseek.com"))
+        && crate::reasoning_capabilities::provider_metadata::detect_platform(provider)
+            == Some("deepseek")
         && model.starts_with("deepseek");
     if official_deepseek_responses {
         return (Some("experimental".to_string()), Some("none".to_string()));
@@ -1685,18 +1672,9 @@ fn dependency_fingerprint(
 }
 
 fn provider_connection_url(provider: &Provider) -> Option<String> {
-    string_field(
+    crate::reasoning_capabilities::provider_metadata::base_url_from_settings(
         &provider.settings_config,
-        &["baseUrl", "base_url", "openaiBaseUrl", "openai_base_url"],
     )
-    .map(ToString::to_string)
-    .or_else(|| {
-        provider
-            .settings_config
-            .get("config")
-            .and_then(Value::as_str)
-            .and_then(crate::codex_config::extract_codex_base_url)
-    })
 }
 
 fn provider_auth_owner(provider: &Provider) -> Value {
@@ -1752,6 +1730,86 @@ mod tests {
             ..Default::default()
         });
         provider
+    }
+
+    #[test]
+    fn compiler_provider_connection_url_follows_canonical_alias_precedence() {
+        let sublyx = "https://api.sublyx.org/v1";
+        let openrouter = "https://openrouter.ai/api/v1";
+        let fixtures = [
+            json!({"base_url": " ", "baseURL": sublyx}),
+            json!({"baseURL": sublyx}),
+            json!({"base_url": openrouter, "baseUrl": sublyx}),
+            json!({"baseUrl": " ", "base_url": sublyx}),
+            json!({"base_url": 42, "baseURL": sublyx}),
+            json!({
+                "base_url": " ",
+                "baseURL": sublyx,
+                "config": "model_provider = \"active\"\n[model_providers.active]\nbase_url = \"https://openrouter.ai/api/v1\"\n"
+            }),
+        ];
+        for settings in fixtures {
+            let mut source = provider("gateway", "Gateway", "openai_responses", json!([]));
+            source.settings_config = settings;
+            let canonical =
+                crate::reasoning_capabilities::provider_metadata::base_url_from_settings(
+                    &source.settings_config,
+                );
+            assert!(
+                canonical.is_some(),
+                "fixture must declare a usable endpoint"
+            );
+            assert_eq!(provider_connection_url(&source), canonical);
+        }
+    }
+
+    #[test]
+    fn compiler_reasoning_summary_requires_exact_deepseek_transport() {
+        let entry = json!({"model": "deepseek-v4-flash"});
+        let mut source = provider("gateway", "DeepSeek Gateway", "openai_responses", json!([]));
+        for endpoint in [
+            "https://api.deepseek.com.example/v1",
+            "https://gateway.example/api.deepseek.com/v1",
+            "https://gateway.example/v1?provider=api.deepseek.com",
+            "https://api.deepseek.com@gateway.example/v1",
+            "ftp://api.deepseek.com/v1",
+        ] {
+            source.settings_config["baseUrl"] = json!(endpoint);
+            assert_eq!(
+                effective_reasoning_summary_metadata(&source, &entry),
+                (None, None),
+                "{endpoint} must not acquire official DeepSeek summary metadata"
+            );
+        }
+        for endpoint in [
+            "https://api.deepseek.com/v1",
+            "https://API.DEEPSEEK.COM./v1",
+        ] {
+            source.settings_config["baseUrl"] = json!(endpoint);
+            assert_eq!(
+                effective_reasoning_summary_metadata(&source, &entry),
+                (Some("experimental".into()), Some("none".into()))
+            );
+        }
+        source.meta.as_mut().unwrap().api_format = Some("openai_chat".into());
+        assert_eq!(
+            effective_reasoning_summary_metadata(&source, &entry),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn compiler_reasoning_summary_preserves_explicit_metadata() {
+        let source = provider("gateway", "Gateway", "openai_responses", json!([]));
+        for entry in [
+            json!({"model": "deepseek-v4-flash", "reasoningSummaryFormat": "concise", "defaultReasoningSummary": "auto"}),
+            json!({"model": "deepseek-v4-flash", "reasoning_summary_format": "concise", "default_reasoning_summary": "auto"}),
+        ] {
+            assert_eq!(
+                effective_reasoning_summary_metadata(&source, &entry),
+                (Some("concise".into()), Some("auto".into()))
+            );
+        }
     }
 
     fn context_oauth_provider(id: &str, account: &str, models: Value) -> Provider {
@@ -3097,7 +3155,7 @@ mod tests {
                     );
                     assert_eq!(
                         selectable.effort_map.get(&CodexReasoningEffort::Ultra),
-                        Some(&CodexReasoningEffort::XHigh)
+                        Some(&CodexReasoningEffort::Max)
                     );
                     let mut request = json!({
                         "model": model_id,
@@ -3106,9 +3164,8 @@ mod tests {
                     });
                     prepare_codex_native_responses_model(&routed, &mut request)
                         .expect("Sublyx Ultra maps on the native Responses boundary");
-                    // Adding native Max does not silently change the independent
-                    // maintained Ultra orchestration target.
-                    assert_eq!(request["reasoning"]["effort"], "xhigh");
+                    // Native-Max Sublyx rows use the native max tier for Ultra.
+                    assert_eq!(request["reasoning"]["effort"], "max");
                     let mut max_request = json!({
                         "model": model_id,
                         "input": "test",
@@ -3403,6 +3460,60 @@ mod tests {
     }
 
     #[test]
+    fn legacy_provider_transport_reasoning_is_not_projected_as_model_capability() {
+        for use_provider_meta in [false, true] {
+            let mut source = provider(
+                "legacy-transport",
+                "Legacy transport",
+                "openai_chat",
+                json!([
+                    {"model": "legacy-transport-undeclared"},
+                    {"model": "legacy-transport-malformed", "reasoning": {
+                        "schemaVersion": 2,
+                        "supportStatus": "confirmed_supported"
+                    }}
+                ]),
+            );
+            let legacy = CodexChatReasoningConfig {
+                supports_thinking: Some(true),
+                supports_effort: Some(false),
+                thinking_param: Some("thinking".into()),
+                ..Default::default()
+            };
+            if use_provider_meta {
+                source.meta.as_mut().unwrap().codex_chat_reasoning = Some(legacy);
+            } else {
+                source.settings_config["codexChatReasoning"] = json!(legacy);
+            }
+
+            let compiled = compile(
+                &plan(vec![route(
+                    "legacy-transport-route",
+                    &source.id,
+                    CodexModelSelection::All,
+                )]),
+                [source],
+            );
+            assert_eq!(compiled.model_catalog.len(), 2);
+            for model in &compiled.model_catalog {
+                let summary = &model.capability_summary;
+                assert!(summary.reasoning.is_none(), "{}", model.canonical_model);
+                assert_eq!(summary.reasoning_source, "unknown");
+            }
+            assert!(compiled.model_catalog[0]
+                .capability_summary
+                .declared_reasoning_diagnostic
+                .is_none());
+            assert_eq!(
+                compiled.model_catalog[1]
+                    .capability_summary
+                    .declared_reasoning_diagnostic,
+                Some(json!({"schemaVersion": 2, "supportStatus": "confirmed_supported"}))
+            );
+        }
+    }
+
+    #[test]
     fn capability_summary_uses_maintained_library_capability() {
         let mut provider = provider(
             "openrouter",
@@ -3560,6 +3671,145 @@ mod tests {
                 .and_then(|value| value.get("codexUltraOrchestration"))
                 .and_then(|value| value.get("enabled")),
             Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn legacy_sublyx_ultra_overlay_matches_resolved_native_max() {
+        let mut provider = provider(
+            "sublyx",
+            "Sublyx",
+            "openai_responses",
+            json!([{
+                "model": "public-model",
+                "upstreamModel": "gpt-6.2-sol",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "medium", "high", "xhigh"],
+                    "defaultEffort": "xhigh",
+                    "disableAllowed": false,
+                    "upstream": {
+                        "format": "reasoning_object",
+                        "parameter": "reasoning.effort",
+                        "effortMap": {
+                            "low": "low",
+                            "medium": "medium",
+                            "high": "high",
+                            "xhigh": "xhigh"
+                        }
+                    },
+                    "source": "builtin",
+                    "codexUltraOrchestration": {
+                        "enabled": true,
+                        "providerEffort": "xhigh"
+                    }
+                },
+                "codexUltra": {"enabled": true, "providerEffort": "xhigh"}
+            }]),
+        );
+        provider.settings_config["baseUrl"] = json!("https://api.sublyx.org/v1");
+
+        let compiled = compile(
+            &plan(vec![route(
+                "sublyx-route",
+                "sublyx",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+        let summary = &compiled.model_catalog[0].capability_summary;
+
+        assert_eq!(
+            summary
+                .reasoning
+                .as_ref()
+                .and_then(|value| value.get("codexUltraOrchestration"))
+                .and_then(|value| value.get("providerEffort")),
+            Some(&json!("max"))
+        );
+        assert_eq!(
+            summary
+                .codex_ultra
+                .as_ref()
+                .and_then(|value| value.get("providerEffort")),
+            Some(&json!("max"))
+        );
+    }
+
+    #[test]
+    fn explicit_sublyx_ultra_xhigh_survives_native_max_projection() {
+        let mut provider = provider(
+            "sublyx",
+            "Sublyx",
+            "openai_responses",
+            json!([{
+                "model": "public-model",
+                "upstreamModel": "gpt-6.2-sol",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "medium", "high", "xhigh"],
+                    "defaultEffort": "xhigh",
+                    "disableAllowed": false,
+                    "upstream": {
+                        "format": "reasoning_object",
+                        "parameter": "reasoning.effort",
+                        "effortMap": {
+                            "low": "low",
+                            "medium": "medium",
+                            "high": "high",
+                            "xhigh": "xhigh"
+                        }
+                    },
+                    "source": "builtin",
+                    "codexUltraOrchestration": {
+                        "enabled": true,
+                        "providerEffort": "xhigh"
+                    }
+                },
+                "codexUltra": {
+                    "enabled": true,
+                    "providerEffort": "xhigh",
+                    "providerEffortSource": "user"
+                }
+            }]),
+        );
+        provider.settings_config["baseUrl"] = json!("https://api.sublyx.org/v1");
+
+        let compiled = compile(
+            &plan(vec![route(
+                "sublyx-route",
+                "sublyx",
+                CodexModelSelection::All,
+            )]),
+            [provider],
+        );
+        let summary = &compiled.model_catalog[0].capability_summary;
+
+        assert_eq!(
+            summary
+                .reasoning
+                .as_ref()
+                .and_then(|value| value.get("codexUltraOrchestration"))
+                .and_then(|value| value.get("providerEffort")),
+            Some(&json!("xhigh"))
+        );
+        assert_eq!(
+            summary
+                .codex_ultra
+                .as_ref()
+                .and_then(|value| value.get("providerEffort")),
+            Some(&json!("xhigh"))
+        );
+        assert_eq!(
+            summary
+                .codex_ultra
+                .as_ref()
+                .and_then(|value| value.get("providerEffortSource")),
+            Some(&json!("user"))
         );
     }
 

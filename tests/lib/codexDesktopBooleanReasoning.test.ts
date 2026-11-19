@@ -510,12 +510,12 @@ describe("native Boolean reasoning presentation", () => {
     const api = bridge([row]);
     const model = row.model;
     expect(api.readNativeBooleanReasoningControlState(model)).toEqual({
-      status: "unverified",
+      status: "not_observed",
       model,
     });
     render(React.createElement(NativeHarness, { row }));
     expect(api.readNativeBooleanReasoningControlState(model).status).toBe(
-      "unverified",
+      "not_observed",
     );
     sync(api);
     expect(api.readNativeBooleanReasoningControlState(model)).toEqual({
@@ -531,12 +531,61 @@ describe("native Boolean reasoning presentation", () => {
     sync(api);
     act(() => api.restoreNativeBooleanReasoningControls());
     expect(api.readNativeBooleanReasoningControlState(model).status).toBe(
-      "unverified",
+      "not_observed",
     );
     api.state.payload.catalogReleased = true;
     expect(api.readNativeBooleanReasoningControlState(model).status).toBe(
       "not_active",
     );
+  });
+
+  it("moves mounted control proof to the new Boolean model without certifying the previous selection", () => {
+    const first = booleanRow();
+    const second = { ...booleanRow(false), model: "fixture/always-thinking" };
+    const models = [first, second];
+    const api = bridge(models);
+    const onSelectModel = vi.fn();
+    const picker = (model: string) =>
+      React.createElement(NativePicker, {
+        model,
+        models,
+        reasoningEffort: "medium",
+        onSelectModel,
+      });
+    const view = render(picker(first.model));
+    sync(api);
+    expect(api.readNativeBooleanReasoningControlState(first.model)).toEqual({
+      status: "ready",
+      model: first.model,
+      selectedState: "on",
+      visibleStates: ["off", "on"],
+    });
+    expect(api.readNativeBooleanReasoningControlState(second.model)).toEqual({
+      status: "not_observed",
+      model: second.model,
+    });
+
+    view.rerender(picker(second.model));
+    // Even before the adapter resyncs, a stale record is not current proof.
+    expect(api.readNativeBooleanReasoningControlState(first.model)).toEqual({
+      status: "unverified",
+      model: first.model,
+    });
+    sync(api);
+    const toggle = screen.getByRole("switch", { name: "Thinking" });
+    expect(toggle).toBeDisabled();
+    expect(api.readNativeBooleanReasoningControlState(second.model)).toEqual({
+      status: "ready",
+      model: second.model,
+      selectedState: "on",
+      visibleStates: ["on"],
+    });
+    toggle.setAttribute("aria-checked", "false");
+    expect(api.readNativeBooleanReasoningControlState(second.model)).toEqual({
+      status: "unverified",
+      model: second.model,
+    });
+    expect(onSelectModel).not.toHaveBeenCalled();
   });
 
   it("cannot reuse a control after a same-provider payload replacement or same-model row replacement", () => {
@@ -655,6 +704,67 @@ describe("native Boolean reasoning presentation", () => {
     expect(api.readNativeBooleanReasoningControlState(row.model).status).toBe(
       "ready",
     );
+  });
+
+  it("reconciles a valid Fiber binding after an invalid observation without a DOM mutation", () => {
+    const row = booleanRow();
+    const filtered = {
+      ...row,
+      supportedReasoningEfforts: row.supportedReasoningEfforts!.filter(
+        (level) => level.reasoningEffort !== "none",
+      ),
+    };
+    const api = bridge([row]);
+    const view = render(React.createElement(NativeHarness, { row: filtered }));
+    sync(api);
+    expect(api.readNativeBooleanReasoningControlState(row.model).status).toBe(
+      "unverified",
+    );
+
+    const mutations = new MutationObserver(() => {});
+    mutations.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      characterData: true,
+    });
+    view.rerender(React.createElement(NativeHarness, { row }));
+    expect(mutations.takeRecords()).toEqual([]);
+    expect(api.readNativeBooleanReasoningControlState(row.model)).toEqual({
+      status: "ready",
+      model: row.model,
+      selectedState: "on",
+      visibleStates: ["off", "on"],
+    });
+    mutations.disconnect();
+  });
+
+  it("recovers the native control after a rejected async selection callback", async () => {
+    const row = booleanRow();
+    const api = bridge([row]);
+    const onSelectModel = vi.fn(() => Promise.reject(new Error("rejected")));
+    render(
+      React.createElement(NativePicker, {
+        model: row.model,
+        models: [row],
+        reasoningEffort: "medium",
+        onSelectModel,
+      }),
+    );
+    sync(api);
+    fireEvent.click(screen.getByRole("switch", { name: "Thinking" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(onSelectModel).toHaveBeenCalledWith(row.model, "none");
+    expect(screen.getByRole("switch", { name: "Thinking" })).toBeEnabled();
+    expect(api.readNativeBooleanReasoningControlState(row.model)).toEqual({
+      status: "ready",
+      model: row.model,
+      selectedState: "on",
+      visibleStates: ["off", "on"],
+    });
   });
 
   it("does not rewrite native or owned DOM during an unchanged heartbeat", () => {

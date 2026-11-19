@@ -26,10 +26,13 @@ pub fn import_hermes_providers_from_live(state: State<'_, AppState>) -> Result<u
 
 /// Get provider names in the Hermes live config.
 #[tauri::command]
-pub fn get_hermes_live_provider_ids() -> Result<Vec<String>, String> {
-    hermes_config::get_providers()
-        .map(|providers| providers.keys().cloned().collect())
-        .map_err(|e| e.to_string())
+pub async fn get_hermes_live_provider_ids() -> Result<Vec<String>, String> {
+    super::run_command_blocking(|| {
+        hermes_config::get_providers()
+            .map(|providers| providers.keys().cloned().collect())
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Get a single Hermes provider fragment from live config.
@@ -47,8 +50,27 @@ pub fn get_hermes_live_provider(
 /// Get Hermes model config (model section of config.yaml). Read-only — writes
 /// happen implicitly through `apply_switch_defaults` when switching providers.
 #[tauri::command]
-pub fn get_hermes_model_config() -> Result<Option<hermes_config::HermesModelConfig>, String> {
-    hermes_config::get_model_config().map_err(|e| e.to_string())
+pub async fn get_hermes_model_config() -> Result<Option<hermes_config::HermesModelConfig>, String> {
+    super::run_command_blocking(|| hermes_config::get_model_config().map_err(|e| e.to_string()))
+        .await
+}
+
+#[cfg(test)]
+mod read_dispatch_tests {
+    use super::{get_hermes_live_provider_ids, get_hermes_model_config};
+    use std::future::Future;
+
+    fn assert_async_command<T, F>(_: impl FnOnce() -> F)
+    where
+        F: Future<Output = Result<T, String>> + Send,
+    {
+    }
+
+    #[test]
+    fn provider_page_reads_use_async_dispatch() {
+        assert_async_command(get_hermes_live_provider_ids);
+        assert_async_command(get_hermes_model_config);
+    }
 }
 
 // ============================================================================

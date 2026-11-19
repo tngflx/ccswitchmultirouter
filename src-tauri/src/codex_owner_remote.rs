@@ -625,12 +625,32 @@ struct OwnerViewWire {
     continue_blocker: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OwnerFailureCategory {
+    ServerOverloaded,
+    UsageLimit,
+    RateLimit,
+    InternalServerError,
+    AuthenticationError,
+    ContextLengthExceeded,
+    InvalidRequestError,
+    ConnectionError,
+    Unknown,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OwnerFailureWire {
+    category: OwnerFailureCategory,
+}
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OwnerTurnWire {
     id: String,
     status: String,
     items: Vec<OwnerItemWire>,
     truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<OwnerFailureWire>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -692,6 +712,7 @@ fn decode_owner_view(
                 "unknown",
             ]
             .contains(&turn.status.as_str())
+            || (turn.failure.is_some() && !matches!(turn.status.as_str(), "failed" | "interrupted"))
         {
             return Err(CodexOwnerRemoteError::ContentUnavailable);
         }
@@ -1612,6 +1633,66 @@ mod tests {
             Some(CodexOwnerRemoteError::ContentUnavailable)
         );
     }
+    #[test]
+    fn native_owner_failure_wire_accepts_fixed_categories_on_failed_turns() {
+        for category in [
+            "server_overloaded",
+            "usage_limit",
+            "rate_limit",
+            "internal_server_error",
+            "authentication_error",
+            "context_length_exceeded",
+            "invalid_request_error",
+            "connection_error",
+            "unknown",
+        ] {
+            for status in ["failed", "interrupted"] {
+                let mut envelope = fixture_envelope();
+                envelope["view"]["status"] = json!("error");
+                envelope["view"]["turns"][0]["status"] = json!(status);
+                envelope["view"]["turns"][0]["failure"] = json!({"category": category});
+                let decoded = decode_owner_view(envelope, "fixture-thread")
+                    .expect("fixed failure category must decode");
+                let public = serde_json::to_value(decoded.view).unwrap();
+                assert_eq!(public["turns"][0]["failure"], json!({"category": category}));
+            }
+        }
+    }
+
+    #[test]
+    fn native_owner_failure_wire_rejects_raw_details_and_nonfailure_turns() {
+        for failure in [
+            json!({"category":"invented"}),
+            json!({"category":"unknown", "message":"secret"}),
+            json!({"category":"unknown", "retryable":true}),
+            json!({"category":"unknown", "retryAfterSeconds":1}),
+            json!({"category":"unknown", "source":{"provider":"secret"}}),
+            json!({"category":null}),
+            json!({"category":1}),
+            json!({}),
+            json!([]),
+        ] {
+            let mut envelope = fixture_envelope();
+            envelope["view"]["status"] = json!("error");
+            envelope["view"]["turns"][0]["status"] = json!("failed");
+            envelope["view"]["turns"][0]["failure"] = failure;
+            assert_eq!(
+                decode_owner_view(envelope, "fixture-thread").err(),
+                Some(CodexOwnerRemoteError::ContentUnavailable)
+            );
+        }
+        for status in ["completed", "inProgress", "unknown"] {
+            let mut envelope = fixture_envelope();
+            envelope["view"]["turns"][0]["failure"] = json!({"category":"unknown"});
+            envelope["view"]["turns"][0]["status"] = json!(status);
+            assert_eq!(
+                decode_owner_view(envelope, "fixture-thread").err(),
+                Some(CodexOwnerRemoteError::ContentUnavailable),
+                "failure on {status} must be rejected"
+            );
+        }
+    }
+
     #[test]
     fn native_owner_error_binding_accepts_only_latest_failed_or_interrupted() {
         for status in ["failed", "interrupted"] {

@@ -42,9 +42,13 @@ const nativeBaseEfforts = quotedValues(
 const rustDefault = rustContract.match(
   /default_effort: Some\("([^"]+)"\.to_string\(\)\)/,
 )?.[1];
-const rustUltraTarget = rustContract.match(
-  /provider_effort: Some\("([^"]+)"\.to_string\(\)\)/,
-)?.[1];
+const rustUltraTarget = rustContract.includes(
+  "provider_effort: Some(if supports_native_max",
+)
+  ? "max"
+  : rustContract.match(
+      /provider_effort: Some\("([^"]+)"\.to_string\(\)\)/,
+    )?.[1];
 const legacyCapability: CodexModelReasoningCapability = {
   // Maintained legacy provenance, not an explicit user-owned subset.
   source: "sublyx",
@@ -68,9 +72,12 @@ describe("Sublyx maintained reasoning TS/Rust contract parity", () => {
     expect(rustContract).toContain(
       'upstream == *known || upstream.starts_with(&format!("{known}-"))',
     );
+    expect(rustContract).toContain(
+      "provider_effort: Some(if supports_native_max",
+    );
     expect(nativeBaseEfforts).toEqual(["low", "medium", "high", "xhigh"]);
     expect(rustDefault).toBe("medium");
-    expect(rustUltraTarget).toBe("xhigh");
+    expect(rustUltraTarget).toBe("max");
   });
 
   it.each(
@@ -129,4 +136,35 @@ describe("Sublyx maintained reasoning TS/Rust contract parity", () => {
       ),
     ).toBe(legacyCapability);
   });
+
+  it.each(rustMaxFamilies)(
+    "retargets the saved maintained Ultra default for %s without changing native Max",
+    (model) => {
+      const capability = normalizeCodexReasoningCapabilityForProvider(
+        model,
+        {
+          ...legacyCapability,
+          supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+          upstream: {
+            format: "reasoning_object",
+            parameter: "reasoning.effort",
+            effortMap: {
+              low: "low",
+              medium: "medium",
+              high: "high",
+              xhigh: "xhigh",
+              max: "max",
+            },
+          },
+          codexUltraOrchestration: { enabled: true, providerEffort: "xhigh" },
+        },
+        identity,
+      );
+
+      expect(capability.upstream.effortMap?.max).toBe("max");
+      expect(capability.codexUltraOrchestration?.providerEffort).toBe(
+        rustUltraTarget,
+      );
+    },
+  );
 });

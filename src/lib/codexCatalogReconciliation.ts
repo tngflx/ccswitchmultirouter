@@ -84,6 +84,16 @@ function rowIdentities(row: CodexCatalogRowLike): string[] {
   return modelBindingIdentityValues(row);
 }
 
+/** A family slug is display metadata, not evidence for a wire binding. */
+function fetchedWireIdentities(model: ModelIdentityShape): string[] {
+  return modelIdentityValues({
+    id: model.id,
+    upstreamModel: model.upstreamModel,
+    upstream_model: model.upstream_model,
+    aliases: model.aliases,
+  });
+}
+
 function hasValue(value: unknown): boolean {
   return value !== undefined && value !== null && value !== "";
 }
@@ -347,15 +357,20 @@ export function pruneMissingRemoteCodexCatalogRows<
   const fetchedIdentities = new Set(
     fetchedModels.flatMap((model) => modelIdentityValues(model)),
   );
+  const wireIdentities = new Set(fetchedModels.flatMap(fetchedWireIdentities));
   const consideredRows = rows.filter(
     (row) =>
       options?.includeUnboundRows === true || rowExplicitUpstreamModel(row),
   );
   const missingRows = new Set(
-    consideredRows.filter(
-      (row) =>
-        !rowIdentities(row).some((identity) => fetchedIdentities.has(identity)),
-    ),
+    consideredRows.filter((row) => {
+      const explicitWire = catalogModelIdentity(rowExplicitUpstreamModel(row));
+      return explicitWire
+        ? !wireIdentities.has(explicitWire)
+        : !rowIdentities(row).some((identity) =>
+            fetchedIdentities.has(identity),
+          );
+    }),
   );
   const removedModels = [...missingRows]
     .filter((row) => !options?.markMissingDisabled || row.enabled !== false)
@@ -414,6 +429,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
   // matching identities through the shared model identity contract.
   const next = [...rows];
   const requestIdentityOwners = new Map<string, number | null>();
+  const wireIdentityOwners = new Map<string, number | null>();
   const identityOwners = new Map<string, number | null>();
   // Resolve ownership from the complete inventory before any row is changed.
   // Exact request IDs win; overlapping aliases never choose an arbitrary model.
@@ -435,27 +451,33 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       catalogModelIdentity(fetched.upstream_model);
     if (!requestIdentity) return;
     registerIdentity(requestIdentityOwners, requestIdentity, index);
+    for (const identity of fetchedWireIdentities(fetched)) {
+      registerIdentity(wireIdentityOwners, identity, index);
+    }
     for (const identity of modelIdentityValues(fetched)) {
       registerIdentity(identityOwners, identity, index);
     }
   });
   const existingIndicesByFetchedIndex = new Map<number, number[]>();
   rows.forEach((row, index) => {
-    const requestIdentity = catalogModelIdentity(
-      rowExplicitUpstreamModel(row) || row.model,
-    );
+    const explicitWire = catalogModelIdentity(rowExplicitUpstreamModel(row));
+    const requestIdentity = explicitWire || catalogModelIdentity(row.model);
     let fetchedIndex = requestIdentityOwners.get(requestIdentity);
     if (fetchedIndex === undefined) {
-      const owners = new Set(
-        rowIdentities(row)
-          .map((identity) =>
-            requestIdentityOwners.has(identity)
-              ? requestIdentityOwners.get(identity)
-              : identityOwners.get(identity),
-          )
-          .filter((owner) => owner !== undefined),
-      );
-      if (owners.size === 1) fetchedIndex = owners.values().next().value;
+      if (explicitWire) {
+        fetchedIndex = wireIdentityOwners.get(explicitWire);
+      } else {
+        const owners = new Set(
+          rowIdentities(row)
+            .map((identity) =>
+              requestIdentityOwners.has(identity)
+                ? requestIdentityOwners.get(identity)
+                : identityOwners.get(identity),
+            )
+            .filter((owner) => owner !== undefined),
+        );
+        if (owners.size === 1) fetchedIndex = owners.values().next().value;
+      }
     }
     if (typeof fetchedIndex !== "number") return;
     const indices = existingIndicesByFetchedIndex.get(fetchedIndex) ?? [];
@@ -493,12 +515,6 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       const contextWindow = resolveContextWindow(fetched);
       const patch: Partial<CodexCatalogRowLike> = {};
       const currentUpstream = rowExplicitUpstreamModel(row);
-      const fetchedWireIdentities = modelIdentityValues({
-        id: fetched.id,
-        upstreamModel: fetched.upstreamModel,
-        upstream_model: fetched.upstream_model,
-        aliases: fetched.aliases,
-      });
       if (
         (!currentUpstream &&
           catalogModelIdentity(wireModel) !==
@@ -506,8 +522,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
         (refresh &&
           currentUpstream &&
           catalogModelIdentity(currentUpstream) !==
-            catalogModelIdentity(wireModel) &&
-          fetchedWireIdentities.includes(catalogModelIdentity(currentUpstream)))
+            catalogModelIdentity(wireModel))
       ) {
         patch.upstreamModel = wireModel;
       }

@@ -2732,7 +2732,14 @@ mod tests {
 
     #[test]
     fn upstream_sync_responses_preserves_explicit_max_effort() {
-        for model in ["gpt-6-sol", "gpt-6-luna", "GPT-6-SOL", "GPT-6-LUNA"] {
+        for model in [
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.2-sol",
+            "GPT-6-SOL",
+            "GPT-6-LUNA",
+            "GPT-6.2-SOL",
+        ] {
             for oauth in [false, true] {
                 let result = anthropic_to_responses(
                     json!({

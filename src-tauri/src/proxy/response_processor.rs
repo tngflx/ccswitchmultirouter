@@ -9,7 +9,7 @@ use super::{
     handler_context::{RequestContext, StreamingTimeoutConfig},
     hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES},
     server::ProxyState,
-    sse::{strip_sse_field, take_sse_block},
+    sse::{strip_sse_field, BoundedSseFrames, SseFrame},
     usage::parser::TokenUsage,
     ProxyError,
 };
@@ -398,7 +398,32 @@ fn should_stream_response(response: &ProxyResponse, request_is_streaming: bool) 
 // SSE 使用量收集器
 // ============================================================================
 
-type UsageCallbackWithTiming = Arc<dyn Fn(Vec<Value>, Option<u64>) + Send + Sync + 'static>;
+type UsageCallbackWithTiming =
+    Arc<dyn Fn(Vec<Value>, Option<u64>, Option<StreamFailure>) + Send + Sync + 'static>;
+
+#[derive(Clone, Copy, Debug)]
+enum StreamFailure {
+    Transport,
+    FirstByteTimeout,
+    IdleTimeout,
+}
+
+impl StreamFailure {
+    fn status_code(self) -> u16 {
+        match self {
+            Self::Transport => 502,
+            Self::FirstByteTimeout | Self::IdleTimeout => 504,
+        }
+    }
+
+    fn summary(self) -> &'static str {
+        match self {
+            Self::Transport => "stream transport failure",
+            Self::FirstByteTimeout => "stream first-byte timeout",
+            Self::IdleTimeout => "stream idle timeout",
+        }
+    }
+}
 
 /// SSE 使用量收集器
 #[derive(Clone)]
@@ -414,14 +439,30 @@ struct SseUsageCollectorInner {
     on_complete: UsageCallbackWithTiming,
     should_collect: Option<StreamUsageEventFilter>,
     finished: AtomicBool,
+    failure: std::sync::atomic::AtomicU8,
 }
 
 impl SseUsageCollector {
     /// 创建使用量收集器；`should_collect` 用来在 hot path 跳过与 usage 无关的事件。
+    #[cfg(test)]
     pub fn new(
         start_time: std::time::Instant,
         should_collect: Option<StreamUsageEventFilter>,
         callback: impl Fn(Vec<Value>, Option<u64>) + Send + Sync + 'static,
+    ) -> Self {
+        Self::new_with_outcome(
+            start_time,
+            should_collect,
+            move |events, first_token_ms, _| {
+                callback(events, first_token_ms);
+            },
+        )
+    }
+
+    fn new_with_outcome(
+        start_time: std::time::Instant,
+        should_collect: Option<StreamUsageEventFilter>,
+        callback: impl Fn(Vec<Value>, Option<u64>, Option<StreamFailure>) + Send + Sync + 'static,
     ) -> Self {
         let on_complete: UsageCallbackWithTiming = Arc::new(callback);
         Self {
@@ -433,6 +474,7 @@ impl SseUsageCollector {
                 on_complete,
                 should_collect,
                 finished: AtomicBool::new(false),
+                failure: std::sync::atomic::AtomicU8::new(0),
             }),
         }
     }
@@ -463,6 +505,24 @@ impl SseUsageCollector {
         events.push(event);
     }
 
+    fn mark_failure(&self, failure: StreamFailure) {
+        let code = match failure {
+            StreamFailure::Transport => 1,
+            StreamFailure::FirstByteTimeout => 2,
+            StreamFailure::IdleTimeout => 3,
+        };
+        self.inner.failure.store(code, Ordering::Release);
+    }
+
+    fn failure(&self) -> Option<StreamFailure> {
+        match self.inner.failure.load(Ordering::Acquire) {
+            1 => Some(StreamFailure::Transport),
+            2 => Some(StreamFailure::FirstByteTimeout),
+            3 => Some(StreamFailure::IdleTimeout),
+            _ => None,
+        }
+    }
+
     /// 完成收集并触发回调
     pub async fn finish(&self) {
         if self.inner.finished.swap(true, Ordering::SeqCst) {
@@ -479,7 +539,7 @@ impl SseUsageCollector {
             first_time.map(|t| (t - self.inner.start_time).as_millis() as u64)
         };
 
-        (self.inner.on_complete)(events, first_token_ms);
+        (self.inner.on_complete)(events, first_token_ms, self.failure());
     }
 }
 
@@ -524,6 +584,28 @@ pub(crate) fn create_usage_collector(
     status_code: u16,
     parser_config: &UsageParserConfig,
 ) -> Option<SseUsageCollector> {
+    create_usage_collector_with_policy(ctx, state, status_code, parser_config, false)
+}
+
+/// Transformed streams historically omit successful records without usable usage.
+/// Keep that billing policy, but share outcome classification and failure logging
+/// with native streams so a missing usage event cannot hide a failed request.
+pub(crate) fn create_transformed_usage_collector(
+    ctx: &RequestContext,
+    state: &ProxyState,
+    status_code: u16,
+    parser_config: &UsageParserConfig,
+) -> Option<SseUsageCollector> {
+    create_usage_collector_with_policy(ctx, state, status_code, parser_config, true)
+}
+
+fn create_usage_collector_with_policy(
+    ctx: &RequestContext,
+    state: &ProxyState,
+    status_code: u16,
+    parser_config: &UsageParserConfig,
+    transformed: bool,
+) -> Option<SseUsageCollector> {
     let logging_enabled = state
         .config
         .try_read()
@@ -549,86 +631,90 @@ pub(crate) fn create_usage_collector(
     let tag = ctx.tag;
     let start_time = ctx.start_time;
     let stream_parser = parser_config.stream_parser;
+    let require_billable_usage = parser_config.app_type_str == "codex";
     let model_extractor = parser_config.model_extractor;
     let session_id = ctx.session_id.clone();
     let request_health_trace = ctx.request_health_trace.clone();
 
-    Some(SseUsageCollector::new(
+    Some(SseUsageCollector::new_with_outcome(
         start_time,
         parser_config.stream_event_filter,
-        move |events, first_token_ms| {
+        move |events, first_token_ms, transport_failure| {
             let stream_error = (app_type_str == "codex")
                 .then(|| codex_sse_failure_summary(&events))
                 .flatten();
-            let status_code = if stream_error.is_some() && (200..300).contains(&status_code) {
+            let status_code = if let Some(failure) = transport_failure {
+                if (200..300).contains(&status_code) {
+                    failure.status_code()
+                } else {
+                    status_code
+                }
+            } else if stream_error.is_some() && (200..300).contains(&status_code) {
                 502
             } else {
                 status_code
             };
-            if let Some(usage) = stream_parser(&events) {
-                if app_type_str == "codex" {
+            let error_message = stream_error
+                .or_else(|| transport_failure.map(|failure| failure.summary().to_string()));
+            let parsed_usage = stream_parser(&events);
+            let failed = !(200..300).contains(&status_code) || error_message.is_some();
+            if transformed
+                && !failed
+                && parsed_usage
+                    .as_ref()
+                    .map(|usage| require_billable_usage && !usage.has_billable_tokens())
+                    .unwrap_or(true)
+            {
+                log::debug!("[{tag}] successful transformed stream has no usable usage; skipping usage recording");
+                return;
+            }
+            if app_type_str == "codex" {
+                if let Some(usage) = parsed_usage.as_ref() {
                     crate::proxy::request_health::record_usage(
                         &request_health_trace,
                         usage.input_tokens,
                         usage.cache_read_tokens,
                     );
                 }
-                let model = model_extractor(&events, &fallback_model);
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-
-                let state = state.clone();
-                let provider_id = provider_id.clone();
-                let session_id = session_id.clone();
-                let request_model = request_model.clone();
-                let outbound_model = fallback_model.clone();
-
-                tokio::spawn(async move {
-                    log_usage_internal(
-                        &state,
-                        &provider_id,
-                        app_type_str,
-                        &model,
-                        &request_model,
-                        &outbound_model,
-                        usage,
-                        latency_ms,
-                        first_token_ms,
-                        true, // is_streaming
-                        status_code,
-                        Some(session_id),
-                        stream_error,
-                    )
-                    .await;
-                });
-            } else {
-                let model = model_extractor(&events, &fallback_model);
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-                let state = state.clone();
-                let provider_id = provider_id.clone();
-                let session_id = session_id.clone();
-                let request_model = request_model.clone();
-                let outbound_model = fallback_model.clone();
-
-                tokio::spawn(async move {
-                    log_usage_internal(
-                        &state,
-                        &provider_id,
-                        app_type_str,
-                        &model,
-                        &request_model,
-                        &outbound_model,
-                        TokenUsage::default(),
-                        latency_ms,
-                        first_token_ms,
-                        true, // is_streaming
-                        status_code,
-                        Some(session_id),
-                        stream_error,
-                    )
-                    .await;
-                });
-                log::debug!("[{tag}] 流式响应缺少 usage 统计，跳过消费记录");
             }
+            // Preserve transformed-stream attribution: a parsed nonempty usage
+            // model wins, otherwise use the current outbound/request model.
+            let model = if transformed {
+                parsed_usage
+                    .as_ref()
+                    .and_then(|usage| usage.model.as_ref())
+                    .filter(|model| !model.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| fallback_model.clone())
+            } else {
+                model_extractor(&events, &fallback_model)
+            };
+            let usage = parsed_usage.unwrap_or_default();
+            let latency_ms = start_time.elapsed().as_millis() as u64;
+            let state = state.clone();
+            let provider_id = provider_id.clone();
+            let session_id = session_id.clone();
+            let request_model = request_model.clone();
+            let outbound_model = fallback_model.clone();
+
+            tokio::spawn(async move {
+                log_usage_internal(
+                    &state,
+                    &provider_id,
+                    app_type_str,
+                    &model,
+                    &request_model,
+                    &outbound_model,
+                    usage,
+                    latency_ms,
+                    first_token_ms,
+                    true,
+                    status_code,
+                    Some(session_id),
+                    error_message,
+                )
+                .await;
+            });
         },
     ))
 }
@@ -792,8 +878,7 @@ pub fn create_logged_passthrough_stream_with_options(
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let _conn_guard = connection_guard;
-        let mut buffer = String::new();
-        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut frames = BoundedSseFrames::default();
         let mut collector = usage_collector;
         let mut finish_guard = collector.clone().map(SseUsageFinishGuard::new);
         let inspect_sse_events = collector.is_some();
@@ -839,6 +924,9 @@ pub fn create_logged_passthrough_stream_with_options(
                         }
                         _ = tokio::time::sleep_until(idle_deadline) => {
                             log::error!("[{tag}] 流式响应静默期超时 ({}秒)", idle_timeout.unwrap().as_secs());
+                            if let Some(c) = collector.as_ref() {
+                                c.mark_failure(StreamFailure::IdleTimeout);
+                            }
                             yield Err(std::io::Error::other("流式响应静默期超时".to_string()));
                             break;
                         }
@@ -852,6 +940,13 @@ pub fn create_logged_passthrough_stream_with_options(
                             // 超时
                             let timeout_type = if is_first_chunk { "首字节" } else { "静默期" };
                             log::error!("[{tag}] 流式响应{}超时 ({}秒)", timeout_type, duration.as_secs());
+                            if let Some(c) = collector.as_ref() {
+                                c.mark_failure(if is_first_chunk {
+                                    StreamFailure::FirstByteTimeout
+                                } else {
+                                    StreamFailure::IdleTimeout
+                                });
+                            }
                             yield Err(std::io::Error::other(format!("流式响应{timeout_type}超时")));
                             break;
                         }
@@ -872,10 +967,12 @@ pub fn create_logged_passthrough_stream_with_options(
                     last_activity = tokio::time::Instant::now();
                     last_keepalive = last_activity;
                     if inspect_sse_events {
-                        crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
-
-                        // 尝试解析并记录完整的 SSE 事件
-                        while let Some(event_text) = take_sse_block(&mut buffer) {
+                        let mut input = bytes.as_ref();
+                        while let Some(frame) = frames.read(&mut input) {
+                            // Usage observation is passive: skip oversized frames
+                            // without changing the SSE bytes or stopping the stream.
+                            let SseFrame::Complete(frame) = frame else { continue };
+                            let event_text = String::from_utf8_lossy(&frame);
                             if !event_text.trim().is_empty() {
                                 // 提取 data 部分；只有 usage collector 存在时才解析 JSON。
                                 let data = event_text.lines()
@@ -913,6 +1010,9 @@ pub fn create_logged_passthrough_stream_with_options(
                 Some(Err(e)) => {
                     let chain = super::error::error_chain_message(&e);
                     log::error!("[{tag}] 流错误: {chain}");
+                    if let Some(c) = collector.as_ref() {
+                        c.mark_failure(StreamFailure::Transport);
+                    }
                     yield Err(std::io::Error::other(e));
                     break;
                 }
@@ -984,6 +1084,43 @@ fn format_headers(headers: &HeaderMap) -> String {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn passive_sse_observation_skips_oversized_frame_without_changing_wire_bytes() {
+        let stored = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_store = stored.clone();
+        let collector =
+            SseUsageCollector::new(std::time::Instant::now(), None, move |events, _| {
+                *callback_store.lock().unwrap() = events;
+            });
+        let padding = Bytes::from(vec![b'x'; crate::proxy::sse::MAX_SSE_FRAME_BYTES]);
+        let tail = Bytes::from_static(b"\ndata: {\"oversized\":true}\r\n\r");
+        let valid = Bytes::from_static(b"\ndata: {\"keep\":true}\n\n");
+        let parts = [padding, tail, valid];
+        let upstream = futures::stream::iter(parts.clone().map(Ok));
+        let output = create_logged_passthrough_stream_with_options(
+            upstream,
+            "test",
+            Some(collector),
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            true,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(output.len(), parts.len());
+        for (actual, original) in output.iter().zip(&parts) {
+            assert_eq!(actual.as_ref().unwrap(), original);
+        }
+        assert_eq!(
+            *stored.lock().unwrap(),
+            vec![serde_json::json!({"keep": true})]
+        );
+    }
+
+    #[tokio::test]
     async fn codex_failed_multiline_stream_is_collected() {
         let stored = Arc::new(std::sync::Mutex::new(Vec::new()));
         let callback_store = stored.clone();
@@ -1015,6 +1152,186 @@ mod tests {
         assert!(codex_sse_failure_summary(&events)
             .unwrap()
             .contains("invalid_prompt"));
+    }
+
+    async fn stream_log_fixture() -> (Arc<Database>, ProxyState, RequestContext) {
+        use crate::app_config::AppType;
+        use crate::provider::Provider;
+
+        let db = Arc::new(Database::memory().unwrap());
+        insert_provider(&db, "stream-provider", "codex", ProviderMeta::default()).unwrap();
+        let state = build_state(db.clone());
+        let context = RequestContext::new_with_provider(
+            &state,
+            &serde_json::json!({"model": "stream-model"}),
+            &HeaderMap::new(),
+            AppType::Codex,
+            "test-stream-log",
+            "codex",
+            Provider::with_id(
+                "stream-provider".to_string(),
+                "Test Provider".to_string(),
+                serde_json::json!({}),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        (db, state, context)
+    }
+
+    fn completed_usage_chunk() -> Bytes {
+        Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"stream-fixture\",\"model\":\"stream-model\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n")
+    }
+
+    async fn persisted_stream_log(db: &Database) -> (u16, Option<String>, u32) {
+        for _ in 0..100 {
+            let row = {
+                let connection = db.conn.lock().unwrap();
+                connection
+                    .query_row(
+                        "SELECT status_code, error_message, output_tokens FROM proxy_request_logs WHERE provider_id='stream-provider'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .ok()
+            };
+            if let Some(row) = row {
+                return row;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("stream request log was not persisted");
+    }
+
+    #[tokio::test]
+    async fn stream_log_marks_transport_error_before_consumer_drops_stream() {
+        let (db, state, context) = stream_log_fixture().await;
+        let collector = create_usage_collector(
+            &context,
+            &state,
+            200,
+            &crate::proxy::handler_config::CODEX_PARSER_CONFIG,
+        );
+        let upstream = futures::stream::iter(vec![
+            Ok(completed_usage_chunk()),
+            Err(std::io::Error::other("redacted-transport-detail")),
+        ]);
+        let output = create_logged_passthrough_stream_with_options(
+            upstream,
+            "test-stream-log",
+            collector,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            true,
+        );
+        // Body consumers can stop polling immediately after the error. The finish
+        // guard must retain the failure even without a final poll returning None.
+        let mut output = Box::pin(output);
+        assert!(output.next().await.unwrap().is_ok());
+        assert!(output.next().await.unwrap().is_err());
+        drop(output);
+
+        let (status, error, output_tokens) = persisted_stream_log(&db).await;
+        assert_eq!(status, 502);
+        let error = error.expect("transport failure must not be logged as HTTP success");
+        assert!(error.contains("transport"), "{error}");
+        assert!(!error.contains("redacted-transport-detail"));
+        assert_eq!(output_tokens, 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_log_marks_idle_timeout_with_and_without_keepalive() {
+        for emit_sse_keepalive in [false, true] {
+            let (db, state, context) = stream_log_fixture().await;
+            let collector = create_usage_collector(
+                &context,
+                &state,
+                200,
+                &crate::proxy::handler_config::CODEX_PARSER_CONFIG,
+            );
+            let upstream = futures::stream::iter(vec![Ok(completed_usage_chunk())])
+                .chain(futures::stream::pending());
+            let output = create_logged_passthrough_stream_with_options(
+                upstream,
+                "test-stream-log",
+                collector,
+                StreamingTimeoutConfig {
+                    first_byte_timeout: 1,
+                    idle_timeout: 3,
+                },
+                None,
+                emit_sse_keepalive,
+            )
+            .collect::<Vec<_>>()
+            .await;
+            assert!(output.last().unwrap().is_err());
+            let (status, error, output_tokens) = persisted_stream_log(&db).await;
+            assert_eq!(status, 504);
+            assert!(error.unwrap().contains("idle timeout"));
+            assert_eq!(output_tokens, 5);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_log_marks_first_byte_timeout_without_usage() {
+        let (db, state, context) = stream_log_fixture().await;
+        let collector = create_usage_collector(
+            &context,
+            &state,
+            200,
+            &crate::proxy::handler_config::CODEX_PARSER_CONFIG,
+        );
+        let output = create_logged_passthrough_stream_with_options(
+            futures::stream::pending(),
+            "test-stream-log",
+            collector,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 1,
+                idle_timeout: 3,
+            },
+            None,
+            true,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(output.last().unwrap().is_err());
+        let (status, error, output_tokens) = persisted_stream_log(&db).await;
+        assert_eq!(status, 504);
+        assert!(error.unwrap().contains("first-byte timeout"));
+        assert_eq!(output_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_log_preserves_clean_terminal_success() {
+        let (db, state, context) = stream_log_fixture().await;
+        let collector = create_usage_collector(
+            &context,
+            &state,
+            200,
+            &crate::proxy::handler_config::CODEX_PARSER_CONFIG,
+        );
+        let output = create_logged_passthrough_stream_with_options(
+            futures::stream::iter(vec![Ok(completed_usage_chunk())]),
+            "test-stream-log",
+            collector,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            true,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(output.iter().all(Result::is_ok));
+        let (status, error, output_tokens) = persisted_stream_log(&db).await;
+        assert_eq!(status, 200);
+        assert_eq!(error, None);
+        assert_eq!(output_tokens, 5);
     }
 
     #[test]

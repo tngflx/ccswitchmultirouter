@@ -1015,16 +1015,19 @@ pub(crate) async fn reproject_current_ccsm_config(
 }
 
 #[tauri::command]
-pub fn inspect_codex_config_consistency(
-    state: State<'_, AppState>,
+pub async fn inspect_codex_config_consistency(
+    app: tauri::AppHandle,
     include_acknowledged: Option<bool>,
 ) -> Result<CodexConfigConsistencyReport, String> {
-    suppress_acknowledged_report(
-        &state,
-        inspect(&state).map_err(String::from)?,
-        include_acknowledged.unwrap_or(false),
-    )
-    .map_err(String::from)
+    crate::commands::run_app_state_blocking(&app, move |state| {
+        suppress_acknowledged_report(
+            state,
+            inspect(state).map_err(String::from)?,
+            include_acknowledged.unwrap_or(false),
+        )
+        .map_err(String::from)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1045,6 +1048,15 @@ mod tests {
     use crate::provider::Provider;
     use serde_json::json;
     use serial_test::serial;
+
+    #[test]
+    fn consistency_poll_is_dispatched_as_an_async_ipc() {
+        fn assert_future<T>(_: impl std::future::Future<Output = Result<T, String>>) {}
+
+        let _: fn(tauri::AppHandle) = |app| {
+            assert_future(inspect_codex_config_consistency(app, Some(false)));
+        };
+    }
 
     struct TestHomeGuard {
         _dir: tempfile::TempDir,

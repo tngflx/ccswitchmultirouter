@@ -8,9 +8,11 @@
 //! 为什么不用 PowerShell/计划任务/systemd/launchd：那是各平台各写一套的运维方案，
 //! 不随软件分发，也无法做成产品开关。这里用同一份 Rust 代码覆盖 Windows/macOS/Linux。
 
-use std::io::Write;
+mod diagnostic_journal;
+
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 守护进程的启动标记；主程序带这个参数运行时进入守护模式，不创建窗口。
 pub const SUPERVISE_FLAG: &str = "--ccsm-supervise";
@@ -22,6 +24,8 @@ pub const DEV_SUPERVISOR_ENV: &str = "CC_SWITCH_DEV_SUPERVISOR";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
 const READY_POLL: Duration = Duration::from_millis(500);
+const FAILED_RESTART_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const FAILED_RESTART_CLEANUP_POLL: Duration = Duration::from_millis(50);
 const RESTART_WINDOW_SECS: u64 = 30 * 60;
 const MAX_RESTARTS_PER_WINDOW: usize = 5;
 const RUN_MARKER_FILE: &str = "app-run-marker.json";
@@ -100,6 +104,51 @@ fn supervisor_identity_from_receipt(
         // child. The retained Child remains the canonical current-app receipt.
         Ok(Some(_)) | Err(_) => None,
     }
+}
+
+trait FailedReplacementChild {
+    fn try_reap(&mut self) -> io::Result<bool>;
+    fn terminate(&mut self) -> io::Result<()>;
+}
+
+impl FailedReplacementChild for std::process::Child {
+    fn try_reap(&mut self) -> io::Result<bool> {
+        self.try_wait().map(|status| status.is_some())
+    }
+
+    fn terminate(&mut self) -> io::Result<()> {
+        self.kill()
+    }
+}
+
+fn terminate_and_reap_child(
+    child: &mut impl FailedReplacementChild,
+    timeout: Duration,
+) -> io::Result<()> {
+    if child.try_reap()? {
+        return Ok(());
+    }
+    if let Err(error) = child.terminate() {
+        // A concurrent exit is harmless, but a failed kill is not a reason to wait indefinitely.
+        return if matches!(child.try_reap(), Ok(true)) {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+
+    let started = Instant::now();
+    while !child.try_reap()? {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "replacement process did not exit after termination",
+            ));
+        }
+        std::thread::sleep(remaining.min(FAILED_RESTART_CLEANUP_POLL));
+    }
+    Ok(())
 }
 
 fn acquire_supervisor_parent_lock(
@@ -357,23 +406,14 @@ fn log_dir(config_dir: &Path) -> PathBuf {
 }
 
 fn append_event(config_dir: &Path, level: &str, event: &str, detail: serde_json::Value) {
-    let directory = log_dir(config_dir);
-    if std::fs::create_dir_all(&directory).is_err() {
-        return;
-    }
     let record = serde_json::json!({
         "timestamp": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "level": level,
         "event": event,
         "detail": detail,
     });
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(directory.join(WATCHDOG_LOG_FILE))
-    {
-        let _ = writeln!(file, "{record}");
-    }
+    let path = log_dir(config_dir).join(WATCHDOG_LOG_FILE);
+    let _ = diagnostic_journal::append(&path, &record);
 }
 
 fn read_run_marker(config_dir: &Path) -> Option<String> {
@@ -920,12 +960,21 @@ pub fn run_supervisor(args: SuperviseArgs) -> ! {
             }
             std::thread::sleep(READY_POLL);
         }
+        let child_pid = child.id();
         append_event(
             &config_dir,
             "error",
             "supervisor-restart-not-ready",
-            serde_json::json!({ "newPid": child.id(), "port": args.port }),
+            serde_json::json!({ "newPid": child_pid, "port": args.port }),
         );
+        if let Err(error) = terminate_and_reap_child(&mut child, FAILED_RESTART_CLEANUP_TIMEOUT) {
+            append_event(
+                &config_dir,
+                "error",
+                "supervisor-restart-child-cleanup-failed",
+                serde_json::json!({ "newPid": child_pid, "error": error.to_string() }),
+            );
+        }
         std::process::exit(0);
     }
 }
@@ -942,16 +991,17 @@ pub struct WatchdogEventRecord {
 
 /// 读取最近 limit 条守护事件（新到旧）。
 pub fn recent_events(config_dir: &Path, limit: usize) -> Vec<WatchdogEventRecord> {
+    const MAX_RECORDS: usize = 64;
     let path = log_dir(config_dir).join(WATCHDOG_LOG_FILE);
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(bytes) = diagnostic_journal::tail(&path) else {
         return Vec::new();
     };
     let mut records = Vec::new();
-    for line in text.lines().rev() {
-        if records.len() >= limit {
+    for line in bytes.rsplit(|byte| *byte == b'\n') {
+        if records.len() >= limit.min(MAX_RECORDS) {
             break;
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
             continue;
         };
         records.push(WatchdogEventRecord {
@@ -1202,6 +1252,84 @@ mod tests {
             flooded,
             "bounded diagnostic history must not erase live ownership"
         );
+    }
+
+    #[test]
+    fn failed_restart_child_is_killed_and_reaped() {
+        let mut child = disposable_watchdog_fixture();
+        let child_pid = child.id();
+
+        terminate_and_reap_child(&mut child, FAILED_RESTART_CLEANUP_TIMEOUT)
+            .expect("failed restart child cleanup");
+
+        assert!(
+            child.try_wait().expect("reaped child status").is_some(),
+            "failed restart child must not remain running after supervisor cleanup"
+        );
+        assert_eq!(
+            child.id(),
+            child_pid,
+            "cleanup must target the spawned child"
+        );
+    }
+
+    #[derive(Default)]
+    struct FailedReplacementFixture {
+        terminate_error: Option<io::ErrorKind>,
+        exits_after_terminate: bool,
+        terminated: bool,
+        reap_attempts: usize,
+    }
+
+    impl FailedReplacementChild for FailedReplacementFixture {
+        fn try_reap(&mut self) -> io::Result<bool> {
+            self.reap_attempts += 1;
+            Ok(self.terminated && self.exits_after_terminate)
+        }
+
+        fn terminate(&mut self) -> io::Result<()> {
+            self.terminated = true;
+            self.terminate_error.map_or(Ok(()), |kind| Err(kind.into()))
+        }
+    }
+
+    #[test]
+    fn failed_restart_cleanup_reports_kill_error_without_waiting() {
+        let mut child = FailedReplacementFixture {
+            terminate_error: Some(io::ErrorKind::PermissionDenied),
+            ..Default::default()
+        };
+
+        let error = terminate_and_reap_child(&mut child, FAILED_RESTART_CLEANUP_TIMEOUT)
+            .expect_err("kill error while replacement is still running");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(child.terminated);
+        assert_eq!(child.reap_attempts, 2);
+    }
+
+    #[test]
+    fn failed_restart_cleanup_accepts_exit_racing_kill_error() {
+        let mut child = FailedReplacementFixture {
+            terminate_error: Some(io::ErrorKind::PermissionDenied),
+            exits_after_terminate: true,
+            ..Default::default()
+        };
+
+        terminate_and_reap_child(&mut child, Duration::ZERO).expect("confirmed exit wins the race");
+        assert_eq!(child.reap_attempts, 2);
+    }
+
+    #[test]
+    fn failed_restart_cleanup_reports_timeout_after_successful_kill() {
+        let mut child = FailedReplacementFixture::default();
+
+        let error = terminate_and_reap_child(&mut child, Duration::ZERO)
+            .expect_err("replacement is still running after the cleanup deadline");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(child.terminated);
+        assert_eq!(child.reap_attempts, 2);
     }
 
     #[test]
@@ -1981,6 +2109,26 @@ mod tests {
         assert_eq!(last_supervisor_pid(dir.path(), 999), Some(22));
         assert_eq!(last_supervisor_pid(dir.path(), 1234), None);
     }
+
+    #[test]
+    fn watchdog_status_reads_bounded_recent_records_from_legacy_journal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = log_dir(dir.path());
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        let mut bytes = vec![0xff; 2 * diagnostic_journal::MAX_BYTES];
+        bytes.push(b'\n');
+        for index in 0..80 {
+            writeln!(bytes, r#"{{"event":"event-{index}"}}"#).unwrap();
+        }
+        std::fs::write(logs.join(WATCHDOG_LOG_FILE), bytes).expect("legacy log");
+
+        let events = recent_events(dir.path(), usize::MAX);
+
+        assert_eq!(events.len(), 64);
+        assert_eq!(events.first().unwrap().event, "event-79");
+        assert_eq!(events.last().unwrap().event, "event-16");
+    }
+
     #[test]
     fn restart_budget_limits_crash_loops() {
         let now = 1_000_000u64;

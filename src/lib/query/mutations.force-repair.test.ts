@@ -1,8 +1,38 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { createProviderSwitchFailureToastOptions } from "./mutations";
+import { providersApi } from "@/lib/api/providers";
+import type { QueryClient } from "@tanstack/react-query";
+import {
+  createProviderSwitchFailureToastOptions,
+  refreshProviderSwitchQueries,
+} from "./mutations";
 
 describe("provider switch force repair action", () => {
+  it("schedules switch cache refreshes without awaiting a slow query", async () => {
+    let finishRefresh!: () => void;
+    const slowRefresh = new Promise<boolean>((resolve) => {
+      finishRefresh = () => resolve(true);
+    });
+    const invalidateQueries = vi.fn(() => slowRefresh);
+    const trayMenu = vi
+      .spyOn(providersApi, "updateTrayMenu")
+      .mockReturnValue(slowRefresh);
+
+    try {
+      const queryClient = { invalidateQueries } as unknown as QueryClient;
+      expect(
+        refreshProviderSwitchQueries(queryClient, "codex"),
+      ).toBeUndefined();
+      expect(invalidateQueries).toHaveBeenCalledWith({
+        queryKey: ["providers", "codex"],
+      });
+      expect(trayMenu).toHaveBeenCalledTimes(1);
+    } finally {
+      finishRefresh();
+      trayMenu.mockRestore();
+    }
+  });
+
   it("offers copy and force repair together for a failed Codex switch", async () => {
     const copy = vi.fn();
     const forceRepair = vi.fn().mockResolvedValue(undefined);

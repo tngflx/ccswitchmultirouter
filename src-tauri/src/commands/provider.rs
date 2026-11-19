@@ -1,9 +1,10 @@
 use indexmap::IndexMap;
-use tauri::{Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::app_config::AppType;
 use crate::codex_multirouter::catalog::catalog_models;
 use crate::commands::copilot::CopilotAuthState;
+use crate::commands::run_app_state_blocking;
 use crate::commands::xai_oauth::XaiOAuthState;
 use crate::error::AppError;
 use crate::provider::{ClaudeDesktopMode, CodexProtocolOverride, Provider};
@@ -34,12 +35,15 @@ const COPILOT_UNIT_PREMIUM: &str = "requests";
 
 /// 获取所有供应商
 #[tauri::command]
-pub fn get_providers(
-    state: State<'_, AppState>,
+pub async fn get_providers(
+    app_handle: AppHandle,
     app: String,
 ) -> Result<IndexMap<String, Provider>, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::list(state.inner(), app_type).map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::list(state, app_type).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -51,33 +55,42 @@ pub fn migrate_codex_official_auth_ownership(
 }
 
 #[tauri::command]
-pub fn get_current_provider(state: State<'_, AppState>, app: String) -> Result<String, String> {
+pub async fn get_current_provider(app_handle: AppHandle, app: String) -> Result<String, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::current(state.inner(), app_type).map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::current(state, app_type).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn get_codex_editor_providers(
-    state: State<'_, AppState>,
+pub async fn get_codex_editor_providers(
+    app_handle: AppHandle,
 ) -> Result<std::collections::HashMap<String, Provider>, String> {
-    let providers = state
-        .db
-        .get_all_providers("codex")
-        .map_err(|err| err.to_string())?
-        .into_iter()
-        .collect();
-    crate::codex_multirouter::provider_set::project_codex_editor_providers(&providers)
-        .map_err(|err| err.to_string())
+    run_app_state_blocking(&app_handle, |state| {
+        let providers = state
+            .db
+            .get_all_providers("codex")
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .collect();
+        crate::codex_multirouter::provider_set::project_codex_editor_providers(&providers)
+            .map_err(|err| err.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 #[allow(non_snake_case)]
-pub fn get_codex_logical_provider_for_editing(
-    state: State<'_, AppState>,
+pub async fn get_codex_logical_provider_for_editing(
+    app_handle: AppHandle,
     providerId: String,
 ) -> Result<Provider, String> {
-    get_codex_logical_provider_for_editing_internal(state.inner(), &providerId)
-        .map_err(|error| error.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        get_codex_logical_provider_for_editing_internal(state, &providerId)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -182,24 +195,30 @@ pub struct CodexProviderAdaptationSummary {
 
 #[tauri::command]
 #[allow(non_snake_case)]
-pub fn get_codex_provider_editor_snapshot(
-    state: State<'_, AppState>,
+pub async fn get_codex_provider_editor_snapshot(
+    app_handle: AppHandle,
     providerId: String,
 ) -> Result<CodexProviderEditorSnapshot, String> {
-    get_codex_provider_editor_snapshot_internal(
-        state.inner(),
-        &providerId,
-        chrono::Utc::now().timestamp(),
-    )
-    .map_err(|error| error.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        get_codex_provider_editor_snapshot_internal(
+            state,
+            &providerId,
+            chrono::Utc::now().timestamp(),
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn list_codex_provider_adaptation_summaries(
-    state: State<'_, AppState>,
+pub async fn list_codex_provider_adaptation_summaries(
+    app_handle: AppHandle,
 ) -> Result<Vec<CodexProviderAdaptationSummary>, String> {
-    list_codex_provider_adaptation_summaries_internal(state.inner(), chrono::Utc::now().timestamp())
-        .map_err(|error| error.to_string())
+    run_app_state_blocking(&app_handle, |state| {
+        list_codex_provider_adaptation_summaries_internal(state, chrono::Utc::now().timestamp())
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 fn get_codex_logical_provider_for_editing_internal(
@@ -235,23 +254,71 @@ pub(crate) fn get_codex_provider_editor_snapshot_internal(
     provider_id: &str,
     now: i64,
 ) -> Result<CodexProviderEditorSnapshot, AppError> {
-    let providers = state
-        .db
-        .get_all_providers(AppType::Codex.as_str())?
-        .into_iter()
-        .collect::<HashMap<_, _>>();
-    let persisted = providers.get(provider_id).cloned().ok_or_else(|| {
+    let inventory = CodexAdaptationInventory::load(state)?;
+    let mut snapshot = build_codex_provider_editor_snapshot(state, &inventory, provider_id, now)?;
+    if snapshot.adaptation.persistence == CodexProviderPersistence::Split {
+        snapshot.adaptation.projection =
+            crate::codex_multirouter::projection::read_projection_status(
+                state.db.as_ref(),
+                provider_id,
+            )?;
+    }
+    Ok(snapshot)
+}
+
+struct CodexAdaptationInventory {
+    providers: HashMap<String, Provider>,
+    listed_ids: Vec<String>,
+    leaf_ids_by_parent: HashMap<String, Vec<String>>,
+}
+
+impl CodexAdaptationInventory {
+    fn load(state: &AppState) -> Result<Self, AppError> {
+        use crate::codex_multirouter::provider_set::{
+            codex_provider_set_leaf_parent_id, is_codex_provider_set_generated_leaf,
+        };
+
+        let providers = state.db.get_all_providers(AppType::Codex.as_str())?;
+        let mut listed_ids = Vec::with_capacity(providers.len());
+        let mut leaf_ids_by_parent = HashMap::<String, Vec<String>>::new();
+        for (provider_id, provider) in &providers {
+            if !is_codex_provider_set_generated_leaf(provider) {
+                listed_ids.push(provider_id.clone());
+            }
+            if let Some(parent_id) = codex_provider_set_leaf_parent_id(provider) {
+                leaf_ids_by_parent
+                    .entry(parent_id.to_string())
+                    .or_default()
+                    .push(provider_id.clone());
+            }
+        }
+        Ok(Self {
+            providers: providers.into_iter().collect(),
+            listed_ids,
+            leaf_ids_by_parent,
+        })
+    }
+}
+
+fn build_codex_provider_editor_snapshot(
+    state: &AppState,
+    inventory: &CodexAdaptationInventory,
+    provider_id: &str,
+    now: i64,
+) -> Result<CodexProviderEditorSnapshot, AppError> {
+    let providers = &inventory.providers;
+    let persisted = providers.get(provider_id).ok_or_else(|| {
         AppError::InvalidInput(format!("codex_provider_not_found: {provider_id}"))
     })?;
-    if crate::codex_multirouter::provider_set::is_codex_provider_set_generated_leaf(&persisted) {
+    if crate::codex_multirouter::provider_set::is_codex_provider_set_generated_leaf(persisted) {
         return Err(AppError::InvalidInput(
             "codex_provider_set_generated_leaf_not_editable".to_string(),
         ));
     }
     let persistence =
-        if crate::codex_multirouter::provider_set::is_codex_provider_set_facade(&persisted) {
+        if crate::codex_multirouter::provider_set::is_codex_provider_set_facade(persisted) {
             CodexProviderPersistence::Split
-        } else if catalog_contains_legacy_codex_protocols(&persisted) {
+        } else if catalog_contains_legacy_codex_protocols(persisted) {
             CodexProviderPersistence::LegacyMixed
         } else {
             CodexProviderPersistence::Single
@@ -259,7 +326,7 @@ pub(crate) fn get_codex_provider_editor_snapshot_internal(
     let mut logical_provider = match persistence {
         CodexProviderPersistence::Split => {
             crate::codex_multirouter::provider_set::restore_logical_codex_provider(
-                &persisted, &providers,
+                persisted, providers,
             )
             .map_err(|error| AppError::InvalidInput(error.to_string()))?
         }
@@ -272,15 +339,13 @@ pub(crate) fn get_codex_provider_editor_snapshot_internal(
     )
     .map_err(|error| AppError::InvalidInput(error.to_string()))?;
 
-    let mut related_provider_ids = vec![provider_id.to_string()];
-    related_provider_ids.extend(
-        providers
-            .values()
-            .filter(|provider| {
-                crate::codex_multirouter::provider_set::codex_provider_set_leaf_parent_id(provider)
-                    == Some(provider_id)
-            })
-            .map(|provider| provider.id.clone()),
+    let related_provider_ids = std::iter::once(provider_id).chain(
+        inventory
+            .leaf_ids_by_parent
+            .get(provider_id)
+            .into_iter()
+            .flatten()
+            .map(String::as_str),
     );
     let mut profiles = Vec::new();
     let mut observations = Vec::new();
@@ -288,16 +353,16 @@ pub(crate) fn get_codex_provider_editor_snapshot_internal(
         profiles.extend(
             state
                 .db
-                .list_protocol_compatibility_profiles(&related_provider_id)?,
+                .list_protocol_compatibility_profiles(related_provider_id)?,
         );
         observations.extend(
             state
                 .db
-                .list_protocol_probe_observations(&related_provider_id)?,
+                .list_protocol_probe_observations(related_provider_id)?,
         );
     }
 
-    let persistence_transports = persisted_protocols_by_model(&persisted, &providers);
+    let persistence_transports = persisted_protocols_by_model(persisted, providers);
     let catalog_models = codex_adaptation_catalog_models(&logical_provider);
     let mut any_evidence = false;
     let mut any_stale = false;
@@ -471,15 +536,6 @@ pub(crate) fn get_codex_provider_editor_snapshot_internal(
         CodexAdaptationStatus::Failed
     };
     let effective_transport = aggregate_codex_effective_transport(&models);
-    let projection = if persistence == CodexProviderPersistence::Split {
-        crate::codex_multirouter::projection::read_projection_status(
-            state.db.as_ref(),
-            provider_id,
-        )?
-    } else {
-        None
-    };
-
     Ok(CodexProviderEditorSnapshot {
         logical_provider,
         adaptation: CodexProviderAdaptationView {
@@ -489,7 +545,7 @@ pub(crate) fn get_codex_provider_editor_snapshot_internal(
             tested_at,
             expires_at,
             models,
-            projection,
+            projection: None,
         },
     })
 }
@@ -743,11 +799,15 @@ fn list_codex_provider_adaptation_summaries_internal(
     state: &AppState,
     now: i64,
 ) -> Result<Vec<CodexProviderAdaptationSummary>, AppError> {
-    let providers = ProviderService::list(state, AppType::Codex)?;
-    providers
-        .keys()
+    // All cards share the same persisted inventory, including the leaves needed
+    // to reconstruct their logical provider. Full editor projections are on demand.
+    let inventory = CodexAdaptationInventory::load(state)?;
+    inventory
+        .listed_ids
+        .iter()
         .map(|provider_id| {
-            let snapshot = get_codex_provider_editor_snapshot_internal(state, provider_id, now)?;
+            let snapshot =
+                build_codex_provider_editor_snapshot(state, &inventory, provider_id, now)?;
             Ok(CodexProviderAdaptationSummary {
                 provider_id: provider_id.clone(),
                 persistence: snapshot.adaptation.persistence,
@@ -1019,6 +1079,19 @@ pub async fn update_provider_if_unchanged(
     .map_err(|e| e.to_string())
 }
 
+/// User-owned Codex MultiRouter edits use their own CAS command. The generic
+/// conditional update above is intentionally source-refresh-only.
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn update_codex_router_if_unchanged(
+    state: State<'_, AppState>,
+    provider: Provider,
+    #[allow(non_snake_case)] expectedProvider: Provider,
+) -> Result<bool, String> {
+    ProviderService::update_codex_router_if_unchanged(state.inner(), provider, &expectedProvider)
+        .map_err(|e| e.to_string())
+}
+
 async fn add_provider_internal(
     state: &AppState,
     app_type: AppType,
@@ -1288,23 +1361,29 @@ pub fn reconcile_codex_subagent_v2_profiles(
 
 #[tauri::command]
 #[allow(non_snake_case)]
-pub fn inspect_codex_multirouter_projection(
-    state: State<'_, AppState>,
+pub async fn inspect_codex_multirouter_projection(
+    app_handle: AppHandle,
     providerId: String,
 ) -> Result<crate::codex_multirouter::projection::CodexRoutingProjectionStatus, String> {
-    crate::codex_multirouter::projection::inspect_codex_multirouter_projection(
-        &state.db,
-        &providerId,
-    )
-    .map_err(|error| error.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        crate::codex_multirouter::projection::inspect_codex_multirouter_projection(
+            &state.db,
+            &providerId,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn inspect_active_codex_multirouter_projection(
-    state: State<'_, AppState>,
+pub async fn inspect_active_codex_multirouter_projection(
+    app_handle: AppHandle,
 ) -> Result<Option<crate::codex_multirouter::projection::CodexRoutingProjectionStatus>, String> {
-    crate::codex_multirouter::projection::inspect_active_codex_multirouter_projection(&state.db)
-        .map_err(|error| error.to_string())
+    run_app_state_blocking(&app_handle, |state| {
+        crate::codex_multirouter::projection::inspect_active_codex_multirouter_projection(&state.db)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1323,12 +1402,15 @@ pub fn retry_codex_multirouter_projection(
 
 #[tauri::command]
 #[allow(non_snake_case)]
-pub fn get_codex_multirouter_revision(
-    state: State<'_, AppState>,
+pub async fn get_codex_multirouter_revision(
+    app_handle: AppHandle,
     providerId: String,
 ) -> Result<String, String> {
-    crate::codex_multirouter::migration::codex_multirouter_revision(&state.db, &providerId)
-        .map_err(|error| error.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        crate::codex_multirouter::migration::codex_multirouter_revision(&state.db, &providerId)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1377,25 +1459,31 @@ pub fn apply_codex_multirouter_migration(
 }
 
 #[tauri::command]
-pub fn delete_provider(
-    state: State<'_, AppState>,
+pub async fn delete_provider(
+    app_handle: AppHandle,
     app: String,
     id: String,
 ) -> Result<crate::codex_multirouter::mutation::CodexProviderDeleteOutcome, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::delete(state.inner(), app_type, &id).map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::delete(state, app_type, &id).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn remove_provider_from_live_config(
-    state: tauri::State<'_, AppState>,
+pub async fn remove_provider_from_live_config(
+    app_handle: AppHandle,
     app: String,
     id: String,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::remove_from_live_config(state.inner(), app_type, &id)
-        .map(|_| true)
-        .map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::remove_from_live_config(state, app_type, &id)
+            .map(|_| true)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 fn switch_provider_internal(
@@ -1552,9 +1640,8 @@ fn restore_codex_history_unify_settings(
 /// 官方切换复用既有链路以保留 OAuth `auth.json`。历史归桶仍要求
 /// Codex/ChatGPT App 完全退出；如果 App 还在运行，命令会先完成官方切换，
 /// 再用 warning 告知历史修复被跳过，避免用户被留在本地 15721 代理上。
-#[tauri::command]
-pub fn switch_codex_to_official_and_repair_history(
-    state: State<'_, AppState>,
+fn switch_codex_to_official_and_repair_history_internal(
+    state: &AppState,
 ) -> Result<CodexOfficialRestoreOutcome, String> {
     state
         .db
@@ -1564,7 +1651,7 @@ pub fn switch_codex_to_official_and_repair_history(
     crate::settings::disable_codex_session_history_unify().map_err(|e| e.to_string())?;
 
     let switch_result =
-        match switch_provider_internal(&state, AppType::Codex, CODEX_OFFICIAL_PROVIDER_ID) {
+        match switch_provider_internal(state, AppType::Codex, CODEX_OFFICIAL_PROVIDER_ID) {
             Ok(result) => result,
             Err(error) => {
                 // provider 尚未切换成功时恢复统一历史开关，避免一次失败点击永久改变用户设置。
@@ -1602,6 +1689,16 @@ pub fn switch_codex_to_official_and_repair_history(
         switch_warnings,
         history,
     })
+}
+
+#[tauri::command]
+pub async fn switch_codex_to_official_and_repair_history(
+    app_handle: AppHandle,
+) -> Result<CodexOfficialRestoreOutcome, String> {
+    run_app_state_blocking(&app_handle, |state| {
+        switch_codex_to_official_and_repair_history_internal(state)
+    })
+    .await
 }
 
 fn import_default_config_internal(state: &AppState, app_type: AppType) -> Result<bool, AppError> {
@@ -1681,18 +1778,30 @@ pub fn import_default_config_test_hook(
 }
 
 #[tauri::command]
-pub fn import_default_config(state: State<'_, AppState>, app: String) -> Result<bool, String> {
+pub async fn import_default_config(app_handle: AppHandle, app: String) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    import_default_config_internal(&state, app_type).map_err(Into::into)
+    run_app_state_blocking(&app_handle, move |state| {
+        import_default_config_internal(state, app_type).map_err(Into::into)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn get_claude_desktop_status(
-    state: State<'_, AppState>,
+    app_handle: AppHandle,
 ) -> Result<crate::claude_desktop_config::ClaudeDesktopStatus, String> {
-    let proxy_running = state.proxy_service.is_running().await;
-    crate::claude_desktop_config::get_status(state.db.as_ref(), proxy_running)
-        .map_err(|e| e.to_string())
+    let proxy_service = app_handle
+        .try_state::<AppState>()
+        .ok_or_else(|| "Application state is not initialized".to_string())?
+        .proxy_service
+        .clone();
+    let proxy_running = proxy_service.is_running().await;
+
+    run_app_state_blocking(&app_handle, move |state| {
+        crate::claude_desktop_config::get_status(state.db.as_ref(), proxy_running)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1944,7 +2053,7 @@ pub async fn queryProviderUsage(
     //      保留上次 data 的语义一致；否则失败快照会经 useUsageCacheBridge 盲写
     //      回 query 缓存，抹掉 reject 本该保留的旧值。
     let inner = query_provider_usage_inner(
-        &state,
+        &state.db,
         &copilot_state,
         &xai_state,
         app_type.clone(),
@@ -2014,18 +2123,16 @@ fn resolve_coding_plan_credentials(
 }
 
 async fn query_provider_usage_inner(
-    state: &AppState,
+    db: &std::sync::Arc<crate::database::Database>,
     copilot_state: &CopilotAuthState,
     xai_state: &XaiOAuthState,
     app_type: AppType,
     provider_id: &str,
 ) -> Result<crate::provider::UsageResult, String> {
-    // 从数据库读取供应商信息，检查特殊模板类型
-    let providers = state
-        .db
-        .get_all_providers(app_type.as_str())
-        .map_err(|e| format!("Failed to get providers: {e}"))?;
-    let provider = providers.get(provider_id);
+    let snapshot = ProviderService::read_usage_provider(db, &app_type, provider_id)
+        .await
+        .map_err(|e| format!("Failed to get provider: {e}"))?;
+    let provider = snapshot.as_ref();
     let usage_script = provider
         .and_then(|p| p.meta.as_ref())
         .and_then(|m| m.usage_script.as_ref());
@@ -2230,7 +2337,7 @@ async fn query_provider_usage_inner(
     }
 
     // ── 通用 JS 脚本路径 ──
-    ProviderService::query_usage(state, app_type, provider_id)
+    ProviderService::query_usage(&app_type, provider_id, provider)
         .await
         .map_err(|e| e.to_string())
 }
@@ -2268,9 +2375,12 @@ pub async fn testUsageScript(
 }
 
 #[tauri::command]
-pub fn read_live_provider_settings(app: String) -> Result<serde_json::Value, String> {
-    let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::read_live_settings(app_type).map_err(|e| e.to_string())
+pub async fn read_live_provider_settings(app: String) -> Result<serde_json::Value, String> {
+    super::run_command_blocking(move || {
+        let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+        ProviderService::read_live_settings(app_type).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2284,14 +2394,17 @@ pub async fn test_api_endpoints(
 }
 
 #[tauri::command]
-pub fn get_custom_endpoints(
-    state: State<'_, AppState>,
+pub async fn get_custom_endpoints(
+    app_handle: AppHandle,
     app: String,
     #[allow(non_snake_case)] providerId: String,
 ) -> Result<Vec<crate::settings::CustomEndpoint>, String> {
-    let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::get_custom_endpoints(state.inner(), app_type, &providerId)
-        .map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+        ProviderService::get_custom_endpoints(state, app_type, &providerId)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2331,18 +2444,20 @@ pub fn update_endpoint_last_used(
 }
 
 #[tauri::command]
-pub fn update_providers_sort_order(
-    state: State<'_, AppState>,
+pub async fn update_providers_sort_order(
+    app_handle: AppHandle,
     app: String,
     updates: Vec<ProviderSortUpdate>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::update_sort_order(state.inner(), app_type, updates).map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::update_sort_order(state, app_type, updates).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 use crate::provider::UniversalProvider;
 use std::collections::HashMap;
-use tauri::AppHandle;
 
 #[derive(Clone, serde::Serialize)]
 pub struct UniversalProviderSyncedEvent {
@@ -2806,15 +2921,53 @@ pub fn import_opencode_providers_from_live(state: State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
-pub fn get_opencode_live_provider_ids() -> Result<Vec<String>, String> {
-    crate::opencode_config::get_providers()
-        .map(|providers| providers.keys().cloned().collect())
-        .map_err(|e| e.to_string())
+pub async fn get_opencode_live_provider_ids() -> Result<Vec<String>, String> {
+    super::run_command_blocking(|| {
+        crate::opencode_config::get_providers()
+            .map(|providers| providers.keys().cloned().collect())
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 // ============================================================================
 // OpenClaw 专属命令 → 已迁移至 commands/openclaw.rs
 // ============================================================================
+
+#[cfg(test)]
+mod provider_read_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn provider_commands_use_async_dispatch() {
+        fn assert_async_command<T, F>(_: impl FnOnce(AppHandle) -> F)
+        where
+            F: Future<Output = Result<T, String>> + Send,
+        {
+        }
+
+        assert_async_command(|app| get_providers(app, String::new()));
+        assert_async_command(|app| get_current_provider(app, String::new()));
+        assert_async_command(get_codex_editor_providers);
+        assert_async_command(|app| get_codex_logical_provider_for_editing(app, String::new()));
+        assert_async_command(|app| get_codex_provider_editor_snapshot(app, String::new()));
+        assert_async_command(list_codex_provider_adaptation_summaries);
+        assert_async_command(|app| inspect_codex_multirouter_projection(app, String::new()));
+        assert_async_command(inspect_active_codex_multirouter_projection);
+        assert_async_command(|app| get_codex_multirouter_revision(app, String::new()));
+        assert_async_command(|_| get_opencode_live_provider_ids());
+        assert_async_command(|_| read_live_provider_settings(String::new()));
+        assert_async_command(|app| get_custom_endpoints(app, String::new(), String::new()));
+        assert_async_command(get_claude_desktop_status);
+        assert_async_command(|app| delete_provider(app, String::new(), String::new()));
+        assert_async_command(|app| {
+            remove_provider_from_live_config(app, String::new(), String::new())
+        });
+        assert_async_command(|app| import_default_config(app, String::new()));
+        assert_async_command(switch_codex_to_official_and_repair_history);
+        assert_async_command(|app| update_providers_sort_order(app, String::new(), Vec::new()));
+    }
+}
 
 #[cfg(test)]
 mod codex_history_rollback_tests {
@@ -3226,7 +3379,8 @@ mod native_query_credentials_tests {
 mod codex_protocol_preflight_save_tests {
     use super::{
         build_codex_provider_adaptation_preview, get_codex_logical_provider_for_editing_internal,
-        get_codex_provider_editor_snapshot_internal, update_provider_internal_with_probe,
+        get_codex_provider_editor_snapshot_internal,
+        list_codex_provider_adaptation_summaries_internal, update_provider_internal_with_probe,
         CodexAdaptationStatus, CodexEffectiveTransport, CodexProtocolChoice,
         CodexProtocolChoiceSource, CodexProtocolResolutionSource, CodexProviderPersistence,
     };
@@ -4124,6 +4278,100 @@ mod codex_protocol_preflight_save_tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn codex_router_order_update_uses_its_own_compare_and_set_boundary() {
+        let _home = crate::config::TestHomeGuard::new();
+        let db = Arc::new(Database::memory().expect("memory database"));
+        let state = AppState::new(db.clone());
+        let mut source = codex_provider();
+        source.settings_config["modelCatalog"]["models"] = json!([
+            {"model": "qwen-visible", "upstreamModel": "Qwen/Qwen3.8"},
+            {"model": "qwen-coder-visible", "upstreamModel": "Qwen/Qwen3-Coder"}
+        ]);
+        let router = codex_router("router-order");
+        db.save_provider(AppType::Codex.as_str(), &source)
+            .expect("seed source");
+        db.save_provider(AppType::Codex.as_str(), &router)
+            .expect("seed router");
+        db.set_current_provider(AppType::Codex.as_str(), &source.id)
+            .expect("keep router inactive for CAS assertions");
+        let expected = db
+            .get_provider_by_id(&router.id, AppType::Codex.as_str())
+            .expect("read router")
+            .expect("router exists");
+
+        let order = json!(["qwen-coder-visible", "qwen-visible"]);
+        let mut reordered = expected.clone();
+        reordered.settings_config["codexRouting"]["modelOrder"] = order.clone();
+        let refresh_error = super::ProviderService::validate_background_provider_refresh(
+            &AppType::Codex,
+            None,
+            &reordered,
+            &expected,
+        )
+        .expect_err("the background writer must continue rejecting user routers");
+        assert_eq!(refresh_error.to_string(), "provider_update_conflict");
+        super::ProviderService::update_codex_router_if_unchanged(&state, reordered, &expected)
+            .expect("router order save should succeed");
+        let saved = db
+            .get_provider_by_id(&router.id, AppType::Codex.as_str())
+            .expect("read saved router")
+            .expect("saved router exists");
+        assert_eq!(saved.settings_config["codexRouting"]["modelOrder"], order);
+
+        let error = super::ProviderService::update_codex_router_if_unchanged(
+            &state,
+            expected.clone(),
+            &expected,
+        )
+        .expect_err("a stale router snapshot must not overwrite the saved order");
+        assert_eq!(error.to_string(), "provider_update_conflict");
+        assert_eq!(
+            db.get_provider_by_id(&router.id, AppType::Codex.as_str())
+                .expect("read router after rejected write")
+                .expect("router exists")
+                .settings_config["codexRouting"]["modelOrder"],
+            order
+        );
+    }
+
+    #[test]
+    fn codex_router_order_update_rejects_legacy_source_and_generated_payloads() {
+        let db = Arc::new(Database::memory().expect("memory database"));
+        let state = AppState::new(db);
+        let source = codex_provider();
+        let router = codex_router("router-order-validation");
+
+        let mut legacy = router.clone();
+        legacy.settings_config["codexRouting"] = json!([]);
+        let mut facade = router.clone();
+        facade.settings_config["codexProtocolSet"] = json!({"version": 1, "role": "facade"});
+        let mut leaf = router.clone();
+        leaf.settings_config["codexProtocolSet"] = json!({
+            "version": 1, "role": "leaf", "parentProviderId": "some-source", "transport": "open_ai_chat"
+        });
+        for (candidate, expected) in [
+            (&router, &legacy),
+            (&source, &source),
+            (&facade, &router),
+            (&router, &facade),
+            (&leaf, &router),
+            (&router, &leaf),
+        ] {
+            assert_eq!(
+                super::ProviderService::update_codex_router_if_unchanged(
+                    &state,
+                    candidate.clone(),
+                    expected,
+                )
+                .expect_err("only a user-owned schema-v2 router can use this writer")
+                .to_string(),
+                "provider_update_conflict"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn schema_v2_router_update_atomically_saves_both_protocol_observations() {
         let db = Arc::new(Database::memory().expect("memory database"));
@@ -4645,6 +4893,26 @@ mod codex_protocol_preflight_save_tests {
         );
         assert!(responses_model.responses.is_some());
         assert!(responses_model.chat.is_some());
+
+        // Cards should depend on inventory and probe evidence only. Unlike the
+        // editor, they neither need nor display the saved projection status.
+        db.set_setting("codex_multirouter_projection:qwen-provider", "{bad-json")
+            .expect("replace editor-only projection status");
+        assert!(get_codex_provider_editor_snapshot_internal(&state, "qwen-provider", now).is_err());
+        let summaries = list_codex_provider_adaptation_summaries_internal(&state, now)
+            .expect("card summaries do not deserialize editor-only projection status");
+        assert_eq!(summaries.len(), 1, "generated leaves are not listed");
+        let summary = &summaries[0];
+        assert_eq!(summary.provider_id, source.id);
+        assert_eq!(summary.persistence, CodexProviderPersistence::Split);
+        assert_eq!(summary.status, CodexAdaptationStatus::Ready);
+        assert_eq!(
+            summary.effective_transport,
+            Some(CodexEffectiveTransport::Mixed)
+        );
+        assert_eq!(summary.model_count, 2);
+        assert_eq!(summary.tested_at, snapshot.adaptation.tested_at);
+        assert_eq!(summary.expires_at, snapshot.adaptation.expires_at);
     }
 
     #[test]

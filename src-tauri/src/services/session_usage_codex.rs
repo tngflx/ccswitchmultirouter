@@ -914,32 +914,38 @@ fn load_codex_checkpoint(
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     let conn = lock_conn!(db.conn);
-    let mut statement = conn.prepare(
-        "SELECT file_path, last_byte_offset, file_size, head_window_len, head_fingerprint, tail_fingerprint, parser_state
-         FROM codex_usage_file_checkpoints
-         WHERE file_path = ?1 OR ((file_path LIKE ?2 OR file_path LIKE ?3) AND ?4 <> '')
-         ORDER BY CASE WHEN file_path = ?1 THEN 0 ELSE 1 END, updated_at DESC LIMIT 1",
-    ).map_err(|e| AppError::Database(format!("读取 Codex checkpoint 失败: {e}")))?;
-    let result = statement.query_row(
-        rusqlite::params![
-            path,
-            format!("%/{file_name}"),
-            format!("%\\{file_name}"),
-            file_name
-        ],
-        |row| {
-            let state_text: String = row.get(6)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                state_text,
-            ))
-        },
-    );
+    let read_row = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    };
+    // A checkpoint at this exact path is authoritative. Reserve the suffix
+    // scan for moved files; otherwise every unchanged rollout scans the table.
+    let exact = conn
+        .prepare_cached(
+            "SELECT file_path, last_byte_offset, file_size, head_window_len, head_fingerprint, tail_fingerprint, parser_state
+             FROM codex_usage_file_checkpoints WHERE file_path = ?1",
+        )
+        .and_then(|mut statement| statement.query_row([&path], read_row));
+    let result = match exact {
+        Err(rusqlite::Error::QueryReturnedNoRows) if !file_name.is_empty() => conn
+            .prepare_cached(
+                "SELECT file_path, last_byte_offset, file_size, head_window_len, head_fingerprint, tail_fingerprint, parser_state
+                 FROM codex_usage_file_checkpoints
+                 WHERE file_path LIKE ?1 OR file_path LIKE ?2
+                 ORDER BY updated_at DESC LIMIT 1",
+            )
+            .and_then(|mut statement| {
+                statement.query_row([format!("%/{file_name}"), format!("%\\{file_name}")], read_row)
+            }),
+        result => result,
+    };
     match result {
         Ok((
             source_path,
@@ -3112,6 +3118,70 @@ fn find_codex_pricing(conn: &rusqlite::Connection, model_id: &str) -> Option<Mod
 mod tests {
     use super::*;
     use crate::services::session_usage::get_sync_state;
+
+    #[test]
+    fn exact_checkpoint_lookup_does_not_scan_aliases() -> Result<(), AppError> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let db = Database::memory()?;
+        let path = Path::new("current/rollout.jsonl");
+        let older_alias = "archived/rollout.jsonl";
+        let newer_alias = r"moved\rollout.jsonl";
+        let state = serde_json::to_string(&CodexParserState::initial(None)).unwrap();
+        let progress = Arc::new(AtomicUsize::new(0));
+        {
+            let conn = lock_conn!(db.conn);
+            let mut insert = conn.prepare(
+                "INSERT INTO codex_usage_file_checkpoints (file_path, parser_state, updated_at)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for index in 0..256 {
+                insert.execute(rusqlite::params![
+                    format!("unrelated/{index}.jsonl"),
+                    state,
+                    0
+                ])?;
+            }
+            for (name, updated_at) in [
+                (path.to_str().unwrap(), 1),
+                (older_alias, 2),
+                (newer_alias, 3),
+            ] {
+                insert.execute(rusqlite::params![name, state, updated_at])?;
+            }
+            let progress = progress.clone();
+            conn.progress_handler(
+                10,
+                Some(move || {
+                    progress.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+        }
+
+        let exact = load_codex_checkpoint(&db, path)?.expect("exact checkpoint");
+        let progress_count = progress.load(Ordering::Relaxed);
+        assert_eq!(exact.source_path, path.to_str().unwrap());
+        assert!(
+            progress_count < 10,
+            "exact lookup used {progress_count} batches of 10 SQLite VM instructions"
+        );
+
+        {
+            let conn = lock_conn!(db.conn);
+            conn.progress_handler(0, None::<fn() -> bool>);
+            conn.execute(
+                "UPDATE codex_usage_file_checkpoints SET parser_state = '{}' WHERE file_path = ?1",
+                [path.to_str().unwrap()],
+            )?;
+        }
+        assert!(load_codex_checkpoint(&db, path)?.is_none());
+
+        let moved = load_codex_checkpoint(&db, Path::new("third/rollout.jsonl"))?
+            .expect("moved checkpoint");
+        assert_eq!(moved.source_path, newer_alias);
+        Ok(())
+    }
     use tempfile::tempdir;
 
     const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";

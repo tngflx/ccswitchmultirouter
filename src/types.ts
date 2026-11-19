@@ -469,12 +469,18 @@ export interface CodexCatalogModel {
   supports_parallel_tool_calls?: boolean;
   baseInstructions?: string;
   base_instructions?: string;
+  /** Source-owned native picker reasoning summary metadata. */
+  reasoningSummaryFormat?: string;
+  reasoning_summary_format?: string;
+  defaultReasoningSummary?: string;
+  default_reasoning_summary?: string;
   protocolCapability?: CodexModelProtocolCapability;
   reasoning?: CodexModelReasoningCapability;
   /** Codex 产品层设置，不属于 Provider capability 或其来源。 */
   codexUltra?: {
     enabled: boolean;
     providerEffort?: CodexReasoningEffort;
+    providerEffortSource?: "user";
   };
   // MultiRouter schema v2: model-specific transport/caching overrides.
   // Provider defaults remain authoritative when these fields are absent.

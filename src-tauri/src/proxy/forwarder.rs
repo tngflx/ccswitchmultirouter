@@ -18,7 +18,7 @@ use super::providers::{
 };
 use super::{
     body_filter::filter_private_params_with_whitelist,
-    content_encoding::{decompress_body_with_limit, get_content_encoding},
+    content_encoding::{decompress_body_with_limit, get_content_encoding, CodexInboundEncoding},
     error::*,
     failover_switch::FailoverSwitchManager,
     json_canonical::{canonicalize_value, short_value_hash},
@@ -74,8 +74,9 @@ const CODEX_RESPONSES_LITE_FALLBACK_TTL: Duration = Duration::from_secs(24 * 60 
 // `ResponsePending` and are never replayed by this transport wrapper.
 const UPSTREAM_TRANSPORT_RETRY_LIMIT: usize = 5;
 /// 真实上游在尚未建立成功响应时明确返回 429，等价于拒绝接收本次采样请求，
-/// 因而可以安全重放同一份 headers/body。次数与 Codex 默认流恢复预算对齐。
-const CODEX_RATE_LIMIT_RETRY_LIMIT: usize = 5;
+/// 因而可以安全重放同一份 headers/body。重试次数由 provider 的
+/// `codexTrafficPolicy.rateLimitMaxRetries` 统一控制；不要在请求循环里再维护
+/// 一个脱离配置的固定上限。
 pub(crate) const CODEX_RATE_LIMIT_MAX_SINGLE_DELAY: Duration = Duration::from_secs(60);
 pub(crate) const CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET: Duration = Duration::from_secs(180);
 const CODEX_RAW_ROUTE_RESOLUTION_ATTEMPTED: &str = "codexRawRouteResolutionAttempted";
@@ -637,6 +638,13 @@ fn retryable_failure_affects_provider_health(provider: &Provider, error: &ProxyE
         )
 }
 
+fn is_native_codex_chat_endpoint(endpoint: &str) -> bool {
+    matches!(
+        split_endpoint_and_query(endpoint).0,
+        "/chat/completions" | "/v1/chat/completions"
+    )
+}
+
 impl RequestForwarder {
     fn codex_oauth_manager(&self) -> Option<Arc<RwLock<CodexOAuthManager>>> {
         #[cfg(test)]
@@ -1102,7 +1110,7 @@ impl RequestForwarder {
                 }
                 Err(error) => {
                     log::warn!("[CodexOAuthPool] 额度刷新失败 account={account_id}: {error}");
-                    manager.mark_pool_quota_checked(&account_id).await;
+                    manager.mark_pool_quota_attempted(&account_id).await;
                 }
             }
         }
@@ -2849,6 +2857,15 @@ impl RequestForwarder {
             &mut mapped_body,
             endpoint,
         )?;
+        if matches!(app_type, AppType::Codex)
+            && !subagent_reasoning_overridden
+            && is_native_codex_chat_endpoint(endpoint)
+            && !provider.uses_managed_account_auth()
+            && provider.category.as_deref() != Some("official")
+            && !super::providers::is_codex_official_provider(provider)
+        {
+            super::providers::apply_codex_native_chat_reasoning(provider, &mut mapped_body)?;
+        }
 
         let projected = project_codex_agent_messages_for_effective_provider(
             app_type,
@@ -3357,7 +3374,21 @@ impl RequestForwarder {
                     },
                 )?;
             } else if matches!(app_type, AppType::Codex) {
-                super::providers::prepare_codex_native_responses_model(provider, &mut mapped_body)?;
+                if is_native_codex_chat_endpoint(endpoint) {
+                    // Native Chat controls (including active child overrides) were
+                    // already mapped once while the canonical model was intact.
+                    // The Responses mapper must never consume this wire body again:
+                    // nonidentity maps can otherwise silently downgrade Ultra.
+                    if let Some(model) = mapped_body.get("model").and_then(Value::as_str) {
+                        super::providers::validate_codex_catalog_request_model(provider, model)?;
+                    }
+                    super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
+                } else {
+                    super::providers::prepare_codex_native_responses_model(
+                        provider,
+                        &mut mapped_body,
+                    )?;
+                }
             }
             mapped_body
         };
@@ -3474,9 +3505,12 @@ impl RequestForwarder {
                 );
             }
         }
-        let subagent_reasoning_projection = subagent_reasoning_overridden.then(|| {
-            super::codex_subagent_reasoning::SubagentReasoningProjection::capture(&request_body)
-        });
+        let canonical_reasoning_projection = (subagent_reasoning_overridden
+            || (matches!(app_type, AppType::Codex)
+                && !provider.uses_managed_account_auth()
+                && provider.category.as_deref() != Some("official")
+                && !super::providers::is_codex_official_provider(provider)))
+        .then(|| super::codex_reasoning_controls::CodexReasoningProjection::capture(&request_body));
         let mut filtered_body = if let Some(policy) = codex_third_party_request_policy.as_ref() {
             policy.finalize_body(
                 codex_request_transport,
@@ -3504,9 +3538,10 @@ impl RequestForwarder {
             }
             filtered_body
         };
-        if let Some(projection) = subagent_reasoning_projection {
+        if let Some(projection) = canonical_reasoning_projection {
             // Reject conflicting advanced provider overrides before sending any
-            // request. Never restore controls over a later protocol safety guard.
+            // request, including main requests. Never restore controls over a later
+            // protocol safety guard.
             projection.verify(&filtered_body)?;
         }
         let hosted_tool_loop_config =
@@ -4402,6 +4437,8 @@ impl RequestForwarder {
                 || codex_responses_to_chat
                 || codex_responses_to_messages
                 || codex_responses_to_anthropic,
+            self.preserve_codex_client_originator && codex_official_auth_passthrough,
+            extensions.get::<CodexInboundEncoding>().copied(),
         );
         let payload = FinalizedRequestPayload::from_transformed_json(
             client_request_bytes,
@@ -8137,10 +8174,9 @@ where
         if status == http::StatusCode::SERVICE_UNAVAILABLE
             && traffic_policy.rejection_retry_mode
                 == crate::provider::CodexRejectionRetryMode::OpencodeEndpointUnavailable
+            && is_retryable_opencode_admission_503(body_text.as_deref())
         {
-            if is_retryable_opencode_admission_503(body_text.as_deref())
-                && admission_retry_count < traffic_policy.rejection_max_retries
-            {
+            if admission_retry_count < traffic_policy.rejection_max_retries {
                 let delay = retry_after
                     .unwrap_or_else(|| traffic_policy.rejection_backoff(admission_retry_count))
                     .min(traffic_policy.rejection_max_delay);
@@ -8232,7 +8268,7 @@ where
             ));
         }
 
-        if retry_count >= CODEX_RATE_LIMIT_RETRY_LIMIT {
+        if retry_count >= traffic_policy.rate_limit_max_retries {
             return Ok(rebuild_consumed_error_response(
                 http::StatusCode::TOO_MANY_REQUESTS,
                 &mut response_headers,
@@ -8255,7 +8291,7 @@ where
         log::warn!(
             "[{app_tag}] 上游明确返回 HTTP 429，CCSM 将重发同一 Codex 请求 {}/{}（等待 {}ms，Retry-After={}）",
             retry_count + 1,
-            CODEX_RATE_LIMIT_RETRY_LIMIT,
+            traffic_policy.rate_limit_max_retries,
             delay.as_millis(),
             retry_after
                 .map(|value| format!("{}ms", value.as_millis()))
@@ -8876,12 +8912,22 @@ fn should_zstd_compress_codex_official_upstream(
     upstream_url: &str,
     official_auth: bool,
     transformed: bool,
+    trusted_native_passthrough: bool,
+    inbound_encoding: Option<CodexInboundEncoding>,
 ) -> bool {
-    matches!(app_type, AppType::Codex)
+    let default = matches!(app_type, AppType::Codex)
         && method == http::Method::POST
         && official_auth
         && !transformed
-        && is_chatgpt_codex_responses_upstream_url(upstream_url)
+        && is_chatgpt_codex_responses_upstream_url(upstream_url);
+    if !default || !trusted_native_passthrough {
+        return default;
+    }
+    match inbound_encoding {
+        Some(CodexInboundEncoding::Plain) => false,
+        Some(CodexInboundEncoding::Compressed) => true,
+        None => default,
+    }
 }
 
 /// Encode the final JSON entity exactly as the official Codex transport does.
@@ -10156,7 +10202,7 @@ mod tests {
             )
             .await
             .expect("enable managed-only account pool");
-        manager.mark_pool_quota_checked("pool-local-id").await;
+        manager.mark_pool_quota_attempted("pool-local-id").await;
         let mut official = test_codex_official_provider();
         official.settings_config["codexTestBaseUrl"] = json!(upstream);
         official.meta = Some(ProviderMeta {
@@ -10260,7 +10306,7 @@ mod tests {
             .ordered_pool_entries("", Some("Bearer desktop-access-token"))
             .await;
         manager
-            .mark_pool_quota_checked(NATIVE_CODEX_ACCOUNT_ID)
+            .mark_pool_quota_attempted(NATIVE_CODEX_ACCOUNT_ID)
             .await;
         let mut official = test_codex_official_provider();
         official.settings_config["codexTestBaseUrl"] = json!(upstream);
@@ -10369,7 +10415,7 @@ mod tests {
             )
             .await
             .expect("enable routed managed-only account pool");
-        manager.mark_pool_quota_checked("pool-local-id").await;
+        manager.mark_pool_quota_attempted("pool-local-id").await;
 
         let mut official = test_codex_official_provider();
         official.settings_config["codexTestBaseUrl"] = json!(upstream);
@@ -10853,6 +10899,320 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_codex_chat_ingress_maps_canonical_reasoning_without_rebuilding_body() {
+        for (endpoint, flat_effort) in [
+            ("/chat/completions", true),
+            ("/v1/chat/completions?trace=kept", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind native Chat mock upstream");
+            let upstream = format!("http://{}", listener.local_addr().unwrap());
+            let capture = tokio::spawn(capture_single_http_request(listener));
+            let mut provider = test_provider_with_type(None);
+            provider.settings_config = json!({
+                "base_url": upstream, "api_key": "REDACTED_TEST_KEY",
+                "modelCatalog": {"models": [{"model": "gpt-6.1-sol", "reasoning": {
+                    "schemaVersion": 2, "supportStatus": "confirmed_supported", "controlKind": "graded",
+                    "supportedEfforts": ["high", "xhigh"], "defaultEffort": "high", "disableAllowed": false,
+                    "upstream": {"format": "reasoning_object", "parameter": "reasoning.effort",
+                        "effortMap": {"high": "high", "xhigh": "xhigh"}},
+                    "codexUltraOrchestration": {"enabled": true, "providerEffort": "xhigh"}
+                }}]}
+            });
+            provider.meta = Some(ProviderMeta {
+                api_format: Some("openai_chat".to_string()),
+                ..Default::default()
+            });
+            let mut body = json!({
+                "model": "gpt-6.1-sol",
+                "messages": [{"role": "user", "content": "Preserve this native Chat message"}],
+                "tools": [{"type": "function", "function": {"name": "inspect", "parameters": {"type": "object"}}}],
+                "reasoning": {"summary": "auto", "exclude": false},
+                "stream": false, "temperature": 0.25
+            });
+            if flat_effort {
+                body["reasoning_effort"] = json!("ultra");
+            } else {
+                body["reasoning"]["effort"] = json!("ultra");
+            }
+            let original = body.clone();
+            let forwarder = test_forwarder(Duration::from_secs(5), Duration::ZERO);
+            let adapter = get_adapter(&AppType::Codex);
+            forwarder
+                .forward(
+                    &AppType::Codex,
+                    &http::Method::POST,
+                    &provider,
+                    endpoint,
+                    &body,
+                    &HeaderMap::new(),
+                    &Extensions::new(),
+                    adapter.as_ref(),
+                )
+                .await
+                .expect("native Chat canonical reasoning must prepare");
+            let (_, bytes) = capture.await.expect("captured native Chat request");
+            let sent: Value = serde_json::from_slice(&bytes).expect("native Chat outgoing JSON");
+            assert_eq!(sent["reasoning"]["effort"], "xhigh", "{endpoint}");
+            assert!(
+                sent.get("reasoning_effort").is_none(),
+                "only the declared nested control may remain"
+            );
+            assert_eq!(sent["messages"], original["messages"]);
+            assert_eq!(sent["tools"], original["tools"]);
+            assert_eq!(sent["stream"], false);
+            assert_eq!(sent["temperature"], 0.25);
+            assert_eq!(sent["reasoning"]["summary"], "auto");
+            assert_eq!(sent["reasoning"]["exclude"], false);
+            assert_eq!(body, original, "caller input is immutable");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_codex_chat_ingress_maps_effort_exactly_once_for_main_and_children() {
+        // Ultra -> native xhigh must not pass through xhigh -> high again.
+        for child in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = format!("http://{}", listener.local_addr().unwrap());
+            let capture = tokio::spawn(capture_single_http_request(listener));
+            let mut provider = test_provider_with_type(None);
+            provider.id = "router::route::once".into();
+            provider.settings_config = json!({
+                "base_url": upstream, "api_key": "REDACTED_TEST_KEY",
+                "codexRouterParentProviderId": "router", "codexResolvedRouteId": "once",
+                "codexResolvedCanonicalModel": "test-once-model",
+                "codexResolvedUpstreamModelOverride": "test-once-model",
+                "modelCatalog": {"models": [{"model": "test-once-model", "reasoning": {
+                    "schemaVersion": 2, "supportStatus": "confirmed_supported", "controlKind": "graded",
+                    "supportedEfforts": ["high", "xhigh"], "defaultEffort": "high", "disableAllowed": false,
+                    "upstream": {"format": "reasoning_object", "parameter": "reasoning.effort",
+                        "effortMap": {"high": "high", "xhigh": "high"}},
+                    "codexUltraOrchestration": {"enabled": true, "providerEffort": "xhigh"}
+                }}]}
+            });
+            provider.meta = Some(ProviderMeta {
+                api_format: Some("openai_chat".into()),
+                ..Default::default()
+            });
+            let router = Provider::with_id(
+                "router".into(),
+                "Router".into(),
+                json!({
+                    "codexRouting": {"enabled": true, "subagentVersion": "v2", "subagentReasoningEffort": "ultra"}
+                }),
+                None,
+            );
+            let forwarder = test_forwarder(Duration::from_secs(5), Duration::ZERO);
+            forwarder
+                .router
+                .database()
+                .save_provider("codex", &router)
+                .unwrap();
+            let body = json!({
+                "model": "test-once-model", "messages": [{"role": "user", "content": "bounded test"}],
+                "reasoning": {"effort": if child {"high"} else {"ultra"}}, "stream": false
+            });
+            let mut headers = HeaderMap::new();
+            if child {
+                headers.insert(
+                    "x-openai-subagent",
+                    HeaderValue::from_static("collab_spawn"),
+                );
+            }
+            let adapter = get_adapter(&AppType::Codex);
+            forwarder
+                .forward(
+                    &AppType::Codex,
+                    &http::Method::POST,
+                    &provider,
+                    "/v1/chat/completions",
+                    &body,
+                    &headers,
+                    &Extensions::new(),
+                    adapter.as_ref(),
+                )
+                .await
+                .expect("nonidentity canonical request prepares once");
+            let (_, bytes) = capture.await.unwrap();
+            let sent: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                sent["reasoning"]["effort"], "xhigh",
+                "child={child}: never remap native xhigh to high"
+            );
+            assert!(sent.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn main_codex_requests_reject_reasoning_overrides_after_canonical_mapping() {
+        for (api_format, endpoint) in [
+            ("openai_chat", "/v1/chat/completions"),
+            ("openai_chat", "/v1/responses"),
+            ("openai_responses", "/v1/responses"),
+        ] {
+            for (overrides, compatible) in [
+                (json!({"reasoning": {"effort": "ultra"}}), false),
+                (json!({"reasoning_effort": "high"}), false),
+                (
+                    json!({"reasoning": {"effort": "xhigh", "summary": "auto"}, "temperature": 0.1}),
+                    true,
+                ),
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream = format!("http://{}", listener.local_addr().unwrap());
+                let capture = tokio::spawn(capture_single_http_request(listener));
+                let mut provider = test_provider_with_type(None);
+                provider.settings_config = json!({
+                    "base_url": upstream, "api_key": "REDACTED_TEST_KEY",
+                    "modelCatalog": {"models": [{"model": "test-override-model", "reasoning": {
+                        "schemaVersion": 2, "supportStatus": "confirmed_supported", "controlKind": "graded",
+                        "supportedEfforts": ["high", "xhigh"], "defaultEffort": "high", "disableAllowed": false,
+                        "upstream": {"format": "reasoning_object", "parameter": "reasoning.effort",
+                            "effortMap": {"high": "high", "xhigh": "xhigh"}},
+                        "codexUltraOrchestration": {"enabled": true, "providerEffort": "xhigh"}
+                    }}]}
+                });
+                provider.meta = Some(ProviderMeta {
+                    api_format: Some(api_format.into()),
+                    local_proxy_request_overrides: Some(
+                        serde_json::from_value(json!({"body": overrides})).unwrap(),
+                    ),
+                    ..Default::default()
+                });
+                let body = if endpoint.contains("chat/completions") {
+                    json!({"model": "test-override-model", "messages": [{"role": "user", "content": "bounded test"}],
+                        "reasoning": {"effort": "ultra"}, "stream": false})
+                } else {
+                    json!({"model": "test-override-model", "input": "bounded test",
+                        "reasoning": {"effort": "ultra"}, "stream": false})
+                };
+                let forwarder = test_forwarder(Duration::from_secs(5), Duration::ZERO);
+                let adapter = get_adapter(&AppType::Codex);
+                let outcome = forwarder
+                    .forward(
+                        &AppType::Codex,
+                        &http::Method::POST,
+                        &provider,
+                        endpoint,
+                        &body,
+                        &HeaderMap::new(),
+                        &Extensions::new(),
+                        adapter.as_ref(),
+                    )
+                    .await;
+                if !compatible {
+                    capture.abort();
+                    let error = match outcome {
+                        Err(error) => error,
+                        Ok(_) => {
+                            panic!("{api_format}/{endpoint}: canonical reasoning was overwritten")
+                        }
+                    };
+                    assert!(error.to_string().contains("reasoning"));
+                    assert!(!error.to_string().contains("REDACTED_TEST_KEY"));
+                    continue;
+                }
+                outcome.expect("matching native control plus ancillary overrides remains valid");
+                let (_, bytes) = capture.await.unwrap();
+                let sent: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(sent["reasoning"]["effort"], "xhigh");
+                assert!(sent.get("reasoning_effort").is_none());
+                assert_eq!(sent["reasoning"]["summary"], "auto");
+                assert_eq!(sent["temperature"], 0.1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_codex_chat_ingress_rejects_inconsistent_enabled_and_effort() {
+        for (enabled, effort) in [(false, "high"), (true, "none")] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind native Chat enabled/effort rejection mock");
+            let upstream = format!("http://{}", listener.local_addr().unwrap());
+            let capture = tokio::spawn(capture_single_http_request(listener));
+            let mut provider = test_provider_with_type(None);
+            provider.settings_config =
+                json!({"base_url": upstream, "api_key": "REDACTED_TEST_KEY"});
+            provider.meta = Some(ProviderMeta {
+                api_format: Some("openai_chat".to_string()),
+                ..Default::default()
+            });
+            let body = json!({
+                "model": "unknown-model",
+                "messages": [{"role": "user", "content": "bounded test"}],
+                "reasoning": {"enabled": enabled, "effort": effort},
+                "stream": false
+            });
+            let forwarder = test_forwarder(Duration::from_secs(5), Duration::ZERO);
+            let adapter = get_adapter(&AppType::Codex);
+            let outcome = forwarder
+                .forward(
+                    &AppType::Codex,
+                    &http::Method::POST,
+                    &provider,
+                    "/v1/chat/completions",
+                    &body,
+                    &HeaderMap::new(),
+                    &Extensions::new(),
+                    adapter.as_ref(),
+                )
+                .await;
+            capture.abort();
+            assert!(
+                outcome.is_err(),
+                "reasoning.enabled={enabled} conflicts with effort={effort}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_codex_chat_ingress_rejects_unmapped_and_conflicting_efforts() {
+        for (flat, nested) in [(Some("ultra"), None), (Some("high"), Some("low"))] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind native Chat rejection mock");
+            let upstream = format!("http://{}", listener.local_addr().unwrap());
+            let capture = tokio::spawn(capture_single_http_request(listener));
+            let mut provider = test_provider_with_type(None);
+            provider.settings_config =
+                json!({"base_url": upstream, "api_key": "REDACTED_TEST_KEY"});
+            provider.name = "OpenRouter".to_string();
+            provider.meta = Some(ProviderMeta {
+                api_format: Some("openai_chat".to_string()),
+                ..Default::default()
+            });
+            let mut body = json!({"model": "unknown-model", "messages": [{"role": "user", "content": "bounded test"}], "stream": false});
+            if let Some(effort) = flat {
+                body["reasoning_effort"] = json!(effort);
+            }
+            if let Some(effort) = nested {
+                body["reasoning"] = json!({"effort": effort});
+            }
+            let forwarder = test_forwarder(Duration::from_secs(5), Duration::ZERO);
+            let adapter = get_adapter(&AppType::Codex);
+            let outcome = forwarder
+                .forward(
+                    &AppType::Codex,
+                    &http::Method::POST,
+                    &provider,
+                    "/v1/chat/completions",
+                    &body,
+                    &HeaderMap::new(),
+                    &Extensions::new(),
+                    adapter.as_ref(),
+                )
+                .await;
+            capture.abort();
+            assert!(
+                outcome.is_err(),
+                "unmapped or ambiguous native Chat effort must fail before dispatch"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn subagent_reasoning_effort_forwarder_uses_current_policy_for_native_and_chat_only_on_children(
     ) {
         // Include both flat relay controls and OpenRouter-compatible nested
@@ -10986,7 +11346,7 @@ mod tests {
                             };
                             assert!(error
                                 .to_string()
-                                .contains("Sub-Agent reasoning override conflicts"));
+                                .contains("Canonical Codex reasoning conflicts"));
                             assert!(!error.to_string().contains("REDACTED_TEST_KEY"));
                             capture.abort();
                             continue;
@@ -11033,6 +11393,91 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_responses_parent_sublyx_alias_preserves_native_max_reasoning() {
+        for incoming_effort in ["max", "ultra"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind Sublyx native Responses upstream");
+            let upstream = format!("http://{}", listener.local_addr().unwrap());
+            let capture = tokio::spawn(capture_single_http_request(listener));
+            let mut target = test_provider_with_type(None);
+            target.id = "router::route::sublyx".to_string();
+            target.settings_config = json!({
+                "base_url": upstream,
+                "api_key": "REDACTED_TEST_KEY",
+                "codexRouterParentProviderId": "router",
+                "codexResolvedRouteId": "sublyx",
+                "codexResolvedCanonicalModel": "sol-public-alias",
+                "codexResolvedUpstreamModelOverride": "gpt-6.2-sol",
+                "modelCatalog": {"models": [{
+                    "model": "sol-public-alias",
+                    "upstreamModel": "gpt-6.2-sol",
+                    "reasoning": {
+                        "schemaVersion": 2,
+                        "supportStatus": "confirmed_supported",
+                        "controlKind": "graded",
+                        "supportedEfforts": ["low", "medium", "high", "xhigh", "max"],
+                        "defaultEffort": "max",
+                        "disableAllowed": false,
+                        "upstream": {
+                            "format": "reasoning_object",
+                            "parameter": "reasoning.effort",
+                            "effortMap": {
+                                "low": "low", "medium": "medium", "high": "high",
+                                "xhigh": "xhigh", "max": "max"
+                            }
+                        }
+                    },
+                    "codexUltra": {"enabled": true, "providerEffort": "max"}
+                }]}
+            });
+            target.meta = Some(ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                ..Default::default()
+            });
+            let router = Provider::with_id(
+                "router".into(),
+                "Router".into(),
+                json!({"codexRouting": {"enabled": true, "subagentReasoningEffort": "max"}}),
+                None,
+            );
+            let mut forwarder = test_forwarder(Duration::from_secs(5), Duration::ZERO);
+            forwarder
+                .router
+                .database()
+                .save_provider("codex", &router)
+                .unwrap();
+            forwarder.session_id = uuid::Uuid::new_v4().to_string();
+            forwarder.request_health_trace = uuid::Uuid::new_v4().to_string();
+            let body = json!({
+                "model": "sol-public-alias",
+                "reasoning": {"effort": incoming_effort},
+                "input": [{"role": "user", "content": "Inspect a bounded change"}],
+                "tools": [],
+                "stream": false
+            });
+            let adapter = get_adapter(&AppType::Codex);
+            forwarder
+                .forward(
+                    &AppType::Codex,
+                    &http::Method::POST,
+                    &target,
+                    "/v1/responses",
+                    &body,
+                    &HeaderMap::new(),
+                    &Extensions::new(),
+                    adapter.as_ref(),
+                )
+                .await
+                .expect("parent native Responses request must forward");
+            let (_, bytes) = capture.await.expect("captured Sublyx request");
+            let sent: Value = serde_json::from_slice(&bytes).expect("outgoing JSON");
+            assert_eq!(sent["model"], "gpt-6.2-sol", "{incoming_effort}");
+            assert_eq!(sent["reasoning"]["effort"], "max", "{incoming_effort}");
         }
     }
 
@@ -12991,6 +13436,8 @@ mod tests {
             "https://chatgpt.com/backend-api/codex/responses",
             /* official_auth */ true,
             /* transformed */ false,
+            /* trusted_native_passthrough */ false,
+            /* inbound_encoding */ None,
         ));
     }
 
@@ -13002,6 +13449,8 @@ mod tests {
             "https://api.deepseek.com/v1/responses",
             /* official_auth */ true,
             /* transformed */ false,
+            /* trusted_native_passthrough */ false,
+            /* inbound_encoding */ None,
         ));
         assert!(!should_zstd_compress_codex_official_upstream(
             &AppType::Codex,
@@ -13009,7 +13458,70 @@ mod tests {
             "https://chatgpt.com/backend-api/codex/responses",
             /* official_auth */ true,
             /* transformed */ true,
+            /* trusted_native_passthrough */ false,
+            /* inbound_encoding */ None,
         ));
+    }
+
+    #[test]
+    fn trusted_native_passthrough_follows_inbound_encoding_choice() {
+        let url = "https://chatgpt.com/backend-api/codex/responses";
+        let select = |trusted, encoding| {
+            should_zstd_compress_codex_official_upstream(
+                &AppType::Codex,
+                &http::Method::POST,
+                url,
+                true,
+                false,
+                trusted,
+                encoding,
+            )
+        };
+
+        assert!(!select(true, Some(CodexInboundEncoding::Plain)));
+        assert!(select(true, Some(CodexInboundEncoding::Compressed)));
+        assert!(select(true, None));
+        assert!(select(false, Some(CodexInboundEncoding::Plain)));
+    }
+
+    #[test]
+    fn trusted_native_responses_and_compact_finalize_the_selected_encoding() {
+        let json = br#"{"model":"test-model","input":[]}"#;
+        for endpoint in ["responses", "responses/compact"] {
+            let url = format!("https://chatgpt.com/backend-api/codex/{endpoint}");
+            for encoding in [
+                CodexInboundEncoding::Plain,
+                CodexInboundEncoding::Compressed,
+            ] {
+                let mut headers = HeaderMap::new();
+                let compress = should_zstd_compress_codex_official_upstream(
+                    &AppType::Codex,
+                    &http::Method::POST,
+                    &url,
+                    true,
+                    false,
+                    true,
+                    Some(encoding),
+                );
+                let payload = FinalizedRequestPayload::from_transformed_json(
+                    json.len(),
+                    json.to_vec(),
+                    &mut headers,
+                    compress,
+                )
+                .unwrap();
+                match encoding {
+                    CodexInboundEncoding::Plain => {
+                        assert!(!headers.contains_key(http::header::CONTENT_ENCODING));
+                        assert_eq!(payload.wire_body(), json);
+                    }
+                    CodexInboundEncoding::Compressed => {
+                        assert_eq!(headers[http::header::CONTENT_ENCODING], "zstd");
+                        assert_eq!(zstd::stream::decode_all(payload.wire_body()).unwrap(), json);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -16241,6 +16753,76 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn codex_rate_limit_retry_honors_configured_retry_budget() {
+        for (configured_retries, expected_attempts) in [(0usize, 1usize), (1, 2), (5, 6)] {
+            let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let attempts_for_send = attempts.clone();
+            let mut policy = safe_test_codex_traffic_policy();
+            policy.rate_limit_max_retries = configured_retries;
+
+            let result = send_codex_request_with_rate_limit_retry("test", true, policy, || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::TOO_MANY_REQUESTS,
+                        http::HeaderMap::new(),
+                        Bytes::from_static(
+                            br#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#,
+                        ),
+                    ))
+                }
+            })
+            .await
+            .expect("bounded 429 retry should return response");
+
+            assert_eq!(result.status(), http::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                attempts.load(std::sync::atomic::Ordering::SeqCst),
+                expected_attempts,
+                "configured rate-limit retry budget must control attempts"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_capacity_retry_wins_over_unrecognized_opencode_rejection_branch() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_send = attempts.clone();
+        let mut policy = safe_test_codex_traffic_policy();
+        policy.rejection_retry_mode =
+            crate::provider::CodexRejectionRetryMode::OpencodeEndpointUnavailable;
+        policy.rejection_max_retries = 1;
+        policy.rejection_initial_delay = Duration::from_millis(100);
+        policy.rejection_max_delay = Duration::from_millis(100);
+
+        let result = send_codex_request_with_rate_limit_retry("test", true, policy, || {
+            let attempts = attempts_for_send.clone();
+            async move {
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        http::HeaderMap::new(),
+                        Bytes::from_static(
+                            br#"{"error":{"type":"server_is_overloaded","message":"Please try again later"}}"#,
+                        ),
+                    ))
+                } else {
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::OK,
+                        http::HeaderMap::new(),
+                        Bytes::new(),
+                    ))
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn codex_rate_limit_retry_honors_retry_after_seconds() {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
@@ -16804,6 +17386,41 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn codex_recognized_opencode_rejection_stops_at_its_own_budget() {
+        for (configured_retries, expected_attempts) in [(0usize, 1usize), (1, 2)] {
+            let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let attempts_for_send = attempts.clone();
+            let mut policy = safe_test_codex_traffic_policy();
+            policy.rejection_retry_mode =
+                crate::provider::CodexRejectionRetryMode::OpencodeEndpointUnavailable;
+            policy.rejection_max_retries = configured_retries;
+            policy.rejection_initial_delay = Duration::from_millis(100);
+            policy.rejection_max_delay = Duration::from_millis(100);
+
+            let response = send_codex_request_with_rate_limit_retry("test", true, policy, || {
+                let attempts = attempts_for_send.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ProxyResponse::buffered(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        http::HeaderMap::new(),
+                        Bytes::from_static(b"upstream request failed: endpoint is unavailable"),
+                    ))
+                }
+            })
+            .await
+            .expect("recognized rejection preserves its final response");
+
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                attempts.load(std::sync::atomic::Ordering::SeqCst),
+                expected_attempts,
+                "exhausted rejection budget must not borrow the capacity retry budget"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn codex_generic_503_is_not_replayed_by_rejection_policy() {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_send = attempts.clone();
@@ -16812,7 +17429,7 @@ mod tests {
             crate::provider::CodexRejectionRetryMode::OpencodeEndpointUnavailable;
         policy.rejection_max_retries = 2;
 
-        let result = send_codex_request_with_rate_limit_retry("test", false, policy, || {
+        let result = send_codex_request_with_rate_limit_retry("test", true, policy, || {
             let attempts = attempts_for_send.clone();
             async move {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

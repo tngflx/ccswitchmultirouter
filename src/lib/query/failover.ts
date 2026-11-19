@@ -104,6 +104,7 @@ export function useFailoverQueue(appType: string, enabled = true) {
     queryKey: ["failoverQueue", appType],
     queryFn: () => failoverApi.getFailoverQueue(appType),
     enabled: enabled && !!appType,
+    retry: false,
   });
 }
 
@@ -115,6 +116,7 @@ export function useAvailableProvidersForFailover(appType: string) {
     queryKey: ["availableProvidersForFailover", appType],
     queryFn: () => failoverApi.getAvailableProvidersForFailover(appType),
     enabled: !!appType,
+    retry: false,
   });
 }
 
@@ -198,6 +200,7 @@ export function useAutoFailoverEnabled(appType: string, enabled = true) {
     enabled: enabled && !!appType,
     // 默认值为 false（与后端保持一致）
     placeholderData: false,
+    retry: false,
   });
 }
 

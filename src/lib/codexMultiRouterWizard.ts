@@ -20,7 +20,7 @@ import {
   type HostedToolsConfig,
 } from "./hostedTools";
 import type { FetchedModel } from "@/lib/api/model-fetch";
-import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
+import { readCodexProviderBaseUrl } from "@/lib/codexReasoningProviderIdentity";
 import {
   codexPlanModelListAction,
   isCodexCatalogOnlyPlanModelFetch,
@@ -327,14 +327,7 @@ export function hasWizardModelCatalog(provider: Provider): boolean {
 
 // 从 Codex provider 配置中读取 Base URL，兼容已扁平化字段和原始 config.toml 字符串。
 export function readWizardProviderBaseUrl(provider: Provider): string {
-  const config = provider.settingsConfig ?? {};
-  const direct = String(
-    config.base_url ?? config.baseURL ?? config.baseUrl ?? "",
-  ).trim();
-  if (direct) return direct;
-  return typeof config.config === "string"
-    ? (extractCodexBaseUrl(config.config) ?? "").trim()
-    : "";
+  return readCodexProviderBaseUrl(provider.settingsConfig) ?? "";
 }
 
 // 判断向导中的模型源是否属于只能使用内置目录的 Plan provider。
@@ -1664,7 +1657,10 @@ export function buildCodexMultiRouterWizardPlan(
     subagentVersion,
     // New and upgraded plans default to High; explicit saved choices, including
     // the Profile opt-out, remain canonical.
-    subagentReasoningEffort: existingRouting?.subagentReasoningEffort ?? "high",
+    subagentReasoningEffort:
+      existingRouting?.subagentReasoningEffort === undefined
+        ? "high"
+        : existingRouting.subagentReasoningEffort,
     subagentV2: subagentNameRedirector.remapSubagentV2(
       existingRouting?.subagentV2,
     ),

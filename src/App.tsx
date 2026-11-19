@@ -35,7 +35,13 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { confirmDialog } from "@/lib/dialog";
 import type { Provider, VisibleApps } from "@/types";
 import type { EnvConflict } from "@/types/env";
-import { proxyKeys, useProvidersQuery, useSettingsQuery } from "@/lib/query";
+import {
+  proxyKeys,
+  useCodexEditorProvidersQuery,
+  useProvidersQuery,
+  useSettingsQuery,
+} from "@/lib/query";
+import { isCodexProtocolSetMember } from "@/lib/codexProviderKind";
 import {
   piApi,
   providersApi,
@@ -572,12 +578,41 @@ function App() {
           "Provider data could not be loaded. Existing data is preserved; retry to reconnect.",
       }) + ` (${providerLoadError})`
     : null;
+  const needsCodexEditorInventory = useMemo(
+    () =>
+      activeApp === "codex" &&
+      Object.values(providers).some(isCodexProtocolSetMember),
+    [activeApp, providers],
+  );
+  const editorInventory = useCodexEditorProvidersQuery(
+    needsCodexEditorInventory &&
+      (currentView === "codexRouter" ||
+        isCodexMultiRouterEntryChoiceOpen ||
+        isCodexMultiRouterWizardOpen),
+  );
+  const codexEditorLoading =
+    activeApp === "codex" &&
+    ((!data && !providersQueryError) ||
+      (needsCodexEditorInventory && editorInventory.isPending));
+  const codexEditorError =
+    needsCodexEditorInventory && editorInventory.isError
+      ? t("codexProviderUi.editorUnsafe", {
+          defaultValue:
+            "Protocol adaptation could not be safely restored. Check the model source configuration and retry.",
+        })
+      : !data
+        ? providerLoadErrorMessage
+        : null;
+  const retryCodexEditorRead = () =>
+    void (needsCodexEditorInventory ? editorInventory.refetch() : refetch());
   const codexWizardProviders = useMemo(
     () =>
       activeApp === "codex"
-        ? Object.values(data?.codexEditorProviders ?? providers)
+        ? needsCodexEditorInventory
+          ? Object.values(editorInventory.data ?? {})
+          : Object.values(providers)
         : [],
-    [activeApp, providers, data?.codexEditorProviders],
+    [activeApp, providers, needsCodexEditorInventory, editorInventory.data],
   );
   const codexRoutingPlans = useMemo(
     () => codexWizardProviders.filter(isRoutingPlan),
@@ -660,13 +695,13 @@ function App() {
     const setupListener = async () => {
       try {
         const off = await providersApi.onSwitched(
-          async (event: ProviderSwitchEvent) => {
-            if (event.appType === activeApp) {
-              await refetch();
-            }
+          (event: ProviderSwitchEvent) => {
+            const refreshes: Promise<unknown>[] = [];
+            if (event.appType === activeApp) refreshes.push(refetch());
             if (event.appType === "pi") {
-              await invalidatePiProviderCaches(queryClient);
+              refreshes.push(invalidatePiProviderCaches(queryClient));
             }
+            void Promise.allSettled(refreshes);
           },
         );
         if (!active) {
@@ -1310,17 +1345,21 @@ function App() {
   };
 
   // 从首页 CTA 进入入口选择面板；用户可以随时退出，也可以选择引导或直接进入工作台。
-  const handleStartCodexMultiRouterWizard = async () => {
+  const handleStartCodexMultiRouterWizard = () => {
     setActiveApp("codex");
     setCurrentView("providers");
-    await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
-    await refetch();
     setIsCodexMultiRouterEntryChoiceOpen(true);
+    void queryClient
+      .invalidateQueries({ queryKey: ["providers", "codex"] })
+      .catch((error) => {
+        console.error("[App] Failed to refresh Codex providers", error);
+      });
   };
 
   const handleCreateCodexMultiRouter = () => {
-    if (data?.codexEditorError) {
-      toast.error(data.codexEditorError);
+    if (codexEditorLoading) return;
+    if (codexEditorError) {
+      toast.error(codexEditorError);
       return;
     }
     setActiveApp("codex");
@@ -1332,8 +1371,9 @@ function App() {
   };
 
   const handleEditCodexMultiRouter = (provider: Provider) => {
-    if (data?.codexEditorError) {
-      toast.error(data.codexEditorError);
+    if (codexEditorLoading) return;
+    if (codexEditorError) {
+      toast.error(codexEditorError);
       return;
     }
     setActiveApp("codex");
@@ -1364,13 +1404,12 @@ function App() {
   const handleEnableCodexMultiRouterPlan = async (provider: Provider) => {
     setActiveApp("codex");
     await enableCodexMultiRouterPlan(provider, switchProvider);
-    await Promise.all([
+    openCodexRouterWorkspace(provider, "status");
+    void Promise.allSettled([
       queryClient.invalidateQueries({ queryKey: ["proxyStatus"] }),
       queryClient.invalidateQueries({ queryKey: ["proxyTakeoverStatus"] }),
       queryClient.invalidateQueries({ queryKey: ["providers", "codex"] }),
       queryClient.invalidateQueries({ queryKey: usageKeys.all }),
-    ]);
-    await Promise.all([
       queryClient.refetchQueries({ queryKey: ["proxyStatus"], type: "active" }),
       queryClient.refetchQueries({
         queryKey: ["proxyTakeoverStatus"],
@@ -1381,8 +1420,15 @@ function App() {
         type: "active",
       }),
       queryClient.refetchQueries({ queryKey: usageKeys.all, type: "active" }),
-    ]);
-    openCodexRouterWorkspace(provider, "status");
+    ]).then((results) => {
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed?.status === "rejected") {
+        console.error(
+          "[App] Failed to refresh Codex MultiRouter state",
+          failed.reason,
+        );
+      }
+    });
   };
 
   // Provider 列表也是启用入口。schema v1 必须先进入带 preview/token/revision
@@ -1498,10 +1544,24 @@ function App() {
         case "openaiApi":
           return <OpenAICompatibleApiPage />;
         case "codexRouter":
-          if (data?.codexEditorError)
+          if (codexEditorLoading)
             return (
-              <div role="alert" className="p-6">
-                {data.codexEditorError}
+              <div role="status" className="flex items-center gap-2 p-6">
+                <Loader2 aria-hidden="true" className="size-4 animate-spin" />
+                {t("common.loading")}
+              </div>
+            );
+          if (codexEditorError)
+            return (
+              <div role="alert" className="flex items-center gap-3 p-6">
+                {codexEditorError}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={retryCodexEditorRead}
+                >
+                  {t("common.retry", { defaultValue: "Retry" })}
+                </Button>
               </div>
             );
           return (
@@ -2419,6 +2479,7 @@ function App() {
             <button
               type="button"
               onClick={handleCreateCodexMultiRouter}
+              disabled={codexEditorLoading}
               className="rounded-xl border border-blue-500/25 bg-gradient-to-r from-blue-500/10 via-background to-cyan-500/10 p-4 text-left shadow-sm transition-colors hover:border-blue-500/45 hover:from-blue-500/15"
             >
               <div className="flex items-center gap-2 font-medium">
@@ -2441,7 +2502,20 @@ function App() {
                 ID remain visible at the top.
               </p>
               <div className="mt-3 max-h-40 space-y-2 overflow-y-auto pr-1">
-                {codexRoutingPlans.length > 0 ? (
+                {codexEditorLoading ? (
+                  <div role="status">{t("common.loading")}</div>
+                ) : codexEditorError ? (
+                  <div role="alert" className="flex items-center gap-3">
+                    {codexEditorError}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={retryCodexEditorRead}
+                    >
+                      {t("common.retry", { defaultValue: "Retry" })}
+                    </Button>
+                  </div>
+                ) : codexRoutingPlans.length > 0 ? (
                   codexRoutingPlans.map((plan) => (
                     <button
                       key={plan.id}

@@ -41,7 +41,8 @@
       "booleanControlUnverified": "The native reasoning on/off controls could not be verified for every Boolean model"
     },
     "booleanUnverifiedCount": "Boolean controls unverified: {{count}}",
-    "booleanReadyCount": "Boolean controls verified: {{count}}"
+    "booleanReadyCount": "Boolean controls verified: {{count}}",
+    "booleanNotObservedCount": "Boolean controls not observed: {{count}}"
   },
   "codexSubagentGovernance": {
     "title": "Guidance and execution permissions",
@@ -56,6 +57,7 @@
     "globalLabel": "All Sub-Agent reasoning effort",
     "globalProfileOption": "Profile settings (override off)",
     "globalLegacyOption": "Saved legacy effort (preserved): {{effort}}",
+    "globalInvalidOption": "Invalid saved reasoning effort",
     "globalHighOption": "High",
     "globalMaxOption": "Max",
     "globalHint": "Applies to both V1 and V2 where the model supports the selected effort. Available overrides are Max or High. Saved profile choices and the main agent stay unchanged. Unsupported models keep their profile policy. Select Profile settings to restore saved choices.",
@@ -1276,7 +1278,7 @@
       "unavailable": "Enabled · unavailable",
       "off": "Off",
       "setup": "Private website setup",
-      "privateNetwork": "First configure private HTTPS access on this computer and your tablet/laptop (for example, Tailscale Serve). This listener is loopback-only; do not forward its port or expose the model API/CDP.",
+      "privateNetwork": "Use Tailscale for the private connection and keep this website on your own computer. Your tablet/laptop needs Tailscale and a browser; Cloudflare is optional domain management, not the traffic path.",
       "origin": "Exact HTTPS website origin",
       "security": "Passkeys and revocable browser sessions protect access. This does not approve Codex tool/sandbox prompts or bypass account usage limits.",
       "enable": "Enable owner remote",
@@ -1293,7 +1295,19 @@
       "retryStatus": "Retry status",
       "setupRequired": "Set up a private HTTPS website below before turning on remote access.",
       "retryListener": "Retry listener",
-      "originPinned": "This deployment is pinned to its HTTPS website. Changing it requires a separate explicit reset and browser re-enrollment; it cannot be changed here."
+      "originPinned": "This deployment is pinned to its HTTPS website. Changing it requires a separate explicit reset and browser re-enrollment; it cannot be changed here.",
+      "tailscaleSteps": "Private Tailscale setup steps",
+      "setupStepDevices": "Install and sign in to Tailscale on this host and your tablet/laptop before leaving. Keep the host online; CCSwitch and a compatible Codex session must also be available.",
+      "setupStepAccess": "Restrict your tailnet rules to your authorized devices reaching this host's HTTPS port (443). Do not publish the listener, model API, debug ports, or use Funnel for this private setup.",
+      "setupStepServe": "On the host, configure Tailscale Serve to forward private HTTPS to the local owner listener:",
+      "setupStepOrigin": "Copy the exact HTTPS origin reported by Serve (normally a .ts.net hostname) into the field below, then enable owner access. Tailscale supplies HTTPS for that hostname; a running listener alone does not verify remote access.",
+      "setupStepEnroll": "Create a one-use enrollment link, open it on your own tablet/laptop within 60 seconds and register a passkey. Later, open the website bookmark, select a conversation and use Continue when eligible; no per-action host approval is needed.",
+      "cloudflareOptional": "Optional: Cloudflare domain management only",
+      "cloudflareDnsOnly": "The .ts.net website needs no Cloudflare configuration. If you choose a custom domain managed at Cloudflare, keep its records DNS-only (not the orange-cloud proxy), its HTTPS service private to Tailscale, and do not add Cloudflare Tunnel or Access to this route.",
+      "cloudflareCertificate": "A CNAME to the Tailscale hostname does not provide a certificate for your custom hostname. That setup needs a separate private HTTPS proxy and a certificate issued with DNS-01 validation. Choose the final origin before enrollment; changing a pinned origin requires an explicit reset and re-enrollment.",
+      "cloudflareNoSecrets": "CCSwitch does not need Cloudflare API tokens or domain credentials. Keep them out of this form, connection links and logs. Domain management does not host or mirror the Codex website.",
+      "openWebsite": "Open owner website",
+      "listenerOnly": "The listener is running locally. This does not prove Tailscale, your tablet connection, the Codex bridge, or the selected conversation is ready. Opening the website performs no Continue submission."
     },
     "tabConnectionsRecovery": "Connections & recovery",
     "connectionsShortcutTitle": "Remote connection & crash recovery",
@@ -4826,6 +4840,17 @@
       "image_generation": "Image generation",
       "context_compaction": "Context compaction",
       "unsupported": "Unsupported content"
+    },
+    "failure": {
+      "server_overloaded": "Server overloaded",
+      "usage_limit": "Temporary usage limit",
+      "rate_limit": "Rate limit",
+      "internal_server_error": "Internal server error",
+      "authentication_error": "Authentication error",
+      "context_length_exceeded": "Context window exceeded",
+      "invalid_request_error": "Invalid request",
+      "connection_error": "Connection error",
+      "unknown": "Unknown error"
     },
     "operation": {
       "pending": "Continue is pending. Only read-only status checks will follow.",

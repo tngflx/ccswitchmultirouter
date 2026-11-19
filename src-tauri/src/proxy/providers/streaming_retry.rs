@@ -38,8 +38,8 @@ use crate::proxy::forwarder::{
     parse_retry_after_delay, CODEX_RATE_LIMIT_MAX_SINGLE_DELAY, CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET,
 };
 use crate::proxy::hyper_client::ProxyResponse;
-use crate::proxy::sse::{strip_sse_field, take_sse_block};
-use bytes::{Bytes, BytesMut};
+use crate::proxy::sse::{strip_sse_field, take_sse_block, BoundedSseFrames, SseFrame};
+use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -108,6 +108,7 @@ impl ReconnectTerminal {
             "response_pending" => "The upstream request may still be running; automatic replay stopped because its outcome is unknown.",
             "overloaded_error" => "The upstream provider is overloaded; automatic capacity retry is disabled.",
             "capacity_retry_stopped" => "Upstream capacity recovery stopped because the reconnect did not produce another confirmed capacity response",
+            "upstream_sse_frame_too_large" => "An upstream SSE event exceeded the proxy's size limit; automatic replay stopped because the event could not be classified.",
             _ => "The upstream request or reconnect configuration was rejected; review it before retrying.",
         };
         Self { code, message }
@@ -673,7 +674,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
 
         'attempts: loop {
             let Some(mut stream) = current.take() else { break };
-            let mut buffer = BytesMut::new();
+            let mut frames = BoundedSseFrames::default();
             let mut swallowed_capacity_block: Option<Bytes> = None;
             let mut failure_reason: Option<String> = None;
             let mut silence = Duration::ZERO;
@@ -694,10 +695,11 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                     }
                 };
                 let Some(item) = item else {
-                    if !buffer.is_empty() {
+                    let pending = frames.take_pending();
+                    if !pending.is_empty() {
                         // 不能验证残块是否只是脚手架；原样发出并关闭重放通道。
                         semantic_output_seen = true;
-                        yield Ok(buffer.split().freeze());
+                        yield Ok(pending);
                         break 'read;
                     } else if semantic_output_seen {
                         // A clean EOF after semantic output is owned by the
@@ -722,8 +724,13 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                         break 'read;
                     }
                 };
-                buffer.extend_from_slice(&chunk);
-                while let Some(block) = take_raw_sse_block(&mut buffer) {
+                let mut input = chunk.as_ref();
+                while let Some(frame) = frames.read(&mut input) {
+                    let SseFrame::Complete(block) = frame else {
+                        retry_activity.finish();
+                        yield Ok(ReconnectTerminal::new("upstream_sse_frame_too_large").anthropic());
+                        break 'attempts;
+                    };
                     let capacity_failure = capacity_retry_enabled
                         && !semantic_output_seen
                         && upstream_sse_block_is_error(&block)
@@ -878,27 +885,6 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
 /// Codex CLI 的标称退避序列（无抖动）：200/400/800/1600/3200ms。
 fn backoff_delay(attempt: u32) -> Duration {
     Duration::from_millis(200u64 << attempt.saturating_sub(1).min(4))
-}
-
-/// 从原始 Responses SSE 字节缓冲中取出一个完整事件（连同分隔空行）。
-///
-/// 不在 chunk 边界上作 UTF-8 解码，避免上游刚好在中文字符中间切块时篡改
-/// passthrough 字节；只有取得完整 SSE block 后才用 UTF-8 读取事件名。
-fn take_raw_sse_block(buffer: &mut BytesMut) -> Option<Bytes> {
-    let bytes = buffer.as_ref();
-    let lf_boundary = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|index| index + 2);
-    let crlf_boundary = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| index + 4);
-    // Providers may switch legal line endings between events. Never merge an
-    // earlier CRLF event into a later LF event and hide semantic output behind
-    // the first event's scaffolding classification.
-    let boundary = lf_boundary.into_iter().chain(crlf_boundary).min()?;
-    Some(buffer.split_to(boundary).freeze())
 }
 
 /// 读取原始 Responses SSE block 的事件名；注释或不含事件名的 block 返回 `None`。
@@ -1085,6 +1071,30 @@ pub(crate) fn is_capacity_error_response(status: http::StatusCode, body: Option<
     let payload =
         serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({ "message": body }));
     is_capacity_error_payload(&payload, Some(status))
+}
+
+fn native_responses_empty_progress(event: Option<&str>, payload: Option<&Value>) -> bool {
+    let status = match event {
+        Some("response.queued") => "queued",
+        Some("response.in_progress") => "in_progress",
+        _ => return false,
+    };
+    let Some(payload) = payload else {
+        return false;
+    };
+    payload.get("type").and_then(Value::as_str) == event
+        && payload.pointer("/response/status").and_then(Value::as_str) == Some(status)
+        && payload
+            .pointer("/response/id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty())
+        && payload
+            .pointer("/response/output")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        && payload
+            .pointer("/response/error")
+            .is_none_or(Value::is_null)
 }
 
 struct NativeResponsesSseErrorDiagnostic {
@@ -1332,9 +1342,8 @@ fn native_responses_failed_terminal_sse(
 /// 原生 Codex Responses 的安全 SSE 重连。
 ///
 /// 除上游错误终态兼容转换外保留协议字节。只有 `response.created` 和
-/// SSE 注释已被发出时，重新执行同一上游请求仍可对客户端透明；任何其它事件
-/// （包括 malformed block）都可能已经进入 Codex 持久化/工具状态机，立即封死
-/// 重放路径。这样中途异常只会作为一次普通断流交给 Codex，而不会造成重复调用。
+/// SSE 注释已被发出时才允许传输重连。明确的容量拒绝还允许出现在已验证的空
+/// `response.queued` / `response.in_progress` 之后；其它事件关闭两种重放路径。
 #[allow(dead_code)]
 pub fn create_resilient_responses_sse_stream(
     initial: ByteStream,
@@ -1358,13 +1367,14 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
         let mut created_forwarded = false;
         let mut response_id: Option<String> = None;
         let mut semantic_output_forwarded = false;
+        let mut capacity_replay_blocked = false;
         let mut capacity_retry_long_wait_mode = false;
         let mut evidence = NativeResponsesEvidence::default();
         let mut current = Some(initial);
 
         'attempts: loop {
             let Some(mut stream) = current.take() else { break };
-            let mut buffer = BytesMut::new();
+            let mut frames = BoundedSseFrames::default();
             let mut silence = Duration::ZERO;
 
             let mut retrying_capacity = false;
@@ -1385,10 +1395,11 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                 };
 
                 let Some(item) = item else {
-                    if !buffer.is_empty() {
+                    let pending = frames.take_pending();
+                    if !pending.is_empty() {
                         // 不能验证残块是否只是脚手架；原样发出并关闭重放通道。
                         semantic_output_forwarded = true;
-                        yield Ok(buffer.split().freeze());
+                        yield Ok(pending);
                     }
                     if semantic_output_forwarded {
                         let message = "Upstream Responses SSE ended without a terminal event after semantic output";
@@ -1424,9 +1435,13 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                         break 'stream format!("upstream Responses SSE transport error: {error}");
                     }
                 };
-                buffer.extend_from_slice(&chunk);
-
-                while let Some(block) = take_raw_sse_block(&mut buffer) {
+                let mut input = chunk.as_ref();
+                while let Some(frame) = frames.read(&mut input) {
+                    let SseFrame::Complete(block) = frame else {
+                        retry_activity.finish();
+                        yield Ok(ReconnectTerminal::new("upstream_sse_frame_too_large").native(response_id.as_deref()));
+                        break 'attempts;
+                    };
                     let event_name = raw_responses_sse_event_name(&block);
                     let payload = raw_responses_sse_payload(&block);
                     let terminal_disposition =
@@ -1474,15 +1489,49 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                                     yield Ok(block);
                                 }
                                 NativeResponsesTerminalDisposition::Failed => {
+                                    let capacity_failure = payload.as_ref().is_some_and(|payload| {
+                                        is_capacity_error_payload(payload, None)
+                                    });
+                                    let long_wait = capacity_retry_long_wait_mode
+                                        || (capacity_failure && payload.as_ref().is_some_and(capacity_error_requires_long_wait));
+                                    if let Some(context) = log_context.as_ref() {
+                                        let reason = match reconnector.as_ref() {
+                                            _ if !capacity_retry_enabled => "retry_disabled",
+                                            _ if capacity_replay_blocked => "semantic_output_forwarded",
+                                            _ if !capacity_failure => "not_capacity",
+                                            None => "reconnector_unavailable",
+                                            Some(reconnector) if retry_attempt >= reconnector.retry_limit()
+                                                || retry_wait.exhausted(long_wait) => "budget_exhausted",
+                                            Some(_) => "retry_started",
+                                        };
+                                        let event_class = match event_name.as_deref() {
+                                            Some("error" | "response.error") => "generic_error",
+                                            Some("response.failed") => "response_failed",
+                                            _ => "other_terminal",
+                                        };
+                                        crate::proxy::codex_router_log::append_event(
+                                            "capacity_retry_decision",
+                                            &[
+                                                ("stage", "native_responses".to_string()),
+                                                ("session", context.session_id.clone()),
+                                                ("model", context.model.clone()),
+                                                ("provider", context.provider_id.clone()),
+                                                ("reason", reason.to_string()),
+                                                ("capacity", capacity_failure.to_string()),
+                                                ("enabled", capacity_retry_enabled.to_string()),
+                                                ("semantic", capacity_replay_blocked.to_string()),
+                                                ("reconnector", reconnector.is_some().to_string()),
+                                                ("attempt", retry_attempt.to_string()),
+                                                ("event_class", event_class.to_string()),
+                                            ],
+                                        );
+                                    }
                                     if capacity_retry_enabled
-                                        && !semantic_output_forwarded
-                                        && payload.as_ref().is_some_and(|payload| {
-                                            is_capacity_error_payload(payload, None)
-                                        })
+                                        && !capacity_replay_blocked
+                                        && capacity_failure
+                                        && reconnector.is_some()
                                     {
-                                        capacity_retry_long_wait_mode |= payload
-                                            .as_ref()
-                                            .is_some_and(capacity_error_requires_long_wait);
+                                        capacity_retry_long_wait_mode = long_wait;
                                         retrying_capacity = true;
                                         break 'stream "upstream reported model capacity pressure".into();
                                     }
@@ -1507,6 +1556,12 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                             break 'attempts;
                         }
                         _ => {
+                            // Explicit capacity rejection can be replayed after validated
+                            // empty progress. An ambiguous transport failure still cannot.
+                            capacity_replay_blocked |= !native_responses_empty_progress(
+                                event_name.as_deref(),
+                                payload.as_ref(),
+                            );
                             semantic_output_forwarded = true;
                             yield Ok(block);
                         }
@@ -1647,7 +1702,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
 
         'attempts: loop {
             let Some(mut stream) = current.take() else { break };
-            let mut buffer = BytesMut::new();
+            let mut frames = BoundedSseFrames::default();
             let mut silence = Duration::ZERO;
             let mut failure: Option<(String, String)> = None;
             let mut terminal = false;
@@ -1669,9 +1724,10 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                 };
 
                 let Some(item) = item else {
-                    if !buffer.is_empty() {
+                    let pending = frames.take_pending();
+                    if !pending.is_empty() {
                         semantic_output_forwarded = true;
-                        yield Ok(buffer.split().freeze());
+                        yield Ok(pending);
                         failure = Some((
                             "residual_before_terminal".to_string(),
                             "upstream Chat Completions SSE ended with an unparsed residual block".to_string(),
@@ -1714,9 +1770,13 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                         break;
                     }
                 };
-                buffer.extend_from_slice(&chunk);
-
-                while let Some(block) = take_raw_sse_block(&mut buffer) {
+                let mut input = chunk.as_ref();
+                while let Some(frame) = frames.read(&mut input) {
+                    let SseFrame::Complete(block) = frame else {
+                        retry_activity.finish();
+                        yield Ok(ReconnectTerminal::new("upstream_sse_frame_too_large").chat());
+                        break 'attempts;
+                    };
                     match classify_chat_sse_block(&block) {
                         ChatSseBlockDisposition::Ignore => {}
                         ChatSseBlockDisposition::Comment => yield Ok(block),
@@ -2477,6 +2537,13 @@ mod tests {
         )
     }
 
+    fn empty_progress(event: &str, status: &str) -> String {
+        sse(
+            event,
+            json!({"type":event,"response":{"id":"resp_1","status":status,"output":[],"error":null}}),
+        )
+    }
+
     fn text_delta(text: &str) -> String {
         sse(
             "response.output_text.delta",
@@ -3142,6 +3209,183 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn native_capacity_replays_after_empty_progress_with_explicit_capacity_code() {
+        for (event, status, code) in [
+            ("response.queued", "queued", "server_is_overloaded"),
+            ("response.in_progress", "in_progress", "slow_down"),
+        ] {
+            let progress = empty_progress(event, status);
+            let (progress_start, progress_end) = progress.split_at(progress.len() / 2);
+            let rejected = sse(
+                "error",
+                json!({"type":"error","error":{"type":"service_unavailable_error","code":code,"message":"Temporarily unavailable"}}),
+            );
+            let retry_body = [
+                created(),
+                progress.clone(),
+                text_delta("recovered"),
+                completed(),
+            ]
+            .concat();
+            let (reconnector, calls) =
+                scripted_reconnector(vec![Ok(streamed_response(&[retry_body.as_str()]))]);
+            let first = ok_chunks(&[created().as_str(), progress_start, progress_end, &rejected]);
+
+            let out = collect(create_resilient_responses_sse_stream_with_context(
+                first,
+                Some(reconnector),
+                None,
+                true,
+            ))
+            .await;
+
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{event}");
+            assert_eq!(out.matches("event: response.created").count(), 1);
+            assert_eq!(
+                out.matches(&progress).count(),
+                2,
+                "both progress blocks must be preserved byte for byte"
+            );
+            assert!(out.contains("recovered"));
+            assert!(out.contains(&completed()));
+            assert!(!out.contains(code));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_capacity_empty_progress_respects_the_configured_retry_budget() {
+        let progress = empty_progress("response.in_progress", "in_progress");
+        let rejection = capacity_failed("server_is_overloaded", "Selected model is at capacity");
+        let response = [created().as_str(), progress.as_str(), rejection.as_str()].concat();
+        let (reconnector, calls) = scripted_reconnector(vec![
+            Ok(streamed_response(&[&response])),
+            Ok(streamed_response(&[&response])),
+        ]);
+
+        let out = collect(create_resilient_responses_sse_stream_with_context(
+            ok_chunks(&[&response]),
+            Some(reconnector.with_max_retries(2)),
+            None,
+            true,
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(out.matches(&progress).count(), 3);
+        assert!(out.contains("capacity_retry_exhausted"));
+        assert!(!out.contains("server_is_overloaded"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_capacity_replay_stays_blocked_after_semantic_or_unverified_progress() {
+        let valid_progress = empty_progress("response.in_progress", "in_progress");
+        let rejection = capacity_failed("server_is_overloaded", "Selected model is at capacity");
+        for prior in [
+            text_delta("already visible"),
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"type":"response.reasoning_summary_text.delta","delta":"reasoning"}),
+            ),
+            sse(
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","item":{"type":"function_call"}}),
+            ),
+            sse(
+                "response.future_event",
+                json!({"type":"response.future_event"}),
+            ),
+            sse(
+                "response.in_progress",
+                json!({"type":"response.queued","response":{"id":"resp_1","status":"in_progress","output":[]}}),
+            ),
+            sse(
+                "response.in_progress",
+                json!({"type":"response.in_progress","response":{"id":"resp_1","status":"queued","output":[]}}),
+            ),
+            sse(
+                "response.in_progress",
+                json!({"type":"response.in_progress","response":{"id":" ","status":"in_progress","output":[]}}),
+            ),
+            sse(
+                "response.in_progress",
+                json!({"type":"response.in_progress","response":{"id":"resp_1","status":"in_progress"}}),
+            ),
+            sse(
+                "response.in_progress",
+                json!({"type":"response.in_progress","response":{"id":"resp_1","status":"in_progress","output":null}}),
+            ),
+            sse(
+                "response.in_progress",
+                json!({"type":"response.in_progress","response":{"id":"resp_1","status":"in_progress","output":[{"type":"message"}]}}),
+            ),
+            sse(
+                "response.in_progress",
+                json!({"type":"response.in_progress","response":{"id":"resp_1","status":"in_progress","output":[],"error":{"code":"invalid_request_error"}}}),
+            ),
+            "event: response.in_progress\ndata: invalid JSON\n\n".to_string(),
+        ] {
+            let (reconnector, calls) = scripted_reconnector(vec![]);
+            let first = ok_chunks(&[created().as_str(), &prior, &valid_progress, &rejection]);
+
+            let out = collect(create_resilient_responses_sse_stream_with_context(
+                first,
+                Some(reconnector),
+                None,
+                true,
+            ))
+            .await;
+
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{prior}");
+            assert!(out.contains(&prior));
+            assert!(out.contains(&valid_progress));
+            assert!(out.contains(&rejection));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_capacity_progress_does_not_open_the_transport_replay_gate() {
+        let progress = empty_progress("response.in_progress", "in_progress");
+        for (first, error_code) in [
+            (
+                ok_chunks(&[created().as_str(), &progress]),
+                "upstream_terminal_event_missing",
+            ),
+            (
+                chunks_then_error(&[created().as_str(), &progress]),
+                "stream_error",
+            ),
+        ] {
+            let (reconnector, calls) = scripted_reconnector(vec![]);
+            let out = collect(create_resilient_responses_sse_stream_with_context(
+                first,
+                Some(reconnector),
+                None,
+                true,
+            ))
+            .await;
+
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(out.contains(&progress));
+            assert!(out.contains(error_code));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_capacity_preserves_original_failure_without_reconnector() {
+        let rejection = capacity_failed("server_is_overloaded", "Selected model is at capacity");
+        let out = collect(create_resilient_responses_sse_stream_with_context(
+            ok_chunks(&[created().as_str(), &rejection]),
+            None,
+            None,
+            true,
+        ))
+        .await;
+
+        assert!(out.ends_with(&rejection));
+        assert!(!out.contains("upstream_terminal_event_missing"));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn native_capacity_failure_does_not_reconnect_after_semantic_output() {
         let (reconnector, calls) = scripted_reconnector(vec![]);
         let first = ok_chunks(&[
@@ -3617,11 +3861,58 @@ mod tests {
     fn raw_sse_splitter_preserves_earliest_mixed_line_ending_boundary() {
         let first = "event: response.created\r\ndata: {\"type\":\"response.created\",\"response\":{}}\r\n\r\n";
         let second = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"redacted-output\"}\n\n";
-        let mut buffer = BytesMut::from([first, second].concat().as_bytes());
+        let chunk = [first, second].concat();
+        let mut input = chunk.as_bytes();
+        let mut frames = BoundedSseFrames::default();
 
-        assert_eq!(take_raw_sse_block(&mut buffer).unwrap(), first);
-        assert_eq!(take_raw_sse_block(&mut buffer).unwrap(), second);
-        assert!(buffer.is_empty());
+        assert!(
+            matches!(frames.read(&mut input), Some(SseFrame::Complete(frame)) if frame.as_ref() == first.as_bytes())
+        );
+        assert!(
+            matches!(frames.read(&mut input), Some(SseFrame::Complete(frame)) if frame.as_ref() == second.as_bytes())
+        );
+        assert!(frames.read(&mut input).is_none());
+        assert!(frames.take_pending().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_unterminated_event_stops_raw_sse_streams_without_replay() {
+        let padding = Bytes::from(vec![b'x'; crate::proxy::sse::MAX_SSE_FRAME_BYTES]);
+        for protocol in [
+            DevWatchdogProtocol::Responses,
+            DevWatchdogProtocol::Chat,
+            DevWatchdogProtocol::Anthropic,
+        ] {
+            let (scaffold, _, _) = dev_watchdog_frames(protocol);
+            let upstream = stream::iter([
+                Ok(Bytes::from(scaffold.clone())),
+                Ok(padding.clone()),
+                Ok(Bytes::from_static(b"x")),
+            ])
+            .chain(stream::pending());
+            let (reconnector, calls) = scripted_reconnector(vec![]);
+            let mut downstream = dev_watchdog_stream(protocol, Box::pin(upstream), reconnector);
+            assert_eq!(downstream.next().await.unwrap().unwrap(), scaffold);
+            let terminal = tokio::time::timeout(Duration::from_secs(1), downstream.next())
+                .await
+                .expect("oversized frame must stop without waiting for a delimiter or EOF")
+                .unwrap()
+                .unwrap();
+            let mut input = terminal.as_ref();
+            let Some(SseFrame::Complete(frame)) = BoundedSseFrames::default().read(&mut input)
+            else {
+                panic!("expected the oversized frame error event");
+            };
+            let payload = raw_responses_sse_payload(&frame).unwrap();
+            let error = payload
+                .pointer("/response/error")
+                .or_else(|| payload.get("error"))
+                .unwrap();
+            assert_eq!(error["code"], "upstream_sse_frame_too_large");
+            assert_eq!(error["retryable"], false);
+            assert!(downstream.next().await.is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -3700,8 +3991,11 @@ mod tests {
         ] {
             let terminal = ReconnectTerminal::new(terminal_code);
             for wire in [terminal.native(None), terminal.chat(), terminal.anthropic()] {
-                let mut buffer = BytesMut::from(wire.as_ref());
-                let block = take_raw_sse_block(&mut buffer).unwrap();
+                let mut input = wire.as_ref();
+                let Some(SseFrame::Complete(block)) = BoundedSseFrames::default().read(&mut input)
+                else {
+                    panic!("expected the reconnect terminal frame");
+                };
                 let payload = raw_responses_sse_payload(&block).unwrap();
                 let error = payload
                     .pointer("/response/error")

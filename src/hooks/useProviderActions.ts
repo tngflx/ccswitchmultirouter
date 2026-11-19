@@ -313,7 +313,10 @@ export function useProviderActions(
 
       try {
         const result = await switchProviderMutation.mutateAsync(provider.id);
-        await syncClaudePlugin(provider);
+        // Plugin synchronization is an optional post-switch side effect. Keep
+        // it out of the provider switch completion path so a slow settings
+        // backend cannot hold navigation or the success state hostage.
+        void syncClaudePlugin(provider);
 
         // Show backfill warning if present
         if (result?.warnings?.length) {

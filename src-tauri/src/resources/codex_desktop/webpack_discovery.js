@@ -180,10 +180,6 @@ const codexInitializedWebpackPickerCandidates = (namespaces) => {
     const namespace = codexWebpackOwnData(inputs, String(index));
     const runtime = codexWebpackOwnData(namespace, "__webpack_require__");
     if (typeof runtime !== "function") continue;
-    // Numeric Desktop entries can apply another native preference filter after
-    // model-query selection. Missing/uninitialized bindings must not certify
-    // that the picker visibly exposes every projected catalog effort.
-    result.nativeReasoningVisibilityRequired = true;
     const cache = codexWebpackOwnData(runtime, "c");
     if (!codexWebpackExportRecord(cache) || seenCaches.has(cache)) continue;
     seenCaches.add(cache);
@@ -288,6 +284,12 @@ const codexInitializedWebpackPickerCandidates = (namespaces) => {
     }
   }
   result.nativeReasoningVisibilityAtoms = Array.from(visibilityAtoms);
+  // Numeric runtime entries are only architecture evidence. Require the
+  // downstream visibility proof when the initialized native atom itself has
+  // been validated. The caller keeps an unresolved import fail-closed while a
+  // later complete scan can clear this requirement when no atom exists.
+  result.nativeReasoningVisibilityRequired =
+    result.nativeReasoningVisibilityAtoms.length > 0;
   result.queryClients = Array.from(clients);
   result.queryObserverPrototypes = Array.from(prototypes);
   result.scopes = Array.from(scopes);

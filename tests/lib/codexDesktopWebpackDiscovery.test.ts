@@ -428,13 +428,13 @@ describe("Codex Desktop initialized numeric Webpack discovery", () => {
     }
   });
 
-  it("requires downstream native visibility proof for every detected runtime, even when no atom is initialized", () => {
+  it("does not require native visibility proof when a runtime has no validated atom", () => {
     const result = api.candidates(namespace({}));
-    expect(result.nativeReasoningVisibilityRequired).toBe(true);
+    expect(result.nativeReasoningVisibilityRequired).toBe(false);
     expect(result.nativeReasoningVisibilityAtoms).toEqual([]);
     expect(
       api.candidates(namespace(globalThis)).nativeReasoningVisibilityRequired,
-    ).toBe(true);
+    ).toBe(false);
     expect(api.candidates({}).nativeReasoningVisibilityRequired).toBe(false);
   });
 

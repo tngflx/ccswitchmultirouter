@@ -74,7 +74,13 @@ assert.equal(
 );
 const port = Number(options.get("--port") || 9229);
 assert.ok(Number.isInteger(port) && port > 0 && port < 65536);
-const waitMs = Number(options.get("--wait-ms") || 0);
+const waitMs = Number(
+  options.has("--wait-ms")
+    ? options.get("--wait-ms")
+    : options.has("--inspect-picker")
+      ? 30_000
+      : 0,
+);
 assert.ok(Number.isInteger(waitMs) && waitMs >= 0 && waitMs <= 900_000);
 const fingerprintPattern = /^sha256-[a-f0-9]{64}$/;
 let expectedFingerprint = options.get("--runtime-fingerprint");
@@ -1898,10 +1904,8 @@ const pickerInspectionExpression = () => `(() => {
       if (own(source,'fiberLimit') === 30000) scan.fiberLimit = 30000;
       const elapsedMs = own(source,'elapsedMs');
       if (typeof elapsedMs === 'number' && Number.isFinite(elapsedMs) && elapsedMs >= 0 && elapsedMs <= 900000) scan.elapsedMs = elapsedMs;
-      if (terminalOnly) {
-        const reason = own(source,'reason');
-        if (['exact_root','fiber_snapshot','object_snapshot','object_read','mutation_generation','pending_nodes','object_limit','field_limit','fiber_limit'].includes(reason)) scan.reason = reason;
-      }
+      const reason = own(source,'reason');
+      if (['exact_root','fiber_snapshot','object_snapshot','object_read','mutation_generation','pending_nodes','value_limit','object_limit','field_limit','fiber_limit'].includes(reason)) scan.reason = reason;
       return scan;
     } catch { return undefined; }
   };
@@ -1914,9 +1918,18 @@ const pickerInspectionExpression = () => `(() => {
   const refusalReason = rawRefusalReason === null || refusalReasons.has(rawRefusalReason) ? rawRefusalReason : undefined;
   const rawOwnerScopeCount = own(reconciliation,'ownerScopeCount');
   const ownerScopeCount = Number.isSafeInteger(rawOwnerScopeCount) && rawOwnerScopeCount >= 0 && rawOwnerScopeCount <= 2048 ? rawOwnerScopeCount : undefined;
+  const rawCanonicalOwnerCounts = own(reconciliation,'canonicalOwnerCounts');
+  const canonicalOwnerCounts = rawCanonicalOwnerCounts && typeof rawCanonicalOwnerCounts === 'object' && !Array.isArray(rawCanonicalOwnerCounts) ? {} : undefined;
+  if (canonicalOwnerCounts) for (const [key, maximum] of [['appServerStatusAtomCount',17],['uniqueBrandCount',16],['hintCount',17],['pendingNodeCount',30000]]) {
+    const value = own(rawCanonicalOwnerCounts,key);
+    if (Number.isSafeInteger(value) && value >= 0 && value <= maximum) canonicalOwnerCounts[key] = value;
+  }
+  const canonicalOwnerReasons = new Set(['unavailable','atoms_unverified','pending_nodes','roots_unavailable','hints_read_failed','snapshot_changed','hints_ambiguous','hints_incomplete','hint_count_mismatch','scope_unmounted','scope_cache_unverified']);
+  const rawCanonicalOwnerRefusalReason = own(reconciliation,'canonicalOwnerRefusalReason');
+  const canonicalOwnerRefusalReason = rawCanonicalOwnerRefusalReason === null || canonicalOwnerReasons.has(rawCanonicalOwnerRefusalReason) ? rawCanonicalOwnerRefusalReason : undefined;
   const rawOwnerFailures = own(reconciliation,'ownerFailureCounts');
   const ownerFailureCounts = rawOwnerFailures && typeof rawOwnerFailures === 'object' && !Array.isArray(rawOwnerFailures) ? {} : undefined;
-  if (ownerFailureCounts) for (const key of ['scope_contract','node_unavailable','node_client_absent','node_client_accessor','node_client_uninitialized','client_mismatch','client_methods_unavailable','cache_unavailable','scope_read_failed','inventory_empty','inventory_capped','inventory_read_failed','owner_snapshot_unverified']) {
+  if (ownerFailureCounts) for (const key of ['scope_contract','node_unavailable','node_client_absent','node_client_accessor','node_client_uninitialized','client_mismatch','client_methods_unavailable','cache_unavailable','scope_read_failed','inventory_empty','inventory_capped','inventory_read_failed','owner_snapshot_unverified','canonical_owner_unavailable','canonical_owner_unverified']) {
     const value = own(rawOwnerFailures,key);
     if (value === 0 || value === 1) ownerFailureCounts[key] = value;
   }
@@ -1941,7 +1954,7 @@ const pickerInspectionExpression = () => `(() => {
       lastSettledScopeScan,
       schedulerCapabilities,
       ownershipStatus:queryRowsVerified ? 'verified_current_query_rows' : 'unverified',
-      reconciliation: {status:reconciliationStatus === 'known' || statusNames.has(reconciliationStatus) ? reconciliationStatus : 'unverified',managed:own(reconciliation,'managed') === true,patchedScopes:count(own(reconciliation,'patchedScopes')),restoredScopes:count(own(reconciliation,'restoredScopes')),refusalReason,ownerScopeCount,ownerFailureCounts},
+      reconciliation: {status:reconciliationStatus === 'known' || statusNames.has(reconciliationStatus) ? reconciliationStatus : 'unverified',managed:own(reconciliation,'managed') === true,patchedScopes:count(own(reconciliation,'patchedScopes')),restoredScopes:count(own(reconciliation,'restoredScopes')),refusalReason,ownerScopeCount,canonicalOwnerCounts,canonicalOwnerRefusalReason,ownerFailureCounts},
     },
     modelObservations: {renderedMenuVerified:false,queryRowsVerified,truncated,unavailable:!queryRowsVerified,unavailableReasons:[...new Set(unavailableReasons)].slice(0,16),rows:observedRows},
   };

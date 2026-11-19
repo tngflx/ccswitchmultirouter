@@ -41,7 +41,8 @@
       "booleanControlUnverified": "尚未验证所有开关式推理模型的原生开关控件"
     },
     "booleanUnverifiedCount": "开关式推理控件未验证：{{count}}",
-    "booleanReadyCount": "开关式推理控件已验证：{{count}}"
+    "booleanReadyCount": "开关式推理控件已验证：{{count}}",
+    "booleanNotObservedCount": "开关式推理控件尚未观察：{{count}}"
   },
   "codexSubagentGovernance": {
     "title": "行为指导与执行权限",
@@ -56,6 +57,7 @@
     "globalLabel": "所有子代理推理强度",
     "globalProfileOption": "使用配置档设置（关闭覆盖）",
     "globalLegacyOption": "已保存的旧推理档位（已保留）：{{effort}}",
+    "globalInvalidOption": "保存的推理档位无效",
     "globalHighOption": "High（高）",
     "globalMaxOption": "Max（最高）",
     "globalHint": "同时适用于 V1 和 V2，且仅覆盖支持所选强度的模型。可用覆盖仅为 Max 或 High。已保存的配置档选择和主代理保持不变；不支持的模型继续使用自身推理策略。选择“使用配置档设置”即可恢复原设置。",
@@ -1276,7 +1278,7 @@
       "unavailable": "已启用 · 不可用",
       "off": "已关闭",
       "setup": "私有网站设置",
-      "privateNetwork": "先在本机和你的平板/笔记本上配置私有 HTTPS 访问（例如 Tailscale Serve）。监听仅限回环地址；不要转发此端口，也不要暴露模型 API 或 CDP。",
+      "privateNetwork": "使用 Tailscale 建立专用连接，网站仍由您自己的电脑提供。平板或笔记本需要 Tailscale 和浏览器；Cloudflare 仅可选用于域名管理，不经过其代理传输内容。",
       "origin": "精确的 HTTPS 网站源地址",
       "security": "使用通行密钥和可撤销的浏览器会话保护访问。此功能不会批准 Codex 工具/沙箱提示，也不会绕过账户用量限制。",
       "enable": "启用所有者远程访问",
@@ -1293,7 +1295,19 @@
       "retryStatus": "重试读取状态",
       "setupRequired": "请先在下方配置私有 HTTPS 网站，再开启远程访问。",
       "retryListener": "重试启动监听",
-      "originPinned": "此部署已绑定当前 HTTPS 站点。更改地址需要单独执行显式重置并重新登记浏览器，无法在此处直接修改。"
+      "originPinned": "此部署已绑定当前 HTTPS 站点。更改地址需要单独执行显式重置并重新登记浏览器，无法在此处直接修改。",
+      "tailscaleSteps": "Tailscale 专用连接设置步骤",
+      "setupStepDevices": "离开前，在这台主机和平板或笔记本上安装并登录 Tailscale。保持主机在线；CCSwitch 和兼容的 Codex 会话也必须可用。",
+      "setupStepAccess": "限制 tailnet 规则，仅允许您授权的设备访问这台主机的 HTTPS 端口（443）。不要公开监听端口、模型 API 或调试端口；此专用方案不使用 Funnel。",
+      "setupStepServe": "在主机上配置 Tailscale Serve，将专用 HTTPS 转发到本地所有者监听服务：",
+      "setupStepOrigin": "将 Serve 提供的完整 HTTPS 源站地址（通常为 .ts.net 主机名）复制到下方，然后开启所有者访问。Tailscale 为该主机名提供 HTTPS；本地监听运行不代表远程访问已验证。",
+      "setupStepEnroll": "创建一次性注册链接，在 60 秒内用您自己的平板或笔记本打开并注册通行密钥。之后打开网站书签，选择会话，并在符合条件时使用继续；每次操作无需主机端批准。",
+      "cloudflareOptional": "可选：仅使用 Cloudflare 管理域名",
+      "cloudflareDnsOnly": ".ts.net 网站不需要配置 Cloudflare。如果使用由 Cloudflare 管理的自定义域名，请将记录设为仅 DNS（不要开启橙云代理），让 HTTPS 服务仅通过 Tailscale 私网访问，且不要为此路径添加 Cloudflare Tunnel 或 Access。",
+      "cloudflareCertificate": "指向 Tailscale 主机名的 CNAME 不会为自定义主机名提供证书。自定义域名需要独立的私网 HTTPS 代理和通过 DNS-01 验证签发的证书。请在注册设备前确定最终源站；更改已固定的源站需要显式重置并重新注册。",
+      "cloudflareNoSecrets": "CCSwitch 不需要 Cloudflare API 令牌或域名凭据。不要将其填入此表单、连接链接或日志。域名管理不会托管或镜像 Codex 网站。",
+      "openWebsite": "打开所有者网站",
+      "listenerOnly": "监听服务正在本地运行。这不代表 Tailscale、平板连接、Codex 桥接或所选会话已就绪。打开网站不会提交继续操作。"
     },
     "tabConnectionsRecovery": "连接与恢复",
     "connectionsShortcutTitle": "远程连接与崩溃恢复",
@@ -4826,6 +4840,17 @@
       "image_generation": "图像生成",
       "context_compaction": "上下文压缩",
       "unsupported": "不受支持的内容"
+    },
+    "failure": {
+      "server_overloaded": "服务器过载",
+      "usage_limit": "临时使用限制",
+      "rate_limit": "速率限制",
+      "internal_server_error": "服务器内部错误",
+      "authentication_error": "身份验证错误",
+      "context_length_exceeded": "超出上下文窗口",
+      "invalid_request_error": "请求无效",
+      "connection_error": "连接错误",
+      "unknown": "未知错误"
     },
     "operation": {
       "pending": "Continue 正在等待处理。后续仅进行只读状态检查。",

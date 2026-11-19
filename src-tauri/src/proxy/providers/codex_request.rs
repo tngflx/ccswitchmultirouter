@@ -28,7 +28,7 @@ use super::{
     CodexAdapter, ProviderAdapter,
 };
 
-pub(crate) const CODEX_REQUEST_PREPARER_VERSION: u32 = 9;
+pub(crate) const CODEX_REQUEST_PREPARER_VERSION: u32 = 10;
 const DEFAULT_THIRD_PARTY_USER_AGENT: &str = concat!("CCSwitchMulti/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +263,8 @@ impl CodexThirdPartyRequestPolicy {
         body: Value,
         options: &CodexRequestOptions,
     ) -> Result<Value, ProxyError> {
+        let reasoning =
+            crate::proxy::codex_reasoning_controls::CodexReasoningProjection::capture(&body);
         let mut body = self.apply_body_policy(body);
         if transport == CodexRequestTransport::Responses {
             body = match options.history_replay.unwrap_or(HistoryReplay::NativeOnly) {
@@ -298,6 +300,7 @@ impl CodexThirdPartyRequestPolicy {
                 &mut body,
             );
         }
+        reasoning.verify(&body)?;
         Ok(body)
     }
 

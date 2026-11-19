@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { ReactElement } from "react";
@@ -8,6 +14,7 @@ import { CodexMultiRouterWizard } from "@/components/codex/CodexMultiRouterWizar
 import { CODEX_MULTI_ROUTER_WIZARD_DISMISSED_KEY } from "@/lib/codexMultiRouterWizard";
 import { providersApi } from "@/lib/api/providers";
 import { codexSubagentV2Api } from "@/lib/api/codexSubagentV2";
+import { useCodexOauth } from "@/components/providers/forms/hooks/useCodexOauth";
 import {
   commitCodexProviderSetBatch,
   prepareCodexProviderSetBatch,
@@ -612,6 +619,90 @@ describe("CodexMultiRouterWizard", () => {
     ]) {
       expect(screen.getByRole("button", { name: pageName })).toBeVisible();
     }
+  });
+
+  it("leaves the closed draft and provider updates idle until the wizard is open", () => {
+    const source = provider();
+    const original = source.settingsConfig;
+    const readSettings = vi.fn(() => original);
+    Object.defineProperty(source, "settingsConfig", { get: readSettings });
+    const queryClient = new QueryClient();
+    const view = (open: boolean, providers: Provider[]) => (
+      <QueryClientProvider client={queryClient}>
+        <CodexMultiRouterWizard
+          open={open}
+          providers={providers}
+          onOpenChange={vi.fn()}
+          onCreateProvider={vi.fn()}
+          onOpenWorkspace={vi.fn()}
+          onEnablePlan={vi.fn()}
+        />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(view(false, [source]));
+    expect(useCodexOauth).toHaveBeenLastCalledWith(false);
+    expect(readSettings).not.toHaveBeenCalled();
+
+    rerender(view(true, [source]));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    expect(useCodexOauth).toHaveBeenLastCalledWith(true);
+    expect(readSettings).toHaveBeenCalled();
+
+    readSettings.mockClear();
+    rerender(view(false, [source]));
+    expect(readSettings).not.toHaveBeenCalled();
+    expect(useCodexOauth).toHaveBeenLastCalledWith(false);
+    rerender(view(true, [source]));
+    expect(
+      screen.getByRole("heading", { name: "Protocol deep probe" }),
+    ).toBeVisible();
+  });
+
+  it("starts model reasoning resolution only on its page and stops scheduling it after exit", async () => {
+    const source = provider({
+      settingsConfig: {
+        base_url: "https://relay.example/v1",
+        auth: { OPENAI_API_KEY: "test-only" },
+        modelCatalog: {
+          models: Array.from({ length: 20 }, (_, index) => ({
+            model: `relay-${index}`,
+          })),
+        },
+      },
+    });
+    const finishLookups: Array<() => void> = [];
+    const resolveReasoning = vi.mocked(
+      codexSubagentV2Api.resolveModelReasoningCapability,
+    );
+    resolveReasoning.mockImplementation(
+      (_settings, _id, model) =>
+        new Promise((resolve) => {
+          finishLookups.push(() => resolve(resolvedReasoning(model, ["high"])));
+        }),
+    );
+    renderWithQueryClient(
+      <CodexMultiRouterWizard
+        open
+        providers={[source]}
+        onOpenChange={vi.fn()}
+        onCreateProvider={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+        onEnablePlan={vi.fn()}
+      />,
+    );
+    expect(resolveReasoning).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Reasoning settings" }));
+    expect(finishLookups.length).toBeGreaterThan(0);
+    expect(finishLookups.length).toBeLessThan(20);
+    const startedLookups = finishLookups.length;
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Protocol deep probe" }),
+    );
+    await act(async () => finishLookups.forEach((finish) => finish()));
+    expect(resolveReasoning).toHaveBeenCalledTimes(startedLookups);
   });
 
   it("shows canonical resolved efforts, including product Ultra, instead of raw provider tiers", async () => {

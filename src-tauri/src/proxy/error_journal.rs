@@ -429,13 +429,29 @@ impl Observer {
     }
 
     fn finish(&mut self, transport_error: Option<&str>) -> Vec<Value> {
+        self.finish_with_transport_error(transport_error, true)
+    }
+
+    /// Finish inspection while optionally suppressing the transport diagnostic.
+    ///
+    /// Encoded SSE is inspected by a nested observer after the outer observer
+    /// has already recorded the wire-level transport result. The nested pass
+    /// must retain EOF/terminal semantics, but must not emit the same transport
+    /// failure a second time.
+    fn finish_with_transport_error(
+        &mut self,
+        transport_error: Option<&str>,
+        emit_transport_error: bool,
+    ) -> Vec<Value> {
         self.finished = true;
         let mut events = Vec::new();
-        if let Some(error) = transport_error {
-            events.push(self.evidence(
-                "stream_transport_error",
-                json!({"error":redact(error,4000)}),
-            ));
+        if emit_transport_error {
+            if let Some(error) = transport_error {
+                events.push(self.evidence(
+                    "stream_transport_error",
+                    json!({"error":redact(error,4000)}),
+                ));
+            }
         }
         if self.sse && (200..300).contains(&self.status) && self.encoding.is_none() {
             if !self.terminal && transport_error.is_none() {
@@ -477,7 +493,7 @@ impl Observer {
                 let mut inspection = Self::new(self.context.clone(), self.status, &headers);
                 inspection.headers = self.headers.clone();
                 events.extend(inspection.feed(decoded));
-                events.extend(inspection.finish(transport_error));
+                events.extend(inspection.finish_with_transport_error(transport_error, false));
             } else {
                 events.push(self.evidence(
                     "encoded_sse_inspection_unavailable",
@@ -604,6 +620,40 @@ mod tests {
             assert!(selected_error(&payload).is_some(), "{payload}");
         }
         assert!(selected_error(&json!({"candidates":[{"finishReason":"STOP"}]})).is_none());
+    }
+
+    #[test]
+    fn journal_records_one_transport_fault_without_exposing_success_bodies() {
+        let sse = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"private_success_text\"}\n\n";
+        for (content_type, encoding, body) in [
+            ("text/event-stream", None, sse.to_vec()),
+            ("text/event-stream", Some("gzip"), {
+                let mut encoded =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoded.write_all(sse).unwrap();
+                encoded.finish().unwrap()
+            }),
+            (
+                "application/json",
+                None,
+                br#"{"message":"private_success_text"}"#.to_vec(),
+            ),
+        ] {
+            let mut observer = observer(200, content_type);
+            observer.encoding = encoding.map(str::to_string);
+            let mut events = observer.feed(&body);
+            events.extend(observer.finish(Some("fixture transport interrupted")));
+            assert_eq!(
+                events.len(),
+                1,
+                "one wire transport fault must have one diagnostic: {content_type}, {encoding:?}"
+            );
+            assert_eq!(events[0]["kind"], "stream_transport_error");
+            assert!(events[0]
+                .to_string()
+                .contains("fixture transport interrupted"));
+            assert!(!events[0].to_string().contains("private_success_text"));
+        }
     }
 
     #[test]

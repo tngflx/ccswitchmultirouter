@@ -651,6 +651,23 @@ fn apply_catalog_ultra_setting(
         log::warn!("Codex Ultra for model {model} is enabled without providerEffort");
         return capability;
     };
+    // Migrate legacy maintained targets while retaining explicit choices.
+    let explicit_capability_declaration = capability
+        .source
+        .as_deref()
+        .is_some_and(|source| matches!(source, "user" | "user_confirmed_detection"))
+        || (capability.source.as_deref() == Some("provider_config")
+            && capability.confidence == Some(CapabilityConfidence::Authoritative));
+    if provider_effort == "xhigh"
+        && setting.get("providerEffortSource").and_then(Value::as_str) != Some("user")
+        && !explicit_capability_declaration
+        && capability
+            .codex_ultra_orchestration
+            .as_ref()
+            .is_some_and(|ultra| ultra.enabled && ultra.provider_effort.as_deref() == Some("max"))
+    {
+        return capability;
+    }
     if !capability
         .supported_efforts
         .iter()
@@ -2184,9 +2201,10 @@ mod tests {
         );
         assert!(!capability.upstream.effort_map.contains_key("ultra"));
         assert!(capability.upstream.effort_map.contains_key("max"));
-        assert!(capability.codex_ultra_orchestration.as_ref().is_some_and(
-            |ultra| ultra.enabled && ultra.provider_effort.as_deref() == Some("xhigh")
-        ));
+        assert!(capability
+            .codex_ultra_orchestration
+            .as_ref()
+            .is_some_and(|ultra| ultra.enabled && ultra.provider_effort.as_deref() == Some("max")));
 
         let projected =
             crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(Some(
@@ -2204,10 +2222,7 @@ mod tests {
             ]
         );
         assert!(projected.codex_selectable_efforts.contains(&Effort::Ultra));
-        assert_eq!(
-            projected.effort_map.get(&Effort::Ultra),
-            Some(&Effort::XHigh)
-        );
+        assert_eq!(projected.effort_map.get(&Effort::Ultra), Some(&Effort::Max));
         assert!(projected.provider_accepted_efforts.contains(&Effort::Max));
 
         // The same model suffix on an aggregator must remain unknown rather
@@ -2222,6 +2237,102 @@ mod tests {
         );
         assert_eq!(openrouter.source, CapabilitySource::Unknown);
         assert!(openrouter.capability.is_none());
+    }
+
+    #[test]
+    fn sublyx_catalog_ultra_overlay_migrates_stale_xhigh_when_native_max_is_available() {
+        for (wire_model, enabled, saved_target, effort_source, expected) in [
+            ("gpt-6.2-sol", true, "xhigh", None, Some("max")),
+            ("gpt-6.2-sol", true, "xhigh", Some("user"), Some("xhigh")),
+            ("gpt-6.2-sol", true, "high", None, Some("high")),
+            ("gpt-6.2-sol", false, "xhigh", None, None),
+            ("gpt-5.4", true, "xhigh", None, Some("xhigh")),
+        ] {
+            let mut ultra = json!({"enabled": enabled, "providerEffort": saved_target});
+            if let Some(effort_source) = effort_source {
+                ultra["providerEffortSource"] = json!(effort_source);
+            }
+            let settings = json!({
+                "baseUrl": "https://api.sublyx.org/v1",
+                "modelCatalog": {"models": [{
+                    "model": "public-model", "upstreamModel": wire_model,
+                    "codexUltra": ultra,
+                }]}
+            });
+            let resolved = resolve_codex_model_capability_core(
+                &settings,
+                Some("sublyx"),
+                "public-model",
+                None,
+                None,
+                &[],
+            );
+            let capability = resolved.capability.unwrap();
+            assert_eq!(
+                capability
+                    .codex_ultra_orchestration
+                    .as_ref()
+                    .and_then(|ultra| ultra.provider_effort.as_deref()),
+                expected,
+                "{wire_model}: {enabled} {saved_target} {effort_source:?}"
+            );
+            if wire_model == "gpt-6.2-sol" {
+                assert_eq!(capability.upstream.effort_map["max"], "max");
+            }
+        }
+    }
+
+    #[test]
+    fn sublyx_catalog_overlay_repairs_legacy_builtin_reasoning_before_stale_xhigh() {
+        let settings = json!({
+            "baseUrl": "https://api.sublyx.org/v1",
+            "modelCatalog": {"models": [{
+                "model": "public-model",
+                "upstreamModel": "gpt-6.2-sol",
+                "reasoning": {
+                    "schemaVersion": 2,
+                    "supportStatus": "confirmed_supported",
+                    "controlKind": "graded",
+                    "supportedEfforts": ["low", "medium", "high", "xhigh"],
+                    "defaultEffort": "xhigh",
+                    "disableAllowed": false,
+                    "upstream": {
+                        "format": "reasoning_object",
+                        "parameter": "reasoning.effort",
+                        "effortMap": {
+                            "low": "low",
+                            "medium": "medium",
+                            "high": "high",
+                            "xhigh": "xhigh"
+                        }
+                    },
+                    "source": "builtin",
+                    "codexUltraOrchestration": {
+                        "enabled": true,
+                        "providerEffort": "xhigh"
+                    }
+                },
+                "codexUltra": {"enabled": true, "providerEffort": "xhigh"}
+            }]}
+        });
+        let resolved = resolve_codex_model_capability_core(
+            &settings,
+            Some("sublyx"),
+            "public-model",
+            None,
+            None,
+            &[],
+        );
+        let capability = resolved
+            .capability
+            .expect("legacy capability should resolve");
+        assert_eq!(
+            capability
+                .codex_ultra_orchestration
+                .as_ref()
+                .and_then(|ultra| ultra.provider_effort.as_deref()),
+            Some("max")
+        );
     }
 
     #[test]

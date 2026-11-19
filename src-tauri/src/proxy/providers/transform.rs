@@ -126,6 +126,7 @@ pub fn resolve_reasoning_effort(body: &Value) -> Option<&'static str> {
                         | "gpt-6-astra"
                         | "gpt-6-sol"
                         | "gpt-6-luna"
+                        | "gpt-6.2-sol"
                 ) =>
             {
                 Some("max")
@@ -1795,7 +1796,14 @@ mod tests {
 
     #[test]
     fn upstream_sync_preserves_max_effort_for_gpt6_sol_and_luna() {
-        for model in ["gpt-6-sol", "gpt-6-luna", "GPT-6-SOL", "GPT-6-LUNA"] {
+        for model in [
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.2-sol",
+            "GPT-6-SOL",
+            "GPT-6-LUNA",
+            "GPT-6.2-SOL",
+        ] {
             let body = json!({"model": model, "output_config": {"effort": "max"}});
             assert_eq!(resolve_reasoning_effort(&body), Some("max"), "{model}");
             let chat = anthropic_to_openai_with_reasoning_content(

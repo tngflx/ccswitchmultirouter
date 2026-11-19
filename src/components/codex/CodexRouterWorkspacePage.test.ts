@@ -9,6 +9,7 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import React from "react";
+import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { providersApi } from "@/lib/api";
 import {
@@ -74,6 +75,14 @@ const requestLogsFixture = vi.hoisted(() => ({
   },
 }));
 
+vi.mock("sonner", () => ({
+  toast: {
+    success: vi.fn(),
+    error: vi.fn(),
+    warning: vi.fn(),
+  },
+}));
+
 vi.mock("@/lib/api/proxy", () => ({
   proxyApi: {
     getGlobalProxyConfig: vi.fn().mockResolvedValue({
@@ -81,6 +90,7 @@ vi.mock("@/lib/api/proxy", () => ({
       listenPort: 15721,
     }),
     diagnoseCodexMultiRouter: vi.fn(),
+    getCodexGuardianStatus: vi.fn(),
     unlockCodexModelPicker: vi.fn(),
     getRequestHealthDiagnostics: vi.fn(),
   },
@@ -130,6 +140,7 @@ vi.mock("@/lib/api", () => ({
   providersApi: {
     add: vi.fn(),
     update: vi.fn(),
+    updateCodexRouterIfUnchanged: vi.fn(),
     updateCodexSubagentPolicy: vi.fn(),
     getAll: vi.fn(),
     inspectCodexMultiRouterProjection: vi.fn(),
@@ -356,6 +367,7 @@ function renderWorkspace(ui: React.ReactElement) {
   );
   return {
     ...result,
+    queryClient,
     rerenderWorkspace: (nextUi: React.ReactElement) =>
       result.rerender(
         React.createElement(
@@ -366,6 +378,149 @@ function renderWorkspace(ui: React.ReactElement) {
       ),
   };
 }
+
+describe("inactive workspace views", () => {
+  it("opens Model sources without projecting model rows for other tabs", async () => {
+    const user = userEvent.setup();
+    const readDescription = vi.fn(() => "Projected model description");
+    const source: Provider = {
+      id: "model-source",
+      name: "Test model source",
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            {
+              model: "test-model",
+              get description() {
+                return readDescription();
+              },
+            },
+          ],
+        },
+      },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([], []),
+      source,
+    );
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [source, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "sources",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    expect(screen.getByText("Test model source")).toBeInTheDocument();
+    expect(readDescription).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("tab", { name: "Model order" }));
+    expect(readDescription).toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", {
+        name: "Make test-model the favorite model",
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("only refreshes guardian diagnostics while the Link view is open", async () => {
+    const user = userEvent.setup();
+    const plan = createDraftRoutingPlan([], []);
+    const { queryClient } = renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "status",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    await waitFor(() =>
+      expect(proxyApi.getCodexGuardianStatus).toHaveBeenCalledTimes(1),
+    );
+    await user.click(screen.getByRole("button", { name: /^Routing/ }));
+    await act(() =>
+      queryClient.invalidateQueries({ queryKey: ["codexGuardianStatus"] }),
+    );
+    expect(proxyApi.getCodexGuardianStatus).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: /^Link/ }));
+    await waitFor(() =>
+      expect(proxyApi.getCodexGuardianStatus).toHaveBeenCalledTimes(2),
+    );
+  });
+
+  it("keeps Routing badges without processing unchanged logs on a proxy status update", async () => {
+    const user = userEvent.setup();
+    const readRequestedModel = vi.fn(() => "test-model");
+    const source: Provider = {
+      id: "model-source",
+      name: "Test model source",
+      settingsConfig: { modelCatalog: { models: [{ model: "test-model" }] } },
+    };
+    const plan = withEnabledProviderRoute(
+      createDraftRoutingPlan([], []),
+      source,
+    );
+    const providers = [source, plan];
+    requestLogsFixture.value = {
+      data: {
+        data: [
+          {
+            ...createCodexProxyLog({ providerId: source.id }),
+            get requestModel() {
+              return readRequestedModel();
+            },
+          },
+        ],
+        total: 1,
+        page: 0,
+        pageSize: 50,
+      },
+      isLoading: false,
+    };
+    const props = {
+      providers,
+      isProxyRunning: true,
+      isCodexTakeoverActive: true,
+      activeProviderId: plan.id,
+      initialProviderId: plan.id,
+      initialTab: "status" as const,
+      onEditProvider: vi.fn(),
+      onDeletePlan: vi.fn(),
+      onCreateProvider: vi.fn(),
+    };
+    const { rerenderWorkspace } = renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, props),
+    );
+
+    expect(readRequestedModel).toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: /^Routing/ }));
+    readRequestedModel.mockClear();
+    rerenderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        ...props,
+        isProxyRunning: false,
+      }),
+    );
+
+    expect(
+      screen.getByRole("button", { name: /^Protocol.*1 models/ }),
+    ).toBeInTheDocument();
+    expect(readRequestedModel).not.toHaveBeenCalled();
+  });
+});
 
 /// 构造状态页所需的最小代理日志；测试只关心 Codex 最近一次真实转发是否成功。
 function createCodexProxyLog(overrides: Partial<RequestLog> = {}): RequestLog {
@@ -397,6 +552,20 @@ function createCodexProxyLog(overrides: Partial<RequestLog> = {}): RequestLog {
 
 beforeEach(() => {
   requestLogsFixture.value = { data: [], isLoading: false };
+  vi.mocked(proxyApi.getCodexGuardianStatus).mockReset().mockResolvedValue({
+    active: false,
+    codexRunning: false,
+    cdpAvailable: false,
+    injectedTargetCount: 0,
+    injected: false,
+    lastEvent: "",
+    message: "",
+  });
+  vi.mocked(toast.success)
+    .mockReset()
+    .mockImplementation((_message, options) => options?.id ?? "order-save");
+  vi.mocked(toast.error).mockReset();
+  vi.mocked(toast.warning).mockReset();
   vi.mocked(usageApi.getModelStats).mockReset().mockResolvedValue([]);
   vi.mocked(usageApi.syncSessionUsage).mockReset().mockResolvedValue({
     imported: 0,
@@ -441,6 +610,7 @@ beforeEach(() => {
   } satisfies RequestHealthSnapshot);
   vi.mocked(providersApi.add).mockResolvedValue(true);
   vi.mocked(providersApi.update).mockResolvedValue(true);
+  vi.mocked(providersApi.updateCodexRouterIfUnchanged).mockResolvedValue(true);
   vi.mocked(providersApi.getAll).mockResolvedValue({});
   vi.mocked(providersApi.inspectCodexMultiRouterProjection).mockResolvedValue({
     schemaVersion: 1,
@@ -634,7 +804,9 @@ describe("Model order real drag sensors", () => {
       "isolates an old plan save %s from the current plan and its draft",
       async (outcome) => {
         const saving = createDeferred<boolean>();
-        vi.mocked(providersApi.update).mockReturnValueOnce(saving.promise);
+        vi.mocked(
+          providersApi.updateCodexRouterIfUnchanged,
+        ).mockReturnValueOnce(saving.promise);
         const { source, plan, elementFor, rendered } = renderModelOrder();
         await userEvent.selectOptions(
           screen.getByRole("combobox", { name: "Model display" }),
@@ -643,7 +815,11 @@ describe("Model order real drag sensors", () => {
         await userEvent.click(
           screen.getByRole("button", { name: "Save order" }),
         );
-        await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+        await waitFor(() =>
+          expect(
+            providersApi.updateCodexRouterIfUnchanged,
+          ).toHaveBeenCalledOnce(),
+        );
         const nextPlan: Provider = {
           ...plan,
           id: "next-order-plan",
@@ -688,6 +864,9 @@ describe("Model order real drag sensors", () => {
         expect(
           providersApi.inspectCodexMultiRouterProjection,
         ).not.toHaveBeenCalled();
+        expect(toast.success).not.toHaveBeenCalled();
+        expect(toast.error).not.toHaveBeenCalled();
+        expect(toast.warning).not.toHaveBeenCalled();
       },
     );
 
@@ -707,6 +886,7 @@ describe("Model order real drag sensors", () => {
         "model",
       );
       await userEvent.click(screen.getByRole("button", { name: "Save order" }));
+      expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
       expect(providersApi.update).not.toHaveBeenCalled();
       const replacement: Provider = {
         ...plan,
@@ -731,6 +911,7 @@ describe("Model order real drag sensors", () => {
         );
         await reasoning.promise;
       });
+      expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
       expect(providersApi.update).not.toHaveBeenCalled();
       expect(
         screen.getByRole("combobox", { name: "Model display" }),
@@ -792,6 +973,9 @@ describe("Model order real drag sensors", () => {
           undefined,
           source,
         );
+        expect(
+          providersApi.updateCodexRouterIfUnchanged,
+        ).not.toHaveBeenCalled();
       },
     );
 
@@ -836,18 +1020,101 @@ describe("Model order real drag sensors", () => {
       );
       await userEvent.click(screen.getByRole("button", { name: "Save order" }));
       await screen.findByText(/Saved the display order for 3 models/);
-      expect(providersApi.update).toHaveBeenCalledWith(
+      expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledWith(
         expect.objectContaining({ id: plan.id }),
-        "codex",
-        undefined,
         plan,
       );
+      expect(providersApi.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps completed save feedback after the same router reloads from storage", async () => {
+      const { source, elementFor, rendered } = renderModelOrder();
+      const projection = createDeferred<CodexRoutingProjectionStatus>();
+      vi.mocked(
+        providersApi.inspectCodexMultiRouterProjection,
+      ).mockReturnValueOnce(projection.promise);
+      await userEvent.click(
+        screen.getByRole("button", { name: "Make order-c the favorite model" }),
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Save order" }));
+      const savedMessage =
+        "Saved the display order for 3 models to this router.";
+      await screen.findByText(savedMessage);
+      expect(
+        vi.mocked(toast.success).mock.calls.map(([message]) => message),
+      ).toEqual([savedMessage]);
+      expect(
+        providersApi.inspectCodexMultiRouterProjection,
+      ).toHaveBeenCalledOnce();
+
+      const [[saved]] = vi.mocked(providersApi.updateCodexRouterIfUnchanged)
+        .mock.calls;
+      rendered.rerenderWorkspace(elementFor([source, saved]));
+      await act(async () => {
+        projection.reject(new Error("stale_projection_check"));
+        await projection.promise.catch(() => undefined);
+      });
+
+      expect(modelOrder()).toEqual(["order-c", "order-a", "order-b"]);
+      expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
+      expect(screen.getByText(savedMessage)).toBeInTheDocument();
+      expect(toast.success).toHaveBeenCalledOnce();
+      expect(toast.warning).not.toHaveBeenCalled();
+    });
+
+    it("uses a newer saved router for ordering after an optimistic settings edit", async () => {
+      const { source, plan, elementFor, rendered } = renderModelOrder();
+      const user = userEvent.setup();
+      await user.click(screen.getByRole("tab", { name: "Route rules" }));
+      await user.click(screen.getByRole("button", { name: "Rename" }));
+      const name = screen.getByPlaceholderText(
+        "For example: Codex MultiRouter",
+      );
+      await user.clear(name);
+      await user.type(name, "Renamed order plan");
+      await user.click(screen.getByRole("button", { name: "Save settings" }));
+      await screen.findByText(/Multi-route settings saved/);
+
+      const [[submitted]] = vi.mocked(providersApi.update).mock.calls;
+      expect(submitted.name).toBe("Renamed order plan");
+      const persisted: Provider = {
+        ...submitted,
+        settingsConfig: {
+          ...submitted.settingsConfig,
+          config: 'model = "order-c"\n',
+          codexRouting: {
+            ...submitted.settingsConfig.codexRouting,
+            modelOrder: ["order-c", "order-b", "order-a"],
+          },
+        },
+      };
+      expect(persisted.id).toBe(plan.id);
+      rendered.rerenderWorkspace(elementFor([source, persisted]));
+
+      await user.click(screen.getByRole("tab", { name: "Model order" }));
+      expect(modelOrder()).toEqual(["order-c", "order-b", "order-a"]);
+      await user.click(
+        screen.getByRole("button", { name: "Make order-b the favorite model" }),
+      );
+      await user.click(screen.getByRole("button", { name: "Save order" }));
+      await screen.findByText(/Saved the display order for 3 models/);
+      expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledWith(
+        expect.objectContaining({
+          settingsConfig: expect.objectContaining({
+            codexRouting: expect.objectContaining({
+              modelOrder: ["order-b", "order-c", "order-a"],
+            }),
+          }),
+        }),
+        persisted,
+      );
+      expect(providersApi.update).toHaveBeenCalledOnce();
     });
 
     it("does not finish a newer plan mutation when the old save completes", async () => {
       const first = createDeferred<boolean>();
       const second = createDeferred<boolean>();
-      vi.mocked(providersApi.update)
+      vi.mocked(providersApi.updateCodexRouterIfUnchanged)
         .mockReturnValueOnce(first.promise)
         .mockReturnValueOnce(second.promise);
       const { source, plan, elementFor, rendered } = renderModelOrder();
@@ -856,7 +1123,11 @@ describe("Model order real drag sensors", () => {
         "model",
       );
       await userEvent.click(screen.getByRole("button", { name: "Save order" }));
-      await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
+      await waitFor(() =>
+        expect(
+          providersApi.updateCodexRouterIfUnchanged,
+        ).toHaveBeenCalledOnce(),
+      );
       const nextPlan = {
         ...plan,
         id: "next-order-plan",
@@ -873,7 +1144,11 @@ describe("Model order real drag sensors", () => {
         "model-provider",
       );
       await userEvent.click(screen.getByRole("button", { name: "Save order" }));
-      await waitFor(() => expect(providersApi.update).toHaveBeenCalledTimes(2));
+      await waitFor(() =>
+        expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledTimes(
+          2,
+        ),
+      );
       await act(async () => {
         first.resolve(true);
         await first.promise;
@@ -957,6 +1232,7 @@ describe("Model order real drag sensors", () => {
     const { source, plan, snapshot, elementFor, rendered } = renderModelOrder();
     const handle = await pointerMoveFirstToSecond();
     expect(modelOrder()).toEqual(["order-a", "order-b", "order-c"]);
+    expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
     expect(providersApi.update).not.toHaveBeenCalled();
 
     fireEvent.pointerUp(document, { pointerId: 1 });
@@ -964,6 +1240,7 @@ describe("Model order real drag sensors", () => {
       expect(handle).not.toHaveAttribute("aria-pressed");
       expect(modelOrder()).toEqual(["order-b", "order-a", "order-c"]);
     });
+    expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
     expect(providersApi.update).not.toHaveBeenCalled();
     // PointerSensor briefly suppresses clicks after release to avoid accidental
     // row actions. A normal later Save click must still use the owning IPC.
@@ -971,8 +1248,10 @@ describe("Model order real drag sensors", () => {
       .setup({ delay: 55 })
       .click(screen.getByRole("button", { name: "Save order" }));
     await waitFor(() => {
-      expect(providersApi.update).toHaveBeenCalledTimes(1);
-      expect(providersApi.update).toHaveBeenCalledWith(
+      expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledTimes(
+        1,
+      );
+      expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledWith(
         expect.objectContaining({
           id: plan.id,
           settingsConfig: expect.objectContaining({
@@ -983,12 +1262,11 @@ describe("Model order real drag sensors", () => {
             },
           }),
         }),
-        "codex",
-        undefined,
         plan,
       );
     });
-    const expected = vi.mocked(providersApi.update).mock.calls[0][0];
+    const expected = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(expected.settingsConfig.config).toMatch(/^model = "order-b"/m);
     expect(expected.settingsConfig.modelCatalog).toBeUndefined();
     expect(JSON.stringify({ source, plan })).toBe(snapshot);
@@ -1006,7 +1284,7 @@ describe("Model order real drag sensors", () => {
       expect(modelOrder()).toEqual(["order-b", "order-a", "order-c"]),
     );
     expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
-    expect(providersApi.update).toHaveBeenCalledTimes(1);
+    expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledTimes(1);
   });
 
   it("reorders through the real keyboard sensor without saving until requested", async () => {
@@ -1026,6 +1304,7 @@ describe("Model order real drag sensors", () => {
     await waitFor(() =>
       expect(modelOrder()).toEqual(["order-b", "order-a", "order-c"]),
     );
+    expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
     expect(providersApi.update).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Save order" })).toBeEnabled();
   });
@@ -1087,8 +1366,11 @@ describe("Model order real drag sensors", () => {
     );
     expect(modelOrder()).toEqual(["a-one", "a-two", "b-two", "b-one"]);
     await userEvent.click(screen.getByRole("button", { name: "Save order" }));
-    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    await waitFor(() =>
+      expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledOnce(),
+    );
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.settingsConfig.codexRouting.modelOrder).toEqual([
       "a-one",
       "a-two",
@@ -1134,8 +1416,11 @@ describe("Model order real drag sensors", () => {
     );
     await user.click(screen.getByRole("button", { name: "Save order" }));
 
-    await waitFor(() => expect(providersApi.update).toHaveBeenCalledOnce());
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    await waitFor(() =>
+      expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledOnce(),
+    );
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.id).toBe(plan.id);
     expect(saved.settingsConfig.codexRouting.routes[0].modelSelection).toEqual({
       mode: "include",
@@ -1180,6 +1465,7 @@ describe("Model order real drag sensors", () => {
         expect(handle).not.toHaveAttribute("aria-pressed");
         expect(modelOrder()).toEqual(["order-a", "order-b", "order-c"]);
       });
+      expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
       expect(providersApi.update).not.toHaveBeenCalled();
       expect(JSON.stringify({ source, plan })).toBe(snapshot);
       expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
@@ -1217,6 +1503,7 @@ describe("Model order real drag sensors", () => {
       }
       await waitFor(() => expect(handle).not.toHaveAttribute("aria-pressed"));
       expect(modelOrder()).toEqual(["order-a", "order-b", "order-c"]);
+      expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
       expect(providersApi.update).not.toHaveBeenCalled();
       expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
     },
@@ -1224,7 +1511,7 @@ describe("Model order real drag sensors", () => {
 
   it("retains a pointer-reordered draft after Save fails and retries the same order", async () => {
     const { source, plan, snapshot } = renderModelOrder();
-    vi.mocked(providersApi.update).mockRejectedValueOnce(
+    vi.mocked(providersApi.updateCodexRouterIfUnchanged).mockRejectedValueOnce(
       new Error("test_source_save_rejected"),
     );
     await pointerMoveFirstToSecond();
@@ -1234,22 +1521,28 @@ describe("Model order real drag sensors", () => {
     );
     const user = userEvent.setup({ delay: 55 });
     await user.click(screen.getByRole("button", { name: "Save order" }));
+    const failureMessage =
+      "Failed to save model order:Operation failed. See the logs for details (error code: test_source_save_rejected).";
+    expect(await screen.findByText(failureMessage)).toBeInTheDocument();
     expect(
-      await screen.findByText(
-        "Failed to save model order:Operation failed. See the logs for details (error code: test_source_save_rejected).",
-      ),
-    ).toBeInTheDocument();
+      vi.mocked(toast.error).mock.calls.map(([message]) => message),
+    ).toEqual([failureMessage]);
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(toast.warning).not.toHaveBeenCalled();
     expect(
       screen.queryByText(/Saved the display order/),
     ).not.toBeInTheDocument();
     expect(modelOrder()).toEqual(["order-b", "order-a", "order-c"]);
     expect(screen.getByRole("button", { name: "Save order" })).toBeEnabled();
-    expect(providersApi.update).toHaveBeenCalledTimes(1);
-    const failedAttempt = vi.mocked(providersApi.update).mock.calls[0];
+    expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledTimes(1);
+    const failedAttempt = vi.mocked(providersApi.updateCodexRouterIfUnchanged)
+      .mock.calls[0];
     await user.click(screen.getByRole("button", { name: "Save order" }));
     await screen.findByText(/Saved the display order for 3 models/);
-    expect(providersApi.update).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(providersApi.update).mock.calls[1]).toEqual(failedAttempt);
+    expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledTimes(2);
+    expect(
+      vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock.calls[1],
+    ).toEqual(failedAttempt);
     expect(JSON.stringify({ source, plan })).toBe(snapshot);
     expect(
       screen.queryByText(/Failed to save model order/),
@@ -1275,6 +1568,7 @@ describe("Model order real drag sensors", () => {
     await waitFor(() =>
       expect(modelOrder()).toEqual(["order-c", "order-a", "order-b"]),
     );
+    expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
     expect(providersApi.update).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Save order" })).toBeEnabled();
   });
@@ -1345,6 +1639,7 @@ describe("Model order real drag sensors", () => {
           .getAllByRole("button", { name: /^Drag / })
           .map((button) => button.getAttribute("aria-label")),
       ).toEqual(["Drag order-h", "Drag order-j"]);
+      expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
       expect(providersApi.update).not.toHaveBeenCalled();
     },
   );
@@ -1390,8 +1685,38 @@ describe("Model order real drag sensors", () => {
       "order-j",
       ..."abcdefghi".split("").map((suffix) => `order-${suffix}`),
     ]);
+    expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
     expect(providersApi.update).not.toHaveBeenCalled();
     expect(JSON.stringify({ source, plan })).toBe(snapshot);
+  });
+
+  it("commits a typed rank before Save order runs", async () => {
+    const { plan } = renderModelOrder({ models: tenModels() });
+    const user = userEvent.setup();
+    const save = screen.getByRole("button", { name: "Save order" });
+    const rank = screen.getByRole("spinbutton", { name: "Rank for order-j" });
+    expect(save).toBeDisabled();
+    await user.clear(rank);
+    await user.type(rank, "3");
+    expect(rank).toHaveFocus();
+    expect(save).toBeEnabled();
+    expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
+    expect(providersApi.update).not.toHaveBeenCalled();
+    await user.click(save);
+    await screen.findByText(/Saved the display order for 10 models/);
+    expect(providersApi.update).not.toHaveBeenCalled();
+    expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledOnce();
+    const [[saved, expected]] = vi.mocked(
+      providersApi.updateCodexRouterIfUnchanged,
+    ).mock.calls;
+    expect(saved.id).toBe(plan.id);
+    expect(expected).toEqual(plan);
+    expect(saved.settingsConfig.codexRouting.modelOrder).toEqual([
+      "order-a",
+      "order-b",
+      "order-j",
+      ..."cdefghi".split("").map((suffix) => `order-${suffix}`),
+    ]);
   });
 
   it("switches an alphabetical sort to custom when a model is moved manually", async () => {
@@ -1436,7 +1761,8 @@ describe("Model order real drag sensors", () => {
     );
     await user.click(screen.getByRole("button", { name: "Save order" }));
     await screen.findByText(/Saved the display order for 3 models/);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.id).toBe(plan.id);
     expect(saved.settingsConfig.config).toBe(plan.settingsConfig.config);
     expect(saved.settingsConfig.codexRouting).toEqual({
@@ -1445,7 +1771,7 @@ describe("Model order real drag sensors", () => {
     });
     expect(saved.settingsConfig.modelCatalog).toBeUndefined();
     expect(JSON.stringify({ source, plan })).toBe(snapshot);
-    expect(providersApi.update).toHaveBeenCalledTimes(1);
+    expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledTimes(1);
   });
 
   const reasoning = (
@@ -1520,10 +1846,12 @@ describe("Model order real drag sensors", () => {
       .split("")
       .map((suffix) => `order-${suffix}`);
     expect(modelOrder()).toEqual(expectedOrder);
+    expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
     expect(providersApi.update).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "Save order" }));
     await screen.findByText(/Saved the display order for 10 models/);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.settingsConfig.codexRouting.modelOrder).toEqual(expectedOrder);
     expect(JSON.stringify({ source, plan })).toBe(snapshot);
     rendered.unmount();
@@ -1559,6 +1887,7 @@ describe("Model order real drag sensors", () => {
     expect(modelOrder()[0]).toBe("order-a");
     expect(usageApi.syncSessionUsage).toHaveBeenCalledTimes(2);
     expect(usageApi.getModelStats).toHaveBeenCalledTimes(4);
+    expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
     expect(providersApi.update).not.toHaveBeenCalled();
   });
 
@@ -1574,6 +1903,7 @@ describe("Model order real drag sensors", () => {
       /Could not read usage history\. Model order was not changed:/,
     );
     expect(modelOrder()).toEqual(["order-a", "order-b", "order-c"]);
+    expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
     expect(providersApi.update).not.toHaveBeenCalled();
     expect(
       screen.getByRole("button", { name: "Apply recommendations" }),
@@ -1597,6 +1927,7 @@ describe("Model order real drag sensors", () => {
     await screen.findByText(/Some usage could not be refreshed/);
     expect(modelOrder()[0]).toBe("order-c");
     expect(screen.getByRole("button", { name: "Save order" })).toBeEnabled();
+    expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
     expect(providersApi.update).not.toHaveBeenCalled();
   });
 
@@ -1619,6 +1950,7 @@ describe("Model order real drag sensors", () => {
     expect(
       screen.queryByText(/Recommendations applied from usage/),
     ).not.toBeInTheDocument();
+    expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
     expect(providersApi.update).not.toHaveBeenCalled();
   });
 
@@ -1639,7 +1971,8 @@ describe("Model order real drag sensors", () => {
       screen.getByRole("button", { name: "Restore default" }),
     );
     await screen.findByText(/Restored newest-first model order/);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     const expected = [
       "gpt-6.1-sol-sublyx",
       "gpt-6-astra-sublyx",
@@ -1699,7 +2032,8 @@ describe("Model order real drag sensors", () => {
       screen.getByRole("button", { name: "Restore default" }),
     );
     await screen.findByText(/Restored newest-first model order/);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.settingsConfig.codexRouting.defaultReasoningEffort).toBe(
       "xhigh",
     );
@@ -1756,7 +2090,8 @@ describe("Model order real drag sensors", () => {
       screen.getByRole("button", { name: "Restore default" }),
     );
     await screen.findByText(/Restored newest-first model order/);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.settingsConfig.codexRouting).toMatchObject({
       modelOrder: ["gpt-6.1-sol", "gpt-6.1-sol-sublyx", "gpt-5.6-luna"],
       defaultReasoningEffort: "xhigh",
@@ -1804,6 +2139,7 @@ describe("Model order real drag sensors", () => {
         .getAllByRole("button", { name: /^Drag / })
         .map((button) => button.getAttribute("aria-label")?.slice(5)),
     ).toEqual(expectedOrder.slice(0, 8));
+    expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
     expect(providersApi.update).not.toHaveBeenCalled();
     expect(screen.getByRole("combobox", { name: "Sort models" })).toHaveValue(
       "custom",
@@ -1815,8 +2151,9 @@ describe("Model order real drag sensors", () => {
     );
     await user.click(screen.getByRole("button", { name: "Save order" }));
     await screen.findByText(/Saved the display order for 10 models/);
-    expect(providersApi.update).toHaveBeenCalledTimes(1);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledTimes(1);
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.id).toBe(plan.id);
     expect(saved.settingsConfig.codexRouting).toEqual({
       ...plan.settingsConfig.codexRouting,
@@ -1836,7 +2173,7 @@ describe("Model order real drag sensors", () => {
       ).toHaveValue("low"),
     );
     expect(screen.getByRole("button", { name: "Save order" })).toBeDisabled();
-    expect(providersApi.update).toHaveBeenCalledTimes(1);
+    expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledTimes(1);
   });
 
   it("trusts resolved selectable efforts without reinterpreting source labels", async () => {
@@ -1897,7 +2234,8 @@ describe("Model order real drag sensors", () => {
       screen.getByRole("button", { name: "Restore default" }),
     );
     await screen.findByText(/Restored newest-first model order/);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.id).toBe(plan.id);
     expect(saved.settingsConfig.codexRouting).toMatchObject({
       modelOrder: ["order-a", "order-b"],
@@ -1936,7 +2274,8 @@ describe("Model order real drag sensors", () => {
     );
     await user.click(screen.getByRole("button", { name: "Save order" }));
     await screen.findByText(/Saved the display order for 1 models/);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.settingsConfig.config).toBe(plan.settingsConfig.config);
     expect(saved.settingsConfig.codexRouting.defaultReasoningEffort).toBe(
       "high",
@@ -1968,10 +2307,12 @@ describe("Model order real drag sensors", () => {
       ).toHaveValue("high"),
     );
     expect(screen.getByRole("button", { name: "Save order" })).toBeEnabled();
+    expect(providersApi.updateCodexRouterIfUnchanged).not.toHaveBeenCalled();
     expect(providersApi.update).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole("button", { name: "Save order" }));
     await screen.findByText(/Saved the display order for 1 models/);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.settingsConfig.codexRouting.defaultReasoningEffort).toBe(
       "high",
     );
@@ -2061,7 +2402,8 @@ describe("Model order real drag sensors", () => {
       await waitFor(() => expect(effort).toHaveValue(expected));
       await user.click(screen.getByRole("button", { name: "Save order" }));
       await screen.findByText(/Saved the display order for 2 models/);
-      const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+      const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+        .calls[0][0];
       expect(saved.settingsConfig.codexRouting).toMatchObject({
         modelOrder: ["order-b", "order-a"],
         defaultReasoningEffort: expected,
@@ -2168,7 +2510,8 @@ describe("Model order real drag sensors", () => {
       await user.selectOptions(effort, "ultra");
       await user.click(screen.getByRole("button", { name: "Save order" }));
       await screen.findByText(/Saved the display order for 1 models/);
-      const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+      const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+        .calls[0][0];
       expect(saved.settingsConfig.codexRouting.defaultReasoningEffort).toBe(
         "ultra",
       );
@@ -2229,7 +2572,8 @@ describe("Model order real drag sensors", () => {
     await user.selectOptions(effort, "none");
     await user.click(screen.getByRole("button", { name: "Save order" }));
     await screen.findByText(/Saved the display order for 1 models/);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.settingsConfig.codexRouting.defaultReasoningEffort).toBe(
       "none",
     );
@@ -2742,7 +3086,8 @@ describe("Model order real drag sensors", () => {
     await user.selectOptions(effort, "xhigh");
     await user.click(screen.getByRole("button", { name: "Save order" }));
     await screen.findByText(/Saved the display order for 1 models/);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.id).toBe(plan.id);
     expect(saved.settingsConfig.codexRouting.defaultReasoningEffort).toBe(
       "xhigh",
@@ -2789,7 +3134,8 @@ describe("Model order real drag sensors", () => {
     await user.selectOptions(effort, "xhigh");
     await user.click(screen.getByRole("button", { name: "Save order" }));
     await screen.findByText(/Saved the display order for 2 models/);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.settingsConfig.codexRouting).toMatchObject({
       modelOrder: ["gpt-6.1-sol-sublyx", "gpt-5.6-luna-sublyx"],
       defaultReasoningEffort: "xhigh",
@@ -3010,7 +3356,8 @@ describe("Model order real drag sensors", () => {
     expect(within(effort).getAllByRole("option")).toHaveLength(1);
     await user.click(screen.getByRole("button", { name: "Save order" }));
     await screen.findByText(/Saved the display order for 2 models/);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(
       saved.settingsConfig.codexRouting.defaultReasoningEffort,
     ).toBeUndefined();
@@ -3059,23 +3406,37 @@ describe("Model order real drag sensors", () => {
           : state === "not_required"
             ? "Order saved for this router. It will be projected when this router is activated."
             : /Order saved, but projection is pending:/;
-      await screen.findByText(expected);
-      expect(providersApi.update).toHaveBeenCalledTimes(1);
+      const notice = await screen.findByText(expected);
+      const successCalls = vi.mocked(toast.success).mock;
+      const saveToastId = successCalls.results[0]?.value;
+      expect(saveToastId).toBeDefined();
+      expect(toast.error).not.toHaveBeenCalled();
+      if (state === "not_required") {
+        expect(successCalls.lastCall?.[0]).toBe(notice.textContent);
+        expect(toast.warning).not.toHaveBeenCalled();
+      } else {
+        expect(toast.warning).toHaveBeenCalledOnce();
+        expect(toast.warning).toHaveBeenCalledWith(
+          notice.textContent,
+          expect.objectContaining({ id: saveToastId }),
+        );
+      }
+      expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledTimes(
+        1,
+      );
       expect(
-        vi.mocked(providersApi.update).mock.calls[0][0].settingsConfig
-          .codexRouting.modelOrder,
+        vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock.calls[0][0]
+          .settingsConfig.codexRouting.modelOrder,
       ).toEqual(["order-b", "order-a", "order-c"]);
       expect(
         screen.queryByText(/Failed to save model order/),
       ).not.toBeInTheDocument();
-      if (state === "pending")
-        expect(
-          providersApi.retryCodexMultiRouterProjection,
-        ).toHaveBeenCalledOnce();
-      else
-        expect(
-          providersApi.retryCodexMultiRouterProjection,
-        ).not.toHaveBeenCalled();
+      expect(
+        providersApi.inspectCodexMultiRouterProjection,
+      ).toHaveBeenCalledOnce();
+      expect(
+        providersApi.retryCodexMultiRouterProjection,
+      ).not.toHaveBeenCalled();
     },
   );
 });
@@ -6551,6 +6912,24 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     },
   );
 
+  it.each([null, true, 7, { effort: "max" }, "HIGH"])(
+    "does not display a malformed saved Sub-Agent override (%j) as High",
+    async (malformed) => {
+      const { source, plan } = createSubagentWorkspaceFixture();
+      Object.assign(plan.settingsConfig.codexRouting, {
+        subagentReasoningEffort: malformed,
+      });
+      await act(async () => {
+        renderWorkspace(subagentWorkspaceElement(source, plan));
+      });
+      const effort = screen.getByRole("combobox", {
+        name: "All Sub-Agent reasoning effort",
+      });
+      expect(effort).toHaveValue("invalid");
+      expect(providersApi.updateCodexSubagentPolicy).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(["v1", "v2"] as const)(
     "exposes only Max and High as new Sub-Agent effort choices in %s",
     (version) => {
@@ -9691,8 +10070,9 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       .click(screen.getByRole("button", { name: "Restore default" }));
 
     await screen.findByText(/Restored newest-first model order/);
-    expect(providersApi.update).toHaveBeenCalledTimes(1);
-    const saved = vi.mocked(providersApi.update).mock.calls[0][0];
+    expect(providersApi.updateCodexRouterIfUnchanged).toHaveBeenCalledTimes(1);
+    const saved = vi.mocked(providersApi.updateCodexRouterIfUnchanged).mock
+      .calls[0][0];
     expect(saved.id).toBe(routedPlan.id);
     expect(saved.settingsConfig.codexRouting.modelOrder).toEqual([
       "model-a",
@@ -10574,6 +10954,49 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
         screen.getByText("MultiRouter verified with a real request"),
       ).toBeInTheDocument(),
     );
+  });
+
+  it("only polls the live projection while viewing Link status", async () => {
+    vi.useFakeTimers();
+    const source: Provider = {
+      id: "projection-poll-source",
+      name: "Projection source",
+      category: "custom",
+      settingsConfig: { modelCatalog: { models: [{ model: "poll-model" }] } },
+    };
+    const plan = createDraftRoutingPlan([source], [source]);
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [source, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "status",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    const advance = (time: number) =>
+      act(async () => {
+        await vi.advanceTimersByTimeAsync(time);
+      });
+    const inspect = providersApi.inspectCodexMultiRouterProjection;
+    await advance(1);
+    expect(inspect).toHaveBeenCalledOnce();
+    expect(inspect).toHaveBeenCalledWith(plan.id);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Traffic/ }));
+    await advance(30_000);
+    expect(inspect).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Link Listener/ }));
+    await advance(1);
+    expect(inspect).toHaveBeenCalledTimes(2);
+    await advance(15_000);
+    expect(inspect).toHaveBeenCalledTimes(3);
   });
 
   it("shows stale projection details and lets the user resync with readable provider names", async () => {

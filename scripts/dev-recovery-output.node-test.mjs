@@ -3,16 +3,22 @@ import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
   existsSync,
-  fstatSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { spawnDevRecoveryProcess } from "./dev-recovery-output.mjs";
+import {
+  appendBoundedDevLog,
+  DEV_RECOVERY_LOG_MAX_BYTES,
+  RECOVERY_LOG_ENV,
+  RECOVERY_PRELOAD_OPTION,
+  spawnDevRecoveryProcess,
+} from "./dev-recovery-output.mjs";
 
 const helperUrl = new URL("./dev-recovery-output.mjs", import.meta.url).href;
 
@@ -101,23 +107,17 @@ function specification(markerPath) {
   };
 }
 
-test("headless recovery appends both streams, preserves launch arguments, and closes the parent descriptor before spawn acknowledgement", async (context) => {
+test("headless recovery installs the bounded writer without changing its identity command line", async (context) => {
   const f = fixture(context);
   const spec = specification(f.markerPath);
   let observed;
-  let descriptor;
   const child = fakeChild();
   const launching = spawnDevRecoveryProcess(spec, {
     spawnProcess(executable, args, options) {
       observed = { executable, args, options };
-      descriptor = options.stdio[1];
-      assert.equal(options.stdio[2], descriptor);
-      assert.equal(fstatSync(descriptor).isFile(), true);
-      writeFileSync(descriptor, "fixture stdout\nfixture stderr\n");
       return child;
     },
   });
-  assert.throws(() => fstatSync(descriptor), { code: "EBADF" });
   let resolved = false;
   launching.then(() => {
     resolved = true;
@@ -134,34 +134,36 @@ test("headless recovery appends both streams, preserves launch arguments, and cl
   assert.equal(observed.executable, spec.executable);
   assert.deepEqual(observed.args, spec.args);
   assert.equal(observed.options.cwd, spec.options.cwd);
-  assert.deepEqual(observed.options.env, spec.options.env);
+  assert.deepEqual(observed.options.env, {
+    ...spec.options.env,
+    NODE_OPTIONS: RECOVERY_PRELOAD_OPTION,
+    [RECOVERY_LOG_ENV]: result.output.logPath,
+  });
+  assert.equal(spec.options.env[RECOVERY_LOG_ENV], undefined);
   assert.equal(observed.options.shell, false);
   assert.equal(observed.options.windowsVerbatimArguments, false);
   assert.equal(observed.options.detached, true);
   assert.equal(observed.options.windowsHide, true);
-  assert.equal(observed.options.stdio[0], "ignore");
+  assert.deepEqual(observed.options.stdio, ["ignore", "ignore", "ignore"]);
   const output = readFileSync(result.output.logPath, "utf8");
   const [launchLine] = output.split("\n");
   const launch = JSON.parse(launchLine);
   assert.equal(launch.event, "dev-recovery-launch");
   assert.equal(launch.pid, process.pid);
   assert.equal(Number.isFinite(Date.parse(launch.timestamp)), true);
-  assert.match(output, /fixture stdout\nfixture stderr\n$/);
   assert.equal(output.includes("redacted-fixture"), false);
   assert.equal(output.includes("value with spaces"), false);
 });
 
 test("subsequent recovery launches append to the same configured persistent log", async (context) => {
   const f = fixture(context);
-  for (const generation of [1, 2]) {
+  for (let generation = 1; generation <= 2; generation++) {
     const child = fakeChild();
     const result = await spawnDevRecoveryProcess(specification(f.markerPath), {
       spawnProcess(_executable, _args, options) {
-        assert.equal(typeof options.stdio[1], "number");
-        assert.equal(options.stdio[1], options.stdio[2]);
+        assert.deepEqual(options.stdio, ["ignore", "ignore", "ignore"]);
         assert.equal(options.detached, true);
         assert.equal(options.windowsHide, true);
-        writeFileSync(options.stdio[1], `fixture generation ${generation}\n`);
         queueMicrotask(() => child.emit("spawn"));
         return child;
       },
@@ -174,9 +176,22 @@ test("subsequent recovery launches append to the same configured persistent log"
   )
     .trim()
     .split("\n");
-  assert.equal(records.length, 4, "every launch appends to existing output");
-  assert.equal(records[1], "fixture generation 1");
-  assert.equal(records[3], "fixture generation 2");
+  assert.equal(records.length, 2, "every launch appends to existing output");
+  assert.ok(
+    records.every((line) => JSON.parse(line).event === "dev-recovery-launch"),
+  );
+});
+
+test("the bounded writer rolls over an existing oversized file and retains an oversized write's tail", (context) => {
+  const f = fixture(context);
+  const logPath = path.join(f.directory, "bounded.log");
+  writeFileSync(logPath, "a".repeat(300));
+  appendBoundedDevLog(logPath, Buffer.from("first\n"), 100);
+  assert.equal(readFileSync(logPath, "utf8"), "first\n");
+  const oversized = `${"b".repeat(150)}\nlast\n`;
+  appendBoundedDevLog(logPath, Buffer.from(oversized), 100);
+  assert.equal(statSync(logPath).size, 100);
+  assert.equal(readFileSync(logPath, "utf8"), oversized.slice(-100));
 });
 
 test("headless recovery requires its configured marker directory before spawning", async () => {
@@ -195,37 +210,30 @@ test("headless recovery requires its configured marker directory before spawning
   assert.equal(launches, 0);
 });
 
-test("a synchronous spawn failure closes the opened recovery descriptor", async (context) => {
+test("a synchronous spawn failure is surfaced to the recovery owner", async (context) => {
   const f = fixture(context);
-  let descriptor;
   const failure = new Error("fixture synchronous failure");
   await assert.rejects(
     spawnDevRecoveryProcess(specification(f.markerPath), {
-      spawnProcess(_executable, _args, options) {
-        descriptor = options.stdio[1];
-        assert.equal(fstatSync(descriptor).isFile(), true);
+      spawnProcess() {
         throw failure;
       },
     }),
     (error) => error === failure,
   );
-  assert.throws(() => fstatSync(descriptor), { code: "EBADF" });
 });
 
-test("an asynchronous spawn failure closes its descriptor and removes its listeners", async (context) => {
+test("an asynchronous spawn failure removes its listeners", async (context) => {
   const f = fixture(context);
-  let descriptor;
   const child = fakeChild();
   const failure = new Error("fixture asynchronous failure");
   const launching = spawnDevRecoveryProcess(specification(f.markerPath), {
-    spawnProcess(_executable, _args, options) {
-      descriptor = options.stdio[1];
+    spawnProcess() {
       queueMicrotask(() => child.emit("error", failure));
       return child;
     },
   });
   await assert.rejects(launching, (error) => error === failure);
-  assert.throws(() => fstatSync(descriptor), { code: "EBADF" });
   assert.equal(child.listenerCount("spawn"), 0);
   assert.equal(child.listenerCount("error"), 0);
 });
@@ -257,7 +265,7 @@ async function waitForProcessExit(pid, timeoutMs = 10_000) {
 }
 
 test(
-  "native headless recovery preserves stdout and stderr written after the launcher exits",
+  "native headless recovery caps both streams after the launcher exits",
   { timeout: 20_000 },
   async (context) => {
     const f = fixture(context);
@@ -265,16 +273,23 @@ test(
     const childPath = path.join(f.directory, "child.mjs");
     const releasePath = path.join(f.directory, "parent-exited.json");
     const completedPath = path.join(f.directory, "completed.json");
+    const budget = DEV_RECOVERY_LOG_MAX_BYTES;
     writeFileSync(
       childPath,
       `import { existsSync, writeFileSync } from "node:fs";
+import assert from "node:assert/strict";
 const [releasePath, completedPath] = process.argv.slice(2);
+assert.equal(process.env.${RECOVERY_LOG_ENV}, undefined);
+assert.equal(process.env.NODE_OPTIONS, "--no-warnings");
 const deadline = Date.now() + 10000;
 while (!existsSync(releasePath)) {
   if (Date.now() >= deadline) process.exit(2);
   await new Promise(resolve => setTimeout(resolve, 20));
 }
-process.stdout.write("after-parent-exit stdout\\n");
+const large = Buffer.alloc(${budget} + 2048, "x");
+process.stdout.write(large);
+process.stderr.write(large);
+await new Promise(resolve => process.stdout.write("after-parent-exit stdout\\n", resolve));
 process.stderr.write("after-parent-exit stderr\\n");
 writeFileSync(completedPath, JSON.stringify({ pid: process.pid }));
 `,
@@ -285,7 +300,7 @@ writeFileSync(completedPath, JSON.stringify({ pid: process.pid }));
 const [markerPath, childPath, releasePath, completedPath] = process.argv.slice(2);
 const { child, output } = await spawnDevRecoveryProcess({
   executable: process.execPath, args: [childPath, releasePath, completedPath],
-  markerPath, options: { cwd: ${JSON.stringify(f.directory)}, env: process.env }
+  markerPath, options: { cwd: ${JSON.stringify(f.directory)}, env: { ...process.env, NODE_OPTIONS: "--no-warnings" } }
 });
 child.unref();
 process.stdout.write(JSON.stringify({ pid: process.pid, childPid: child.pid, output }) + "\\n");
@@ -313,6 +328,10 @@ process.stdout.write(JSON.stringify({ pid: process.pid, childPid: child.pid, out
     f.waitForCleanup(() => waitForProcessExit(result.childPid));
     assert.equal(result.pid, parent.pid);
     assert.notEqual(result.childPid, parent.pid);
+    assert.match(
+      readFileSync(result.output.logPath, "utf8"),
+      /dev-recovery-launch/,
+    );
     writeFileSync(releasePath, JSON.stringify({ parentExited: true }));
     await waitForFile(completedPath);
     const completed = JSON.parse(readFileSync(completedPath, "utf8"));
@@ -320,6 +339,6 @@ process.stdout.write(JSON.stringify({ pid: process.pid, childPid: child.pid, out
     const output = readFileSync(result.output.logPath, "utf8");
     assert.match(output, /after-parent-exit stdout\n/);
     assert.match(output, /after-parent-exit stderr\n/);
-    assert.equal(output.includes("dev-recovery-launch"), true);
+    assert.ok(statSync(result.output.logPath).size <= budget);
   },
 );

@@ -1,4 +1,8 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { confirmDialog } from "@/lib/dialog";
@@ -75,6 +79,59 @@ export function createProviderSwitchFailureToastOptions({
 }
 
 const codexForceRepairInFlight = new Set<string>();
+
+/** Refresh switch-dependent UI caches without extending the switch mutation. */
+export function refreshProviderSwitchQueries(
+  queryClient: QueryClient,
+  appId: AppId,
+): void {
+  const refreshes: Promise<unknown>[] = [
+    queryClient.invalidateQueries({ queryKey: ["providers", appId] }),
+  ];
+
+  if (appId === "codex") {
+    refreshes.push(
+      queryClient.invalidateQueries({ queryKey: ["proxyStatus"] }),
+      queryClient.invalidateQueries({ queryKey: ["proxyRunning"] }),
+      queryClient.invalidateQueries({ queryKey: ["proxyTakeoverStatus"] }),
+      queryClient.invalidateQueries({ queryKey: ["liveTakeoverActive"] }),
+    );
+  }
+  if (appId === "claude-desktop") {
+    refreshes.push(
+      queryClient.invalidateQueries({ queryKey: proxyKeys.status }),
+      queryClient.invalidateQueries({ queryKey: ["claudeDesktopStatus"] }),
+    );
+  }
+  if (appId === "opencode") {
+    refreshes.push(
+      queryClient.invalidateQueries({
+        queryKey: ["opencodeLiveProviderIds"],
+      }),
+      queryClient.invalidateQueries({
+        queryKey: ["opencode", "runtime-models"],
+      }),
+      queryClient.invalidateQueries({
+        queryKey: ["omo", "current-provider-id"],
+      }),
+      queryClient.invalidateQueries({
+        queryKey: ["omo-slim", "current-provider-id"],
+      }),
+    );
+  }
+  if (appId === "openclaw") {
+    refreshes.push(
+      queryClient.invalidateQueries({ queryKey: openclawKeys.liveProviderIds }),
+      queryClient.invalidateQueries({ queryKey: openclawKeys.defaultModel }),
+      queryClient.invalidateQueries({ queryKey: openclawKeys.health }),
+    );
+  }
+  if (appId === "hermes") {
+    refreshes.push(invalidateHermesProviderCaches(queryClient));
+  }
+  refreshes.push(providersApi.updateTrayMenu());
+  void Promise.allSettled(refreshes);
+}
 
 async function warnIfActiveCodexProjectionPending(
   appId: AppId,
@@ -444,63 +501,8 @@ export const useSwitchProviderMutation = (appId: AppId) => {
     mutationFn: async (providerId: string): Promise<SwitchResult> => {
       return await providersApi.switch(providerId, appId);
     },
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
-      if (appId === "codex") {
-        await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
-        await queryClient.invalidateQueries({ queryKey: ["proxyRunning"] });
-        await queryClient.invalidateQueries({
-          queryKey: ["proxyTakeoverStatus"],
-        });
-        await queryClient.invalidateQueries({
-          queryKey: ["liveTakeoverActive"],
-        });
-      }
-      if (appId === "claude-desktop") {
-        await queryClient.invalidateQueries({ queryKey: proxyKeys.status });
-        await queryClient.invalidateQueries({
-          queryKey: ["claudeDesktopStatus"],
-        });
-      }
-
-      // OpenCode/OpenClaw: also invalidate live provider IDs cache to update button state
-      if (appId === "opencode") {
-        await queryClient.invalidateQueries({
-          queryKey: ["opencodeLiveProviderIds"],
-        });
-        await queryClient.invalidateQueries({
-          queryKey: ["opencode", "runtime-models"],
-        });
-        await queryClient.invalidateQueries({
-          queryKey: ["omo", "current-provider-id"],
-        });
-        await queryClient.invalidateQueries({
-          queryKey: ["omo-slim", "current-provider-id"],
-        });
-      }
-      if (appId === "openclaw") {
-        await queryClient.invalidateQueries({
-          queryKey: openclawKeys.liveProviderIds,
-        });
-        await queryClient.invalidateQueries({
-          queryKey: openclawKeys.defaultModel,
-        });
-        await queryClient.invalidateQueries({
-          queryKey: openclawKeys.health,
-        });
-      }
-      if (appId === "hermes") {
-        await invalidateHermesProviderCaches(queryClient);
-      }
-
-      try {
-        await providersApi.updateTrayMenu();
-      } catch (trayError) {
-        console.error(
-          "Failed to update tray menu after switching provider",
-          trayError,
-        );
-      }
+    onSuccess: () => {
+      refreshProviderSwitchQueries(queryClient, appId);
     },
     onError: (error: Error, providerId: string) => {
       const detail = extractErrorMessage(error) || t("common.unknown");
@@ -586,9 +588,14 @@ export const useSwitchProviderMutation = (appId: AppId) => {
         },
       );
     },
-    onSettled: async () => {
+    onSettled: () => {
       if (appId === "pi") {
-        await invalidatePiProviderCaches(queryClient);
+        void invalidatePiProviderCaches(queryClient).catch((error) => {
+          console.error(
+            "Failed to refresh Pi provider caches after switching provider",
+            error,
+          );
+        });
       }
     },
   });

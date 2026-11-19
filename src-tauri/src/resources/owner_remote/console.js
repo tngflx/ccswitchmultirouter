@@ -25,6 +25,24 @@ const itemTypes = new Set([
   "context_compaction",
   "unsupported",
 ]);
+const failureCategories = new Set([
+  "server_overloaded",
+  "usage_limit",
+  "rate_limit",
+  "internal_server_error",
+  "authentication_error",
+  "context_length_exceeded",
+  "invalid_request_error",
+  "connection_error",
+  "unknown",
+]);
+const failureCategoryKey = (turn) => {
+  if (!plain(turn) || !plain(turn.failure)) return null;
+  return typeof turn.failure.category === "string" &&
+    failureCategories.has(turn.failure.category)
+    ? turn.failure.category
+    : "unknown";
+};
 const statuses = new Set([
   "idle",
   "active",
@@ -490,6 +508,13 @@ export function mountOwnerRemoteConsole(root, options = {}) {
       const status = document.createElement("span");
       status.textContent = t(`status.${statusKey(turn.status)}`);
       label.append(name, status);
+      const failure = failureCategoryKey(turn);
+      if (failure) {
+        const failureLabel = document.createElement("span");
+        failureLabel.className = "turn-failure";
+        failureLabel.textContent = t(`failure.${failure}`);
+        label.append(failureLabel);
+      }
       section.append(label);
       const items = Array.isArray(turn.items) ? turn.items.slice(-40) : [];
       for (const item of items) {

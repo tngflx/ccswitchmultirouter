@@ -38,6 +38,7 @@ type State = {
     fiberLimit: number;
     scopeCount: number;
     elapsedMs: number;
+    reason?: string;
   };
   scopedAppServerScopeLastSettledScan?: {
     status: string;
@@ -374,6 +375,62 @@ describe("Codex Desktop declared client discovery", () => {
     }
   });
 
+  it("finds a scope behind scalar fields and still invalidates changed edges", async () => {
+    const client = new QueryClient();
+    const owner = createScope(client);
+    const values: Record<string, unknown> = Object.fromEntries(
+      Array.from({ length: 200 }, (_, index) => [`scalar${index}`, index]),
+    );
+    values.owner = owner;
+    const root = { memoizedState: values };
+    const harness = createHarness(
+      {},
+      { __codexRoot: { _internalRoot: { current: root } } },
+    );
+    try {
+      expect(await harness.api.codexRendererScopeCandidates()).toEqual([owner]);
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(true);
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(true);
+
+      values.scalar0 = createScope(client);
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(false);
+    } finally {
+      client.clear();
+    }
+  });
+
+  it("keeps the inventory incomplete when a Fiber value queue omits an owner", async () => {
+    const client = new QueryClient();
+    const retained = createScope(client);
+    const omitted = createScope(client);
+    const values: Record<string, unknown> = Object.fromEntries(
+      Array.from({ length: 2048 }, (_, index) => [`unrelated${index}`, {}]),
+    );
+    values.owner = omitted;
+    const root = { memoizedState: values };
+    const harness = createHarness(
+      { scopedAppServerScopeCandidates: new Set([retained]) },
+      { __codexRoot: { _internalRoot: { current: root } } },
+    );
+    try {
+      expect(await harness.api.codexRendererScopeCandidates()).toEqual([
+        retained,
+      ]);
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(false);
+      expect(harness.state.scopedAppServerScopeScan).toMatchObject({
+        status: "capped",
+        reason: "value_limit",
+      });
+      expect(harness.state.scopedAppServerScopeLastSettledScan).toMatchObject({
+        status: "capped",
+        reason: "value_limit",
+      });
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(false);
+    } finally {
+      client.clear();
+    }
+  });
+
   it.each(["object", "field"] as const)(
     "keeps the inventory incomplete when its %s snapshot budget is exhausted",
     async (budget) => {
@@ -387,7 +444,10 @@ describe("Codex Desktop declared client discovery", () => {
       );
       await harness.api.codexRendererScopeCandidates();
       expect(harness.state.scopedAppServerScopeScanComplete).toBe(false);
-      expect(harness.state.scopedAppServerScopeScan?.status).toBe("capped");
+      expect(harness.state.scopedAppServerScopeScan).toMatchObject({
+        status: "capped",
+        reason: budget === "object" ? "object_limit" : "field_limit",
+      });
       expect(harness.state.scopedAppServerScopeLastSettledScan).toMatchObject({
         status: "capped",
         reason: budget === "object" ? "object_limit" : "field_limit",

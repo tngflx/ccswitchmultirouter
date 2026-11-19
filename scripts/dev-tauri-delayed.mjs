@@ -2,7 +2,6 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
-  appendFileSync,
   closeSync,
   mkdirSync,
   openSync,
@@ -27,7 +26,11 @@ import {
 } from "./dev-app-exit.mjs";
 import { parseGuardianJson, utcTicks } from "./ccswitchmulti-guardian-core.mjs";
 import {
+  appendBoundedDevLog,
+  appendDevRecoveryOutput,
   devRecoveryLogPath,
+  devRecoveryOutputInstalled,
+  DEV_WATCHDOG_LOG_MAX_BYTES,
   spawnDevRecoveryProcess,
 } from "./dev-recovery-output.mjs";
 import {
@@ -79,6 +82,8 @@ const WINDOWS_LISTENER_RELEASE_TIMEOUT_MS = 60_000;
 const DEV_AUTO_RESTART_DELAY_MS = 1_000;
 const DEV_SUPERVISOR_PUBLICATION_TIMEOUT_MS = 30_000;
 const DEV_WATCHDOG_LIVENESS_FALLBACK_TIMEOUT_MS = 1_500;
+const DEV_WATCHDOG_POLL_MS = 5_000;
+const DEV_WATCHDOG_DIAGNOSTIC_INTERVAL_MS = 60_000;
 const DEV_WATCHDOG_LIVENESS_FALLBACK_MAX_BUFFER = 64 * 1024;
 const DEV_SUPERVISOR_ENV = "CC_SWITCH_DEV_SUPERVISOR";
 const DEV_WORKER_FLAG = "--ccsm-dev-worker";
@@ -1807,14 +1812,23 @@ export async function superviseDevSessions({
   return 0;
 }
 
-export function devWorkerCommand(args, environment = process.env) {
+export function devWorkerCommand(
+  args,
+  environment = process.env,
+  pipeOutput = devRecoveryOutputInstalled(),
+) {
   return {
     executable: process.execPath,
     args: [fileURLToPath(import.meta.url), DEV_WORKER_FLAG, ...args],
     options: {
       cwd: REPO_ROOT,
       env: { ...environment, [DEV_SUPERVISOR_ENV]: "1" },
-      stdio: ["inherit", "inherit", "inherit", "ipc"],
+      stdio: [
+        "inherit",
+        pipeOutput ? "pipe" : "inherit",
+        pipeOutput ? "pipe" : "inherit",
+        "ipc",
+      ],
       detached: process.platform !== "win32",
       windowsHide: true,
     },
@@ -2118,9 +2132,17 @@ function writeDevWatchdogEvent(event, detail) {
   const markerPath = devSessionPath();
   if (!markerPath) return;
   try {
-    appendFileSync(
+    const record = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event,
+      detail,
+    });
+    const line = Buffer.from(`${record}\n`);
+    if (line.length > DEV_WATCHDOG_LOG_MAX_BYTES) return;
+    appendBoundedDevLog(
       path.join(path.dirname(markerPath), "dev-watchdog.jsonl"),
-      `${JSON.stringify({ timestamp: new Date().toISOString(), event, detail })}\n`,
+      line,
+      DEV_WATCHDOG_LOG_MAX_BYTES,
     );
   } catch {}
 }
@@ -2476,17 +2498,34 @@ export async function runDetachedDevWatchdog(
   {
     markerPath = devSessionPath(),
     readSession = () => JSON.parse(readFileSync(markerPath, "utf8")),
-    wait = () => new Promise((resolve) => setTimeout(resolve, 2_000)),
+    wait = (milliseconds) =>
+      new Promise((resolve) => setTimeout(resolve, milliseconds)),
     queryProcesses = queryWindowsProcesses,
     livenessFallback = ({ supervisorPid: pid }) =>
       probeDevSupervisorLivenessFallback(pid),
     handoff = handoffDetachedDevSupervisor,
     writeEvent = writeDevWatchdogEvent,
+    now = Date.now,
   } = {},
 ) {
   if (!markerPath) return;
+  const diagnosticTimes = new Map();
+  const writeDiagnostic = (event, detail) => {
+    // Keep different outcomes (especially absence) visible, but don't write
+    // the same failed probe on every retry or key by arbitrary error strings.
+    const key = `${event}:${detail.result ?? "failed"}`;
+    const at = now();
+    const lastDiagnosticAt = diagnosticTimes.get(key);
+    if (
+      lastDiagnosticAt === undefined ||
+      at - lastDiagnosticAt >= DEV_WATCHDOG_DIAGNOSTIC_INTERVAL_MS
+    ) {
+      writeEvent(event, detail);
+      diagnosticTimes.set(key, at);
+    }
+  };
   while (true) {
-    await wait();
+    await wait(DEV_WATCHDOG_POLL_MS);
     try {
       let session;
       try {
@@ -2514,7 +2553,7 @@ export async function runDetachedDevWatchdog(
           error,
           session,
         });
-        writeEvent("dev-watchdog-liveness-fallback", {
+        writeDiagnostic("dev-watchdog-liveness-fallback", {
           supervisorPid,
           result: ["present", "absent", "unknown"].includes(fallback)
             ? fallback
@@ -2537,8 +2576,8 @@ export async function runDetachedDevWatchdog(
       if (result.retry) continue;
       return;
     } catch (error) {
-      writeEvent("dev-watchdog-iteration-failed", {
-        error: error.message,
+      writeDiagnostic("dev-watchdog-iteration-failed", {
+        error: String(error?.message ?? error).slice(0, 240),
       });
     }
   }
@@ -2906,7 +2945,7 @@ async function runDevSupervisor(launchArgs) {
                 error: cleanupError.message,
               }),
           });
-          appendFileSync(
+          appendDevRecoveryOutput(
             outputPath,
             `${JSON.stringify({
               timestamp: new Date().toISOString(),
@@ -2946,6 +2985,15 @@ async function runDevSupervisor(launchArgs) {
           const command = devWorkerCommand(args);
           worker = spawn(command.executable, command.args, command.options);
           const sessionWorker = worker;
+          for (const [stream, destination] of [
+            [sessionWorker.stdout, process.stdout],
+            [sessionWorker.stderr, process.stderr],
+          ]) {
+            // An orphan inheriting a worker pipe must not outlive the checks
+            // that otherwise let this exact supervisor exit.
+            stream?.unref?.();
+            stream?.on("data", (chunk) => destination.write(chunk));
+          }
           workerIdentity = null;
           saveSession();
           if (process.platform === "win32" && worker.pid) {

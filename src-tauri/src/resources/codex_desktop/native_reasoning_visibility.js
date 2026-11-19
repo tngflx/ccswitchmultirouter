@@ -54,19 +54,27 @@ const codexNativeReasoningScopeQueryCache = (scope, inspection) => {
 // A complete current owner snapshot can ignore historical, still-subscribed
 // caches without deleting their undo/release registrations. Any uncertain owner
 // or a capped scan means unknown, never a partially authoritative cache list.
-const codexCurrentNativeReasoningQueryCaches = (inspection) => {
+const codexNativeReasoningCompleteOwnerProof = (inspection) => {
   const refuse = (reason) =>
     codexNativeReasoningOwnerRefusal(inspection, reason);
-  if (!codexRendererScopeSnapshotIsCurrent())
-    return refuse("owner_snapshot_unverified");
+  if (!codexRendererScopeSnapshotIsCurrent()) return null;
   try {
     const scopes = Set.prototype.values.call(
       state.scopedAppServerScopeCandidates,
     );
-    const caches = new Set();
+    const currentScopes = new Set();
+    const scopeCaches = new Map();
     for (let inspected = 0; inspected <= 2048; inspected += 1) {
       const entry = scopes.next();
-      if (entry.done) return caches.size ? caches : refuse("inventory_empty");
+      if (entry.done)
+        return scopeCaches.size
+          ? {
+              kind: "complete",
+              scopes: currentScopes,
+              scopeCaches,
+              caches: new Set(scopeCaches.values()),
+            }
+          : refuse("inventory_empty");
       if (inspected === 2048) return refuse("inventory_capped");
       if (inspection) inspection.ownerScopeCount = inspected + 1;
       let cache;
@@ -76,19 +84,196 @@ const codexCurrentNativeReasoningQueryCaches = (inspection) => {
         return refuse("scope_read_failed");
       }
       if (!cache) return null;
-      caches.add(cache);
+      currentScopes.add(entry.value);
+      scopeCaches.set(entry.value, cache);
     }
   } catch {
     return refuse("inventory_read_failed");
   }
   return null;
 };
+// The broad Fiber/object inventory can be capped by unrelated renderer state.
+// Native reasoning has one narrower, independently validated owner boundary:
+// the current app-server status atom brand. This path never certifies the
+// broad request-client inventory or changes its completion flag. It only proves
+// exact mounted scope/cache pairs for the native preference read/patch, and
+// refuses on missing, ambiguous, stale, or mutating hints.
+const codexNativeReasoningCanonicalOwnerProof = (inspection) => {
+  // Fixed counters describe only this proof's inspected prefix. Never retain
+  // atom/brand identities, object paths, descriptor contents or error text.
+  const counts = inspection?.canonicalOwnerCounts;
+  const refuse = (reason) => {
+    if (inspection) inspection.canonicalOwnerRefusalReason = reason;
+    return codexNativeReasoningOwnerRefusal(
+      inspection,
+      reason === "unavailable"
+        ? "canonical_owner_unavailable"
+        : "canonical_owner_unverified",
+    );
+  };
+  if (
+    typeof codexCurrentAppServerScopeHints !== "function" ||
+    typeof codexRendererScopeIsMounted !== "function"
+  )
+    return refuse("unavailable");
+  const atoms = state.appServerStatusAtoms;
+  const brands = new Set();
+  let atomCount;
+  try {
+    atomCount = codexNativeReasoningOwnData(atoms, "length");
+    if (counts && Number.isSafeInteger(atomCount) && atomCount >= 0)
+      counts.appServerStatusAtomCount = Math.min(atomCount, 17);
+    if (
+      !Array.isArray(atoms) ||
+      !Number.isSafeInteger(atomCount) ||
+      atomCount < 1 ||
+      atomCount > 16
+    )
+      return refuse("atoms_unverified");
+    for (let index = 0; index < atomCount; index += 1) {
+      const atom = codexNativeReasoningOwnData(atoms, String(index));
+      const brand = codexNativeReasoningOwnData(atom, "scope");
+      if (
+        !brand ||
+        typeof codexNativeReasoningOwnData(atom, "resolve") !== "function"
+      )
+        return refuse("atoms_unverified");
+      brands.add(brand);
+      if (counts) counts.uniqueBrandCount = brands.size;
+    }
+  } catch {
+    return refuse("atoms_unverified");
+  }
+  // Discovery deduplicates status atoms by atom identity, not by scope brand.
+  // Several validated manager/status bindings may share one exact scope brand;
+  // the shared hint reader deliberately returns one owner per unique brand.
+  let pendingNodeCount = 0;
+  try {
+    if (state.pendingReactNodes != null)
+      pendingNodeCount = Object.getOwnPropertyDescriptor(
+        Set.prototype,
+        "size",
+      ).get.call(state.pendingReactNodes);
+  } catch {
+    return refuse("pending_nodes");
+  }
+  if (counts) counts.pendingNodeCount = Math.min(pendingNodeCount, 30000);
+  if (pendingNodeCount > 0) return refuse("pending_nodes");
+  let beforeRoots;
+  let beforeGeneration;
+  try {
+    beforeRoots = codexRendererScopeRootIdentities();
+    beforeGeneration = codexRendererMutationGeneration();
+  } catch {
+    return refuse("roots_unavailable");
+  }
+  if (!beforeRoots.length) return refuse("roots_unavailable");
+  let hints;
+  try {
+    hints = codexCurrentAppServerScopeHints(true);
+    if (counts && Array.isArray(hints))
+      counts.hintCount = Math.min(hints.length, 17);
+  } catch {
+    return refuse("hints_read_failed");
+  }
+  let afterRoots;
+  try {
+    afterRoots = codexRendererScopeRootIdentities();
+    if (
+      beforeRoots.length !== afterRoots.length ||
+      !beforeRoots.every((root, index) => root === afterRoots[index]) ||
+      beforeGeneration !== codexRendererMutationGeneration() ||
+      state.pendingReactNodes?.size > 0
+    )
+      return refuse("snapshot_changed");
+  } catch {
+    return refuse("snapshot_changed");
+  }
+  if (state.scopedAppServerScopeHintScanComplete !== true)
+    return refuse("hints_incomplete");
+  if (
+    !Array.isArray(hints) ||
+    hints.length < brands.size ||
+    hints.length > CODEX_APP_SERVER_SCOPE_HINT_LIMIT
+  )
+    return refuse("hint_count_mismatch");
+  const scopes = new Set(hints);
+  if (scopes.size !== hints.length) return refuse("hint_count_mismatch");
+  const scopeCaches = new Map();
+  const brandCaches = new Map();
+  for (const scope of hints) {
+    let cache;
+    let brand;
+    try {
+      brand = codexNativeReasoningOwnData(scope, "scope");
+      if (
+        !codexDeclaredDependencyScope(scope) ||
+        !brands.has(brand) ||
+        !codexRendererScopeIsMounted(scope)
+      )
+        return refuse("scope_unmounted");
+      cache = codexNativeReasoningScopeQueryCache(scope, inspection);
+    } catch {
+      return refuse("scope_cache_unverified");
+    }
+    if (!cache || !codexNativeReasoningCacheHasManagedQuery(cache))
+      return refuse("scope_cache_unverified");
+    // The brand identifies a scope definition, not a unique instance. Keep
+    // every mounted scope on its exact managed cache; never guess which cache
+    // owns the native preference when a single brand spans different caches.
+    if (brandCaches.has(brand) && brandCaches.get(brand) !== cache)
+      return refuse("hints_ambiguous");
+    brandCaches.set(brand, cache);
+    scopeCaches.set(scope, cache);
+  }
+  if (brandCaches.size !== brands.size) return refuse("hint_count_mismatch");
+  return {
+    kind: "canonical_hints",
+    scopes,
+    scopeCaches,
+    caches: new Set(scopeCaches.values()),
+    roots: afterRoots,
+    mutationGeneration: beforeGeneration,
+  };
+};
+const codexCurrentNativeReasoningOwnerProof = (inspection) => {
+  const snapshotCurrent = codexRendererScopeSnapshotIsCurrent();
+  const proof = snapshotCurrent
+    ? codexNativeReasoningCompleteOwnerProof(inspection)
+    : codexNativeReasoningCanonicalOwnerProof(inspection);
+  if (!proof) return null;
+  // A stale broad snapshot may still find a same-node ref replacement through
+  // canonical hints. Preserve the identities from the last published proof
+  // until a complete current scan can establish a new owner boundary.
+  if (!snapshotCurrent) {
+    const previous = state.nativeReasoningVisibilityOwnerProof;
+    if (previous) {
+      const retainedScopes = new Set();
+      const retainedScopeCaches = new Map();
+      for (const [scope, cache] of proof.scopeCaches) {
+        if (previous.scopeCaches.get(scope) !== cache) continue;
+        retainedScopes.add(scope);
+        retainedScopeCaches.set(scope, cache);
+      }
+      if (!retainedScopes.size) return null;
+      if (retainedScopes.size !== proof.scopeCaches.size)
+        return {
+          ...proof,
+          scopes: retainedScopes,
+          scopeCaches: retainedScopeCaches,
+          caches: new Set(retainedScopeCaches.values()),
+        };
+    }
+  }
+  return proof;
+};
+const codexCurrentNativeReasoningQueryCaches = (inspection) =>
+  codexCurrentNativeReasoningOwnerProof(inspection)?.caches || null;
 const readCodexNativeReasoningVisibility = (cache, efforts) => {
   if (state.nativeReasoningVisibilityRequired !== true)
     return { status: "not_required", missingEfforts: [] };
   const unverified = () => ({ status: "unverified", missingEfforts: [] });
   try {
-    if (!codexRendererScopeSnapshotIsCurrent()) return unverified();
     const atoms = state.nativeReasoningVisibilityAtoms;
     if (
       !Array.isArray(atoms) ||
@@ -115,16 +300,14 @@ const readCodexNativeReasoningVisibility = (cache, efforts) => {
       if (!expected.includes(effort)) expected.push(effort);
     }
     // Scope ownership is fresh, not inferred from the historical patched-cache
-    // map. Use the intrinsic iterator only for the canonical current scope Set.
-    const scopes = Set.prototype.values.call(
-      state.scopedAppServerScopeCandidates,
-    );
-    for (let inspected = 0; inspected < 2048; inspected += 1) {
-      const entry = scopes.next();
-      if (entry.done) break;
-      const scope = entry.value;
+    // map. Complete inventories and the narrower canonical atom proof both
+    // return exact current scope/cache pairs.
+    const ownerProof = codexCurrentNativeReasoningOwnerProof();
+    if (!ownerProof || !ownerProof.caches.has(cache)) return unverified();
+    let missingEfforts = null;
+    for (const scope of ownerProof.scopes) {
       try {
-        const currentCache = codexNativeReasoningScopeQueryCache(scope);
+        const currentCache = ownerProof.scopeCaches.get(scope);
         if (!currentCache || currentCache !== cache) continue;
         const get = codexNativeReasoningOwnData(scope, "get");
         if (typeof get !== "function") return unverified();
@@ -132,18 +315,25 @@ const readCodexNativeReasoningVisibility = (cache, efforts) => {
         // chain. Never invoke atom.resolve or a new hook/factory ourselves.
         const enabled = get.call(scope, atom);
         Set.prototype.has.call(enabled, "");
-        return {
-          status: "known",
-          missingEfforts: expected.filter(
-            (effort) => !Set.prototype.has.call(enabled, effort),
-          ),
-        };
+        const missing = expected.filter(
+          (effort) => !Set.prototype.has.call(enabled, effort),
+        );
+        // Scopes can share a query cache while resolving different preferences.
+        // Without agreement, the cache cannot prove which efforts are visible.
+        if (
+          missingEfforts &&
+          (missing.length !== missingEfforts.length ||
+            missing.some((effort, index) => effort !== missingEfforts[index]))
+        )
+          return unverified();
+        missingEfforts = missing;
       } catch {
         // No alternate scope may turn a failed same-owner native read into a
         // positive proof by borrowing another account or historical value.
         return unverified();
       }
     }
+    if (missingEfforts) return { status: "known", missingEfforts };
   } catch {}
   return unverified();
 };
@@ -308,8 +498,7 @@ const codexNativeReasoningStartPickerPowerSync = () => {
         state.nativeReasoningVisibilityEnabled !== true ||
         state.nativeReasoningVisibilityReconciliation?.status !== "known"
       ) {
-        if (state.nativeReasoningVisibilityEnabled !== true)
-          codexNativeReasoningRestorePickerPowerSelections();
+        codexNativeReasoningRestorePickerPowerSelections();
         return;
       }
       codexNativeReasoningPatchPickerPowerSelections();
@@ -340,6 +529,10 @@ const codexNativeReasoningPatchPickerPowerSelections = () => {
   const payload = currentPayload();
   if (
     state.nativeReasoningVisibilityEnabled !== true ||
+    !codexNativeReasoningRetainedOwnerProofIsCurrent() ||
+    !Array.from(state.nativeReasoningVisibilityOwnerProof.caches).some(
+      (cache) => codexNativeReasoningCacheHasManagedQuery(cache),
+    ) ||
     payload.catalogAvailable !== true ||
     typeof payload.modelProvider !== "string" ||
     !payload.modelProvider.trim() ||
@@ -445,6 +638,10 @@ const codexNativeReasoningPatchPickerPowerSelections = () => {
         residual.push(selection);
       }
     }
+    // DOM/Fiber lookup may cross a renderer update. Do not retain an old
+    // projection merely because its native array already contains all efforts.
+    if (!codexNativeReasoningRetainedOwnerProofIsCurrent())
+      return codexNativeReasoningRestorePickerPowerSelections();
     const missing = efforts.filter((effort) => !existing.has(effort));
     if (!missing.length && removed === 0) {
       const retained = patches.get(props);
@@ -472,6 +669,8 @@ const codexNativeReasoningPatchPickerPowerSelections = () => {
       next.push(generated);
     }
     next.push(...residual);
+    if (!codexNativeReasoningRetainedOwnerProofIsCurrent())
+      return codexNativeReasoningRestorePickerPowerSelections();
     try {
       Object.defineProperty(props, "powerSelections", {
         ...field,
@@ -500,14 +699,50 @@ const codexNativeReasoningPatchPickerPowerSelections = () => {
   return patched;
 };
 
-const codexNativeReasoningScopeIsCurrent = (scope, cache) => {
-  if (!codexRendererScopeBindingIsCurrent(scope)) return false;
+// A mounted node is not proof that its old scope is still the current own-data
+// binding: refs can replace scopes without changing the root, node or mutation
+// generation. Reuse the same bounded owner proof used during reconciliation,
+// and require its exact scope/cache inventory before any retained mutation.
+const codexNativeReasoningRetainedOwnerProofIsCurrent = (scope, cache) => {
+  const proof = state.nativeReasoningVisibilityOwnerProof;
+  if (!proof) return false;
   try {
-    return codexNativeReasoningScopeQueryCache(scope) === cache;
+    if (scope && proof.scopeCaches.get(scope) !== cache) return false;
+    // Complete discovery retains exact binding provenance. Native atom reads
+    // validate only their own path, not unrelated renderer objects; unscoped
+    // picker mutations must still revalidate the whole inventory below.
+    if (proof.kind === "complete" && scope)
+      return (
+        codexRendererScopeBindingIsCurrent(scope) &&
+        codexNativeReasoningScopeQueryCache(scope) === cache
+      );
+    let current;
+    if (proof.kind === "canonical_hints") {
+      const roots = codexRendererScopeRootIdentities();
+      if (
+        !Array.isArray(proof.roots) ||
+        roots.length !== proof.roots.length ||
+        !roots.every((root, index) => root === proof.roots[index]) ||
+        proof.mutationGeneration !== codexRendererMutationGeneration()
+      )
+        return false;
+      current = codexNativeReasoningCanonicalOwnerProof();
+    } else if (proof.kind === "complete") {
+      current = codexNativeReasoningCompleteOwnerProof();
+    }
+    return Boolean(
+      current &&
+      current.scopeCaches.size === proof.scopeCaches.size &&
+      Array.from(proof.scopeCaches).every(
+        ([scope, cache]) => current.scopeCaches.get(scope) === cache,
+      ),
+    );
   } catch {
     return false;
   }
 };
+const codexNativeReasoningScopeIsCurrent = (scope, cache) =>
+  codexNativeReasoningRetainedOwnerProofIsCurrent(scope, cache);
 const codexNativeReasoningCacheHasManagedQuery = (cache) => {
   try {
     const getAll = codexDeclaredMethod(cache, "getAll");
@@ -595,6 +830,14 @@ const reconcileCodexNativeReasoningVisibility = (requestedEfforts) => {
     restoredScopes: 0,
     refusalReason: null,
     ownerScopeCount: 0,
+    canonicalOwnerRefusalReason: null,
+    canonicalOwnerCounts: {
+      // Saturated overflow sentinels are 17 atoms/hints and 30000 pending nodes.
+      appServerStatusAtomCount: 0,
+      uniqueBrandCount: 0,
+      hintCount: 0,
+      pendingNodeCount: 0,
+    },
     ownerFailureCounts: {
       scope_contract: 0,
       node_unavailable: 0,
@@ -609,6 +852,8 @@ const reconcileCodexNativeReasoningVisibility = (requestedEfforts) => {
       inventory_capped: 0,
       inventory_read_failed: 0,
       owner_snapshot_unverified: 0,
+      canonical_owner_unavailable: 0,
+      canonical_owner_unverified: 0,
     },
   };
   if (state.nativeReasoningVisibilityRequired !== true) {
@@ -639,12 +884,8 @@ const reconcileCodexNativeReasoningVisibility = (requestedEfforts) => {
     return result;
   }
   // The complete owner-cache inventory below validates retained nested
-  // provenance once. Per-scope native reads use only their exact binding path.
-  if (!codexRendererScopeSnapshotRootsAreCurrent()) {
-    result.refusalReason = "renderer_scope_snapshot_unverified";
-    result.restoredScopes = codexNativeReasoningRestoreAndRefresh();
-    return result;
-  }
+  // provenance once. If that broad inventory is capped, a separate exact
+  // canonical atom-owner proof may authorize only native visibility.
   const atom = codexNativeReasoningOwnData(atoms, "0");
   const atomScope = codexNativeReasoningOwnData(atom, "scope");
   if (
@@ -655,31 +896,17 @@ const reconcileCodexNativeReasoningVisibility = (requestedEfforts) => {
     result.restoredScopes = codexNativeReasoningRestoreAndRefresh();
     return result;
   }
-  const scopes = state.scopedAppServerScopeCandidates;
-  if (!(scopes instanceof Set)) {
-    result.refusalReason = "scope_set_unverified";
+  const ownerProof = codexCurrentNativeReasoningOwnerProof(result);
+  if (!ownerProof) {
+    result.refusalReason = codexRendererScopeSnapshotRootsAreCurrent()
+      ? "owner_cache_inventory_unverified"
+      : "renderer_scope_snapshot_unverified";
     result.restoredScopes = codexNativeReasoningRestoreAndRefresh();
     return result;
   }
-  const currentScopes = new Set();
-  try {
-    const iterator = Set.prototype.values.call(scopes);
-    for (let index = 0; index < 2048; index += 1) {
-      const entry = iterator.next();
-      if (entry.done) break;
-      currentScopes.add(entry.value);
-    }
-  } catch {
-    result.refusalReason = "scope_enumeration_failed";
-    result.restoredScopes = codexNativeReasoningRestoreAndRefresh();
-    return result;
-  }
-  const currentCaches = codexCurrentNativeReasoningQueryCaches(result);
-  if (!currentCaches) {
-    result.refusalReason = "owner_cache_inventory_unverified";
-    result.restoredScopes = codexNativeReasoningRestoreAndRefresh();
-    return result;
-  }
+  const currentScopes = ownerProof.scopes;
+  const currentCaches = ownerProof.caches;
+  state.nativeReasoningVisibilityOwnerProof = ownerProof;
   const patches = codexNativeReasoningPatchMap();
   let newlyPatchedScopes = 0;
   // A changed atom, scope, or renderer ownership snapshot invalidates the old
@@ -689,10 +916,11 @@ const reconcileCodexNativeReasoningVisibility = (requestedEfforts) => {
     if (retained) {
       try {
         const getDescriptor = Object.getOwnPropertyDescriptor(scope, "get");
-        const cache = codexNativeReasoningScopeQueryCache(scope);
+        const cache = ownerProof.scopeCaches.get(scope);
         retained =
           getDescriptor?.value === record.patched &&
           Boolean(cache) &&
+          cache === record.cache &&
           currentCaches.has(cache) &&
           codexNativeReasoningCacheHasManagedQuery(cache);
       } catch {
@@ -727,21 +955,17 @@ const reconcileCodexNativeReasoningVisibility = (requestedEfforts) => {
     if (needsRefresh) codexNativeReasoningRefreshPickerObservers();
     return result;
   }
-  state.nativeReasoningVisibilityEnabled = true;
   for (const scope of currentScopes) {
-    const cache = codexNativeReasoningScopeQueryCache(scope);
+    const cache = ownerProof.scopeCaches.get(scope);
     if (
       !cache ||
       !currentCaches.has(cache) ||
       !codexNativeReasoningScopeIsCurrent(scope, cache)
     ) {
-      result.refusalReason ||= "owner_cache_inventory_unverified";
-      continue;
+      result.refusalReason = "owner_cache_inventory_unverified";
+      break;
     }
-    if (!codexNativeReasoningCacheHasManagedQuery(cache)) {
-      result.refusalReason ||= "no_managed_picker_query";
-      continue;
-    }
+    if (!codexNativeReasoningCacheHasManagedQuery(cache)) continue;
     const existing = patches.get(scope);
     if (existing?.atom === atom) {
       result.patchedScopes += 1;
@@ -755,19 +979,19 @@ const reconcileCodexNativeReasoningVisibility = (requestedEfforts) => {
         (!ownDescriptor.configurable ||
           ("writable" in ownDescriptor && !ownDescriptor.writable)))
     ) {
-      result.refusalReason ||= "native_get_unpatchable";
-      continue;
+      result.refusalReason = "native_get_unpatchable";
+      break;
     }
     let baseline;
     try {
       baseline = original.call(scope, atom);
       if (!codexNativeReasoningCloneSet(baseline)) {
-        result.refusalReason ||= "native_set_unverified";
-        continue;
+        result.refusalReason = "native_set_unverified";
+        break;
       }
     } catch {
-      result.refusalReason ||= "native_get_read_failed";
-      continue;
+      result.refusalReason = "native_get_read_failed";
+      break;
     }
     const patched = function ccSwitchNativeReasoningVisibility(
       atomValue,
@@ -807,38 +1031,43 @@ const reconcileCodexNativeReasoningVisibility = (requestedEfforts) => {
       newlyPatchedScopes += 1;
       result.patchedScopes += 1;
     } catch {
-      result.refusalReason ||= "native_get_patch_failed";
+      result.refusalReason = "native_get_patch_failed";
+      break;
     }
   }
-  result.status = patches.size ? "known" : "unverified";
-  if (result.status === "known") result.refusalReason = null;
-  else result.refusalReason ||= "no_patchable_native_scope";
-  if (result.status === "known") {
-    const needsRefresh =
-      newlyPatchedScopes > 0 ||
-      result.restoredScopes > 0 ||
-      state.nativeReasoningVisibilityRefreshKey !== refreshKey;
-    state.nativeReasoningVisibilityRefreshKey = refreshKey;
-    if (needsRefresh)
-      state.nativeReasoningVisibilityRefreshVersion =
-        (Number.isSafeInteger(state.nativeReasoningVisibilityRefreshVersion)
-          ? state.nativeReasoningVisibilityRefreshVersion
-          : 0) + 1;
-    if (shouldExposeNativeEfforts) {
-      codexNativeReasoningStartPickerPowerSync();
-      codexNativeReasoningPatchPickerPowerSelections();
-    }
-    if (needsRefresh) {
-      codexNativeReasoningRefreshPickerObservers();
-      const schedule =
-        typeof queueMicrotask === "function"
-          ? queueMicrotask
-          : (callback) => setTimeout(callback, 0);
-      schedule(() => {
-        if (state.nativeReasoningVisibilityEnabled === true)
-          codexNativeReasoningPatchPickerPowerSelections();
-      });
-    }
+  // The menu has no authoritative scope identifier of its own. Publishing a
+  // partial bridge can add choices even when the native scope that handles
+  // selection refused them. Restore all owned projections on a failed proof.
+  if (result.refusalReason || !patches.size) {
+    result.refusalReason ||= "no_managed_picker_query";
+    result.restoredScopes += codexNativeReasoningRestoreAndRefresh();
+    result.patchedScopes = 0;
+    return result;
+  }
+  state.nativeReasoningVisibilityEnabled = true;
+  result.status = "known";
+  const needsRefresh =
+    newlyPatchedScopes > 0 ||
+    result.restoredScopes > 0 ||
+    state.nativeReasoningVisibilityRefreshKey !== refreshKey;
+  state.nativeReasoningVisibilityRefreshKey = refreshKey;
+  if (needsRefresh)
+    state.nativeReasoningVisibilityRefreshVersion =
+      (Number.isSafeInteger(state.nativeReasoningVisibilityRefreshVersion)
+        ? state.nativeReasoningVisibilityRefreshVersion
+        : 0) + 1;
+  codexNativeReasoningStartPickerPowerSync();
+  codexNativeReasoningPatchPickerPowerSelections();
+  if (needsRefresh) {
+    codexNativeReasoningRefreshPickerObservers();
+    const schedule =
+      typeof queueMicrotask === "function"
+        ? queueMicrotask
+        : (callback) => setTimeout(callback, 0);
+    schedule(() => {
+      if (state.nativeReasoningVisibilityEnabled === true)
+        codexNativeReasoningPatchPickerPowerSelections();
+    });
   }
   return result;
 };

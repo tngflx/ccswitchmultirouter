@@ -1343,7 +1343,9 @@ mod tests {
                     "codexCache": {"cacheMode": "qwen_context_cache"},
                     "supportsParallelToolCalls": true,
                     "baseInstructions": "Use Qwen tools.",
-                    "codexUltra": {"enabled": true, "providerEffort": "high"}
+                    "codexUltra": {
+                        "enabled": true, "providerEffort": "high", "providerEffortSource": "user"
+                    }
                 }]}
             }),
             None,
@@ -1367,6 +1369,67 @@ mod tests {
         assert_eq!(models[0]["supportsParallelToolCalls"], true);
         assert_eq!(models[0]["baseInstructions"], "Use Qwen tools.");
         assert_eq!(models[0]["codexUltra"]["providerEffort"], "high");
+        assert_eq!(models[0]["codexUltra"]["providerEffortSource"], "user");
+    }
+
+    #[test]
+    fn projected_models_keep_legacy_sublyx_ultra_overlay_consistent_with_reasoning() {
+        let db = Database::memory().expect("memory db");
+        let mut router = router();
+        router.settings_config["codexRouting"]["defaultRouteId"] = json!("sublyx");
+        router.settings_config["codexRouting"]["routes"][0]["id"] = json!("sublyx");
+        router.settings_config["codexRouting"]["routes"][0]["targetProviderId"] = json!("sublyx");
+
+        let mut target = Provider::with_id(
+            "sublyx".to_string(),
+            "Sublyx".to_string(),
+            json!({
+                "baseUrl": "https://api.sublyx.org/v1",
+                "modelCatalog": {"models": [{
+                    "model": "public-model",
+                    "upstreamModel": "gpt-6.2-sol",
+                    "reasoning": {
+                        "schemaVersion": 2,
+                        "supportStatus": "confirmed_supported",
+                        "controlKind": "graded",
+                        "supportedEfforts": ["low", "medium", "high", "xhigh"],
+                        "defaultEffort": "xhigh",
+                        "disableAllowed": false,
+                        "upstream": {
+                            "format": "reasoning_object",
+                            "parameter": "reasoning.effort",
+                            "effortMap": {
+                                "low": "low",
+                                "medium": "medium",
+                                "high": "high",
+                                "xhigh": "xhigh"
+                            }
+                        },
+                        "source": "builtin",
+                        "codexUltraOrchestration": {
+                            "enabled": true,
+                            "providerEffort": "xhigh"
+                        }
+                    },
+                    "codexUltra": {"enabled": true, "providerEffort": "xhigh"}
+                }]}
+            }),
+            None,
+        );
+        target.meta = Some(ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        db.save_provider("codex", &router).expect("save router");
+        db.save_provider("codex", &target).expect("save target");
+
+        let artifact = build_projection_artifact(&db, "router").expect("projection artifact");
+        let model = &artifact.projection_settings["modelCatalog"]["models"][0];
+        assert_eq!(
+            model["reasoning"]["codexUltraOrchestration"]["providerEffort"],
+            "max"
+        );
+        assert_eq!(model["codexUltra"]["providerEffort"], "max");
     }
 
     #[test]

@@ -47,6 +47,7 @@ const harness = <T>(
   const state = {
     payload: payload(),
     reasoningQueryCaches: new Map([[client.getQueryCache(), {}]]),
+    scopedAppServerScopeScanComplete: true,
   };
   return {
     client,
@@ -280,6 +281,58 @@ describe("Codex Desktop picker observer diagnostics", () => {
     expect(loadDiagnostics(state)()).toMatchObject({
       status: "unverified",
       booleanControlUnverifiedModelCount: 1,
+    });
+  });
+
+  it("does not downgrade readiness for Boolean models that are not the mounted picker selection", () => {
+    const marker = {
+      kind: "boolean",
+      disableAllowed: true,
+      fingerprint: "canonical-binary",
+    };
+    const models = ["selected", "off-selection"];
+    const observer = {
+      options: { queryKey: key },
+      getCurrentResult: () => ({
+        status: "success",
+        data: {
+          models: models.map((model) => ({
+            model,
+            supportedReasoningEfforts: ["none", "medium"].map(
+              (reasoningEffort) => ({ reasoningEffort }),
+            ),
+          })),
+        },
+      }),
+    };
+    const cache = { getAll: () => [{ queryKey: key, observers: [observer] }] };
+    const state: Record<string, any> = {
+      payload: {
+        ...payload(),
+        modelNames: models,
+        models: models.map((model) => ({
+          model,
+          supported_reasoning_levels: [],
+          ccSwitchReasoningControl: marker,
+        })),
+      },
+      reasoningQueryCaches: new Map([[cache, {}]]),
+      readNativeBooleanReasoningControlDiagnostics: (model: string) =>
+        model === "selected"
+          ? {
+              status: "ready",
+              model,
+              selectedState: "on",
+              visibleStates: ["off", "on"],
+            }
+          : { status: "not_observed", model },
+    };
+
+    expect(loadDiagnostics(state)()).toMatchObject({
+      status: "ready",
+      booleanControlReadyModelCount: 1,
+      booleanControlUnverifiedModelCount: 0,
+      booleanControlNotObservedModelCount: 1,
     });
   });
 
@@ -1008,6 +1061,22 @@ describe("optional current-owner picker model observations", () => {
         unavailable: true,
         rows: [],
         unavailableReasons: expect.arrayContaining(["native_owner_unverified"]),
+      });
+      expect(h.state.visibilityReadCount).toBe(0);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it("keeps readiness pending while the current native owner scan is incomplete", () => {
+    const h = observationHarness((value) => ({ models: value.data }));
+    try {
+      h.state.currentNativeCaches = null;
+      h.state.scopedAppServerScopeScanComplete = false;
+      expect(h.read()).toMatchObject({
+        status: "pending",
+        nativeVisibilityUnverifiedObserverCount: 0,
+        pickerObserverCount: 1,
       });
       expect(h.state.visibilityReadCount).toBe(0);
     } finally {

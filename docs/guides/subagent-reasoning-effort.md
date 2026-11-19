@@ -69,10 +69,20 @@ not reclassified by their model name or prompt text, so main-agent requests stay
 unchanged. Generation requests are scoped explicitly to Responses and Chat;
 compact, search, and image-control endpoints are left unchanged. For native Chat,
 the same capability mapping chooses the provider's actual effort parameter.
-Conflicting advanced provider request-body overrides fail before forwarding,
-with instructions to remove the conflicting controls or select Profile settings;
-they cannot silently turn High back into Max. Unrelated body overrides remain
-allowed, and protocol thinking-history/output-budget safety guards remain in force.
+The canonical reasoning boundary also applies to main-agent generation requests:
+flat and nested effort aliases must agree, and explicit Boolean intent must not
+contradict the effort. Native Chat maps controls once without rebuilding messages
+or passing its mapped body through the Responses mapper again. Synthetic Ultra
+must resolve to a declared provider-native value; it is never sent literally.
+
+Conflicting advanced provider request-body overrides fail before forwarding for
+both main and child requests. They cannot silently turn High back into Max,
+restore literal Ultra, add a competing effort alias, or re-enable guarded-off
+thinking. Remove the conflicting controls from the advanced body settings.
+Selecting **Profile settings** disables the plan-level override but does not
+disable canonical capability validation. Unrelated body overrides and ancillary
+reasoning summary fields remain allowed, and protocol thinking-history/output-budget
+safety guards remain in force.
 Clients that omit the explicit child marker cannot receive the
 request-boundary override; managed role defaults and parent guidance still apply.
 

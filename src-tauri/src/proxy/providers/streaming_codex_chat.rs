@@ -18,7 +18,7 @@ use super::{
 };
 use crate::protocol_compatibility::ReasoningProjection;
 use crate::proxy::json_canonical::canonicalize_tool_arguments_str;
-use crate::proxy::sse::{strip_sse_field, take_sse_block};
+use crate::proxy::sse::{strip_sse_field, BoundedSseFrames, SseFrame};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -1018,6 +1018,23 @@ impl ChatToResponsesState {
 
         sse::response_failed(&response)
     }
+
+    fn oversized_sse_frame(&mut self) -> Bytes {
+        self.failed_error_event(json!({
+            "code": "upstream_sse_frame_too_large",
+            "message": "Upstream Chat Completions SSE event exceeded the proxy size limit",
+            "retryable": false,
+        }))
+    }
+}
+
+fn decode_chat_sse_frame(frame: &[u8]) -> std::borrow::Cow<'_, str> {
+    // The converter emits its own blank line when forwarding comments.
+    let payload = frame
+        .strip_suffix(b"\r\n\r\n")
+        .or_else(|| frame.strip_suffix(b"\n\n"))
+        .unwrap_or(frame);
+    String::from_utf8_lossy(payload)
 }
 
 fn chat_delta_reasoning_text(delta: &Value) -> Option<String> {
@@ -1077,8 +1094,7 @@ pub fn create_responses_sse_stream_from_chat_with_context_and_projection<
     reasoning_projection: ReasoningProjection,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
-        let mut buffer = String::new();
-        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut frames = BoundedSseFrames::default();
         let mut state = ChatToResponsesState::with_tool_context_and_projection(
             tool_context,
             reasoning_projection,
@@ -1090,9 +1106,14 @@ pub fn create_responses_sse_stream_from_chat_with_context_and_projection<
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
-
-                    while let Some(block) = take_sse_block(&mut buffer) {
+                    let mut input = bytes.as_ref();
+                    while let Some(frame) = frames.read(&mut input) {
+                        let SseFrame::Complete(frame) = frame else {
+                            yield Ok(state.oversized_sse_frame());
+                            stream_failed = true;
+                            break;
+                        };
+                        let block = decode_chat_sse_frame(&frame);
                         if block.trim().is_empty() {
                             continue;
                         }
@@ -1219,8 +1240,7 @@ where
             tool_context,
             reasoning_projection,
         );
-        let mut buffer = String::new();
-        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut frames = BoundedSseFrames::default();
         let mut stream_failed = false;
         let mut done_received = false;
 
@@ -1228,13 +1248,14 @@ where
             while let Some(chunk) = current_stream.next().await {
                 match chunk {
                     Ok(bytes) => {
-                        crate::proxy::sse::append_utf8_safe(
-                            &mut buffer,
-                            &mut utf8_remainder,
-                            &bytes,
-                        );
-
-                        while let Some(block) = take_sse_block(&mut buffer) {
+                        let mut input = bytes.as_ref();
+                        while let Some(frame) = frames.read(&mut input) {
+                            let SseFrame::Complete(frame) = frame else {
+                                yield Ok(state.oversized_sse_frame());
+                                stream_failed = true;
+                                break;
+                            };
+                            let block = decode_chat_sse_frame(&frame);
                             if block.trim().is_empty() {
                                 continue;
                             }
@@ -1287,8 +1308,7 @@ where
                                     Ok(Some(next_stream)) => {
                                         state.begin_hosted_continuation();
                                         current_stream = next_stream;
-                                        buffer.clear();
-                                        utf8_remainder.clear();
+                                        frames = BoundedSseFrames::default();
                                         continue 'rounds;
                                     }
                                     Ok(None) => {
@@ -1421,6 +1441,72 @@ mod tests {
             .collect::<Vec<_>>()
             .await
             .concat()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_unterminated_chat_frame_fails_both_converters_before_eof() {
+        let padding = Bytes::from(vec![b'x'; crate::proxy::sse::MAX_SSE_FRAME_BYTES]);
+        for hosted in [false, true] {
+            let upstream = stream::iter([
+                Ok::<_, std::io::Error>(padding.clone()),
+                Ok(Bytes::from_static(b"x")),
+            ])
+            .chain(stream::pending());
+            let converted: ChatSseStream = if hosted {
+                Box::pin(create_responses_sse_stream_from_chat_with_hosted_loop(
+                    Box::pin(upstream),
+                    CodexToolContext::default(),
+                    None,
+                    |_calls, _assistant| async { panic!("oversized input must not invoke tools") },
+                ))
+            } else {
+                Box::pin(create_responses_sse_stream_from_chat(upstream))
+            };
+            let chunks = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                converted.collect::<Vec<_>>(),
+            )
+            .await
+            .expect("oversized frame must close the converter without waiting for EOF");
+            let output = String::from_utf8(
+                chunks
+                    .into_iter()
+                    .map(Result::unwrap)
+                    .collect::<Vec<_>>()
+                    .concat(),
+            )
+            .unwrap();
+            assert_eq!(output.matches("event: response.failed\n").count(), 1);
+            assert!(!output.contains("event: response.completed\n"));
+            let events = parse_sse_events(&output);
+            let failed = events
+                .iter()
+                .find(|event| event["type"] == "response.failed")
+                .unwrap();
+            assert_eq!(
+                failed["response"]["error"]["code"],
+                "upstream_sse_frame_too_large"
+            );
+            assert_eq!(failed["response"]["error"]["retryable"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn split_crlf_comment_and_utf8_payload_keep_existing_wire_behavior() {
+        let output = collect_terminal_boundary_stream(vec![
+            Ok(Bytes::from_static(b": checkpoint\r\n\r")),
+            Ok(Bytes::from_static(
+                b"\ndata: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"caf\xc3",
+            )),
+            Ok(Bytes::from_static(
+                b"\xa9\"},\"finish_reason\":\"stop\"}]}\r\n\r\ndata: [DONE]\n\n",
+            )),
+        ])
+        .await;
+
+        assert!(output.starts_with(": checkpoint\n\nevent:"));
+        assert!(output.contains("caf\u{e9}"));
+        assert_eq!(output.matches("event: response.completed\n").count(), 1);
     }
 
     #[tokio::test]

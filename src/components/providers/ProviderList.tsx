@@ -329,8 +329,8 @@ export function ProviderList({
       }
       outcome.switchWarnings.forEach((warning) => toast.warning(warning));
     },
-    onError: (error: Error) => {
-      toast.error(error.message);
+    onError: (error: unknown) => {
+      toast.error(extractErrorMessage(error) || t("common.unknown"));
     },
   });
 

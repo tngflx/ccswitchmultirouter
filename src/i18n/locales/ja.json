@@ -41,7 +41,8 @@
       "booleanControlUnverified": "すべてのオン・オフ推論モデルについてネイティブの切り替え操作を検証できませんでした"
     },
     "booleanUnverifiedCount": "推論オン・オフの未検証数：{{count}}",
-    "booleanReadyCount": "推論オン・オフの検証済み数：{{count}}"
+    "booleanReadyCount": "推論オン・オフの検証済み数：{{count}}",
+    "booleanNotObservedCount": "推論オン・オフの未観測数：{{count}}"
   },
   "codexSubagentGovernance": {
     "title": "行動指針と実行権限",
@@ -56,6 +57,7 @@
     "globalLabel": "すべてのサブエージェントの推論強度",
     "globalProfileOption": "プロファイル設定（上書きなし）",
     "globalLegacyOption": "保存済みの旧推論強度（保持済み）：{{effort}}",
+    "globalInvalidOption": "保存済みの推論強度が無効です",
     "globalHighOption": "High（高）",
     "globalMaxOption": "Max（最大）",
     "globalHint": "V1 と V2 の両方に適用され、選択した強度に対応するモデルのみ上書きします。上書きとして選べるのは Max と High のみです。保存済みのプロファイル設定とメインエージェントは変更されません。非対応モデルは元の推論ポリシーを維持します。プロファイル設定を選ぶと元に戻せます。",
@@ -1276,7 +1278,7 @@
       "unavailable": "有効 · 利用不可",
       "off": "オフ",
       "setup": "プライベートサイトの設定",
-      "privateNetwork": "最初にこの PC とタブレット/ノート PC でプライベート HTTPS 接続を設定してください（Tailscale Serve など）。ループバック専用です。このポートの転送やモデル API・CDP の公開はしないでください。",
+      "privateNetwork": "Tailscale でプライベート接続し、Web サイトはご自身の PC で提供します。タブレットやノート PC には Tailscale とブラウザーが必要です。Cloudflare は任意のドメイン管理にのみ使用し、通信の中継には使用しません。",
       "origin": "正確な HTTPS サイトのオリジン",
       "security": "パスキーと取り消し可能なブラウザーセッションで保護します。Codex のツール/サンドボックス承認やアカウント使用量制限の回避は行いません。",
       "enable": "所有者リモートを有効化",
@@ -1293,7 +1295,19 @@
       "retryStatus": "状態の取得を再試行",
       "setupRequired": "リモートアクセスを有効にする前に、以下でプライベート HTTPS サイトを設定してください。",
       "retryListener": "リスナーを再試行",
-      "originPinned": "この環境は現在の HTTPS サイトに固定されています。変更には別途明示的なリセットとブラウザーの再登録が必要で、ここでは変更できません。"
+      "originPinned": "この環境は現在の HTTPS サイトに固定されています。変更には別途明示的なリセットとブラウザーの再登録が必要で、ここでは変更できません。",
+      "tailscaleSteps": "Tailscale プライベート接続の設定手順",
+      "setupStepDevices": "外出前に、このホストとタブレットまたはノート PC に Tailscale をインストールしてサインインします。ホストをオンラインに保ち、CCSwitch と互換性のある Codex セッションも利用可能にしてください。",
+      "setupStepAccess": "tailnet のルールを制限し、許可したデバイスだけがこのホストの HTTPS ポート（443）へ接続できるようにします。リスナー、モデル API、デバッグポートを公開せず、このプライベート構成では Funnel を使用しないでください。",
+      "setupStepServe": "ホストで Tailscale Serve を設定し、プライベート HTTPS をローカルの所有者リスナーへ転送します：",
+      "setupStepOrigin": "Serve が表示する正確な HTTPS オリジン（通常は .ts.net のホスト名）を下欄にコピーし、所有者アクセスを有効にします。Tailscale がそのホスト名の HTTPS を提供します。ローカルリスナーの動作だけではリモートアクセスを検証できません。",
+      "setupStepEnroll": "使い捨て登録リンクを作成し、60 秒以内にご自身のタブレットまたはノート PC で開いてパスキーを登録します。以後はサイトのブックマークを開き、会話を選択し、条件を満たす場合に続行します。操作ごとのホスト承認は不要です。",
+      "cloudflareOptional": "任意：Cloudflare はドメイン管理にのみ使用",
+      "cloudflareDnsOnly": ".ts.net のサイトに Cloudflare の設定は不要です。Cloudflare 管理の独自ドメインを使う場合は DNS のみ（オレンジ色のプロキシは無効）に設定し、HTTPS サービスを Tailscale のプライベートネットワーク内に保ち、この経路に Cloudflare Tunnel や Access を追加しないでください。",
+      "cloudflareCertificate": "Tailscale ホスト名への CNAME だけでは独自ホスト名の証明書は発行されません。独自ドメインには別途プライベート HTTPS プロキシと DNS-01 検証で発行した証明書が必要です。デバイス登録前に最終オリジンを決めてください。固定済みオリジンの変更には明示的なリセットと再登録が必要です。",
+      "cloudflareNoSecrets": "CCSwitch は Cloudflare API トークンやドメイン認証情報を必要としません。このフォーム、接続リンク、ログに入力しないでください。ドメイン管理は Codex サイトのホスティングや画面ミラーリングではありません。",
+      "openWebsite": "所有者サイトを開く",
+      "listenerOnly": "リスナーはローカルで動作しています。Tailscale、タブレット接続、Codex ブリッジ、選択した会話の準備完了を示すものではありません。サイトを開いても続行は送信されません。"
     },
     "tabConnectionsRecovery": "接続と復旧",
     "connectionsShortcutTitle": "リモート接続とクラッシュ復旧",
@@ -4826,6 +4840,17 @@
       "image_generation": "画像生成",
       "context_compaction": "コンテキスト圧縮",
       "unsupported": "未対応のコンテンツ"
+    },
+    "failure": {
+      "server_overloaded": "サーバー過負荷",
+      "usage_limit": "一時的な使用制限",
+      "rate_limit": "レート制限",
+      "internal_server_error": "サーバー内部エラー",
+      "authentication_error": "認証エラー",
+      "context_length_exceeded": "コンテキスト上限超過",
+      "invalid_request_error": "無効なリクエスト",
+      "connection_error": "接続エラー",
+      "unknown": "不明なエラー"
     },
     "operation": {
       "pending": "Continue は保留中です。以降は読み取り専用の状態確認のみを行います。",

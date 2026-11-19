@@ -309,6 +309,65 @@ describe("owner remote browser console", () => {
     expect(harness.node<HTMLButtonElement>("continue").disabled).toBe(false);
   });
 
+  it.each(["server_overloaded", "usage_limit", "connection_error"])(
+    "renders only the sanitized failure category for a failed turn: %s",
+    async (category) => {
+      const harness = setup((route) =>
+        route.startsWith("/view?")
+          ? response(
+              terminalErrorSnapshot("failed", {
+                turns: [
+                  {
+                    id: "base-one",
+                    status: "failed",
+                    failure: { category },
+                    items: [],
+                  },
+                ],
+              }),
+            )
+          : undefined,
+      );
+      await harness.controller.start();
+      await harness.controller.selectThread("thread-one");
+      expect(harness.node("transcript").textContent).toContain(
+        localeResources.en.translation.ownerRemoteConsole.failure[category],
+      );
+      expect(harness.node("transcript").textContent).not.toContain(
+        "retryAfterSeconds",
+      );
+    },
+  );
+
+  it("falls back to an unknown label for a malformed failure category without rendering raw details", async () => {
+    const harness = setup((route) =>
+      route.startsWith("/view?")
+        ? response(
+            terminalErrorSnapshot("interrupted", {
+              turns: [
+                {
+                  id: "base-one",
+                  status: "interrupted",
+                  failure: {
+                    category: "not-a-category",
+                    message: "provider secret should not be rendered",
+                  },
+                  items: [],
+                },
+              ],
+            }),
+          )
+        : undefined,
+    );
+    await harness.controller.start();
+    await harness.controller.selectThread("thread-one");
+    const content = harness.node("transcript").textContent;
+    expect(content).toContain(
+      localeResources.en.translation.ownerRemoteConsole.failure.unknown,
+    );
+    expect(content).not.toContain("provider secret");
+  });
+
   it("makes no transcript or device request before authentication", async () => {
     const harness = setup((route) =>
       route === "/session"
@@ -1269,6 +1328,27 @@ describe("owner remote browser console", () => {
         }
     }
   });
+  it("keeps every localized sanitized failure category label nonempty", () => {
+    const categories = [
+      "server_overloaded",
+      "usage_limit",
+      "rate_limit",
+      "internal_server_error",
+      "authentication_error",
+      "context_length_exceeded",
+      "invalid_request_error",
+      "connection_error",
+      "unknown",
+    ];
+    for (const resource of Object.values(localeResources)) {
+      const failure = resource.translation.ownerRemoteConsole.failure;
+      for (const category of categories)
+        expect(failure[category]).toEqual(expect.any(String));
+      for (const category of categories)
+        expect(failure[category].trim()).not.toBe("");
+    }
+  });
+
   it("roundtrips only bounded base64url passkey data", () => {
     const harness = setup();
     expect(

@@ -281,6 +281,18 @@ export const normalizeCodexCatalogModelsForSave = (
       item.protocolCapability,
     );
     const rawReasoning = item.reasoning;
+    const reasoningSummaryFormat =
+      typeof item.reasoningSummaryFormat === "string"
+        ? item.reasoningSummaryFormat.trim()
+        : undefined;
+    const defaultReasoningSummary =
+      typeof item.defaultReasoningSummary === "string"
+        ? item.defaultReasoningSummary.trim()
+        : undefined;
+    const apiFormatSource =
+      typeof item.apiFormatSource === "string"
+        ? item.apiFormatSource.trim()
+        : undefined;
     const reasoning =
       rawReasoning &&
       (rawReasoning.supportStatus !== undefined
@@ -384,6 +396,9 @@ export const normalizeCodexCatalogModelsForSave = (
         : {}),
       ...(baseInstructions ? { baseInstructions } : {}),
       ...(reasoning ? { reasoning } : {}),
+      ...(reasoningSummaryFormat ? { reasoningSummaryFormat } : {}),
+      ...(defaultReasoningSummary ? { defaultReasoningSummary } : {}),
+      ...(apiFormatSource ? { apiFormatSource } : {}),
       ...(protocolCapability ? { protocolCapability } : {}),
       ...(item.apiFormat ? { apiFormat: item.apiFormat } : {}),
       ...(item.codexCache ? { codexCache: { ...item.codexCache } } : {}),
@@ -398,6 +413,10 @@ export const normalizeCodexCatalogModelsForSave = (
               enabled: item.codexUltra.enabled,
               ...(item.codexUltra.providerEffort
                 ? { providerEffort: item.codexUltra.providerEffort }
+                : {}),
+              ...(item.codexUltra.providerEffort &&
+              item.codexUltra.providerEffortSource === "user"
+                ? { providerEffortSource: "user" as const }
                 : {}),
             },
           }

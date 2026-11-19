@@ -47,6 +47,7 @@ type View = {
       status?: string;
     }>;
     truncated: boolean;
+    failure?: { category: string };
   }>;
 };
 type Binding = {
@@ -173,7 +174,7 @@ const createHarness = (
         if (turn && typeof turn === "object") {
           pageTurns.set(own(turn, "id"), turn);
           const metadata = { itemsView: "notLoaded", items: [] };
-          for (const key of ["id", "status", "model"]) {
+          for (const key of ["id", "status", "model", "error", "failure"]) {
             const field = Object.getOwnPropertyDescriptor(turn, key);
             if (field) Object.defineProperty(metadata, key, field);
           }
@@ -1448,6 +1449,200 @@ describe("owner bounded explicit conversation choices", () => {
     expect(await harness.state.listCodexOwnerRemoteConversations()).toEqual({
       kind: "unavailable",
       reason: "ownership_changed",
+    });
+  });
+});
+
+const failedOwnerThread = (error?: unknown, status = "failed") => {
+  const thread = completedThread();
+  thread.status = { type: "systemError" };
+  const turn = (thread.turns as Array<Record<string, unknown>>)[0];
+  turn.status = status;
+  if (error !== undefined) turn.error = error;
+  return thread;
+};
+
+describe("Codex owner remote exact-turn failure category", () => {
+  it.each([
+    [{ codexErrorInfo: "serverOverloaded" }, "server_overloaded"],
+    [{ codexErrorInfo: "usageLimitExceeded" }, "usage_limit"],
+    [{ codexErrorInfo: "rateLimitExceeded" }, "rate_limit"],
+    [{ codexErrorInfo: "internalServerError" }, "internal_server_error"],
+    [{ codexErrorInfo: "unauthorized" }, "authentication_error"],
+    [{ codexErrorInfo: "contextWindowExceeded" }, "context_length_exceeded"],
+    [{ codexErrorInfo: "badRequest" }, "invalid_request_error"],
+    [{ codexErrorInfo: "modelNotFound" }, "invalid_request_error"],
+    [
+      { codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 502 } } },
+      "connection_error",
+    ],
+    [
+      {
+        codexErrorInfo: {
+          responseStreamConnectionFailed: { httpStatusCode: null },
+        },
+      },
+      "connection_error",
+    ],
+    [
+      {
+        codexErrorInfo: {
+          responseStreamDisconnected: { httpStatusCode: null },
+        },
+      },
+      "connection_error",
+    ],
+    [
+      {
+        codexErrorInfo: {
+          responseTooManyFailedAttempts: { httpStatusCode: 503 },
+        },
+      },
+      "connection_error",
+    ],
+    [
+      {
+        message: "Insufficient quota; check billing",
+        codexErrorInfo: "usageLimitExceeded",
+      },
+      "usage_limit",
+    ],
+    [{ message: "Our servers are overloaded", retryable: false }, "unknown"],
+    [
+      { message: "Authentication failed for fixture-sensitive-token" },
+      "unknown",
+    ],
+    [undefined, "unknown"],
+    [{ codexErrorInfo: "futureUnknownFailure" }, "unknown"],
+  ])(
+    "projects only a fixed category for native error %j",
+    async (error, category) => {
+      const harness = createHarness(failedOwnerThread(error));
+      const view = await harness.read();
+      expect(view.kind).toBe("snapshot");
+      expect(view.turns?.[0].failure).toEqual({ category });
+      expect(JSON.stringify(view)).not.toMatch(
+        /fixture-sensitive-token|codexErrorInfo|retryable|httpStatusCode/,
+      );
+      expect(
+        harness.calls.mock.calls.every(
+          ([method]) => !["turn/start", "thread/resume"].includes(method),
+        ),
+      ).toBe(true);
+    },
+  );
+
+  it.each(["completed", "inProgress", "unknown"])(
+    "does not inspect or emit failures for nonfailed turn %s",
+    async (status) => {
+      const getter = vi.fn(() => ({ message: "sensitive error" }));
+      const thread = failedOwnerThread(undefined, status);
+      Object.defineProperty((thread.turns as object[])[0], "error", {
+        get: getter,
+      });
+      const view = await createHarness(thread).read();
+      expect(view.kind).toBe("snapshot");
+      expect(view.turns?.[0]).not.toHaveProperty("failure");
+      expect(getter).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps failures bound to each turn, without adopting thread or older error data", async () => {
+    const thread = failedOwnerThread({ codexErrorInfo: "serverOverloaded" });
+    thread.error = { message: "Authentication failed for thread-secret" };
+    (thread.turns as object[]).unshift({
+      id: "older-turn",
+      status: "failed",
+      items: [],
+      error: { codexErrorInfo: "usageLimitExceeded" },
+    });
+    const view = await createHarness(thread).read();
+    expect(view.turns?.map((turn) => [turn.id, turn.failure])).toEqual([
+      ["older-turn", { category: "usage_limit" }],
+      ["base-turn", { category: "server_overloaded" }],
+    ]);
+    expect(JSON.stringify(view)).not.toMatch(/thread-secret|older-secret/);
+  });
+
+  it("maps an already-projected invented category to unknown", async () => {
+    const thread = failedOwnerThread();
+    (thread.turns as Array<Record<string, unknown>>)[0].failure = {
+      category: "invented",
+    };
+    const view = await createHarness(thread).read();
+    expect(view.kind).toBe("snapshot");
+    expect(view.turns?.[0].failure).toEqual({ category: "unknown" });
+    expect(JSON.stringify(view)).not.toContain("invented");
+  });
+
+  it.each(["error", "message", "code", "codexErrorInfo", "variant"])(
+    "shows unknown without invoking %s accessors",
+    async (field) => {
+      const getter = vi.fn(() => "fixture-sensitive-marker");
+      const error: Record<string, unknown> = {};
+      const thread = failedOwnerThread(error);
+      if (field === "error")
+        Object.defineProperty((thread.turns as object[])[0], "error", {
+          get: getter,
+        });
+      else if (field === "variant") {
+        const info = {};
+        Object.defineProperty(info, "httpConnectionFailed", { get: getter });
+        error.codexErrorInfo = info;
+      } else Object.defineProperty(error, field, { get: getter });
+      const view = await createHarness(thread).read();
+      expect(view.kind).toBe("snapshot");
+      expect(view.turns?.[0].failure).toEqual({ category: "unknown" });
+      expect(getter).not.toHaveBeenCalled();
+      expect(JSON.stringify(view)).not.toContain("fixture-sensitive-marker");
+    },
+  );
+
+  it("bounds classified strings and never serializes raw nested errors or additional details", async () => {
+    const toJSON = vi.fn(() => "authentication private-serialization-marker");
+    const additional = vi.fn(() => "private-details-marker");
+    const errors: unknown[] = [
+      { message: "authentication " + "x".repeat(4096) },
+      { message: { toJSON }, error: { toJSON } },
+      Object.defineProperty(
+        { codexErrorInfo: "futureUnknownFailure", toJSON },
+        "additionalDetails",
+        { get: additional },
+      ),
+    ];
+    for (const error of errors) {
+      const view = await createHarness(failedOwnerThread(error)).read();
+      expect(view.kind).toBe("snapshot");
+      expect(view.turns?.[0].failure).toEqual({ category: "unknown" });
+      expect(JSON.stringify(view)).not.toMatch(
+        /private-serialization|private-details/,
+      );
+    }
+    expect(toJSON).not.toHaveBeenCalled();
+    expect(additional).not.toHaveBeenCalled();
+  });
+
+  it("refuses a multi-request snapshot when its exact latest failure category changes", async () => {
+    const harness = createHarness(failedOwnerThread());
+    let reads = 0;
+    harness.setPageResponse("thread/turns/list", () => ({
+      data: [
+        {
+          id: "base-turn",
+          status: "failed",
+          itemsView: "notLoaded",
+          items: [],
+          error: {
+            codexErrorInfo:
+              ++reads === 1 ? "serverOverloaded" : "usageLimitExceeded",
+          },
+        },
+      ],
+      nextCursor: null,
+    }));
+    expect(await harness.read()).toEqual({
+      kind: "unavailable",
+      reason: "thread_unavailable",
     });
   });
 });

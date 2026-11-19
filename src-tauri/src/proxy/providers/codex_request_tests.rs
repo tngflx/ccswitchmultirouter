@@ -579,6 +579,150 @@ fn responses_request_policy_maps_effort_model_and_provider_overrides() {
 }
 
 #[test]
+fn final_body_policy_rejects_ultra_and_competing_effort_alias_overrides() {
+    for (api_format, transport, patch, mapped_path) in [
+        (
+            "openai_responses",
+            CodexRequestTransport::Responses,
+            json!({"reasoning": {"effort": "ultra"}}),
+            "/reasoning/effort",
+        ),
+        (
+            "openai_responses",
+            CodexRequestTransport::Responses,
+            json!({"reasoning_effort": "high"}),
+            "/reasoning/effort",
+        ),
+        (
+            "openai_chat",
+            CodexRequestTransport::ChatCompletions,
+            json!({"reasoning_effort": "ultra"}),
+            "/reasoning_effort",
+        ),
+        (
+            "openai_chat",
+            CodexRequestTransport::ChatCompletions,
+            json!({"reasoning": {"effort": "high"}}),
+            "/reasoning_effort",
+        ),
+    ] {
+        let mut provider = third_party_provider(api_format);
+        provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .local_proxy_request_overrides
+            .as_mut()
+            .unwrap()
+            .body = Some(patch.clone());
+        let policy = CodexThirdPartyRequestPolicy::compile(&provider).unwrap();
+        let options = CodexRequestOptions::default();
+        let mapped = policy
+            .prepare_protocol_body(transport, logical_request(), &options)
+            .expect("the canonical capability must map before provider body policy");
+        assert_eq!(mapped.pointer(mapped_path), Some(&json!("xhigh")));
+
+        let error = policy
+            .finalize_body(transport, mapped, &options)
+            .expect_err("provider body policy must not undo canonical reasoning conversion");
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("reasoning"),
+            "{transport:?}: {patch}: {error}"
+        );
+    }
+}
+
+#[test]
+fn final_body_policy_rejects_changes_to_each_native_reasoning_control() {
+    for patch in [
+        json!({"reasoning": {"effort": "ultra"}}),
+        json!({"reasoning": {"enabled": false}}),
+        json!({"reasoning_effort": "ultra"}),
+        json!({"thinking": {"type": "disabled"}}),
+        json!({"enable_thinking": false}),
+        json!({"chat_template_kwargs": {"enable_thinking": false}}),
+        json!({"reasoning_split": false}),
+        json!({"output_config": {"effort": "ultra"}}),
+        json!({"reasoning": null}),
+    ] {
+        let mut provider = third_party_provider("openai_responses");
+        provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .local_proxy_request_overrides
+            .as_mut()
+            .unwrap()
+            .body = Some(patch.clone());
+        let policy = CodexThirdPartyRequestPolicy::compile(&provider).unwrap();
+        let mapped = json!({
+            "model": "upstream/model-v2", "input": "contract probe", "stream": true,
+            "reasoning": {"effort": "xhigh", "enabled": true, "summary": "auto"},
+            "reasoning_effort": "xhigh", "thinking": {"type": "enabled"},
+            "enable_thinking": true, "chat_template_kwargs": {"enable_thinking": true},
+            "reasoning_split": true, "output_config": {"effort": "high"}
+        });
+        let result = policy.finalize_body(
+            CodexRequestTransport::Responses,
+            mapped,
+            &CodexRequestOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "provider body policy changed a protected native control: {patch}"
+        );
+    }
+}
+
+#[test]
+fn final_body_policy_allows_ancillary_reasoning_and_nonreasoning_overrides() {
+    for (api_format, transport, mapped_path) in [
+        (
+            "openai_responses",
+            CodexRequestTransport::Responses,
+            "/reasoning/effort",
+        ),
+        (
+            "openai_chat",
+            CodexRequestTransport::ChatCompletions,
+            "/reasoning_effort",
+        ),
+    ] {
+        let mut provider = third_party_provider(api_format);
+        provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .local_proxy_request_overrides
+            .as_mut()
+            .unwrap()
+            .body = Some(json!({
+            "reasoning": {"summary": "detailed", "exclude": true},
+            "metadata": {"policy": "ancillary"},
+            "temperature": 0.25,
+            "stream": false
+        }));
+        let policy = CodexThirdPartyRequestPolicy::compile(&provider).unwrap();
+        let options = CodexRequestOptions::default();
+        let mapped = policy
+            .prepare_protocol_body(transport, logical_request(), &options)
+            .unwrap();
+        let body = policy
+            .finalize_body(transport, mapped, &options)
+            .expect("ancillary reasoning metadata is not a native effort control");
+        assert_eq!(body.pointer(mapped_path), Some(&json!("xhigh")));
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+        assert_eq!(body["reasoning"]["exclude"], true);
+        assert_eq!(body["metadata"]["policy"], "ancillary");
+        assert_eq!(body["temperature"], 0.25);
+        assert_eq!(
+            body["stream"], true,
+            "stream remains independently protected"
+        );
+    }
+}
+
+#[test]
 fn xai_responses_request_policy_applies_the_production_native_compatibility_layer() {
     let mut provider = third_party_provider("openai_responses");
     provider.settings_config["config"] = json!(

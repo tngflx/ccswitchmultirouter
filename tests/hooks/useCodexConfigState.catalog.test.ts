@@ -170,6 +170,30 @@ describe("useCodexConfigState catalog load", () => {
     ]);
   });
 
+  it("reloads the snake_case Codex Ultra overlay for existing catalog rows", () => {
+    const initialData = {
+      settingsConfig: {
+        modelCatalog: {
+          models: [
+            {
+              model: "openrouter/graded",
+              codex_ultra: { enabled: true, providerEffort: "max" },
+            },
+          ],
+        },
+      },
+    };
+
+    const { result } = renderHook(() => useCodexConfigState({ initialData }));
+
+    expect(result.current.codexCatalogModels).toEqual([
+      {
+        model: "openrouter/graded",
+        codexUltra: { enabled: true, providerEffort: "max" },
+      },
+    ]);
+  });
+
   it("reloads camelCase image-support booleans from the DB SSOT without modalities", () => {
     const initialData = {
       settingsConfig: {
@@ -229,6 +253,20 @@ describe("useCodexConfigState catalog load", () => {
       },
       source: "builtin" as const,
     };
+    const normalizedReasoning = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported" as const,
+      controlKind: "graded" as const,
+      supportedEfforts: ["low", "high", "max"] as const,
+      defaultEffort: "high" as const,
+      disableAllowed: false,
+      upstream: {
+        format: "string" as const,
+        parameter: "reasoning_effort",
+        effortMap: { low: "low", high: "high", max: "max" },
+      },
+      source: "builtin" as const,
+    };
     const initialData = {
       settingsConfig: {
         auth: {},
@@ -241,6 +279,8 @@ describe("useCodexConfigState catalog load", () => {
 
     const { result } = renderHook(() => useCodexConfigState({ initialData }));
 
-    expect(result.current.codexCatalogModels[0].reasoning).toEqual(reasoning);
+    expect(result.current.codexCatalogModels[0].reasoning).toEqual(
+      normalizedReasoning,
+    );
   });
 });

@@ -6,6 +6,29 @@ import type {
   FailoverQueueItem,
 } from "@/types/proxy";
 
+const FAILOVER_READ_TIMEOUT_MS = 15_000;
+
+async function invokeFailoverRead<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      invoke<T>(command, args),
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`Timed out waiting for ${command}`));
+        }, FAILOVER_READ_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 export interface Provider {
   id: string;
   name: string;
@@ -63,12 +86,12 @@ export const failoverApi = {
 
   // 获取故障转移队列
   async getFailoverQueue(appType: string): Promise<FailoverQueueItem[]> {
-    return invoke("get_failover_queue", { appType });
+    return invokeFailoverRead("get_failover_queue", { appType });
   },
 
   // 获取可添加到队列的供应商（不在队列中的）
   async getAvailableProvidersForFailover(appType: string): Promise<Provider[]> {
-    return invoke("get_available_providers_for_failover", { appType });
+    return invokeFailoverRead("get_available_providers_for_failover", { appType });
   },
 
   // 添加供应商到故障转移队列
@@ -86,7 +109,7 @@ export const failoverApi = {
 
   // 获取指定应用的自动故障转移开关状态
   async getAutoFailoverEnabled(appType: string): Promise<boolean> {
-    return invoke("get_auto_failover_enabled", { appType });
+    return invokeFailoverRead("get_auto_failover_enabled", { appType });
   },
 
   // 设置指定应用的自动故障转移开关状态

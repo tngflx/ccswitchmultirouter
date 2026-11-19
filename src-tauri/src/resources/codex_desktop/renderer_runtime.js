@@ -123,11 +123,10 @@
     state.scopedAppServerScopeScanComplete = false;
     state.scopedAppServerRootIdentities = [];
     state.webpackPickerDiscovery = null;
-    // Architecture evidence belongs to this window, not to an old closure.
-    // If script tags disappear during reinjection, unknown visibility must not
-    // become optional. A true page reload naturally creates a fresh state.
-    state.nativeReasoningVisibilityRequired =
-      state.nativeReasoningVisibilityRequired === true;
+    // Recompute native visibility from the current initialized webpack
+    // inventory. A prior injection must not permanently require a projection
+    // that the current renderer no longer exposes.
+    state.nativeReasoningVisibilityRequired = false;
     state.nativeReasoningVisibilityAtoms = [];
     state.pendingReactNodes = new Set();
     state.reactMutationGeneration = 0;
@@ -382,10 +381,14 @@
       })),
       document.baseURI || window.location?.href || globalThis.location?.href,
     );
-    // The final native menu has a separate preference filter. A failed import
-    // cannot make that visibility contract disappear or reuse a stale atom.
+    // Keep entry-backed discovery fail-closed while imports are unresolved.
+    // The completed candidate scan below is authoritative when every entry
+    // import succeeds and no validated native atom is present.
+    const priorNativeVisibilityRequired =
+      state.nativeReasoningVisibilityRequired === true;
+    let entryImportsComplete = true;
     state.nativeReasoningVisibilityRequired =
-      state.nativeReasoningVisibilityRequired === true || entryUrls.length > 0;
+      priorNativeVisibilityRequired || entryUrls.length > 0;
     state.nativeReasoningVisibilityAtoms = [];
     const namespaces = [];
     // Keep exact, previously imported namespaces as read-only inspection roots.
@@ -420,14 +423,15 @@
         namespaces.push(namespace);
       } catch (error) {
         if (!installationIsCurrent()) return [];
+        entryImportsComplete = false;
         recordFailure(error);
       }
     }
     if (!installationIsCurrent()) return [];
     const candidates = codexInitializedWebpackPickerCandidates(namespaces);
     state.nativeReasoningVisibilityRequired =
-      state.nativeReasoningVisibilityRequired === true ||
-      candidates.nativeReasoningVisibilityRequired === true;
+      candidates.nativeReasoningVisibilityRequired === true ||
+      !entryImportsComplete;
     state.nativeReasoningVisibilityAtoms =
       candidates.nativeReasoningVisibilityAtoms;
     // Rspack can keep the app-server registry in an initialized numeric module
@@ -514,10 +518,25 @@
   };
   // 新版 Codex/ChatGPT App 用 localThreadCatalog 保存统一侧边栏目录。这里只调用
   // App 自己的 RPC 同步服务，不直接改 codex-dev.db 或历史 provider 元数据。
-  const triggerLocalThreadCatalogSync = async () => {
-    if (!installationIsCurrent()) return state.historySync;
-    if (state.historySyncPromise) return state.historySyncPromise;
-    state.historySyncPromise = Promise.resolve()
+  const historySyncAttemptLimit = 5;
+  const triggerLocalThreadCatalogSync = ({ explicit = false } = {}) => {
+    if (
+      !installationIsCurrent() ||
+      state.historySyncPromise ||
+      state.historySync?.complete === true ||
+      monotonicNow() < (state.historySyncRetryAt || 0) ||
+      (!explicit && (state.historySyncAttempts || 0) >= historySyncAttemptLimit)
+    )
+      return;
+
+    // This RPC belongs to the document, not the injection generation. Share
+    // the in-flight job and its budget across reinjections; a hung native RPC
+    // cannot be cancelled, so do not start another one on top of it.
+    state.historySyncAttempts = Math.min(
+      (state.historySyncAttempts || 0) + 1,
+      historySyncAttemptLimit,
+    );
+    const job = Promise.resolve()
       .then(async () => {
         const module = await loadAppModule("rpc-");
         const catalog = localCatalogFromModule(module);
@@ -528,86 +547,60 @@
 
         // 26.825+ exposes readStatus and can report a complete local catalog before
         // requestStartupSync. Do not wait on a redundant startup sync RPC forever.
-        try {
-          const status = await catalog.readStatus();
-          const summary = summarizeCatalogStatus(status, false);
-          if (summary.complete === true) {
+        if (typeof catalog.readStatus === "function") {
+          const summary = await Promise.resolve()
+            .then(() => catalog.readStatus())
+            .then((status) => summarizeCatalogStatus(status, false))
+            .catch((error) => {
+              recordFailure(error);
+              return null;
+            });
+          if (summary?.complete === true) {
             state.historySync = summary;
-            return summary;
+            return;
           }
-          state.historySync = summarizeCatalogStatus(status, true);
-          Promise.resolve(catalog.requestStartupSync())
-            .then(async () => {
-              try {
-                state.historySync = summarizeCatalogStatus(
-                  await catalog.readStatus(),
-                  true,
-                );
-              } catch (error) {
-                recordFailure(error);
-              }
-            })
-            .catch(recordFailure);
-          return state.historySync;
-        } catch (error) {
-          recordFailure(error);
+          if (summary) {
+            state.historySync = { ...summary, requested: true, pending: true };
+            await catalog.requestStartupSync();
+            state.historySync = summarizeCatalogStatus(
+              await catalog.readStatus(),
+              true,
+            );
+            return;
+          }
         }
 
         // Older builds expose readSnapshot instead of readStatus. Preserve that
-        // official cold-sweep path as a capability fallback. The request itself
-        // remains fire-and-observe so optional history work cannot hold the
-        // model-picker heartbeat or the CDP installation result open.
-        try {
-          const before =
+        // path without retaining the potentially large first snapshot.
+        const readSnapshotSummary = async () => {
+          const snapshot =
             typeof catalog.readSnapshot === "function"
               ? await catalog.readSnapshot()
               : null;
-          state.historySync = {
-            requested: true,
-            beforeCount: Array.isArray(before?.entries)
-              ? before.entries.length
+          return {
+            count: Array.isArray(snapshot?.entries)
+              ? snapshot.entries.length
               : null,
-            afterCount: null,
-            complete: null,
-            source: "snapshot",
-            pending: true,
+            complete: snapshot?.isComplete ?? null,
           };
-          Promise.resolve()
-            .then(() => catalog.requestStartupSync())
-            .then(async () => {
-              const after =
-                typeof catalog.readSnapshot === "function"
-                  ? await catalog.readSnapshot()
-                  : null;
-              state.historySync = {
-                requested: true,
-                beforeCount: Array.isArray(before?.entries)
-                  ? before.entries.length
-                  : null,
-                afterCount: Array.isArray(after?.entries)
-                  ? after.entries.length
-                  : null,
-                complete: after?.isComplete ?? null,
-                source: "snapshot",
-                pending: false,
-              };
-              if (after?.isComplete !== true) state.historySyncPromise = null;
-            })
-            .catch((error) => {
-              state.historySync = {
-                requested: false,
-                error: String(error?.message || error),
-              };
-              recordFailure(error);
-              state.historySyncPromise = null;
-            });
-          return state.historySync;
-        } catch (error) {
-          recordFailure(error);
-        }
-        throw new Error(
-          "Codex App localThreadCatalog RPC service was not found",
-        );
+        };
+        const before = await readSnapshotSummary();
+        state.historySync = {
+          requested: true,
+          beforeCount: before.count,
+          afterCount: null,
+          complete: null,
+          source: "snapshot",
+          pending: true,
+        };
+        await catalog.requestStartupSync();
+        const after = await readSnapshotSummary();
+        state.historySync = {
+          ...state.historySync,
+          afterCount: after.count,
+          complete: after.complete,
+          pending: false,
+        };
       })
       .catch((error) => {
         state.historySync = {
@@ -615,10 +608,14 @@
           error: String(error?.message || error),
         };
         recordFailure(error);
+      })
+      .finally(() => {
+        if (state.historySyncPromise !== job) return;
         state.historySyncPromise = null;
-        return state.historySync;
+        state.historySyncRetryAt =
+          monotonicNow() + 5000 * 2 ** (state.historySyncAttempts - 1);
       });
-    return state.historySyncPromise;
+    state.historySyncPromise = job;
   };
   /*__CCSWITCH_APP_SERVER_MODEL_LIST_SCOPE_CORE__*/
   const patchModelListResult = (result) => {
@@ -1571,7 +1568,7 @@
   await run();
   if (state.runtimeGeneration === installationGeneration && !state.interval)
     state.interval = setInterval(() => {
-      void run();
+      if (!state.runPromise) void run().catch(recordFailure);
     }, 1500);
   // The native history catalog is optional. Return the renderer compatibility
   // result immediately and let the existing heartbeat publish the eventual

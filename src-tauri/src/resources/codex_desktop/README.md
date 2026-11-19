@@ -45,8 +45,14 @@ Initialized exported scopes can expose patchable caches but cannot join the
 canonical current-owner set from a complete React scan. A single in-flight,
 time-sliced inventory is bound to an exact committed Fiber snapshot and a DOM
 mutation generation. Root/Fiber changes during a yield, removal-only mutations,
-and incomplete/capped scans invalidate native ownership proof. A stable FiberRoot
-or its alternate is not by itself proof that the scanned scopes are still current.
+and incomplete/capped scans invalidate the broad inventory. When that broad
+inventory is capped, native reasoning visibility may use a separate, narrower
+canonical atom-brand proof only if every current status atom maps to exactly one
+mounted scope, the exact query cache is managed, roots/mutation generation stay
+stable, and no pending React nodes exist. This proof authorizes native
+visibility only; request-client ownership still requires the complete inventory.
+A stable FiberRoot or its alternate is not by itself proof that the scanned
+scopes are still current.
 React element debug-owner links are not mounted ownership paths; ordinary unknown
 application fields remain part of the fail-closed inventory. Bounded scan telemetry
 reports scanning, complete, capped, invalidated, or unavailable-root outcomes.

@@ -9,37 +9,57 @@ use crate::error::AppError;
 use crate::services::stream_check::{
     HealthStatus, StreamCheckConfig, StreamCheckResult, StreamCheckService,
 };
-use crate::store::AppState;
 use std::collections::HashSet;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 /// 连通性检查（单个供应商）
 #[tauri::command]
 pub async fn stream_check_provider(
-    state: State<'_, AppState>,
+    app: AppHandle,
     copilot_state: State<'_, CopilotAuthState>,
     app_type: AppType,
     provider_id: String,
 ) -> Result<StreamCheckResult, AppError> {
-    let config = state.db.get_stream_check_config()?;
-
-    let providers = state.db.get_all_providers(app_type.as_str())?;
-    let provider = providers
-        .get(&provider_id)
-        .ok_or_else(|| AppError::Message(format!("供应商 {provider_id} 不存在")))?;
+    let provider_id_for_load = provider_id.clone();
+    let app_type_for_load = app_type.clone();
+    let (config, provider) = crate::commands::run_app_state_blocking(&app, move |state| {
+        let config = state.db.get_stream_check_config().map_err(|e| e.to_string())?;
+        let providers = state
+            .db
+            .get_all_providers(app_type_for_load.as_str())
+            .map_err(|e| e.to_string())?;
+        let provider = providers
+            .get(&provider_id_for_load)
+            .cloned()
+            .ok_or_else(|| format!("供应商 {provider_id_for_load} 不存在"))?;
+        Ok((config, provider))
+    })
+    .await
+    .map_err(AppError::Message)?;
 
     // Copilot 端点是动态的（随 OAuth token 解析），需预先取出 host 再探测；
     // 其余供应商传 None，由服务层从 settings_config 提取 base_url。无需鉴权。
-    let base_url_override = resolve_copilot_base_url_override(provider, &copilot_state).await?;
+    let base_url_override = resolve_copilot_base_url_override(&provider, &copilot_state).await?;
     let result =
-        StreamCheckService::check_with_retry(&app_type, provider, &config, base_url_override)
+        StreamCheckService::check_with_retry(&app_type, &provider, &config, base_url_override)
             .await?;
 
     // 记录日志
-    let _ =
+    let app_type_for_log = app_type.as_str().to_string();
+    let provider_name = provider.name.clone();
+    let result_for_log = result.clone();
+    let _ = crate::commands::run_app_state_blocking(&app, move |state| {
         state
             .db
-            .save_stream_check_log(&provider_id, &provider.name, app_type.as_str(), &result);
+            .save_stream_check_log(
+                &provider_id,
+                &provider_name,
+                &app_type_for_log,
+                &result_for_log,
+            )
+            .map_err(|e| e.to_string())
+    })
+    .await;
 
     Ok(result)
 }
@@ -47,43 +67,50 @@ pub async fn stream_check_provider(
 /// 批量连通性检查
 #[tauri::command]
 pub async fn stream_check_all_providers(
-    state: State<'_, AppState>,
+    app: AppHandle,
     copilot_state: State<'_, CopilotAuthState>,
     app_type: AppType,
     proxy_targets_only: bool,
 ) -> Result<Vec<(String, StreamCheckResult)>, AppError> {
-    let config = state.db.get_stream_check_config()?;
-    let providers = state.db.get_all_providers(app_type.as_str())?;
-
-    let allowed_ids: Option<HashSet<String>> = if proxy_targets_only {
-        let mut ids = HashSet::new();
-        if let Ok(Some(current_id)) = state.db.get_current_provider(app_type.as_str()) {
-            ids.insert(current_id);
-        }
-        if let Ok(queue) = state.db.get_failover_queue(app_type.as_str()) {
-            for item in queue {
-                ids.insert(item.provider_id);
+    let app_type_for_load = app_type.clone();
+    let (config, providers) = crate::commands::run_app_state_blocking(&app, move |state| {
+        let config = state.db.get_stream_check_config().map_err(|e| e.to_string())?;
+        let providers = state
+            .db
+            .get_all_providers(app_type_for_load.as_str())
+            .map_err(|e| e.to_string())?;
+        let allowed_ids: Option<HashSet<String>> = if proxy_targets_only {
+            let mut ids = HashSet::new();
+            if let Ok(Some(current_id)) = state.db.get_current_provider(app_type_for_load.as_str())
+            {
+                ids.insert(current_id);
             }
-        }
-        Some(ids)
-    } else {
-        None
-    };
+            if let Ok(queue) = state.db.get_failover_queue(app_type_for_load.as_str()) {
+                for item in queue {
+                    ids.insert(item.provider_id);
+                }
+            }
+            Some(ids)
+        } else {
+            None
+        };
+
+        let providers = providers
+            .into_iter()
+            .filter(|(id, provider)| {
+                provider.category.as_deref() != Some("official")
+                    && allowed_ids
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.contains(id))
+            })
+            .collect::<Vec<_>>();
+        Ok((config, providers))
+    })
+    .await
+    .map_err(AppError::Message)?;
 
     let mut results = Vec::new();
     for (id, provider) in providers {
-        // Official OAuth providers intentionally have no user-configured probe
-        // target. Never turn their runtime adapter defaults into unauthenticated
-        // network probes against first-party endpoints.
-        if provider.category.as_deref() == Some("official") {
-            continue;
-        }
-        if let Some(ids) = &allowed_ids {
-            if !ids.contains(&id) {
-                continue;
-            }
-        }
-
         let base_url_override =
             resolve_copilot_base_url_override(&provider, &copilot_state).await?;
         let result =
@@ -101,9 +128,22 @@ pub async fn stream_check_all_providers(
                     error_category: None,
                 });
 
-        let _ = state
-            .db
-            .save_stream_check_log(&id, &provider.name, app_type.as_str(), &result);
+        let app_type_for_log = app_type.as_str().to_string();
+        let provider_name = provider.name.clone();
+        let result_for_log = result.clone();
+        let id_for_log = id.clone();
+        let _ = crate::commands::run_app_state_blocking(&app, move |state| {
+            state
+                .db
+                .save_stream_check_log(
+                    &id_for_log,
+                    &provider_name,
+                    &app_type_for_log,
+                    &result_for_log,
+                )
+                .map_err(|e| e.to_string())
+        })
+        .await;
 
         results.push((id, result));
     }
@@ -113,17 +153,28 @@ pub async fn stream_check_all_providers(
 
 /// 获取连通性检查配置
 #[tauri::command]
-pub fn get_stream_check_config(state: State<'_, AppState>) -> Result<StreamCheckConfig, AppError> {
-    state.db.get_stream_check_config()
+pub async fn get_stream_check_config(app: AppHandle) -> Result<StreamCheckConfig, AppError> {
+    crate::commands::run_app_state_blocking(&app, |state| {
+        state.db.get_stream_check_config().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(AppError::Message)
 }
 
 /// 保存连通性检查配置
 #[tauri::command]
-pub fn save_stream_check_config(
-    state: State<'_, AppState>,
+pub async fn save_stream_check_config(
+    app: AppHandle,
     config: StreamCheckConfig,
 ) -> Result<(), AppError> {
-    state.db.save_stream_check_config(&config)
+    crate::commands::run_app_state_blocking(&app, move |state| {
+        state
+            .db
+            .save_stream_check_config(&config)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(AppError::Message)
 }
 
 /// Copilot 供应商的 base_url 需要从 OAuth 管理器动态解析（按账号或默认端点）。

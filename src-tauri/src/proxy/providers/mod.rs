@@ -76,7 +76,7 @@ pub use claude::{
 };
 pub use codex::CodexAdapter;
 pub(crate) use codex::{
-    adapt_codex_reasoning_projection_for_desktop,
+    adapt_codex_reasoning_projection_for_desktop, apply_codex_native_chat_reasoning,
     apply_detected_codex_transport_to_effective_provider, codex_provider_remote_compaction_enabled,
     codex_route_auth_source, codex_route_supports_responses_compaction,
     codex_route_target_provider_id_from_route, codex_route_uses_official_agent_backend,
@@ -86,7 +86,8 @@ pub(crate) use codex::{
     resolve_codex_chat_protocol_target, resolve_codex_chat_reasoning_projection,
     resolve_codex_native_responses_reasoning_projection, resolve_codex_primary_route_from_settings,
     resolve_codex_request_compatibility, strip_legacy_codex_official_auth,
-    validate_codex_provider_api_capability, CODEX_ACCOUNT_POOL_ENABLED,
+    validate_codex_catalog_request_model, validate_codex_provider_api_capability,
+    CODEX_ACCOUNT_POOL_ENABLED,
 };
 pub use codex::{
     apply_codex_chat_upstream_model, apply_codex_upstream_model, build_codex_route_probe_provider,

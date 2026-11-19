@@ -751,6 +751,69 @@ describe("reconcileFetchedCodexCatalogRows", () => {
     });
   });
 
+  it.each([false, true])(
+    "does not treat a fetched family slug as an explicit wire alias (complete=%s)",
+    (complete) => {
+      const previousReasoning: CodexModelReasoningCapability = {
+        schemaVersion: 2,
+        supportStatus: "confirmed_supported",
+        controlKind: "boolean",
+        supportedEfforts: [],
+        disableAllowed: true,
+        upstream: { format: "boolean", parameter: "reasoning.enabled" },
+        source: "detection",
+        evidenceScope: {
+          transportFingerprint: "a".repeat(64),
+          model: "provider/model",
+        },
+      };
+      const newReasoning: CodexModelReasoningCapability = {
+        ...previousReasoning,
+        controlKind: "graded",
+        supportedEfforts: ["low", "high"],
+        upstream: { format: "reasoning_object", parameter: "reasoning.effort" },
+        evidenceScope: {
+          transportFingerprint: "a".repeat(64),
+          model: "provider/model-new",
+        },
+      };
+      const existing = createRow({
+        model: "My Public Model",
+        upstreamModel: "provider/model",
+        reasoning: previousReasoning,
+      });
+      const result = reconcileFetchedCodexCatalogRows(
+        [existing],
+        [
+          {
+            id: "provider/model-new",
+            canonicalSlug: "provider/model",
+            reasoning: newReasoning,
+          },
+        ],
+        {},
+        {
+          appendNew: true,
+          createRow,
+          existingMetadataMode: "refresh",
+          removeMissingRemote: complete,
+          markMissingRemoteDisabled: true,
+        },
+      );
+
+      expect(result.rows).toEqual([
+        { ...existing, enabled: !complete },
+        expect.objectContaining({
+          model: "provider/model-new",
+          upstreamModel: "provider/model-new",
+          canonicalSlug: "provider/model",
+          reasoning: newReasoning,
+          enabled: false,
+        }),
+      ]);
+    },
+  );
+
   it("refreshes every visible alias bound to the same upstream model", () => {
     const capability = {
       schemaVersion: 1 as const,

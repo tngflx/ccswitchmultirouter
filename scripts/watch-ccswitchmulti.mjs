@@ -1,5 +1,14 @@
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -35,6 +44,100 @@ const optionKey = (name) =>
   name.replace(/^-+/, "").replaceAll("-", "").toLowerCase();
 const sleep = (milliseconds) =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
+const GUARDIAN_LOG_MAX_BYTES = 1024 * 1024;
+const GUARDIAN_LOG_RETAIN_BYTES = 512 * 1024;
+const GUARDIAN_LOG_MAX_RECORD_BYTES = 64 * 1024;
+
+function readBoundedGuardianLogTail(descriptor, size) {
+  const start = Math.max(0, size - GUARDIAN_LOG_RETAIN_BYTES);
+  const offset = Math.max(0, start - 1);
+  const buffer = Buffer.alloc(size - offset);
+  let bytesRead = 0;
+  while (bytesRead < buffer.length) {
+    const count = readSync(
+      descriptor,
+      buffer,
+      bytesRead,
+      buffer.length - bytesRead,
+      offset + bytesRead,
+    );
+    if (count === 0) break;
+    bytesRead += count;
+  }
+  const retained = buffer.subarray(0, bytesRead);
+  // Include the preceding byte so a record starting at the cutoff is kept.
+  const separator = start > 0 ? retained.indexOf(0x0a) : -1;
+  return start > 0 && separator === -1
+    ? retained.subarray(bytesRead)
+    : retained.subarray(separator + 1);
+}
+
+function appendBoundedGuardianLog(logPath, record) {
+  mkdirSync(path.dirname(logPath), { recursive: true });
+  const recordBytes = Buffer.from(`${record}\n`, "utf8");
+  const descriptor = openSync(logPath, "a+");
+  let compacted;
+  try {
+    const size = fstatSync(descriptor).size;
+    if (size + recordBytes.length + 1 > GUARDIAN_LOG_MAX_BYTES) {
+      const retained = readBoundedGuardianLogTail(descriptor, size);
+      const parts = [retained];
+      if (retained.length > 0 && retained.at(-1) !== 0x0a)
+        parts.push(Buffer.from("\n"));
+      parts.push(recordBytes);
+      compacted = Buffer.concat(parts);
+    } else {
+      const last = Buffer.alloc(1);
+      const torn =
+        size > 0 &&
+        readSync(descriptor, last, 0, 1, size - 1) === 1 &&
+        last[0] !== 0x0a;
+      appendFileSync(
+        descriptor,
+        torn ? Buffer.concat([Buffer.from("\n"), recordBytes]) : recordBytes,
+      );
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+  // Windows append handles cannot truncate. Only the lock owner writes here.
+  if (compacted) writeFileSync(logPath, compacted);
+}
+
+function serializeGuardianLogRecord(timestamp, level, event, detail) {
+  const record = JSON.stringify({ timestamp, level, event, detail });
+  if (Buffer.byteLength(record, "utf8") + 1 <= GUARDIAN_LOG_MAX_RECORD_BYTES)
+    return record;
+  return JSON.stringify({
+    timestamp,
+    level,
+    event,
+    detail: "[detail truncated: guardian record exceeded 64 KiB]",
+  });
+}
+
+function waitForGuardianChild(child, timeoutMs, stop) {
+  if (child.exitCode != null || child.signalCode != null)
+    return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const finish = (exited) => {
+      clearTimeout(timer);
+      child.off("exit", onExit);
+      child.off("close", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once("exit", onExit);
+    child.once("close", onExit);
+    try {
+      stop();
+    } catch {
+      // A stop error does not prove the process is gone. Wait for an exit
+      // or close event, but do not hold up recovery past the deadline.
+    }
+  });
+}
 const psString = (value) => `'${String(value).replaceAll("'", "''")}'`;
 const safePid = (value) => {
   if (!Number.isSafeInteger(value) || value < 1)
@@ -228,19 +331,30 @@ try {
   let held = false;
   let releasing = false;
   let exited = false;
+  const cleanupTimeoutMs = Math.min(timeoutMs, 5_000);
   let resolveLost;
   const lost = new Promise((resolve) => {
     resolveLost = resolve;
   });
-  child.once("exit", () => {
+  const markExited = () => {
+    child.off("exit", markExited);
+    child.off("close", markExited);
     exited = true;
     held = false;
     if (!releasing) resolveLost();
-  });
-  child.on("error", () => {
+  };
+  const markChildError = () => {
     held = false;
     if (!releasing) resolveLost();
-  });
+  };
+  const detachChildObservers = () => {
+    child.off("exit", markExited);
+    child.off("close", markExited);
+    child.off("error", markChildError);
+  };
+  child.once("exit", markExited);
+  child.once("close", markExited);
+  child.on("error", markChildError);
   child.stdin?.on("error", () => {});
   child.stderr?.resume();
   await new Promise((resolve, reject) => {
@@ -271,9 +385,23 @@ try {
       child.off("exit", onExit);
       child.stdout.off("data", onData);
       if (error) {
-        child.stdin?.end();
-        if (!exited) child.kill();
-        reject(error);
+        void (async () => {
+          const stopped =
+            exited ||
+            (await waitForGuardianChild(child, cleanupTimeoutMs, () => {
+              child.stdin?.end();
+              if (!exited) child.kill();
+            }));
+          reject(
+            stopped
+              ? error
+              : new Error(
+                  `${error.message} Guardian lock keeper did not exit after termination.`,
+                  { cause: error },
+                ),
+          );
+          detachChildObservers();
+        })();
       } else resolve();
     }
     child.once("error", onError);
@@ -289,21 +417,26 @@ try {
     async release() {
       releasing = true;
       held = false;
-      if (exited) return;
-      const completion = new Promise((resolve) => child.once("exit", resolve));
-      child.stdin.end();
-      let timer;
-      try {
-        await Promise.race([
-          completion,
-          new Promise((resolve) => {
-            timer = setTimeout(resolve, 5000);
-          }),
-        ]);
-      } finally {
-        clearTimeout(timer);
+      if (exited) {
+        detachChildObservers();
+        return;
       }
-      if (!exited) child.kill();
+      try {
+        if (
+          !(await waitForGuardianChild(child, cleanupTimeoutMs, () =>
+            child.stdin.end(),
+          )) &&
+          !(await waitForGuardianChild(child, cleanupTimeoutMs, () =>
+            child.kill(),
+          ))
+        ) {
+          throw new Error(
+            "Guardian lock keeper did not exit after termination.",
+          );
+        }
+      } finally {
+        detachChildObservers();
+      }
     },
   };
 }
@@ -534,12 +667,16 @@ ConvertTo-Json -InputObject $items -Compress`,
       child.unref();
       return safePid(child.pid);
     },
-    writeEvent: (level, event, detail = null) =>
-      appendFileSync(
-        plan.LogPath,
-        `${JSON.stringify({ timestamp: new Date(now()).toISOString(), level, event, detail })}\n`,
-        "utf8",
-      ),
+    writeEvent: (level, event, detail = null) => {
+      const timestamp = new Date(now()).toISOString();
+      const record = serializeGuardianLogRecord(
+        timestamp,
+        level,
+        event,
+        detail,
+      );
+      appendBoundedGuardianLog(plan.LogPath, record);
+    },
   };
 }
 

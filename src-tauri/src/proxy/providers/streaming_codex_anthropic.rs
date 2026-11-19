@@ -21,7 +21,7 @@ use super::transform_codex_chat::{
 };
 use super::transform_responses::sanitize_anthropic_tool_use_input_json;
 use crate::proxy::json_canonical::canonicalize_tool_arguments_str;
-use crate::proxy::sse::{strip_sse_field, take_sse_block};
+use crate::proxy::sse::{strip_sse_field, SseOrJsonFrames, SseOrJsonItem};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Map, Value};
@@ -720,36 +720,61 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
     tool_context: CodexToolContext,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
-        let mut buffer = String::new();
-        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut frames = SseOrJsonFrames::default();
         let mut state = AnthropicToResponsesState::with_tool_context(tool_context);
         let mut stream_failed = false;
 
+        // EOF may terminate the last SSE frame or a compatible JSON response.
+        let stream = stream
+            .map(|result| (result, false))
+            .chain(futures::stream::once(async {
+                (Ok::<Bytes, E>(Bytes::new()), true)
+            }));
         tokio::pin!(stream);
 
-        while let Some(chunk) = stream.next().await {
+        'stream_loop: while let Some((chunk, is_eof)) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
-
-                    // A few compatible gateways ignore stream:true and return one
-                    // JSON document. Hold that body intact (including pretty-printed
-                    // blank lines) until EOF instead of discarding it as SSE blocks.
-                    if json_document_candidate(&buffer).is_none() {
-                        while let Some(block) = take_sse_block(&mut buffer) {
-                            let (events, failed) = process_anthropic_sse_block(&mut state, &block);
-                            for event in events {
-                                yield Ok(event);
+                    let mut input = bytes.as_ref();
+                    while let Some(item) = frames.read(&mut input, is_eof) {
+                        let frame = match item {
+                            SseOrJsonItem::Frame(frame) => frame,
+                            SseOrJsonItem::Json(body) => {
+                                let text = String::from_utf8_lossy(&body);
+                                if let Some(body) = json_document_candidate(&text)
+                                    .and_then(|candidate| serde_json::from_str::<Value>(candidate).ok())
+                                {
+                                    for event in responses_sse_events_from_anthropic_message(
+                                        &body,
+                                        state.tool_context.clone(),
+                                    ) {
+                                        yield Ok(event);
+                                    }
+                                    state.completed = true;
+                                    break 'stream_loop;
+                                }
+                                body
                             }
-                            if failed {
+                            SseOrJsonItem::Oversized => {
+                                if let Some(event) = state.failed_event(
+                                    "Upstream SSE or JSON body exceeded the proxy size limit".to_string(),
+                                    Some("response_too_large".to_string()),
+                                ) {
+                                    yield Ok(event);
+                                }
                                 stream_failed = true;
-                                break;
+                                break 'stream_loop;
                             }
+                        };
+                        let block = String::from_utf8_lossy(&frame);
+                        let (events, failed) = process_anthropic_sse_block(&mut state, &block);
+                        for event in events {
+                            yield Ok(event);
                         }
-                    }
-
-                    if stream_failed {
-                        break;
+                        if failed {
+                            stream_failed = true;
+                            break 'stream_loop;
+                        }
                     }
                 }
                 Err(e) => {
@@ -762,32 +787,6 @@ pub(crate) fn create_responses_sse_stream_from_anthropic_with_context<
                     stream_failed = true;
                     break;
                 }
-            }
-        }
-
-        // Process a final event even when the upstream omitted the trailing blank
-        // line. This is common with buffering reverse proxies and must not discard
-        // the last delta or terminal message_stop.
-        if !stream_failed && !buffer.trim().is_empty() {
-            if !state.response_started {
-                if let Some(candidate) = json_document_candidate(&buffer) {
-                    if let Ok(body) = serde_json::from_str::<Value>(candidate) {
-                        for event in responses_sse_events_from_anthropic_message(
-                            &body,
-                            state.tool_context.clone(),
-                        ) {
-                            yield Ok(event);
-                        }
-                        state.completed = true;
-                    }
-                }
-            }
-            if !state.completed {
-                let (events, failed) = process_anthropic_sse_block(&mut state, &buffer);
-                for event in events {
-                    yield Ok(event);
-                }
-                stream_failed = failed;
             }
         }
 

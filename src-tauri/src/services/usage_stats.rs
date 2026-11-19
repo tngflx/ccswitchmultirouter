@@ -3436,11 +3436,22 @@ impl Database {
         let base_total = input_cost + output_cost + cache_read_cost + cache_creation_cost;
         let total_cost = base_total * multiplier;
 
-        log.input_cost_usd = format!("{input_cost:.6}");
-        log.output_cost_usd = format!("{output_cost:.6}");
-        log.cache_read_cost_usd = format!("{cache_read_cost:.6}");
-        log.cache_creation_cost_usd = format!("{cache_creation_cost:.6}");
-        log.total_cost_usd = format!("{total_cost:.6}");
+        let input_cost = format!("{input_cost:.6}");
+        let output_cost = format!("{output_cost:.6}");
+        let cache_read_cost = format!("{cache_read_cost:.6}");
+        let cache_creation_cost = format!("{cache_creation_cost:.6}");
+        let total_cost = format!("{total_cost:.6}");
+
+        // Zero totals remain eligible for later pricing updates, but reading
+        // the same log should not rewrite unchanged costs.
+        if log.input_cost_usd == input_cost
+            && log.output_cost_usd == output_cost
+            && log.cache_read_cost_usd == cache_read_cost
+            && log.cache_creation_cost_usd == cache_creation_cost
+            && log.total_cost_usd == total_cost
+        {
+            return Ok(false);
+        }
 
         conn.execute(
             "UPDATE proxy_request_logs
@@ -3451,15 +3462,21 @@ impl Database {
                  total_cost_usd = ?5
              WHERE request_id = ?6",
             params![
-                log.input_cost_usd,
-                log.output_cost_usd,
-                log.cache_read_cost_usd,
-                log.cache_creation_cost_usd,
-                log.total_cost_usd,
+                input_cost,
+                output_cost,
+                cache_read_cost,
+                cache_creation_cost,
+                total_cost,
                 log.request_id
             ],
         )
         .map_err(|e| AppError::Database(format!("更新请求成本失败: {e}")))?;
+
+        log.input_cost_usd = input_cost;
+        log.output_cost_usd = output_cost;
+        log.cache_read_cost_usd = cache_read_cost;
+        log.cache_creation_cost_usd = cache_creation_cost;
+        log.total_cost_usd = total_cost;
 
         Ok(true)
     }
@@ -4919,6 +4936,63 @@ mod tests {
         assert_eq!(fixed.total, 1);
         assert_eq!(fixed.data[0].request_id, "route-500");
 
+        Ok(())
+    }
+
+    #[test]
+    fn request_log_reads_do_not_rewrite_unchanged_zero_costs() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO model_pricing (
+                    model_id, display_name, input_cost_per_million, output_cost_per_million
+                 ) VALUES ('zero-cost-fixture', 'Zero Cost Fixture', '0', '0')",
+                [],
+            )?;
+            insert_usage_log(
+                &conn,
+                "zero-cost-fixture-request",
+                "codex",
+                "fixture-provider",
+                "zero-cost-fixture",
+                "proxy",
+                1000,
+                1_000_000,
+                0,
+                0,
+                0,
+                200,
+                "0",
+            )?;
+        }
+
+        let filters = LogFilters {
+            app_type: Some("codex".into()),
+            ..Default::default()
+        };
+        let first = db.get_request_logs(&filters, 0, 50)?;
+        assert_eq!(first.total, 1);
+        assert_eq!(first.data[0].total_cost_usd, "0.000000");
+        let changes_before: i64 =
+            lock_conn!(db.conn).query_row("SELECT total_changes()", [], |row| row.get(0))?;
+
+        let next = db.get_request_logs(&filters, 0, 50)?;
+        assert_eq!(next.data[0].total_cost_usd, "0.000000");
+        {
+            let conn = lock_conn!(db.conn);
+            let changes_after: i64 =
+                conn.query_row("SELECT total_changes()", [], |row| row.get(0))?;
+            assert_eq!(changes_after, changes_before);
+
+            conn.execute(
+                "UPDATE model_pricing SET input_cost_per_million = '1.5'
+                 WHERE model_id = 'zero-cost-fixture'",
+                [],
+            )?;
+        }
+        let repriced = db.get_request_logs(&filters, 0, 50)?;
+        assert_eq!(repriced.data[0].total_cost_usd, "1.500000");
         Ok(())
     }
 

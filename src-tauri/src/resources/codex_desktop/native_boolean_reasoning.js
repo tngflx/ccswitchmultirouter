@@ -256,6 +256,43 @@ const nativeBooleanBinding = (button) => {
     root: path[path.length - 1],
   };
 };
+// Recover only the selected model identity when a native trigger is mounted
+// but fails the stricter Boolean adapter contract. This lets diagnostics tell a
+// malformed current control from a Boolean model that is simply off-selection.
+const nativeBooleanSelectedModel = (button) => {
+  const provider = nativeBooleanProvider();
+  const path = provider && nativeBooleanCurrentFiberPath(button);
+  if (!path) return null;
+  const candidates = [];
+  for (const fiber of path) {
+    const props = nativeBooleanOwn(fiber, "memoizedProps");
+    const candidate = nativeBooleanOwn(props, "selectedLabelCandidate");
+    if (
+      candidate &&
+      typeof nativeBooleanOwn(props, "onSelectPower") === "function" &&
+      Array.isArray(nativeBooleanOwn(props, "powerSelections")) &&
+      nativeBooleanOwn(props, "triggerConfig") &&
+      typeof nativeBooleanOwn(props, "triggerConfig") === "object"
+    ) {
+      const model = nativeBooleanOwn(candidate, "model");
+      if (typeof model === "string" && model.trim()) candidates.push(model);
+    }
+  }
+  return candidates.length === 1 && new Set(candidates).size === 1
+    ? candidates[0]
+    : null;
+};
+const nativeBooleanHasCurrentBinding = (model) => {
+  const effects = document.querySelectorAll(
+    "[class*='ModelPickerTriggerEffortLabel-']",
+  );
+  for (const effect of effects) {
+    const button = effect.closest("button");
+    const binding = button && nativeBooleanBinding(button);
+    if (binding?.model === model) return true;
+  }
+  return false;
+};
 const nativeBooleanRestoreRecord = (record) => {
   record.active = false;
   record.toggle.removeEventListener("click", record.onClick);
@@ -301,6 +338,7 @@ const restoreNativeBooleanReasoningControls = () => {
   for (const record of records?.values() || [])
     nativeBooleanRestoreRecord(record);
   records?.clear();
+  state.nativeBooleanReasoningUnverifiedModels?.clear();
 };
 const nativeBooleanMatchesRecord = (record, binding) =>
   binding &&
@@ -317,6 +355,7 @@ const nativeBooleanMatchesRecord = (record, binding) =>
 const syncNativeBooleanReasoningControls = () => {
   state.nativeBooleanReasoningControls =
     state.nativeBooleanReasoningControls || new Map();
+  state.nativeBooleanReasoningUnverifiedModels = new Set();
   const records = state.nativeBooleanReasoningControls;
   if (!nativeBooleanProvider()) {
     restoreNativeBooleanReasoningControls();
@@ -333,7 +372,12 @@ const syncNativeBooleanReasoningControls = () => {
   for (const effect of effects) {
     const button = effect.closest("button");
     const binding = button && nativeBooleanBinding(button);
-    if (!binding) continue;
+    if (!binding) {
+      const selectedModel = button && nativeBooleanSelectedModel(button);
+      if (selectedModel)
+        state.nativeBooleanReasoningUnverifiedModels.add(selectedModel);
+      continue;
+    }
     active.add(button);
     let record = records.get(button);
     if (
@@ -657,9 +701,23 @@ const readNativeBooleanReasoningControlState = (model) => {
     return { status: "not_active", model };
   }
   const records = state.nativeBooleanReasoningControls;
+  if (
+    state.nativeBooleanReasoningUnverifiedModels?.has(model) &&
+    nativeBooleanHasCurrentBinding(model)
+  ) {
+    // React can commit new Fiber props without changing this trigger's DOM.
+    // Reconcile a previously invalid observation before reporting it as stale.
+    syncNativeBooleanReasoningControls();
+    if (state.nativeBooleanReasoningUnverifiedModels?.has(model))
+      return { status: "unverified", model };
+  }
+  if (state.nativeBooleanReasoningUnverifiedModels?.has(model))
+    return { status: "unverified", model };
   const ready = [];
+  let observed = false;
   for (const record of records?.values() || []) {
     if (record.model !== model) continue;
+    observed = true;
     const binding = nativeBooleanBinding(record.button);
     if (!nativeBooleanMatchesRecord(record, binding)) continue;
     const on = binding.effort !== "none";
@@ -688,7 +746,12 @@ const readNativeBooleanReasoningControlState = (model) => {
       visibleStates: marker.disableAllowed ? ["off", "on"] : ["on"],
     });
   }
-  return ready.length === 1 ? ready[0] : { status: "unverified", model };
+  if (ready.length === 1) return ready[0];
+  // A mounted picker can prove only its selected model. An included Boolean
+  // row with no current binding is therefore an observation gap, not evidence
+  // that its control is malformed. Keep malformed or ambiguous current
+  // bindings unverified when a record exists for the requested model.
+  return { status: observed ? "unverified" : "not_observed", model };
 };
 // Reinjection owns a new generation. Old scheduled frames and listeners are
 // restoration state only and cannot survive registration of the new helpers.

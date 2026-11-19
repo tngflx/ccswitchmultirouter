@@ -3165,6 +3165,7 @@ export function CodexFormFields({
                         defaultEffort={defaultEffort}
                         ultraEnabled={effectiveUltra.enabled}
                         ultraEffort={effectiveUltra.providerEffort}
+                        ultraEffortSource={effectiveUltra.providerEffortSource}
                         ultraEfforts={
                           reasoningResolution?.resolved
                             .providerAcceptedEfforts ?? []

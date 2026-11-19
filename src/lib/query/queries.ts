@@ -1,10 +1,5 @@
-import i18n from "@/i18n";
-import { useRef } from "react";
-import {
-  useQuery,
-  type UseQueryResult,
-  keepPreviousData,
-} from "@tanstack/react-query";
+import { useEffect, useReducer, useRef } from "react";
+import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import {
   providersApi,
   settingsApi,
@@ -21,7 +16,6 @@ import type {
 } from "@/types";
 import { usageKeys } from "@/lib/query/usage";
 import { extractErrorMessage } from "@/utils/errorUtils";
-import { isCodexProtocolSetMember } from "@/lib/codexProviderKind";
 
 const sortProviders = (
   providers: Record<string, Provider>,
@@ -49,8 +43,6 @@ const sortProviders = (
 export interface ProvidersQueryData {
   providers: Record<string, Provider>;
   currentProviderId: string;
-  codexEditorProviders?: Record<string, Provider>;
-  codexEditorError?: string;
   currentProviderError?: string;
 }
 
@@ -75,29 +67,10 @@ export async function fetchProvidersQueryData(
     currentProviderError = extractErrorMessage(error);
   }
 
-  let codexEditorProviders: Record<string, Provider> | undefined;
-  let codexEditorError: string | undefined;
-  if (
-    appId === "codex" &&
-    Object.values(providers).some(isCodexProtocolSetMember)
-  ) {
-    try {
-      codexEditorProviders = sortProviders(
-        await providersApi.getCodexEditorProviders(),
-      );
-    } catch {
-      codexEditorError = i18n.t("codexProviderUi.editorUnsafe", {
-        defaultValue:
-          "Protocol adaptation could not be safely restored. Check the model source configuration and retry.",
-      });
-    }
-  }
   return {
     providers: sortProviders(providers),
     currentProviderId,
     ...(currentProviderError ? { currentProviderError } : {}),
-    ...(codexEditorProviders ? { codexEditorProviders } : {}),
-    ...(codexEditorError ? { codexEditorError } : {}),
   };
 }
 
@@ -109,13 +82,23 @@ export const useProvidersQuery = (
 
   return useQuery({
     queryKey: ["providers", appId],
-    placeholderData: keepPreviousData,
     // 当代理服务运行时，每 10 秒刷新一次供应商列表
     // 这样可以自动反映后端熔断器自动禁用代理目标的变更
     refetchInterval: isProxyRunning ? 10000 : false,
     queryFn: () => fetchProvidersQueryData(appId),
   });
 };
+
+/** Restoring split protocol sources is for editing, not displaying runtime providers. */
+export function useCodexEditorProvidersQuery(enabled: boolean) {
+  return useQuery({
+    queryKey: ["providers", "codex", "editor"],
+    enabled,
+    retry: false,
+    queryFn: async () =>
+      sortProviders(await providersApi.getCodexEditorProviders()),
+  });
+}
 
 export const useSettingsQuery = (): UseQueryResult<Settings> => {
   return useQuery({
@@ -315,6 +298,28 @@ export const useUsageQuery = (
     { rejected: query.isError },
   );
   lastGoodRef.current = lastGood;
+
+  // Expire a retained value even when automatic queries are disabled.
+  const expiresAt =
+    enabled &&
+    data?.success &&
+    (query.isError || data !== query.data) &&
+    lastQueriedAt !== null
+      ? lastQueriedAt + KEEP_LAST_GOOD_MS
+      : null;
+  const [, invalidateDisplay] = useReducer(
+    (revision: number) => revision + 1,
+    0,
+  );
+  useEffect(() => {
+    if (expiresAt === null) return;
+
+    const timer = setTimeout(
+      invalidateDisplay,
+      Math.max(0, expiresAt - Date.now()),
+    );
+    return () => clearTimeout(timer);
+  }, [expiresAt]);
 
   return {
     ...query,

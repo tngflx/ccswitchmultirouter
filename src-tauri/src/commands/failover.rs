@@ -14,70 +14,82 @@ fn ensure_failover_supported(app_type: &str) -> Result<crate::app_config::AppTyp
 /// 获取故障转移队列
 #[tauri::command]
 pub async fn get_failover_queue(
-    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     app_type: String,
 ) -> Result<Vec<FailoverQueueItem>, String> {
     ensure_failover_supported(&app_type)?;
-    state
-        .db
-        .get_failover_queue(&app_type)
-        .map_err(|e| e.to_string())
+    crate::commands::run_app_state_blocking(&app, move |state| {
+        state
+            .db
+            .get_failover_queue(&app_type)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// 获取可添加到故障转移队列的供应商（不在队列中的）
 #[tauri::command]
 pub async fn get_available_providers_for_failover(
-    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     app_type: String,
 ) -> Result<Vec<Provider>, String> {
     ensure_failover_supported(&app_type)?;
-    state
-        .db
-        .get_available_providers_for_failover(&app_type)
-        .map_err(|e| e.to_string())
+    crate::commands::run_app_state_blocking(&app, move |state| {
+        state
+            .db
+            .get_available_providers_for_failover(&app_type)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// 添加供应商到故障转移队列
 #[tauri::command]
 pub async fn add_to_failover_queue(
-    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     app_type: String,
     provider_id: String,
 ) -> Result<(), String> {
     ensure_failover_supported(&app_type)?;
-    state
-        .db
-        .add_to_failover_queue(&app_type, &provider_id)
-        .map_err(|e| e.to_string())
+    crate::commands::run_app_state_blocking(&app, move |state| {
+        state
+            .db
+            .add_to_failover_queue(&app_type, &provider_id)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// 从故障转移队列移除供应商
 #[tauri::command]
 pub async fn remove_from_failover_queue(
-    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     app_type: String,
     provider_id: String,
 ) -> Result<(), String> {
     ensure_failover_supported(&app_type)?;
-    state
-        .db
-        .remove_from_failover_queue(&app_type, &provider_id)
-        .map_err(|e| e.to_string())
+    crate::commands::run_app_state_blocking(&app, move |state| {
+        state
+            .db
+            .remove_from_failover_queue(&app_type, &provider_id)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// 获取指定应用的自动故障转移开关状态（从 proxy_config 表读取）
 #[tauri::command]
 pub async fn get_auto_failover_enabled(
-    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     app_type: String,
 ) -> Result<bool, String> {
     ensure_failover_supported(&app_type)?;
-    state
-        .db
-        .get_proxy_config_for_app(&app_type)
-        .await
-        .map(|config| config.auto_failover_enabled)
-        .map_err(|e| e.to_string())
+    crate::commands::run_app_state_blocking(&app, move |state| {
+        futures::executor::block_on(state.db.get_proxy_config_for_app(&app_type))
+            .map(|config| config.auto_failover_enabled)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// 设置指定应用的自动故障转移开关状态（写入 proxy_config 表）
@@ -96,11 +108,12 @@ pub async fn set_auto_failover_enabled(
     );
 
     // 读取当前配置
-    let mut config = state
-        .db
-        .get_proxy_config_for_app(&app_type)
-        .await
-        .map_err(|e| e.to_string())?;
+    let app_type_for_config = app_type.clone();
+    let mut config = crate::commands::run_app_state_blocking(&app, move |state| {
+        futures::executor::block_on(state.db.get_proxy_config_for_app(&app_type_for_config))
+            .map_err(|e| e.to_string())
+    })
+    .await?;
 
     if enabled && !config.enabled {
         return Err("需要先启用该应用的代理接管，再开启故障转移".to_string());
@@ -109,37 +122,44 @@ pub async fn set_auto_failover_enabled(
     // 队列为空时把当前供应商自动加入作为 P1，避免用户陷入"必须先加队列才能开启"的死锁
     let mut auto_added_provider_id: Option<String> = None;
     let p1_provider_id = if enabled {
-        let mut queue = state
-            .db
-            .get_failover_queue(&app_type)
-            .map_err(|e| e.to_string())?;
+        let app_type_for_queue = app_type.clone();
+        let (p1_provider_id, auto_added) =
+            crate::commands::run_app_state_blocking(&app, move |state| {
+                let mut queue = state
+                    .db
+                    .get_failover_queue(&app_type_for_queue)
+                    .map_err(|e| e.to_string())?;
+                let mut auto_added_provider_id = None;
 
-        if queue.is_empty() {
-            let app_enum = ensure_failover_supported(&app_type)?;
+                if queue.is_empty() {
+                    let app_enum = ensure_failover_supported(&app_type_for_queue)?;
+                    let current_id =
+                        crate::settings::get_effective_current_provider(&state.db, &app_enum)
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| {
+                                "故障转移队列为空，且未设置当前供应商，无法开启故障转移".to_string()
+                            })?;
 
-            let current_id = crate::settings::get_effective_current_provider(&state.db, &app_enum)
-                .map_err(|e| e.to_string())?;
+                    state
+                        .db
+                        .add_to_failover_queue(&app_type_for_queue, &current_id)
+                        .map_err(|e| e.to_string())?;
+                    auto_added_provider_id = Some(current_id);
+                    queue = state
+                        .db
+                        .get_failover_queue(&app_type_for_queue)
+                        .map_err(|e| e.to_string())?;
+                }
 
-            let Some(current_id) = current_id else {
-                return Err("故障转移队列为空，且未设置当前供应商，无法开启故障转移".to_string());
-            };
-
-            state
-                .db
-                .add_to_failover_queue(&app_type, &current_id)
-                .map_err(|e| e.to_string())?;
-            auto_added_provider_id = Some(current_id);
-
-            queue = state
-                .db
-                .get_failover_queue(&app_type)
-                .map_err(|e| e.to_string())?;
-        }
-
-        queue
-            .first()
-            .map(|item| item.provider_id.clone())
-            .ok_or_else(|| "故障转移队列为空，无法开启故障转移".to_string())?
+                let p1_provider_id = queue
+                    .first()
+                    .map(|item| item.provider_id.clone())
+                    .ok_or_else(|| "故障转移队列为空，无法开启故障转移".to_string())?;
+                Ok((p1_provider_id, auto_added_provider_id))
+            })
+            .await?;
+        auto_added_provider_id = auto_added;
+        p1_provider_id
     } else {
         String::new()
     };
@@ -153,7 +173,14 @@ pub async fn set_auto_failover_enabled(
             .await
         {
             if let Some(provider_id) = auto_added_provider_id {
-                let _ = state.db.remove_from_failover_queue(&app_type, &provider_id);
+                let app_type_for_cleanup = app_type.clone();
+                let _ = crate::commands::run_app_state_blocking(&app, move |state| {
+                    state
+                        .db
+                        .remove_from_failover_queue(&app_type_for_cleanup, &provider_id)
+                        .map_err(|e| e.to_string())
+                })
+                .await;
             }
             return Err(e);
         }
@@ -163,11 +190,11 @@ pub async fn set_auto_failover_enabled(
     config.auto_failover_enabled = enabled;
 
     // 写回数据库
-    state
-        .db
-        .update_proxy_config_for_app(config)
-        .await
-        .map_err(|e| e.to_string())?;
+    crate::commands::run_app_state_blocking(&app, move |state| {
+        futures::executor::block_on(state.db.update_proxy_config_for_app(config))
+            .map_err(|e| e.to_string())
+    })
+    .await?;
 
     if enabled {
         // 发射 provider-switched 事件（让前端刷新当前供应商）
@@ -180,7 +207,12 @@ pub async fn set_auto_failover_enabled(
     }
 
     // 刷新托盘菜单，确保状态同步
-    if let Ok(new_menu) = crate::tray::create_tray_menu(&app, &state) {
+    let app_for_menu = app.clone();
+    if let Ok(new_menu) = crate::commands::run_app_state_blocking(&app, move |state| {
+        crate::tray::create_tray_menu(&app_for_menu, state).map_err(|e| e.to_string())
+    })
+    .await
+    {
         if let Some(tray) = app.tray_by_id(crate::tray::TRAY_ID) {
             let _ = tray.set_menu(Some(new_menu));
         }

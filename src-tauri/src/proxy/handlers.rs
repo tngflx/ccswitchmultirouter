@@ -13,7 +13,9 @@ use super::{
         observe_responses_turn_json, observe_responses_turn_stream, provider_fingerprint,
         schedule_turn_recovery, track_turn, TurnRecoveryContext,
     },
-    content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
+    content_encoding::{
+        decompress_body, get_content_encoding, is_supported_content_encoding, CodexInboundEncoding,
+    },
     error_mapper::{
         actionable_upstream_error_message, get_error_message, map_proxy_error_to_status,
         upstream_html_error_message,
@@ -23,8 +25,7 @@ use super::{
     },
     forwarder::{ActiveConnectionGuard, CodexRealtimeWebSocketStream},
     handler_config::{
-        claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
-        CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
+        CLAUDE_PARSER_CONFIG, CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
     handler_context::RequestContext,
     orchestration_runtime,
@@ -61,10 +62,10 @@ use super::{
         transform_gemini, transform_responses,
     },
     response_processor::{
-        create_logged_passthrough_stream, create_usage_collector, process_response,
-        process_response_with_stream_hint, read_decoded_body,
-        strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
-        usage_logging_enabled, SseUsageCollector,
+        create_logged_passthrough_stream, create_transformed_usage_collector,
+        create_usage_collector, process_response, process_response_with_stream_hint,
+        read_decoded_body, strip_entity_headers_for_rebuilt_body,
+        strip_hop_by_hop_response_headers, usage_logging_enabled,
     },
     server::ProxyState,
     sse::{strip_sse_field, take_sse_block},
@@ -1444,65 +1445,8 @@ async fn handle_claude_transform(
         };
 
         // 创建使用量收集器；关闭 usage logging 时不要再解析转换后的 SSE。
-        let usage_collector = if usage_logging_enabled(state) {
-            let state = state.clone();
-            let provider_id = ctx.provider.id.clone();
-            let request_model = ctx.request_model.clone();
-            // 上游/转换层未回显模型时，优先用映射后的出站模型兜底（路由接管真值），
-            // 其次才是客户端请求别名。空字符串视为缺失（转换器对无回显上游会合成 ""）。
-            let fallback_model = ctx
-                .outbound_model
-                .clone()
-                .unwrap_or_else(|| ctx.request_model.clone());
-            let status_code = status.as_u16();
-            let start_time = ctx.start_time;
-            let session_id = ctx.session_id.clone();
-            // 用 ctx 的 app_type：Claude Desktop 网关也走此转换路径，硬编码
-            // "claude" 会把 claude-desktop 的行错记到 claude 名下
-            let app_type_str = ctx.app_type_str;
-
-            Some(SseUsageCollector::new(
-                start_time,
-                Some(claude_stream_usage_event_filter),
-                move |events, first_token_ms| {
-                    if let Some(usage) = TokenUsage::from_claude_stream_events(&events) {
-                        let model = usage
-                            .model
-                            .clone()
-                            .filter(|m| !m.is_empty())
-                            .unwrap_or_else(|| fallback_model.clone());
-                        let latency_ms = start_time.elapsed().as_millis() as u64;
-                        let state = state.clone();
-                        let provider_id = provider_id.clone();
-                        let session_id = session_id.clone();
-                        let request_model = request_model.clone();
-                        let outbound_model = fallback_model.clone();
-
-                        tokio::spawn(async move {
-                            log_usage(
-                                &state,
-                                &provider_id,
-                                app_type_str,
-                                &model,
-                                &request_model,
-                                &outbound_model,
-                                usage,
-                                latency_ms,
-                                first_token_ms,
-                                true,
-                                status_code,
-                                Some(session_id),
-                            )
-                            .await;
-                        });
-                    } else {
-                        log::debug!("[Claude] OpenRouter 流式响应缺少 usage 统计，跳过消费记录");
-                    }
-                },
-            ))
-        } else {
-            None
-        };
+        let usage_collector =
+            create_transformed_usage_collector(ctx, state, status.as_u16(), &CLAUDE_PARSER_CONFIG);
 
         // 获取流式超时配置
         let timeout_config = ctx.streaming_timeout_config();
@@ -1739,6 +1683,37 @@ fn decode_codex_request_body(
     headers.remove(axum::http::header::TRANSFER_ENCODING);
 
     Ok(Bytes::from(decompressed))
+}
+
+/// Snapshot a native Codex caller's entity preference before decoding removes
+/// Content-Encoding. Store it only after decoding succeeds, so malformed or
+/// unsupported encodings cannot influence forwarding.
+fn codex_inbound_encoding_preference(
+    app_type: &AppType,
+    headers: &axum::http::HeaderMap,
+) -> Option<CodexInboundEncoding> {
+    if *app_type != AppType::Codex || !should_handle_as_codex_client(headers) {
+        return None;
+    }
+    Some(if get_content_encoding(headers).is_some() {
+        CodexInboundEncoding::Compressed
+    } else {
+        CodexInboundEncoding::Plain
+    })
+}
+
+fn decode_and_record_codex_inbound_encoding(
+    app_type: &AppType,
+    headers: &mut axum::http::HeaderMap,
+    body_bytes: Bytes,
+    extensions: &mut axum::http::Extensions,
+) -> Result<Bytes, ProxyError> {
+    let preference = codex_inbound_encoding_preference(app_type, headers);
+    let decoded = decode_codex_request_body(headers, body_bytes)?;
+    if let Some(preference) = preference {
+        extensions.insert(preference);
+    }
+    Ok(decoded)
 }
 
 // ============================================================================
@@ -3761,7 +3736,12 @@ async fn handle_responses_for_app(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
+    let body_bytes = decode_and_record_codex_inbound_encoding(
+        &app_type,
+        &mut headers,
+        body_bytes,
+        &mut extensions,
+    )?;
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
     let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
@@ -4291,7 +4271,12 @@ async fn handle_responses_compact_for_app(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
+    let body_bytes = decode_and_record_codex_inbound_encoding(
+        &app_type,
+        &mut headers,
+        body_bytes,
+        &mut extensions,
+    )?;
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
@@ -4855,61 +4840,8 @@ async fn handle_codex_chat_to_responses_transform(
         let stream =
             record_responses_sse_stream(response.bytes_stream(), state.codex_chat_history.clone());
         let stream = observe_aggressive_recovery(stream, recovery_context);
-        let usage_collector = if usage_logging_enabled(state) {
-            let state = state.clone();
-            let provider_id = ctx.provider.id.clone();
-            let request_model = ctx.request_model.clone();
-            let fallback_model = ctx
-                .outbound_model
-                .clone()
-                .unwrap_or_else(|| ctx.request_model.clone());
-            let app_type_str = ctx.app_type_str;
-            let start_time = ctx.start_time;
-            let session_id = ctx.session_id.clone();
-
-            Some(SseUsageCollector::new(
-                start_time,
-                Some(codex_stream_usage_event_filter),
-                move |events, first_token_ms| {
-                    let usage =
-                        TokenUsage::from_codex_stream_events_auto(&events).unwrap_or_default();
-                    if !usage.has_billable_tokens() {
-                        log::debug!("[Codex] hosted 流式响应 usage 全 0 或缺失，跳过消费记录");
-                        return;
-                    }
-                    let model = usage
-                        .model
-                        .clone()
-                        .filter(|m| !m.is_empty())
-                        .unwrap_or_else(|| fallback_model.clone());
-                    let latency_ms = start_time.elapsed().as_millis() as u64;
-                    let state = state.clone();
-                    let provider_id = provider_id.clone();
-                    let request_model = request_model.clone();
-                    let outbound_model = fallback_model.clone();
-                    let session_id = session_id.clone();
-                    tokio::spawn(async move {
-                        log_usage(
-                            &state,
-                            &provider_id,
-                            app_type_str,
-                            &model,
-                            &request_model,
-                            &outbound_model,
-                            usage,
-                            latency_ms,
-                            first_token_ms,
-                            true,
-                            status.as_u16(),
-                            Some(session_id),
-                        )
-                        .await;
-                    });
-                },
-            ))
-        } else {
-            None
-        };
+        let usage_collector =
+            create_transformed_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
         let logged_stream = create_logged_passthrough_stream(
             stream,
             ctx.tag,
@@ -5046,69 +4978,8 @@ async fn handle_codex_chat_to_responses_transform(
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
         let sse_stream = observe_aggressive_recovery(sse_stream, recovery_context);
 
-        let usage_collector = if usage_logging_enabled(state) {
-            let state = state.clone();
-            let provider_id = ctx.provider.id.clone();
-            let request_model = ctx.request_model.clone();
-            // 接管/模型覆写场景的归因兜底：出站真值优先于客户端请求别名
-            let fallback_model = ctx
-                .outbound_model
-                .clone()
-                .unwrap_or_else(|| ctx.request_model.clone());
-            let app_type_str = ctx.app_type_str;
-            let start_time = ctx.start_time;
-            let session_id = ctx.session_id.clone();
-
-            Some(SseUsageCollector::new(
-                start_time,
-                Some(codex_stream_usage_event_filter),
-                move |events, first_token_ms| {
-                    let usage =
-                        TokenUsage::from_codex_stream_events_auto(&events).unwrap_or_default();
-                    // 上游遵守 OpenAI 语义省略 usage 时，Chat→Responses 转换器会合成一个
-                    // 全 0 的 response.completed，from_codex_response 对 input/output 字段
-                    // 存在（哪怕=0）即返回 Some。缺 nonzero 闸门会让全 0 usage 也被写入：
-                    // message_id=None → dedup_request_id 退化为随机 UUID，无法去重，每笔
-                    // 请求插入一条无意义空行、虚增请求数。对齐 Claude transform handler 的 skip。
-                    if !usage.has_billable_tokens() {
-                        log::debug!("[Codex] 流式响应 usage 全 0 或缺失，跳过消费记录");
-                        return;
-                    }
-                    let model = usage
-                        .model
-                        .clone()
-                        .filter(|m| !m.is_empty())
-                        .unwrap_or_else(|| fallback_model.clone());
-                    let latency_ms = start_time.elapsed().as_millis() as u64;
-
-                    let state = state.clone();
-                    let provider_id = provider_id.clone();
-                    let request_model = request_model.clone();
-                    let outbound_model = fallback_model.clone();
-                    let session_id = session_id.clone();
-
-                    tokio::spawn(async move {
-                        log_usage(
-                            &state,
-                            &provider_id,
-                            app_type_str,
-                            &model,
-                            &request_model,
-                            &outbound_model,
-                            usage,
-                            latency_ms,
-                            first_token_ms,
-                            true,
-                            status.as_u16(),
-                            Some(session_id),
-                        )
-                        .await;
-                    });
-                },
-            ))
-        } else {
-            None
-        };
+        let usage_collector =
+            create_transformed_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
 
         let logged_stream = create_logged_passthrough_stream(
             sse_stream,
@@ -5480,62 +5351,8 @@ fn build_codex_anthropic_sse_response(
     recovery_context: Option<TurnRecoveryContext>,
 ) -> Result<axum::response::Response, ProxyError> {
     let sse_stream = observe_aggressive_recovery(sse_stream, recovery_context);
-    let usage_collector = if usage_logging_enabled(state) {
-        let state = state.clone();
-        let provider_id = ctx.provider.id.clone();
-        let request_model = ctx.request_model.clone();
-        let fallback_model = ctx
-            .outbound_model
-            .clone()
-            .unwrap_or_else(|| ctx.request_model.clone());
-        let app_type_str = ctx.app_type_str;
-        let start_time = ctx.start_time;
-        let session_id = ctx.session_id.clone();
-
-        Some(SseUsageCollector::new(
-            start_time,
-            Some(codex_stream_usage_event_filter),
-            move |events, first_token_ms| {
-                let usage = TokenUsage::from_codex_stream_events_auto(&events).unwrap_or_default();
-                if !usage.has_billable_tokens() {
-                    log::debug!("[Codex] Anthropic streaming response usage is all-zero or missing, skipping usage recording");
-                    return;
-                }
-                let model = usage
-                    .model
-                    .clone()
-                    .filter(|m| !m.is_empty())
-                    .unwrap_or_else(|| fallback_model.clone());
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-
-                let state = state.clone();
-                let provider_id = provider_id.clone();
-                let request_model = request_model.clone();
-                let outbound_model = fallback_model.clone();
-                let session_id = session_id.clone();
-
-                tokio::spawn(async move {
-                    log_usage(
-                        &state,
-                        &provider_id,
-                        app_type_str,
-                        &model,
-                        &request_model,
-                        &outbound_model,
-                        usage,
-                        latency_ms,
-                        first_token_ms,
-                        true,
-                        status.as_u16(),
-                        Some(session_id),
-                    )
-                    .await;
-                });
-            },
-        ))
-    } else {
-        None
-    };
+    let usage_collector =
+        create_transformed_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
 
     let logged_stream = create_logged_passthrough_stream(
         sse_stream,
@@ -7162,7 +6979,8 @@ mod tests {
         chat_completion_to_response_from_verified_profile, chat_sse_to_response_value,
         classify_body_for_diagnostics, codex_catalog_models_response, codex_proxy_error_json,
         codex_proxy_error_status, codex_request_classification_fields,
-        create_codex_chat_sse_stream_from_verified_profile, external_openai_api_models_response,
+        create_codex_chat_sse_stream_from_verified_profile,
+        decode_and_record_codex_inbound_encoding, external_openai_api_models_response,
         external_openai_api_unsupported_response, is_codex_desktop_request,
         is_verified_codex_desktop_request, mark_external_openai_headers,
         request_is_literal_continue, resolve_codex_image_generation_provider,
@@ -8291,6 +8109,111 @@ data: [DONE]\n\n";
         );
 
         assert!(should_handle_as_codex_client(&headers));
+    }
+
+    #[test]
+    fn native_responses_encoding_preference_is_recorded_only_after_successful_decode() {
+        use super::CodexInboundEncoding;
+        use axum::http::{header, Extensions};
+
+        let body = br#"{"model":"gpt-test","input":[]}"#;
+        let native_headers = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::USER_AGENT,
+                HeaderValue::from_static("codex_cli_rs/0.144.2"),
+            );
+            headers
+        };
+
+        for encoding in [None, Some("identity")] {
+            let mut headers = native_headers();
+            if let Some(encoding) = encoding {
+                headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static(encoding));
+            }
+            let mut extensions = Extensions::new();
+            assert_eq!(
+                decode_and_record_codex_inbound_encoding(
+                    &AppType::Codex,
+                    &mut headers,
+                    Bytes::from_static(body),
+                    &mut extensions,
+                )
+                .expect("decode plain or identity request"),
+                Bytes::from_static(body)
+            );
+            assert_eq!(
+                extensions.get::<CodexInboundEncoding>(),
+                Some(&CodexInboundEncoding::Plain)
+            );
+        }
+
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(body), 0)
+            .expect("compress native request");
+        let mut compressed_headers = native_headers();
+        compressed_headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+        compressed_headers.insert(header::CONTENT_LENGTH, HeaderValue::from(compressed.len()));
+        let mut compressed_extensions = Extensions::new();
+        assert_eq!(
+            decode_and_record_codex_inbound_encoding(
+                &AppType::Codex,
+                &mut compressed_headers,
+                Bytes::from(compressed),
+                &mut compressed_extensions,
+            )
+            .expect("decode native request"),
+            Bytes::from_static(body)
+        );
+        assert!(!compressed_headers.contains_key(header::CONTENT_ENCODING));
+        assert!(!compressed_headers.contains_key(header::CONTENT_LENGTH));
+        assert_eq!(
+            compressed_extensions.get::<CodexInboundEncoding>(),
+            Some(&CodexInboundEncoding::Compressed)
+        );
+        assert_eq!(
+            compressed_extensions.clone().get::<CodexInboundEncoding>(),
+            Some(&CodexInboundEncoding::Compressed)
+        );
+
+        for encoding in ["zstd", "unsupported"] {
+            let mut headers = native_headers();
+            headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static(encoding));
+            let mut extensions = Extensions::new();
+            assert!(matches!(
+                decode_and_record_codex_inbound_encoding(
+                    &AppType::Codex,
+                    &mut headers,
+                    Bytes::from_static(b"malformed"),
+                    &mut extensions,
+                ),
+                Err(ProxyError::InvalidRequest(_))
+            ));
+            assert!(extensions.get::<CodexInboundEncoding>().is_none());
+        }
+
+        let mut external_headers = native_headers();
+        mark_external_openai_headers(&mut external_headers);
+        let mut external_key_headers = native_headers();
+        external_key_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer ccsw_test"),
+        );
+        for (app_type, mut headers) in [
+            (AppType::Codex, external_headers),
+            (AppType::Codex, external_key_headers),
+            (AppType::GrokBuild, native_headers()),
+            (AppType::Codex, HeaderMap::new()),
+        ] {
+            let mut extensions = Extensions::new();
+            decode_and_record_codex_inbound_encoding(
+                &app_type,
+                &mut headers,
+                Bytes::from_static(body),
+                &mut extensions,
+            )
+            .expect("decode non-native request");
+            assert!(extensions.get::<CodexInboundEncoding>().is_none());
+        }
     }
 
     #[test]
@@ -11532,6 +11455,137 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
             .expect("plain provider");
             assert_eq!(resolved.id, provider.id);
             assert_eq!(resolved.settings_config, provider.settings_config);
+        }
+    }
+
+    async fn transformed_stream_log_fixture() -> (Arc<Database>, ProxyState, RequestContext) {
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = Provider::with_id(
+            "transformed-stream-provider".to_string(),
+            "Stream fixture".to_string(),
+            json!({}),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        let state = build_state(db.clone());
+        let mut context = RequestContext::new_with_provider(
+            &state,
+            &json!({"model": "stream-alias"}),
+            &HeaderMap::new(),
+            AppType::Codex,
+            "transformed-stream-test",
+            "codex",
+            provider,
+        )
+        .await
+        .unwrap();
+        context.outbound_model = Some("stream-outbound".to_string());
+        context.app_config.auto_failover_enabled = true;
+        context.app_config.streaming_first_byte_timeout = 1;
+        context.app_config.streaming_idle_timeout = 2;
+        (db, state, context)
+    }
+
+    fn transformed_usage_chunk() -> Bytes {
+        Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"transformed-fixture\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n")
+    }
+
+    async fn transformed_stream_log(db: &Database) -> Option<(u16, Option<String>, u32, String)> {
+        for _ in 0..100 {
+            let row = {
+                let connection = db.conn.lock().unwrap();
+                connection.query_row(
+                    "SELECT status_code, error_message, output_tokens, model FROM proxy_request_logs WHERE provider_id='transformed-stream-provider'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                ).ok()
+            };
+            if row.is_some() {
+                return row;
+            }
+            tokio::task::yield_now().await;
+        }
+        None
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transformed_stream_log_preserves_failures_with_and_without_usage() {
+        for (with_usage, timeout, original_status, expected_status) in [
+            (true, false, StatusCode::OK, 502),
+            (false, false, StatusCode::OK, 502),
+            (true, true, StatusCode::OK, 504),
+            (false, true, StatusCode::OK, 504),
+            (true, false, StatusCode::SERVICE_UNAVAILABLE, 503),
+        ] {
+            let (db, state, context) = transformed_stream_log_fixture().await;
+            let head = futures::stream::iter(with_usage.then(|| Ok(transformed_usage_chunk())));
+            let tail: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>> =
+                if timeout {
+                    futures::stream::pending().boxed()
+                } else {
+                    futures::stream::iter(vec![Err(std::io::Error::other(
+                        "private-transport-detail",
+                    ))])
+                    .boxed()
+                };
+            // Exercise the production transformed Codex/Anthropic response builder,
+            // not just the generic/native collector constructor.
+            let response = super::build_codex_anthropic_sse_response(
+                head.chain(tail),
+                &context,
+                &state,
+                original_status,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(response.into_body().collect().await.is_err());
+            let (status, error, output_tokens, model) = transformed_stream_log(&db)
+                .await
+                .expect("failed transformed streams must log even without usage");
+            assert_eq!(
+                status, expected_status,
+                "with_usage={with_usage}, timeout={timeout}"
+            );
+            let expected_error = if timeout {
+                if with_usage {
+                    "stream idle timeout"
+                } else {
+                    "stream first-byte timeout"
+                }
+            } else {
+                "stream transport failure"
+            };
+            assert_eq!(error.as_deref(), Some(expected_error));
+            assert_eq!(output_tokens, if with_usage { 5 } else { 0 });
+            assert_eq!(model, "stream-outbound");
+        }
+    }
+
+    #[tokio::test]
+    async fn transformed_stream_log_preserves_success_and_skips_missing_usage() {
+        for with_usage in [true, false] {
+            let (db, state, context) = transformed_stream_log_fixture().await;
+            let stream = futures::stream::iter(with_usage.then(|| Ok(transformed_usage_chunk())));
+            let response = super::build_codex_anthropic_sse_response(
+                stream,
+                &context,
+                &state,
+                StatusCode::OK,
+                None,
+                None,
+            )
+            .unwrap();
+            response.into_body().collect().await.unwrap();
+            let row = transformed_stream_log(&db).await;
+            if with_usage {
+                assert_eq!(row, Some((200, None, 5, "stream-outbound".to_string())));
+            } else {
+                assert!(
+                    row.is_none(),
+                    "clean transformed streams without usage remain unlogged"
+                );
+            }
         }
     }
 

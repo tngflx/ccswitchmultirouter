@@ -15,7 +15,10 @@ import {
 } from "@/utils/providerConfigUtils";
 import { normalizeTomlText } from "@/utils/textNormalization";
 import { normalizeModelIdentityMetadata } from "@/lib/modelIdentities";
-import { readCodexCatalogSettings } from "@/lib/codexCatalogSchema";
+import {
+  normalizeCodexReasoning,
+  readCodexCatalogSettings,
+} from "@/lib/codexCatalogSchema";
 import { normalizeCodexModelProtocolCapability } from "@/lib/codexProtocolCapability";
 import type {
   CodexApiFormat,
@@ -222,8 +225,28 @@ export function extractCodexCatalogModels(
             : undefined;
       const reasoning =
         item?.reasoning && typeof item.reasoning === "object"
-          ? item.reasoning
+          ? normalizeCodexReasoning(item.reasoning)
           : undefined;
+      // Codex Desktop picker metadata is source-owned and must survive a
+      // provider edit; it is not derivable from the catalog row identity.
+      const reasoningSummaryFormat =
+        typeof item?.reasoningSummaryFormat === "string"
+          ? item.reasoningSummaryFormat.trim()
+          : typeof item?.reasoning_summary_format === "string"
+            ? item.reasoning_summary_format.trim()
+            : undefined;
+      const defaultReasoningSummary =
+        typeof item?.defaultReasoningSummary === "string"
+          ? item.defaultReasoningSummary.trim()
+          : typeof item?.default_reasoning_summary === "string"
+            ? item.default_reasoning_summary.trim()
+            : undefined;
+      const apiFormatSource =
+        typeof item?.apiFormatSource === "string"
+          ? item.apiFormatSource.trim()
+          : typeof item?.api_format_source === "string"
+            ? item.api_format_source.trim()
+            : undefined;
       const protocolCapability = normalizeCodexModelProtocolCapability(
         item?.protocolCapability,
       );
@@ -232,7 +255,9 @@ export function extractCodexCatalogModels(
       const codexUltra =
         item?.codexUltra && typeof item.codexUltra === "object"
           ? item.codexUltra
-          : undefined;
+          : item?.codex_ultra && typeof item.codex_ultra === "object"
+            ? item.codex_ultra
+            : undefined;
       const apiFormat =
         typeof item?.apiFormat === "string"
           ? item.apiFormat
@@ -271,6 +296,9 @@ export function extractCodexCatalogModels(
         ...(textOnly !== undefined ? { textOnly } : {}),
         ...(baseInstructions ? { baseInstructions } : {}),
         ...(reasoning ? { reasoning } : {}),
+        ...(reasoningSummaryFormat ? { reasoningSummaryFormat } : {}),
+        ...(defaultReasoningSummary ? { defaultReasoningSummary } : {}),
+        ...(apiFormatSource ? { apiFormatSource } : {}),
         ...(protocolCapability ? { protocolCapability } : {}),
         ...(codexUltra ? { codexUltra } : {}),
         ...(apiFormat ? { apiFormat } : {}),

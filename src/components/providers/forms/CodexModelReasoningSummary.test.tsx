@@ -237,6 +237,32 @@ describe("CodexModelReasoningSummary", () => {
     expect(onUltraChange).toHaveBeenCalledWith({
       enabled: true,
       providerEffort: "xhigh",
+      providerEffortSource: "user",
+    });
+  });
+
+  it("retains a manually selected Ultra target when locking Ultra again", () => {
+    const onUltraChange = vi.fn();
+    render(
+      <CodexModelReasoningSummary
+        model="gpt-6.2-sol"
+        source="library"
+        selectableEfforts={["xhigh", "max"]}
+        ultraEnabled
+        ultraEffort="xhigh"
+        ultraEffortSource="user"
+        ultraEfforts={["xhigh", "max"]}
+        onUltraChange={onUltraChange}
+        expanded={false}
+        onToggle={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /Unlock Ultra/ }));
+    expect(onUltraChange).toHaveBeenCalledWith({
+      enabled: false,
+      providerEffort: "xhigh",
+      providerEffortSource: "user",
     });
   });
 

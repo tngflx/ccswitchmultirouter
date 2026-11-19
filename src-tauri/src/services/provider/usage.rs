@@ -3,11 +3,40 @@
 //! Handles executing and formatting usage query results.
 
 use crate::app_config::AppType;
+use crate::database::Database;
 use crate::error::AppError;
-use crate::provider::{UsageData, UsageResult, UsageScript};
+use crate::provider::{Provider, UsageData, UsageResult, UsageScript};
 use crate::settings;
-use crate::store::AppState;
 use crate::usage_script;
+use std::sync::Arc;
+
+pub(super) async fn read_provider(
+    db: &Arc<Database>,
+    app_type: &AppType,
+    provider_id: &str,
+) -> Result<Option<Provider>, AppError> {
+    let db = Arc::clone(db);
+    let app_type = app_type.clone();
+    let provider_id = provider_id.to_owned();
+    tauri::async_runtime::spawn_blocking(move || {
+        db.get_provider_by_id(&provider_id, app_type.as_str())
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("Background usage lookup failed: {error}")))?
+}
+
+pub(super) fn require_provider<'a>(
+    provider: Option<&'a Provider>,
+    provider_id: &str,
+) -> Result<&'a Provider, AppError> {
+    provider.ok_or_else(|| {
+        AppError::localized(
+            "provider.not_found",
+            format!("供应商不存在: {provider_id}"),
+            format!("Provider not found: {provider_id}"),
+        )
+    })
+}
 
 /// Execute usage script and format result (private helper method)
 pub(crate) async fn execute_and_format_usage_result(
@@ -123,21 +152,8 @@ fn resolve_script_credentials(
 }
 
 /// Query provider usage (using saved script configuration)
-pub async fn query_usage(
-    state: &AppState,
-    app_type: AppType,
-    provider_id: &str,
-) -> Result<UsageResult, AppError> {
+pub async fn query_usage(app_type: &AppType, provider: &Provider) -> Result<UsageResult, AppError> {
     let (script_code, timeout, api_key, base_url, access_token, user_id, template_type) = {
-        let providers = state.db.get_all_providers(app_type.as_str())?;
-        let provider = providers.get(provider_id).ok_or_else(|| {
-            AppError::localized(
-                "provider.not_found",
-                format!("供应商不存在: {provider_id}"),
-                format!("Provider not found: {provider_id}"),
-            )
-        })?;
-
         let usage_script = provider
             .meta
             .as_ref()
@@ -159,7 +175,7 @@ pub async fn query_usage(
 
         // Get credentials: prioritize UsageScript values, fallback to provider config
         let (api_key, base_url) = resolve_script_credentials(
-            &app_type,
+            app_type,
             provider,
             usage_script.api_key.as_deref(),
             usage_script.base_url.as_deref(),
@@ -191,9 +207,8 @@ pub async fn query_usage(
 /// Test usage script (using temporary script content, not saved)
 #[allow(clippy::too_many_arguments)]
 pub async fn test_usage_script(
-    state: &AppState,
-    app_type: AppType,
-    provider_id: &str,
+    app_type: &AppType,
+    provider: &Provider,
     script_code: &str,
     timeout: u64,
     api_key: Option<&str>,
@@ -202,18 +217,9 @@ pub async fn test_usage_script(
     user_id: Option<&str>,
     template_type: Option<&str>,
 ) -> Result<UsageResult, AppError> {
-    let providers = state.db.get_all_providers(app_type.as_str())?;
-    let provider = providers.get(provider_id).ok_or_else(|| {
-        AppError::localized(
-            "provider.not_found",
-            format!("供应商不存在: {provider_id}"),
-            format!("Provider not found: {provider_id}"),
-        )
-    })?;
-
     // Resolve like the real query so testing matches what a saved script does:
     // explicit values win, empty ones fall back to the provider config.
-    let (api_key, base_url) = resolve_script_credentials(&app_type, provider, api_key, base_url);
+    let (api_key, base_url) = resolve_script_credentials(app_type, provider, api_key, base_url);
 
     execute_and_format_usage_result(
         script_code,
@@ -247,10 +253,11 @@ pub(crate) fn validate_usage_script(script: &UsageScript) -> Result<(), AppError
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_script_credentials;
+    use super::{read_provider, resolve_script_credentials, Database};
     use crate::app_config::AppType;
     use crate::provider::Provider;
     use serde_json::json;
+    use std::sync::Arc;
 
     fn provider_with_settings(settings_config: serde_json::Value) -> Provider {
         Provider::with_id(
@@ -259,6 +266,33 @@ mod tests {
             settings_config,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn usage_read_is_scoped_to_one_provider_and_app() {
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = provider_with_settings(json!({}));
+        db.save_provider("claude", &provider).unwrap();
+        let mut other = provider.clone();
+        other.id = "unrelated".into();
+        db.save_provider("claude", &other).unwrap();
+        // A full scan would try to decode this invalid unsigned sort index.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE providers SET sort_index = -1 WHERE id = 'unrelated' AND app_type = 'claude'", [])
+            .unwrap();
+        assert!(db.get_all_providers("claude").is_err());
+
+        let selected = read_provider(&db, &AppType::Claude, &provider.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.id, provider.id);
+        assert!(read_provider(&db, &AppType::Codex, &provider.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[test]

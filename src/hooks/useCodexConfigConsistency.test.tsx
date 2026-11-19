@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type {
   CodexConfigConsistencyReport,
+  CodexRuntimeRefreshPreflight,
   CodexRuntimeRefreshProgress,
   CodexRuntimeRefreshResult,
 } from "@/lib/api/codexConfigConsistency";
@@ -40,6 +41,52 @@ const drift: CodexConfigConsistencyReport = {
     reason: null,
   },
 };
+
+const consistent: CodexConfigConsistencyReport = {
+  ...drift,
+  state: "consistent",
+  changedKeys: [],
+  reason: null,
+};
+
+const healthyPreflight: CodexRuntimeRefreshPreflight = {
+  supported: true,
+  canRefresh: true,
+  snapshotToken: "healthy-snapshot",
+  desktopProcessCount: 1,
+  appServerProcessCount: 1,
+  processCount: 2,
+  launchTarget: null,
+  warning: null,
+  paginatedHistory: {
+    affectedRolloutCount: 0,
+    duplicateOrdinalCount: 0,
+    affectedBytes: 0,
+    blockedRolloutCount: 0,
+    blockedReason: null,
+  },
+};
+
+const repairablePreflight: CodexRuntimeRefreshPreflight = {
+  ...healthyPreflight,
+  paginatedHistory: {
+    ...healthyPreflight.paginatedHistory,
+    affectedRolloutCount: 1,
+    duplicateOrdinalCount: 1,
+  },
+};
+
+function enableFakePollTimers() {
+  vi.useFakeTimers({
+    toFake: [
+      "setTimeout",
+      "clearTimeout",
+      "setInterval",
+      "clearInterval",
+      "performance",
+    ],
+  });
+}
 
 describe("useCodexConfigConsistency", () => {
   it("deduplicates the startup event and fallback query by actual fingerprint", async () => {
@@ -238,6 +285,125 @@ describe("useCodexConfigConsistency", () => {
     );
     expect(result.current.refresh.phase).toBe("idle");
     expect(result.current.report).toBeNull();
+  });
+
+  it("keeps checking config every 30 seconds but scans unchanged history only on the fallback", async () => {
+    enableFakePollTimers();
+    try {
+      vi.mocked(codexConfigConsistencyApi.inspect).mockResolvedValue(
+        consistent,
+      );
+      const preflight = vi.mocked(
+        codexConfigConsistencyApi.inspectRuntimeRefresh,
+      );
+      preflight.mockResolvedValue(healthyPreflight);
+
+      const { result } = renderHook(() => useCodexConfigConsistency());
+      await act(async () => vi.advanceTimersByTimeAsync(270_000));
+
+      expect(codexConfigConsistencyApi.inspect).toHaveBeenCalledTimes(10);
+      expect(preflight).toHaveBeenCalledOnce();
+      expect(result.current.refresh.phase).toBe("idle");
+
+      preflight.mockResolvedValue(repairablePreflight);
+      await act(async () => vi.advanceTimersByTimeAsync(30_000));
+
+      expect(preflight).toHaveBeenCalledTimes(2);
+      expect(result.current.refresh.phase).toBe("status");
+      expect(result.current.refresh.preflight).toEqual(repairablePreflight);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("runs the full preflight on the next poll after runtime evidence changes", async () => {
+    enableFakePollTimers();
+    try {
+      const inspect = vi.mocked(codexConfigConsistencyApi.inspect);
+      inspect.mockResolvedValue(consistent);
+      const preflight = vi.mocked(
+        codexConfigConsistencyApi.inspectRuntimeRefresh,
+      );
+      preflight
+        .mockResolvedValueOnce(healthyPreflight)
+        .mockResolvedValue(repairablePreflight);
+
+      const { result } = renderHook(() => useCodexConfigConsistency());
+      await act(async () => vi.advanceTimersByTimeAsync(30_000));
+      expect(preflight).toHaveBeenCalledOnce();
+
+      inspect.mockResolvedValue({
+        ...consistent,
+        runtimeActivation: {
+          ...consistent.runtimeActivation,
+          appServerStartedAt: "2026-09-01T00:01:00+08:00",
+        },
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(30_000));
+
+      expect(preflight).toHaveBeenCalledTimes(2);
+      expect(result.current.refresh.phase).toBe("status");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("checks history promptly when attention clears even with the previous healthy evidence", async () => {
+    enableFakePollTimers();
+    try {
+      const inspect = vi.mocked(codexConfigConsistencyApi.inspect);
+      inspect.mockResolvedValue(consistent);
+      const preflight = vi.mocked(
+        codexConfigConsistencyApi.inspectRuntimeRefresh,
+      );
+      preflight.mockResolvedValue(healthyPreflight);
+
+      const { result } = renderHook(() => useCodexConfigConsistency());
+      await act(async () => vi.advanceTimersByTimeAsync(0));
+      expect(preflight).toHaveBeenCalledOnce();
+
+      inspect.mockResolvedValue(drift);
+      await act(async () => vi.advanceTimersByTimeAsync(30_000));
+      expect(result.current.report).toEqual(drift);
+      expect(preflight).toHaveBeenCalledOnce();
+
+      inspect.mockResolvedValue(consistent);
+      preflight.mockResolvedValue(repairablePreflight);
+      await act(async () => vi.advanceTimersByTimeAsync(30_000));
+      expect(preflight).toHaveBeenCalledTimes(2);
+      expect(result.current.refresh.phase).toBe("status");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not retry a failed background scan on every unchanged config poll", async () => {
+    enableFakePollTimers();
+    try {
+      vi.mocked(codexConfigConsistencyApi.inspect).mockResolvedValue(
+        consistent,
+      );
+      const preflight = vi.mocked(
+        codexConfigConsistencyApi.inspectRuntimeRefresh,
+      );
+      preflight
+        .mockRejectedValueOnce(new Error("history inspection unavailable"))
+        .mockResolvedValue(healthyPreflight);
+
+      const { result } = renderHook(() => useCodexConfigConsistency());
+      await act(async () => vi.advanceTimersByTimeAsync(270_000));
+
+      expect(preflight).toHaveBeenCalledOnce();
+      expect(result.current.refresh.phase).toBe("idle");
+
+      preflight.mockResolvedValue(repairablePreflight);
+      await act(async () => vi.advanceTimersByTimeAsync(30_000));
+
+      expect(preflight).toHaveBeenCalledTimes(2);
+      expect(result.current.refresh.phase).toBe("status");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("requires a checked preflight before refreshing and preserves progress until completion", async () => {
@@ -481,44 +647,34 @@ describe("useCodexConfigConsistency", () => {
     }
   });
 
-  it("opens a persistent status overview even when config is already consistent", async () => {
-    const consistent: CodexConfigConsistencyReport = {
-      ...drift,
-      state: "consistent",
-      changedKeys: [],
-      reason: null,
-    };
-    vi.mocked(codexConfigConsistencyApi.inspect).mockResolvedValue(consistent);
-    vi.mocked(
-      codexConfigConsistencyApi.inspectRuntimeRefresh,
-    ).mockResolvedValue({
-      supported: true,
-      canRefresh: true,
-      snapshotToken: "status-snapshot",
-      desktopProcessCount: 1,
-      appServerProcessCount: 1,
-      processCount: 2,
-      launchTarget: "OpenAI.Codex_2p2nqsd0c76g0!App",
-      warning: null,
-      paginatedHistory: {
-        affectedRolloutCount: 0,
-        duplicateOrdinalCount: 0,
-        affectedBytes: 0,
-        blockedRolloutCount: 0,
-        blockedReason: null,
-      },
-    });
-    const { result } = renderHook(() => useCodexConfigConsistency());
-    await waitFor(() =>
-      expect(codexConfigConsistencyApi.inspect).toHaveBeenCalled(),
-    );
+  it("opens a persistent status overview with a fresh snapshot despite the background cooldown", async () => {
+    enableFakePollTimers();
+    try {
+      vi.mocked(codexConfigConsistencyApi.inspect).mockResolvedValue(
+        consistent,
+      );
+      const preflight = vi.mocked(
+        codexConfigConsistencyApi.inspectRuntimeRefresh,
+      );
+      preflight.mockResolvedValue(healthyPreflight);
+      const { result } = renderHook(() => useCodexConfigConsistency());
+      await act(async () => vi.advanceTimersByTimeAsync(30_000));
+      expect(preflight).toHaveBeenCalledOnce();
 
-    await act(async () => result.current.openStatusPanel());
+      preflight.mockResolvedValue({
+        ...healthyPreflight,
+        snapshotToken: "status-snapshot",
+      });
+      await act(async () => result.current.openStatusPanel());
 
-    expect(result.current.report).toEqual(consistent);
-    expect(result.current.refresh.phase).toBe("status");
-    expect(result.current.refresh.preflight?.snapshotToken).toBe(
-      "status-snapshot",
-    );
+      expect(preflight).toHaveBeenCalledTimes(2);
+      expect(result.current.report).toEqual(consistent);
+      expect(result.current.refresh.phase).toBe("status");
+      expect(result.current.refresh.preflight?.snapshotToken).toBe(
+        "status-snapshot",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -2393,7 +2393,11 @@ describe("CodexFormFields local model routing", () => {
     await waitFor(() => {
       expect(latestCatalog()[0]).toEqual(
         expect.objectContaining({
-          codexUltra: { enabled: true, providerEffort: "high" },
+          codexUltra: {
+            enabled: true,
+            providerEffort: "high",
+            providerEffortSource: "user",
+          },
         }),
       );
     });

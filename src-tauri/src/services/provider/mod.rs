@@ -15,6 +15,7 @@ use std::future::Future;
 
 use crate::app_config::AppType;
 use crate::codex_multirouter::catalog::catalog_models;
+use crate::codex_multirouter::mutation::CodexProviderMutationOutcome;
 use crate::database::{
     validate_cost_multiplier, validate_pricing_source, ProviderSetDatabaseMutation,
     ProviderSetDatabaseTransaction,
@@ -6696,6 +6697,124 @@ requires_openai_auth = true
 
     #[test]
     #[serial]
+    fn codex_router_order_update_repairs_active_profile_only_after_commit() {
+        with_test_home(|state, _| {
+            let mut source = api_declared_codex_source();
+            let mut second_model = source.settings_config["modelCatalog"]["models"][0].clone();
+            second_model["model"] = json!("model-b");
+            second_model["upstreamModel"] = json!("upstream-b");
+            second_model["protocolCapability"]["upstreamModel"] = json!("upstream-b");
+            source.settings_config["modelCatalog"]["models"]
+                .as_array_mut()
+                .unwrap()
+                .push(second_model);
+            let router = Provider::with_id(
+                "router-order".to_string(),
+                "Router".to_string(),
+                json!({
+                    "auth": {},
+                    "codexRouting": {
+                        "schemaVersion": 2,
+                        "enabled": true,
+                        "routes": [{
+                            "id": "route-relay",
+                            "targetProviderId": source.id,
+                            "modelSelection": {"mode": "all"},
+                            "authPolicy": {"source": "provider_config"}
+                        }],
+                        "modelOrder": ["model-a", "model-b"]
+                    }
+                }),
+                None,
+            );
+            let db = state.db.as_ref();
+            db.save_provider("codex", &source).unwrap();
+            db.save_provider("codex", &router).unwrap();
+            db.set_current_provider("codex", &router.id).unwrap();
+            crate::settings::set_current_provider(&AppType::Codex, Some(&router.id)).unwrap();
+            db.save_profile(&crate::database::Profile {
+                id: "workspace".to_string(),
+                name: "Workspace".to_string(),
+                payload: json!({"providers": {"codex": source.id}}).to_string(),
+                sort_order: None,
+                created_at: Some(1),
+                updated_at: Some(1),
+            })
+            .unwrap();
+            db.set_current_profile_id("codex", Some("workspace"))
+                .unwrap();
+            let profile_provider = || {
+                let profile = db.get_profile("workspace").unwrap().unwrap();
+                let payload: Value = serde_json::from_str(&profile.payload).unwrap();
+                payload["providers"]["codex"].clone()
+            };
+
+            let current = || db.get_provider_by_id(&router.id, "codex").unwrap().unwrap();
+            let expected = current();
+            let mut reordered = expected.clone();
+            reordered.settings_config["codexRouting"]["modelOrder"] = json!(["model-b", "model-a"]);
+            let mut stale = expected.clone();
+            stale.notes = Some("stale router snapshot".to_string());
+            let error =
+                ProviderService::update_codex_router_if_unchanged(state, reordered.clone(), &stale)
+                    .expect_err("reject stale order save before changing the workspace");
+            assert_eq!(error.to_string(), "provider_update_conflict");
+            assert_eq!(profile_provider(), json!(source.id));
+            assert_eq!(
+                current().settings_config["codexRouting"]["modelOrder"],
+                json!(["model-a", "model-b"])
+            );
+
+            ProviderService::update_codex_router_if_unchanged(state, reordered, &expected)
+                .expect("save the order using the current router snapshot");
+            assert_eq!(profile_provider(), json!(router.id));
+            assert_eq!(
+                current().settings_config["codexRouting"]["modelOrder"],
+                json!(["model-b", "model-a"])
+            );
+            let catalog_path = crate::codex_config::get_codex_model_catalog_path();
+            let catalog: Value = serde_json::from_slice(&std::fs::read(catalog_path).unwrap())
+                .expect("read the isolated live model catalog");
+            assert_eq!(catalog["models"][0]["slug"], "model-b");
+            assert_eq!(catalog["models"][1]["slug"], "model-a");
+
+            // The project and device now agree on the active Router, so the
+            // mutation finalizer itself can publish the next order change.
+            {
+                let conn = db.conn.lock().expect("lock database");
+                conn.execute_batch(
+                    "CREATE TEMP TABLE router_projection_writes (write_marker INTEGER);
+                     CREATE TEMP TRIGGER count_router_projection_writes
+                     AFTER INSERT ON main.settings
+                     WHEN NEW.key = 'codex_multirouter_projection:router-order'
+                     BEGIN
+                       INSERT INTO router_projection_writes VALUES (1);
+                     END;",
+                )
+                .expect("count projection receipts in the isolated database");
+            }
+            let committed = current();
+            let mut restored = committed.clone();
+            restored.settings_config["codexRouting"]["modelOrder"] = json!(["model-a", "model-b"]);
+            ProviderService::update_codex_router_if_unchanged(state, restored, &committed)
+                .expect("save a new order with the Router already owning the live projection");
+            let writes: u32 = db
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM router_projection_writes", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                writes, 1,
+                "a verified projection must be published only once"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
     fn api_declared_current_provider_publishes_its_committed_transport() {
         with_test_home(|state, _| {
             crate::settings::reload_settings().unwrap();
@@ -7471,9 +7590,9 @@ requires_openai_auth = true
             )
             .expect_err("generated leaf Subagent config must be internal"),
             block_on_tauri_runtime(ProviderService::query_usage(
-                &state,
-                AppType::Codex,
+                &AppType::Codex,
                 &leaf.id,
+                Some(&leaf),
             ))
             .expect_err("generated leaf usage queries must be internal"),
             block_on_tauri_runtime(ProviderService::test_usage_script(
@@ -8478,6 +8597,26 @@ impl ProviderService {
                 expected,
             )?;
         }
+        Self::update_with_validated_precondition(
+            state,
+            app_type,
+            original_id,
+            provider,
+            protocol_profiles,
+            protocol_observations,
+            expected_provider,
+        )
+    }
+
+    fn update_with_validated_precondition(
+        state: &AppState,
+        app_type: AppType,
+        original_id: Option<&str>,
+        provider: Provider,
+        protocol_profiles: &[ProtocolCompatibilityRecord],
+        protocol_observations: &[ProtocolCompatibilityRecord],
+        expected_provider: Option<&Provider>,
+    ) -> Result<bool, AppError> {
         if app_type == AppType::Pi {
             if !protocol_profiles.is_empty() || !protocol_observations.is_empty() {
                 return Err(AppError::InvalidInput(
@@ -8652,7 +8791,7 @@ impl ProviderService {
 
         // Save through the Codex domain mutation so Provider edits, catalog refreshes and
         // MultiRouter plan saves all share the same compiler/projection lifecycle.
-        Self::persist_provider_mutation_if_unchanged(
+        let mutation = Self::persist_provider_mutation_if_unchanged(
             state,
             &app_type,
             &provider,
@@ -8672,9 +8811,9 @@ impl ProviderService {
 
         if expected_provider.is_some() {
             // Effective-current lookup can clean stale local settings, and
-            // profile synchronization writes its snapshot. A rejected refresh
+            // profile synchronization writes its snapshot. A rejected update
             // must do neither; defer both until the atomic ownership check has
-            // committed. Protocol Set facades remain legitimate model sources.
+            // committed.
             let effective_current =
                 crate::settings::get_effective_current_provider(&state.db, &app_type)?;
             is_current = effective_current.as_deref() == Some(provider.id.as_str());
@@ -8695,10 +8834,23 @@ impl ProviderService {
         }
 
         if is_current && Self::is_codex_schema_v2_router(&app_type, &provider) {
+            // Guarded Router edits need a fallback only when finalization did
+            // not handle this Router, e.g. after repairing profile ownership.
+            // A pending result is reported by Status and retried on request.
+            let force = expected_provider.is_none()
+                || crate::codex_multirouter::provider_set::is_codex_provider_set_facade(&provider);
+            if !force
+                && mutation
+                    .projections
+                    .iter()
+                    .any(|projection| projection.router_provider_id == provider.id)
+            {
+                return Ok(true);
+            }
             let status = crate::codex_multirouter::projection::ensure_codex_multirouter_projection(
                 state.db.as_ref(),
                 &provider.id,
-                true,
+                force,
             )?;
             if status.state == crate::codex_multirouter::projection::ProjectionState::Pending {
                 log::warn!(
@@ -8763,6 +8915,43 @@ impl ProviderService {
             return Err(AppError::Message("provider_update_conflict".to_string()));
         }
         Ok(())
+    }
+
+    /// Persist a user-owned Codex MultiRouter edit with an optimistic
+    /// compare-and-set against the snapshot shown by the workspace.
+    ///
+    /// This is intentionally separate from `update_provider_if_unchanged`:
+    /// that command is reserved for background source refreshes and rejects
+    /// user routers by design. Both paths still converge on the same locked
+    /// provider mutation and projection lifecycle below.
+    pub(crate) fn update_codex_router_if_unchanged(
+        state: &AppState,
+        provider: Provider,
+        expected_provider: &Provider,
+    ) -> Result<bool, AppError> {
+        let is_user_router = |candidate: &Provider| {
+            Self::is_codex_schema_v2_router(&AppType::Codex, candidate)
+                && !crate::codex_multirouter::provider_set::is_codex_provider_set_facade(candidate)
+                && !crate::codex_multirouter::provider_set::is_codex_provider_set_generated_leaf(
+                    candidate,
+                )
+        };
+        if provider.id != expected_provider.id
+            || !is_user_router(&provider)
+            || !is_user_router(expected_provider)
+        {
+            return Err(AppError::Message("provider_update_conflict".to_string()));
+        }
+
+        Self::update_with_validated_precondition(
+            state,
+            AppType::Codex,
+            None,
+            provider,
+            &[],
+            &[],
+            Some(expected_provider),
+        )
     }
 
     pub(crate) fn prepare_provider_for_mutation(
@@ -9375,6 +9564,7 @@ impl ProviderService {
             protocol_observations,
             None,
         )
+        .map(|_| ())
     }
 
     fn persist_provider_mutation_if_unchanged(
@@ -9384,9 +9574,12 @@ impl ProviderService {
         protocol_profiles: &[ProtocolCompatibilityRecord],
         protocol_observations: &[ProtocolCompatibilityRecord],
         expected_provider: Option<&Provider>,
-    ) -> Result<(), AppError> {
+    ) -> Result<CodexProviderMutationOutcome, AppError> {
         if *app_type != AppType::Codex {
-            return state.db.save_provider(app_type.as_str(), provider);
+            state.db.save_provider(app_type.as_str(), provider)?;
+            return Ok(CodexProviderMutationOutcome {
+                projections: Vec::new(),
+            });
         }
 
         let previous = state
@@ -9482,7 +9675,7 @@ impl ProviderService {
                     .map_err(|error| error.to_string())
                 },
             )?;
-            for projection in outcome.projections {
+            for projection in &outcome.projections {
                 if projection.state
                     == crate::codex_multirouter::projection::ProjectionState::Pending
                 {
@@ -9496,7 +9689,7 @@ impl ProviderService {
                     );
                 }
             }
-            return Ok(());
+            return Ok(outcome);
         }
         let requires_automatic_provider_set = !is_router
             && provider.category.as_deref() != Some("official")
@@ -9562,7 +9755,7 @@ impl ProviderService {
                     .map_err(|error| error.to_string())
                 },
             )?;
-            for projection in outcome.projections {
+            for projection in &outcome.projections {
                 if projection.state
                     == crate::codex_multirouter::projection::ProjectionState::Pending
                 {
@@ -9576,7 +9769,7 @@ impl ProviderService {
                     );
                 }
             }
-            return Ok(());
+            return Ok(outcome);
         }
 
         let persists_explicit_official_auth = provider.id
@@ -9616,7 +9809,7 @@ impl ProviderService {
                 protocol_observations,
             )?
         };
-        for projection in outcome.projections {
+        for projection in &outcome.projections {
             if projection.state == crate::codex_multirouter::projection::ProjectionState::Pending {
                 log::warn!(
                     "Codex MultiRouter projection pending after Provider mutation: router={} code={}",
@@ -9625,7 +9818,7 @@ impl ProviderService {
                 );
             }
         }
-        Ok(())
+        Ok(outcome)
     }
 
     fn is_codex_schema_v2_router(app_type: &AppType, provider: &Provider) -> bool {
@@ -11576,14 +11769,23 @@ impl ProviderService {
         Ok(true)
     }
 
-    /// Query provider usage (re-export)
-    pub async fn query_usage(
-        state: &AppState,
-        app_type: AppType,
+    pub(crate) async fn read_usage_provider(
+        db: &std::sync::Arc<crate::database::Database>,
+        app_type: &AppType,
         provider_id: &str,
+    ) -> Result<Option<Provider>, AppError> {
+        usage::read_provider(db, app_type, provider_id).await
+    }
+
+    /// Execute the saved script using the same snapshot used to select its template.
+    pub(crate) async fn query_usage(
+        app_type: &AppType,
+        provider_id: &str,
+        provider: Option<&Provider>,
     ) -> Result<UsageResult, AppError> {
-        Self::ensure_codex_provider_id_is_user_operable(state, &app_type, provider_id)?;
-        usage::query_usage(state, app_type, provider_id).await
+        let provider = usage::require_provider(provider, provider_id)?;
+        Self::ensure_codex_provider_is_user_operable(app_type, provider)?;
+        usage::query_usage(app_type, provider).await
     }
 
     /// Test usage script (re-export)
@@ -11600,11 +11802,12 @@ impl ProviderService {
         user_id: Option<&str>,
         template_type: Option<&str>,
     ) -> Result<UsageResult, AppError> {
-        Self::ensure_codex_provider_id_is_user_operable(state, &app_type, provider_id)?;
+        let snapshot = Self::read_usage_provider(&state.db, &app_type, provider_id).await?;
+        let provider = usage::require_provider(snapshot.as_ref(), provider_id)?;
+        Self::ensure_codex_provider_is_user_operable(&app_type, provider)?;
         usage::test_usage_script(
-            state,
-            app_type,
-            provider_id,
+            &app_type,
+            provider,
             script_code,
             timeout,
             api_key,

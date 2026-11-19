@@ -42,6 +42,7 @@ vi.mock("@/components/providers/ProviderList", () => ({
   ProviderList: ({
     providers,
     currentProviderId,
+    isLoading,
     onSwitch,
     onEdit,
     onDuplicate,
@@ -52,7 +53,9 @@ vi.mock("@/components/providers/ProviderList", () => ({
     onRemoveFromConfig,
   }: any) => (
     <div>
-      <div data-testid="provider-list">{JSON.stringify(providers)}</div>
+      <div data-testid="provider-list" aria-busy={isLoading}>
+        {JSON.stringify(providers)}
+      </div>
       <div data-testid="current-provider">{currentProviderId}</div>
       <button onClick={() => onSwitch(providers[currentProviderId])}>
         switch
@@ -339,6 +342,57 @@ describe("App integration with MSW", () => {
     skillsPanelMocks.openDiscovery.mockReset();
     localStorage.removeItem("cc-switch-last-view");
   });
+
+  it("keeps app navigation usable while a new provider inventory is pending", async () => {
+    const readProviders = providersApi.getAll;
+    let finishCodex!: (
+      providers: Awaited<ReturnType<typeof readProviders>>,
+    ) => void;
+    const slowRead = new Promise<Awaited<ReturnType<typeof readProviders>>>(
+      (resolve) => {
+        finishCodex = resolve;
+      },
+    );
+    const read = vi
+      .spyOn(providersApi, "getAll")
+      .mockImplementation((appId) =>
+        appId === "codex" ? slowRead : readProviders(appId),
+      );
+    try {
+      const { default: App } = await import("@/App");
+      renderApp(App);
+      await waitFor(() =>
+        expect(screen.getByTestId("provider-list")).toHaveTextContent(
+          "claude-1",
+        ),
+      );
+
+      fireEvent.click(screen.getByText("switch-codex"));
+      await waitFor(() =>
+        expect(screen.getByTestId("provider-list")).toHaveAttribute(
+          "aria-busy",
+          "true",
+        ),
+      );
+      expect(screen.getByTestId("provider-list")).not.toHaveTextContent(
+        "claude-1",
+      );
+
+      fireEvent.click(screen.getByText("switch-claude"));
+      await waitFor(() =>
+        expect(screen.getByTestId("provider-list")).toHaveTextContent(
+          "claude-1",
+        ),
+      );
+      expect(screen.getByTestId("provider-list")).toHaveAttribute(
+        "aria-busy",
+        "false",
+      );
+    } finally {
+      finishCodex({});
+      read.mockRestore();
+    }
+  }, 15_000);
 
   it("covers basic provider flows via real hooks", async () => {
     const { default: App } = await import("@/App");
@@ -862,6 +916,58 @@ describe("App integration with MSW", () => {
     expect(wizard).toHaveAttribute("data-plan-id", "legacy-codex-router");
   }, 30_000);
 
+  it("opens an enabled schema-v2 MultiRouter before post-switch refreshes finish", async () => {
+    setProviders("codex", {
+      "codex-router": {
+        id: "codex-router",
+        name: "OpenAI Multi-Model Router",
+        settingsConfig: {
+          codexRouting: { schemaVersion: 2, enabled: true, routes: [] },
+        },
+        category: "aggregator",
+        sortIndex: 0,
+        createdAt: Date.now(),
+      },
+    });
+    setCurrentProviderId("codex", "codex-router");
+
+    let releaseRefresh!: () => void;
+    const pendingRefresh = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+
+    try {
+      const { default: App } = await import("@/App");
+      const { client } = renderApp(App);
+      const refetchSpy = vi
+        .spyOn(client, "refetchQueries")
+        .mockImplementation((filters) => {
+          const queryKey = filters?.queryKey;
+          return queryKey?.[0] === "proxyStatus"
+            ? pendingRefresh
+            : Promise.resolve();
+        });
+
+      fireEvent.click(screen.getByText("switch-codex"));
+      await waitFor(() =>
+        expect(screen.getByTestId("provider-list").textContent).toContain(
+          "codex-router",
+        ),
+      );
+
+      fireEvent.click(screen.getByText("switch"));
+
+      expect(
+        await screen.findByTestId("codex-router-workspace"),
+      ).toBeInTheDocument();
+      expect(refetchSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ queryKey: ["proxyStatus"] }),
+      );
+    } finally {
+      releaseRefresh();
+    }
+  }, 30_000);
+
   it("starts a new Codex MultiRouter draft explicitly from the refreshed entry", async () => {
     const { default: App } = await import("@/App");
     renderApp(App);
@@ -949,6 +1055,7 @@ describe("App integration with MSW", () => {
           "kimi-source",
         ),
       );
+      expect(projection).not.toHaveBeenCalled();
       fireEvent.click(screen.getByText("open-multirouter-entry"));
       // Startup notices may still be open while the picker refreshes providers.
       const dialog = await screen.findByRole("dialog", {
@@ -986,6 +1093,9 @@ describe("App integration with MSW", () => {
         ),
       );
       fireEvent.click(screen.getByText("open-multirouter-entry"));
+      await screen.findByText(
+        /Protocol adaptation could not be safely restored/,
+      );
       fireEvent.click(await screen.findByText("Create new configuration"));
       expect(screen.queryByTestId("codex-multirouter-wizard")).toBeNull();
       expect(toastErrorMock).toHaveBeenCalledWith(
@@ -993,6 +1103,22 @@ describe("App integration with MSW", () => {
           "Protocol adaptation could not be safely restored",
         ),
       );
+      projection.mockResolvedValue({
+        "broken-source": {
+          id: "broken-source",
+          name: "Restored source",
+          settingsConfig: {},
+        },
+      });
+      const dialog = screen.getByRole("dialog", {
+        name: "Configure multi-model routing",
+      });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+      await within(dialog).findByText(/No MultiRouter exists yet/);
+      fireEvent.click(within(dialog).getByText("Create new configuration"));
+      expect(
+        await screen.findByTestId("codex-multirouter-wizard"),
+      ).toHaveAttribute("data-mode", "create");
     } finally {
       projection.mockRestore();
     }

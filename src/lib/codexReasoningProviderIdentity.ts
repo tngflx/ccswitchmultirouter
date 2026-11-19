@@ -342,6 +342,7 @@ function maintainedSublyxNativeEfforts(model: string): CodexReasoningEffort[] {
     "gpt-6-sol",
     "gpt-6.1-sol",
     "gpt-6.1-terra",
+    "gpt-6.2-sol",
   ];
   const supportsNativeMax = knownNativeMaxModels.some(
     (known) =>
@@ -419,15 +420,22 @@ function verifiedSublyxNativeEvidence(
 
   // Ultra is a separate product overlay, not an alias for native Max.
   const defaultUltraTarget: CodexReasoningEffort | undefined = efforts.includes(
-    "xhigh",
+    "max",
   )
-    ? "xhigh"
-    : efforts.includes("max")
-      ? "max"
+    ? "max"
+    : efforts.includes("xhigh")
+      ? "xhigh"
       : undefined;
   const normalizedUltra: CodexModelReasoningCapability["codexUltraOrchestration"] =
     ultra
-      ? { ...ultra }
+      ? {
+          ...ultra,
+          ...(ultra.enabled &&
+          ultra.providerEffort === "xhigh" &&
+          efforts.includes("max")
+            ? { providerEffort: "max" as const }
+            : {}),
+        }
       : defaultUltraTarget
         ? { enabled: true, providerEffort: defaultUltraTarget }
         : undefined;
@@ -472,28 +480,34 @@ export function normalizeCodexReasoningCapabilityForProvider(
   // because their source once matched a provider label.
   const verifiedEvidence = verifiedSublyxNativeEvidence(model, capability);
   if (verifiedEvidence) return verifiedEvidence;
-  if (hasExplicitSublyxNativeEvidence(capability)) return capability;
+  const legacyUnownedUltra =
+    capability.source == null &&
+    capability.codexUltraOrchestration?.enabled === true &&
+    capability.codexUltraOrchestration.providerEffort === "xhigh" &&
+    maintainedSublyxNativeEfforts(model).includes("max");
+  if (hasExplicitSublyxNativeEvidence(capability) && !legacyUnownedUltra)
+    return capability;
 
   const savedDefault = capability.defaultEffort?.trim().toLowerCase();
   const nativeEfforts = maintainedSublyxNativeEfforts(model);
   // Only the maintained migration path uses the family allowlist; verified
   // native evidence returned above is never broadened or downgraded by it.
   const acceptsNativeMax = nativeEfforts.includes("max");
-  const defaultUltraTarget: CodexReasoningEffort = nativeEfforts.includes(
-    "xhigh",
-  )
-    ? "xhigh"
-    : "max";
-  // Preserve a valid explicitly saved target, including the legacy mapped
-  // target. Only an absent/invalid overlay uses the maintained product default;
-  // native Max remains independently selectable and is never downgraded.
+  const defaultUltraTarget = acceptsNativeMax ? "max" : "xhigh";
   const savedUltraTarget =
     capability.codexUltraOrchestration?.providerEffort ??
     (capability.codexUltraOrchestration?.enabled
       ? capability.upstream.effortMap?.max
       : undefined);
-  const ultraTarget =
-    savedUltraTarget && nativeEfforts.includes(savedUltraTarget)
+  // Older maintained Sublyx capabilities targeted xhigh even after learning
+  // native max. The legacy Ultra target is independent of effortMap.max.
+  const migratesLegacySublyxUltra =
+    capability.codexUltraOrchestration?.enabled === true &&
+    acceptsNativeMax &&
+    savedUltraTarget === "xhigh";
+  const ultraTarget = migratesLegacySublyxUltra
+    ? "max"
+    : savedUltraTarget && nativeEfforts.includes(savedUltraTarget)
       ? savedUltraTarget
       : defaultUltraTarget;
   const normalizedSavedDefault: CodexReasoningEffort | undefined =
@@ -554,23 +568,36 @@ export function normalizeCodexCatalogReasoningForProvider<
   const nativeEfforts =
     normalizedReasoning?.supportedEfforts ??
     maintainedSublyxNativeEfforts(model);
+  const migratedRowUltra =
+    row.codexUltra?.enabled === true &&
+    row.codexUltra.providerEffort === "xhigh" &&
+    row.codexUltra.providerEffortSource !== "user" &&
+    nativeEfforts.includes("max") &&
+    (normalizedReasoning
+      ? normalizedReasoning.codexUltraOrchestration?.enabled === true &&
+        normalizedReasoning.codexUltraOrchestration.providerEffort === "max"
+      : true)
+      ? { ...row.codexUltra, providerEffort: "max" as const }
+      : row.codexUltra;
   return {
     ...row,
     ...(normalizedReasoning ? { reasoning: normalizedReasoning } : {}),
-    ...(row.codexUltra?.providerEffort &&
-    !nativeEfforts.includes(row.codexUltra.providerEffort) &&
+    ...(migratedRowUltra?.providerEffort &&
+    !nativeEfforts.includes(migratedRowUltra.providerEffort) &&
     (nativeEfforts.includes("xhigh") || nativeEfforts.includes("max"))
       ? {
           codexUltra: {
-            ...row.codexUltra,
-            providerEffort: nativeEfforts.includes("xhigh") ? "xhigh" : "max",
+            ...migratedRowUltra,
+            providerEffort: nativeEfforts.includes("max") ? "max" : "xhigh",
           },
         }
-      : {}),
+      : migratedRowUltra && migratedRowUltra !== row.codexUltra
+        ? { codexUltra: migratedRowUltra }
+        : {}),
   };
 }
 
-/** The explicit catalog overlay wins; otherwise show the shared resolved Ultra. */
+/** Show the catalog overlay with any target migration resolved by the backend. */
 export function resolveCodexCatalogUltraDisplay(
   row: CodexCatalogModel,
   resolved:
@@ -581,8 +608,11 @@ export function resolveCodexCatalogUltraDisplay(
     | undefined,
   identity?: CodexReasoningProviderIdentity | null,
 ): NonNullable<CodexCatalogModel["codexUltra"]> {
+  const normalized = normalizeCodexCatalogReasoningForProvider(row, identity);
+  const codexUltra =
+    normalized.codexUltra ?? normalized.reasoning?.codexUltraOrchestration;
   return (
-    normalizeCodexCatalogReasoningForProvider(row, identity).codexUltra ?? {
+    codexUltra ?? {
       enabled: resolved?.codexUltraOrchestrationEnabled === true,
       ...(resolved?.effortMap.ultra
         ? { providerEffort: resolved.effortMap.ultra }

@@ -93,26 +93,43 @@ pub fn emit_profile_apply_events(
 }
 
 #[tauri::command]
-pub fn list_profiles(state: State<'_, AppState>) -> Result<ProfilesResponse, String> {
-    let profiles = ProfileService::list(&state).map_err(|e| e.to_string())?;
-    let current_ids = CurrentProfileIds {
-        claude: state
-            .db
-            .get_current_profile_id(ProfileScope::Claude.as_str())
-            .map_err(|e| e.to_string())?,
-        claude_desktop: state
-            .db
-            .get_current_profile_id(ProfileScope::ClaudeDesktop.as_str())
-            .map_err(|e| e.to_string())?,
-        codex: state
-            .db
-            .get_current_profile_id(ProfileScope::Codex.as_str())
-            .map_err(|e| e.to_string())?,
-    };
-    Ok(ProfilesResponse {
-        profiles: profiles.into_iter().map(ProfileDto::from).collect(),
-        current_ids,
+pub async fn list_profiles(app: tauri::AppHandle) -> Result<ProfilesResponse, String> {
+    super::run_app_state_blocking(&app, |state| {
+        let profiles = ProfileService::list(state).map_err(|e| e.to_string())?;
+        let current_ids = CurrentProfileIds {
+            claude: state
+                .db
+                .get_current_profile_id(ProfileScope::Claude.as_str())
+                .map_err(|e| e.to_string())?,
+            claude_desktop: state
+                .db
+                .get_current_profile_id(ProfileScope::ClaudeDesktop.as_str())
+                .map_err(|e| e.to_string())?,
+            codex: state
+                .db
+                .get_current_profile_id(ProfileScope::Codex.as_str())
+                .map_err(|e| e.to_string())?,
+        };
+        Ok(ProfilesResponse {
+            profiles: profiles.into_iter().map(ProfileDto::from).collect(),
+            current_ids,
+        })
     })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn profile_list_uses_async_dispatch() {
+        fn assert_async<F>(_: impl FnOnce(tauri::AppHandle) -> F)
+        where
+            F: std::future::Future<Output = Result<super::ProfilesResponse, String>> + Send,
+        {
+        }
+
+        assert_async(super::list_profiles);
+    }
 }
 
 #[tauri::command]

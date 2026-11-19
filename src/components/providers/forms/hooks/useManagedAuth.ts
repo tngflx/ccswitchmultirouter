@@ -17,6 +17,7 @@ type LoginRequest = {
 export function useManagedAuth(
   authProvider: ManagedAuthProvider,
   githubDomain?: string,
+  statusEnabled = true,
 ) {
   const queryClient = useQueryClient();
   const queryKey = ["managed-auth-status", authProvider];
@@ -43,6 +44,7 @@ export function useManagedAuth(
   } = useQuery<ManagedAuthStatus>({
     queryKey,
     queryFn: () => authApi.authGetStatus(authProvider),
+    enabled: statusEnabled,
     staleTime: 30000,
     // A rejected xAI refresh token is persisted as `requires_reauth` by the
     // proxy hot path. Periodically refresh local status so an already-open Auth

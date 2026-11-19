@@ -2,7 +2,7 @@
 //!
 //! 实现 OpenAI SSE → Anthropic SSE 格式转换
 
-use crate::proxy::sse::{strip_sse_field, take_sse_block};
+use crate::proxy::sse::{strip_sse_field, BoundedSseFrames, SseFrame};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -145,13 +145,20 @@ fn build_message_delta_event(stop_reason: Option<String>, usage_json: Option<Val
     })
 }
 
+fn stream_error_event(message: &str) -> Bytes {
+    let error_event = json!({
+        "type": "error",
+        "error": {"type": "stream_error", "message": message}
+    });
+    Bytes::from(format!("event: error\ndata: {error_event}\n\n"))
+}
+
 /// 创建 Anthropic SSE 流
 pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
-        let mut buffer = String::new();
-        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut frames = BoundedSseFrames::default();
         let mut message_id = None;
         let mut current_model = None;
         let mut next_content_index: u32 = 0;
@@ -175,9 +182,13 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
-
-                    while let Some(line) = take_sse_block(&mut buffer) {
+                    let mut input = bytes.as_ref();
+                    while let Some(frame) = frames.read(&mut input) {
+                        let SseFrame::Complete(frame) = frame else {
+                            yield Ok(stream_error_event("An upstream SSE event exceeded the proxy's size limit."));
+                            return;
+                        };
+                        let line = String::from_utf8_lossy(&frame);
                         if line.trim().is_empty() {
                             continue;
                         }
@@ -630,16 +641,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                     let chain = crate::proxy::error::error_chain_message(&e);
                     log::error!("Stream error: {chain}");
                     stream_ended_with_error = true;
-                    let error_event = json!({
-                        "type": "error",
-                        "error": {
-                            "type": "stream_error",
-                            "message": format!("Stream error: {chain}")
-                        }
-                    });
-                    let sse_data = format!("event: error\ndata: {}\n\n",
-                        serde_json::to_string(&error_event).unwrap_or_default());
-                    yield Ok(Bytes::from(sse_data));
+                    yield Ok(stream_error_event(&format!("Stream error: {chain}")));
                     break;
                 }
             }
@@ -772,6 +774,24 @@ mod tests {
             .await
             .concat();
         assert_eq!(output.matches("event: error\n").count(), 1);
+        assert!(!output.contains("event: message_stop\n"));
+    }
+
+    #[tokio::test]
+    async fn oversized_unterminated_sse_frame_is_reported_without_success_terminal() {
+        let oversized = Bytes::from(vec![b'x'; crate::proxy::sse::MAX_SSE_FRAME_BYTES]);
+        let upstream = stream::iter(vec![
+            Ok::<_, std::io::Error>(oversized),
+            Ok(Bytes::from_static(b"x")),
+        ]);
+        let output = create_anthropic_sse_stream(upstream)
+            .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+
+        assert!(output.contains("event: error\n"));
+        assert!(output.contains("exceeded the proxy's size limit"));
         assert!(!output.contains("event: message_stop\n"));
     }
 

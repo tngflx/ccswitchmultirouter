@@ -127,17 +127,20 @@ fn restore_codex_history_unify_settings(
 /// 获取设置
 #[tauri::command]
 pub async fn get_settings() -> Result<crate::settings::AppSettings, String> {
-    Ok(crate::settings::get_settings_for_frontend())
+    super::run_command_blocking(|| Ok(crate::settings::get_settings_for_frontend())).await
 }
 
 #[tauri::command]
 pub async fn get_tool_auto_update_settings(
 ) -> Result<std::collections::HashMap<String, bool>, String> {
-    let settings = crate::settings::get_settings();
-    Ok(super::misc::VALID_TOOLS
-        .iter()
-        .map(|&tool| (tool.to_string(), settings.tool_auto_update_enabled(tool)))
-        .collect())
+    super::run_command_blocking(|| {
+        let settings = crate::settings::get_settings();
+        Ok(super::misc::VALID_TOOLS
+            .iter()
+            .map(|&tool| (tool.to_string(), settings.tool_auto_update_enabled(tool)))
+            .collect())
+    })
+    .await
 }
 
 #[tauri::command]

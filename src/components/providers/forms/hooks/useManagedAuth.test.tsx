@@ -7,6 +7,7 @@ import type {
   ManagedAuthStatus,
 } from "@/lib/api";
 import { useManagedAuth } from "./useManagedAuth";
+import { useCodexOauth } from "./useCodexOauth";
 
 const mocks = vi.hoisted(() => ({
   authGetStatus: vi.fn(),
@@ -108,6 +109,35 @@ afterEach(() => {
 });
 
 describe("useManagedAuth device flow", () => {
+  it("only loads status for a Codex OAuth consumer when enabled", async () => {
+    mocks.authGetStatus.mockClear();
+    const queryClient = new QueryClient();
+    const wrapper = ({ children }: React.PropsWithChildren) =>
+      React.createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        children,
+      );
+    const { rerender, result } = renderHook(
+      ({ enabled }) => useCodexOauth(enabled),
+      { wrapper, initialProps: { enabled: false } },
+    );
+    expect(mocks.authGetStatus).not.toHaveBeenCalled();
+    expect(result.current.isLoadingStatus).toBe(false);
+
+    rerender({ enabled: true });
+    await waitFor(() => expect(mocks.authGetStatus).toHaveBeenCalledOnce());
+    await waitFor(() =>
+      expect(result.current.authStatus).toEqual(loggedOutStatus),
+    );
+
+    rerender({ enabled: false });
+    await queryClient.invalidateQueries({
+      queryKey: ["managed-auth-status", "codex_oauth"],
+    });
+    expect(mocks.authGetStatus).toHaveBeenCalledOnce();
+  });
+
   it("同一登录请求尚未完成时忽略重复点击", async () => {
     let resolveLogin: ((value: typeof deviceCode) => void) | undefined;
     mocks.authStartLogin.mockReturnValue(

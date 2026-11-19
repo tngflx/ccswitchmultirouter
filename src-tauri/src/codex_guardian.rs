@@ -13,6 +13,36 @@ use crate::codex_desktop::{
 };
 
 const GUARDIAN_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+const GUARDIAN_IDLE_MAX_INTERVAL: Duration = Duration::from_secs(12);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuardianCycleState {
+    DesktopMissing,
+    VerifiedRendererUnavailable,
+    WatchingRenderer,
+}
+
+#[derive(Default)]
+struct GuardianCadence {
+    previous: Option<(GuardianCycleState, Duration)>,
+}
+
+impl GuardianCadence {
+    fn after_cycle(&mut self, state: GuardianCycleState) -> Duration {
+        // Keep live renderer verification at full cadence. Only consecutive
+        // equivalent idle checks back off the native process/listener probes.
+        let delay = match self.previous {
+            Some((previous, delay))
+                if state != GuardianCycleState::WatchingRenderer && state == previous =>
+            {
+                (delay * 2).min(GUARDIAN_IDLE_MAX_INTERVAL)
+            }
+            _ => GUARDIAN_CHECK_INTERVAL,
+        };
+        self.previous = Some((state, delay));
+        delay
+    }
+}
 
 /// 守护上报给前端的即时状态。
 #[derive(Debug, Clone, Serialize)]
@@ -96,6 +126,7 @@ async fn guardian_loop(
     inner: Arc<Mutex<GuardianInner>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let mut cadence = GuardianCadence::default();
     loop {
         if *shutdown.borrow() {
             let mut s = status.lock().await;
@@ -109,10 +140,10 @@ async fn guardian_loop(
             return;
         }
 
-        run_guardian_cycle(&status, &inner).await;
+        let delay = cadence.after_cycle(run_guardian_cycle(&status, &inner).await);
 
         tokio::select! {
-            _ = tokio::time::sleep(GUARDIAN_CHECK_INTERVAL) => {},
+            _ = tokio::time::sleep(delay) => {},
             _ = shutdown.changed() => {
                 let mut s = status.lock().await;
                 s.active = false;
@@ -131,7 +162,7 @@ async fn guardian_loop(
 async fn run_guardian_cycle(
     status: &Arc<Mutex<CodexGuardianStatus>>,
     inner: &Arc<Mutex<GuardianInner>>,
-) {
+) -> GuardianCycleState {
     // 1. 检查 Codex 主进程是否在运行。
     let running = detect_running_codex_main_process_async().await;
     if running.is_none() {
@@ -151,7 +182,7 @@ async fn run_guardian_cycle(
         guard.injected_target_ids.clear();
         guard.injected_catalog_fingerprint = None;
         guard.last_picker_readiness_signature = None;
-        return;
+        return GuardianCycleState::DesktopMissing;
     }
 
     // 2. 保留 websocket 地址，以便同一 target 重载后核验 renderer 状态。
@@ -196,7 +227,7 @@ async fn run_guardian_cycle(
         guard.injected_target_ids.clear();
         guard.injected_catalog_fingerprint = None;
         guard.last_picker_readiness_signature = None;
-        return;
+        return GuardianCycleState::VerifiedRendererUnavailable;
     }
 
     // 3. 同时比较 target 和目录。renderer 补丁持有模型目录状态，因此 Provider
@@ -206,20 +237,14 @@ async fn run_guardian_cycle(
         Ok(CodexModelCatalogLoadOutcome::Unmanaged { model_provider }) => {
             release_unmanaged_picker(&current_targets, model_provider.as_deref(), status, inner)
                 .await;
-            return;
+            return GuardianCycleState::WatchingRenderer;
         }
         Err(error) => {
             let mut s = status.lock().await;
-            s.codex_running = true;
-            s.cdp_available = true;
-            s.picker_ready_target_count = 0;
-            s.picker_status = CodexModelPickerReadiness::Unverified;
-            s.picker_diagnostics = None;
-            s.picker_verification_issues.clear();
-            s.last_event = "模型目录加载失败".into();
-            s.message = format!("无法加载 CCSM 模型目录: {error}");
-            log::warn!("Codex 守护: 模型目录加载失败: {error}");
-            return;
+            if report_catalog_load_failure(&mut s, &error.to_string()) {
+                log::warn!("Codex 守护: 模型目录加载失败: {error}");
+            }
+            return GuardianCycleState::WatchingRenderer;
         }
     };
     let catalog_fingerprint = catalog.fingerprint();
@@ -265,7 +290,7 @@ async fn run_guardian_cycle(
         apply_renderer_observation(s, &observations);
         s.last_event = "CDP renderer 安装状态与模型选择器就绪状态已核验".into();
         s.message = renderer_observation_message(&observations);
-        return;
+        return GuardianCycleState::WatchingRenderer;
     }
 
     // 4. 有新 target、目录变化或 renderer 状态丢失时尝试注入。
@@ -361,6 +386,23 @@ async fn run_guardian_cycle(
             log::warn!("Codex 守护: 注入失败，未找到可注入的 target");
         }
     }
+    GuardianCycleState::WatchingRenderer
+}
+
+/// Update the live failure status every time, but log only a new failure.
+fn report_catalog_load_failure(status: &mut CodexGuardianStatus, error: &str) -> bool {
+    const EVENT: &str = "模型目录加载失败";
+    let message = format!("无法加载 CCSM 模型目录: {error}");
+    let changed = status.last_event != EVENT || status.message != message;
+    status.codex_running = true;
+    status.cdp_available = true;
+    status.picker_ready_target_count = 0;
+    status.picker_status = CodexModelPickerReadiness::Unverified;
+    status.picker_diagnostics = None;
+    status.picker_verification_issues.clear();
+    status.last_event = EVENT.into();
+    status.message = message;
+    changed
 }
 
 async fn release_unmanaged_picker(
@@ -485,6 +527,9 @@ fn add_picker_diagnostics(
     total.boolean_control_ready_model_count = total
         .boolean_control_ready_model_count
         .saturating_add(value.boolean_control_ready_model_count);
+    total.boolean_control_not_observed_model_count = total
+        .boolean_control_not_observed_model_count
+        .saturating_add(value.boolean_control_not_observed_model_count);
     total.effort_mismatch_count = total
         .effort_mismatch_count
         .saturating_add(value.effort_mismatch_count);
@@ -714,6 +759,62 @@ mod tests {
     use serde_json::json;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    #[test]
+    fn guardian_backs_off_repeated_idle_native_probes_and_recovers_full_cadence() {
+        use GuardianCycleState::*;
+
+        let mut cadence = GuardianCadence::default();
+        let seconds = [
+            DesktopMissing,
+            DesktopMissing,
+            DesktopMissing,
+            DesktopMissing,
+            VerifiedRendererUnavailable,
+            VerifiedRendererUnavailable,
+            VerifiedRendererUnavailable,
+            VerifiedRendererUnavailable,
+            WatchingRenderer,
+            WatchingRenderer,
+            WatchingRenderer,
+            VerifiedRendererUnavailable,
+            DesktopMissing,
+        ]
+        .map(|state| cadence.after_cycle(state).as_secs());
+
+        // No unbounded idle wait or inherited delay after a state transition.
+        assert_eq!(seconds, [3, 6, 12, 12, 3, 6, 12, 12, 3, 3, 3, 3, 3]);
+    }
+
+    #[test]
+    fn guardian_reports_new_catalog_failures_without_repeating_a_steady_warning() {
+        let mut status = CodexGuardianStatus {
+            active: true,
+            codex_running: true,
+            cdp_available: true,
+            injected_target_count: 1,
+            injected: true,
+            picker_ready_target_count: 1,
+            picker_status: CodexModelPickerReadiness::Ready,
+            picker_diagnostics: Some(CodexModelPickerDiagnosticsCounts::default()),
+            picker_verification_issues: vec!["stale".into()],
+            last_event: "Verified".into(),
+            message: "Picker is ready".into(),
+        };
+
+        assert!(report_catalog_load_failure(&mut status, "invalid JSON"));
+        assert!(!report_catalog_load_failure(&mut status, "invalid JSON"));
+        assert_eq!(status.picker_ready_target_count, 0);
+        assert_eq!(status.picker_status, CodexModelPickerReadiness::Unverified);
+        assert!(status.picker_diagnostics.is_none());
+        assert!(status.picker_verification_issues.is_empty());
+        assert!(status.message.contains("invalid JSON"));
+        assert!(report_catalog_load_failure(&mut status, "catalog missing"));
+        assert!(!report_catalog_load_failure(&mut status, "catalog missing"));
+
+        status.last_event = "Verified".into();
+        assert!(report_catalog_load_failure(&mut status, "catalog missing"));
+    }
 
     #[tokio::test]
     async fn unmanaged_catalog_release_clears_previous_guardian_ownership() {

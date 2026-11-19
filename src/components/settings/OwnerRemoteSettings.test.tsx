@@ -12,6 +12,10 @@ import {
   useOwnerRemoteController,
 } from "./OwnerRemoteSettings";
 import { ownerRemoteApi, type OwnerRemoteStatus } from "@/lib/api/ownerRemote";
+import en from "@/i18n/locales/en.json";
+import zh from "@/i18n/locales/zh.json";
+import zhTW from "@/i18n/locales/zh-TW.json";
+import ja from "@/i18n/locales/ja.json";
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -97,6 +101,123 @@ describe("OwnerRemoteSettings", () => {
     expect(screen.getByText("settings.ownerRemote.security")).toBeVisible();
     expect(screen.getByText("settings.ownerRemote.boundary")).toBeVisible();
   });
+
+  it("shows ordered Tailscale-first setup without installing or changing access", async () => {
+    await mount();
+    const steps = screen.getByRole("list", {
+      name: "settings.ownerRemote.tailscaleSteps",
+    });
+    expect(
+      Array.from(steps.querySelectorAll("li"), (item) => item.textContent),
+    ).toEqual([
+      "settings.ownerRemote.setupStepDevices",
+      "settings.ownerRemote.setupStepAccess",
+      "settings.ownerRemote.setupStepServe" +
+        "tailscale serve --bg http://127.0.0.1:15723",
+      "settings.ownerRemote.setupStepOrigin",
+      "settings.ownerRemote.setupStepEnroll",
+    ]);
+    expect(
+      screen
+        .getByText("settings.ownerRemote.cloudflareOptional")
+        .closest("details"),
+    ).not.toHaveAttribute("open");
+    expect(
+      screen.getByText("settings.ownerRemote.cloudflareDnsOnly"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("settings.ownerRemote.cloudflareCertificate"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("settings.ownerRemote.cloudflareNoSecrets"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "settings.ownerRemote.openWebsite" }),
+    ).toBeNull();
+    expect(ownerRemoteApi.start).not.toHaveBeenCalled();
+    expect(ownerRemoteApi.stop).not.toHaveBeenCalled();
+    expect(ownerRemoteApi.createInvite).not.toHaveBeenCalled();
+  });
+
+  it("opens only the normalized pinned website through an explicit safe link", async () => {
+    await mount({ ...running, httpsOrigin: "https://OWNER.test:443/" });
+    const link = screen.getByRole("link", {
+      name: "settings.ownerRemote.openWebsite",
+    });
+    expect(link).toHaveAttribute("href", "https://owner.test/remote/");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    expect(screen.getByText("settings.ownerRemote.listenerOnly")).toBeVisible();
+    expect(ownerRemoteApi.start).not.toHaveBeenCalled();
+    expect(ownerRemoteApi.createInvite).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    stopped,
+    { ...stopped, httpsOrigin: running.httpsOrigin },
+    { ...running, running: false },
+    { ...running, enabled: false },
+    { ...running, httpsOrigin: "http://owner.test" },
+    { ...running, httpsOrigin: "https://owner.test/other" },
+    { ...running, httpsOrigin: "https://owner.test/?token=private" },
+    { ...running, httpsOrigin: "https://user:private@owner.test" },
+    { ...running, httpsOrigin: "https://owner.test/#private" },
+  ])(
+    "never offers a website link for unavailable or unsafe status %#",
+    async (status) => {
+      await mount(status);
+      expect(
+        screen.queryByRole("link", {
+          name: "settings.ownerRemote.openWebsite",
+        }),
+      ).toBeNull();
+    },
+  );
+
+  it("withdraws the website link when listener status becomes unknown", async () => {
+    await mount(running);
+    expect(
+      screen.getByRole("link", { name: "settings.ownerRemote.openWebsite" }),
+    ).toBeVisible();
+    vi.mocked(ownerRemoteApi.getStatus).mockRejectedValueOnce(
+      new Error("private-status-error"),
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "settings.ownerRemote.refreshStatus",
+      }),
+    );
+    await screen.findByRole("alert");
+    expect(
+      screen.queryByRole("link", { name: "settings.ownerRemote.openWebsite" }),
+    ).toBeNull();
+    expect(screen.queryByText("settings.ownerRemote.listenerOnly")).toBeNull();
+  });
+
+  it.each(Object.entries({ en, zh, zhTW, ja }))(
+    "localizes the private-network setup in %s",
+    (_locale, messages) => {
+      const keys = [
+        "tailscaleSteps",
+        "setupStepDevices",
+        "setupStepAccess",
+        "setupStepServe",
+        "setupStepOrigin",
+        "setupStepEnroll",
+        "cloudflareOptional",
+        "cloudflareDnsOnly",
+        "cloudflareCertificate",
+        "cloudflareNoSecrets",
+        "openWebsite",
+        "listenerOnly",
+      ];
+      const copy = messages.settings.ownerRemote as Record<string, unknown>;
+      for (const key of keys) {
+        expect(copy[key], key).toEqual(expect.any(String));
+        expect((copy[key] as string).trim().length, key).toBeGreaterThan(0);
+      }
+    },
+  );
 
   it("shows loading instead of a false Off state before status is known", async () => {
     const status = deferred<OwnerRemoteStatus>();

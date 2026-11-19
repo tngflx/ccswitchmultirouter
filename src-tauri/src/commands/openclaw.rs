@@ -20,10 +20,13 @@ pub fn import_openclaw_providers_from_live(state: State<'_, AppState>) -> Result
 
 /// Get provider IDs in the OpenClaw live config.
 #[tauri::command]
-pub fn get_openclaw_live_provider_ids() -> Result<Vec<String>, String> {
-    openclaw_config::get_providers()
-        .map(|providers| providers.keys().cloned().collect())
-        .map_err(|e| e.to_string())
+pub async fn get_openclaw_live_provider_ids() -> Result<Vec<String>, String> {
+    super::run_command_blocking(|| {
+        openclaw_config::get_providers()
+            .map(|providers| providers.keys().cloned().collect())
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Get a single OpenClaw provider fragment from live config.
@@ -47,9 +50,28 @@ pub fn scan_openclaw_config_health() -> Result<Vec<openclaw_config::OpenClawHeal
 
 /// Get OpenClaw default model config (agents.defaults.model)
 #[tauri::command]
-pub fn get_openclaw_default_model() -> Result<Option<openclaw_config::OpenClawDefaultModel>, String>
-{
-    openclaw_config::get_default_model().map_err(|e| e.to_string())
+pub async fn get_openclaw_default_model(
+) -> Result<Option<openclaw_config::OpenClawDefaultModel>, String> {
+    super::run_command_blocking(|| openclaw_config::get_default_model().map_err(|e| e.to_string()))
+        .await
+}
+
+#[cfg(test)]
+mod read_dispatch_tests {
+    use super::{get_openclaw_default_model, get_openclaw_live_provider_ids};
+    use std::future::Future;
+
+    fn assert_async_command<T, F>(_: impl FnOnce() -> F)
+    where
+        F: Future<Output = Result<T, String>> + Send,
+    {
+    }
+
+    #[test]
+    fn provider_page_reads_use_async_dispatch() {
+        assert_async_command(get_openclaw_live_provider_ids);
+        assert_async_command(get_openclaw_default_model);
+    }
 }
 
 /// Set OpenClaw default model config (agents.defaults.model)

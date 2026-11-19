@@ -329,9 +329,7 @@ export function CodexModelReasoningEditor({
                   capability.defaultEffort as CodexReasoningEffort,
                 )
                   ? capability.defaultEffort
-                  : isSublyx && nativeEfforts.includes("xhigh")
-                    ? "xhigh"
-                    : ""
+                  : ""
               }
               disabled={readOnly}
               onChange={(event) =>

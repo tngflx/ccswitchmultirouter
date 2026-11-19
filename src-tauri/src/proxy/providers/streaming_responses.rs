@@ -15,7 +15,7 @@ use super::transform_responses::{
     web_search_max_uses_exceeded_error, web_search_result_from_annotation,
     web_search_results_from_action, web_search_tool_result_error,
 };
-use crate::proxy::sse::{strip_sse_field, take_sse_block};
+use crate::proxy::sse::{strip_sse_field, SseOrJsonFrames, SseOrJsonItem};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -495,8 +495,7 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
         let hosted_web_search_name = hosted_web_search_name
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "web_search".to_string());
-        let mut buffer = String::new();
-        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut frames = SseOrJsonFrames::default();
         let mut message_id: Option<String> = None;
         let mut current_model: Option<String> = None;
         let mut has_sent_message_start = false;
@@ -538,51 +537,43 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
         'stream_loop: while let Some((chunk, is_eof)) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
-
-                    // A few compatible gateways ignore stream:true and return one
-                    // JSON document. Hold it intact until EOF, including any pretty-
-                    // printed blank lines that would otherwise look like SSE separators.
-                    let looks_like_json = matches!(
-                        buffer
-                            .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}')
-                            .as_bytes()
-                            .first(),
-                        Some(b'{') | Some(b'[')
-                    );
-                    if looks_like_json && !is_eof {
-                        continue;
-                    }
-                    if looks_like_json && is_eof {
-                        match serde_json::from_str::<Value>(buffer.trim()) {
-                            Ok(body) => {
-                                for event in responses_json_to_anthropic_sse(
-                                    body,
-                                    Some(&hosted_web_search_name),
-                                    max_web_search_uses,
-                                ) {
-                                    yield Ok(event);
+                    let mut input = bytes.as_ref();
+                    while let Some(item) = frames.read(&mut input, is_eof) {
+                        let block = match item {
+                            SseOrJsonItem::Frame(frame) => frame,
+                            SseOrJsonItem::Json(body) => {
+                                let text = String::from_utf8_lossy(&body);
+                                let candidate = text.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}');
+                                match serde_json::from_str::<Value>(candidate) {
+                                    Ok(body) => {
+                                        for event in responses_json_to_anthropic_sse(
+                                            body,
+                                            Some(&hosted_web_search_name),
+                                            max_web_search_uses,
+                                        ) {
+                                            yield Ok(event);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        yield Ok(anthropic_error_sse(
+                                            &format!("Invalid JSON response from Responses upstream: {error}"),
+                                            "response_parse_error",
+                                        ));
+                                    }
                                 }
                                 terminated = true;
+                                break 'stream_loop;
                             }
-                            Err(error) => {
+                            SseOrJsonItem::Oversized => {
                                 yield Ok(anthropic_error_sse(
-                                    &format!("Invalid JSON response from Responses upstream: {error}"),
-                                    "response_parse_error",
+                                    "Upstream SSE or JSON body exceeded the proxy size limit",
+                                    "response_too_large",
                                 ));
                                 terminated = true;
+                                break 'stream_loop;
                             }
-                        }
-                        buffer.clear();
-                        continue;
-                    }
-
-                    if is_eof && !buffer.trim().is_empty() {
-                        buffer.push_str("\n\n");
-                    }
-
-                    // SSE 事件由 \n\n 分隔
-                    while let Some(block) = take_sse_block(&mut buffer) {
+                        };
+                        let block = String::from_utf8_lossy(&block);
                         if block.trim().is_empty() {
                             continue;
                         }

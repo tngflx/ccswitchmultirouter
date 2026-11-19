@@ -39,6 +39,22 @@ interface DragHandleProps {
   isDragging: boolean;
 }
 
+function FailoverHealthBadge({
+  providerId,
+  appId,
+}: {
+  providerId: string;
+  appId: AppId;
+}) {
+  const { data: health } = useProviderHealth(providerId, appId);
+  return health ? (
+    <ProviderHealthBadge
+      consecutiveFailures={health.consecutive_failures}
+      isHealthy={health.is_healthy}
+    />
+  ) : null;
+}
+
 interface ProviderCardProps {
   provider: Provider;
   isCurrent: boolean;
@@ -248,12 +264,6 @@ export function ProviderCard({
   const handleDisableAnyOmo = isOmoSlim ? onDisableOmoSlim : onDisableOmo;
   const isAdditiveMode = appId === "opencode" && !isAnyOmo;
 
-  const { data: health } = useProviderHealth(
-    provider.id,
-    appId,
-    isProxyAppId(appId),
-  );
-
   const fallbackUrlText = t("provider.notConfigured", {
     defaultValue: "未配置接口地址",
   });
@@ -349,6 +359,8 @@ export function ProviderCard({
   // 统一权威谓词覆盖 MultiRouter、托管 OAuth 与协议转换。
   const codexNeedsRouting =
     appId === "codex" && providerNeedsRouting(appId, provider);
+  const scriptUsageEnabled =
+    usageEnabled && !isOfficial && !isOfficialSubscriptionUsage;
   // 获取用量数据以判断是否有多套餐
   // 累加模式应用（OpenCode/OpenClaw/Hermes）：使用 isInConfig 代替 isCurrent
   const shouldAutoQuery =
@@ -359,15 +371,31 @@ export function ProviderCard({
     ? provider.meta?.usage_script?.autoQueryInterval || 0
     : 0;
 
-  const { data: usage } = useUsageQuery(provider.id, appId, {
-    enabled: usageEnabled && !isOfficial && !isOfficialSubscriptionUsage,
+  const {
+    data: usage,
+    isFetching: loading,
+    lastQueriedAt,
+    refetch,
+  } = useUsageQuery(provider.id, appId, {
+    enabled: scriptUsageEnabled,
     autoQueryInterval,
   });
 
   const isTokenPlan =
     provider.meta?.usage_script?.templateType === "token_plan";
   const hasMultiplePlans =
-    usage?.success && usage.data && usage.data.length > 1 && !isTokenPlan;
+    scriptUsageEnabled &&
+    usage?.success &&
+    usage.data &&
+    usage.data.length > 1 &&
+    !isTokenPlan;
+  const usageFooterProps = {
+    usage,
+    loading,
+    lastQueriedAt,
+    refetch,
+    isTokenPlan,
+  };
 
   const [isExpanded, setIsExpanded] = useState(false);
 
@@ -557,11 +585,8 @@ export function ProviderCard({
                   </span>
                 )}
 
-              {isProxyRunning && isInFailoverQueue && health && (
-                <ProviderHealthBadge
-                  consecutiveFailures={health.consecutive_failures}
-                  isHealthy={health.is_healthy}
-                />
+              {isProxyAppId(appId) && isProxyRunning && isInFailoverQueue && (
+                <FailoverHealthBadge providerId={provider.id} appId={appId} />
               )}
 
               {isAutoFailoverEnabled &&
@@ -656,17 +681,9 @@ export function ProviderCard({
                     })}
                   </span>
                 </div>
-              ) : (
-                <UsageFooter
-                  provider={provider}
-                  providerId={provider.id}
-                  appId={appId}
-                  usageEnabled={usageEnabled}
-                  isCurrent={isCurrent}
-                  isInConfig={isInConfig}
-                  inline={true}
-                />
-              )}
+              ) : scriptUsageEnabled ? (
+                <UsageFooter {...usageFooterProps} inline />
+              ) : null}
               {hasMultiplePlans && (
                 <button
                   onClick={(e) => {
@@ -755,15 +772,7 @@ export function ProviderCard({
 
       {isExpanded && hasMultiplePlans && (
         <div className="mt-4 pt-4 border-t border-border-default">
-          <UsageFooter
-            provider={provider}
-            providerId={provider.id}
-            appId={appId}
-            usageEnabled={usageEnabled}
-            isCurrent={isCurrent}
-            isInConfig={isInConfig}
-            inline={false}
-          />
+          <UsageFooter {...usageFooterProps} />
         </div>
       )}
     </div>

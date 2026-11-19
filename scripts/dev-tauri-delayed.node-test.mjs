@@ -474,6 +474,21 @@ test("development worker launch preserves options and enters worker mode", () =>
   assert.equal(environment.CC_SWITCH_DEV_SUPERVISOR, "0");
 });
 
+test("a recovered supervisor captures worker output without changing its worker identity or IPC", () => {
+  const ordinary = devWorkerCommand([], {}, false);
+  const recovering = devWorkerCommand([], {}, true);
+  assert.equal(recovering.executable, ordinary.executable);
+  assert.deepEqual(recovering.args, ordinary.args);
+  assert.deepEqual(recovering.options.env, ordinary.options.env);
+  assert.equal(recovering.options.detached, ordinary.options.detached);
+  assert.deepEqual(recovering.options.stdio, [
+    "inherit",
+    "pipe",
+    "pipe",
+    "ipc",
+  ]);
+});
+
 test("development recovery metadata saves options without arbitrary environment secrets", () => {
   const options = {
     TAURI_DEV_PORT: "3410",
@@ -3754,6 +3769,41 @@ test("detached watchdog never hands off on a present or unknown fallback", async
       events.every(({ event }) => event === "dev-watchdog-liveness-fallback"),
     );
   }
+});
+
+test("detached watchdog retries at the lower cadence without flooding repeat diagnostics", async () => {
+  const session = {
+    ...replacementDevSession(),
+    supervisorPid: 100,
+    repoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."),
+    scriptPath: fileURLToPath(
+      new URL("./dev-tauri-delayed.mjs", import.meta.url),
+    ),
+  };
+  const times = [0, 5_000, 10_000, 60_000, 65_000, 70_000];
+  const events = [];
+  let waits = 0;
+  await runDetachedDevWatchdog(100, {
+    markerPath: path.join("isolated", "dev-session.json"),
+    readSession() {
+      if (waits === times.length) return { ...session, state: "stopping" };
+      throw new Error("fixture transient session error");
+    },
+    now: () => times[waits - 1],
+    wait: async (milliseconds) => {
+      assert.equal(milliseconds, 5_000);
+      assert.ok(++waits <= times.length);
+    },
+    handoff: async () => assert.fail("unreadable ownership may not recover"),
+    writeEvent(event) {
+      events.push([event, times[waits - 1]]);
+    },
+  });
+  assert.equal(waits, times.length);
+  assert.deepEqual(events, [
+    ["dev-watchdog-iteration-failed", 0],
+    ["dev-watchdog-iteration-failed", 60_000],
+  ]);
 });
 
 test("detached watchdog publication does not release ownership at spawn acknowledgement", async () => {

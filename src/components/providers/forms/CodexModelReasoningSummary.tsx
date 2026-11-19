@@ -1,5 +1,5 @@
 import { Button } from "@/components/ui/button";
-import type { CodexReasoningEffort } from "@/types";
+import type { CodexCatalogModel, CodexReasoningEffort } from "@/types";
 import type { CodexModelReasoningResolution } from "@/types/codexSubagentV2";
 import { useState } from "react";
 
@@ -22,6 +22,8 @@ function formatCapabilitySource(source: string): string {
   );
 }
 
+type CatalogUltra = NonNullable<CodexCatalogModel["codexUltra"]>;
+
 export interface CodexModelReasoningSummaryProps {
   model: string;
   source: string;
@@ -30,11 +32,9 @@ export interface CodexModelReasoningSummaryProps {
   defaultEffort?: string;
   ultraEnabled: boolean;
   ultraEffort?: CodexReasoningEffort;
+  ultraEffortSource?: CatalogUltra["providerEffortSource"];
   ultraEfforts: CodexReasoningEffort[];
-  onUltraChange: (ultra: {
-    enabled: boolean;
-    providerEffort?: CodexReasoningEffort;
-  }) => void;
+  onUltraChange: (ultra: CatalogUltra) => void;
   expanded: boolean;
   onToggle: () => void;
 }
@@ -47,6 +47,7 @@ export function CodexModelReasoningSummary({
   defaultEffort,
   ultraEnabled,
   ultraEffort,
+  ultraEffortSource,
   ultraEfforts,
   onUltraChange,
   expanded,
@@ -119,6 +120,9 @@ export function CodexModelReasoningSummary({
               onUltraChange({
                 enabled: event.target.checked,
                 providerEffort: ultraEffort,
+                ...(ultraEffortSource
+                  ? { providerEffortSource: ultraEffortSource }
+                  : {}),
               });
             }}
           />
@@ -129,13 +133,16 @@ export function CodexModelReasoningSummary({
           aria-label={`Provider reasoning effort used by ${displayModel} Ultra`}
           value={ultraEffort ?? ""}
           disabled={!ultraEnabled || ultraEfforts.length === 0}
-          onChange={(event) =>
+          onChange={(event) => {
+            const providerEffort = ultraEfforts.find(
+              (effort) => effort === event.target.value,
+            );
             onUltraChange({
               enabled: ultraEnabled,
-              providerEffort: (event.target.value || undefined) as
-                CodexReasoningEffort | undefined,
-            })
-          }
+              providerEffort,
+              ...(providerEffort ? { providerEffortSource: "user" } : {}),
+            });
+          }}
         >
           <option value="">Select provider level…</option>
           {unavailableUltraEffort ? (

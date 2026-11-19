@@ -348,6 +348,11 @@ export function OwnerRemoteSettings({ controller }: OwnerRemoteSettingsProps) {
               })}
         </Button>
       </div>
+      {enabled && running ? (
+        <p className="text-xs text-muted-foreground">
+          {t("settings.ownerRemote.listenerOnly")}
+        </p>
+      ) : null}
       {!enabled && !normalizedOrigin ? (
         <p className="text-xs text-muted-foreground">
           {t("settings.ownerRemote.setupRequired", {
@@ -364,9 +369,37 @@ export function OwnerRemoteSettings({ controller }: OwnerRemoteSettingsProps) {
           <p className="text-xs text-muted-foreground">
             {t("settings.ownerRemote.privateNetwork")}
           </p>
-          <pre className="overflow-auto rounded-md bg-muted p-2 text-xs">
-            tailscale serve --bg http://127.0.0.1:15723
-          </pre>
+          <ol
+            aria-label={t("settings.ownerRemote.tailscaleSteps")}
+            className="list-decimal space-y-2 pl-5 text-xs text-muted-foreground"
+          >
+            {[
+              "setupStepDevices",
+              "setupStepAccess",
+              "setupStepServe",
+              "setupStepOrigin",
+              "setupStepEnroll",
+            ].map((step) => (
+              <li key={step}>
+                {t(`settings.ownerRemote.${step}`)}
+                {step === "setupStepServe" ? (
+                  <pre className="mt-2 overflow-auto rounded-md bg-muted p-2 text-xs">
+                    tailscale serve --bg http://127.0.0.1:15723
+                  </pre>
+                ) : null}
+              </li>
+            ))}
+          </ol>
+          <details className="space-y-2">
+            <summary className="cursor-pointer text-xs">
+              {t("settings.ownerRemote.cloudflareOptional")}
+            </summary>
+            <div className="space-y-2 pt-2 text-xs text-muted-foreground">
+              <p>{t("settings.ownerRemote.cloudflareDnsOnly")}</p>
+              <p>{t("settings.ownerRemote.cloudflareCertificate")}</p>
+              <p>{t("settings.ownerRemote.cloudflareNoSecrets")}</p>
+            </div>
+          </details>
           <div className="space-y-1">
             <Label htmlFor="owner-remote-origin">
               {t("settings.ownerRemote.origin")}
@@ -443,11 +476,22 @@ export function OwnerRemoteSettings({ controller }: OwnerRemoteSettingsProps) {
               </p>
             </div>
           ) : null}
-          {running && status?.httpsOrigin ? (
-            <p className="break-all text-xs text-muted-foreground">
-              {t("settings.ownerRemote.consoleAddress")}: {status.httpsOrigin}
-              /remote/
-            </p>
+          {enabled && running && originPinned && normalizedOrigin && !busy ? (
+            <div className="space-y-2">
+              <p className="break-all text-xs text-muted-foreground">
+                {t("settings.ownerRemote.consoleAddress")}: {normalizedOrigin}
+                /remote/
+              </p>
+              <Button size="sm" variant="outline" asChild>
+                <a
+                  href={`${normalizedOrigin}/remote/`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {t("settings.ownerRemote.openWebsite")}
+                </a>
+              </Button>
+            </div>
           ) : null}
           <p className="text-xs text-muted-foreground">
             {t("settings.ownerRemote.boundary")}

@@ -4,6 +4,7 @@
 //! and explicit spawn arguments can choose another effort. Only Codex's explicit
 //! child-request metadata authorizes this override; prompts/model names do not.
 
+use super::codex_reasoning_controls::CodexReasoningProjection;
 use crate::provider::Provider;
 use axum::http::HeaderMap;
 use serde_json::Value;
@@ -86,32 +87,28 @@ pub(super) fn apply_subagent_reasoning_effort(
         {
             return false;
         }
-        SubagentReasoningProjection::capture(&controls).apply(body);
+        CodexReasoningProjection::capture(&controls).apply(body);
         return true;
     }
-    let Some(object) = body.as_object_mut() else {
+    let Some(object) = body.as_object() else {
         return false;
     };
-    let reasoning = object
-        .entry("reasoning")
-        .or_insert_with(|| Value::Object(Default::default()));
-    if reasoning.is_null() {
-        *reasoning = Value::Object(Default::default());
+    if object
+        .get("reasoning")
+        .is_some_and(|value| !value.is_null() && !value.is_object())
+    {
+        // Preserve malformed input for ordinary validation; an override is not
+        // permission to reinterpret an unrecognized request structure.
+        return false;
     }
-    let Some(reasoning) = reasoning.as_object_mut() else {
-        // Preserve malformed input for normal validation instead of panicking.
-        return false;
-    };
-    reasoning.insert(
-        "effort".to_string(),
-        Value::String(effort.as_str().to_string()),
-    );
+    let mut logical = serde_json::json!({"reasoning": {"effort": effort.as_str()}});
     if object.contains_key("reasoning_effort") {
-        object.insert(
-            "reasoning_effort".to_string(),
-            Value::String(effort.as_str().to_string()),
-        );
+        logical["reasoning_effort"] = Value::String(effort.as_str().to_string());
     }
+    // This active policy replaces prior reasoning intent, not just one alias.
+    // A stale enabled=false must not contradict the chosen logical High when
+    // the common ingress validator subsequently prepares the provider body.
+    CodexReasoningProjection::capture(&logical).apply(body);
     true
 }
 
@@ -168,88 +165,6 @@ fn diagnostic_effort(body: &Value) -> &'static str {
         resolved = Some(effort);
     }
     resolved.map_or("unset", CodexReasoningEffort::as_str)
-}
-
-const CONTROL_PATHS: [&str; 8] = [
-    "/reasoning/effort",
-    "/reasoning/enabled",
-    "/reasoning_effort",
-    "/thinking",
-    "/enable_thinking",
-    "/chat_template_kwargs/enable_thinking",
-    "/reasoning_split",
-    "/output_config/effort",
-];
-
-/// Request-local projection, never persisted. Native controls are captured only
-/// after conversion and its safety guards. Later provider body policy may not
-/// silently undo an active plan override or re-enable guarded-off thinking.
-pub(super) struct SubagentReasoningProjection {
-    controls: [Option<Value>; CONTROL_PATHS.len()],
-}
-
-impl SubagentReasoningProjection {
-    pub(super) fn capture(body: &Value) -> Self {
-        Self {
-            controls: std::array::from_fn(|index| body.pointer(CONTROL_PATHS[index]).cloned()),
-        }
-    }
-
-    fn apply(&self, body: &mut Value) {
-        for (path, value) in CONTROL_PATHS.iter().zip(&self.controls) {
-            let segments = path.split('/').skip(1).collect::<Vec<_>>();
-            replace_control(body, &segments, value.as_ref());
-        }
-    }
-
-    pub(super) fn verify(&self, body: &Value) -> Result<(), super::error::ProxyError> {
-        let conflict = self.controls != Self::capture(body).controls;
-        let invalid_budget = body
-            .pointer("/thinking/budget_tokens")
-            .and_then(Value::as_u64)
-            .is_some_and(|budget| {
-                body.get("max_tokens")
-                    .and_then(Value::as_u64)
-                    .is_none_or(|ceiling| budget < 1024 || budget > ceiling / 2)
-            });
-        if conflict || invalid_budget {
-            return Err(super::error::ProxyError::ConfigError(
-                "Sub-Agent reasoning override conflicts with provider request-body settings; remove conflicting reasoning/thinking or output-budget overrides, or select Profile settings".to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn replace_control(body: &mut Value, path: &[&str], replacement: Option<&Value>) {
-    let Some((key, rest)) = path.split_first() else {
-        return;
-    };
-    let Some(object) = body.as_object_mut() else {
-        return;
-    };
-    if rest.is_empty() {
-        if let Some(value) = replacement {
-            object.insert((*key).to_string(), value.clone());
-        } else {
-            object.remove(*key);
-        }
-        return;
-    }
-    if replacement.is_some() {
-        let child = object
-            .entry((*key).to_string())
-            .or_insert_with(|| serde_json::json!({}));
-        if !child.is_object() {
-            *child = serde_json::json!({});
-        }
-        replace_control(child, rest, replacement);
-    } else if let Some(child) = object.get_mut(*key) {
-        replace_control(child, rest, None);
-        if child.as_object().is_some_and(|child| child.is_empty()) {
-            object.remove(*key);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -536,6 +451,95 @@ mod tests {
     }
 
     #[test]
+    fn subagent_reasoning_effort_prepares_sublyx_native_max_for_marked_children() {
+        let base_url = "https://api.sublyx.org/v1";
+        let wire_model = "gpt-6.2-sol";
+        let evidence_scope =
+            crate::reasoning_capabilities::reasoning_evidence_scope(base_url, wire_model)
+                .expect("Sublyx Responses evidence scope");
+        let provider = Provider::with_id(
+            "sublyx-router-route".into(),
+            "Sublyx relay".into(),
+            json!({
+                "base_url": base_url,
+                "codexResolvedRouteId": "sublyx-route",
+                "codexResolvedTargetProviderId": "sublyx-test-target",
+                "codexResolvedCanonicalModel": "gpt-6.2-sol-sublyx",
+                "codexResolvedUpstreamModelOverride": wire_model,
+                "modelCatalog": {"models": [{
+                    "model": "gpt-6.2-sol-sublyx",
+                    "upstreamModel": wire_model,
+                    "codexUltra": {"enabled": true, "providerEffort": "xhigh"},
+                    "reasoning": {
+                        "schemaVersion": 2,
+                        "supportStatus": "confirmed_supported",
+                        "controlKind": "graded",
+                        "supportedEfforts": ["low", "medium", "high", "xhigh", "max"],
+                        "defaultEffort": "medium",
+                        "disableAllowed": false,
+                        "source": "sublyx",
+                        "confidence": "maintained",
+                        "evidenceScope": evidence_scope,
+                        "upstream": {
+                            "format": "reasoning_object",
+                            "parameter": "reasoning.effort",
+                            "effortMap": {"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"}
+                        },
+                        "codexUltraOrchestration": {"enabled": true, "providerEffort": "xhigh"}
+                    }
+                }]}
+            }),
+            None,
+        );
+
+        for (policy, incoming) in [
+            ("max", "low"),
+            ("max", "medium"),
+            ("max", "xhigh"),
+            ("ultra", "low"),
+            ("ultra", "medium"),
+            ("ultra", "xhigh"),
+            ("max", "ultra"),
+        ] {
+            for child in [false, true] {
+                let headers = if child {
+                    child_headers()
+                } else {
+                    HeaderMap::new()
+                };
+                let mut body = request();
+                body["model"] = json!("router-generated-public-alias");
+                body["reasoning"]["effort"] = json!(incoming);
+                assert_eq!(
+                    apply_subagent_reasoning_effort(
+                        &settings(policy),
+                        &provider,
+                        &headers,
+                        &mut body,
+                        "/v1/responses",
+                    ),
+                    child,
+                    "{policy}/{incoming}/child={child}"
+                );
+                crate::proxy::providers::prepare_codex_native_responses_model(&provider, &mut body)
+                    .expect("prepare Sublyx Responses request");
+                let wire_effort = if child || incoming == "ultra" {
+                    "max"
+                } else {
+                    incoming
+                };
+                assert_eq!(body["model"], wire_model);
+                assert_eq!(
+                    body["reasoning"]["effort"], wire_effort,
+                    "{policy}/{incoming}/child={child}"
+                );
+                assert_eq!(body["reasoning"]["summary"], "auto");
+                assert!(body.get("reasoning_effort").is_none());
+            }
+        }
+    }
+
+    #[test]
     fn subagent_reasoning_effort_native_chat_uses_flat_field_without_responses_shape() {
         let mut body = json!({"model": "test-graded-model", "messages": [{"role": "user", "content": "Inspect"}]});
         assert!(apply_subagent_reasoning_effort(
@@ -547,6 +551,37 @@ mod tests {
         ));
         assert_eq!(body["reasoning_effort"], "high");
         assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn subagent_reasoning_effort_responses_replaces_stale_boolean_controls_before_validation() {
+        let mut body = json!({
+            "model": "test-graded-model", "input": "bounded test", "reasoning_effort": "max",
+            "reasoning": {"enabled": false, "effort": "max", "summary": "auto"},
+            "thinking": {"type": "disabled"}, "enable_thinking": false, "reasoning_split": false,
+            "chat_template_kwargs": {"enable_thinking": false, "keep": "ancillary"},
+            "output_config": {"effort": "low", "keep": "ancillary"}
+        });
+        assert!(apply_subagent_reasoning_effort(
+            &settings("high"),
+            &provider(),
+            &child_headers(),
+            &mut body,
+            "/v1/responses"
+        ));
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert!(body["reasoning"].get("enabled").is_none());
+        for field in ["thinking", "enable_thinking", "reasoning_split"] {
+            assert!(body.get(field).is_none());
+        }
+        assert!(body["chat_template_kwargs"]
+            .get("enable_thinking")
+            .is_none());
+        assert!(body["output_config"].get("effort").is_none());
+        assert_eq!(body["chat_template_kwargs"]["keep"], "ancillary");
+        assert_eq!(body["output_config"]["keep"], "ancillary");
     }
 
     #[test]
@@ -651,7 +686,7 @@ mod tests {
     #[test]
     fn subagent_reasoning_effort_final_policy_rejects_conflicts_without_exposing_values() {
         let original = json!({"reasoning": {"effort": "high"}, "model": "test-graded-model"});
-        let projection = SubagentReasoningProjection::capture(&original);
+        let projection = CodexReasoningProjection::capture(&original);
         let mut compatible = original.clone();
         compatible["reasoning"]["summary"] = json!("auto");
         compatible["temperature"] = json!(0.1);
@@ -667,7 +702,7 @@ mod tests {
         }
         let budget =
             json!({"thinking": {"type": "enabled", "budget_tokens": 4096}, "max_tokens": 16384});
-        let projection = SubagentReasoningProjection::capture(&budget);
+        let projection = CodexReasoningProjection::capture(&budget);
         projection.verify(&budget).unwrap();
         let mut reduced = budget;
         reduced["max_tokens"] = json!(2048);

@@ -1,4 +1,5 @@
 use crate::codex_multirouter::catalog::catalog_models;
+use crate::proxy::providers::codex_reasoning::CodexReasoningEffort;
 use crate::Provider;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,7 +21,7 @@ pub struct CodexRoutingParseError {
 
 impl CodexRoutingDocument {
     pub fn parse(value: &Value) -> Result<Self, CodexRoutingParseError> {
-        validate_subagent_reasoning_effort(value.get("subagentReasoningEffort"))?;
+        parse_subagent_reasoning_effort(value.get("subagentReasoningEffort"))?;
         let schema_version = value.get("schemaVersion").and_then(Value::as_u64);
         match schema_version {
             None | Some(1) => Ok(Self::Legacy(value.clone())),
@@ -44,19 +45,20 @@ impl CodexRoutingDocument {
 }
 
 /// Both routing schemas share the same reversible Sub-Agent effort contract.
-/// An explicit invalid value must never silently become profile/default mode.
-pub(crate) fn validate_subagent_reasoning_effort(
+/// Missing values default to High; only explicit Profile mode disables the override.
+pub(crate) fn parse_subagent_reasoning_effort(
     value: Option<&Value>,
-) -> Result<(), CodexRoutingParseError> {
-    if value.is_none()
-        || value.and_then(Value::as_str).is_some_and(|effort| {
-            effort == "profile"
-                || effort
-                    .parse::<crate::proxy::providers::codex_reasoning::CodexReasoningEffort>()
-                    .is_ok()
-        })
-    {
-        return Ok(());
+) -> Result<Option<CodexReasoningEffort>, CodexRoutingParseError> {
+    let Some(value) = value else {
+        return Ok(Some(CodexReasoningEffort::High));
+    };
+    if let Some(effort) = value.as_str() {
+        if effort == "profile" {
+            return Ok(None);
+        }
+        if let Ok(effort) = effort.parse() {
+            return Ok(Some(effort));
+        }
     }
     Err(CodexRoutingParseError {
         code: "invalid_subagent_reasoning_effort".to_string(),
@@ -226,7 +228,7 @@ pub fn validate_v2(
 ) -> Result<(), Vec<CodexRoutingValidationIssue>> {
     let mut issues = Vec::new();
     if let Err(error) =
-        validate_subagent_reasoning_effort(plan.extensions.get("subagentReasoningEffort"))
+        parse_subagent_reasoning_effort(plan.extensions.get("subagentReasoningEffort"))
     {
         push_issue(&mut issues, &error.code, None, &error.message);
     }

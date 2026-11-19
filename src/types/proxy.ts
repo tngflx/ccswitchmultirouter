@@ -279,6 +279,7 @@ export interface CodexModelPickerDiagnosticsCounts {
   // Older native builds may omit Boolean control telemetry.
   booleanControlUnverifiedModelCount?: number;
   booleanControlReadyModelCount?: number;
+  booleanControlNotObservedModelCount?: number;
   effortMismatchCount: number;
   flagMismatchCount: number;
   missingMaxModelCount: number;

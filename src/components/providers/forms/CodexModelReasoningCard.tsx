@@ -175,12 +175,17 @@ export function CodexModelReasoningCard({
   const { resolved, detection } = resolution;
   const isUnknown = status === "unknown";
   const canRedetect = isUnknown || resolution.source !== "user";
+  const detectionReasoning = detection?.reasoning;
   const hasUsableDetection =
     resolution.hasDetectionCandidate &&
     Boolean(
-      detection?.reasoning?.supportedEfforts?.some(
-        (effort) => effort && effort !== "none",
-      ),
+      detectionReasoning &&
+      ((detectionReasoning.controlKind === "boolean" &&
+        (detectionReasoning.supportStatus ?? "confirmed_supported") ===
+          "confirmed_supported") ||
+        detectionReasoning.supportedEfforts.some(
+          (effort) => effort && effort !== "none",
+        )),
     );
 
   return (

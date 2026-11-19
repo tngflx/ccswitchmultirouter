@@ -94,6 +94,44 @@ describe("ProviderForm Codex catalog helpers", () => {
     ).toBe("openai_responses");
   });
 
+  it("normalizes legacy reasoning aliases while reopening a saved catalog", () => {
+    const [loaded] = extractCodexCatalogModels({
+      models: [
+        {
+          model: "openrouter/graded",
+          reasoning: {
+            support_status: "confirmed_supported",
+            control_kind: "graded",
+            supported_efforts: ["low", "medium", "high"],
+            default_effort: "medium",
+            disable_allowed: false,
+            upstream: {
+              format: "reasoning_object",
+              parameter: "reasoning.effort",
+              effort_map: { low: "low", medium: "medium", high: "high" },
+            },
+          },
+        },
+      ],
+    });
+
+    expect(loaded.reasoning).toMatchObject({
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: ["low", "medium", "high"],
+      defaultEffort: "medium",
+      disableAllowed: false,
+      upstream: {
+        format: "reasoning_object",
+        parameter: "reasoning.effort",
+        effortMap: { low: "low", medium: "medium", high: "high" },
+      },
+    });
+    expect(loaded.reasoning).not.toHaveProperty("supported_efforts");
+    expect(loaded.reasoning?.upstream).not.toHaveProperty("effort_map");
+  });
+
   it("preserves provider API declarations when constructing the save payload", () => {
     const [saved] = normalizeCodexCatalogModelsForSave([
       {
@@ -107,6 +145,46 @@ describe("ProviderForm Codex catalog helpers", () => {
     expect(
       readCodexModelProtocolCapability(providerWithCatalog([saved]), saved),
     ).toBe("openai_responses");
+  });
+
+  it("round-trips an explicit Sublyx XHigh Ultra target with maintained capability evidence", () => {
+    const identity = { baseUrl: "https://api.sublyx.org/v1" };
+    const codexUltra = {
+      enabled: true,
+      providerEffort: "xhigh",
+      providerEffortSource: "user",
+    } as const;
+    const [row] = extractCodexCatalogModels({
+      models: [
+        {
+          model: "gpt-6.2-sol",
+          reasoning: {
+            schemaVersion: 2,
+            supportStatus: "confirmed_supported",
+            controlKind: "graded",
+            supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+            defaultEffort: "xhigh",
+            disableAllowed: false,
+            upstream: {
+              format: "reasoning_object",
+              parameter: "reasoning.effort",
+            },
+            source: "sublyx",
+            codexUltraOrchestration: { enabled: true, providerEffort: "xhigh" },
+          },
+          codexUltra,
+        },
+      ],
+    });
+
+    const models = normalizeCodexCatalogModelsForSave([row], identity);
+    expect(models[0].reasoning?.codexUltraOrchestration?.providerEffort).toBe(
+      "max",
+    );
+    expect(models[0].codexUltra).toEqual(codexUltra);
+    expect(extractCodexCatalogModels({ models })[0].codexUltra).toEqual(
+      codexUltra,
+    );
   });
 
   it("round-trips fetched capability evidence and exact reasoning efforts through saving and reopening", () => {
@@ -501,6 +579,69 @@ describe("ProviderForm Codex catalog helpers", () => {
     ).toEqual([
       { model: "enabled-model" },
       { model: "disabled-model", enabled: false },
+    ]);
+  });
+
+  it("round-trips canonical picker reasoning metadata and API format provenance", () => {
+    const loaded = extractCodexCatalogModels({
+      models: [
+        {
+          model: "deepseek-flash",
+          reasoning_summary_format: "experimental",
+          default_reasoning_summary: "none",
+          api_format_source: "probe",
+        },
+      ],
+    });
+
+    expect(normalizeCodexCatalogModelsForSave(loaded)).toEqual([
+      {
+        model: "deepseek-flash",
+        reasoningSummaryFormat: "experimental",
+        defaultReasoningSummary: "none",
+        apiFormatSource: "probe",
+      },
+    ]);
+  });
+  it("preserves typed canonical picker metadata without reviving conflicting legacy aliases", () => {
+    const models: CodexCatalogModel[] = [
+      {
+        model: "deepseek-flash",
+        reasoningSummaryFormat: " experimental ",
+        reasoning_summary_format: "disabled",
+        defaultReasoningSummary: " none ",
+        default_reasoning_summary: "auto",
+        apiFormatSource: " probe ",
+        api_format_source: "provider",
+      },
+    ];
+
+    expect(
+      normalizeCodexCatalogModelsForSave(extractCodexCatalogModels({ models })),
+    ).toEqual([
+      {
+        model: "deepseek-flash",
+        reasoningSummaryFormat: "experimental",
+        defaultReasoningSummary: "none",
+        apiFormatSource: "probe",
+      },
+    ]);
+  });
+
+  it("omits empty or malformed source picker metadata instead of serializing it", () => {
+    const loaded = extractCodexCatalogModels({
+      models: [
+        {
+          model: "no-summary-override",
+          reasoningSummaryFormat: " ",
+          defaultReasoningSummary: 123,
+          apiFormatSource: null,
+        },
+      ],
+    });
+
+    expect(normalizeCodexCatalogModelsForSave(loaded)).toEqual([
+      { model: "no-summary-override" },
     ]);
   });
 

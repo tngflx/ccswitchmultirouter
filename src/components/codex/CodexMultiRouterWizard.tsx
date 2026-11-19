@@ -334,6 +334,9 @@ const INITIAL_FLOW_STATE: WizardFlowState = {
   stepKey: "welcome",
 };
 
+const EMPTY_MODEL_SOURCES: Provider[] = [];
+const REASONING_LOOKUP_CONCURRENCY = 6;
+
 // reducer 是向导的状态机核心；所有异步动作只发事件，不直接改流程状态。
 function wizardFlowReducer(
   state: WizardFlowState,
@@ -713,6 +716,10 @@ function protocolProbeProviderSignature(provider: Provider): string {
   });
 }
 
+function probeModelKey(providerId: string, model: string): string {
+  return `${providerId}\u0000${model}`;
+}
+
 function skipsWizardDeepProtocolProbe(provider: Provider): boolean {
   return !providerHasAutomaticCodexModels(provider);
 }
@@ -1060,7 +1067,7 @@ export function CodexMultiRouterWizard({
   const {
     hasAnyAccount: hasCodexOauthAccount,
     isLoadingStatus: isCodexOauthStatusLoading,
-  } = useCodexOauth();
+  } = useCodexOauth(open);
   const [flowState, dispatchFlow] = useReducer(
     wizardFlowReducer,
     INITIAL_FLOW_STATE,
@@ -1099,10 +1106,9 @@ export function CodexMultiRouterWizard({
   const [isLoadingMigration, setIsLoadingMigration] = useState(false);
   const [isApplyingMigration, setIsApplyingMigration] = useState(false);
   const [reasoningResolutionState, setReasoningResolutionState] = useState<{
-    contextKey: string;
+    sources: Provider[];
     models: Record<string, CodexModelReasoningResolution>;
-  }>({ contextKey: "", models: {} });
-  const reasoningResolutionRequestRef = useRef(0);
+  } | null>(null);
   const initializedOpenRef = useRef(false);
   const initializedTargetRef = useRef<string | null>(null);
   const draftGenerationRef = useRef(0);
@@ -1117,20 +1123,23 @@ export function CodexMultiRouterWizard({
   const consumedReceiptIdsRef = useRef(new Set<string>());
   const lastProtocolLabIssueRef = useRef<string | null>(null);
 
-  const resolvedMode =
-    mode ??
-    (planId || providers.some((provider) => isCodexMultiRouterPlan(provider))
-      ? "edit"
-      : "create");
+  const resolvedMode = useMemo(
+    () =>
+      mode ??
+      (planId || (open && providers.some(isCodexMultiRouterPlan))
+        ? "edit"
+        : "create"),
+    [mode, open, planId, providers],
+  );
   const storedExistingPlan = useMemo(() => {
-    if (resolvedMode !== "edit") return undefined;
+    if (!open || resolvedMode !== "edit") return undefined;
     return planId
       ? providers.find(
           (provider) =>
             provider.id === planId && isCodexMultiRouterPlan(provider),
         )
       : providers.find((provider) => isCodexMultiRouterPlan(provider));
-  }, [planId, providers, resolvedMode]);
+  }, [open, planId, providers, resolvedMode]);
   const existingPlan =
     resolvedMode === "edit" &&
     migratedPlanOverride?.id === storedExistingPlan?.id
@@ -1140,33 +1149,20 @@ export function CodexMultiRouterWizard({
   const wizardSubagentVersion = normalizeCodexSubagentVersion(
     activePlan?.settingsConfig?.codexRouting?.subagentVersion,
   );
-  const reasoningContextKey = JSON.stringify({
-    subagentVersion: wizardSubagentVersion,
-    sources: draftSources.map((provider) => ({
-      id: provider.id,
-      name: provider.name,
-      settingsConfig: provider.settingsConfig,
-      models: readIncludedWizardModelCatalog(provider).map((model) => ({
-        model: model.model,
-        upstreamModel: model.upstreamModel ?? model.upstream_model,
-        enabled: model.enabled,
-        reasoning: model.reasoning,
-        codexUltra: model.codexUltra,
-      })),
-    })),
-  });
+  // Keep draft state alive while closed, without projecting hidden catalogs.
+  const activeDraftSources = open ? draftSources : EMPTY_MODEL_SOURCES;
   const reasoningResolutions =
-    reasoningResolutionState.contextKey === reasoningContextKey
+    reasoningResolutionState?.sources === activeDraftSources
       ? reasoningResolutionState.models
       : {};
   const editingTargetMissing = resolvedMode === "edit" && !existingPlan;
   const providerModelSources = useMemo(
-    () => defaultWizardModelSources(providers),
-    [providers],
+    () => (open ? defaultWizardModelSources(providers) : EMPTY_MODEL_SOURCES),
+    [open, providers],
   );
   const hasCodexOAuthSources = useMemo(
-    () => draftSources.some((provider) => isWizardCodexOAuthSource(provider)),
-    [draftSources],
+    () => activeDraftSources.some(isWizardCodexOAuthSource),
+    [activeDraftSources],
   );
   const selectedSourceIdSet = useMemo(
     () => new Set(selectedSourceIds),
@@ -1175,104 +1171,122 @@ export function CodexMultiRouterWizard({
   const hasUnauthenticatedCodexOAuthSources =
     hasCodexOAuthSources && !isCodexOauthStatusLoading && !hasCodexOauthAccount;
   const configIssues = useMemo(
-    () => getWizardConfigIssues(draftSources),
-    [draftSources],
+    () => getWizardConfigIssues(activeDraftSources),
+    [activeDraftSources],
   );
   const modelCollisions = useMemo(
-    () => collectWizardModelNameCollisions(draftSources),
-    [draftSources],
+    () => collectWizardModelNameCollisions(activeDraftSources),
+    [activeDraftSources],
   );
-  const protocolLabOutcomeById = mergeWizardProtocolOutcomes(
-    [
+  const protocolLabOutcomeById = useMemo(() => {
+    if (activeDraftSources.length === 0) return mergeWizardProtocolOutcomes([]);
+    const entries = [
       ...(restoredEvidence?.outcomes ?? []),
       ...(batchProtocolLab.probeOutcome?.outcomes ?? []),
-    ].filter((entry) =>
-      draftSources.some(
-        (provider) =>
-          provider.id === entry.providerId &&
-          protocolProbeProviderSignature(entry.inputProvider) ===
-            protocolProbeProviderSignature(provider),
-      ),
-    ),
-  );
-  const currentProtocolOutcomes = [...protocolLabOutcomeById.values()];
-  const connectivityResults = buildWizardConnectivityResultsFromBatchOutcome(
-    draftSources,
-    {
-      outcomes: currentProtocolOutcomes,
-      sources: currentProtocolOutcomes.map((entry) => ({
-        provider: entry.outcome.provider,
-        receiptIds: entry.outcome.receiptIds,
-      })),
-    },
-    hasCodexOauthAccount,
-  ).map((result) => {
-    if (result.canContinue) return result;
-    const previous = lastConnectivityResults.find(
-      (item) =>
-        item.providerId === result.providerId &&
-        (item.model === result.model || item.model === "*") &&
-        !item.canContinue,
+    ];
+    if (entries.length === 0) return mergeWizardProtocolOutcomes([]);
+    const signatureById = new Map(
+      activeDraftSources.map((provider) => [
+        provider.id,
+        protocolProbeProviderSignature(provider),
+      ]),
     );
-    return previous ? { ...result, detail: previous.detail } : result;
-  });
-  const excludedProbeModelSet = new Set(excludedProbeModels);
-  const probeModelKey = (providerId: string, model: string) =>
-    `${providerId}\u0000${model}`;
-  const isProbeModelExcluded = (providerId: string, model: string) =>
-    excludedProbeModelSet.has(probeModelKey(providerId, model)) ||
-    excludedProbeModelSet.has(probeModelKey(providerId, "*"));
+    return mergeWizardProtocolOutcomes(
+      entries.filter(
+        (entry) =>
+          signatureById.get(entry.providerId) ===
+          protocolProbeProviderSignature(entry.inputProvider),
+      ),
+    );
+  }, [activeDraftSources, restoredEvidence, batchProtocolLab.probeOutcome]);
+  const currentProtocolOutcomes = useMemo(
+    () => [...protocolLabOutcomeById.values()],
+    [protocolLabOutcomeById],
+  );
+  const connectivityResults = useMemo(() => {
+    return buildWizardConnectivityResultsFromBatchOutcome(
+      activeDraftSources,
+      {
+        outcomes: currentProtocolOutcomes,
+        sources: currentProtocolOutcomes.map((entry) => ({
+          provider: entry.outcome.provider,
+          receiptIds: entry.outcome.receiptIds,
+        })),
+      },
+      hasCodexOauthAccount,
+    ).map((result) => {
+      if (result.canContinue) return result;
+      const previous = lastConnectivityResults.find(
+        (item) =>
+          item.providerId === result.providerId &&
+          (item.model === result.model || item.model === "*") &&
+          !item.canContinue,
+      );
+      return previous ? { ...result, detail: previous.detail } : result;
+    });
+  }, [
+    activeDraftSources,
+    currentProtocolOutcomes,
+    hasCodexOauthAccount,
+    lastConnectivityResults,
+  ]);
+  const isProbeModelExcluded = useMemo(() => {
+    const excludedProbeModelSet = new Set(open ? excludedProbeModels : []);
+    return (providerId: string, model: string) =>
+      excludedProbeModelSet.has(probeModelKey(providerId, model)) ||
+      excludedProbeModelSet.has(probeModelKey(providerId, "*"));
+  }, [open, excludedProbeModels]);
   const retainedConnectivityResults = connectivityResults.filter(
     (result) => !isProbeModelExcluded(result.providerId, result.model),
   );
-  const probeAdjustedSources = draftSources
-    .map((provider) => {
-      const entry = protocolLabOutcomeById.get(provider.id);
-      return entry &&
-        protocolProbeProviderSignature(entry.inputProvider) ===
-          protocolProbeProviderSignature(provider)
-        ? {
-            ...provider,
-            settingsConfig: entry.outcome.provider.settingsConfig,
-            meta: entry.outcome.provider.meta,
-          }
-        : provider;
-    })
-    .filter((provider) => !isProbeModelExcluded(provider.id, "*"))
-    .map((provider) => ({
-      ...provider,
-      settingsConfig: {
-        ...provider.settingsConfig,
-        modelCatalog: {
-          ...(readCodexCatalogSettings(provider.settingsConfig) ?? {}),
-          models: readWizardModelCatalog(provider).map((model) =>
-            isProbeModelExcluded(provider.id, model.model)
-              ? { ...model, enabled: false }
-              : model,
-          ),
-        },
-      },
-    }));
-  const routeReadySources = probeAdjustedSources.filter((provider) =>
-    readWizardModelCatalog(provider).some((model) => model.enabled !== false),
-  );
-  const availableCatalogModels = buildWizardModelCatalog(
-    resolveWizardModelNameCollisions(probeAdjustedSources),
-    { includeDisabled: true },
-  ).models;
-  const activeCatalogModelOrder = resolveActiveCatalogModelOrder(
-    availableCatalogModels,
-    catalogModelOrder,
+  const { routeReadySources, availableCatalogModels } = useMemo(() => {
+    const probeAdjustedSources = activeDraftSources
+      .filter((provider) => !isProbeModelExcluded(provider.id, "*"))
+      .map((provider) => {
+        const source = protocolLabOutcomeById.get(provider.id)?.outcome
+          .provider;
+        const adjusted = source
+          ? {
+              ...provider,
+              settingsConfig: source.settingsConfig,
+              meta: source.meta,
+            }
+          : provider;
+        return {
+          ...adjusted,
+          settingsConfig: {
+            ...adjusted.settingsConfig,
+            modelCatalog: {
+              ...(readCodexCatalogSettings(adjusted.settingsConfig) ?? {}),
+              models: readWizardModelCatalog(adjusted).map((model) =>
+                isProbeModelExcluded(provider.id, model.model)
+                  ? { ...model, enabled: false }
+                  : model,
+              ),
+            },
+          },
+        };
+      });
+    return {
+      routeReadySources: probeAdjustedSources.filter((provider) =>
+        readWizardModelCatalog(provider).some(
+          (model) => model.enabled !== false,
+        ),
+      ),
+      availableCatalogModels: buildWizardModelCatalog(
+        resolveWizardModelNameCollisions(probeAdjustedSources),
+        { includeDisabled: true },
+      ).models,
+    };
+  }, [activeDraftSources, isProbeModelExcluded, protocolLabOutcomeById]);
+  const activeCatalogModelOrder = useMemo(
+    () =>
+      resolveActiveCatalogModelOrder(availableCatalogModels, catalogModelOrder),
+    [availableCatalogModels, catalogModelOrder],
   );
   // Disabled rows stay visible on the Models page so a user can understand
   // and recover a previously filtered catalog. They are not routeable,
   // however, and must not satisfy navigation or save gates.
-  const routeableCatalogModelOrder = activeCatalogModelOrder.filter((model) =>
-    availableCatalogModels.some(
-      (catalogModel) =>
-        catalogModel.model === model && catalogModel.enabled !== false,
-    ),
-  );
   const activeSpawnAgentModels = resolveActiveSpawnAgentModels(
     draftSpawnAgentModels,
     activeCatalogModelOrder,
@@ -1289,7 +1303,7 @@ export function CodexMultiRouterWizard({
     protocolProbeComplete:
       retainedConnectivityResults.length > 0 &&
       canContinueAfterConnectivity(retainedConnectivityResults),
-    hasVisibleModels: routeableCatalogModelOrder.length > 0,
+    hasVisibleModels: activeCatalogModelOrder.length > 0,
     planSaved: Boolean(savedPlan),
     planEnabled:
       flowState.status === "enabled" ||
@@ -1313,61 +1327,72 @@ export function CodexMultiRouterWizard({
   const isProbingConnectivity = batchProtocolLab.state.phase === "probing";
   const isSavingPlan = flowState.status === "savingPlan";
   const isEnablingPlan = flowState.status === "enabling";
+  const activeTargetKey = `${resolvedMode}:${planId ?? storedExistingPlan?.id ?? "new"}`;
+  const reasoningPageActive = open && currentStep.key === "reasoning";
+  const resolvedReasoningSources = reasoningResolutionState?.sources;
 
   useEffect(() => {
-    const requestId = ++reasoningResolutionRequestRef.current;
-    const models = draftSources.flatMap((provider) =>
-      readIncludedWizardModelCatalog(provider).map((model) => ({
-        provider,
-        model,
-      })),
-    );
-    if (models.length === 0) {
-      setReasoningResolutionState({
-        contextKey: reasoningContextKey,
-        models: {},
-      });
+    if (
+      !reasoningPageActive ||
+      initializedTargetRef.current !== activeTargetKey ||
+      draftSources === resolvedReasoningSources
+    ) {
       return;
     }
+    const models = draftSources.flatMap((provider) => {
+      const settingsConfig = {
+        ...provider.settingsConfig,
+        providerName: provider.name,
+      };
+      return readIncludedWizardModelCatalog(provider).map((model) => ({
+        providerId: provider.id,
+        model: model.model,
+        settingsConfig,
+      }));
+    });
+    if (!models.length) return;
     let cancelled = false;
     const resolve = async () => {
-      const entries = await Promise.all(
-        models.map(async ({ provider, model }) => {
-          const settingsConfig = {
-            ...provider.settingsConfig,
-            providerName: provider.name,
-          };
-          try {
-            const resolution =
-              await codexSubagentV2Api.resolveModelReasoningCapability(
-                settingsConfig,
-                provider.id,
-                model.model,
-              );
-            return [`${provider.id}\u0000${model.model}`, resolution] as [
-              string,
-              CodexModelReasoningResolution,
-            ];
-          } catch {
-            return null;
-          }
-        }),
-      );
-      if (cancelled || requestId !== reasoningResolutionRequestRef.current)
-        return;
-      const resolvedEntries = entries.filter(
-        (entry) => entry !== null,
-      ) as Array<[string, CodexModelReasoningResolution]>;
-      setReasoningResolutionState({
-        contextKey: reasoningContextKey,
-        models: Object.fromEntries(resolvedEntries),
-      });
+      const resolved: Record<string, CodexModelReasoningResolution> = {};
+      // Large catalogs must not serialize/send every settings payload at once.
+      for (
+        let index = 0;
+        !cancelled && index < models.length;
+        index += REASONING_LOOKUP_CONCURRENCY
+      ) {
+        await Promise.all(
+          models
+            .slice(index, index + REASONING_LOOKUP_CONCURRENCY)
+            .map(async ({ providerId, model, settingsConfig }) => {
+              try {
+                resolved[probeModelKey(providerId, model)] =
+                  await codexSubagentV2Api.resolveModelReasoningCapability(
+                    settingsConfig,
+                    providerId,
+                    model,
+                  );
+              } catch {
+                // Leave this model unresolved if the backend cannot read it.
+              }
+            }),
+        );
+      }
+      if (!cancelled)
+        setReasoningResolutionState({
+          sources: draftSources,
+          models: resolved,
+        });
     };
     void resolve();
     return () => {
       cancelled = true;
     };
-  }, [draftSources, reasoningContextKey]);
+  }, [
+    activeTargetKey,
+    draftSources,
+    reasoningPageActive,
+    resolvedReasoningSources,
+  ]);
 
   useEffect(() => {
     if (!open) {
@@ -1440,15 +1465,14 @@ export function CodexMultiRouterWizard({
     if (!open) {
       return;
     }
-    const targetKey = `${resolvedMode}:${planId ?? storedExistingPlan?.id ?? "new"}`;
-    if (initializedTargetRef.current !== targetKey)
+    if (initializedTargetRef.current !== activeTargetKey)
       initializedOpenRef.current = false;
     if (initializedOpenRef.current) return;
 
     initializedOpenRef.current = true;
     draftGenerationRef.current += 1;
     targetGenerationRef.current += 1;
-    initializedTargetRef.current = targetKey;
+    initializedTargetRef.current = activeTargetKey;
     handledCreatedProviderIdsRef.current.clear();
     committedSourceFactsRef.current.clear();
     sourceFactsRef.current = new Map(
@@ -1542,7 +1566,7 @@ export function CodexMultiRouterWizard({
       type: "INIT",
       hasSources: initialSourceIds.length > 0,
     });
-  }, [existingPlan, open, planId, providerModelSources, resolvedMode]);
+  }, [activeTargetKey, existingPlan, open, providerModelSources]);
 
   // Add Provider 对话框关闭后，App 会把本次新增 ID 传回。向导只选中真实新增项，
   // 不根据名称或数组顺序猜测，并回到就绪检查展示下一步。
@@ -1590,26 +1614,26 @@ export function CodexMultiRouterWizard({
   useEffect(() => {
     if (!open || !initializedOpenRef.current) return;
     setSavedPlan((currentPlan) => existingPlan ?? currentPlan);
-    const changedIds = new Set(
-      providerModelSources
-        .filter((provider) => {
-          const previous = sourceFactsRef.current.get(provider.id);
-          const next = protocolProbeProviderSignature(provider);
-          if (previous === next) return false;
-          // Only the exact atomic-save response is an expected change. Keep the
-          // observed baseline until refetch arrives so old query renders remain safe.
-          const committed = committedSourceFactsRef.current.get(provider.id);
-          committedSourceFactsRef.current.delete(provider.id);
-          return previous !== undefined && next !== committed;
-        })
-        .map((provider) => provider.id),
-    );
-    sourceFactsRef.current = new Map(
+    const newSourceFacts = new Map(
       providerModelSources.map((provider) => [
         provider.id,
         protocolProbeProviderSignature(provider),
       ]),
     );
+    const changedIds = new Set(
+      Array.from(newSourceFacts)
+        .filter(([id, next]) => {
+          const previous = sourceFactsRef.current.get(id);
+          if (previous === next) return false;
+          // Only the exact atomic-save response is an expected change. Keep the
+          // observed baseline until refetch arrives so old query renders remain safe.
+          const committed = committedSourceFactsRef.current.get(id);
+          committedSourceFactsRef.current.delete(id);
+          return previous !== undefined && next !== committed;
+        })
+        .map(([id]) => id),
+    );
+    sourceFactsRef.current = newSourceFacts;
     if (changedIds.size > 0) {
       draftGenerationRef.current += 1;
       if (isProbingConnectivity) batchProtocolLab.reset();
@@ -1650,13 +1674,20 @@ export function CodexMultiRouterWizard({
       const nextSourceById = new Map(
         providerModelSources.map((provider) => [provider.id, provider]),
       );
-      return selectedSourceIds
+      const retainedSourceById = new Map(
+        currentSources.map((provider) => [provider.id, provider]),
+      );
+      const nextSources = selectedSourceIds
         .map((providerId) => {
           const latest = nextSourceById.get(providerId);
-          const retained = currentSources.find(
-            (provider) => provider.id === providerId,
-          );
-          if (!latest || !retained || changedIds.has(providerId)) return latest;
+          const retained = retainedSourceById.get(providerId);
+          if (
+            !latest ||
+            !retained ||
+            latest === retained ||
+            changedIds.has(providerId)
+          )
+            return latest;
           return {
             ...latest,
             settingsConfig: retained.settingsConfig,
@@ -1664,6 +1695,12 @@ export function CodexMultiRouterWizard({
           };
         })
         .filter((provider): provider is Provider => Boolean(provider));
+      return nextSources.length === currentSources.length &&
+        nextSources.every(
+          (provider, index) => provider === currentSources[index],
+        )
+        ? currentSources
+        : nextSources;
     });
     setSelectedSourceIds((currentIds) => {
       const nextIds = currentIds.filter((providerId) =>
@@ -1983,7 +2020,7 @@ export function CodexMultiRouterWizard({
         });
         return;
       case "models":
-        if (routeableCatalogModelOrder.length === 0) {
+        if (activeCatalogModelOrder.length === 0) {
           toast.error("Keep at least one model.", { closeButton: true });
           return;
         }
@@ -2003,7 +2040,7 @@ export function CodexMultiRouterWizard({
           toast.error("Enter a MultiRouter name first.", { closeButton: true });
           return;
         }
-        if (routeableCatalogModelOrder.length === 0) {
+        if (activeCatalogModelOrder.length === 0) {
           toast.error("Keep at least one model.", { closeButton: true });
           return;
         }
@@ -2771,31 +2808,37 @@ export function CodexMultiRouterWizard({
 
   if (!open) return null;
 
-  const planPreviewResult = buildCodexMultiRouterWizardPlan(
-    providers,
-    routeReadySources,
-    activePlan,
-    {
-      planId: activePlan?.id ?? createPlanIdRef.current ?? undefined,
-      planName: draftPlanName,
-      // Keep automatic-follow semantics intact in the preview as well as the
-      // save path; the concrete active list is only a UI projection.
-      catalogModelOrder:
-        catalogModelOrder === null ? undefined : activeCatalogModelOrder,
-      spawnAgentModels: activeSpawnAgentModels,
-    },
-  );
-  const planPreview = planPreviewResult.plan;
-  const previewRoutes = (planPreview.settingsConfig.codexRouting?.routes ??
-    []) as CodexRoutingRouteV2[];
-  const previewModels = buildWizardModelCatalog(
-    resolveWizardModelNameCollisions(planPreviewResult.sourceProviders),
-    { catalogModelOrder: activeCatalogModelOrder },
-  ).models;
-  const aliasSelectionIssues = collectWizardRouteAliasSelectionIssues(
-    previewRoutes,
-    routeReadySources,
-  );
+  const planPreviewResult = [
+    "models",
+    "routing-review",
+    "save-enable",
+  ].includes(currentStep.key)
+    ? buildCodexMultiRouterWizardPlan(
+        providers,
+        routeReadySources,
+        activePlan,
+        {
+          planId: activePlan?.id ?? createPlanIdRef.current ?? undefined,
+          planName: draftPlanName,
+          // Keep automatic-follow semantics intact in the preview as well as the
+          // save path; the concrete active list is only a UI projection.
+          catalogModelOrder:
+            catalogModelOrder === null ? undefined : activeCatalogModelOrder,
+          spawnAgentModels: activeSpawnAgentModels,
+        },
+      )
+    : undefined;
+  const previewRoutes = (planPreviewResult?.plan.settingsConfig.codexRouting
+    ?.routes ?? []) as CodexRoutingRouteV2[];
+  const previewModels = planPreviewResult
+    ? buildWizardModelCatalog(
+        resolveWizardModelNameCollisions(planPreviewResult.sourceProviders),
+        { catalogModelOrder: activeCatalogModelOrder },
+      ).models
+    : [];
+  const aliasSelectionIssues = planPreviewResult
+    ? collectWizardRouteAliasSelectionIssues(previewRoutes, routeReadySources)
+    : [];
   const pendingSourcePreview =
     batchProtocolLab.state.phase === "blocked"
       ? ((
@@ -2807,17 +2850,21 @@ export function CodexMultiRouterWizard({
   const previewProvidersById = new Map(
     routeReadySources.map((provider) => [provider.id, provider]),
   );
-  const availableModelByName = new Map(
-    availableCatalogModels.map((model) => [model.model, model]),
-  );
-  const selectModelRows = [
-    ...activeCatalogModelOrder
-      .map((model) => availableModelByName.get(model))
-      .filter((model): model is CodexCatalogModel => Boolean(model)),
-    ...availableCatalogModels.filter(
-      (model) => !activeCatalogModelOrder.includes(model.model),
-    ),
-  ];
+  let selectModelRows: CodexCatalogModel[] = [];
+  if (currentStep.key === "models" || currentStep.key === "model-order") {
+    const activeOrder = new Set(activeCatalogModelOrder);
+    const availableModelByName = new Map(
+      availableCatalogModels.map((model) => [model.model, model]),
+    );
+    selectModelRows = [
+      ...activeCatalogModelOrder
+        .map((model) => availableModelByName.get(model))
+        .filter((model): model is CodexCatalogModel => Boolean(model)),
+      ...availableCatalogModels.filter(
+        (model) => !activeOrder.has(model.model),
+      ),
+    ];
+  }
 
   return createPortal(
     <div className="fixed inset-0 z-[120] flex items-center justify-center overflow-hidden bg-black/70 p-3 text-foreground backdrop-blur-sm sm:p-4">

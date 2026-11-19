@@ -3838,14 +3838,11 @@ pub(crate) fn codex_subagent_reasoning_effort_override(
     settings: &Value,
 ) -> Option<SubagentReasoningEffort> {
     let routing = settings.get("codexRouting")?.as_object()?;
-    let value = routing
-        .get("subagentReasoningEffort")
-        .and_then(Value::as_str)
-        .unwrap_or("high");
-    if value == "profile" {
-        return None;
-    }
-    value.parse::<SubagentReasoningEffort>().ok()
+    crate::codex_multirouter::schema::parse_subagent_reasoning_effort(
+        routing.get("subagentReasoningEffort"),
+    )
+    .ok()
+    .flatten()
 }
 
 /// Never invent a model capability or remap an unsupported plan preference to
@@ -7162,6 +7159,8 @@ fn merge_codex_model_entry_with_reasoning_authority(
     };
 
     let mut merged = official_object.clone();
+    // Only the current resolved capability can publish a CCSM Boolean control.
+    merged.remove("ccSwitchReasoningControl");
     if reasoning_authoritative {
         for field in [
             "default_reasoning_level",
@@ -7219,7 +7218,8 @@ fn codex_official_picker_metadata_field(
         | "supports_parallel_tool_calls"
         | "supportsParallelToolCalls"
         | "base_instructions"
-        | "baseInstructions" => false,
+        | "baseInstructions"
+        | "ccSwitchReasoningControl" => false,
         // 对同 slug 的官方 GPT，图片能力必须来自接管前官方 catalog。路由
         // catalog 往往是 NativeResponses text-only 模板的产物；允许它覆盖会把
         // 官方模型错误降级，令 Desktop 在请求送达代理前就拒绝图片输入。
@@ -7263,6 +7263,9 @@ fn codex_official_picker_metadata_field(
         }
         "default_reasoning_summary" | "defaultReasoningSummary" => {
             official_has_any(&["default_reasoning_summary", "defaultReasoningSummary"])
+        }
+        "reasoning_summary_format" | "reasoningSummaryFormat" => {
+            official_has_any(&["reasoning_summary_format", "reasoningSummaryFormat"])
         }
         "support_verbosity" | "supportVerbosity" => {
             official_has_any(&["support_verbosity", "supportVerbosity"])
@@ -7313,6 +7316,7 @@ fn project_official_picker_metadata_aliases(
         ("default_service_tier", "defaultServiceTier"),
         ("supports_reasoning_summaries", "supportsReasoningSummaries"),
         ("default_reasoning_summary", "defaultReasoningSummary"),
+        ("reasoning_summary_format", "reasoningSummaryFormat"),
         ("support_verbosity", "supportVerbosity"),
         ("default_verbosity", "defaultVerbosity"),
     ] {
@@ -11649,6 +11653,59 @@ wire_api = "responses"
     }
 
     #[test]
+    fn desktop_boolean_reasoning_control_ignores_official_cache_markers() {
+        let mut spec = review_codex_catalog_spec("cached-control-model");
+        let official = json!([{
+            "slug": spec.model,
+            "ccSwitchReasoningControl": {
+                "kind": "boolean", "disableAllowed": true, "fingerprint": "stale"
+            },
+            "model_specialty": "official picker hint"
+        }]);
+        let boolean = serde_json::from_value(json!({
+            "schemaVersion": 2,
+            "supportStatus": "confirmed_supported",
+            "controlKind": "boolean",
+            "supportedEfforts": [],
+            "disableAllowed": false,
+            "upstream": {"format": "boolean", "parameter": "reasoning.enabled"},
+            "source": "user"
+        }))
+        .expect("valid Boolean capability");
+        for (reasoning, authoritative) in [(None, false), (None, true), (Some(boolean), true)] {
+            spec.reasoning = reasoning;
+            let specs = std::slice::from_ref(&spec);
+            let generated = codex_model_catalog_from_specs(
+                specs,
+                &json!({}),
+                CodexCatalogToolProfile::NativeResponses,
+                128_000,
+            );
+            let expected = generated["models"][0].get("ccSwitchReasoningControl");
+            assert_eq!(expected.is_some(), spec.reasoning.is_some());
+            let compiled = CompiledReasoning::new();
+            let authority = codex_catalog_reasoning_authoritative_ids(
+                specs,
+                authoritative.then_some(&compiled),
+            );
+            let merged = merge_codex_models_with_reasoning_authority(
+                official.as_array().unwrap(),
+                generated["models"].as_array().unwrap(),
+                &authority,
+            );
+            assert_eq!(merged[0].get("ccSwitchReasoningControl"), expected);
+            assert_eq!(merged[0]["model_specialty"], "official picker hint");
+
+            let mut config = DocumentMut::new();
+            config["models"] =
+                codex_provider_models_toml_array(specs, Some(&json!({"models": merged})));
+            let inline: toml::Value = toml::from_str(&config.to_string()).unwrap();
+            let inline_model = serde_json::to_value(&inline["models"][0]).unwrap();
+            assert_eq!(inline_model.get("ccSwitchReasoningControl"), expected);
+        }
+    }
+
+    #[test]
     fn desktop_boolean_reasoning_control_projection_omits_malformed_inline_markers() {
         let spec = review_codex_catalog_spec("inline-control-model");
         for marker in [
@@ -11888,7 +11945,17 @@ wire_api = "responses"
                 "canonical effort must not be silently discarded"
             );
         }
-        for effort in ["profile", "HIGH", "extra-high", "invalid"] {
+        for effort in [
+            json!("profile"),
+            json!("HIGH"),
+            json!("extra-high"),
+            json!("invalid"),
+            Value::Null,
+            json!(true),
+            json!(7),
+            json!({"effort": "max"}),
+            json!(["max"]),
+        ] {
             let settings = json!({"codexRouting": {"subagentReasoningEffort": effort}});
             assert_eq!(codex_subagent_reasoning_effort_override(&settings), None);
         }
@@ -22338,6 +22405,34 @@ model_catalog_json = "cc-switch-model-catalog.json"
     }
 
     #[test]
+    fn merge_codex_models_preserves_official_reasoning_summary_format_aliases() {
+        let official_models = json!([{
+            "slug": "deepseek-flash",
+            "reasoning_summary_format": "experimental"
+        }]);
+        let routed_models = json!([{
+            "model": "deepseek-flash",
+            "reasoningSummaryFormat": "concise"
+        }]);
+
+        let merged = merge_codex_models(
+            official_models.as_array().expect("official models"),
+            routed_models.as_array().expect("routed models"),
+        );
+        let model = merged.first().expect("merged model");
+
+        assert_eq!(
+            model.get("reasoning_summary_format"),
+            Some(&json!("experimental"))
+        );
+        assert_eq!(
+            model.get("reasoningSummaryFormat"),
+            Some(&json!("experimental")),
+            "official snake_case metadata must project to the renderer alias"
+        );
+    }
+
+    #[test]
     #[serial]
     fn canonical_reasoning_survives_catalog_and_cache_official_merges() {
         let _home = TestHomeGuard::new();
@@ -24934,6 +25029,7 @@ wire_api = "responses"
             json!({"codexRouting": {
                 "schemaVersion": 2, "enabled": true, "subagentVersion": "v2",
                 "defaultReasoningEffort": "high",
+                "subagentReasoningEffort": "profile",
                 "subagentV2": {"schemaVersion": 2, "selectionPolicy": "balanced", "profiles": {
                     model: profile
                 }},
@@ -25045,8 +25141,20 @@ wire_api = "responses"
              [model_providers.codex_model_router_v2]\n\
              base_url = \"http://127.0.0.1:15721/v1\"\nwire_api = \"responses\"\n"
         );
-        for (selection, expected) in [("high", "high"), ("max", "max"), ("profile", "low")] {
-            router.settings_config["codexRouting"]["subagentReasoningEffort"] = json!(selection);
+        for (selection, expected) in [
+            (None, "high"),
+            (Some("high"), "high"),
+            (Some("max"), "max"),
+            (Some("profile"), "low"),
+        ] {
+            let routing = router.settings_config["codexRouting"]
+                .as_object_mut()
+                .unwrap();
+            if let Some(selection) = selection {
+                routing.insert("subagentReasoningEffort".into(), json!(selection));
+            } else {
+                routing.remove("subagentReasoningEffort");
+            }
             db.save_provider("codex", &router).unwrap();
             let artifact =
                 crate::codex_multirouter::projection::build_projection_artifact(&db, "router")
@@ -25255,7 +25363,7 @@ wire_api = "responses"
         assert_eq!(projected_reasoning["upstream"]["effortMap"]["max"], "max");
         assert_eq!(
             projected_reasoning["codexUltraOrchestration"],
-            json!({"enabled": true, "providerEffort": "xhigh"})
+            json!({"enabled": true, "providerEffort": "max"})
         );
         let request_capability =
             crate::reasoning_capabilities::resolve_codex_model_capability_with_library(

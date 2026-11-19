@@ -8,7 +8,7 @@ use super::transform_gemini::{
     build_anthropic_usage, is_synthesized_tool_call_id, rectify_tool_call_parts,
     synthesize_tool_call_id, AnthropicToolSchemaHints,
 };
-use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
+use crate::proxy::sse::{strip_sse_field, BoundedSseFrames, SseFrame};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -242,8 +242,7 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
     tool_schema_hints: Option<AnthropicToolSchemaHints>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
-        let mut buffer = String::new();
-        let mut utf8_remainder = Vec::new();
+        let mut frames = BoundedSseFrames::default();
         let mut message_id: Option<String> = None;
         let mut current_model: Option<String> = None;
         let mut has_sent_message_start = false;
@@ -261,9 +260,16 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
-
-                    while let Some(block) = take_sse_block(&mut buffer) {
+                    let mut input = bytes.as_ref();
+                    while let Some(frame) = frames.read(&mut input) {
+                        let SseFrame::Complete(frame) = frame else {
+                            yield Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "An upstream SSE event exceeded the proxy's size limit.",
+                            ));
+                            return;
+                        };
+                        let block = String::from_utf8_lossy(&frame);
                         if block.trim().is_empty() {
                             continue;
                         }
@@ -642,6 +648,25 @@ mod tests {
         assert!(output.contains("\"text\":\"lo\""));
         assert!(output.contains("\"stop_reason\":\"end_turn\""));
         assert!(output.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn oversized_unterminated_sse_frame_returns_an_error() {
+        let oversized = Bytes::from(vec![b'x'; crate::proxy::sse::MAX_SSE_FRAME_BYTES]);
+        let stream = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(oversized),
+            Ok(Bytes::from_static(b"x")),
+        ]);
+        let converted = create_anthropic_sse_stream_from_gemini(stream, None, None, None, None);
+        let result =
+            futures::executor::block_on(async move { converted.collect::<Vec<_>>().await });
+        let error = result
+            .into_iter()
+            .find_map(Result::err)
+            .expect("oversized frame should fail the converter");
+        assert!(error
+            .to_string()
+            .contains("exceeded the proxy's size limit"));
     }
 
     #[test]

@@ -1572,6 +1572,7 @@ pub fn run() {
             commands::add_provider,
             commands::update_provider,
             commands::update_provider_if_unchanged,
+            commands::update_codex_router_if_unchanged,
             commands::update_codex_subagent_policy,
             commands::update_codex_subagent_v2,
             commands::initialize_codex_subagent_v2,

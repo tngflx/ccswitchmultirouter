@@ -36,6 +36,7 @@ const diagnosticCountKeys = {
   nativeVisibilityUnverifiedObserverCount: "nativeVisibilityCount",
   booleanControlUnverifiedModelCount: "booleanUnverifiedCount",
   booleanControlReadyModelCount: "booleanReadyCount",
+  booleanControlNotObservedModelCount: "booleanNotObservedCount",
   effortMismatchCount: "effortMismatchCount",
   flagMismatchCount: "flagMismatchCount",
   missingMaxModelCount: "missingMaxCount",

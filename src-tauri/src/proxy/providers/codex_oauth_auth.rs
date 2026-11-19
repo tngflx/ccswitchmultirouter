@@ -1192,7 +1192,7 @@ impl CodexOAuthManager {
                     )
                     && (bound.as_deref() == Some(entry.account_id.as_str())
                         || runtime
-                            .remaining_percent(&entry.account_id)
+                            .fresh_remaining_percent(&entry.account_id, now)
                             .is_none_or(|value| value > entry.reserve_percent)))
                 .then_some(CodexPoolCandidate {
                     entry,
@@ -1214,7 +1214,7 @@ impl CodexOAuthManager {
                         *enabled_account_generations.get(&entry.account_id)?;
                     let within_reserve = bound.as_deref() == Some(entry.account_id.as_str())
                         || runtime
-                            .remaining_percent(&entry.account_id)
+                            .fresh_remaining_percent(&entry.account_id, now)
                             .is_none_or(|value| value > entry.reserve_percent);
                     if !within_reserve {
                         return None;
@@ -1275,10 +1275,10 @@ impl CodexOAuthManager {
         .unwrap_or(false)
     }
 
-    pub async fn mark_pool_quota_checked(&self, account_id: &str) {
+    pub async fn mark_pool_quota_attempted(&self, account_id: &str) {
         let now_ms = chrono::Utc::now().timestamp_millis();
         self.with_prepared_pool_account_runtime(account_id, |runtime| {
-            runtime.mark_quota_checked(account_id, now_ms)
+            runtime.mark_quota_attempted(account_id, now_ms)
         })
         .await;
     }
@@ -3103,6 +3103,59 @@ mod tests {
         let manager = CodexOAuthManager::new(temp.path().to_path_buf());
         manager.record_pool_remaining_percent("acc-a", 9.0).await;
 
+        assert!(manager
+            .ordered_pool_entries("thread-new", None)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_quota_after_failed_refresh_no_longer_blocks_pool_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+        add_pool_test_account(&manager, "acc-a", "redacted-test-refresh-token").await;
+        enable_single_managed_pool(&manager, "acc-a", 10.0).await;
+
+        let initial = manager.ordered_pool_entries("thread-new", None).await;
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].entry.account_id, "acc-a");
+        let generation = initial[0].credential_generation;
+
+        manager.record_pool_remaining_percent("acc-a", 9.0).await;
+        assert!(manager
+            .ordered_pool_entries("thread-new", None)
+            .await
+            .is_empty());
+
+        let stale_at = (chrono::Utc::now() - chrono::Duration::minutes(10)).timestamp_millis();
+        assert!(manager
+            .pool_runtime
+            .lock()
+            .await
+            .record_remaining_percent("acc-a", 9.0, stale_at));
+        assert!(manager.pool_quota_refresh_due("acc-a").await);
+        manager.mark_pool_quota_attempted("acc-a").await;
+        assert!(!manager.pool_quota_refresh_due("acc-a").await);
+
+        let recovered = manager.ordered_pool_entries("thread-new", None).await;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].entry.account_id, "acc-a");
+
+        assert!(
+            manager
+                .record_pool_attempt(
+                    "acc-a",
+                    generation,
+                    "thread-new",
+                    CodexPoolAttemptOutcome::Quota { status: 429 },
+                )
+                .await
+        );
+        let fallback = manager.ordered_pool_entries("thread-new", None).await;
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].entry.account_id, "acc-a");
+
+        manager.record_pool_remaining_percent("acc-a", 9.0).await;
         assert!(manager
             .ordered_pool_entries("thread-new", None)
             .await

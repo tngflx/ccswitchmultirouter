@@ -260,8 +260,9 @@ const runFreshSessionFromSummary = async (sourceThreadId, summary) => {
               newThreadId,
               "after acknowledgement",
             ) || freshName;
+          // Optional sidebar maintenance must not hold up a completed handoff.
           try {
-            await triggerLocalThreadCatalogSync();
+            void triggerLocalThreadCatalogSync({ explicit: true });
           } catch (error) {
             recordFailure(error);
           }

@@ -120,6 +120,33 @@ describe("CodexModelReasoningCard metadata refresh", () => {
     expect(screen.getByText("Reasoning unsupported")).toBeInTheDocument();
   });
 
+  it("allows adoption of a confirmed Boolean detection without effort levels", () => {
+    const value = resolution("unknown");
+    value.hasDetectionCandidate = true;
+    value.detection = {
+      providerKey: "openrouter",
+      model: value.model,
+      fetchedAt: 1,
+      source: "openrouter_api",
+      reasoning: {
+        supportedEfforts: [],
+        mandatory: false,
+        controlKind: "boolean",
+        supportStatus: "confirmed_supported",
+        disableAllowed: true,
+        upstreamFormat: "boolean",
+        upstreamParameter: "reasoning.enabled",
+      },
+    };
+    const actions = renderCard(value);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Use detected result" }),
+    );
+
+    expect(actions.onAdoptDetection).toHaveBeenCalledOnce();
+  });
+
   it("keeps exactly one metadata refresh action for unknown models", () => {
     renderCard(resolution("unknown"));
 

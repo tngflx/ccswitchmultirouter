@@ -869,8 +869,29 @@ const codexRendererScopeObjectSnapshotsAreCurrent = (snapshots) => {
   }
   return true;
 };
-const codexCurrentAppServerScopeHints = () => {
+// Numeric Desktop can retain more than one mounted provider scope for the same
+// app-server status atom. Keep this inventory bounded, but leave enough room
+// for the observed renderer multiplicity before treating the proof as capped.
+const CODEX_APP_SERVER_SCOPE_HINT_LIMIT = 64;
+const CODEX_RENDERER_FIBER_VALUE_LIMIT = 160;
+// The inexpensive discovery pass intentionally stays small. Complete owner
+// proofs must also cover the larger hook/props objects used by current Codex
+// Desktop builds, while remaining bounded so an arbitrary renderer graph
+// cannot make the proof unbounded.
+const CODEX_RENDERER_SCOPE_VALUE_LIMIT = 2048;
+// Only object edges can lead to a scope. Scalar descriptors still belong in
+// the full snapshot so replacing one with an object invalidates the scan.
+const codexRendererScopeObjectValue = (value) =>
+  value !== null && typeof value === "object";
+const codexCurrentAppServerScopeHints = (completeInventory = false) => {
   const scopesByBrand = new Map();
+  const scopeValues = new Set();
+  const valueLimit = completeInventory
+    ? CODEX_RENDERER_SCOPE_VALUE_LIMIT
+    : CODEX_RENDERER_FIBER_VALUE_LIMIT;
+  if (completeInventory) {
+    state.scopedAppServerScopeHintScanComplete = false;
+  }
   for (const atom of state.appServerStatusAtoms || []) {
     const brand = Object.getOwnPropertyDescriptor(atom || {}, "scope")?.value;
     if (brand) scopesByBrand.set(brand, null);
@@ -878,8 +899,11 @@ const codexCurrentAppServerScopeHints = () => {
   if (!scopesByBrand.size) return [];
   const fibers = codexRendererScopeRootIdentities();
   const seen = new Set();
+  let valueScanComplete = true;
+  let valueReadFailed = false;
+  let cursor = 0;
   for (
-    let cursor = 0;
+    ;
     cursor < fibers.length && seen.size < CODEX_RENDERER_FIBER_SCAN_LIMIT;
     cursor += 1
   ) {
@@ -896,15 +920,19 @@ const codexCurrentAppServerScopeHints = () => {
       "dependencies",
       "memoizedProps",
       "pendingProps",
-    ].map((key) => ({
-      value: Object.getOwnPropertyDescriptor(fiber, key)?.value,
-      depth: 0,
-    }));
-    for (let index = 0; index < values.length && index < 160; index += 1) {
+    ]
+      .map((key) => ({
+        value: Object.getOwnPropertyDescriptor(fiber, key)?.value,
+        depth: 0,
+      }))
+      .filter(({ value }) => codexRendererScopeObjectValue(value));
+    for (
+      let index = 0;
+      index < values.length && index < valueLimit;
+      index += 1
+    ) {
       const { value, depth } = values[index];
       if (
-        !value ||
-        typeof value !== "object" ||
         visited.has(value) ||
         value === window ||
         (typeof Node !== "undefined" && value instanceof Node)
@@ -913,9 +941,18 @@ const codexCurrentAppServerScopeHints = () => {
       visited.add(value);
       if (codexDeclaredDependencyScope(value)) {
         const brand = Object.getOwnPropertyDescriptor(value, "scope")?.value;
-        if (scopesByBrand.has(brand) && !scopesByBrand.get(brand))
-          scopesByBrand.set(brand, value);
-        if (Array.from(scopesByBrand.values()).every(Boolean))
+        if (scopesByBrand.has(brand)) {
+          if (completeInventory) {
+            scopeValues.add(value);
+            if (scopeValues.size > CODEX_APP_SERVER_SCOPE_HINT_LIMIT)
+              return Array.from(scopeValues);
+          }
+          if (!scopesByBrand.get(brand)) scopesByBrand.set(brand, value);
+        }
+        if (
+          !completeInventory &&
+          Array.from(scopesByBrand.values()).every(Boolean)
+        )
           return Array.from(scopesByBrand.values());
         continue;
       }
@@ -923,11 +960,29 @@ const codexCurrentAppServerScopeHints = () => {
       let descriptors = {};
       try {
         descriptors = Object.getOwnPropertyDescriptors(value);
-      } catch {}
+      } catch {
+        // Unknown own-data edges can hide another scope with the same brand.
+        valueReadFailed = true;
+      }
       for (const [key, field] of Object.entries(descriptors))
-        if ("value" in field && !codexRendererScopeNonBindingLink(value, key))
+        if (
+          "value" in field &&
+          codexRendererScopeObjectValue(field.value) &&
+          !codexRendererScopeNonBindingLink(value, key)
+        )
           values.push({ value: field.value, depth: depth + 1 });
     }
+    // A first matching brand is not uniqueness proof if another owner can be
+    // hidden in this Fiber's uninspected value suffix.
+    if (values.length > valueLimit) valueScanComplete = false;
+  }
+  if (completeInventory) {
+    state.scopedAppServerScopeHintScanComplete =
+      valueScanComplete &&
+      !valueReadFailed &&
+      seen.size < CODEX_RENDERER_FIBER_SCAN_LIMIT &&
+      cursor >= fibers.length;
+    return Array.from(scopeValues);
   }
   return Array.from(scopesByBrand.values()).filter(Boolean);
 };
@@ -938,6 +993,8 @@ const codexRendererNodeIsMounted = (node) => {
 const codexRendererMountedNodes = (targets) => {
   const mounted = new Set();
   if (!targets.size) return mounted;
+  const canReachTarget = (value) =>
+    targets.has(value) || codexRendererScopeObjectValue(value);
   const fibers = codexRendererScopeRootIdentities();
   const seenFibers = new Set();
   for (
@@ -958,19 +1015,24 @@ const codexRendererMountedNodes = (targets) => {
       "dependencies",
       "memoizedProps",
       "pendingProps",
-    ].map((key) => ({
-      value: Object.getOwnPropertyDescriptor(fiber, key)?.value,
-      depth: 0,
-    }));
-    for (let index = 0; index < values.length && index < 160; index += 1) {
+    ]
+      .map((key) => ({
+        value: Object.getOwnPropertyDescriptor(fiber, key)?.value,
+        depth: 0,
+      }))
+      .filter(({ value }) => canReachTarget(value));
+    for (
+      let index = 0;
+      index < values.length && index < CODEX_RENDERER_SCOPE_VALUE_LIMIT;
+      index += 1
+    ) {
       const { value, depth } = values[index];
       if (targets.has(value)) {
         mounted.add(value);
         if (mounted.size === targets.size) return mounted;
       }
       if (
-        !value ||
-        typeof value !== "object" ||
+        !codexRendererScopeObjectValue(value) ||
         seenValues.has(value) ||
         value === window ||
         (typeof Node !== "undefined" && value instanceof Node)
@@ -993,6 +1055,7 @@ const codexRendererMountedNodes = (targets) => {
       for (const [key, descriptor] of Object.entries(descriptors)) {
         if (
           "value" in descriptor &&
+          canReachTarget(descriptor.value) &&
           !codexRendererScopeNonBindingLink(value, key)
         )
           values.push({ value: descriptor.value, depth: depth + 1 });
@@ -1105,6 +1168,7 @@ const codexDiscoverRendererScopeCandidates = async () => {
       fiberLimit: CODEX_RENDERER_FIBER_SCAN_LIMIT,
       scopeCount,
       elapsedMs: Math.max(0, Date.now() - scanStartedAt),
+      ...(reason ? { reason } : {}),
     };
     // Sequential module fallbacks can start another scan in the same task.
     // Keep one bounded terminal receipt so polling cannot miss its refusal.
@@ -1207,18 +1271,22 @@ const codexDiscoverRendererScopeCandidates = async () => {
         "dependencies",
         "memoizedProps",
         "pendingProps",
-      ].map((key) => ({
-        value: snapshot[key],
-        depth: 0,
-        parent: fiberPath,
-        key,
-      }));
-      for (let index = 0; index < values.length && index < 160; index += 1) {
+      ]
+        .map((key) => ({
+          value: snapshot[key],
+          depth: 0,
+          parent: fiberPath,
+          key,
+        }))
+        .filter(({ value }) => codexRendererScopeObjectValue(value));
+      for (
+        let index = 0;
+        index < values.length && index < CODEX_RENDERER_SCOPE_VALUE_LIMIT;
+        index += 1
+      ) {
         const binding = values[index];
         const { value, depth } = binding;
         if (
-          !value ||
-          typeof value !== "object" ||
           seenValues.has(value) ||
           value === window ||
           (typeof Node !== "undefined" && value instanceof Node)
@@ -1277,6 +1345,7 @@ const codexDiscoverRendererScopeCandidates = async () => {
         for (const [key, descriptor] of Object.entries(descriptors)) {
           if (
             "value" in descriptor &&
+            codexRendererScopeObjectValue(descriptor.value) &&
             !codexRendererScopeNonBindingLink(value, key)
           ) {
             values.push({
@@ -1287,6 +1356,15 @@ const codexDiscoverRendererScopeCandidates = async () => {
             });
           }
         }
+      }
+      // The per-Fiber queue is independently bounded. An omitted own-data edge
+      // may contain another owner, so it cannot produce a complete inventory.
+      if (
+        !objectScanCapped &&
+        values.length > CODEX_RENDERER_SCOPE_VALUE_LIMIT
+      ) {
+        objectScanCapped = true;
+        objectScanCapReason = "value_limit";
       }
     }
     visitedFiberCount = seenFibers.size;

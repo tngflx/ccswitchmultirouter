@@ -721,6 +721,65 @@ fn parse_provider_models_response_with_pagination(
     base_url: &str,
     models_url: &str,
 ) -> Result<ParsedProviderModels, String> {
+    let (entries, pagination) = parse_model_inventory(
+        body,
+        known_secrets,
+        is_native_google_models_discovery(base_url, models_url),
+    )?;
+    let openrouter_contract = is_openrouter_models_discovery(base_url, models_url);
+    let models = entries
+        .into_iter()
+        .map(|entry| fetched_model_from_entry(entry, base_url, models_url, openrouter_contract))
+        .collect();
+    Ok(ParsedProviderModels { models, pagination })
+}
+
+pub(crate) fn openrouter_discovery_model_entry(
+    body: &str,
+    base_url: &str,
+    models_url: &str,
+    wire_model: &str,
+) -> Result<Option<serde_json::Value>, ()> {
+    if !is_openrouter_models_discovery(base_url, models_url) {
+        return Err(());
+    }
+    let (entries, pagination) = parse_model_inventory(body, &[], false).map_err(|_| ())?;
+    if pagination.is_some() {
+        return Err(());
+    }
+    let wire_model = normalize_model_identity(wire_model);
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| normalize_model_identity(&entry.id) == wire_model)
+    {
+        return Ok(Some(serde_json::Value::Object(entry.extra.clone())));
+    }
+    let mut matches = entries.into_iter().filter(|entry| {
+        let identity = extract_model_identity_fields(&entry.extra);
+        let mut request_aliases = Vec::new();
+        for alias in [identity.canonical_slug, identity.slug]
+            .into_iter()
+            .flatten()
+        {
+            push_model_identity(&mut request_aliases, &alias);
+        }
+        if let Some(aliases) = identity.aliases.as_ref() {
+            push_alias_identities(&mut request_aliases, aliases);
+        }
+        request_aliases.contains(&wire_model)
+    });
+    let matched = matches.next();
+    if matches.next().is_some() {
+        return Err(());
+    }
+    Ok(matched.map(|entry| serde_json::Value::Object(entry.extra)))
+}
+
+fn parse_model_inventory(
+    body: &str,
+    known_secrets: &[String],
+    native_google_models: bool,
+) -> Result<(Vec<ModelEntry>, Option<ModelListPagination>), String> {
     let response: ModelsResponse = serde_json::from_str(body).map_err(|error| {
         let detail = format!("Failed to parse response: {error}");
         crate::redact_known_secrets(&detail, known_secrets)
@@ -775,7 +834,6 @@ fn parse_provider_models_response_with_pagination(
     let data = response.data;
     let rich_models = response.models;
     let output_models = response.output.and_then(|output| output.models);
-    let native_google_models = is_native_google_models_discovery(base_url, models_url);
     let entries = match (data, rich_models, output_models) {
         (Some(mut data), Some(rich), None) => {
             let rich = normalize_rich_model_entries(rich, native_google_models)?;
@@ -804,24 +862,28 @@ fn parse_provider_models_response_with_pagination(
         (None, None, None) => return Err(format!("Model fetch failed: {error_detail}")),
     };
     validate_model_entries(&entries)?;
+    Ok((entries, output_pagination))
+}
 
-    let models = entries
-        .into_iter()
-        .map(|entry| {
-            let is_free = classify_model_free_status(&entry.id, &entry.extra);
-            let protocol_capability =
-                extract_protocol_capability(&entry.id, &entry.extra, base_url, models_url);
-            let identity = extract_model_identity_fields(&entry.extra);
-            let supports_parallel_tool_calls =
-                identity.supports_parallel_tool_calls.or_else(|| {
-                    is_openrouter_models_discovery(base_url, models_url)
-                        .then(|| extract_openrouter_parallel_tool_calls(&entry.extra))
-                        .flatten()
-                });
-            let reasoning = crate::reasoning_capabilities::provider_metadata::
+fn fetched_model_from_entry(
+    entry: ModelEntry,
+    base_url: &str,
+    models_url: &str,
+    openrouter_contract: bool,
+) -> FetchedModel {
+    let is_free = classify_model_free_status(&entry.id, &entry.extra);
+    let protocol_capability =
+        extract_protocol_capability(&entry.id, &entry.extra, base_url, models_url);
+    let identity = extract_model_identity_fields(&entry.extra);
+    let supports_parallel_tool_calls = identity.supports_parallel_tool_calls.or_else(|| {
+        openrouter_contract
+            .then(|| extract_openrouter_parallel_tool_calls(&entry.extra))
+            .flatten()
+    });
+    let reasoning = crate::reasoning_capabilities::provider_metadata::
                 provider_reasoning_capability_from_model_entry(
                     &serde_json::Value::Object(entry.extra.clone()),
-                    is_openrouter_models_discovery(base_url, models_url),
+                    openrouter_contract,
                 )
                 .and_then(|mut capability| {
                     // Discovery evidence belongs to the inference transport and
@@ -831,47 +893,41 @@ fn parse_provider_models_response_with_pagination(
                         crate::reasoning_capabilities::reasoning_evidence_scope(base_url, &entry.id);
                     serde_json::to_value(capability).ok()
                 });
-            FetchedModel {
-                context_window: extract_context_window(&entry.extra),
-                max_context_window: explicit_positive_model_limit(
-                    &entry.extra,
-                    &["max_context_window", "maxContextWindow"],
-                ),
-                max_input_tokens: extract_max_input_tokens(&entry.extra),
-                max_output_tokens: extract_max_output_tokens(&entry.extra),
-                id: entry.id,
-                input_modalities: extract_input_modalities(&entry.extra),
-                output_modalities: extract_output_modalities(&entry.extra),
-                owned_by: entry.owned_by.or_else(|| {
-                    ["publisher", "ownedBy", "provider", "inference_provider"]
-                        .iter()
-                        .filter_map(|key| entry.extra.get(*key))
-                        .find_map(serde_json::Value::as_str)
-                        .map(ToString::to_string)
-                }),
-                supports_image: extract_supports_image(&entry.extra),
-                display_name: identity.display_name,
-                canonical_slug: identity.canonical_slug,
-                slug: identity.slug,
-                name: identity.name,
-                aliases: identity.aliases,
-                upstream_model: None,
-                supports_parallel_tool_calls,
-                reasoning,
-                effort: entry
-                    .extra
-                    .get("effort")
-                    .filter(|value| !value.is_null())
-                    .cloned(),
-                protocol_capability,
-                is_free,
-            }
-        })
-        .collect();
-    Ok(ParsedProviderModels {
-        models,
-        pagination: output_pagination,
-    })
+    FetchedModel {
+        context_window: extract_context_window(&entry.extra),
+        max_context_window: explicit_positive_model_limit(
+            &entry.extra,
+            &["max_context_window", "maxContextWindow"],
+        ),
+        max_input_tokens: extract_max_input_tokens(&entry.extra),
+        max_output_tokens: extract_max_output_tokens(&entry.extra),
+        id: entry.id,
+        input_modalities: extract_input_modalities(&entry.extra),
+        output_modalities: extract_output_modalities(&entry.extra),
+        owned_by: entry.owned_by.or_else(|| {
+            ["publisher", "ownedBy", "provider", "inference_provider"]
+                .iter()
+                .filter_map(|key| entry.extra.get(*key))
+                .find_map(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        }),
+        supports_image: extract_supports_image(&entry.extra),
+        display_name: identity.display_name,
+        canonical_slug: identity.canonical_slug,
+        slug: identity.slug,
+        name: identity.name,
+        aliases: identity.aliases,
+        upstream_model: None,
+        supports_parallel_tool_calls,
+        reasoning,
+        effort: entry
+            .extra
+            .get("effort")
+            .filter(|value| !value.is_null())
+            .cloned(),
+        protocol_capability,
+        is_free,
+    }
 }
 
 fn normalize_rich_model_entries(
@@ -1025,6 +1081,9 @@ fn enrich_data_model_entries(data: &mut [ModelEntry], rich: &[ModelEntry]) -> Re
 }
 
 fn model_metadata_field(key: &str) -> Option<&'static str> {
+    if let Some(field) = reasoning_metadata_field(key) {
+        return Some(field);
+    }
     match key {
         "context" | "context_window" | "context_length" | "contextLength" | "ContextWindow"
         | "ContextLength" | "max_context_window" | "max_context_length" | "contextWindow"
@@ -1068,45 +1127,6 @@ fn model_metadata_field(key: &str) -> Option<&'static str> {
         "name" => Some("name"),
         "aliases" | "alias" | "model_aliases" | "modelAliases" => Some("aliases"),
         "is_free" | "isFree" | "pricing" | "cost" => Some("pricing"),
-        "reasoning"
-        | "effort"
-        | "supported_levels"
-        | "supportedLevels"
-        | "default_level"
-        | "defaultLevel"
-        | "supportsReasoning"
-        | "supports_reasoning"
-        | "reasoningSupported"
-        | "reasoning_supported"
-        | "supportsThinking"
-        | "supports_thinking"
-        | "supported_efforts"
-        | "supportedEfforts"
-        | "efforts"
-        | "supported_reasoning_levels"
-        | "supportedReasoningLevels"
-        | "supported_reasoning_efforts"
-        | "supportedReasoningEfforts"
-        | "default_effort"
-        | "defaultEffort"
-        | "default_reasoning_level"
-        | "default_reasoning_effort"
-        | "defaultReasoningLevel"
-        | "defaultReasoningEffort"
-        | "reasoning_format"
-        | "reasoningFormat"
-        | "upstream_format"
-        | "upstreamFormat"
-        | "reasoning_parameter"
-        | "reasoningParameter"
-        | "upstream_parameter"
-        | "upstreamParameter"
-        | "mandatory"
-        | "reasoningMandatory"
-        | "default_enabled"
-        | "defaultEnabled"
-        | "supports_max_tokens"
-        | "supportsMaxTokens" => Some("reasoning"),
         "supported_endpoints" | "supportedEndpoints" | "endpoints" => Some("endpoints"),
         "supportsTools"
         | "supports_tools"
@@ -1133,8 +1153,26 @@ fn collect_declared_model_metadata_fields(
     fields: &mut HashSet<&'static str>,
 ) {
     for (key, value) in object {
-        if value.is_null() {
+        use crate::reasoning_capabilities::provider_metadata::looks_like_canonical_reasoning;
+        let reasoning_field = reasoning_metadata_field(key);
+        if (reasoning_field == Some("reasoning")
+            && (!value.is_object() || looks_like_canonical_reasoning(value)))
+            || (reasoning_field == Some("supports_reasoning") && value.as_bool() == Some(false))
+        {
+            fields.insert("atomic_reasoning");
+        }
+        if value.is_null()
+            && !matches!(
+                model_metadata_field(key),
+                Some("reasoning" | "supported_efforts")
+            )
+        {
             continue;
+        }
+        if matches!(key.as_str(), "reasoning" | "effort") {
+            if let Some(nested) = value.as_object() {
+                collect_declared_model_metadata_fields(nested, fields);
+            }
         }
         if let Some(field) = model_metadata_field(key) {
             fields.insert(field);
@@ -1178,6 +1216,42 @@ fn merge_missing_model_metadata(
     declared: &HashSet<&'static str>,
 ) {
     for (key, value) in descriptor {
+        if declared.contains("atomic_reasoning") && reasoning_metadata_field(key).is_some() {
+            continue;
+        }
+        // Lightweight reasoning descriptors can supply missing individual
+        // fields. Typed capabilities and explicit scalar controls are atomic.
+        if matches!(key.as_str(), "reasoning" | "effort") {
+            use crate::reasoning_capabilities::provider_metadata::looks_like_canonical_reasoning;
+            match (target.get_mut(key), value) {
+                (Some(existing), serde_json::Value::Object(descriptor_reasoning))
+                    if existing.is_object()
+                        && !looks_like_canonical_reasoning(existing)
+                        && !looks_like_canonical_reasoning(value) =>
+                {
+                    merge_missing_model_metadata(
+                        existing.as_object_mut().expect("checked object"),
+                        descriptor_reasoning,
+                        declared,
+                    );
+                }
+                (None, serde_json::Value::Object(descriptor_reasoning))
+                    if !declared.contains(key.as_str())
+                        && !looks_like_canonical_reasoning(value) =>
+                {
+                    let mut object = serde_json::Map::new();
+                    merge_missing_model_metadata(&mut object, descriptor_reasoning, declared);
+                    if !object.is_empty() || descriptor_reasoning.is_empty() {
+                        target.insert(key.clone(), serde_json::Value::Object(object));
+                    }
+                }
+                (None, _) if !declared.contains(key.as_str()) => {
+                    target.insert(key.clone(), value.clone());
+                }
+                _ => {}
+            }
+            continue;
+        }
         if let Some(field) = model_metadata_field(key) {
             if declared.contains(field) || (field == "parameters" && declared.contains("tools")) {
                 continue;
@@ -1211,6 +1285,49 @@ fn merge_missing_model_metadata(
         if target.get(key).is_none_or(serde_json::Value::is_null) {
             target.insert(key.clone(), value.clone());
         }
+    }
+}
+
+fn reasoning_metadata_field(key: &str) -> Option<&'static str> {
+    match key {
+        "reasoning" => Some("reasoning"),
+        "effort" => Some("effort"),
+        "supportsReasoning"
+        | "supports_reasoning"
+        | "reasoningSupported"
+        | "reasoning_supported"
+        | "supportsThinking"
+        | "supports_thinking" => Some("supports_reasoning"),
+        "supported_efforts"
+        | "supportedEfforts"
+        | "supported_levels"
+        | "supportedLevels"
+        | "efforts"
+        | "supported_reasoning_levels"
+        | "supportedReasoningLevels"
+        | "supported_reasoning_efforts"
+        | "supportedReasoningEfforts" => Some("supported_efforts"),
+        "default_effort"
+        | "defaultEffort"
+        | "default_level"
+        | "defaultLevel"
+        | "default_reasoning_level"
+        | "defaultReasoningLevel"
+        | "default_reasoning_effort"
+        | "defaultReasoningEffort" => Some("default_effort"),
+        "mandatory" | "reasoningMandatory" => Some("mandatory"),
+        "default_enabled" | "defaultEnabled" => Some("default_enabled"),
+        "supports_max_tokens" | "supportsMaxTokens" => Some("supports_max_tokens"),
+        "disable_allowed" | "disableAllowed" => Some("disable_allowed"),
+        "output_format" | "outputFormat" => Some("output_format"),
+        "reasoning_format" | "reasoningFormat" | "upstream_format" | "upstreamFormat"
+        | "format" => Some("reasoning_format"),
+        "reasoning_parameter"
+        | "reasoningParameter"
+        | "upstream_parameter"
+        | "upstreamParameter"
+        | "parameter" => Some("reasoning_parameter"),
+        _ => None,
     }
 }
 
@@ -1765,7 +1882,16 @@ fn is_openrouter_api_url(value: &str, expected_path: &str) -> bool {
 /// Both the configured API scope and the successful model-list endpoint must
 /// identify OpenRouter before applying its provider-specific defaults.
 fn is_openrouter_models_discovery(base_url: &str, models_url: &str) -> bool {
-    (is_openrouter_api_url(base_url, "/api/v1") || is_openrouter_api_url(base_url, "/api"))
+    [
+        "",
+        "/api",
+        "/api/v1",
+        "/api/v1/models",
+        "/api/v1/chat/completions",
+        "/api/v1/responses",
+    ]
+    .iter()
+    .any(|path| is_openrouter_api_url(base_url, path))
         && is_openrouter_api_url(models_url, "/api/v1/models")
         && model_discovery_has_same_origin(base_url, models_url)
 }
@@ -3977,8 +4103,8 @@ mod tests {
                 .codex_ultra_orchestration
                 .as_ref()
                 .and_then(|ultra| ultra.provider_effort.as_deref()),
-            Some("xhigh"),
-            "native model metadata does not upgrade the independent Ultra fallback"
+            Some("max"),
+            "metadata normalization uses the maintained Ultra target for this Max-capable model"
         );
         assert!(normalized
             .supported_efforts
@@ -5906,6 +6032,192 @@ mod tests {
         assert_eq!(deepseek["upstream"]["format"], "reasoning_object");
         assert_eq!(deepseek["upstream"]["parameter"], "reasoning.effort");
         assert_eq!(deepseek["defaultEffort"], "high");
+    }
+
+    #[test]
+    fn openrouter_discovery_requires_unique_request_identities() {
+        let body = serde_json::json!({
+            "data": [
+                {"id": "test/first", "name": "Display only", "aliases": ["test/shared", "test/second"]},
+                {"id": "test/second", "aliases": ["test/shared"], "reasoning": {"mandatory": true}}
+            ]
+        });
+        let lookup = |id| {
+            openrouter_discovery_model_entry(
+                &body.to_string(),
+                "https://openrouter.ai/api/v1/responses",
+                "https://openrouter.ai/api/v1/models",
+                id,
+            )
+        };
+        assert_eq!(
+            lookup("test/second").unwrap().unwrap()["reasoning"]["mandatory"],
+            true
+        );
+        assert!(lookup("test/shared").is_err());
+        assert!(lookup("Display only").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_models_response_merges_nested_openrouter_reasoning_metadata_from_rich_descriptors() {
+        let models = parse_provider_models_response(
+            r#"{
+                "data": [{
+                    "id": "provider/graded",
+                    "reasoning": {"mandatory": false},
+                    "supported_parameters": ["reasoning", "reasoning_effort"]
+                }],
+                "models": [{
+                    "id": "provider/graded",
+                    "reasoning": {
+                        "mandatory": false,
+                        "supported_efforts": ["high", "medium", "low"],
+                        "default_effort": "medium"
+                    }
+                }]
+            }"#,
+            &[],
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/models",
+        )
+        .expect("merge rich OpenRouter reasoning metadata");
+
+        let reasoning = models[0]
+            .reasoning
+            .as_ref()
+            .expect("merged reasoning declaration");
+        assert_eq!(reasoning["controlKind"], "graded");
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["high", "medium", "low"])
+        );
+        assert_eq!(reasoning["defaultEffort"], "medium");
+    }
+
+    #[test]
+    fn parse_models_response_preserves_openrouter_null_effort_declaration_from_rich_descriptors() {
+        let models = parse_provider_models_response(
+            r#"{
+                "data": [{
+                    "id": "provider/null-efforts",
+                    "reasoning": {"mandatory": false}
+                }],
+                "models": [{
+                    "id": "provider/null-efforts",
+                    "reasoning": {
+                        "mandatory": false,
+                        "supported_efforts": null
+                    }
+                }]
+            }"#,
+            &[],
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/models",
+        )
+        .expect("merge null OpenRouter reasoning metadata");
+
+        let reasoning = models[0]
+            .reasoning
+            .as_ref()
+            .expect("merged reasoning declaration");
+        assert_eq!(reasoning["controlKind"], "graded");
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["max", "xhigh", "high", "medium", "low", "minimal", "none"])
+        );
+    }
+
+    #[test]
+    fn parse_models_response_keeps_compact_openrouter_efforts_across_scopes() {
+        for (compact_efforts, expected) in [
+            (
+                serde_json::json!(["low", "high"]),
+                serde_json::json!(["low", "high"]),
+            ),
+            (
+                serde_json::Value::Null,
+                serde_json::json!(["max", "xhigh", "high", "medium", "low", "minimal", "none"]),
+            ),
+        ] {
+            let body = serde_json::json!({
+                "data": [{
+                    "id": "example/model",
+                    "supportedReasoningEfforts": compact_efforts,
+                    "supported_parameters": ["reasoning"],
+                    "reasoning": {"mandatory": false}
+                }],
+                "models": [{
+                    "id": "example/model",
+                    "reasoning": {
+                        "supported_efforts": ["medium", "high"],
+                        "default_effort": "high"
+                    }
+                }]
+            });
+            let models = parse_provider_models_response(
+                &body.to_string(),
+                &[],
+                "https://openrouter.ai/api/v1",
+                "https://openrouter.ai/api/v1/models",
+            )
+            .unwrap();
+            let reasoning = models[0].reasoning.as_ref().unwrap();
+            assert_eq!(reasoning["supportedEfforts"], expected);
+            assert_eq!(reasoning["defaultEffort"], "high");
+        }
+    }
+
+    #[test]
+    fn parse_models_response_keeps_compact_negative_reasoning_authoritative() {
+        for compact in [
+            serde_json::json!({"id": "example/model", "supports_reasoning": false}),
+            serde_json::json!({"id": "example/model", "reasoning": false}),
+        ] {
+            let body = serde_json::json!({
+                "data": [compact],
+                "models": [{
+                    "id": "example/model",
+                    "reasoning": {"supported_efforts": ["low", "high"]}
+                }]
+            });
+            let models = parse_provider_models_response(
+                &body.to_string(),
+                &[],
+                "https://openrouter.ai/api/v1",
+                "https://openrouter.ai/api/v1/models",
+            )
+            .unwrap();
+            let reasoning = models[0].reasoning.as_ref().unwrap();
+            assert_eq!(reasoning["supportStatus"], "confirmed_unsupported");
+        }
+    }
+
+    #[test]
+    fn parse_models_response_enriches_nested_openrouter_effort_descriptors() {
+        let body = serde_json::json!({
+            "data": [{
+                "id": "example/model",
+                "supported_parameters": ["reasoning"],
+                "reasoning": {"effort": {"defaultLevel": "high"}}
+            }],
+            "models": [{
+                "id": "example/model",
+                "reasoning": {"effort": {"supported_levels": ["low", "high"], "default_effort": "low"}}
+            }]
+        });
+        let models = parse_provider_models_response(
+            &body.to_string(),
+            &[],
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/models",
+        )
+        .unwrap();
+        let reasoning = models[0].reasoning.as_ref().unwrap();
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["low", "high"])
+        );
+        assert_eq!(reasoning["defaultEffort"], "high");
     }
 
     #[test]

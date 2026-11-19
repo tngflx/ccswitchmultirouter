@@ -180,6 +180,79 @@ const codexOwnerRemoteMetadataSignature = (thread) => {
     pending,
   ]);
 };
+const codexOwnerRemoteFailureCategories = Object.freeze({
+  serverOverloaded: "server_overloaded",
+  usageLimitExceeded: "usage_limit",
+  rateLimitExceeded: "rate_limit",
+  internalServerError: "internal_server_error",
+  unauthorized: "authentication_error",
+  contextWindowExceeded: "context_length_exceeded",
+  badRequest: "invalid_request_error",
+  modelNotFound: "invalid_request_error",
+});
+const codexOwnerRemoteFailureVariants = Object.freeze({
+  httpConnectionFailed: "connection_error",
+  responseStreamConnectionFailed: "connection_error",
+  responseStreamDisconnected: "connection_error",
+  responseTooManyFailedAttempts: "connection_error",
+});
+const codexOwnerRemoteFailureCategoryValues = new Set([
+  ...Object.values(codexOwnerRemoteFailureCategories),
+  "connection_error",
+  "unknown",
+]);
+const codexOwnerRemoteDataField = (value, key) => {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return { present: false };
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (!descriptor) return { present: false };
+  if (!Object.hasOwn(descriptor, "value"))
+    return { present: true, unsafe: true };
+  return { present: true, value: descriptor.value };
+};
+const codexOwnerRemoteFailureCategory = (turn) => {
+  const status = codexOwnerRemoteDataField(turn, "status");
+  if (!status.present || !["failed", "interrupted"].includes(status.value))
+    return undefined;
+  const projected = codexOwnerRemoteDataField(turn, "failure");
+  if (projected.present && !projected.unsafe) {
+    const category = codexOwnerRemoteDataField(projected.value, "category");
+    return category.present &&
+      typeof category.value === "string" &&
+      codexOwnerRemoteFailureCategoryValues.has(category.value)
+      ? { category: category.value }
+      : { category: "unknown" };
+  }
+  if (projected.unsafe) return { category: "unknown" };
+  const error = codexOwnerRemoteDataField(turn, "error");
+  if (!error.present || error.unsafe) return { category: "unknown" };
+  const info = codexOwnerRemoteDataField(error.value, "codexErrorInfo");
+  if (!info.present || info.unsafe) return { category: "unknown" };
+  if (typeof info.value === "string")
+    return {
+      category:
+        Object.getOwnPropertyDescriptor(
+          codexOwnerRemoteFailureCategories,
+          info.value,
+        )?.value || "unknown",
+    };
+  if (
+    info.value &&
+    typeof info.value === "object" &&
+    !Array.isArray(info.value)
+  ) {
+    for (const key of Object.keys(codexOwnerRemoteFailureVariants)) {
+      const variant = codexOwnerRemoteDataField(info.value, key);
+      if (variant.present)
+        return {
+          category: variant.unsafe
+            ? "unknown"
+            : codexOwnerRemoteFailureVariants[key],
+        };
+    }
+  }
+  return { category: "unknown" };
+};
 const codexOwnerRemoteTurnMetadata = (turn) => {
   const items = codexOwnerRemoteOwnData(turn, "items");
   if (
@@ -192,6 +265,8 @@ const codexOwnerRemoteTurnMetadata = (turn) => {
     const value = codexOwnerRemoteOwnData(turn, key);
     if (value !== undefined) metadata[key] = value;
   }
+  const failure = codexOwnerRemoteFailureCategory(turn);
+  if (failure) metadata.failure = failure;
   // Preserve an accessor descriptor as unavailable evidence for the shared
   // classifier, without invoking it or hiding it as an absent optional model.
   const model = Object.getOwnPropertyDescriptor(turn, "model");
@@ -216,6 +291,7 @@ const codexOwnerRemoteTurnSignature = (turn) =>
           ? codexOwnerRemoteOwnData(turn, "status")
           : "unknown",
         codexOwnerRemoteTurnModelSignature(turn),
+        codexOwnerRemoteFailureCategory(turn)?.category || "none",
       ])
     : "empty";
 const codexOwnerRemoteReadPage = (response, key, limit) => {
@@ -537,11 +613,13 @@ const codexOwnerRemoteProjectThread = (thread, threadId, observedAtMs) => {
       itemCount < itemLength ||
       codexOwnerRemoteOwnData(turn, "itemsTruncated") === true;
     if (turnTruncated) truncated = true;
+    const failure = codexOwnerRemoteFailureCategory(turn);
     turns.push({
       id,
       status,
       items: items.reverse(),
       truncated: turnTruncated,
+      ...(failure ? { failure } : {}),
     });
   }
   return {

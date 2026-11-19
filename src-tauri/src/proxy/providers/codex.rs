@@ -3365,7 +3365,7 @@ fn codex_provider_catalog_upstream_model_for_request(
 
 /// Reject only explicit catalog exclusions or ambiguous identities. Missing
 /// rows (including unloaded/absent catalogs) retain legacy passthrough semantics.
-pub(super) fn validate_codex_catalog_request_model(
+pub(crate) fn validate_codex_catalog_request_model(
     provider: &Provider,
     request_model: &str,
 ) -> Result<(), ProxyError> {
@@ -3538,61 +3538,108 @@ pub fn resolve_codex_chat_reasoning_config(
     inferred
 }
 
-/// Apply the Provider capability map while keeping the native Responses shape.
-/// Synthetic Codex Ultra uses the resolved Provider-native target (for example,
-/// `xhigh` for Sublyx); it must never be sent as a literal `ultra` value.
+/// Apply the canonical logical request once, keeping native Responses controls
+/// nested even when the Provider's Chat capability uses a flat effort field.
 pub fn apply_codex_native_responses_reasoning_effort(
     provider: &Provider,
     body: &mut JsonValue,
 ) -> Result<(), ProxyError> {
-    let Some(requested_effort) = body
+    apply_codex_native_reasoning_controls(provider, body, true)
+}
+
+/// Native Chat keeps its messages/tools intact but shares logical validation and
+/// capability conversion with Responses-to-Chat, rather than bypassing it.
+pub fn apply_codex_native_chat_reasoning(
+    provider: &Provider,
+    body: &mut JsonValue,
+) -> Result<(), ProxyError> {
+    apply_codex_native_reasoning_controls(provider, body, false)
+}
+
+fn apply_codex_native_reasoning_controls(
+    provider: &Provider,
+    body: &mut JsonValue,
+    native_responses: bool,
+) -> Result<(), ProxyError> {
+    use super::transform_codex_chat::{
+        apply_reasoning_options, normalized_codex_reasoning_request,
+    };
+    use crate::proxy::codex_reasoning_controls::CodexReasoningProjection;
+    use serde_json::json;
+
+    let mut logical = normalized_codex_reasoning_request(body)?;
+    let effort = logical
         .pointer("/reasoning/effort")
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-    else {
+        .and_then(JsonValue::as_str);
+    let enabled = logical
+        .pointer("/reasoning/enabled")
+        .and_then(JsonValue::as_bool);
+    let Some(mut config) = resolve_codex_chat_reasoning_config(provider, &logical) else {
+        if effort == Some("ultra") {
+            return Err(ProxyError::TransformError(
+                "reasoning effort `ultra` cannot be mapped without a declared Provider contract"
+                    .to_string(),
+            ));
+        }
+        // Unknown contracts remain native. De-duplicate equivalent logical
+        // aliases without guessing a capability or adding a vendor switch.
+        if let Some(effort) = effort {
+            let object = body.as_object_mut().ok_or_else(|| {
+                ProxyError::TransformError(
+                    "native Codex request body must be an object".to_string(),
+                )
+            })?;
+            object.remove("reasoning_effort");
+            if let Some(reasoning) = object
+                .get_mut("reasoning")
+                .and_then(JsonValue::as_object_mut)
+            {
+                reasoning.remove("effort");
+            }
+            if native_responses {
+                body["reasoning"]["effort"] = json!(effort);
+            } else {
+                body["reasoning_effort"] = json!(effort);
+            }
+        }
         return Ok(());
     };
-    let Some(config) = resolve_codex_chat_reasoning_config(provider, body) else {
-        return Ok(());
-    };
-    if !config.supports_effort.unwrap_or(false) {
-        // Responses and Chat share the logical Codex reasoning request, but a
-        // non-graded OpenRouter declaration uses the provider's boolean switch
-        // (or no control at all).  Do not leave the incoming Codex effort in a
-        // native Responses body: OpenRouter accepts `reasoning.effort` only for
-        // models whose declared contract exposes that graded control.
-        let mut converted = serde_json::json!({});
-        super::transform_codex_chat::apply_reasoning_options(&mut converted, body, Some(&config))?;
-        if let Some(reasoning) = body.get_mut("reasoning").and_then(JsonValue::as_object_mut) {
-            reasoning.remove("effort");
-            if let Some(mapped) = converted.get("reasoning").and_then(JsonValue::as_object) {
-                for (key, value) in mapped {
-                    reasoning.insert(key.clone(), value.clone());
-                }
-            }
-            if reasoning.is_empty() {
-                body.as_object_mut()
-                    .expect("Responses body is an object")
-                    .remove("reasoning");
-            }
+    let graded = config.supports_effort.unwrap_or(false);
+    let forbidden = !graded && !config.supports_thinking.unwrap_or(false);
+    if effort.is_none() && enabled.is_none() {
+        // Ancillary summary/exclude alone does not enable reasoning. Existing
+        // vendor-native switches are not logical effort and must not be remapped.
+        if forbidden {
+            CodexReasoningProjection::capture(&json!({})).apply(body);
         }
         return Ok(());
     }
-    let Some(mapped) =
-        super::transform_codex_chat::map_codex_reasoning_effort(&requested_effort, &config)?
-    else {
-        let normalized = requested_effort.trim().to_ascii_lowercase();
-        if config.supports_effort.unwrap_or(false)
-            && !matches!(normalized.as_str(), "none" | "off" | "disabled")
-        {
-            return Err(ProxyError::TransformError(format!(
-                "reasoning effort `{requested_effort}` cannot be mapped for the declared Provider contract"
-            )));
+    if graded {
+        // Responses has one canonical nested reasoning wire shape, while native
+        // Chat must honor the capability's declared parameter (for example the
+        // flat `reasoning_effort` used by Sublyx/OpenAI-compatible gateways).
+        // Rewriting the parameter unconditionally here makes a native Chat
+        // request take the Responses path a second time and silently changes
+        // the provider contract after the first mapping.
+        if native_responses {
+            config.effort_param = Some("reasoning.effort".to_string());
+            config.thinking_param = Some("none".to_string());
         }
-        return Ok(());
-    };
-
-    body["reasoning"]["effort"] = JsonValue::String(mapped.to_string());
+        if effort.is_none() {
+            if enabled == Some(false) && config.disable_contract {
+                logical["reasoning"]["effort"] = json!("none");
+            } else {
+                return Err(ProxyError::TransformError(
+                    "graded native Codex reasoning requires an effort; Boolean intent cannot be represented by the declared Provider contract".to_string(),
+                ));
+            }
+        }
+    }
+    let mut controls = json!({});
+    apply_reasoning_options(&mut controls, &logical, Some(&config))?;
+    // One shared projection replaces only known controls, retaining native
+    // prompts, tools, summary/exclude, token budgets and unrelated template kwargs.
+    CodexReasoningProjection::capture(&controls).apply(body);
     Ok(())
 }
 
@@ -8986,6 +9033,252 @@ wire_api = "chat"
         }
     }
 
+    fn native_reasoning_boundary_provider(capability: JsonValue) -> Provider {
+        create_provider(json!({
+            "baseUrl": "https://gateway.example/v1",
+            "modelCatalog": {"models": [{"model": "boundary-model", "reasoning": capability}]}
+        }))
+    }
+
+    #[test]
+    fn native_reasoning_boundary_normalizes_aliases_and_rejects_conflicts() {
+        let provider = native_reasoning_boundary_provider(json!({
+            "schemaVersion": 2, "supportStatus": "confirmed_supported", "controlKind": "graded",
+            "supportedEfforts": ["low", "high", "xhigh"], "defaultEffort": "high", "disableAllowed": false,
+            "upstream": {"format": "string", "parameter": "reasoning_effort", "effortMap": {"low":"low", "high":"high", "xhigh":"xhigh"}},
+            "codexUltraOrchestration": {"enabled": true}
+        }));
+        for aliases in [
+            json!({"reasoning_effort":" HIGH "}),
+            json!({"reasoning_effort":" HIGH ", "reasoning":{"effort":"high", "summary":"auto"}}),
+        ] {
+            let mut body = aliases;
+            body["model"] = json!("boundary-model");
+            apply_codex_native_responses_reasoning_effort(&provider, &mut body).unwrap();
+            assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("high")));
+            assert!(body.get("reasoning_effort").is_none());
+        }
+        for controls in [
+            json!({"reasoning_effort":"low", "reasoning":{"effort":"high"}}),
+            json!({"reasoning":{"effort":"high", "enabled":false}}),
+            json!({"reasoning":{"effort":"none", "enabled":true}}),
+        ] {
+            let mut body = controls;
+            body["model"] = json!("boundary-model");
+            let original = body.clone();
+            assert!(apply_codex_native_responses_reasoning_effort(&provider, &mut body).is_err());
+            assert_eq!(
+                body, original,
+                "rejected native controls must not mutate the request"
+            );
+        }
+    }
+
+    #[test]
+    fn native_reasoning_boundary_native_chat_preserves_declared_flat_wire() {
+        let provider = native_reasoning_boundary_provider(json!({
+            "schemaVersion": 2, "supportStatus": "confirmed_supported", "controlKind": "graded",
+            "supportedEfforts": ["low", "high", "xhigh"], "defaultEffort": "high", "disableAllowed": false,
+            "upstream": {"format": "string", "parameter": "reasoning_effort", "effortMap": {"low": "low", "high": "high", "xhigh": "xhigh"}}
+        }));
+        let mut body = json!({
+            "model": "boundary-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning": {"effort": "high"}
+        });
+        apply_codex_native_chat_reasoning(&provider, &mut body).unwrap();
+        assert_eq!(body.get("reasoning_effort"), Some(&json!("high")));
+        assert!(body.pointer("/reasoning/effort").is_none());
+        assert_eq!(body["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn native_reasoning_boundary_rejects_unrepresentable_boolean_and_preserves_absent_intent() {
+        let provider = native_reasoning_boundary_provider(json!({
+            "schemaVersion":2, "supportStatus":"confirmed_supported", "controlKind":"graded",
+            "supportedEfforts":["high"], "defaultEffort":"high", "disableAllowed":false,
+            "upstream":{"format":"string", "parameter":"reasoning_effort", "effortMap":{"high":"high"}}
+        }));
+        for enabled in [true, false] {
+            let mut body = json!({"model":"boundary-model", "reasoning":{"enabled":enabled, "summary":"auto"}});
+            assert!(apply_codex_native_responses_reasoning_effort(&provider, &mut body).is_err());
+        }
+        let mut absent = json!({"model":"boundary-model", "reasoning":{"summary":"auto"}, "thinking":{"type":"disabled"}});
+        let original = absent.clone();
+        apply_codex_native_responses_reasoning_effort(&provider, &mut absent).unwrap();
+        assert_eq!(
+            absent, original,
+            "summary alone must not invent reasoning or reinterpret a native switch"
+        );
+        let unknown = create_provider(json!({"baseUrl":"https://unknown.example/v1"}));
+        let mut ultra = json!({"model":"unlisted", "reasoning_effort":"ultra"});
+        assert!(apply_codex_native_responses_reasoning_effort(&unknown, &mut ultra).is_err());
+        let mut preserved = json!({"model":"unlisted", "reasoning_effort":" HIGH ", "reasoning":{"effort":"high", "enabled":true}, "enable_thinking":true});
+        apply_codex_native_responses_reasoning_effort(&unknown, &mut preserved).unwrap();
+        assert_eq!(
+            preserved["reasoning"],
+            json!({"effort":"high", "enabled":true})
+        );
+        assert!(preserved.get("reasoning_effort").is_none());
+        assert_eq!(preserved["enable_thinking"], true);
+    }
+
+    #[test]
+    fn native_reasoning_chat_preserves_declared_flat_effort_wire() {
+        let provider = native_reasoning_boundary_provider(json!({
+            "schemaVersion": 2,
+            "supportStatus": "confirmed_supported",
+            "controlKind": "graded",
+            "supportedEfforts": ["low", "high", "xhigh"],
+            "defaultEffort": "high",
+            "disableAllowed": false,
+            "upstream": {
+                "format": "string",
+                "parameter": "reasoning_effort",
+                "effortMap": {"low": "low", "high": "high", "xhigh": "xhigh"}
+            }
+        }));
+        let mut chat = json!({
+            "model": "boundary-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning": {"effort": "xhigh", "summary": "auto"}
+        });
+        apply_codex_native_chat_reasoning(&provider, &mut chat).unwrap();
+        assert_eq!(chat["reasoning_effort"], "xhigh");
+        assert_eq!(chat["reasoning"]["summary"], "auto");
+        assert!(chat["reasoning"].get("effort").is_none());
+    }
+
+    #[test]
+    fn native_reasoning_boolean_intent_rejects_unrepresentable_chat_enable() {
+        let provider = native_reasoning_boundary_provider(json!({
+            "schemaVersion":2, "supportStatus":"confirmed_supported", "controlKind":"graded",
+            "supportedEfforts":["none", "high"], "defaultEffort":"high", "disableAllowed":true,
+            "upstream":{"format":"reasoning_object", "parameter":"reasoning.effort", "effortMap":{"none":"none", "high":"high"}}
+        }));
+        let mut enabled =
+            json!({"model":"boundary-model", "reasoning":{"enabled":true, "summary":"auto"}});
+        let original = enabled.clone();
+        assert!(apply_codex_native_chat_reasoning(&provider, &mut enabled).is_err());
+        assert_eq!(enabled, original);
+        let mut disabled =
+            json!({"model":"boundary-model", "reasoning":{"enabled":false, "summary":"auto"}});
+        apply_codex_native_chat_reasoning(&provider, &mut disabled).unwrap();
+        assert_eq!(
+            disabled["reasoning"],
+            json!({"effort":"none", "summary":"auto"})
+        );
+    }
+
+    #[test]
+    fn native_reasoning_boolean_intent_rejects_malformed_enabled() {
+        let provider = native_reasoning_boundary_provider(json!({
+            "schemaVersion":2, "supportStatus":"confirmed_supported", "controlKind":"boolean",
+            "supportedEfforts":[], "disableAllowed":true,
+            "upstream":{"format":"boolean", "parameter":"reasoning.enabled", "effortMap":{}}
+        }));
+        for enabled in [json!("false"), json!(0), json!({})] {
+            for native_responses in [false, true] {
+                let mut body = json!({"model":"boundary-model", "reasoning":{"effort":"high", "enabled":enabled}});
+                let original = body.clone();
+                assert!(apply_codex_native_reasoning_controls(
+                    &provider,
+                    &mut body,
+                    native_responses
+                )
+                .is_err());
+                assert_eq!(body, original);
+            }
+        }
+    }
+
+    #[test]
+    fn native_reasoning_boundary_scrubs_stale_unsupported_controls() {
+        for (status, kind) in [
+            ("confirmed_unsupported", "none"),
+            ("confirmed_supported", "none"),
+            ("unknown", "unknown"),
+        ] {
+            let provider = native_reasoning_boundary_provider(json!({
+                "schemaVersion":2, "supportStatus":status, "controlKind":kind,
+                "supportedEfforts":[], "defaultEffort":null, "disableAllowed":false,
+                "upstream":{"format":"none", "parameter":"none", "effortMap":{}}
+            }));
+            let mut body = json!({"model":"boundary-model", "reasoning_effort":"high",
+                "reasoning":{"effort":"high", "enabled":true, "summary":"auto", "exclude":true},
+                "thinking":{"type":"enabled"}, "enable_thinking":true, "reasoning_split":true,
+                "chat_template_kwargs":{"enable_thinking":true, "other":"preserved"}});
+            apply_codex_native_responses_reasoning_effort(&provider, &mut body).unwrap();
+            assert_eq!(body["reasoning"], json!({"summary":"auto", "exclude":true}));
+            assert_eq!(body["chat_template_kwargs"], json!({"other":"preserved"}));
+            for key in [
+                "reasoning_effort",
+                "thinking",
+                "enable_thinking",
+                "reasoning_split",
+            ] {
+                assert!(body.get(key).is_none(), "{status}: {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_reasoning_boundary_preserves_each_declared_boolean_wire() {
+        for parameter in [
+            "thinking",
+            "enable_thinking",
+            "chat_template_kwargs.enable_thinking",
+            "reasoning_split",
+            "reasoning.enabled",
+        ] {
+            let provider = native_reasoning_boundary_provider(json!({
+                "schemaVersion":2, "supportStatus":"confirmed_supported", "controlKind":"boolean",
+                "supportedEfforts":[], "defaultEffort":null, "disableAllowed":true,
+                "upstream":{"format":"boolean", "parameter":parameter, "effortMap":{}}
+            }));
+            let mut provider = provider;
+            if matches!(
+                parameter,
+                "chat_template_kwargs.enable_thinking" | "reasoning_split"
+            ) {
+                provider.settings_config["modelCatalog"]["models"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("reasoning");
+                provider.meta = Some(crate::provider::ProviderMeta {
+                    codex_chat_reasoning: Some(CodexChatReasoningConfig {
+                        supports_thinking: Some(true),
+                        supports_effort: Some(false),
+                        thinking_param: Some(parameter.to_string()),
+                        disable_contract: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            }
+            for (effort, enabled) in [("high", true), ("none", false)] {
+                let mut body = json!({"model":"boundary-model", "reasoning":{"effort":effort, "summary":"auto"}, "chat_template_kwargs":{"other":1}});
+                apply_codex_native_responses_reasoning_effort(&provider, &mut body).unwrap();
+                let path = format!("/{}", parameter.replace('.', "/"));
+                if parameter == "thinking" {
+                    assert_eq!(
+                        body.pointer("/thinking/type"),
+                        Some(&json!(if enabled { "enabled" } else { "disabled" }))
+                    );
+                } else {
+                    assert_eq!(
+                        body.pointer(&path),
+                        Some(&json!(enabled)),
+                        "{parameter}: {effort}"
+                    );
+                }
+                assert!(body.pointer("/reasoning/effort").is_none());
+                assert_eq!(body["reasoning"]["summary"], "auto");
+                assert_eq!(body["chat_template_kwargs"]["other"], 1);
+            }
+        }
+    }
+
     #[test]
     fn native_responses_non_graded_switches_match_chat_contract_and_preserve_ancillary_fields() {
         use crate::proxy::providers::codex_request::{
@@ -9154,11 +9447,16 @@ wire_api = "chat"
     fn sublyx_native_and_chat_requests_use_provider_scoped_reasoning_contract() {
         let provider = create_provider(json!({
             "baseUrl": "https://sublyx.org/v1",
-            "modelCatalog": {"models": [{"model": "gpt-6.1-sol"}]}
+            "modelCatalog": {"models": [{"model": "gpt-6.1-sol"}, {"model": "gpt-6.2-astra"}]}
         }));
-        for (effort, expected) in [("xhigh", "xhigh"), ("max", "max"), ("ultra", "xhigh")] {
+        for (model, effort, expected) in [
+            ("gpt-6.1-sol", "xhigh", "xhigh"),
+            ("gpt-6.1-sol", "max", "max"),
+            ("gpt-6.1-sol", "ultra", "max"),
+            ("gpt-6.2-astra", "ultra", "xhigh"),
+        ] {
             let mut native = json!({
-                "model": "gpt-6.1-sol", "input": "hello", "reasoning": {"effort": effort}
+                "model": model, "input": "hello", "reasoning": {"effort": effort}
             });
             let config = resolve_codex_chat_reasoning_config(&provider, &native)
                 .expect("Sublyx maintained contract");

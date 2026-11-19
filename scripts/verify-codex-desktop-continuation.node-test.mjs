@@ -2217,6 +2217,141 @@ test("picker inspection whitelists finite native reconciliation refusal evidence
   }
 });
 
+test("picker inspection preserves fixed-enum current and settled cap reasons", async () => {
+  for (const reason of [
+    "value_limit",
+    "object_limit",
+    "field_limit",
+    "fiber_limit",
+  ]) {
+    const context = pickerInspectionContext({
+      rendererRuntimeFingerprint: fingerprint,
+      scopedAppServerScopeScan: { status: "capped", reason },
+      scopedAppServerScopeLastSettledScan: { status: "capped", reason },
+    });
+    const result = vm.runInContext(
+      await pickerInspectionProgram(context),
+      context,
+    );
+    assert.equal(result.nativeVisibility.scopeScan.reason, reason);
+    assert.equal(result.nativeVisibility.lastSettledScopeScan.reason, reason);
+    assert.equal(result.renderedMenuVerified, false);
+  }
+});
+
+test("picker inspection preserves bounded canonical owner diagnostics without certifying ownership", async () => {
+  for (const reason of [
+    null,
+    "unavailable",
+    "atoms_unverified",
+    "pending_nodes",
+    "roots_unavailable",
+    "hints_read_failed",
+    "snapshot_changed",
+    "hints_ambiguous",
+    "hints_incomplete",
+    "hint_count_mismatch",
+    "scope_unmounted",
+    "scope_cache_unverified",
+  ]) {
+    const counts = {
+      appServerStatusAtomCount: 17,
+      uniqueBrandCount: 16,
+      hintCount: 17,
+      pendingNodeCount: 30000,
+    };
+    const context = pickerInspectionContext({
+      rendererRuntimeFingerprint: fingerprint,
+      nativeReasoningVisibilityReconciliation: {
+        status: "unverified",
+        canonicalOwnerCounts: counts,
+        canonicalOwnerRefusalReason: reason,
+        ownerFailureCounts: {
+          canonical_owner_unavailable: 0,
+          canonical_owner_unverified: 1,
+        },
+      },
+    });
+    const result = vm.runInContext(
+      await pickerInspectionProgram(context),
+      context,
+    );
+    const evidence = result.nativeVisibility.reconciliation;
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(evidence.canonicalOwnerCounts)),
+      counts,
+    );
+    assert.equal(evidence.canonicalOwnerRefusalReason, reason);
+    assert.deepEqual(JSON.parse(JSON.stringify(evidence.ownerFailureCounts)), {
+      canonical_owner_unavailable: 0,
+      canonical_owner_unverified: 1,
+    });
+    assert.equal(result.nativeVisibility.ownershipStatus, "unverified");
+    assert.equal(result.renderedMenuVerified, false);
+  }
+});
+
+test("picker inspection filters malformed canonical diagnostics without getter reads or secrets", async () => {
+  const secret = "private-canonical-owner-fixture";
+  let reads = 0;
+  const counts = {
+    appServerStatusAtomCount: 18,
+    uniqueBrandCount: -1,
+    hintCount: 1.5,
+    pendingNodeCount: 30001,
+    private: secret,
+  };
+  Object.defineProperty(counts, "hintCount", {
+    get() {
+      reads += 1;
+      throw new Error(secret);
+    },
+  });
+  const failures = {
+    canonical_owner_unavailable: 2,
+    canonical_owner_unverified: secret,
+    private: secret,
+  };
+  for (const invalidCounts of [
+    counts,
+    Object.create({ uniqueBrandCount: 1 }),
+    [],
+    null,
+  ]) {
+    const context = pickerInspectionContext({
+      rendererRuntimeFingerprint: fingerprint,
+      scopedAppServerScopeScan: { status: "capped", reason: secret },
+      scopedAppServerScopeLastSettledScan: { status: "capped", reason: secret },
+      nativeReasoningVisibilityReconciliation: {
+        canonicalOwnerCounts: invalidCounts,
+        canonicalOwnerRefusalReason: secret,
+        ownerFailureCounts: failures,
+      },
+    });
+    const result = vm.runInContext(
+      await pickerInspectionProgram(context),
+      context,
+    );
+    const evidence = result.nativeVisibility.reconciliation;
+    assert.equal(evidence.canonicalOwnerRefusalReason, undefined);
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(evidence.canonicalOwnerCounts ?? {})),
+      {},
+    );
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(evidence.ownerFailureCounts)),
+      {},
+    );
+    assert.equal(result.nativeVisibility.scopeScan.reason, undefined);
+    assert.equal(
+      result.nativeVisibility.lastSettledScopeScan.reason,
+      undefined,
+    );
+    assert.equal(JSON.stringify(result).includes(secret), false);
+  }
+  assert.equal(reads, 0);
+});
+
 test("picker inspection reports only public scheduler capability booleans without invoking them", async () => {
   let calls = 0;
   const forbidden = () => {
@@ -3860,6 +3995,36 @@ test("picker inspection accepts its explicit flag without consuming a value", as
     "--inspect-picker": true,
     "--wait-ms": "250",
   });
+});
+
+test("picker inspection uses a bounded default readiness window", async () => {
+  const source = await readMonitorSource();
+  const begin = source.indexOf("const options = new Map();");
+  const end = source.indexOf("const fingerprintPattern", begin);
+  assert.ok(begin >= 0 && end > begin);
+  const defaultContext = vm.createContext({
+    assert,
+    process: {
+      platform: "win32",
+      argv: ["node", "verifier", "--inspect-picker"],
+    },
+  });
+  assert.equal(
+    vm.runInContext(`${source.slice(begin, end)}; waitMs`, defaultContext),
+    30_000,
+  );
+
+  const explicitContext = vm.createContext({
+    assert,
+    process: {
+      platform: "win32",
+      argv: ["node", "verifier", "--inspect-picker", "--wait-ms", "0"],
+    },
+  });
+  assert.equal(
+    vm.runInContext(`${source.slice(begin, end)}; waitMs`, explicitContext),
+    0,
+  );
 });
 
 test("picker sampling keeps requested cadence on one pinned selected session with validation only before and after", async () => {

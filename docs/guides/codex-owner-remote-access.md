@@ -1,6 +1,6 @@
 # Owner remote access to Codex
 
-Status: **local native Continue and two actual-browser flows verified, with an intervening bridge-readiness failure; production and off-device deployment remain unverified**. Updated November 15, 2026. This is the single owner-remote implementation contract and setup guide. It supersedes the earlier suggestion of host approval for each remote action; native Codex tool/sandbox approvals are unchanged.
+Status: **local native Continue and two actual-browser flows verified, with an intervening bridge-readiness failure; production and off-device deployment remain unverified**. Updated November 17, 2026. This is the single owner-remote implementation contract and setup guide. It supersedes the earlier suggestion of host approval for each remote action; native Codex tool/sandbox approvals are unchanged.
 
 ## Current implementation boundary
 
@@ -15,15 +15,15 @@ successes do not explain that refusal, certify the installed production service
 or prove that a tablet can reach this host; sustained bridge availability remains
 an open gate.
 
-| Area                       | Implemented source                                                                                                           | Remaining boundary                                                                                                   |
-| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| Host setup                 | Settings → Owner remote access; enable/disable, exact HTTPS origin, short-lived enrollment link                              | Audited host service remains off; exact HTTPS origin/private ingress unconfigured                                    |
-| Website and authentication | `resources/owner_remote/`, `services/owner_remote/`; real WebAuthn verification, sessions, CSRF, device management           | Two local HTTPS browser/virtual-passkey flows passed; private HTTPS deployment and real-device passkey/browser tests |
-| Native bridge              | `codex_owner_remote.rs`; concrete endpoint/target, process start identity, runtime and canonical provider/settings freshness | Strong native owner proof is Windows-only; intervening guarded-client readiness failed; other platforms fail closed  |
-| Content                    | `owner_remote_view.js`; count-bounded native protocol pages and allowlisted recent projection                                | Exact failed-conversation view passed in actual local browser; in-progress output fidelity remains unverified        |
-| Displayed host chat        | Explicit conversation selection                                                                                              | No verified host-navigation reader; `currentDisplay: "unavailable"`                                                  |
-| Continue                   | Shared renderer prepare/commit core and canonical native recovery ledger with typed owner intent                             | Isolated native HTTP and actual-browser Continue passed; production service/native scheduling unverified             |
-| Action-record migration    | Strict install-time v2 action document, secure document revisions and runtime/action freshness evidence                      | Installed migration/current-writer verification; failed persistence cannot promise evidence across full process loss |
+| Area                       | Implemented source                                                                                                           | Remaining boundary                                                                                                                                                            |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Host setup                 | Settings → Owner remote access; enable/disable, exact HTTPS origin, short-lived enrollment link                              | Audited host service remains off; exact HTTPS origin/private ingress unconfigured                                                                                             |
+| Website and authentication | `resources/owner_remote/`, `services/owner_remote/`; real WebAuthn verification, sessions, CSRF, device management           | Two local HTTPS browser/virtual-passkey flows passed; private HTTPS deployment and real-device passkey/browser tests                                                          |
+| Native bridge              | `codex_owner_remote.rs`; concrete endpoint/target, process start identity, runtime and canonical provider/settings freshness | Strong native owner proof is Windows-only; intervening guarded-client readiness failed; other platforms fail closed                                                           |
+| Content                    | `owner_remote_view.js`; count-bounded native protocol pages, allowlisted recent projection and exact-turn failure category   | Exact failed-conversation view passed in actual local browser; in-progress output fidelity remains unverified; failure detail is sanitized and must not fall back to raw logs |
+| Displayed host chat        | Explicit conversation selection                                                                                              | No verified host-navigation reader; `currentDisplay: "unavailable"`                                                                                                           |
+| Continue                   | Shared renderer prepare/commit core and canonical native recovery ledger with typed owner intent                             | Isolated native HTTP and actual-browser Continue passed; production service/native scheduling unverified                                                                      |
+| Action-record migration    | Strict install-time v2 action document, secure document revisions and runtime/action freshness evidence                      | Installed migration/current-writer verification; failed persistence cannot promise evidence across full process loss                                                          |
 
 ### Actual runtime evidence and its limits
 
@@ -206,6 +206,12 @@ already has the settings panel:
    tailscale serve --bg http://127.0.0.1:15723
    ```
 
+   This is the reference Tailscale-first route. Tailscale supplies the private
+   network and Serve supplies the HTTPS website; CCSwitch remains the owner
+   console and Codex bridge. The current audit machine did **not** have the
+   Tailscale CLI or the standard Windows installation path available, so this
+   guide does not claim that the route is installed or reachable yet.
+
 4. Open **Settings → Connections & recovery → Remote connection (owner access)**
    (or the shortcut at the top of General). Enter the exact HTTPS origin reported
    by that deployment, for example `https://your-machine.your-tailnet.ts.net`,
@@ -230,6 +236,24 @@ already has the settings panel:
 8. When the browser session expires, sign in with its passkey **on the remote
    device**. An enrolled owner can invite/revoke devices while away using
    owner-side passkey reauthentication; that step-up is not required per Continue.
+
+### Optional Cloudflare domain management
+
+Cloudflare may manage the DNS zone for the chosen hostname, but the default
+plan keeps Cloudflare out of the Codex traffic path: use a Tailscale `.ts.net`
+hostname and its Serve certificate, or use a separately operated HTTPS proxy
+bound only to the host's Tailscale address. A plain Cloudflare CNAME does not
+provide the private-host certificate needed for a custom hostname. If a custom
+hostname is required, use Cloudflare **DNS-only** with a narrowly scoped DNS
+API token held by the external certificate/proxy service, obtain the certificate
+with DNS-01, and pin that exact HTTPS origin in CCSwitch. Do not enable the
+orange-cloud HTTP proxy, Cloudflare Tunnel, Funnel, or a second public owner
+service merely because the DNS zone is on Cloudflare. Never put a DNS token in
+CCSwitch configuration, a repository, a browser URL, or a log.
+
+This optional custom-hostname path is not live-verified. The pinned origin and
+WebAuthn relying-party binding must not silently switch between `.ts.net` and a
+custom domain; changing it requires an explicit reset and re-enrollment.
 
 The adjacent **Crash recovery** card uses the existing device-local
 `watchdogEnabled` setting. Its **Auto-recover from crashes (watchdog)** switch is
@@ -359,8 +383,16 @@ by the bounded protocol requests; do not promise full terminal-output parity.
 The projection allowlists user/assistant text, application-supplied **public**
 reasoning summaries, and finite tool/action states. It excludes hidden reasoning,
 raw config/auth/error/provider objects, arbitrary object coercion and recursive
-crawling. Tool output/prompts may themselves contain secrets intentionally shown
-to the owner; do not claim arbitrary transcript text is perfectly redacted. Keep
+crawling. For an exact latest turn whose status is `failed` or `interrupted`, the
+native projection may include one sanitized `failure.category` from this fixed
+set: `server_overloaded`, `usage_limit`, `rate_limit`, `internal_server_error`,
+`authentication_error`, `context_length_exceeded`, `invalid_request_error`,
+`connection_error`, or `unknown`. The category is display-only: it does not
+authorize Continue, assert retryability, provide an ETA, or substitute for the
+canonical recovery policy. Missing, unreadable, stale or unrecognized failure
+metadata becomes `unknown`; no latest-log or session-log record is attached to a
+turn. Tool output/prompts may themselves contain secrets intentionally shown to
+the owner; do not claim arbitrary transcript text is perfectly redacted. Keep
 payloads out of access/error/audit logs and telemetry.
 
 The browser renders text, not arbitrary HTML/Markdown or remote images. It shows
@@ -587,6 +619,10 @@ approval requirement was earlier design advice, not an implemented workflow.
   [installed-runtime follow-up](../audits/2026-11-14-continuation-postrestart-verification.md):
   historical verification, not evidence of remote pairing/browser access.
 - Tailscale Serve: <https://tailscale.com/kb/1312/serve>.
+- Tailscale connection types and coordination outages:
+  <https://tailscale.com/docs/reference/connection-types> and
+  <https://tailscale.com/docs/reference/coordination-server-down>.
+- Cloudflare DNS records: <https://developers.cloudflare.com/dns/manage-dns-records/how-to/create-dns-records/>.
 - W3C WebAuthn: <https://www.w3.org/TR/webauthn-3/>.
 - Maintainer advisory: <https://github.com/kanidm/webauthn-rs/security/advisories/GHSA-22w3-693w-x895>.
 - OWASP session management:

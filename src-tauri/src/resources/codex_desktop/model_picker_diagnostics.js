@@ -89,6 +89,7 @@ const codexModelPickerDiagnostics = (options) => {
     nativeVisibilityUnverifiedObserverCount: 0,
     booleanControlUnverifiedModelCount: 0,
     booleanControlReadyModelCount: 0,
+    booleanControlNotObservedModelCount: 0,
     effortMismatchCount: 0,
     flagMismatchCount: 0,
     missingMaxModelCount: 0,
@@ -126,6 +127,7 @@ const codexModelPickerDiagnostics = (options) => {
   const selectedUltra = new Set();
   const booleanReadyModels = new Set();
   const booleanUnverifiedModels = new Set();
+  const booleanNotObservedModels = new Set();
   // Keep old hooks for orderly release, but a complete current owner snapshot
   // can exclude orphaned cache observers from readiness after navigation. An
   // incomplete/unloaded snapshot is unknown, never an authoritative empty set.
@@ -134,6 +136,11 @@ const codexModelPickerDiagnostics = (options) => {
     typeof codexCurrentNativeReasoningQueryCaches === "function"
       ? codexCurrentNativeReasoningQueryCaches()
       : null;
+  const nativeVisibilityPending =
+    state.nativeReasoningVisibilityRequired === true &&
+    !authoritativeEmptyCatalog &&
+    currentNativeCaches === null &&
+    state.scopedAppServerScopeScanComplete === false;
   if (modelObservations && !currentNativeCaches)
     observationUnavailable("native_owner_unverified");
   for (const cache of state.reasoningQueryCaches?.keys() || []) {
@@ -142,7 +149,9 @@ const codexModelPickerDiagnostics = (options) => {
       status:
         state.nativeReasoningVisibilityRequired === true &&
         !authoritativeEmptyCatalog
-          ? "unverified"
+          ? nativeVisibilityPending
+            ? "pending"
+            : "unverified"
           : "not_required",
       missingEfforts: [],
     };
@@ -300,6 +309,8 @@ const codexModelPickerDiagnostics = (options) => {
                       control.disableAllowed ? ["off", "on"] : ["on"],
                     );
                 if (binaryUiReady) booleanReadyModels.add(row.model);
+                else if (codexPickerOwnData(proof, "status") === "not_observed")
+                  booleanNotObservedModels.add(row.model);
                 else booleanUnverifiedModels.add(row.model);
               } catch (error) {
                 // An unreadable later proof must not leave a previous observer's
@@ -431,6 +442,12 @@ const codexModelPickerDiagnostics = (options) => {
   diagnostics.booleanControlReadyModelCount = [...booleanReadyModels].filter(
     (model) => !booleanUnverifiedModels.has(model),
   ).length;
+  diagnostics.booleanControlNotObservedModelCount = [
+    ...booleanNotObservedModels,
+  ].filter(
+    (model) =>
+      !booleanReadyModels.has(model) && !booleanUnverifiedModels.has(model),
+  ).length;
   if (diagnostics.errorObserverCount) diagnostics.status = "error";
   else if (diagnostics.effortMismatchCount || diagnostics.flagMismatchCount)
     diagnostics.status = "mismatch";
@@ -441,6 +458,7 @@ const codexModelPickerDiagnostics = (options) => {
     diagnostics.booleanControlUnverifiedModelCount
   )
     diagnostics.status = "unverified";
+  else if (nativeVisibilityPending) diagnostics.status = "pending";
   else if (authoritativeEmptyCatalog && !diagnostics.successObserverCount)
     diagnostics.status = "not_required";
   else if (diagnostics.pickerObserverCount && !diagnostics.pendingObserverCount)

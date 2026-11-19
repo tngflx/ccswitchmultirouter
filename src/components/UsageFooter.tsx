@@ -1,20 +1,17 @@
 import React from "react";
 import { RefreshCw, AlertCircle, Clock } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { type AppId } from "@/lib/api";
-import { useUsageQuery } from "@/lib/query/queries";
-import { UsageData, Provider } from "@/types";
+import type { UsageData, UsageResult } from "@/types";
 import { TierBadge } from "@/components/SubscriptionQuotaFooter";
 import type { QuotaTier } from "@/types/subscription";
 import { formatRelativeTime } from "@/utils/usageRelativeTime";
 
 interface UsageFooterProps {
-  provider: Provider;
-  providerId: string;
-  appId: AppId;
-  usageEnabled: boolean; // 是否启用了用量查询
-  isCurrent: boolean; // 是否为当前激活的供应商
-  isInConfig?: boolean; // OpenCode: 是否已添加到配置
+  usage: UsageResult | undefined;
+  loading: boolean;
+  lastQueriedAt: number | null;
+  refetch: () => void;
+  isTokenPlan: boolean;
   inline?: boolean; // 是否内联显示（在按钮左侧）
 }
 
@@ -44,35 +41,14 @@ function toQuotaTier(data: UsageData): QuotaTier {
 }
 
 const UsageFooter: React.FC<UsageFooterProps> = ({
-  provider,
-  providerId,
-  appId,
-  usageEnabled,
-  isCurrent,
-  isInConfig = false,
+  usage,
+  loading,
+  lastQueriedAt,
+  refetch,
+  isTokenPlan,
   inline = false,
 }) => {
   const { t } = useTranslation();
-  const isTokenPlan =
-    provider.meta?.usage_script?.templateType === "token_plan";
-
-  // 统一的用量查询（自动查询仅对当前激活的供应商启用）
-  // OpenCode（累加模式）：使用 isInConfig 代替 isCurrent
-  const shouldAutoQuery = appId === "opencode" ? isInConfig : isCurrent;
-  const autoQueryInterval = shouldAutoQuery
-    ? provider.meta?.usage_script?.autoQueryInterval || 0
-    : 0;
-
-  const {
-    data: usage,
-    isFetching: loading,
-    isError,
-    lastQueriedAt,
-    refetch,
-  } = useUsageQuery(providerId, appId, {
-    enabled: usageEnabled,
-    autoQueryInterval,
-  });
 
   // 🆕 定期更新当前时间，用于刷新相对时间显示
   const [now, setNow] = React.useState(Date.now());
@@ -88,13 +64,11 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
     return () => clearInterval(interval);
   }, [lastQueriedAt]);
 
-  // 只在启用用量查询且有数据时显示。后端把瞬时传输失败转成了 reject：有缓存
-  // 成功值时 react-query 保留 data 照常展示；首次查询就失败则 data 为空——
-  // 此时（isError）仍要渲染失败态给出重试入口，否则 footer 整体消失、无从重查。
-  if (!usageEnabled || (!usage && !isError)) return null;
+  // The query owner supplies an explicit failure result so refresh remains available.
+  if (!usage) return null;
 
   // 错误状态（业务失败，或无缓存成功值的 reject）
-  if (!usage || !usage.success) {
+  if (!usage.success) {
     if (inline) {
       return (
         <div className="inline-flex items-center gap-2 text-xs rounded-lg border border-border-default bg-card px-3 py-2 shadow-sm">
@@ -119,7 +93,7 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
         <div className="flex items-center justify-between gap-2 text-xs">
           <div className="flex items-center gap-2 text-red-500 dark:text-red-400">
             <AlertCircle size={14} />
-            <span>{usage?.error || t("usage.queryFailed")}</span>
+            <span>{usage.error || t("usage.queryFailed")}</span>
           </div>
 
           {/* 刷新按钮 */}

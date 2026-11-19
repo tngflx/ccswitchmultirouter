@@ -1030,11 +1030,74 @@ fn apply_min_output_tokens(
     }
 }
 
+/// Normalize the logical Codex aliases before capability mapping. Only the
+/// model/reasoning envelope is copied; prompts and tools are not duplicated.
+/// Explicit Boolean intent must agree with effort, rather than winning or being
+/// silently discarded depending on the selected transport.
+pub(crate) fn normalized_codex_reasoning_request(body: &Value) -> Result<Value, ProxyError> {
+    let normalize = |value: Option<&Value>| -> Result<Option<String>, ProxyError> {
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) if !value.trim().is_empty() => {
+                Ok(Some(value.trim().to_ascii_lowercase()))
+            }
+            _ => Err(ProxyError::TransformError(
+                "Codex reasoning effort must be a nonempty string".to_string(),
+            )),
+        }
+    };
+    let flat = normalize(body.get("reasoning_effort"))?;
+    let nested = normalize(body.pointer("/reasoning/effort"))?;
+    if matches!((&flat, &nested), (Some(flat), Some(nested)) if flat != nested) {
+        return Err(ProxyError::TransformError(
+            "conflicting reasoning_effort and reasoning.effort aliases".to_string(),
+        ));
+    }
+    let effort = nested.or(flat);
+    if let Some(enabled) = body.pointer("/reasoning/enabled") {
+        if !enabled.is_null() && !enabled.is_boolean() {
+            return Err(ProxyError::TransformError(
+                "Codex reasoning.enabled must be a boolean".to_string(),
+            ));
+        }
+    }
+    if let (Some(effort), Some(enabled)) = (
+        effort.as_deref(),
+        body.pointer("/reasoning/enabled").and_then(Value::as_bool),
+    ) {
+        let effort_enabled = !matches!(effort, "none" | "off" | "disabled");
+        if enabled != effort_enabled {
+            return Err(ProxyError::TransformError(
+                "conflicting reasoning.enabled and reasoning effort controls".to_string(),
+            ));
+        }
+    }
+    let mut normalized = json!({});
+    if let Some(model) = body.get("model") {
+        normalized["model"] = model.clone();
+    }
+    if let Some(reasoning) = body.get("reasoning") {
+        normalized["reasoning"] = reasoning.clone();
+    }
+    if let Some(effort) = effort {
+        if normalized.get("reasoning").is_none_or(Value::is_null) {
+            normalized["reasoning"] = json!({});
+        }
+        let reasoning = normalized["reasoning"].as_object_mut().ok_or_else(|| {
+            ProxyError::TransformError("Codex reasoning controls require an object".to_string())
+        })?;
+        reasoning.insert("effort".to_string(), json!(effort));
+    }
+    Ok(normalized)
+}
+
 pub(crate) fn apply_reasoning_options(
     result: &mut Value,
     body: &Value,
     config: Option<&CodexChatReasoningConfig>,
 ) -> Result<(), ProxyError> {
+    let normalized = normalized_codex_reasoning_request(body)?;
+    let body = &normalized;
     let Some(config) = config else {
         // P2：通用 GPT reasoning fallback 已封闭。GPT 模型统一经 resolver 的
         // official 来源（未知平台）或平台推断（聚合平台）解析；config 为 None
@@ -3215,6 +3278,36 @@ pub fn chat_error_to_response_error(body: Option<&Value>) -> Value {
 mod tests {
     use super::*;
     use crate::protocol_compatibility::ReasoningProjection;
+
+    #[test]
+    fn canonical_reasoning_options_normalize_aliases_and_validate_boolean_intent() {
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("none".into()),
+            effort_param: Some("reasoning_effort".into()),
+            effort_value_mode: Some("capability|none,high|none=none,high=high".into()),
+            disable_contract: true,
+            ..Default::default()
+        };
+        for body in [
+            json!({"reasoning_effort":" HIGH "}),
+            json!({"reasoning_effort":" HIGH ", "reasoning":{"effort":"high", "enabled":true}}),
+        ] {
+            let mut result = json!({});
+            apply_reasoning_options(&mut result, &body, Some(&config)).unwrap();
+            assert_eq!(result["reasoning_effort"], "high");
+        }
+        for body in [
+            json!({"reasoning_effort":"none", "reasoning":{"effort":"high"}}),
+            json!({"reasoning":{"effort":"high", "enabled":false}}),
+            json!({"reasoning":{"effort":"none", "enabled":true}}),
+        ] {
+            let mut result = json!({});
+            assert!(apply_reasoning_options(&mut result, &body, Some(&config)).is_err());
+            assert_eq!(result, json!({}));
+        }
+    }
 
     fn projected_chat_response(projection: ReasoningProjection) -> Value {
         chat_completion_to_response_with_context_and_projection(

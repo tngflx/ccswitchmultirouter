@@ -475,7 +475,7 @@ describe("Codex Desktop current numeric-bundle runtime integration", () => {
       expect(otherProvider.efforts()).toEqual(nativeVisibleEfforts);
       expect(harness.state.reasoningQueryCaches?.size).toBe(1);
       expect(harness.state.readCodexModelPickerDiagnostics?.()).toMatchObject({
-        status: "unverified",
+        status: "ready",
       });
       expect(harness.state.appServerClients ?? []).toEqual([]);
       expect(harness.state.appServerPatchInstalled).not.toBe(true);
@@ -886,7 +886,7 @@ describe("Codex Desktop current numeric-bundle runtime integration", () => {
     try {
       await harness.execute();
       expect(harness.state.readCodexModelPickerDiagnostics?.().status).toBe(
-        "unverified",
+        "ready",
       );
       const startedAt = Date.now();
       harness.state.appServerModuleRetryAt = startedAt + 30000;
@@ -1060,11 +1060,12 @@ describe("Codex Desktop current numeric-bundle runtime integration", () => {
         expect(picker.efforts()).toEqual(allEfforts);
         expect(harness.state.readCodexModelPickerDiagnostics?.()).toMatchObject(
           {
-            // A current managed picker without its exact atom cannot be
-            // verified. An empty or remote-only current owner has not observed
-            // a managed picker yet, so it is pending rather than certified by
-            // a historical cache that happens to contain all six efforts.
-            status: boundary === "unknown_atom" ? "unverified" : "pending",
+            // Without the initialized atom there is no native visibility gate
+            // to verify. An empty or remote-only current owner has not observed
+            // a managed picker yet, so it remains pending rather than being
+            // certified by a historical cache that happens to contain all six
+            // efforts.
+            status: boundary === "unknown_atom" ? "ready" : "pending",
           },
         );
         expect(native.get).not.toHaveBeenCalled();
@@ -1283,7 +1284,7 @@ describe("Codex Desktop current numeric-bundle runtime integration", () => {
       second.dispose();
     }
   });
-  it("retains a known native visibility requirement across fingerprint reinjection without reusing stale atom proof when entry scripts disappear", async () => {
+  it("clears a stale native visibility requirement across fingerprint reinjection when entry scripts disappear", async () => {
     const client = new QueryClient();
     const picker = createPicker(client);
     const native = createNativeVisibilityFixture(client, new Set(allEfforts));
@@ -1297,10 +1298,10 @@ describe("Codex Desktop current numeric-bundle runtime integration", () => {
     try {
       await harness.execute();
       expect(picker.efforts()).toEqual(allEfforts);
-      expect(harness.state.nativeReasoningVisibilityRequired).toBe(true);
+      expect(harness.state.nativeReasoningVisibilityRequired).toBe(false);
       expect(harness.state.nativeReasoningVisibilityAtoms).toEqual([]);
       expect(harness.state.readCodexModelPickerDiagnostics?.()).toMatchObject({
-        status: "unverified",
+        status: "ready",
       });
       expect(harness.importModule).not.toHaveBeenCalled();
       expect(native.get).not.toHaveBeenCalled();

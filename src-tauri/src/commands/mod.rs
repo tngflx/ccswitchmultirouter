@@ -90,3 +90,70 @@ pub use workspace::*;
 pub use crate::codex_config_consistency::{
     inspect_codex_config_consistency, resolve_codex_config_consistency,
 };
+
+/// Keep blocking command work (SQLite, filesystem, and native queries) off both
+/// the window thread and the async executor. Reuse the one managed app state.
+pub(crate) async fn run_app_state_blocking<T>(
+    app: &tauri::AppHandle,
+    work: impl FnOnce(&crate::store::AppState) -> Result<T, String> + Send + 'static,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+{
+    use tauri::Manager;
+
+    let app = app.clone();
+    run_command_blocking(move || {
+        let state = app
+            .try_state::<crate::store::AppState>()
+            .ok_or_else(|| "Application state is not initialized".to_string())?;
+        work(state.inner())
+    })
+    .await
+}
+
+async fn run_command_blocking<T>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| format!("Background command failed: {error}"))?
+}
+
+#[cfg(test)]
+mod blocking_command_tests {
+    use super::run_command_blocking;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn blocking_command_runs_on_a_worker_and_preserves_errors() {
+        let caller = std::thread::current().id();
+        let worker = run_command_blocking(|| Ok(std::thread::current().id()))
+            .await
+            .unwrap();
+        assert_ne!(caller, worker);
+
+        let result = run_command_blocking(|| Err::<(), _>("inspection failed".to_string())).await;
+        assert_eq!(result, Err("inspection failed".to_string()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_command_keeps_the_async_executor_schedulable() {
+        let command = run_command_blocking(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            Ok::<_, String>(())
+        });
+        tokio::pin!(command);
+
+        let result = tokio::time::timeout(Duration::from_millis(20), &mut command).await;
+        assert!(
+            result.is_err(),
+            "blocking command completed on the async executor"
+        );
+
+        command.await.unwrap();
+    }
+}

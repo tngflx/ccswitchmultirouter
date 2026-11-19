@@ -6,6 +6,7 @@ pub mod body_filter;
 pub mod cache_injector;
 pub mod circuit_breaker;
 pub(crate) mod codex_error_capture;
+pub(crate) mod codex_reasoning_controls;
 pub(crate) mod codex_router_log;
 pub(crate) mod codex_subagent_reasoning;
 pub(crate) mod codex_traffic_policy;

@@ -62,6 +62,8 @@ interface CodexConfigConsistencyState {
 
 const CODEX_RUNTIME_REFRESH_STALL_TIMEOUT_MS = 30_000;
 const CODEX_RUNTIME_REFRESH_LOG_LIMIT = 200;
+const CODEX_CONFIG_POLL_INTERVAL_MS = 30_000;
+const CODEX_HISTORY_PREFLIGHT_FALLBACK_MS = 5 * 60_000;
 
 function emptyRuntimeRefresh(): CodexRuntimeRefreshWorkflow {
   return {
@@ -84,6 +86,19 @@ function attentionKeyForReport(
     : next.runtimeActivation?.state === "restart_required"
       ? `runtime:${next.runtimeActivation.appServerStartedAt ?? "unknown"}:${next.runtimeActivation.configModifiedAt ?? "unknown"}`
       : null;
+}
+
+function historyEvidenceKey(report: CodexConfigConsistencyReport): string {
+  return JSON.stringify([
+    report.state,
+    report.reason,
+    report.providerId,
+    report.expectedFingerprint,
+    report.actualFingerprint,
+    report.runtimeActivation?.state,
+    report.runtimeActivation?.appServerStartedAt,
+    report.runtimeActivation?.configModifiedAt,
+  ]);
 }
 
 export function useCodexConfigConsistency(): CodexConfigConsistencyState {
@@ -205,6 +220,8 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
   useEffect(() => {
     let active = true;
     let requestPending = false;
+    let lastHistoryPreflight: { evidence: string; completedAt: number } | null =
+      null;
     const inspect = async () => {
       if (runtimeRefreshActiveRef.current) return;
       if (requestPending) return;
@@ -216,9 +233,29 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
         const configNeedsAttention =
           next.state === "external_drift" ||
           next.runtimeActivation?.state === "restart_required";
-        if (configNeedsAttention || runtimeRefreshActiveRef.current) return;
-        const preflight =
-          await codexConfigConsistencyApi.inspectRuntimeRefresh();
+        if (configNeedsAttention) {
+          lastHistoryPreflight = null;
+          return;
+        }
+        if (runtimeRefreshActiveRef.current) return;
+
+        // The full preflight walks Codex history. Reuse cheap config/runtime
+        // evidence to schedule it, but still look for history-only changes.
+        const evidence = historyEvidenceKey(next);
+        if (
+          lastHistoryPreflight?.evidence === evidence &&
+          performance.now() - lastHistoryPreflight.completedAt <
+            CODEX_HISTORY_PREFLIGHT_FALLBACK_MS
+        ) {
+          return;
+        }
+        let preflight: CodexRuntimeRefreshPreflight;
+        try {
+          preflight = await codexConfigConsistencyApi.inspectRuntimeRefresh();
+        } finally {
+          // Failed scans must not restart on every unchanged config poll.
+          lastHistoryPreflight = { evidence, completedAt: performance.now() };
+        }
         if (!active || runtimeRefreshActiveRef.current) return;
         const history = preflight.paginatedHistory;
         // 只有“存在可安全修复项”时才自动弹出状态面板。被保护性跳过
@@ -253,7 +290,10 @@ export function useCodexConfigConsistency(): CodexConfigConsistencyState {
       }
     };
     void inspect();
-    const interval = window.setInterval(() => void inspect(), 30_000);
+    const interval = window.setInterval(
+      () => void inspect(),
+      CODEX_CONFIG_POLL_INTERVAL_MS,
+    );
     return () => {
       active = false;
       window.clearInterval(interval);

@@ -80,6 +80,19 @@ wire_api = "responses"
     });
 
     it.each([
+      ["blank first alias", { base_url: " ", baseURL: endpoint }],
+      ["non-string first alias", { base_url: 42, baseURL: endpoint }],
+      ["blank camel alias", { baseUrl: " ", base_url: endpoint }],
+    ])(
+      "uses the shared first-nonblank URL authority for %s",
+      (_label, settingsConfig) => {
+        expect(readWizardProviderBaseUrl(provider({ settingsConfig }))).toBe(
+          endpoint,
+        );
+      },
+    );
+
+    it.each([
       ["auth.OPENAI_API_KEY", { auth: { OPENAI_API_KEY: secret } }],
       ["apiKey", { apiKey: secret }],
       ["api_key", { api_key: secret }],

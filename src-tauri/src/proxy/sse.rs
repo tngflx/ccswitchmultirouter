@@ -1,3 +1,206 @@
+use bytes::{Buf, Bytes, BytesMut};
+
+// Count wire bytes, including the blank-line delimiter. A stream may deliver
+// arbitrarily many frames, but the decoder never retains more than one frame.
+pub(crate) const MAX_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) enum SseFrame {
+    Complete(Bytes),
+    Oversized,
+}
+
+pub(crate) struct BoundedSseFrames {
+    pending: BytesMut,
+    tail: u32,
+    discarding: bool,
+    limit: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SseOrJsonMode {
+    Unknown,
+    Json,
+    Sse,
+}
+
+pub(crate) enum SseOrJsonItem {
+    Frame(Bytes),
+    Json(Bytes),
+    Oversized,
+}
+
+/// Bounded discriminator for endpoints that accept either an SSE stream or a
+/// non-stream JSON document. Leading whitespace/BOM is retained only until the
+/// first meaningful byte identifies the protocol; JSON is bounded as a whole,
+/// while SSE is decoded one bounded frame at a time.
+pub(crate) struct SseOrJsonFrames {
+    mode: SseOrJsonMode,
+    prefix: BytesMut,
+    sse: BoundedSseFrames,
+    bom_bytes: usize,
+    closed: bool,
+}
+
+impl Default for SseOrJsonFrames {
+    fn default() -> Self {
+        Self {
+            mode: SseOrJsonMode::Unknown,
+            prefix: BytesMut::new(),
+            sse: BoundedSseFrames::default(),
+            bom_bytes: 0,
+            closed: false,
+        }
+    }
+}
+
+impl SseOrJsonFrames {
+    pub(crate) fn read(&mut self, input: &mut &[u8], eof: bool) -> Option<SseOrJsonItem> {
+        const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
+
+        if self.closed {
+            return None;
+        }
+        if self.mode == SseOrJsonMode::Unknown {
+            let mut count = 0;
+            for &byte in input.iter() {
+                if BOM[self.bom_bytes] == byte {
+                    self.bom_bytes = (self.bom_bytes + 1) % BOM.len();
+                } else if self.bom_bytes != 0 || !byte.is_ascii_whitespace() {
+                    self.mode = if self.bom_bytes == 0 && matches!(byte, b'{' | b'[') {
+                        SseOrJsonMode::Json
+                    } else {
+                        SseOrJsonMode::Sse
+                    };
+                    break;
+                }
+                if count == MAX_SSE_FRAME_BYTES - self.prefix.len() {
+                    return self.oversized();
+                }
+                count += 1;
+            }
+            self.prefix.extend_from_slice(&input[..count]);
+            *input = &input[count..];
+        }
+
+        match self.mode {
+            SseOrJsonMode::Unknown => {
+                self.closed = eof;
+                None
+            }
+            SseOrJsonMode::Json => {
+                if input.len() > MAX_SSE_FRAME_BYTES - self.prefix.len() {
+                    return self.oversized();
+                }
+                self.prefix.extend_from_slice(input);
+                *input = &[];
+                self.closed = eof;
+                eof.then(|| SseOrJsonItem::Json(std::mem::take(&mut self.prefix).freeze()))
+            }
+            SseOrJsonMode::Sse => {
+                if !self.prefix.is_empty() {
+                    let mut prefix = self.prefix.as_ref();
+                    let original_len = prefix.len();
+                    let frame = self.sse.read(&mut prefix);
+                    let consumed = original_len - prefix.len();
+                    self.prefix.advance(consumed);
+                    if self.prefix.is_empty() {
+                        self.prefix = BytesMut::new();
+                    }
+                    if let Some(frame) = frame {
+                        return self.classify_frame(frame);
+                    }
+                }
+                if let Some(frame) = self.sse.read(input) {
+                    return self.classify_frame(frame);
+                }
+                if eof {
+                    self.closed = true;
+                    let pending = self.sse.take_pending();
+                    if !pending.is_empty() {
+                        return Some(SseOrJsonItem::Frame(pending));
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn classify_frame(&mut self, frame: SseFrame) -> Option<SseOrJsonItem> {
+        match frame {
+            SseFrame::Complete(frame) => Some(SseOrJsonItem::Frame(frame)),
+            SseFrame::Oversized => self.oversized(),
+        }
+    }
+
+    fn oversized(&mut self) -> Option<SseOrJsonItem> {
+        self.closed = true;
+        self.prefix = BytesMut::new();
+        Some(SseOrJsonItem::Oversized)
+    }
+}
+
+impl Default for BoundedSseFrames {
+    fn default() -> Self {
+        Self::new(MAX_SSE_FRAME_BYTES)
+    }
+}
+
+impl BoundedSseFrames {
+    fn new(limit: usize) -> Self {
+        Self {
+            pending: BytesMut::new(),
+            tail: 0,
+            discarding: false,
+            limit,
+        }
+    }
+
+    /// Advance through the chunk at most once. After reporting an oversized
+    /// frame, discard until a blank line, never treating the suffix as an event.
+    pub(crate) fn read(&mut self, input: &mut &[u8]) -> Option<SseFrame> {
+        let bytes = *input;
+        let mut start = 0;
+        for (index, &byte) in bytes.iter().enumerate() {
+            self.tail = (self.tail << 8) | u32::from(byte);
+            let end_of_frame = self.tail & 0xffff == 0x0a0a || self.tail == 0x0d0a0d0a;
+            if self.discarding {
+                if end_of_frame {
+                    self.tail = 0;
+                    self.discarding = false;
+                    start = index + 1;
+                }
+                continue;
+            }
+
+            if index - start == self.limit - self.pending.len() {
+                self.pending = BytesMut::new();
+                self.discarding = !end_of_frame;
+                if end_of_frame {
+                    self.tail = 0;
+                }
+                *input = &bytes[index + 1..];
+                return Some(SseFrame::Oversized);
+            }
+
+            if end_of_frame {
+                self.pending.extend_from_slice(&bytes[start..=index]);
+                self.tail = 0;
+                *input = &bytes[index + 1..];
+                return Some(SseFrame::Complete(self.take_pending()));
+            }
+        }
+        if !self.discarding {
+            self.pending.extend_from_slice(&bytes[start..]);
+        }
+        *input = &[];
+        None
+    }
+
+    pub(crate) fn take_pending(&mut self) -> Bytes {
+        std::mem::take(&mut self.pending).freeze()
+    }
+}
+
 #[inline]
 pub(crate) fn strip_sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
     line.strip_prefix(&format!("{field}: "))
@@ -87,7 +290,87 @@ pub(crate) fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, new
 
 #[cfg(test)]
 mod tests {
-    use super::{append_utf8_safe, strip_sse_field, take_sse_block};
+    use super::{
+        append_utf8_safe, strip_sse_field, take_sse_block, BoundedSseFrames, SseFrame,
+        SseOrJsonFrames, SseOrJsonItem,
+    };
+
+    #[test]
+    fn hybrid_reader_keeps_pretty_json_bounded_and_emits_only_at_eof() {
+        let mut reader = SseOrJsonFrames::default();
+        for bytes in [&b" \n\xEF"[..], &b"\xBB"[..], &b"\xBF{\"ok\":\n\n"[..]] {
+            let mut input = bytes;
+            assert!(reader.read(&mut input, false).is_none());
+            assert!(input.is_empty());
+        }
+        let mut input = &b"true}"[..];
+        assert!(
+            matches!(reader.read(&mut input, true), Some(SseOrJsonItem::Json(body)) if body.as_ref() == b" \n\xEF\xBB\xBF{\"ok\":\n\ntrue}")
+        );
+
+        let mut oversized = SseOrJsonFrames::default();
+        let bytes = vec![b'{'; super::MAX_SSE_FRAME_BYTES + 1];
+        let mut input = bytes.as_slice();
+        assert!(matches!(
+            oversized.read(&mut input, false),
+            Some(SseOrJsonItem::Oversized)
+        ));
+        assert_eq!(oversized.prefix.capacity(), 0);
+        assert!(oversized.read(&mut input, false).is_none());
+    }
+
+    #[test]
+    fn hybrid_reader_preserves_sse_frames_and_eof_residual() {
+        let mut reader = SseOrJsonFrames::default();
+        let mut input = &b"event: done\ndata: {}\n\ndata: final"[..];
+        assert!(
+            matches!(reader.read(&mut input, false), Some(SseOrJsonItem::Frame(frame)) if frame.ends_with(b"\n\n"))
+        );
+        assert_eq!(input, b"data: final");
+        assert!(
+            matches!(reader.read(&mut input, true), Some(SseOrJsonItem::Frame(frame)) if frame.as_ref() == b"data: final")
+        );
+        assert!(reader.read(&mut input, true).is_none());
+    }
+
+    #[test]
+    fn bounded_sse_frames_discard_until_real_boundary_without_retaining_bytes() {
+        let mut frames = BoundedSseFrames::new(10);
+        let mut input = &b"1234567890"[..];
+        assert!(frames.read(&mut input).is_none());
+        assert_eq!(frames.pending.len(), 10);
+
+        let oversized = [b'x'; 1024];
+        let mut input = &oversized[..];
+        assert!(matches!(frames.read(&mut input), Some(SseFrame::Oversized)));
+        assert!(frames.read(&mut input).is_none());
+        assert_eq!(frames.pending.capacity(), 0);
+
+        // This apparent event is still part of the oversized frame.
+        let mut input = &b"\ndata:fake\r\n\r"[..];
+        assert!(frames.read(&mut input).is_none());
+        assert_eq!(frames.pending.capacity(), 0);
+
+        // Consume the rest of the split CRLF boundary, then a complete event
+        // occupying exactly the configured limit (including the delimiter).
+        let mut input = &b"\ndata:yes\n\n"[..];
+        let Some(SseFrame::Complete(frame)) = frames.read(&mut input) else {
+            panic!("expected the next complete event");
+        };
+        assert_eq!(frame.as_ref(), b"data:yes\n\n");
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn delimiter_on_first_over_limit_byte_resumes_at_next_event() {
+        let mut frames = BoundedSseFrames::new(6);
+        let mut input = &b"abcde\n\na\n\n"[..];
+        assert!(matches!(frames.read(&mut input), Some(SseFrame::Oversized)));
+        let Some(SseFrame::Complete(frame)) = frames.read(&mut input) else {
+            panic!("expected a frame after the completed oversized frame");
+        };
+        assert_eq!(frame.as_ref(), b"a\n\n");
+    }
 
     #[test]
     fn strip_sse_field_accepts_optional_space() {

@@ -41,7 +41,8 @@
       "booleanControlUnverified": "尚未驗證所有開關式推理模型的原生開關控制項"
     },
     "booleanUnverifiedCount": "開關式推理控制項未驗證：{{count}}",
-    "booleanReadyCount": "開關式推理控制項已驗證：{{count}}"
+    "booleanReadyCount": "開關式推理控制項已驗證：{{count}}",
+    "booleanNotObservedCount": "開關式推理控制項尚未觀測：{{count}}"
   },
   "codexSubagentGovernance": {
     "title": "行為指引與執行權限",
@@ -56,6 +57,7 @@
     "globalLabel": "所有子代理推理強度",
     "globalProfileOption": "使用設定檔設定（關閉覆寫）",
     "globalLegacyOption": "已儲存的舊推理檔位（已保留）：{{effort}}",
+    "globalInvalidOption": "儲存的推理檔位無效",
     "globalHighOption": "High（高）",
     "globalMaxOption": "Max（最高）",
     "globalHint": "同時適用於 V1 和 V2，且只覆寫支援所選強度的模型。可用覆寫僅為 Max 或 High。已儲存的設定檔選擇和主代理保持不變；不支援的模型繼續使用自身推理策略。選擇「使用設定檔設定」即可還原原設定。",
@@ -1277,7 +1279,7 @@
       "unavailable": "已啟用 · 無法使用",
       "off": "已關閉",
       "setup": "私人網站設定",
-      "privateNetwork": "先在本機與你的平板/筆電設定私人 HTTPS 存取（例如 Tailscale Serve）。僅監聽回環位址；請勿轉送此連接埠，也不要公開模型 API 或 CDP。",
+      "privateNetwork": "使用 Tailscale 建立私人連線，網站仍由您自己的電腦提供。平板或筆記型電腦需要 Tailscale 和瀏覽器；Cloudflare 僅可選用於網域管理，不經過其代理傳輸內容。",
       "origin": "精確的 HTTPS 網站來源",
       "security": "透過通行密鑰與可撤銷的瀏覽器工作階段保護存取。此功能不會核准 Codex 工具/沙箱提示，也不會繞過帳戶用量限制。",
       "enable": "啟用擁有者遠端存取",
@@ -1294,7 +1296,19 @@
       "retryStatus": "重試讀取狀態",
       "setupRequired": "請先在下方設定私人 HTTPS 網站，再開啟遠端存取。",
       "retryListener": "重試啟動監聽",
-      "originPinned": "此部署已綁定目前的 HTTPS 網站。變更位址需要另行明確重設並重新註冊瀏覽器，無法在此處直接修改。"
+      "originPinned": "此部署已綁定目前的 HTTPS 網站。變更位址需要另行明確重設並重新註冊瀏覽器，無法在此處直接修改。",
+      "tailscaleSteps": "Tailscale 私人連線設定步驟",
+      "setupStepDevices": "離開前，在此主機和平板或筆記型電腦上安裝並登入 Tailscale。保持主機上線；CCSwitch 和相容的 Codex 工作階段也必須可用。",
+      "setupStepAccess": "限制 tailnet 規則，只允許您授權的裝置存取此主機的 HTTPS 連接埠（443）。不要公開監聽連接埠、模型 API 或除錯連接埠；此私人方案不使用 Funnel。",
+      "setupStepServe": "在主機上設定 Tailscale Serve，將私人 HTTPS 轉送至本機擁有者監聽服務：",
+      "setupStepOrigin": "將 Serve 提供的完整 HTTPS 來源位址（通常為 .ts.net 主機名稱）複製到下方，再啟用擁有者存取。Tailscale 為該主機名稱提供 HTTPS；本機監聽運作不代表遠端存取已驗證。",
+      "setupStepEnroll": "建立一次性註冊連結，在 60 秒內以自己的平板或筆記型電腦開啟並註冊通行金鑰。之後開啟網站書籤、選擇對話，並在符合條件時使用繼續；每次操作不需主機端核准。",
+      "cloudflareOptional": "選用：僅使用 Cloudflare 管理網域",
+      "cloudflareDnsOnly": ".ts.net 網站不需要設定 Cloudflare。如果使用由 Cloudflare 管理的自訂網域，請將記錄設為僅 DNS（不要啟用橘雲代理），讓 HTTPS 服務僅透過 Tailscale 私網存取，且不要為此路徑加入 Cloudflare Tunnel 或 Access。",
+      "cloudflareCertificate": "指向 Tailscale 主機名稱的 CNAME 不會為自訂主機名稱提供憑證。自訂網域需要獨立的私網 HTTPS 代理，以及透過 DNS-01 驗證簽發的憑證。請在註冊裝置前決定最終來源；變更已固定的來源需要明確重設並重新註冊。",
+      "cloudflareNoSecrets": "CCSwitch 不需要 Cloudflare API 權杖或網域憑證。不要將其填入此表單、連線連結或記錄。網域管理不會託管或鏡像 Codex 網站。",
+      "openWebsite": "開啟擁有者網站",
+      "listenerOnly": "監聽服務正在本機運作。這不代表 Tailscale、平板連線、Codex 橋接或所選對話已就緒。開啟網站不會提交繼續操作。"
     },
     "tabConnectionsRecovery": "連線與復原",
     "connectionsShortcutTitle": "遠端連線與崩潰復原",
@@ -4827,6 +4841,17 @@
       "image_generation": "圖像生成",
       "context_compaction": "上下文壓縮",
       "unsupported": "不受支援的內容"
+    },
+    "failure": {
+      "server_overloaded": "伺服器過載",
+      "usage_limit": "暫時使用限制",
+      "rate_limit": "速率限制",
+      "internal_server_error": "伺服器內部錯誤",
+      "authentication_error": "驗證錯誤",
+      "context_length_exceeded": "超出上下文視窗",
+      "invalid_request_error": "無效請求",
+      "connection_error": "連線錯誤",
+      "unknown": "未知錯誤"
     },
     "operation": {
       "pending": "Continue 正在等待處理。後續僅進行唯讀狀態檢查。",

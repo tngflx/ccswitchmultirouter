@@ -82,6 +82,24 @@ describe("provider background-refresh ownership", () => {
     });
   });
 
+  it("uses the router-specific compare-and-set command for Model order writes", async () => {
+    invokeMock.mockResolvedValueOnce(true);
+    const next = {
+      ...provider,
+      settingsConfig: {
+        ...provider.settingsConfig,
+        codexRouting: { schemaVersion: 2, routes: [] },
+      },
+    };
+    await expect(
+      providersApi.updateCodexRouterIfUnchanged(next, provider),
+    ).resolves.toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "update_codex_router_if_unchanged",
+      { provider: next, expectedProvider: provider },
+    );
+  });
+
   it("leaves the ordinary manual update IPC contract unchanged", async () => {
     invokeMock.mockResolvedValueOnce(true);
     await providersApi.update(provider, "codex");

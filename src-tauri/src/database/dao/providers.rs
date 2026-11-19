@@ -58,6 +58,21 @@ type OmoProviderRow = (
     String,
 );
 
+struct ProviderListRow {
+    id: String,
+    name: String,
+    settings_config: String,
+    website_url: Option<String>,
+    category: Option<String>,
+    created_at: Option<i64>,
+    sort_index: Option<usize>,
+    notes: Option<String>,
+    icon: Option<String>,
+    icon_color: Option<String>,
+    meta: String,
+    in_failover_queue: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderSetDatabaseMutation {
     pub app_type: String,
@@ -303,91 +318,110 @@ impl Database {
         &self,
         app_type: &str,
     ) -> Result<IndexMap<String, Provider>, AppError> {
-        let conn = lock_conn!(self.conn);
-        let mut stmt = conn.prepare(
-            "SELECT id, name, settings_config, website_url, category, created_at, sort_index, notes, icon, icon_color, meta, in_failover_queue
-             FROM providers WHERE app_type = ?1
-             ORDER BY COALESCE(sort_index, 999999), created_at ASC, id ASC"
-        ).map_err(|e| AppError::Database(e.to_string()))?;
+        let read_error = |e: rusqlite::Error| AppError::Database(e.to_string());
+        // Copy the raw rows under the shared connection lock; catalog parsing can be expensive.
+        let (provider_rows, endpoint_rows) = {
+            let mut conn = lock_conn!(self.conn);
+            let tx = conn.transaction().map_err(read_error)?;
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, name, settings_config, website_url, category, created_at, sort_index,
+                            notes, icon, icon_color, meta, in_failover_queue
+                     FROM providers WHERE app_type = ?1
+                     ORDER BY COALESCE(sort_index, 999999), created_at ASC, id ASC",
+                )
+                .map_err(read_error)?;
+            let provider_rows = stmt
+                .query_map(params![app_type], |row| {
+                    Ok(ProviderListRow {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        settings_config: row.get(2)?,
+                        website_url: row.get(3)?,
+                        category: row.get(4)?,
+                        created_at: row.get(5)?,
+                        sort_index: row.get(6)?,
+                        notes: row.get(7)?,
+                        icon: row.get(8)?,
+                        icon_color: row.get(9)?,
+                        meta: row.get(10)?,
+                        in_failover_queue: row.get(11)?,
+                    })
+                })
+                .map_err(read_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(read_error)?;
+            drop(stmt);
+            if provider_rows.is_empty() {
+                return Ok(IndexMap::new());
+            }
 
-        let provider_iter = stmt
-            .query_map(params![app_type], |row| {
-                let id: String = row.get(0)?;
-                let name: String = row.get(1)?;
-                let settings_config_str: String = row.get(2)?;
-                let website_url: Option<String> = row.get(3)?;
-                let category: Option<String> = row.get(4)?;
-                let created_at: Option<i64> = row.get(5)?;
-                let sort_index: Option<usize> = row.get(6)?;
-                let notes: Option<String> = row.get(7)?;
-                let icon: Option<String> = row.get(8)?;
-                let icon_color: Option<String> = row.get(9)?;
-                let meta_str: String = row.get(10)?;
-                let in_failover_queue: bool = row.get(11)?;
-
-                let settings_config =
-                    parse_provider_settings_config_for_app(app_type, &settings_config_str);
-                let meta: ProviderMeta = serde_json::from_str(&meta_str).unwrap_or_default();
-
-                Ok((
-                    id,
-                    Provider {
-                        id: "".to_string(), // Placeholder, set below
-                        name,
-                        settings_config,
-                        website_url,
-                        category,
-                        created_at,
-                        sort_index,
-                        notes,
-                        meta: Some(meta),
-                        icon,
-                        icon_color,
-                        in_failover_queue,
-                    },
-                ))
-            })
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let mut providers = IndexMap::new();
-        for provider_res in provider_iter {
-            let (id, mut provider) = provider_res.map_err(|e| AppError::Database(e.to_string()))?;
-            provider.id = id.clone();
-
-            let mut stmt_endpoints = conn.prepare(
-                "SELECT url, added_at FROM provider_endpoints WHERE provider_id = ?1 AND app_type = ?2 ORDER BY added_at ASC, url ASC"
-            ).map_err(|e| AppError::Database(e.to_string()))?;
-
-            let endpoints_iter = stmt_endpoints
-                .query_map(params![id, app_type], |row| {
-                    let url: String = row.get(0)?;
-                    let added_at: Option<i64> = row.get(1)?;
+            let mut endpoint_stmt = tx
+                .prepare(
+                    "SELECT e.provider_id, e.url, e.added_at
+                     FROM provider_endpoints e
+                     JOIN providers p ON p.id = e.provider_id AND p.app_type = e.app_type
+                     WHERE e.app_type = ?1
+                     ORDER BY e.added_at ASC, e.url ASC",
+                )
+                .map_err(read_error)?;
+            let endpoint_rows = endpoint_stmt
+                .query_map(params![app_type], |row| {
                     Ok((
-                        url,
-                        crate::settings::CustomEndpoint {
-                            url: "".to_string(),
-                            added_at: added_at.unwrap_or(0),
-                            last_used: None,
-                        },
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
                     ))
                 })
-                .map_err(|e| AppError::Database(e.to_string()))?;
+                .map_err(read_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(read_error)?;
+            drop(endpoint_stmt);
+            tx.commit().map_err(read_error)?;
+            (provider_rows, endpoint_rows)
+        };
 
-            let mut custom_endpoints = HashMap::new();
-            for ep_res in endpoints_iter {
-                let (url, mut ep) = ep_res.map_err(|e| AppError::Database(e.to_string()))?;
-                ep.url = url.clone();
-                custom_endpoints.insert(url, ep);
-            }
-
-            if let Some(meta) = &mut provider.meta {
-                meta.custom_endpoints = custom_endpoints;
-            }
-
-            providers.insert(id, provider);
+        let mut endpoints_by_provider = HashMap::<_, HashMap<_, _>>::new();
+        for (provider_id, url, added_at) in endpoint_rows {
+            endpoints_by_provider
+                .entry(provider_id)
+                .or_default()
+                .insert(
+                    url.clone(),
+                    crate::settings::CustomEndpoint {
+                        url,
+                        added_at: added_at.unwrap_or(0),
+                        last_used: None,
+                    },
+                );
         }
 
-        Ok(providers)
+        Ok(provider_rows
+            .into_iter()
+            .map(|row| {
+                let settings_config =
+                    parse_provider_settings_config_for_app(app_type, &row.settings_config);
+                let mut meta: ProviderMeta = serde_json::from_str(&row.meta).unwrap_or_default();
+                meta.custom_endpoints = endpoints_by_provider.remove(&row.id).unwrap_or_default();
+                (
+                    row.id.clone(),
+                    Provider {
+                        id: row.id,
+                        name: row.name,
+                        settings_config,
+                        website_url: row.website_url,
+                        category: row.category,
+                        created_at: row.created_at,
+                        sort_index: row.sort_index,
+                        notes: row.notes,
+                        icon: row.icon,
+                        icon_color: row.icon_color,
+                        meta: Some(meta),
+                        in_failover_queue: row.in_failover_queue,
+                    },
+                )
+            })
+            .collect())
     }
 
     pub fn get_current_provider(&self, app_type: &str) -> Result<Option<String>, AppError> {
@@ -1337,6 +1371,93 @@ mod tests {
     };
     use crate::provider::UniversalProvider;
     use serde_json::json;
+
+    #[test]
+    fn list_providers_reads_endpoints_in_one_app_scoped_query() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let db = Database::memory().expect("memory db");
+        let mut later = provider("shared-id", "later");
+        later.sort_index = Some(2);
+        let mut first = provider("first", "first");
+        first.sort_index = Some(1);
+        db.save_provider("codex", &later).unwrap();
+        db.save_provider("codex", &first).unwrap();
+        db.save_provider("claude", &later).unwrap();
+
+        let select_count = Arc::new(AtomicUsize::new(0));
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE providers SET meta = ?1 WHERE id = ?2 AND app_type = 'codex'",
+                params![
+                    json!({"custom_endpoints": {"https://stale.example": {
+                        "url": "https://stale.example", "addedAt": 5
+                    }}})
+                    .to_string(),
+                    first.id,
+                ],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+            for (app_type, id, url, added_at) in [
+                ("codex", "shared-id", "https://codex.example", None),
+                ("codex", "shared-id", "https://duplicate.example", Some(1)),
+                ("codex", "shared-id", "https://duplicate.example", Some(2)),
+                ("claude", "shared-id", "https://claude.example", Some(3)),
+            ] {
+                conn.execute(
+                    "INSERT INTO provider_endpoints (app_type, provider_id, url, added_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![app_type, id, url, added_at],
+                )
+                .unwrap();
+            }
+            // Historical orphan rows must not enter the snapshot or break other providers.
+            conn.execute(
+                "INSERT INTO provider_endpoints (app_type, provider_id, url, added_at)
+                 VALUES ('codex', 'deleted', 'https://orphan.example', 'invalid')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+            let select_count = Arc::clone(&select_count);
+            conn.authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(context.action, AuthAction::Select) {
+                    select_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Authorization::Allow
+            }));
+        }
+
+        let providers = db.get_all_providers("codex").unwrap();
+        assert_eq!(select_count.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            providers.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["first", "shared-id"]
+        );
+        assert!(providers["first"]
+            .meta
+            .as_ref()
+            .unwrap()
+            .custom_endpoints
+            .is_empty());
+        let endpoints = &providers["shared-id"]
+            .meta
+            .as_ref()
+            .unwrap()
+            .custom_endpoints;
+        assert_eq!(endpoints.len(), 2);
+        let codex_endpoint = &endpoints["https://codex.example"];
+        assert_eq!(codex_endpoint.url, "https://codex.example");
+        assert_eq!(codex_endpoint.added_at, 0);
+        assert!(codex_endpoint.last_used.is_none());
+        assert_eq!(endpoints["https://duplicate.example"].added_at, 2);
+    }
 
     #[test]
     fn save_provider_strips_v2_route_inherited_fields_at_the_shared_transaction_boundary() {

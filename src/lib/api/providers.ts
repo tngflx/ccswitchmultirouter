@@ -339,6 +339,21 @@ export const providersApi = {
     });
   },
 
+  /**
+   * Persist a user-owned Codex MultiRouter edit with a compare-and-set
+   * precondition. This is deliberately separate from `update`, whose guarded
+   * variant is reserved for background model-source refreshes.
+   */
+  async updateCodexRouterIfUnchanged(
+    provider: Provider,
+    expectedProvider: Provider,
+  ): Promise<boolean> {
+    return await invoke("update_codex_router_if_unchanged", {
+      provider,
+      expectedProvider,
+    });
+  },
+
   async getTeProviderDescriptor(
     providerId: string,
   ): Promise<TeStaticProviderDescriptor | null> {

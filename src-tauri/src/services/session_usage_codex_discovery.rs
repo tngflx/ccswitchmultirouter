@@ -60,51 +60,48 @@ impl CodexDiscoveryState {
     /// and periodic repair passes walk all roots; normal passes inspect known
     /// files and only the current/previous active date directories.
     pub fn discover_at(&mut self, now: i64) -> Result<CodexDiscoveryBatch, AppError> {
+        self.discover_with_known_path_probe(now, |path| {
+            fs::canonicalize(path).ok().filter(|path| path.is_file())
+        })
+    }
+
+    fn discover_with_known_path_probe(
+        &mut self,
+        now: i64,
+        mut probe_known_path: impl FnMut(&Path) -> Option<PathBuf>,
+    ) -> Result<CodexDiscoveryBatch, AppError> {
         let full_scan = self
             .next_full_scan_at
             .is_none_or(|deadline| now >= deadline);
         let mut candidates = BTreeSet::new();
+        let mut roots = Vec::with_capacity(self.roots.len());
 
         for root in &self.roots {
             let root_path = canonical_existing_directory(&root.path)?;
             let found = if full_scan {
                 collect_jsonl_recursive(&root_path)?
             } else {
-                self.collect_bounded_candidates(root.kind, &root_path, now)?
+                self.collect_bounded_candidates(root.kind, &root_path, now, &mut probe_known_path)?
             };
-            for path in found {
-                candidates.insert(path);
-            }
+            candidates.extend(found);
+            roots.push((root.kind, root_path));
         }
 
-        if full_scan {
-            self.known_paths.clear();
-            for root in &self.roots {
-                let root_path = canonical_existing_directory(&root.path)?;
+        // The candidates already passed the existence and containment checks.
+        // Reuse them for the next pass, including candidates in overlapping roots.
+        self.known_paths = roots
+            .iter()
+            .map(|(kind, root_path)| {
                 let paths = candidates
                     .iter()
-                    .filter(|path| is_path_within_root(path, &root_path))
+                    .filter(|path| is_path_within_root(path, root_path))
                     .cloned()
                     .collect();
-                self.known_paths.insert(root.kind, paths);
-            }
+                (*kind, paths)
+            })
+            .collect();
+        if full_scan {
             self.next_full_scan_at = Some(now.saturating_add(self.full_rescan_secs));
-        } else {
-            for root in &self.roots {
-                let root_path = canonical_existing_directory(&root.path)?;
-                let known = self.known_paths.entry(root.kind).or_default();
-                *known = known
-                    .iter()
-                    .filter_map(|path| fs::canonicalize(path).ok())
-                    .filter(|path| path.is_file() && is_path_within_root(path, &root_path))
-                    .collect();
-                known.extend(
-                    candidates
-                        .iter()
-                        .filter(|path| is_path_within_root(path, &root_path))
-                        .cloned(),
-                );
-            }
         }
 
         Ok(CodexDiscoveryBatch {
@@ -118,14 +115,15 @@ impl CodexDiscoveryState {
         kind: CodexDiscoveryRootKind,
         root: &Path,
         now: i64,
+        probe_known_path: &mut impl FnMut(&Path) -> Option<PathBuf>,
     ) -> Result<BTreeSet<PathBuf>, AppError> {
         let mut paths: BTreeSet<PathBuf> = self
             .known_paths
             .get(&kind)
             .into_iter()
             .flatten()
-            .filter_map(|path| fs::canonicalize(path).ok())
-            .filter(|path| path.is_file() && is_path_within_root(path, root))
+            .filter_map(|path| probe_known_path(path))
+            .filter(|path| is_path_within_root(path, root))
             .collect();
 
         // Active rollouts are date partitioned; a shallow recent-date walk
@@ -141,7 +139,8 @@ impl CodexDiscoveryState {
                     .join(format!("{:02}", day.day()));
                 if let Ok(canonical_recent) = fs::canonicalize(&recent) {
                     if canonical_recent.is_dir() && is_path_within_root(&canonical_recent, root) {
-                        paths.extend(collect_jsonl_shallow(&canonical_recent, root)?);
+                        let new_paths = collect_jsonl_shallow(&canonical_recent, root, &paths)?;
+                        paths.extend(new_paths);
                     }
                 }
             }
@@ -166,7 +165,11 @@ fn is_path_within_root(path: &Path, root: &Path) -> bool {
     path.strip_prefix(root).is_ok()
 }
 
-fn collect_jsonl_shallow(dir: &Path, root: &Path) -> Result<BTreeSet<PathBuf>, AppError> {
+fn collect_jsonl_shallow(
+    dir: &Path,
+    root: &Path,
+    known_paths: &BTreeSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>, AppError> {
     let mut paths = BTreeSet::new();
     let entries = fs::read_dir(dir)
         .map_err(|error| AppError::Config(format!("读取 Codex 会话目录失败: {error}")))?;
@@ -174,7 +177,7 @@ fn collect_jsonl_shallow(dir: &Path, root: &Path) -> Result<BTreeSet<PathBuf>, A
         let path = entry
             .map_err(|error| AppError::Config(format!("读取 Codex 会话目录项失败: {error}")))?
             .path();
-        if path.is_file() && is_jsonl(&path) {
+        if is_jsonl(&path) && !known_paths.contains(&path) && path.is_file() {
             if let Ok(canonical) = fs::canonicalize(&path) {
                 if is_path_within_root(&canonical, root) {
                     paths.insert(canonical);
@@ -318,6 +321,40 @@ mod tests {
             .iter()
             .any(|path| path.ends_with("late.jsonl")));
         fs::remove_dir_all(root).expect("cleanup fixture");
+    }
+
+    #[test]
+    fn bounded_discovery_probes_each_known_path_once_and_drops_missing_files() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let active = root.path().join("sessions");
+        let kept = active.join("2020/01/01/kept.jsonl");
+        let removed = active.join("2020/01/01/removed.jsonl");
+        write_fixture(&kept);
+        write_fixture(&removed);
+        let kept = fs::canonicalize(kept).expect("canonical kept path");
+        let removed = fs::canonicalize(removed).expect("canonical removed path");
+        let mut state = CodexDiscoveryState::new(vec![CodexDiscoveryRoot {
+            kind: CodexDiscoveryRootKind::Sessions,
+            path: active,
+        }]);
+        state.discover_at(1_700_000_000).expect("bootstrap");
+        fs::remove_file(&removed).expect("remove fixture");
+
+        let mut probes = Vec::new();
+        let tick = state
+            .discover_with_known_path_probe(1_700_000_060, |path| {
+                probes.push(path.to_owned());
+                fs::canonicalize(path).ok().filter(|path| path.is_file())
+            })
+            .expect("bounded tick");
+
+        assert!(!tick.full_scan);
+        assert_eq!(tick.paths, [kept.clone()]);
+        assert_eq!(probes, [kept.clone(), removed]);
+        assert_eq!(
+            state.discover_at(1_700_000_120).expect("next tick").paths,
+            [kept]
+        );
     }
 
     #[test]

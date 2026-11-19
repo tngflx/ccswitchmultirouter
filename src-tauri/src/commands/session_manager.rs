@@ -10,17 +10,37 @@ pub struct PiCurrentState {
 }
 
 #[tauri::command]
-pub fn get_pi_current_state() -> Result<PiCurrentState, String> {
-    let store = crate::pi_config::PiModelsStore::new(
-        crate::pi_config::get_pi_models_path().map_err(|error| error.to_string())?,
-    );
-    let snapshot = store.read_snapshot().map_err(|error| error.to_string())?;
-    let defaults =
-        crate::pi_config::read_pi_native_defaults().map_err(|error| error.to_string())?;
-    Ok(PiCurrentState {
-        enabled_provider_ids: snapshot.providers.keys().cloned().collect(),
-        default_provider_id: defaults.default_provider,
+pub async fn get_pi_current_state() -> Result<PiCurrentState, String> {
+    super::run_command_blocking(|| {
+        let store = crate::pi_config::PiModelsStore::new(
+            crate::pi_config::get_pi_models_path().map_err(|error| error.to_string())?,
+        );
+        let snapshot = store.read_snapshot().map_err(|error| error.to_string())?;
+        let defaults =
+            crate::pi_config::read_pi_native_defaults().map_err(|error| error.to_string())?;
+        Ok(PiCurrentState {
+            enabled_provider_ids: snapshot.providers.keys().cloned().collect(),
+            default_provider_id: defaults.default_provider,
+        })
     })
+    .await
+}
+
+#[cfg(test)]
+mod read_dispatch_tests {
+    use super::get_pi_current_state;
+    use std::future::Future;
+
+    fn assert_async_command<T, F>(_: impl FnOnce() -> F)
+    where
+        F: Future<Output = Result<T, String>> + Send,
+    {
+    }
+
+    #[test]
+    fn provider_page_reads_use_async_dispatch() {
+        assert_async_command(get_pi_current_state);
+    }
 }
 
 #[tauri::command]

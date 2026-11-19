@@ -531,6 +531,14 @@ impl Database {
 
     /// Periodic backup: create a new backup if the latest one is older than the configured interval
     pub(crate) fn periodic_backup_if_needed(&self) -> Result<(), AppError> {
+        let backup_result = self.create_periodic_backup_if_due();
+        // A backup failure must not prevent retention of unrelated operational logs.
+        // Keep the backup error as the primary result if both steps fail.
+        let maintenance_result = self.run_periodic_database_maintenance();
+        backup_result.and(maintenance_result)
+    }
+
+    fn create_periodic_backup_if_due(&self) -> Result<(), AppError> {
         let interval_hours = crate::settings::effective_backup_interval_hours();
         if interval_hours > 0 {
             let backup_file_guard = lock_backup_file_operations()?;
@@ -563,8 +571,10 @@ impl Database {
                 }
             }
         }
+        Ok(())
+    }
 
-        // Periodic maintenance is always enabled, regardless of auto-backup settings.
+    fn run_periodic_database_maintenance(&self) -> Result<(), AppError> {
         let mut reclaimed_rows = 0u64;
         match self.cleanup_old_stream_check_logs(7) {
             Ok(deleted) => {
@@ -1513,10 +1523,14 @@ mod tests {
 
     impl SettingsGuard {
         fn with_backup_retain_count(retain: u32) -> Self {
+            Self::with_settings(|settings| settings.backup_retain_count = Some(retain))
+        }
+
+        fn with_settings(configure: impl FnOnce(&mut AppSettings)) -> Self {
             let previous = get_settings();
             let mut next = previous.clone();
-            next.backup_retain_count = Some(retain);
-            update_settings(next).expect("set backup retention for test");
+            configure(&mut next);
+            update_settings(next).expect("set backup options for test");
             Self { previous }
         }
     }
@@ -1854,12 +1868,16 @@ mod tests {
 
     #[test]
     #[serial]
-    fn upstream_backup_atomic_failed_publish_leaves_no_files() -> Result<(), AppError> {
+    fn upstream_backup_atomic_failed_publish_preserves_existing_backups() -> Result<(), AppError> {
         let _test_home = TestHomeGuard::new();
-        let _settings = SettingsGuard::with_backup_retain_count(10);
+        let _settings = SettingsGuard::with_backup_retain_count(1);
         let db = Database::init()?;
         let backup_dir = crate::config::get_app_config_dir().join("backups");
-        std::fs::create_dir_all(&backup_dir).map_err(|e| AppError::io(&backup_dir, e))?;
+        let existing_backup = db.backup_database_file()?.expect("create valid backup");
+        // Exceed retention so an early cleanup would remove a valid backup.
+        let second_backup = backup_dir.join("previous-backup.db");
+        std::fs::copy(&existing_backup, &second_backup)
+            .map_err(|e| AppError::io(&second_backup, e))?;
         let mut files_before = std::fs::read_dir(&backup_dir)
             .map_err(|e| AppError::io(&backup_dir, e))?
             .filter_map(|entry| entry.ok())
@@ -2321,13 +2339,25 @@ mod tests {
     #[test]
     #[serial]
     fn periodic_maintenance_runs_even_when_auto_backup_disabled() -> Result<(), AppError> {
-        let _test_home = TestHomeGuard::new();
+        assert_periodic_maintenance_without_backup(false)
+    }
 
-        let settings = AppSettings {
-            backup_interval_hours: Some(0),
-            ..AppSettings::default()
-        };
-        update_settings(settings).expect("disable auto backup");
+    #[test]
+    #[serial]
+    fn periodic_maintenance_runs_after_automatic_backup_failure() -> Result<(), AppError> {
+        assert_periodic_maintenance_without_backup(true)
+    }
+
+    fn assert_periodic_maintenance_without_backup(fail_backup: bool) -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        let _settings = SettingsGuard::with_settings(|settings| {
+            settings.backup_interval_hours = Some(u32::from(fail_backup));
+        });
+        let backup_dir = crate::config::get_app_config_dir().join("backups");
+        if fail_backup {
+            // A regular file at this path forces a portable, deterministic backup failure.
+            std::fs::File::create(&backup_dir).map_err(|e| AppError::io(&backup_dir, e))?;
+        }
 
         let db = Database::memory()?;
         let now = chrono::Utc::now().timestamp();
@@ -2353,7 +2383,15 @@ mod tests {
             )?;
         }
 
-        db.periodic_backup_if_needed()?;
+        let result = db.periodic_backup_if_needed();
+        if fail_backup {
+            assert!(
+                matches!(result, Err(AppError::Io { ref path, .. }) if path == &backup_dir.display().to_string()),
+                "expected the backup creation error, got {result:?}"
+            );
+        } else {
+            result?;
+        }
 
         let (remaining_request_logs, stream_logs, rollups): (i64, i64, i64) = {
             let conn = crate::database::lock_conn!(db.conn);
@@ -2374,11 +2412,11 @@ mod tests {
 
         assert_eq!(
             remaining_request_logs, 0,
-            "old request logs should still be pruned when auto backup is disabled"
+            "old request logs should still be pruned without an automatic backup"
         );
         assert_eq!(
             stream_logs, 0,
-            "old stream check logs should still be pruned when auto backup is disabled"
+            "old stream check logs should still be pruned without an automatic backup"
         );
         assert_eq!(rollups, 1, "old request logs should be rolled up");
 
