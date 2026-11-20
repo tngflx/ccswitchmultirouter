@@ -81,6 +81,19 @@ test("repository policy inspects non-ignored untracked inventory and bundle entr
   );
 });
 
+test("repository policy reads a large inventory before rejecting a late forbidden file", () => {
+  const files = Array.from(
+    { length: 10_000 },
+    (_, index) =>
+      `inventory/${String(index).padStart(5, "0")}-${"x".repeat(120)}.txt`,
+  );
+  files.push("zz-late-forbidden.PS1");
+  assert.throws(
+    () => checkRepositoryScriptPolicy({ repoRoot, listFiles: () => files }),
+    /zz-late-forbidden\.PS1/iu,
+  );
+});
+
 test("repository policy passes for the current source tree", () => {
   assert.doesNotThrow(() => checkRepositoryScriptPolicy({ repoRoot }));
 });

@@ -97,14 +97,17 @@ pub async fn save_file_dialog<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     #[allow(non_snake_case)] defaultName: String,
 ) -> Result<Option<String>, String> {
-    let dialog = app.dialog();
-    let result = dialog
-        .file()
-        .add_filter("SQL", &["sql"])
-        .set_file_name(&defaultName)
-        .blocking_save_file();
+    super::run_command_blocking(move || {
+        let result = app
+            .dialog()
+            .file()
+            .add_filter("SQL", &["sql"])
+            .set_file_name(&defaultName)
+            .blocking_save_file();
 
-    Ok(result.map(|p| p.to_string()))
+        Ok(result.map(|p| p.to_string()))
+    })
+    .await
 }
 
 /// 打开文件对话框
@@ -112,13 +115,16 @@ pub async fn save_file_dialog<R: tauri::Runtime>(
 pub async fn open_file_dialog<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<Option<String>, String> {
-    let dialog = app.dialog();
-    let result = dialog
-        .file()
-        .add_filter("SQL", &["sql"])
-        .blocking_pick_file();
+    super::run_command_blocking(move || {
+        let result = app
+            .dialog()
+            .file()
+            .add_filter("SQL", &["sql"])
+            .blocking_pick_file();
 
-    Ok(result.map(|p| p.to_string()))
+        Ok(result.map(|p| p.to_string()))
+    })
+    .await
 }
 
 /// 打开 ZIP 文件选择对话框
@@ -126,13 +132,16 @@ pub async fn open_file_dialog<R: tauri::Runtime>(
 pub async fn open_zip_file_dialog<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<Option<String>, String> {
-    let dialog = app.dialog();
-    let result = dialog
-        .file()
-        .add_filter("ZIP / Skill", &["zip", "skill"])
-        .blocking_pick_file();
+    super::run_command_blocking(move || {
+        let result = app
+            .dialog()
+            .file()
+            .add_filter("ZIP / Skill", &["zip", "skill"])
+            .blocking_pick_file();
 
-    Ok(result.map(|p| p.to_string()))
+        Ok(result.map(|p| p.to_string()))
+    })
+    .await
 }
 
 // ─── Database backup management ─────────────────────────────

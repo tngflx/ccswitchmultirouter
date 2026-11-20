@@ -3,6 +3,7 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import type { CodexCatalogModel } from "@/types";
+import type { CodexModelReasoningResolution } from "@/types/codexSubagentV2";
 import { codexProviderPresets } from "@/config/codexProviderPresets";
 import { providersApi } from "@/lib/api/providers";
 import {
@@ -13,7 +14,10 @@ import {
   showFetchModelsError,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
-import { CodexFormFields } from "./CodexFormFields";
+import {
+  CodexFormFields,
+  resolveCodexReasoningCapabilities,
+} from "./CodexFormFields";
 import type { CodexProviderReadinessSection } from "./CodexProviderReadinessSection";
 
 type ReadinessProps = ComponentProps<typeof CodexProviderReadinessSection>;
@@ -135,6 +139,37 @@ describe("Codex form discovery request ownership", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     view.readiness = null;
+  });
+
+  it("limits visible reasoning lookups to six concurrent requests", async () => {
+    const pending = new Map<string, () => void>();
+    let active = 0;
+    let maximumActive = 0;
+    const lookup = vi.fn((model: string) => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      return new Promise<CodexModelReasoningResolution>((resolve) => {
+        pending.set(model, () => {
+          active -= 1;
+          resolve({ model } as CodexModelReasoningResolution);
+        });
+      });
+    });
+    const models = Array.from({ length: 10 }, (_, index) => `model-${index}`);
+    const resolving = resolveCodexReasoningCapabilities(models, lookup);
+
+    await vi.waitFor(() => expect(lookup).toHaveBeenCalledTimes(6));
+    expect(maximumActive).toBe(6);
+    for (let index = 0; index < 6; index += 1) {
+      pending.get(`model-${index}`)?.();
+    }
+    await vi.waitFor(() => expect(lookup).toHaveBeenCalledTimes(10));
+    expect(maximumActive).toBe(6);
+    for (let index = 6; index < 10; index += 1) {
+      pending.get(`model-${index}`)?.();
+    }
+    await resolving;
+    expect(lookup).toHaveBeenCalledTimes(10);
   });
 
   it.each([

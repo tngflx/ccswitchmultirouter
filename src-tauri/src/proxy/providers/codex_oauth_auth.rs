@@ -1499,8 +1499,8 @@ impl CodexOAuthManager {
     pub async fn clear_auth(&self) -> Result<(), CodexOAuthError> {
         log::info!("[CodexOAuth] 清除所有认证");
 
-        let _commit_guard = self.login_commit_lock.lock().await;
-        let _persist_guard = self.persistence_lock.lock().await;
+        let commit_guard = self.login_commit_lock.clone().lock_owned().await;
+        let persist_guard = self.persistence_lock.clone().lock_owned().await;
         self.login_epoch.fetch_add(1, Ordering::AcqRel);
         self.target_login_generations.write().await.clear();
 
@@ -1523,9 +1523,16 @@ impl CodexOAuthManager {
         self.pending_device_codes.write().await.clear();
         self.pool_runtime.lock().await.purge_all();
 
-        if self.storage_path.exists() {
-            std::fs::remove_file(&self.storage_path)?;
-        }
+        let storage_path = self.storage_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let (_commit_guard, _persist_guard) = (commit_guard, persist_guard);
+            if storage_path.exists() {
+                std::fs::remove_file(storage_path)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|error| CodexOAuthError::IoError(error.to_string()))??;
 
         Ok(())
     }
@@ -1627,8 +1634,8 @@ impl CodexOAuthManager {
             Some(account_id) => Some(self.get_refresh_lock(account_id).await),
             None => None,
         };
-        let _target_refresh_guard = match target_refresh_lock.as_ref() {
-            Some(lock) => Some(lock.lock().await),
+        let target_refresh_guard = match target_refresh_lock {
+            Some(lock) => Some(lock.lock_owned().await),
             None => None,
         };
         if let (Some(target), Some(generation)) =
@@ -1710,10 +1717,9 @@ impl CodexOAuthManager {
         };
         let account = CodexManagedAccount::from(&data);
 
-        let _pending_commit_guard = if let Some(device_code) =
-            context.pending_device_code.as_deref()
+        let pending_commit_guard = if let Some(device_code) = context.pending_device_code.as_deref()
         {
-            let guard = self.login_commit_lock.lock().await;
+            let guard = self.login_commit_lock.clone().lock_owned().await;
             let pending = self
                 .pending_device_codes
                 .read()
@@ -1748,7 +1754,7 @@ impl CodexOAuthManager {
             None
         };
 
-        let _persist_guard = self.persistence_lock.lock().await;
+        let persist_guard = self.persistence_lock.clone().lock_owned().await;
         let mut prospective_accounts = self.accounts.read().await.clone();
         let duplicate = prospective_accounts.iter().any(|(existing_id, existing)| {
             existing_id != &account_id
@@ -1784,20 +1790,36 @@ impl CodexOAuthManager {
         };
         let content = serde_json::to_string_pretty(&store)
             .map_err(|error| CodexOAuthError::ParseError(error.to_string()))?;
-        self.write_store_atomic(&content)?;
-
-        self.accounts.write().await.insert(account_id.clone(), data);
-        if let Some(token) = initial_access_token {
-            self.access_tokens
-                .write()
+        let accounts = Arc::clone(&self.accounts);
+        let access_tokens = Arc::clone(&self.access_tokens);
+        let pool_policy = Arc::clone(&self.pool_policy);
+        let default_account_id = Arc::clone(&self.default_account_id);
+        let pool_runtime = Arc::clone(&self.pool_runtime);
+        let storage_path = self.storage_path.clone();
+        // Keep the login and persistence locks through both sides of the commit.
+        tokio::spawn(async move {
+            let (_refresh, _commit, _persist) =
+                (target_refresh_guard, pending_commit_guard, persist_guard);
+            tokio::task::spawn_blocking(move || Self::write_store_atomic(&storage_path, &content))
                 .await
-                .insert(account_id.clone(), token);
-        } else {
-            self.access_tokens.write().await.remove(&account_id);
-        }
-        *self.pool_policy.write().await = prospective_policy;
-        *self.default_account_id.write().await = prospective_default;
-        self.pool_runtime.lock().await.purge_account(&account_id);
+                .map_err(|error| CodexOAuthError::IoError(error.to_string()))??;
+
+            accounts.write().await.insert(account_id.clone(), data);
+            if let Some(token) = initial_access_token {
+                access_tokens
+                    .write()
+                    .await
+                    .insert(account_id.clone(), token);
+            } else {
+                access_tokens.write().await.remove(&account_id);
+            }
+            *pool_policy.write().await = prospective_policy;
+            *default_account_id.write().await = prospective_default;
+            pool_runtime.lock().await.purge_account(&account_id);
+            Ok::<(), CodexOAuthError>(())
+        })
+        .await
+        .map_err(|error| CodexOAuthError::IoError(error.to_string()))??;
 
         Ok(account)
     }
@@ -1926,17 +1948,15 @@ impl CodexOAuthManager {
         )
     }
 
-    fn write_store_atomic(&self, content: &str) -> Result<(), CodexOAuthError> {
-        if let Some(parent) = self.storage_path.parent() {
+    fn write_store_atomic(path: &Path, content: &str) -> Result<(), CodexOAuthError> {
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let parent = self
-            .storage_path
+        let parent = path
             .parent()
             .ok_or_else(|| CodexOAuthError::IoError("无效的存储路径".to_string()))?;
-        let file_name = self
-            .storage_path
+        let file_name = path
             .file_name()
             .ok_or_else(|| CodexOAuthError::IoError("无效的存储文件名".to_string()))?
             .to_string_lossy()
@@ -1959,8 +1979,8 @@ impl CodexOAuthManager {
             file.write_all(content.as_bytes())?;
             file.flush()?;
 
-            fs::rename(&tmp_path, &self.storage_path)?;
-            fs::set_permissions(&self.storage_path, fs::Permissions::from_mode(0o600))?;
+            fs::rename(&tmp_path, path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         }
 
         #[cfg(windows)]
@@ -1972,10 +1992,10 @@ impl CodexOAuthManager {
             file.write_all(content.as_bytes())?;
             file.flush()?;
 
-            if self.storage_path.exists() {
-                let _ = fs::remove_file(&self.storage_path);
+            if path.exists() {
+                let _ = fs::remove_file(path);
             }
-            fs::rename(&tmp_path, &self.storage_path)?;
+            fs::rename(&tmp_path, path)?;
         }
 
         Ok(())
@@ -2010,11 +2030,20 @@ impl CodexOAuthManager {
     }
 
     async fn reload_from_disk(&self) -> Result<(), CodexOAuthError> {
-        if !self.storage_path.exists() {
+        let persist_guard = self.persistence_lock.clone().lock_owned().await;
+        let storage_path = self.storage_path.clone();
+        let content = tokio::task::spawn_blocking(move || {
+            let _persist_guard = persist_guard;
+            if !storage_path.exists() {
+                return Ok(None);
+            }
+            fs::read_to_string(storage_path).map(Some)
+        })
+        .await
+        .map_err(|error| CodexOAuthError::IoError(error.to_string()))??;
+        let Some(content) = content else {
             return Ok(());
-        }
-
-        let content = std::fs::read_to_string(&self.storage_path)?;
+        };
         let store: CodexOAuthStore = serde_json::from_str(&content)
             .map_err(|error| CodexOAuthError::ParseError(error.to_string()))?;
         let fallback_default = Self::fallback_default_account_id(&store.accounts);
@@ -2034,7 +2063,7 @@ impl CodexOAuthManager {
     }
 
     async fn save_to_disk(&self) -> Result<(), CodexOAuthError> {
-        let _persist_guard = self.persistence_lock.lock().await;
+        let persist_guard = self.persistence_lock.clone().lock_owned().await;
         let accounts = self.accounts.read().await.clone();
         let default = self.resolve_default_account_id().await;
         let pool_policy = self.normalized_pool_policy().await;
@@ -2049,7 +2078,13 @@ impl CodexOAuthManager {
         let content = serde_json::to_string_pretty(&store)
             .map_err(|e| CodexOAuthError::ParseError(e.to_string()))?;
 
-        self.write_store_atomic(&content)?;
+        let storage_path = self.storage_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let _persist_guard = persist_guard;
+            Self::write_store_atomic(&storage_path, &content)
+        })
+        .await
+        .map_err(|error| CodexOAuthError::IoError(error.to_string()))??;
 
         log::info!(
             "[CodexOAuth] 保存到磁盘成功（{} 个账号）",

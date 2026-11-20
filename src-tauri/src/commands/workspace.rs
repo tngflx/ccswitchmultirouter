@@ -58,95 +58,104 @@ pub struct DailyMemoryFileInfo {
 /// List all daily memory files under `workspace/memory/`.
 #[tauri::command]
 pub async fn list_daily_memory_files() -> Result<Vec<DailyMemoryFileInfo>, String> {
-    let memory_dir = get_openclaw_dir().join("workspace").join("memory");
+    super::run_command_blocking(move || {
+        let memory_dir = get_openclaw_dir().join("workspace").join("memory");
 
-    if !memory_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut files: Vec<DailyMemoryFileInfo> = Vec::new();
-
-    let entries = std::fs::read_dir(&memory_dir)
-        .map_err(|e| format!("Failed to read memory directory: {e}"))?;
-
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".md") {
-            continue;
+        if !memory_dir.exists() {
+            return Ok(Vec::new());
         }
 
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if !meta.is_file() {
-            continue;
+        let mut files: Vec<DailyMemoryFileInfo> = Vec::new();
+
+        let entries = std::fs::read_dir(&memory_dir)
+            .map_err(|e| format!("Failed to read memory directory: {e}"))?;
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".md") {
+                continue;
+            }
+
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !meta.is_file() {
+                continue;
+            }
+
+            let date = name.trim_end_matches(".md").to_string();
+
+            let size_bytes = meta.len();
+            let modified_at = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let preview = std::fs::read_to_string(entry.path())
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect::<String>();
+
+            files.push(DailyMemoryFileInfo {
+                filename: name,
+                date,
+                size_bytes,
+                modified_at,
+                preview,
+            });
         }
 
-        let date = name.trim_end_matches(".md").to_string();
+        // Sort by filename descending (newest date first, YYYY-MM-DD.md)
+        files.sort_by(|a, b| b.filename.cmp(&a.filename));
 
-        let size_bytes = meta.len();
-        let modified_at = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let preview = std::fs::read_to_string(entry.path())
-            .unwrap_or_default()
-            .chars()
-            .take(200)
-            .collect::<String>();
-
-        files.push(DailyMemoryFileInfo {
-            filename: name,
-            date,
-            size_bytes,
-            modified_at,
-            preview,
-        });
-    }
-
-    // Sort by filename descending (newest date first, YYYY-MM-DD.md)
-    files.sort_by(|a, b| b.filename.cmp(&a.filename));
-
-    Ok(files)
+        Ok(files)
+    })
+    .await
 }
 
 /// Read a daily memory file.
 #[tauri::command]
 pub async fn read_daily_memory_file(filename: String) -> Result<Option<String>, String> {
-    validate_daily_memory_filename(&filename)?;
+    super::run_command_blocking(move || {
+        validate_daily_memory_filename(&filename)?;
 
-    let path = get_openclaw_dir()
-        .join("workspace")
-        .join("memory")
-        .join(&filename);
+        let path = get_openclaw_dir()
+            .join("workspace")
+            .join("memory")
+            .join(&filename);
 
-    if !path.exists() {
-        return Ok(None);
-    }
+        if !path.exists() {
+            return Ok(None);
+        }
 
-    std::fs::read_to_string(&path)
-        .map(Some)
-        .map_err(|e| format!("Failed to read daily memory file {filename}: {e}"))
+        std::fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|e| format!("Failed to read daily memory file {filename}: {e}"))
+    })
+    .await
 }
 
 /// Write a daily memory file (atomic write).
 #[tauri::command]
 pub async fn write_daily_memory_file(filename: String, content: String) -> Result<(), String> {
-    validate_daily_memory_filename(&filename)?;
+    super::run_command_blocking(move || {
+        validate_daily_memory_filename(&filename)?;
 
-    let memory_dir = get_openclaw_dir().join("workspace").join("memory");
+        let memory_dir = get_openclaw_dir().join("workspace").join("memory");
 
-    std::fs::create_dir_all(&memory_dir)
-        .map_err(|e| format!("Failed to create memory directory: {e}"))?;
+        std::fs::create_dir_all(&memory_dir)
+            .map_err(|e| format!("Failed to create memory directory: {e}"))?;
 
-    let path = memory_dir.join(&filename);
+        let path = memory_dir.join(&filename);
 
-    write_text_file(&path, &content)
-        .map_err(|e| format!("Failed to write daily memory file {filename}: {e}"))
+        write_text_file(&path, &content)
+            .map_err(|e| format!("Failed to write daily memory file {filename}: {e}"))
+    })
+    .await
 }
 
 /// Find the largest index `<= i` that is a valid UTF-8 char boundary.
@@ -194,112 +203,118 @@ pub struct DailyMemorySearchResult {
 pub async fn search_daily_memory_files(
     query: String,
 ) -> Result<Vec<DailyMemorySearchResult>, String> {
-    let memory_dir = get_openclaw_dir().join("workspace").join("memory");
+    super::run_command_blocking(move || {
+        let memory_dir = get_openclaw_dir().join("workspace").join("memory");
 
-    if !memory_dir.exists() || query.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let query_lower = query.to_lowercase();
-    let mut results: Vec<DailyMemorySearchResult> = Vec::new();
-
-    let entries = std::fs::read_dir(&memory_dir)
-        .map_err(|e| format!("Failed to read memory directory: {e}"))?;
-
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".md") {
-            continue;
-        }
-        let meta = match entry.metadata() {
-            Ok(m) if m.is_file() => m,
-            _ => continue,
-        };
-
-        let date = name.trim_end_matches(".md").to_string();
-        let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
-        let content_lower = content.to_lowercase();
-
-        // Count matches in content
-        let content_matches: Vec<usize> = content_lower
-            .match_indices(&query_lower)
-            .map(|(i, _)| i)
-            .collect();
-
-        // Also check date field
-        let date_matches = date.to_lowercase().contains(&query_lower);
-
-        if content_matches.is_empty() && !date_matches {
-            continue;
+        if !memory_dir.exists() || query.is_empty() {
+            return Ok(Vec::new());
         }
 
-        // Build snippet around first content match (~120 chars of context)
-        let snippet = if let Some(&first_pos) = content_matches.first() {
-            let start = if first_pos > 50 {
-                floor_char_boundary(&content, first_pos - 50)
-            } else {
-                0
+        let query_lower = query.to_lowercase();
+        let mut results: Vec<DailyMemorySearchResult> = Vec::new();
+
+        let entries = std::fs::read_dir(&memory_dir)
+            .map_err(|e| format!("Failed to read memory directory: {e}"))?;
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".md") {
+                continue;
+            }
+            let meta = match entry.metadata() {
+                Ok(m) if m.is_file() => m,
+                _ => continue,
             };
-            let end = ceil_char_boundary(&content, (first_pos + 70).min(content.len()));
-            let mut s = String::new();
-            if start > 0 {
-                s.push_str("...");
+
+            let date = name.trim_end_matches(".md").to_string();
+            let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            let content_lower = content.to_lowercase();
+
+            // Count matches in content
+            let content_matches: Vec<usize> = content_lower
+                .match_indices(&query_lower)
+                .map(|(i, _)| i)
+                .collect();
+
+            // Also check date field
+            let date_matches = date.to_lowercase().contains(&query_lower);
+
+            if content_matches.is_empty() && !date_matches {
+                continue;
             }
-            s.push_str(&content[start..end]);
-            if end < content.len() {
-                s.push_str("...");
-            }
-            s
-        } else {
-            // Date-only match — use beginning of file as preview
-            let end = ceil_char_boundary(&content, 120.min(content.len()));
-            let mut s = content[..end].to_string();
-            if end < content.len() {
-                s.push_str("...");
-            }
-            s
-        };
 
-        let size_bytes = meta.len();
-        let modified_at = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            // Build snippet around first content match (~120 chars of context)
+            let snippet = if let Some(&first_pos) = content_matches.first() {
+                let start = if first_pos > 50 {
+                    floor_char_boundary(&content, first_pos - 50)
+                } else {
+                    0
+                };
+                let end = ceil_char_boundary(&content, (first_pos + 70).min(content.len()));
+                let mut s = String::new();
+                if start > 0 {
+                    s.push_str("...");
+                }
+                s.push_str(&content[start..end]);
+                if end < content.len() {
+                    s.push_str("...");
+                }
+                s
+            } else {
+                // Date-only match — use beginning of file as preview
+                let end = ceil_char_boundary(&content, 120.min(content.len()));
+                let mut s = content[..end].to_string();
+                if end < content.len() {
+                    s.push_str("...");
+                }
+                s
+            };
 
-        results.push(DailyMemorySearchResult {
-            filename: name,
-            date,
-            size_bytes,
-            modified_at,
-            snippet,
-            match_count: content_matches.len(),
-        });
-    }
+            let size_bytes = meta.len();
+            let modified_at = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
 
-    // Sort by filename descending (newest date first)
-    results.sort_by(|a, b| b.filename.cmp(&a.filename));
+            results.push(DailyMemorySearchResult {
+                filename: name,
+                date,
+                size_bytes,
+                modified_at,
+                snippet,
+                match_count: content_matches.len(),
+            });
+        }
 
-    Ok(results)
+        // Sort by filename descending (newest date first)
+        results.sort_by(|a, b| b.filename.cmp(&a.filename));
+
+        Ok(results)
+    })
+    .await
 }
 
 /// Delete a daily memory file (idempotent).
 #[tauri::command]
 pub async fn delete_daily_memory_file(filename: String) -> Result<(), String> {
-    validate_daily_memory_filename(&filename)?;
+    super::run_command_blocking(move || {
+        validate_daily_memory_filename(&filename)?;
 
-    let path = get_openclaw_dir()
-        .join("workspace")
-        .join("memory")
-        .join(&filename);
+        let path = get_openclaw_dir()
+            .join("workspace")
+            .join("memory")
+            .join(&filename);
 
-    if path.exists() {
-        std::fs::remove_file(&path)
-            .map_err(|e| format!("Failed to delete daily memory file {filename}: {e}"))?;
-    }
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("Failed to delete daily memory file {filename}: {e}"))?;
+        }
 
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 // --- Workspace file commands ---
@@ -308,35 +323,41 @@ pub async fn delete_daily_memory_file(filename: String) -> Result<(), String> {
 /// Returns None if the file does not exist.
 #[tauri::command]
 pub async fn read_workspace_file(filename: String) -> Result<Option<String>, String> {
-    validate_filename(&filename)?;
+    super::run_command_blocking(move || {
+        validate_filename(&filename)?;
 
-    let path = get_openclaw_dir().join("workspace").join(&filename);
+        let path = get_openclaw_dir().join("workspace").join(&filename);
 
-    if !path.exists() {
-        return Ok(None);
-    }
+        if !path.exists() {
+            return Ok(None);
+        }
 
-    std::fs::read_to_string(&path)
-        .map(Some)
-        .map_err(|e| format!("Failed to read workspace file {filename}: {e}"))
+        std::fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|e| format!("Failed to read workspace file {filename}: {e}"))
+    })
+    .await
 }
 
 /// Write content to an OpenClaw workspace file (atomic write).
 /// Creates the workspace directory if it does not exist.
 #[tauri::command]
 pub async fn write_workspace_file(filename: String, content: String) -> Result<(), String> {
-    validate_filename(&filename)?;
+    super::run_command_blocking(move || {
+        validate_filename(&filename)?;
 
-    let workspace_dir = get_openclaw_dir().join("workspace");
+        let workspace_dir = get_openclaw_dir().join("workspace");
 
-    // Ensure workspace directory exists
-    std::fs::create_dir_all(&workspace_dir)
-        .map_err(|e| format!("Failed to create workspace directory: {e}"))?;
+        // Ensure workspace directory exists
+        std::fs::create_dir_all(&workspace_dir)
+            .map_err(|e| format!("Failed to create workspace directory: {e}"))?;
 
-    let path = workspace_dir.join(&filename);
+        let path = workspace_dir.join(&filename);
 
-    write_text_file(&path, &content)
-        .map_err(|e| format!("Failed to write workspace file {filename}: {e}"))
+        write_text_file(&path, &content)
+            .map_err(|e| format!("Failed to write workspace file {filename}: {e}"))
+    })
+    .await
 }
 
 /// Open the workspace or memory directory in the system file manager.
@@ -344,14 +365,20 @@ pub async fn write_workspace_file(filename: String, content: String) -> Result<(
 ///           "memory" opens `~/.openclaw/workspace/memory/`.
 #[tauri::command]
 pub async fn open_workspace_directory(handle: AppHandle, subdir: String) -> Result<bool, String> {
-    let dir = match subdir.as_str() {
-        "memory" => get_openclaw_dir().join("workspace").join("memory"),
-        _ => get_openclaw_dir().join("workspace"),
-    };
-
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create directory: {e}"))?;
-    }
+    let dir = super::run_command_blocking(move || {
+        let workspace_dir = get_openclaw_dir().join("workspace");
+        let dir = if subdir == "memory" {
+            workspace_dir.join("memory")
+        } else {
+            workspace_dir
+        };
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("Failed to create directory: {e}"))?;
+        }
+        Ok(dir)
+    })
+    .await?;
 
     handle
         .opener()
@@ -359,4 +386,51 @@ pub async fn open_workspace_directory(handle: AppHandle, subdir: String) -> Resu
         .map_err(|e| format!("Failed to open directory: {e}"))?;
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::search_daily_memory_files;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn daily_memory_search_yields_while_resolving_the_workspace_path() {
+        let home = crate::config::TestHomeGuard::new();
+        let memory_dir = home
+            .path()
+            .join(".openclaw")
+            .join("workspace")
+            .join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::write(memory_dir.join("2026-11-20.md"), "A search fixture").unwrap();
+
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let settings_writer = std::thread::spawn(move || {
+            crate::settings::mutate_settings(|_| {
+                locked_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10))
+            })
+            .unwrap()
+        });
+        locked_rx.await.unwrap();
+
+        // Poll the search with the settings lock held, then let the same executor release it.
+        let (results, _) = tokio::join!(
+            biased;
+            search_daily_memory_files("fixture".to_string()),
+            async move { release_tx.send(()) }
+        );
+        settings_writer
+            .join()
+            .unwrap()
+            .expect("daily memory search blocked the async executor");
+
+        let results = results.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].filename, "2026-11-20.md");
+        assert_eq!(results[0].match_count, 1);
+    }
 }

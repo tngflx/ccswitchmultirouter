@@ -102,6 +102,11 @@ const codexNativeReasoningCanonicalOwnerProof = (inspection) => {
   // Fixed counters describe only this proof's inspected prefix. Never retain
   // atom/brand identities, object paths, descriptor contents or error text.
   const counts = inspection?.canonicalOwnerCounts;
+  if (counts) {
+    counts.hintScanStatus =
+      state.scopedAppServerScopeHintScan?.status || "unknown";
+    counts.hintScanReason = state.scopedAppServerScopeHintScan?.reason || null;
+  }
   const refuse = (reason) => {
     if (inspection) inspection.canonicalOwnerRefusalReason = reason;
     return codexNativeReasoningOwnerRefusal(
@@ -173,6 +178,12 @@ const codexNativeReasoningCanonicalOwnerProof = (inspection) => {
     hints = codexCurrentAppServerScopeHints(true);
     if (counts && Array.isArray(hints))
       counts.hintCount = Math.min(hints.length, 17);
+    if (counts) {
+      counts.hintScanStatus =
+        state.scopedAppServerScopeHintScan?.status || "unknown";
+      counts.hintScanReason =
+        state.scopedAppServerScopeHintScan?.reason || null;
+    }
   } catch {
     return refuse("hints_read_failed");
   }
@@ -189,7 +200,14 @@ const codexNativeReasoningCanonicalOwnerProof = (inspection) => {
   } catch {
     return refuse("snapshot_changed");
   }
-  if (state.scopedAppServerScopeHintScanComplete !== true)
+  // A complete hint walk can hit an unrelated large Fiber-owned object graph
+  // after finding the current branded scopes. Keep that bounded walk usable
+  // only after the exact visible scopes below pass mounted/cache validation.
+  // Other incomplete scans remain fail-closed.
+  const hintScan = state.scopedAppServerScopeHintScan;
+  const boundedValueScan =
+    hintScan?.status === "capped" && hintScan.reason === "value_limit";
+  if (state.scopedAppServerScopeHintScanComplete !== true && !boundedValueScan)
     return refuse("hints_incomplete");
   if (
     !Array.isArray(hints) ||
@@ -199,6 +217,21 @@ const codexNativeReasoningCanonicalOwnerProof = (inspection) => {
     return refuse("hint_count_mismatch");
   const scopes = new Set(hints);
   if (scopes.size !== hints.length) return refuse("hint_count_mismatch");
+  if (boundedValueScan) {
+    // The retained renderer inventory is the second bounded view of the same
+    // mounted tree. A capped hint walk may authorize only when every retained
+    // candidate is present in the exact branded hints. This rejects omitted
+    // visible owners while allowing unrelated object edges to be truncated.
+    try {
+      const candidates = state.scopedAppServerScopeCandidates;
+      if (!candidates || typeof candidates[Symbol.iterator] !== "function")
+        return refuse("hints_incomplete");
+      for (const candidate of candidates)
+        if (!scopes.has(candidate)) return refuse("hints_incomplete");
+    } catch {
+      return refuse("hints_incomplete");
+    }
+  }
   const scopeCaches = new Map();
   const brandCaches = new Map();
   for (const scope of hints) {
@@ -837,6 +870,8 @@ const reconcileCodexNativeReasoningVisibility = (requestedEfforts) => {
       uniqueBrandCount: 0,
       hintCount: 0,
       pendingNodeCount: 0,
+      hintScanStatus: "unknown",
+      hintScanReason: null,
     },
     ownerFailureCounts: {
       scope_contract: 0,

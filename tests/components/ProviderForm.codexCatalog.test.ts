@@ -1,10 +1,16 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { renderHook } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
   CodexCatalogValidationError,
   normalizeCodexCatalogModelsForSave,
   normalizeCodexChatReasoningForSave,
 } from "@/components/providers/forms/ProviderForm";
-import { extractCodexCatalogModels } from "@/components/providers/forms/hooks/useCodexConfigState";
+import {
+  extractCodexCatalogModels,
+  useCodexConfigState,
+} from "@/components/providers/forms/hooks/useCodexConfigState";
 import {
   codexModelProtocolDeclarationStatus,
   readCodexModelProtocolCapability,
@@ -39,6 +45,112 @@ const providerWithCatalog = (models: CodexCatalogModel[]): Provider => ({
 });
 
 describe("ProviderForm Codex catalog helpers", () => {
+  it("keeps an OpenRouter graded model's reasoning contract through fetch, save, reopen, and picker projection", () => {
+    const reasoning = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported" as const,
+      controlKind: "graded" as const,
+      supportedEfforts: ["max", "xhigh", "high", "medium", "low"] as const,
+      defaultEffort: "max" as const,
+      disableAllowed: false,
+      upstream: {
+        format: "reasoning_object" as const,
+        parameter: "reasoning.effort" as const,
+        effortMap: {
+          max: "max",
+          xhigh: "xhigh",
+          high: "high",
+          medium: "medium",
+          low: "low",
+        },
+      },
+      source: "detection" as const,
+      confidence: "authoritative" as const,
+    } satisfies CodexModelReasoningCapability;
+    const fetchedModel = {
+      id: "minimax/minimax-m3.1-flash",
+      displayName: "MiniMax: MiniMax M3.1 Flash",
+      reasoning,
+    };
+
+    const reconciled = reconcileFetchedCodexCatalogRows(
+      [],
+      [fetchedModel],
+      {
+        providerId: "openrouter",
+        providerName: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api/v1",
+      },
+      {
+        appendNew: true,
+        existingMetadataMode: "refresh",
+        createRow: (seed) => seed as CodexCatalogModel,
+        newRowEnabled: true,
+      },
+    );
+    const saved = normalizeCodexCatalogModelsForSave(reconciled.rows);
+    const initialData = {
+      settingsConfig: {
+        modelCatalog: { models: saved },
+      },
+    };
+    const { result } = renderHook(() =>
+      // This is the editor's actual load path after a provider save.
+      // Keeping the initial object stable also mirrors ProviderForm usage.
+      useCodexConfigState({ initialData }),
+    );
+    const reopened = result.current.codexCatalogModels[0];
+
+    expect(reopened.reasoning).toMatchObject({
+      controlKind: "graded",
+      supportedEfforts: ["max", "xhigh", "high", "medium", "low"],
+      defaultEffort: "max",
+    });
+
+    const pickerCore = readFileSync(
+      path.resolve(
+        process.cwd(),
+        "src-tauri/src/resources/codex_desktop/model_picker_core.js",
+      ),
+      "utf8",
+    );
+    const state = {
+      payload: {
+        modelProvider: "openrouter",
+        catalogAvailable: true,
+        modelNames: [reopened.model],
+        models: [reopened],
+      },
+    };
+    const { patchModelArray } = new Function(
+      "state",
+      `${pickerCore}\nreturn { patchModelArray };`,
+    )(state) as {
+      patchModelArray: (
+        models: Array<Record<string, unknown>>,
+        allowEmpty?: boolean,
+        managedOnly?: boolean,
+      ) => boolean;
+    };
+    const pickerRows: Array<Record<string, unknown>> = [
+      { model: reopened.model },
+    ];
+    expect(patchModelArray(pickerRows, true, true)).toBe(true);
+    const projected = pickerRows[0];
+
+    expect(
+      (
+        projected.supportedReasoningEfforts as Array<{
+          reasoningEffort: string;
+        }>
+      ).map(({ reasoningEffort }) => reasoningEffort),
+    ).toEqual(["max", "xhigh", "high", "medium", "low"]);
+    expect(projected.defaultReasoningEffort).toBe("max");
+    expect((projected.reasoning as { controlKind?: string }).controlKind).toBe(
+      "graded",
+    );
+  });
+
   it.each([
     0,
     -1,

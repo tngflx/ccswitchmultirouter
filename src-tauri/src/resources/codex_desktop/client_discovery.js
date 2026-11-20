@@ -943,16 +943,24 @@ const codexCurrentAppServerScopeHints = (completeInventory = false) => {
     : CODEX_RENDERER_FIBER_VALUE_LIMIT;
   if (completeInventory) {
     state.scopedAppServerScopeHintScanComplete = false;
+    state.scopedAppServerScopeHintScan = { status: "scanning" };
   }
   for (const atom of state.appServerStatusAtoms || []) {
     const brand = Object.getOwnPropertyDescriptor(atom || {}, "scope")?.value;
     if (brand) scopesByBrand.set(brand, null);
   }
-  if (!scopesByBrand.size) return [];
+  if (!scopesByBrand.size) {
+    if (completeInventory) {
+      state.scopedAppServerScopeHintScanComplete = true;
+      state.scopedAppServerScopeHintScan = { status: "complete" };
+    }
+    return [];
+  }
   const fibers = codexRendererScopeRootIdentities();
   const seen = new Set();
   let valueScanComplete = true;
   let valueReadFailed = false;
+  let valueScanCapReason = null;
   let cursor = 0;
   for (
     ;
@@ -978,8 +986,11 @@ const codexCurrentAppServerScopeHints = (completeInventory = false) => {
         if (scopesByBrand.has(brand)) {
           if (completeInventory) {
             scopeValues.add(value);
-            if (scopeValues.size > CODEX_APP_SERVER_SCOPE_HINT_LIMIT)
-              return Array.from(scopeValues);
+            if (scopeValues.size > CODEX_APP_SERVER_SCOPE_HINT_LIMIT) {
+              valueScanComplete = false;
+              valueScanCapReason = "scope_limit";
+              break;
+            }
           }
           if (!scopesByBrand.get(brand)) scopesByBrand.set(brand, value);
         }
@@ -1002,14 +1013,28 @@ const codexCurrentAppServerScopeHints = (completeInventory = false) => {
     }
     // A first matching brand is not uniqueness proof if another owner can be
     // hidden in this Fiber's uninspected value suffix.
-    if (queue.capped) valueScanComplete = false;
+    if (queue.capped) {
+      valueScanComplete = false;
+      valueScanCapReason ||= "value_limit";
+    }
   }
   if (completeInventory) {
-    state.scopedAppServerScopeHintScanComplete =
+    const complete =
       valueScanComplete &&
       !valueReadFailed &&
       seen.size < CODEX_RENDERER_FIBER_SCAN_LIMIT &&
       cursor >= fibers.length;
+    state.scopedAppServerScopeHintScanComplete = complete;
+    state.scopedAppServerScopeHintScan = {
+      status: complete ? "complete" : "capped",
+      ...(complete
+        ? {}
+        : {
+            reason:
+              valueScanCapReason ||
+              (valueReadFailed ? "read_failed" : "fiber_limit"),
+          }),
+    };
     return Array.from(scopeValues);
   }
   return Array.from(scopesByBrand.values()).filter(Boolean);

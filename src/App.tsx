@@ -648,6 +648,7 @@ function App() {
     deleteProvider,
     saveUsageScript,
     setAsDefaultModel,
+    isLoading: providerActionLoading,
   } = useProviderActions(
     activeApp,
     currentAppUsesProxy && isProxyRunning,
@@ -987,6 +988,7 @@ function App() {
   }, [activeApp]);
 
   const currentViewRef = useRef(currentView);
+  const navigationRevisionRef = useRef(0);
   const managementBusy =
     mcpManagementBusy || skillsNavigationBusy || promptNavigationBusy;
   const managementBusyRef = useRef(false);
@@ -995,6 +997,10 @@ function App() {
   useEffect(() => {
     currentViewRef.current = currentView;
   }, [currentView]);
+
+  useEffect(() => {
+    navigationRevisionRef.current += 1;
+  }, [activeApp, currentView]);
 
   useEffect(() => {
     const openSettingsTab = (event: Event) => {
@@ -1402,8 +1408,12 @@ function App() {
   // 目标 Provider 的 switch 路径会在同一个后端切换锁内启动代理并完成接管；
   // 这里不能先接管当前 Provider，否则会短暂写入错误的模型目录与 managed roles。
   const handleEnableCodexMultiRouterPlan = async (provider: Provider) => {
+    const navigationRevision = navigationRevisionRef.current;
     setActiveApp("codex");
     await enableCodexMultiRouterPlan(provider, switchProvider);
+    if (navigationRevisionRef.current !== navigationRevision) {
+      return;
+    }
     openCodexRouterWorkspace(provider, "status");
     void Promise.allSettled([
       queryClient.invalidateQueries({ queryKey: ["proxyStatus"] }),
@@ -1702,7 +1712,7 @@ function App() {
                       providers={providers}
                       currentProviderId={currentProviderId}
                       appId={activeApp}
-                      isLoading={isLoading}
+                      isLoading={isLoading || providerActionLoading}
                       isProxyRunning={currentAppUsesProxy && isProxyRunning}
                       isProxyTakeover={
                         isProxyRunning && isCurrentAppTakeoverActive

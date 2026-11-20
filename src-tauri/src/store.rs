@@ -25,7 +25,23 @@ pub struct AppState {
     protocol_probe_released: Arc<tokio::sync::Notify>,
     protocol_probe_receipts: Arc<Mutex<HashMap<String, ProtocolProbeReceipt>>>,
     codex_provider_set_probe_receipts: Arc<Mutex<CodexProviderSetProbeReceiptState>>,
-    codex_startup_reconciliation_pending: AtomicBool,
+    codex_startup_reconciliation_pending: Arc<AtomicBool>,
+}
+
+impl Clone for AppState {
+    fn clone(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            proxy_service: self.proxy_service.clone(),
+            owner_remote: self.owner_remote.clone(),
+            usage_cache: self.usage_cache.clone(),
+            protocol_probes_in_flight: self.protocol_probes_in_flight.clone(),
+            protocol_probe_released: self.protocol_probe_released.clone(),
+            protocol_probe_receipts: self.protocol_probe_receipts.clone(),
+            codex_provider_set_probe_receipts: self.codex_provider_set_probe_receipts.clone(),
+            codex_startup_reconciliation_pending: self.codex_startup_reconciliation_pending.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -233,7 +249,7 @@ impl AppState {
             // Tests, CLI helpers and command-only AppState instances do not run the
             // Desktop startup recovery pipeline. The real app explicitly opens the
             // gate before exposing its renderer.
-            codex_startup_reconciliation_pending: AtomicBool::new(false),
+            codex_startup_reconciliation_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 

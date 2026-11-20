@@ -491,6 +491,39 @@ pub fn provider_reasoning_capability_from_model_entry(
     };
     let supported_efforts =
         collect_effort_declaration(&scopes, openrouter_contract, mandatory).ok()?;
+    let default_effort_declaration = lookup_effort_string(
+        &scopes,
+        &[
+            "default_effort",
+            "defaultEffort",
+            "default_level",
+            "defaultLevel",
+            "default_reasoning_level",
+            "defaultReasoningLevel",
+            "default_reasoning_effort",
+            "defaultReasoningEffort",
+        ],
+    )?;
+    let format_declaration = lookup_wire_string(
+        &scopes,
+        &[
+            "reasoning_format",
+            "reasoningFormat",
+            "upstream_format",
+            "upstreamFormat",
+            "format",
+        ],
+    )?;
+    let parameter_declaration = lookup_wire_string(
+        &scopes,
+        &[
+            "reasoning_parameter",
+            "reasoningParameter",
+            "upstream_parameter",
+            "upstreamParameter",
+            "parameter",
+        ],
+    )?;
     let has_explicit_controls = supported_efforts.is_some()
         || !supported_parameters.is_empty()
         || has_declared_key(
@@ -506,36 +539,9 @@ pub fn provider_reasoning_capability_from_model_entry(
                 "reasoningMandatory",
             ],
         )
-        || lookup_effort_string(
-            &scopes,
-            &[
-                "default_effort",
-                "defaultEffort",
-                "default_level",
-                "defaultLevel",
-                "default_reasoning_level",
-                "defaultReasoningLevel",
-                "default_reasoning_effort",
-                "defaultReasoningEffort",
-            ],
-        )
-        .is_none()
-        || lookup_wire_string(
-            &scopes,
-            &[
-                "reasoning_format",
-                "reasoningFormat",
-                "upstream_format",
-                "upstreamFormat",
-                "format",
-                "reasoning_parameter",
-                "reasoningParameter",
-                "upstream_parameter",
-                "upstreamParameter",
-                "parameter",
-            ],
-        )
-        .is_none();
+        || default_effort_declaration.is_some()
+        || format_declaration.is_some()
+        || parameter_declaration.is_some();
 
     // Explicit negative evidence conflicts with any positive control
     // declaration. A positive boolean can be completed by those controls.
@@ -1109,12 +1115,7 @@ fn build_reasoning_capability(
         .filter(|effort| effort.as_str() != "none")
         .map(|effort| (effort.clone(), effort.clone()))
         .collect::<std::collections::HashMap<_, _>>();
-    let control_kind = if !efforts
-        .iter()
-        .filter(|effort| effort.as_str() != "none")
-        .collect::<Vec<_>>()
-        .is_empty()
-    {
+    let control_kind = if !efforts.is_empty() {
         ReasoningControlKind::Graded
     } else if supports_max_tokens || format == "budget" {
         ReasoningControlKind::Budget
@@ -2813,6 +2814,24 @@ baseUrl = "https://api.sublyx.org/v1""#,
             assert!(!capability.disable_allowed);
             assert_eq!(capability.upstream.format, "string");
             assert_eq!(capability.upstream.parameter, "reasoning_effort");
+        }
+    }
+
+    #[test]
+    fn provider_reasoning_negative_flags_conflict_with_valid_sibling_controls() {
+        for sibling in [
+            json!({"default_effort": "high"}),
+            json!({"reasoning_format": "string"}),
+            json!({"reasoning_parameter": "reasoning_effort"}),
+        ] {
+            let mut entry = json!({"id": "model", "supportsReasoning": false});
+            for (key, value) in sibling.as_object().expect("object sibling") {
+                entry[key] = value.clone();
+            }
+            assert!(
+                provider_reasoning_capability_from_model_entry(&entry, false).is_none(),
+                "negative reasoning evidence must not coexist with valid controls: {entry}"
+            );
         }
     }
 

@@ -11,7 +11,7 @@ use std::{
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
-use tauri::{ipc::Channel, State};
+use tauri::{ipc::Channel, AppHandle, State};
 use uuid::Uuid;
 
 use crate::{
@@ -174,14 +174,42 @@ async fn summarize_protocol_probe_usage(
     provider: &Provider,
     records: &[ProtocolCompatibilityRecord],
 ) -> CodexProtocolProbeUsageSummary {
-    let default_multiplier = state
-        .db
-        .get_default_cost_multiplier(AppType::Codex.as_str())
-        .await
-        .ok()
-        .and_then(|value| Decimal::from_str(value.trim()).ok())
-        .filter(|value| *value >= Decimal::ZERO)
-        .unwrap_or(Decimal::ONE);
+    let default_multiplier = crate::commands::run_state_blocking(state, |state| {
+        let value = tauri::async_runtime::block_on(
+            state
+                .db
+                .get_default_cost_multiplier(AppType::Codex.as_str()),
+        )
+        .ok();
+        Ok(value
+            .as_deref()
+            .and_then(|value| Decimal::from_str(value.trim()).ok())
+            .filter(|value| *value >= Decimal::ZERO)
+            .unwrap_or(Decimal::ONE))
+    })
+    .await
+    .unwrap_or(Decimal::ONE);
+    let state = state.clone();
+    let provider = provider.clone();
+    let records = records.to_vec();
+    crate::commands::run_state_blocking(&state, move |state| {
+        Ok(summarize_protocol_probe_usage_blocking(
+            state,
+            &provider,
+            &records,
+            default_multiplier,
+        ))
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn summarize_protocol_probe_usage_blocking(
+    state: &AppState,
+    provider: &Provider,
+    records: &[ProtocolCompatibilityRecord],
+    default_multiplier: Decimal,
+) -> CodexProtocolProbeUsageSummary {
     let logger = UsageLogger::new(state.db.as_ref());
     let mut summary = CodexProtocolProbeUsageSummary::default();
     let mut total_cost = Decimal::ZERO;
@@ -940,24 +968,24 @@ pub async fn preflight_codex_provider_protocol_compatibility(
     on_event: Channel<ProtocolProbeProgressEvent>,
     scope: Option<CodexProtocolProbeScope>,
 ) -> Result<CodexProviderProtocolPreflightOutcome, String> {
-    run_provider_preflight(
-        state.inner(),
-        provider,
-        scope.unwrap_or_default(),
-        move |event| {
-            let _ = on_event.send(event);
-        },
-    )
+    let state = state.inner().clone();
+    run_provider_preflight(&state, provider, scope.unwrap_or_default(), move |event| {
+        let _ = on_event.send(event);
+    })
     .await
 }
 
 /// Restore persisted evidence without sending requests or extending its lifetime.
 #[tauri::command]
-pub fn restore_codex_provider_protocol_evidence(
+pub async fn restore_codex_provider_protocol_evidence(
     state: State<'_, AppState>,
     provider: Provider,
 ) -> Result<Option<CodexProviderProtocolPreflightOutcome>, String> {
-    restore_provider_protocol_evidence(state.inner(), provider, Utc::now().timestamp())
+    let now = Utc::now().timestamp();
+    crate::commands::run_state_blocking(state.inner(), move |state| {
+        restore_provider_protocol_evidence(state, provider, now)
+    })
+    .await
 }
 
 fn restore_provider_protocol_evidence(
@@ -1282,14 +1310,17 @@ pub async fn preflight_universal_codex_protocol_compatibility(
     provider: UniversalProvider,
     on_event: Channel<ProtocolProbeProgressEvent>,
 ) -> Result<Option<CodexProviderProtocolPreflightOutcome>, String> {
-    let Some(codex_provider) =
-        ProviderService::prepare_universal_codex_provider_from_definition(state.inner(), &provider)
-            .map_err(|error| error.to_string())?
-    else {
+    let codex_provider = crate::commands::run_state_blocking(state.inner(), move |state| {
+        ProviderService::prepare_universal_codex_provider_from_definition(state, &provider)
+            .map_err(|error| error.to_string())
+    })
+    .await?;
+    let Some(codex_provider) = codex_provider else {
         return Ok(None);
     };
+    let state = state.inner().clone();
     run_provider_preflight(
-        state.inner(),
+        &state,
         codex_provider,
         CodexProtocolProbeScope::AutomaticModels,
         move |event| {
@@ -1303,36 +1334,51 @@ pub async fn preflight_universal_codex_protocol_compatibility(
 #[tauri::command]
 #[allow(non_snake_case)]
 pub async fn save_codex_provider_with_protocol_preflight(
-    state: State<'_, AppState>,
+    app_handle: AppHandle,
     provider: Provider,
     originalId: Option<String>,
     addToLive: Option<bool>,
 ) -> Result<CodexProviderProtocolSaveOutcome, String> {
     let (provider, records, observations, protocol_applied, probe_error) =
-        match automatic_codex_provider_preflight(state.inner(), provider.clone()).await {
+        match automatic_codex_provider_preflight_with_app(&app_handle, provider.clone()).await {
             Ok((provider, records, observations)) => (provider, records, observations, false, None),
             Err(error) => (provider, Vec::new(), Vec::new(), false, Some(error)),
         };
     let record = records.first().cloned();
 
     if let Some(original_id) = originalId.as_deref() {
-        ProviderService::update_with_protocol_state(
-            state.inner(),
-            AppType::Codex,
-            Some(original_id),
-            provider.clone(),
-            &records,
-            &observations,
-        )
+        let provider_for_save = provider.clone();
+        let records_for_save = records.clone();
+        let observations_for_save = observations.clone();
+        let original_id = original_id.to_string();
+        crate::commands::run_app_state_blocking(&app_handle, move |state| {
+            ProviderService::update_with_protocol_state(
+                state,
+                AppType::Codex,
+                Some(&original_id),
+                provider_for_save,
+                &records_for_save,
+                &observations_for_save,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .await
     } else {
-        ProviderService::add_with_protocol_state(
-            state.inner(),
-            AppType::Codex,
-            provider.clone(),
-            addToLive.unwrap_or(true),
-            &records,
-            &observations,
-        )
+        let provider_for_save = provider.clone();
+        let records_for_save = records.clone();
+        let observations_for_save = observations.clone();
+        crate::commands::run_app_state_blocking(&app_handle, move |state| {
+            ProviderService::add_with_protocol_state(
+                state,
+                AppType::Codex,
+                provider_for_save,
+                addToLive.unwrap_or(true),
+                &records_for_save,
+                &observations_for_save,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .await
     }
     .map_err(|error| error.to_string())?;
 
@@ -1354,29 +1400,87 @@ async fn run_provider_preflight<F>(
 where
     F: Fn(ProtocolProbeProgressEvent) + Send + Sync,
 {
-    let providers = state
-        .db
-        .get_all_providers(AppType::Codex.as_str())
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .collect::<HashMap<_, _>>();
-    let (candidates, is_router) =
-        compile_preflight_candidates_with_saved_evidence(state, &provider, &providers, scope)?;
+    let provider_for_plan = provider.clone();
+    let (providers, candidates, is_router) =
+        crate::commands::run_state_blocking(state, move |state| {
+            let providers = state
+                .db
+                .get_all_providers(AppType::Codex.as_str())
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+            let (candidates, is_router) = compile_preflight_candidates_with_saved_evidence(
+                state,
+                &provider_for_plan,
+                &providers,
+                scope,
+            )?;
+            Ok((providers, candidates, is_router))
+        })
+        .await?;
     if scope == CodexProtocolProbeScope::AllEnabledModels && candidates.is_empty() {
         return Err("codex_protocol_probe_no_enabled_models".to_string());
     }
     let total = candidates.len();
+    let state_for_batch = state.clone();
     let batch = run_candidate_batch_with_observations(candidates, |candidate| {
-        run_explicit_candidate_result_with(state, candidate, |candidate| {
-            run_candidate_result_with_reporter(state, candidate, &reporter)
-        })
+        let state = state_for_batch.clone();
+        let reporter = &reporter;
+        async move {
+            let receipt_key = candidate.lease_key();
+            let result = run_candidate_result_with_reporter(&state, candidate, &reporter).await?;
+            crate::commands::run_state_blocking(&state, move |state| {
+                state
+                    .remember_protocol_probe_receipt(receipt_key, result.clone())
+                    .map(|_| result)
+            })
+            .await
+        }
     })
     .await?;
     if batch.observations.len() != batch.records.len() * 2 {
         return Err("codex_provider_set_probe_observation_mismatch".to_string());
     }
-    let fresh_receipt_ids = batch
-        .records
+    let provider_for_finalize = provider.clone();
+    let batch_finished_records = batch.records.clone();
+    let (records, observations, receipt_ids, receipt_models, adaptation_preview) =
+        crate::commands::run_state_blocking(state, move |state| {
+            finish_provider_preflight(state, provider_for_finalize, providers, is_router, batch)
+        })
+        .await?;
+    let probe_usage = summarize_protocol_probe_usage(state, &provider, &records).await;
+    reporter(batch_finished_event(total, &batch_finished_records));
+    Ok(CodexProviderProtocolPreflightOutcome {
+        provider,
+        adaptation_preview,
+        records,
+        observations,
+        receipt_ids,
+        receipt_models,
+        protocol_applied: false,
+        probe_usage,
+    })
+}
+
+#[allow(clippy::type_complexity)]
+fn finish_provider_preflight(
+    state: &AppState,
+    provider: Provider,
+    providers: HashMap<String, Provider>,
+    is_router: bool,
+    batch: CandidateBatchRecords,
+) -> Result<
+    (
+        Vec<ProtocolCompatibilityRecord>,
+        Vec<ProtocolCompatibilityRecord>,
+        Vec<String>,
+        BTreeMap<String, String>,
+        crate::commands::provider::CodexProviderAdaptationView,
+    ),
+    String,
+> {
+    let fresh_records = batch.records;
+    let fresh_receipt_ids = fresh_records
         .iter()
         .cloned()
         .zip(batch.observations.chunks_exact(2))
@@ -1389,16 +1493,13 @@ where
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let probe_usage = summarize_protocol_probe_usage(state, &provider, &batch.records).await;
-    reporter(batch_finished_event(total, &batch.records));
-    let fresh_records = batch.records.clone();
     let records = if is_router {
-        batch.records
+        fresh_records.clone()
     } else {
         merge_saved_provider_protocol_records(
             state,
             &provider,
-            &batch.records,
+            &fresh_records,
             Utc::now().timestamp(),
         )?
     };
@@ -1456,16 +1557,13 @@ where
         chrono::Utc::now().timestamp(),
     )
     .map_err(|error| error.to_string())?;
-    Ok(CodexProviderProtocolPreflightOutcome {
-        provider,
-        adaptation_preview,
+    Ok((
         records,
         observations,
         receipt_ids,
         receipt_models,
-        protocol_applied: false,
-        probe_usage,
-    })
+        adaptation_preview,
+    ))
 }
 
 #[cfg(test)]
@@ -1487,6 +1585,7 @@ fn remember_candidate_batch_receipts(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) async fn automatic_codex_provider_preflight(
     state: &AppState,
     provider: Provider,
@@ -1498,8 +1597,54 @@ pub(crate) async fn automatic_codex_provider_preflight(
     ),
     String,
 > {
-    if provider.uses_fixed_codex_responses_transport() {
+    let (provider, candidates) = plan_automatic_codex_provider_preflight(state, provider)?;
+    if candidates.is_empty() {
         return Ok((provider, Vec::new(), Vec::new()));
+    }
+    let batch = run_candidate_batch_with_observations(candidates, |candidate| {
+        run_automatic_candidate_result(state, candidate)
+    })
+    .await?;
+    Ok((provider, batch.records, batch.observations))
+}
+
+/// Variant used by async commands whose managed state must never be read on
+/// the async executor. Planning and cached-result reads run on a blocking
+/// worker, while network probes remain asynchronous.
+pub(crate) async fn automatic_codex_provider_preflight_with_app(
+    app: &AppHandle,
+    provider: Provider,
+) -> Result<
+    (
+        Provider,
+        Vec<ProtocolCompatibilityRecord>,
+        Vec<ProtocolCompatibilityRecord>,
+    ),
+    String,
+> {
+    let provider_for_plan = provider;
+    let (provider, candidates) = crate::commands::run_app_state_blocking(app, move |state| {
+        plan_automatic_codex_provider_preflight(state, provider_for_plan)
+    })
+    .await?;
+    if candidates.is_empty() {
+        return Ok((provider, Vec::new(), Vec::new()));
+    }
+    let app_for_probe = app.clone();
+    let batch = run_candidate_batch_with_observations(candidates, move |candidate| {
+        let app = app_for_probe.clone();
+        async move { run_automatic_candidate_result_with_app(&app, candidate).await }
+    })
+    .await?;
+    Ok((provider, batch.records, batch.observations))
+}
+
+fn plan_automatic_codex_provider_preflight(
+    state: &AppState,
+    provider: Provider,
+) -> Result<(Provider, Vec<ProbeCandidate>), String> {
+    if provider.uses_fixed_codex_responses_transport() {
+        return Ok((provider, Vec::new()));
     }
 
     let providers = state
@@ -1514,14 +1659,7 @@ pub(crate) async fn automatic_codex_provider_preflight(
         &providers,
         CodexProtocolProbeScope::AutomaticModels,
     )?;
-    if candidates.is_empty() {
-        return Ok((provider, Vec::new(), Vec::new()));
-    }
-    let batch = run_candidate_batch_with_observations(candidates, |candidate| {
-        run_automatic_candidate_result(state, candidate)
-    })
-    .await?;
-    Ok((provider, batch.records, batch.observations))
+    Ok((provider, candidates))
 }
 
 fn compile_preflight_candidates_with_saved_evidence(
@@ -1738,6 +1876,7 @@ where
     Ok(run_protocol_compatibility_probe_with_reporter(candidate, &client, reporter).await)
 }
 
+#[cfg(test)]
 async fn run_automatic_candidate_result(
     state: &AppState,
     candidate: ProbeCandidate,
@@ -1748,6 +1887,36 @@ async fn run_automatic_candidate_result(
     .await
 }
 
+async fn run_automatic_candidate_result_with_app(
+    app: &AppHandle,
+    candidate: ProbeCandidate,
+) -> Result<ProtocolCompatibilityProbeResult, String> {
+    let candidate_for_cache = candidate.clone();
+    let cached = crate::commands::run_app_state_blocking(app, move |state| {
+        if let Some(result) =
+            state.consume_protocol_probe_receipt(&candidate_for_cache.lease_key())?
+        {
+            return Ok(Some(result));
+        }
+        find_cached_candidate_result(state, &candidate_for_cache, Utc::now().timestamp())
+    })
+    .await?;
+    if let Some(result) = cached {
+        return Ok(result);
+    }
+
+    let candidate_for_lease = candidate.clone();
+    let lease = crate::commands::run_app_state_blocking(app, move |state| {
+        state.try_acquire_protocol_probe(&candidate_for_lease.lease_key())
+    })
+    .await?;
+    let client = crate::proxy::http_client::build_protocol_probe_client()?;
+    let result = run_protocol_compatibility_probe(candidate, &client).await;
+    drop(lease);
+    Ok(result)
+}
+
+#[cfg(test)]
 async fn run_explicit_candidate_result_with<F, Fut>(
     state: &AppState,
     candidate: ProbeCandidate,
@@ -1763,6 +1932,7 @@ where
     Ok(result)
 }
 
+#[cfg(test)]
 async fn run_automatic_candidate_result_with<F, Fut>(
     state: &AppState,
     candidate: ProbeCandidate,

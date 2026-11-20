@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -151,8 +151,15 @@ pub async fn set_tool_auto_update(
     if !super::misc::VALID_TOOLS.contains(&tool.as_str()) {
         return Err(format!("Unsupported tool: {tool}"));
     }
-    crate::settings::set_tool_auto_update(&tool, enabled).map_err(|error| error.to_string())?;
-    get_tool_auto_update_settings().await
+    super::run_command_blocking(move || {
+        crate::settings::set_tool_auto_update(&tool, enabled).map_err(|error| error.to_string())?;
+        let settings = crate::settings::get_settings();
+        Ok(super::misc::VALID_TOOLS
+            .iter()
+            .map(|&tool| (tool.to_string(), settings.tool_auto_update_enabled(tool)))
+            .collect())
+    })
+    .await
 }
 
 /// 保存设置
@@ -238,90 +245,100 @@ fn apply_settings_patch(settings: &mut crate::settings::AppSettings, patch: Sett
 /// Persist small UI changes without replaying a stale full settings snapshot.
 #[tauri::command]
 pub async fn patch_settings(patch: SettingsPatch) -> Result<(), String> {
-    crate::settings::mutate_settings(|settings| apply_settings_patch(settings, patch))
-        .map_err(|error| error.to_string())
+    super::run_command_blocking(move || {
+        crate::settings::mutate_settings(|settings| apply_settings_patch(settings, patch))
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn save_settings(
-    state: tauri::State<'_, crate::store::AppState>,
+    app: AppHandle,
     settings: crate::settings::AppSettings,
 ) -> Result<SettingsSaveResult, String> {
-    let existing = crate::settings::get_settings();
-    let merged = merge_settings_for_save(settings, &existing);
-    let env_injection = merged.env_injection.clone();
-    let watchdog_enabled = merged.watchdog_enabled;
-    let unify_codex_changed =
-        merged.unify_codex_session_history != existing.unify_codex_session_history;
-    let unify_codex_enabled = merged.unify_codex_session_history;
-    crate::settings::update_settings_preserving_dedicated_settings(merged)
-        .map_err(|e| e.to_string())?;
+    let (watchdog_enabled, env_injection) = super::run_app_state_blocking(&app, move |state| {
+        let existing = crate::settings::get_settings();
+        let merged = merge_settings_for_save(settings, &existing);
+        let env_injection = merged.env_injection.clone();
+        let watchdog_enabled = merged.watchdog_enabled;
+        let unify_codex_changed =
+            merged.unify_codex_session_history != existing.unify_codex_session_history;
+        let unify_codex_enabled = merged.unify_codex_session_history;
+        crate::settings::update_settings_preserving_dedicated_settings(merged)
+            .map_err(|e| e.to_string())?;
 
-    // 统一会话开关变更时立即重写当前官方 Codex 供应商的 live 配置，
-    // 不必等下一次切换才生效。
-    if unify_codex_changed {
-        // live 重写失败时回滚设置并把保存整体报失败：若设置保持已切换状态，
-        // live 仍跑旧桶，后续的历史迁移/还原会让会话再次分裂（开启=历史
-        // 迁走而新会话仍写 openai 桶；关闭=会话还原而 live 仍写 custom）。
-        // 报错让前端 saved=false 短路还原；回滚是整次保存的事务语义
-        // （本开关的保存只携带开关相关字段）。
-        if let Err(err) =
-            crate::services::provider::reapply_current_codex_official_live(state.inner())
-        {
-            log::warn!("统一 Codex 会话历史开关变更后重写 live 配置失败，回滚设置: {err}");
-            if let Err(rollback_err) = crate::settings::mutate_settings(|current| {
-                restore_codex_history_unify_settings(current, &existing);
-            }) {
-                log::error!("回滚统一会话开关设置失败: {rollback_err}");
+        // 统一会话开关变更时立即重写当前官方 Codex 供应商的 live 配置，
+        // 不必等下一次切换才生效。
+        if unify_codex_changed {
+            // live 重写失败时回滚设置并把保存整体报失败：若设置保持已切换状态，
+            // live 仍跑旧桶，后续的历史迁移/还原会让会话再次分裂（开启=历史
+            // 迁走而新会话仍写 openai 桶；关闭=会话还原而 live 仍写 custom）。
+            // 报错让前端 saved=false 短路还原；回滚是整次保存的事务语义
+            // （本开关的保存只携带开关相关字段）。
+            if let Err(err) = crate::services::provider::reapply_current_codex_official_live(state) {
+                log::warn!("统一 Codex 会话历史开关变更后重写 live 配置失败，回滚设置: {err}");
+                if let Err(rollback_err) = crate::settings::mutate_settings(|current| {
+                    restore_codex_history_unify_settings(current, &existing);
+                }) {
+                    log::error!("回滚统一会话开关设置失败: {rollback_err}");
+                }
+                return Err(format!(
+                    "统一 Codex 会话历史开关未生效（live 配置重写失败）: {err}"
+                ));
             }
-            return Err(format!(
-                "统一 Codex 会话历史开关未生效（live 配置重写失败）: {err}"
-            ));
-        }
 
-        if unify_codex_enabled {
-            // 后台执行存量迁移（openai 桶 → custom 桶；仅当用户勾选了迁入既有
-            // 会话，函数内部自门控）。大会话目录可能要读数秒，不能阻塞设置保存；
-            // 失败时不写完成标记，下次启动自动重试。
-            tauri::async_runtime::spawn_blocking(|| {
-                match crate::codex_history_migration::maybe_migrate_codex_official_history_to_unified_bucket() {
-                    Ok(outcome) => {
-                        if let Some(reason) = outcome.skipped_reason {
-                            log::debug!("○ Codex official history unify migration skipped: {reason}");
-                        } else {
-                            log::info!(
-                                "✓ Codex official history unify migration completed: jsonl_files={}, state_rows={}",
-                                outcome.migrated_jsonl_files,
-                                outcome.migrated_state_rows
-                            );
+            if unify_codex_enabled {
+                // 后台执行存量迁移（openai 桶 → custom 桶；仅当用户勾选了迁入既有
+                // 会话，函数内部自门控）。大会话目录可能要读数秒，不能阻塞设置保存；
+                // 失败时不写完成标记，下次启动自动重试。
+                tauri::async_runtime::spawn_blocking(|| {
+                    match crate::codex_history_migration::maybe_migrate_codex_official_history_to_unified_bucket() {
+                        Ok(outcome) => {
+                            if let Some(reason) = outcome.skipped_reason {
+                                log::debug!("○ Codex official history unify migration skipped: {reason}");
+                            } else {
+                                log::info!(
+                                    "✓ Codex official history unify migration completed: jsonl_files={}, state_rows={}",
+                                    outcome.migrated_jsonl_files,
+                                    outcome.migrated_state_rows
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("✗ Codex official history unify migration failed: {e}");
                         }
                     }
-                    Err(e) => {
-                        log::warn!("✗ Codex official history unify migration failed: {e}");
-                    }
+                });
+            } else {
+                // 清除标记与迁移意愿，让重新开启并再次勾选时能补迁
+                // 关闭期间落入 openai 桶的官方会话。
+                if let Err(err) = crate::settings::clear_codex_official_history_unify_migration() {
+                    log::warn!("清除统一会话迁移标记失败: {err}");
                 }
-            });
-        } else {
-            // 清除标记与迁移意愿，让重新开启并再次勾选时能补迁
-            // 关闭期间落入 openai 桶的官方会话。
-            if let Err(err) = crate::settings::clear_codex_official_history_unify_migration() {
-                log::warn!("清除统一会话迁移标记失败: {err}");
-            }
-            if let Err(err) = crate::settings::clear_codex_unify_migrate_existing() {
-                log::warn!("清除统一会话迁移意愿失败: {err}");
+                if let Err(err) = crate::settings::clear_codex_unify_migrate_existing() {
+                    log::warn!("清除统一会话迁移意愿失败: {err}");
+                }
             }
         }
-    }
+        let env_injection = crate::env_injection::sync_to_live_configs(&env_injection);
+        Ok((watchdog_enabled, env_injection))
+    })
+    .await?;
     if watchdog_enabled {
-        let watchdog_port = state
+        let watchdog_port = app
+            .state::<crate::store::AppState>()
             .db
             .get_proxy_config()
             .await
             .map(|config| config.listen_port)
             .unwrap_or(0);
-        crate::watchdog::ensure_supervisor(&crate::config::get_app_config_dir(), watchdog_port);
+        super::run_command_blocking(move || {
+            crate::watchdog::ensure_supervisor(&crate::config::get_app_config_dir(), watchdog_port);
+            Ok(())
+        })
+        .await?;
     }
-    let env_injection = crate::env_injection::sync_to_live_configs(&env_injection);
     Ok(SettingsSaveResult {
         settings_saved: true,
         env_injection,
@@ -334,7 +351,10 @@ pub async fn save_settings(
 pub async fn save_request_health_settings(
     config: crate::settings::RequestHealthConfig,
 ) -> Result<crate::settings::RequestHealthConfig, String> {
-    crate::settings::update_request_health_config(config).map_err(|e| e.to_string())
+    super::run_command_blocking(move || {
+        crate::settings::update_request_health_config(config).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Persist the master switch without publishing other Request Health drafts.
@@ -342,25 +362,34 @@ pub async fn save_request_health_settings(
 pub async fn set_request_health_enabled(
     enabled: bool,
 ) -> Result<crate::settings::RequestHealthConfig, String> {
-    crate::settings::set_request_health_enabled(enabled).map_err(|e| e.to_string())
+    super::run_command_blocking(move || {
+        crate::settings::set_request_health_enabled(enabled).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn inspect_env_injection_status(
 ) -> Result<crate::env_injection::EnvInjectionSyncReport, String> {
-    let settings = crate::settings::get_settings();
-    Ok(crate::env_injection::inspect_status(
-        &settings.env_injection,
-    ))
+    super::run_command_blocking(|| {
+        let settings = crate::settings::get_settings();
+        Ok(crate::env_injection::inspect_status(
+            &settings.env_injection,
+        ))
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn retry_env_injection_sync(
 ) -> Result<crate::env_injection::EnvInjectionSyncReport, String> {
-    let settings = crate::settings::get_settings();
-    Ok(crate::env_injection::sync_to_live_configs(
-        &settings.env_injection,
-    ))
+    super::run_command_blocking(|| {
+        let settings = crate::settings::get_settings();
+        Ok(crate::env_injection::sync_to_live_configs(
+            &settings.env_injection,
+        ))
+    })
+    .await
 }
 
 #[derive(serde::Serialize)]
@@ -376,7 +405,10 @@ pub struct CodexUnifyHistoryRestoreResult {
 /// 是否存在统一会话开关的迁移备份（决定关闭弹窗里是否显示"恢复备份"勾选）。
 #[tauri::command]
 pub async fn has_codex_unify_history_backup() -> Result<bool, String> {
-    Ok(crate::codex_history_migration::has_codex_official_history_unify_backup())
+    super::run_command_blocking(|| {
+        Ok(crate::codex_history_migration::has_codex_official_history_unify_backup())
+    })
+    .await
 }
 
 /// 按迁移备份账本把当时迁入共享桶的官方会话还原回 "openai" 桶。
@@ -545,8 +577,11 @@ pub async fn check_app_update(app: AppHandle) -> Result<Option<AppUpdateInfo>, S
 /// 获取 app_config_dir 覆盖配置 (从 Store)
 #[tauri::command]
 pub async fn get_app_config_dir_override(app: AppHandle) -> Result<Option<String>, String> {
-    Ok(crate::app_store::refresh_app_config_dir_override(&app)
-        .map(|p| p.to_string_lossy().to_string()))
+    super::run_command_blocking(move || {
+        Ok(crate::app_store::refresh_app_config_dir_override(&app)
+            .map(|p| p.to_string_lossy().to_string()))
+    })
+    .await
 }
 
 /// 设置 app_config_dir 覆盖配置 (到 Store)
@@ -555,19 +590,27 @@ pub async fn set_app_config_dir_override(
     app: AppHandle,
     path: Option<String>,
 ) -> Result<bool, String> {
-    crate::app_store::set_app_config_dir_to_store(&app, path.as_deref())?;
-    Ok(true)
+    super::run_command_blocking(move || {
+        crate::app_store::set_app_config_dir_to_store(&app, path.as_deref())?;
+        Ok(true)
+    })
+    .await
 }
 
 /// 设置开机自启
 #[tauri::command]
 pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
-    if enabled {
-        crate::auto_launch::enable_auto_launch().map_err(|e| format!("启用开机自启失败: {e}"))?;
-    } else {
-        crate::auto_launch::disable_auto_launch().map_err(|e| format!("禁用开机自启失败: {e}"))?;
-    }
-    Ok(true)
+    super::run_command_blocking(move || {
+        if enabled {
+            crate::auto_launch::enable_auto_launch()
+                .map_err(|e| format!("启用开机自启失败: {e}"))?;
+        } else {
+            crate::auto_launch::disable_auto_launch()
+                .map_err(|e| format!("禁用开机自启失败: {e}"))?;
+        }
+        Ok(true)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1271,100 +1314,126 @@ mod tests {
 /// 获取开机自启状态
 #[tauri::command]
 pub async fn get_auto_launch_status() -> Result<bool, String> {
-    crate::auto_launch::is_auto_launch_enabled().map_err(|e| format!("获取开机自启状态失败: {e}"))
+    super::run_command_blocking(|| {
+        crate::auto_launch::is_auto_launch_enabled()
+            .map_err(|e| format!("获取开机自启状态失败: {e}"))
+    })
+    .await
 }
 
 /// 获取整流器配置
 #[tauri::command]
 pub async fn get_rectifier_config(
-    state: tauri::State<'_, crate::AppState>,
+    app: AppHandle,
 ) -> Result<crate::proxy::types::RectifierConfig, String> {
-    state.db.get_rectifier_config().map_err(|e| e.to_string())
+    super::run_app_state_blocking(&app, |state| {
+        state.db.get_rectifier_config().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// 设置整流器配置
 #[tauri::command]
 pub async fn set_rectifier_config(
-    state: tauri::State<'_, crate::AppState>,
+    app: AppHandle,
     config: crate::proxy::types::RectifierConfig,
 ) -> Result<bool, String> {
-    state
-        .db
-        .set_rectifier_config(&config)
-        .map_err(|e| e.to_string())?;
-    Ok(true)
+    super::run_app_state_blocking(&app, move |state| {
+        state
+            .db
+            .set_rectifier_config(&config)
+            .map_err(|e| e.to_string())?;
+        Ok(true)
+    })
+    .await
 }
 
 /// 获取优化器配置
 #[tauri::command]
 pub async fn get_optimizer_config(
-    state: tauri::State<'_, crate::AppState>,
+    app: AppHandle,
 ) -> Result<crate::proxy::types::OptimizerConfig, String> {
-    state.db.get_optimizer_config().map_err(|e| e.to_string())
+    super::run_app_state_blocking(&app, |state| {
+        state.db.get_optimizer_config().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// 设置优化器配置
 #[tauri::command]
 pub async fn set_optimizer_config(
-    state: tauri::State<'_, crate::AppState>,
+    app: AppHandle,
     config: crate::proxy::types::OptimizerConfig,
 ) -> Result<bool, String> {
-    state
-        .db
-        .set_optimizer_config(&config)
-        .map_err(|e| e.to_string())?;
-    Ok(true)
+    super::run_app_state_blocking(&app, move |state| {
+        state
+            .db
+            .set_optimizer_config(&config)
+            .map_err(|e| e.to_string())?;
+        Ok(true)
+    })
+    .await
 }
 
 /// 获取 Copilot 优化器配置
 #[tauri::command]
 pub async fn get_copilot_optimizer_config(
-    state: tauri::State<'_, crate::AppState>,
+    app: AppHandle,
 ) -> Result<crate::proxy::types::CopilotOptimizerConfig, String> {
-    state
-        .db
-        .get_copilot_optimizer_config()
-        .map_err(|e| e.to_string())
+    super::run_app_state_blocking(&app, |state| {
+        state
+            .db
+            .get_copilot_optimizer_config()
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// 设置 Copilot 优化器配置
 #[tauri::command]
 pub async fn set_copilot_optimizer_config(
-    state: tauri::State<'_, crate::AppState>,
+    app: AppHandle,
     config: crate::proxy::types::CopilotOptimizerConfig,
 ) -> Result<bool, String> {
-    state
-        .db
-        .set_copilot_optimizer_config(&config)
-        .map_err(|e| e.to_string())?;
-    Ok(true)
+    super::run_app_state_blocking(&app, move |state| {
+        state
+            .db
+            .set_copilot_optimizer_config(&config)
+            .map_err(|e| e.to_string())?;
+        Ok(true)
+    })
+    .await
 }
 
 /// 获取日志配置
 #[tauri::command]
-pub async fn get_log_config(
-    state: tauri::State<'_, crate::AppState>,
-) -> Result<crate::proxy::types::LogConfig, String> {
-    state.db.get_log_config().map_err(|e| e.to_string())
+pub async fn get_log_config(app: AppHandle) -> Result<crate::proxy::types::LogConfig, String> {
+    super::run_app_state_blocking(&app, |state| {
+        state.db.get_log_config().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// 设置日志配置
 #[tauri::command]
 pub async fn set_log_config(
-    state: tauri::State<'_, crate::AppState>,
+    app: AppHandle,
     config: crate::proxy::types::LogConfig,
 ) -> Result<bool, String> {
-    state
-        .db
-        .set_log_config(&config)
-        .map_err(|e| e.to_string())?;
-    log::set_max_level(config.to_level_filter());
-    log::info!(
-        "日志配置已更新: enabled={}, level={}",
-        config.enabled,
-        config.level
-    );
-    Ok(true)
+    super::run_app_state_blocking(&app, move |state| {
+        state
+            .db
+            .set_log_config(&config)
+            .map_err(|e| e.to_string())?;
+        log::set_max_level(config.to_level_filter());
+        log::info!(
+            "日志配置已更新: enabled={}, level={}",
+            config.enabled,
+            config.level
+        );
+        Ok(true)
+    })
+    .await
 }
 
 /// 打开应用日志目录。
@@ -1373,14 +1442,17 @@ pub async fn set_log_config(
 /// 以及 Codex MultiRouter 的 `codex-router.log`。`crash.log` 位于同级配置目录。
 #[tauri::command]
 pub async fn open_log_dir(app: AppHandle) -> Result<bool, String> {
-    let log_dir = crate::app_exit_monitor::log_dir_path();
-    if !log_dir.exists() {
-        std::fs::create_dir_all(&log_dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
-    }
+    let log_dir = super::run_command_blocking(|| {
+        let log_dir = crate::app_exit_monitor::log_dir_path();
+        if !log_dir.exists() {
+            std::fs::create_dir_all(&log_dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
+        }
+        Ok(log_dir.to_string_lossy().to_string())
+    })
+    .await?;
 
     app.opener()
-        .open_path(log_dir.to_string_lossy().to_string(), None::<String>)
+        .open_path(log_dir, None::<String>)
         .map_err(|e| format!("打开日志目录失败: {e}"))?;
-
     Ok(true)
 }

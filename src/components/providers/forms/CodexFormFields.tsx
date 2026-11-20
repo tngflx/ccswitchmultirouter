@@ -149,6 +149,27 @@ import type {
 } from "@/types/codexSubagentV2";
 
 const EMPTY_CODEX_API_KEY_GROUPS: CodexApiKeyGroup[] = [];
+const REASONING_LOOKUP_CONCURRENCY = 6;
+
+export async function resolveCodexReasoningCapabilities(
+  models: string[],
+  lookup: (model: string) => Promise<CodexModelReasoningResolution>,
+  isCancelled: () => boolean = () => false,
+): Promise<Array<readonly [string, CodexModelReasoningResolution]>> {
+  const results: Array<readonly [string, CodexModelReasoningResolution]> = [];
+  for (
+    let index = 0;
+    index < models.length && !isCancelled();
+    index += REASONING_LOOKUP_CONCURRENCY
+  ) {
+    const batch = models.slice(index, index + REASONING_LOOKUP_CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map(async (model) => [model, await lookup(model)] as const),
+    );
+    results.push(...batchResults);
+  }
+  return results;
+}
 
 interface EndpointCandidate {
   url: string;
@@ -1148,7 +1169,7 @@ export function CodexFormFields({
   const [redetectingReasoningModel, setRedetectingReasoningModel] = useState<
     string | null
   >(null);
-  const reasoningResolutionRequestRef = useRef(0);
+  const reasoningResolutionTailRef = useRef<Promise<void>>(Promise.resolve());
   const reasoningDetectionRequestRef = useRef(0);
   const [isProtocolProbeConfirmOpen, setIsProtocolProbeConfirmOpen] =
     useState(false);
@@ -1384,39 +1405,36 @@ export function CodexFormFields({
       });
       return;
     }
-    const requestId = ++reasoningResolutionRequestRef.current;
     let cancelled = false;
-    void Promise.all(
-      models.map(async (model) => {
-        try {
-          return [
-            model,
-            await codexSubagentV2Api.resolveModelReasoningCapability(
-              reasoningSettingsConfig,
-              providerId ?? "codex-draft",
-              model,
-            ),
-          ] as const;
-        } catch {
-          console.warn("[CodexFormFields] reasoning resolution failed", {
-            model,
-          });
-          return [model, unknownReasoningResolution(model)] as const;
-        }
-      }),
-    ).then((results) => {
-      if (cancelled || requestId !== reasoningResolutionRequestRef.current) {
-        return;
-      }
-      const next: Record<string, CodexModelReasoningResolution> = {};
-      for (const result of results) {
-        if (result) next[result[0]] = result[1];
-      }
-      setReasoningResolutionState({
-        contextKey: reasoningContextKey,
-        models: next,
+    // Let the previous viewport's active batch finish before issuing more IPC.
+    reasoningResolutionTailRef.current =
+      reasoningResolutionTailRef.current.then(async () => {
+        const results = await resolveCodexReasoningCapabilities(
+          models,
+          async (model) => {
+            try {
+              return await codexSubagentV2Api.resolveModelReasoningCapability(
+                reasoningSettingsConfig,
+                providerId ?? "codex-draft",
+                model,
+              );
+            } catch {
+              console.warn("[CodexFormFields] reasoning resolution failed", {
+                model,
+              });
+              return unknownReasoningResolution(model);
+            }
+          },
+          () => cancelled,
+        );
+        if (cancelled) return;
+        const next: Record<string, CodexModelReasoningResolution> = {};
+        for (const result of results) next[result[0]] = result[1];
+        setReasoningResolutionState({
+          contextKey: reasoningContextKey,
+          models: next,
+        });
       });
-    });
     return () => {
       cancelled = true;
     };

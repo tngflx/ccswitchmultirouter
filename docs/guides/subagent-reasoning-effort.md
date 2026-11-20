@@ -61,7 +61,13 @@ Generated managed role files, previews, and status are derived from current
 canonical settings. At the proxy request boundary, explicit Codex child markers
 (`x-openai-subagent` header or its top-level `client_metadata` equivalent)
 authorize the same override before protocol conversion. For a marked child,
-the router uses the plan's saved effort and the routed model's capabilities.
+the router uses the plan's saved effort and the routed model's capabilities. A
+High child policy is promoted to native Max for Sublyx when the same router and
+installation observed an exact parent turn requesting Max or Ultra within the
+six-hour lineage window. The match requires the parent thread and turn ids,
+and unrelated routers, installations, turns, expired observations, and
+non-generation requests do not promote a child. This lineage evidence is
+bounded to the most recent 1,024 turns and is kept in memory only.
 In **Profile settings** mode, the child uses its own reasoning policy. Main-agent
 reasoning follows the main request and the provider model's mapping. The
 Sub-Agent override applies to Responses and Chat generation endpoints. For

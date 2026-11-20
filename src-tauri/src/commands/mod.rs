@@ -112,7 +112,20 @@ where
     .await
 }
 
-async fn run_command_blocking<T>(
+/// Run synchronous work against a shared state clone on a blocking worker.
+/// The clone retains the process-wide Arc-backed caches and coordination locks.
+pub(crate) async fn run_state_blocking<T>(
+    state: &crate::store::AppState,
+    work: impl FnOnce(&crate::store::AppState) -> Result<T, String> + Send + 'static,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+{
+    let state = state.clone();
+    run_command_blocking(move || work(&state)).await
+}
+
+pub(crate) async fn run_command_blocking<T>(
     work: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String>
 where

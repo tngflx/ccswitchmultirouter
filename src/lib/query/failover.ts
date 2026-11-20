@@ -127,6 +127,8 @@ export function useAddToFailoverQueue() {
   const queryClient = useQueryClient();
 
   return useMutation({
+    mutationKey: ["addToFailoverQueue"],
+    scope: { id: "failoverQueue" },
     mutationFn: ({
       appType,
       providerId,
@@ -155,6 +157,8 @@ export function useRemoveFromFailoverQueue() {
   const queryClient = useQueryClient();
 
   return useMutation({
+    mutationKey: ["removeFromFailoverQueue"],
+    scope: { id: "failoverQueue" },
     mutationFn: ({
       appType,
       providerId,

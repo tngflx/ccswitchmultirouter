@@ -8,6 +8,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -187,6 +188,7 @@ pub struct XaiOAuthStatus {
     pub username: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct XaiOAuthManager {
     accounts: Arc<RwLock<HashMap<String, XaiAccountData>>>,
     default_account_id: Arc<RwLock<Option<String>>>,
@@ -436,7 +438,14 @@ impl XaiOAuthManager {
     }
 
     pub async fn remove_account(&self, account_id: &str) -> Result<(), XaiOAuthError> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let account_id = account_id.to_string();
+        self.commit_mutation(move |manager| async move {
+            manager.remove_account_inner(&account_id).await
+        })
+        .await
+    }
+
+    async fn remove_account_inner(&self, account_id: &str) -> Result<(), XaiOAuthError> {
         let mut accounts = self.accounts.read().await.clone();
         if accounts.remove(account_id).is_none() {
             return Err(XaiOAuthError::AccountNotFound(account_id.to_string()));
@@ -455,7 +464,14 @@ impl XaiOAuthManager {
     }
 
     pub async fn set_default_account(&self, account_id: &str) -> Result<(), XaiOAuthError> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let account_id = account_id.to_string();
+        self.commit_mutation(move |manager| async move {
+            manager.set_default_account_inner(&account_id).await
+        })
+        .await
+    }
+
+    async fn set_default_account_inner(&self, account_id: &str) -> Result<(), XaiOAuthError> {
         let accounts = self.accounts.read().await.clone();
         let account = accounts
             .get(account_id)
@@ -468,10 +484,20 @@ impl XaiOAuthManager {
     }
 
     pub async fn clear_auth(&self) -> Result<(), XaiOAuthError> {
-        let _mutation_guard = self.mutation_lock.lock().await;
-        if self.storage_path.exists() {
-            fs::remove_file(&self.storage_path)?;
-        }
+        self.commit_mutation(|manager| async move { manager.clear_auth_inner().await })
+            .await
+    }
+
+    async fn clear_auth_inner(&self) -> Result<(), XaiOAuthError> {
+        let storage_path = self.storage_path.clone();
+        tokio::task::spawn_blocking(move || {
+            if storage_path.exists() {
+                fs::remove_file(storage_path)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|error| XaiOAuthError::IoError(error.to_string()))??;
         *self.accounts.write().await = HashMap::new();
         *self.default_account_id.write().await = None;
         self.access_tokens.write().await.clear();
@@ -561,7 +587,29 @@ impl XaiOAuthManager {
         pending_device_code: Option<&str>,
         cached_access_token: Option<CachedAccessToken>,
     ) -> Result<XaiOAuthAccount, XaiOAuthError> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let pending_device_code = pending_device_code.map(str::to_owned);
+        self.commit_mutation(move |manager| async move {
+            manager
+                .commit_login(
+                    account_id,
+                    login,
+                    refresh_token,
+                    pending_device_code.as_deref(),
+                    cached_access_token,
+                )
+                .await
+        })
+        .await
+    }
+
+    async fn commit_login(
+        &self,
+        account_id: String,
+        login: Option<String>,
+        refresh_token: String,
+        pending_device_code: Option<&str>,
+        cached_access_token: Option<CachedAccessToken>,
+    ) -> Result<XaiOAuthAccount, XaiOAuthError> {
         if let Some(device_code) = pending_device_code {
             let login_is_pending = self
                 .pending_device_codes
@@ -609,7 +657,22 @@ impl XaiOAuthManager {
         expected_refresh_token: &str,
         tokens: OAuthTokenResponse,
     ) -> Result<String, XaiOAuthError> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let account_id = account_id.to_owned();
+        let expected_refresh_token = expected_refresh_token.to_owned();
+        self.commit_mutation(move |manager| async move {
+            manager
+                .apply_refreshed_tokens(&account_id, &expected_refresh_token, tokens)
+                .await
+        })
+        .await
+    }
+
+    async fn apply_refreshed_tokens(
+        &self,
+        account_id: &str,
+        expected_refresh_token: &str,
+        tokens: OAuthTokenResponse,
+    ) -> Result<String, XaiOAuthError> {
         let mut accounts = self.accounts.read().await.clone();
         let account = accounts
             .get_mut(account_id)
@@ -653,7 +716,14 @@ impl XaiOAuthManager {
     }
 
     async fn mark_reauth_required(&self, account_id: &str) -> Result<(), XaiOAuthError> {
-        let _mutation_guard = self.mutation_lock.lock().await;
+        let account_id = account_id.to_owned();
+        self.commit_mutation(move |manager| async move {
+            manager.mark_reauth_required_inner(&account_id).await
+        })
+        .await
+    }
+
+    async fn mark_reauth_required_inner(&self, account_id: &str) -> Result<(), XaiOAuthError> {
         let mut accounts = self.accounts.read().await.clone();
         let account = accounts
             .get_mut(account_id)
@@ -678,10 +748,27 @@ impl XaiOAuthManager {
         };
         let content = serde_json::to_string_pretty(&store)
             .map_err(|error| XaiOAuthError::ParseError(error.to_string()))?;
-        self.write_store_atomic(&content)?;
+        self.write_store_atomic_async(content).await?;
         *self.accounts.write().await = accounts;
         *self.default_account_id.write().await = default_account_id;
         Ok(())
+    }
+
+    async fn commit_mutation<T, F, Fut>(&self, mutate: F) -> Result<T, XaiOAuthError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Self) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, XaiOAuthError>> + Send + 'static,
+    {
+        let guard = self.mutation_lock.clone().lock_owned().await;
+        let manager = self.clone();
+        // Caller cancellation must leave both the disk write and its memory updates running.
+        tokio::spawn(async move {
+            let _guard = guard;
+            mutate(manager).await
+        })
+        .await
+        .map_err(|error| XaiOAuthError::IoError(error.to_string()))?
     }
 
     async fn cached_token(&self, account_id: &str) -> Option<String> {
@@ -802,14 +889,12 @@ impl XaiOAuthManager {
         Ok(())
     }
 
-    fn write_store_atomic(&self, content: &str) -> Result<(), XaiOAuthError> {
-        let parent = self
-            .storage_path
+    fn write_store_atomic(path: &std::path::Path, content: &str) -> Result<(), XaiOAuthError> {
+        let parent = path
             .parent()
             .ok_or_else(|| XaiOAuthError::IoError("无效的存储路径".to_string()))?;
         fs::create_dir_all(parent)?;
-        let file_name = self
-            .storage_path
+        let file_name = path
             .file_name()
             .ok_or_else(|| XaiOAuthError::IoError("无效的存储文件名".to_string()))?
             .to_string_lossy();
@@ -830,8 +915,8 @@ impl XaiOAuthManager {
                     .open(&temporary_path)?;
                 file.write_all(content.as_bytes())?;
                 file.flush()?;
-                fs::rename(&temporary_path, &self.storage_path)?;
-                fs::set_permissions(&self.storage_path, fs::Permissions::from_mode(0o600))?;
+                fs::rename(&temporary_path, path)?;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
                 Ok(())
             })();
             if result.is_err() {
@@ -849,10 +934,10 @@ impl XaiOAuthManager {
                     .open(&temporary_path)?;
                 file.write_all(content.as_bytes())?;
                 file.flush()?;
-                if self.storage_path.exists() {
-                    fs::remove_file(&self.storage_path)?;
+                if path.exists() {
+                    fs::remove_file(path)?;
                 }
-                fs::rename(&temporary_path, &self.storage_path)?;
+                fs::rename(&temporary_path, path)?;
                 Ok(())
             })();
             if result.is_err() {
@@ -860,6 +945,14 @@ impl XaiOAuthManager {
             }
             result?;
         }
+        Ok(())
+    }
+
+    async fn write_store_atomic_async(&self, content: String) -> Result<(), XaiOAuthError> {
+        let storage_path = self.storage_path.clone();
+        tokio::task::spawn_blocking(move || Self::write_store_atomic(&storage_path, &content))
+            .await
+            .map_err(|error| XaiOAuthError::IoError(error.to_string()))??;
         Ok(())
     }
 }
@@ -1351,5 +1444,48 @@ mod tests {
         assert!(manager.list_accounts().await.is_empty());
         assert!(manager.access_tokens.read().await.is_empty());
         assert!(!data_dir.path().join("xai_oauth_auth.json").exists());
+    }
+
+    #[test]
+    fn cancelled_persistence_cannot_overtake_clear_auth() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let data_dir = tempfile::tempdir().unwrap();
+            let manager = XaiOAuthManager::new(data_dir.path().to_path_buf());
+
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.blocking_recv();
+            });
+            started_rx.await.unwrap();
+
+            let mut login = Box::pin(manager.add_account_internal(
+                "account-one".to_string(),
+                None,
+                "test-refresh-token".to_string(),
+                None,
+                None,
+            ));
+            assert!(futures::poll!(&mut login).is_pending());
+            drop(login);
+            assert!(manager.mutation_lock.try_lock().is_err());
+
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            {
+                let _guard = manager.mutation_lock.lock().await;
+                assert_eq!(manager.list_accounts().await[0].id, "account-one");
+                assert!(manager.storage_path.exists());
+            }
+            manager.clear_auth().await.unwrap();
+            assert!(manager.list_accounts().await.is_empty());
+            assert!(!manager.storage_path.exists());
+        });
     }
 }

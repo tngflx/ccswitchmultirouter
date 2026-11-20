@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = fileURLToPath(new URL("../", import.meta.url));
 const POWERSHELL_FILE = /\.(?:ps1|psm1|psd1)$/iu;
+const INVENTORY_MAX_BUFFER = 16 * 1024 * 1024;
 
 export function assertNoPowerShellScriptPaths(paths) {
   const forbidden = paths.filter((name) => POWERSHELL_FILE.test(name));
@@ -26,6 +27,7 @@ function repositoryFiles(repoRoot) {
         cwd: repoRoot,
         encoding: "utf8",
         windowsHide: true,
+        maxBuffer: INVENTORY_MAX_BUFFER,
       },
     );
   } catch {

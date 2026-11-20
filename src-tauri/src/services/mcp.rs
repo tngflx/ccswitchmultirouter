@@ -1,10 +1,13 @@
 use indexmap::IndexMap;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::app_config::{AppType, McpServer};
 use crate::error::AppError;
 use crate::mcp;
 use crate::store::AppState;
+
+static MCP_PROJECTION_LOCK: Mutex<()> = Mutex::new(());
 
 /// MCP 相关业务逻辑（v3.7.0 统一结构）
 pub struct McpService;
@@ -17,55 +20,31 @@ impl McpService {
 
     /// 添加或更新 MCP 服务器
     pub fn upsert_server(state: &AppState, server: McpServer) -> Result<(), AppError> {
-        // 读取旧状态：用于处理“编辑时取消勾选某个应用”的场景（需要从对应 live 配置中移除）
-        let prev_apps = state
-            .db
-            .get_all_mcp_servers()?
+        let _guard = MCP_PROJECTION_LOCK.lock()?;
+        let previous = Self::get_all_servers(state)?;
+        let disabled_apps = previous
             .get(&server.id)
-            .map(|s| s.apps.clone())
-            .unwrap_or_default();
-
-        state.db.save_mcp_server(&server)?;
-
-        // 处理禁用：若旧版本启用但新版本取消，则需要从该应用的 live 配置移除
-        if prev_apps.claude && !server.apps.claude {
-            Self::remove_server_from_app(state, &server.id, &AppType::Claude)?;
-        }
-        if prev_apps.codex && !server.apps.codex {
-            Self::remove_server_from_app(state, &server.id, &AppType::Codex)?;
-        }
-        if prev_apps.gemini && !server.apps.gemini {
-            Self::remove_server_from_app(state, &server.id, &AppType::Gemini)?;
-        }
-        if prev_apps.grokbuild && !server.apps.grokbuild {
-            Self::remove_server_from_app(state, &server.id, &AppType::GrokBuild)?;
-        }
-        if prev_apps.opencode && !server.apps.opencode {
-            Self::remove_server_from_app(state, &server.id, &AppType::OpenCode)?;
-        }
-        if prev_apps.hermes && !server.apps.hermes {
-            Self::remove_server_from_app(state, &server.id, &AppType::Hermes)?;
-        }
-
-        // 同步到各个启用的应用
-        Self::sync_server_to_apps(state, &server)?;
-
-        Ok(())
+            .into_iter()
+            .flat_map(|previous| previous.apps.enabled_apps())
+            .filter(|app| !server.apps.is_enabled_for(app));
+        let apps = disabled_apps.chain(server.apps.enabled_apps());
+        Self::apply_server_change(state, &previous, &server.id, Some(&server), apps, || {
+            state.db.save_mcp_server(&server)
+        })
     }
 
     /// 删除 MCP 服务器
     pub fn delete_server(state: &AppState, id: &str) -> Result<bool, AppError> {
-        let server = state.db.get_all_mcp_servers()?.shift_remove(id);
-
-        if let Some(server) = server {
-            state.db.delete_mcp_server(id)?;
-
-            // 从所有应用的 live 配置中移除
-            Self::remove_server_from_all_apps(state, id, &server)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let _guard = MCP_PROJECTION_LOCK.lock()?;
+        let previous = Self::get_all_servers(state)?;
+        let Some(server) = previous.get(id) else {
+            return Ok(false);
+        };
+        let apps = server.apps.enabled_apps();
+        Self::apply_server_change(state, &previous, id, None, apps, || {
+            state.db.delete_mcp_server(id)
+        })?;
+        Ok(true)
     }
 
     /// 切换指定应用的启用状态
@@ -75,40 +54,95 @@ impl McpService {
         app: AppType,
         enabled: bool,
     ) -> Result<(), AppError> {
-        if let Some(server) = state
-            .db
-            .update_mcp_server_app_enabled(server_id, &app, enabled)?
-        {
-            // 同步到对应应用
-            if enabled {
-                Self::sync_server_to_app(state, &server, &app)?;
-            } else {
-                Self::remove_server_from_app(state, server_id, &app)?;
-            }
-        }
-
-        Ok(())
+        let _guard = MCP_PROJECTION_LOCK.lock()?;
+        let previous = Self::get_all_servers(state)?;
+        let Some(mut server) = previous.get(server_id).cloned() else {
+            return Ok(());
+        };
+        server.apps.set_enabled_for(&app, enabled);
+        Self::apply_server_change(
+            state,
+            &previous,
+            server_id,
+            Some(&server),
+            [app.clone()],
+            || {
+                state
+                    .db
+                    .update_mcp_server_app_enabled(server_id, &app, enabled)
+                    .map(|_| ())
+            },
+        )
     }
 
-    /// 将 MCP 服务器同步到所有启用的应用
-    fn sync_server_to_apps(state: &AppState, server: &McpServer) -> Result<(), AppError> {
-        for app in server.apps.enabled_apps() {
-            Self::sync_server_to_app(state, server, &app)?;
-        }
-
-        Ok(())
-    }
-
-    /// 将 MCP 服务器同步到指定应用
-    fn sync_server_to_app(
+    fn apply_server_change(
         state: &AppState,
-        server: &McpServer,
+        previous: &IndexMap<String, McpServer>,
+        id: &str,
+        next: Option<&McpServer>,
+        apps: impl IntoIterator<Item = AppType>,
+        commit: impl FnOnce() -> Result<(), AppError>,
+    ) -> Result<(), AppError> {
+        let mut desired = previous.clone();
+        if let Some(server) = next {
+            desired.insert(id.to_string(), server.clone());
+        } else {
+            desired.shift_remove(id);
+        }
+
+        // The database remains the last committed state until every live write succeeds.
+        let mut applied = Vec::new();
+        let result = (|| {
+            for app in apps {
+                Self::project_server_change(state, &desired, id, &app)?;
+                applied.push(app);
+            }
+            commit()
+        })();
+
+        if let Err(error) = result {
+            let mut failed_to_restore = Vec::new();
+            for app in applied.into_iter().rev() {
+                if let Err(restore_error) = Self::project_server_change(state, previous, id, &app) {
+                    log::error!(
+                        "MCP projection restore failed for {}: {restore_error}",
+                        app.as_str()
+                    );
+                    failed_to_restore.push(app);
+                }
+            }
+            if !failed_to_restore.is_empty() {
+                let apps = failed_to_restore
+                    .iter()
+                    .map(AppType::as_str)
+                    .collect::<Vec<_>>();
+                return Err(AppError::Message(format!(
+                    "{error}. Failed to restore MCP projection for {}",
+                    apps.join(", ")
+                )));
+            }
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    fn project_server_change(
+        state: &AppState,
+        servers: &IndexMap<String, McpServer>,
+        id: &str,
         app: &AppType,
     ) -> Result<(), AppError> {
         if matches!(app, AppType::Codex) {
-            return Self::sync_enabled_for_app(state, app);
+            return Self::project_servers_to_app(state, servers, app);
         }
-        Self::sync_server_to_app_no_config(server, app)
+        match servers
+            .get(id)
+            .filter(|server| server.apps.is_enabled_for(app))
+        {
+            Some(server) => Self::sync_server_to_app_no_config(server, app),
+            None => Self::remove_server_from_app(id, app),
+        }
     }
 
     fn sync_server_to_app_no_config(server: &McpServer, app: &AppType) -> Result<(), AppError> {
@@ -150,26 +184,13 @@ impl McpService {
         Ok(())
     }
 
-    /// 从所有曾启用过该服务器的应用中移除
-    fn remove_server_from_all_apps(
-        state: &AppState,
-        id: &str,
-        server: &McpServer,
-    ) -> Result<(), AppError> {
-        // 从所有曾启用的应用中移除
-        for app in server.apps.enabled_apps() {
-            Self::remove_server_from_app(state, id, &app)?;
-        }
-        Ok(())
-    }
-
-    fn remove_server_from_app(state: &AppState, id: &str, app: &AppType) -> Result<(), AppError> {
+    fn remove_server_from_app(id: &str, app: &AppType) -> Result<(), AppError> {
         match app {
             AppType::Claude => mcp::remove_server_from_claude(id)?,
             AppType::ClaudeDesktop => {
                 log::debug!("Claude Desktop 3P profiles do not use CC Switch MCP sync, skipping");
             }
-            AppType::Codex => return Self::sync_enabled_for_app(state, app),
+            AppType::Codex => unreachable!("Codex MCP sync requires database ownership context"),
             AppType::Gemini => mcp::remove_server_from_gemini(id)?,
             AppType::GrokBuild => mcp::remove_server_from_grokbuild(id)?,
             AppType::OpenCode => {
@@ -194,6 +215,7 @@ impl McpService {
     /// 应用的 MCP 状态陈旧。全部跑完后若有失败，聚合成一个错误上报，
     /// 保留调用方的可见性。
     pub fn sync_all_enabled(state: &AppState) -> Result<(), AppError> {
+        let _guard = MCP_PROJECTION_LOCK.lock()?;
         let servers = Self::get_all_servers(state)?;
 
         let mut failures: Vec<String> = Vec::new();
@@ -218,6 +240,7 @@ impl McpService {
     /// 定向重投影，避免把无关应用的失败面（如 ~/.claude.json 坏 JSON）
     /// 牵连进目标应用的关键路径。
     pub fn sync_enabled_for_app(state: &AppState, app: &AppType) -> Result<(), AppError> {
+        let _guard = MCP_PROJECTION_LOCK.lock()?;
         let servers = Self::get_all_servers(state)?;
         Self::project_servers_to_app(state, &servers, app)
     }
@@ -244,12 +267,8 @@ impl McpService {
             return mcp::sync_enabled_to_codex_with_ownership(state.db.as_ref(), &enabled);
         }
 
-        for server in servers.values() {
-            if server.apps.is_enabled_for(app) {
-                Self::sync_server_to_app(state, server, app)?;
-            } else {
-                Self::remove_server_from_app(state, &server.id, app)?;
-            }
+        for id in servers.keys() {
+            Self::project_server_change(state, servers, id, app)?;
         }
 
         Ok(())
@@ -292,11 +311,16 @@ impl McpService {
     /// [已废弃] 同步启用的 MCP 到指定应用（兼容旧 API）
     #[deprecated(since = "3.7.0", note = "Use sync_all_enabled instead")]
     pub fn sync_enabled(state: &AppState, app: AppType) -> Result<(), AppError> {
+        let _guard = MCP_PROJECTION_LOCK.lock()?;
         let servers = Self::get_all_servers(state)?;
+
+        if matches!(app, AppType::Codex) {
+            return Self::project_servers_to_app(state, &servers, &app);
+        }
 
         for server in servers.values() {
             if server.apps.is_enabled_for(&app) {
-                Self::sync_server_to_app(state, server, &app)?;
+                Self::sync_server_to_app_no_config(server, &app)?;
             }
         }
 
@@ -305,6 +329,7 @@ impl McpService {
 
     /// 从 Claude 导入 MCP（v3.7.0 已更新为统一结构）
     pub fn import_from_claude(state: &AppState) -> Result<usize, AppError> {
+        let _guard = MCP_PROJECTION_LOCK.lock()?;
         // 创建临时 MultiAppConfig 用于导入
         let mut temp_config = crate::app_config::MultiAppConfig::default();
 
@@ -343,6 +368,7 @@ impl McpService {
 
     /// 从 Codex 导入 MCP（v3.7.0 已更新为统一结构）
     pub fn import_from_codex(state: &AppState) -> Result<usize, AppError> {
+        let _guard = MCP_PROJECTION_LOCK.lock()?;
         // 创建临时 MultiAppConfig 用于导入
         let mut temp_config = crate::app_config::MultiAppConfig::default();
 
@@ -381,6 +407,7 @@ impl McpService {
 
     /// 从 Gemini 导入 MCP（v3.7.0 已更新为统一结构）
     pub fn import_from_gemini(state: &AppState) -> Result<usize, AppError> {
+        let _guard = MCP_PROJECTION_LOCK.lock()?;
         // 创建临时 MultiAppConfig 用于导入
         let mut temp_config = crate::app_config::MultiAppConfig::default();
 
@@ -419,6 +446,7 @@ impl McpService {
 
     /// 从 Grok Build 的 `[mcp_servers]` 导入 MCP。
     pub fn import_from_grokbuild(state: &AppState) -> Result<usize, AppError> {
+        let _guard = MCP_PROJECTION_LOCK.lock()?;
         let mut temp_config = crate::app_config::MultiAppConfig::default();
         let count = crate::mcp::import_from_grokbuild(&mut temp_config)?;
         let mut new_count = 0;
@@ -445,6 +473,7 @@ impl McpService {
 
     /// 从 OpenCode 导入 MCP（v3.9.2+ 新增）
     pub fn import_from_opencode(state: &AppState) -> Result<usize, AppError> {
+        let _guard = MCP_PROJECTION_LOCK.lock()?;
         // 创建临时 MultiAppConfig 用于导入
         let mut temp_config = crate::app_config::MultiAppConfig::default();
 
@@ -483,6 +512,7 @@ impl McpService {
 
     /// 从 Hermes 导入 MCP
     pub fn import_from_hermes(state: &AppState) -> Result<usize, AppError> {
+        let _guard = MCP_PROJECTION_LOCK.lock()?;
         // 创建临时 MultiAppConfig 用于导入
         let mut temp_config = crate::app_config::MultiAppConfig::default();
 
@@ -555,5 +585,169 @@ impl McpService {
                 failures.join("; ")
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_config::McpApps;
+    use crate::config::TestHomeGuard;
+    use serial_test::serial;
+    use std::sync::Arc;
+
+    fn write_malformed_claude_config() {
+        std::fs::create_dir_all(crate::config::get_claude_config_dir())
+            .expect("create Claude config directory");
+        std::fs::write(crate::config::get_claude_mcp_path(), b"{")
+            .expect("write malformed Claude config");
+    }
+
+    fn server(apps: McpApps) -> McpServer {
+        McpServer {
+            id: "broken-live".to_string(),
+            name: "Broken live config test server".to_string(),
+            server: serde_json::json!({"command": "echo", "args": ["hello"]}),
+            apps,
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn state() -> AppState {
+        AppState::new(Arc::new(
+            crate::database::Database::memory().expect("memory database"),
+        ))
+    }
+
+    #[test]
+    #[serial]
+    fn failed_upsert_preserves_the_database_row_and_restores_codex_projection() {
+        let _home = TestHomeGuard::new();
+        write_malformed_claude_config();
+        std::fs::create_dir_all(crate::codex_config::get_codex_config_dir())
+            .expect("create Codex config directory");
+        let state = state();
+        let previous = server(McpApps {
+            codex: true,
+            ..McpApps::default()
+        });
+        state.db.save_mcp_server(&previous).expect("seed server");
+        McpService::sync_enabled_for_app(&state, &AppType::Codex).expect("seed Codex projection");
+
+        let mut attempted = previous.clone();
+        attempted.name = "new name".to_string();
+        attempted.apps.codex = false;
+        attempted.apps.claude = true;
+        assert!(McpService::upsert_server(&state, attempted).is_err());
+
+        assert_eq!(
+            state
+                .db
+                .get_all_mcp_servers()
+                .expect("read servers")
+                .get(&previous.id)
+                .map(|server| (&server.name, &server.server, &server.apps)),
+            Some((&previous.name, &previous.server, &previous.apps))
+        );
+        let live = crate::codex_config::read_and_validate_codex_config_text()
+            .expect("read restored Codex config")
+            .parse::<toml::Table>()
+            .expect("parse restored Codex config");
+        let servers = live
+            .get("mcp_servers")
+            .and_then(toml::Value::as_table)
+            .expect("restored MCP server table");
+        assert_eq!(
+            servers
+                .get(&previous.id)
+                .and_then(|server| server.get("command"))
+                .and_then(toml::Value::as_str),
+            Some("echo")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn failed_delete_restores_the_deleted_database_row() {
+        let _home = TestHomeGuard::new();
+        write_malformed_claude_config();
+        let state = state();
+        let previous = server(McpApps {
+            claude: true,
+            ..McpApps::default()
+        });
+        state.db.save_mcp_server(&previous).expect("seed server");
+
+        assert!(McpService::delete_server(&state, &previous.id).is_err());
+        assert_eq!(
+            state
+                .db
+                .get_all_mcp_servers()
+                .expect("read servers")
+                .get(&previous.id)
+                .map(|server| &server.apps),
+            Some(&previous.apps)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn failed_toggle_restores_the_previous_app_flag() {
+        let _home = TestHomeGuard::new();
+        write_malformed_claude_config();
+        let state = state();
+        let previous = server(McpApps::default());
+        state.db.save_mcp_server(&previous).expect("seed server");
+
+        assert!(McpService::toggle_app(&state, &previous.id, AppType::Claude, true).is_err());
+        assert_eq!(
+            state
+                .db
+                .get_all_mcp_servers()
+                .expect("read servers")
+                .get(&previous.id)
+                .map(|server| server.apps.claude),
+            Some(false)
+        );
+    }
+
+    #[test]
+    #[serial]
+    #[allow(deprecated)]
+    fn deprecated_codex_sync_removes_managed_entries_when_no_rows_are_enabled() {
+        let _home = TestHomeGuard::new();
+        let codex_dir = crate::codex_config::get_codex_config_dir();
+        std::fs::create_dir_all(&codex_dir).expect("create Codex config directory");
+        let config_path = crate::codex_config::get_codex_config_path();
+        std::fs::write(&config_path, "[mcp_servers.user]\ncommand = \"user\"\n")
+            .expect("seed Codex config");
+
+        let state = state();
+        let previous = server(McpApps {
+            codex: true,
+            ..McpApps::default()
+        });
+        state.db.save_mcp_server(&previous).expect("seed server");
+        McpService::sync_enabled(&state, AppType::Codex).expect("seed managed Codex MCP");
+
+        state
+            .db
+            .update_mcp_server_app_enabled(&previous.id, &AppType::Codex, false)
+            .expect("disable Codex MCP row");
+        McpService::sync_enabled(&state, AppType::Codex).expect("remove managed Codex MCP");
+
+        let written = std::fs::read_to_string(config_path)
+            .expect("read Codex config")
+            .parse::<toml::Table>()
+            .expect("parse Codex config");
+        let servers = written
+            .get("mcp_servers")
+            .and_then(toml::Value::as_table)
+            .expect("MCP server table");
+        assert!(!servers.contains_key(&previous.id));
+        assert!(servers.contains_key("user"));
     }
 }

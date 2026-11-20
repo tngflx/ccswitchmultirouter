@@ -709,12 +709,19 @@ impl RequestForwarder {
                 )
             })?;
         Ok(router.and_then(|router| {
-            super::codex_subagent_reasoning::apply_subagent_reasoning_effort(
+            let parent_requests_max = self
+                .router
+                .codex_parent_turn_efforts
+                .parent_requests_max(router_id, headers, body);
+            super::codex_subagent_reasoning::apply_subagent_reasoning_effort_with_parent(
+                // The parent lineage can promote the default High child policy
+                // to native Max when the exact parent turn requested Max/Ultra.
                 &router.settings_config,
                 provider,
                 headers,
                 body,
                 endpoint,
+                parent_requests_max,
             )
         }))
     }
@@ -3616,6 +3623,17 @@ impl RequestForwarder {
             codex_responses_to_chat.then(|| summarize_codex_chat_request_shape(&filtered_body));
         let hosted_chat_tool_projection =
             codex_responses_to_chat.then(|| summarize_hosted_chat_tool_projection(&filtered_body));
+        if matches!(app_type, AppType::Codex)
+            && super::codex_subagent_reasoning::is_generation_endpoint(endpoint)
+        {
+            let (router_id, _) = super::providers::codex_route_persistent_provider(provider);
+            self.router.codex_parent_turn_efforts.observe_request(
+                router_id,
+                headers,
+                body,
+                subagent_reasoning_override.or(restored_desktop_effort),
+            );
+        }
         if let Some(trace_id) = codex_trace_id.as_deref() {
             let mut fields = vec![
                 ("trace", trace_id.to_string()),
@@ -11487,7 +11505,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subagent_reasoning_effort_native_responses_keeps_child_policy_through_sublyx_alias() {
+    async fn subagent_reasoning_effort_native_responses_inherits_parent_max_for_sublyx_alias() {
         for incoming_effort in ["max", "ultra"] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -11587,7 +11605,7 @@ mod tests {
                 "turn_id": "child-turn",
                 "x-openai-subagent": "collab_spawn",
             });
-            for (selection, expected) in [("high", "high"), ("max", "max"), ("profile", "low")] {
+            for (selection, expected) in [("high", "max"), ("max", "max"), ("profile", "low")] {
                 router.settings_config["codexRouting"]["subagentReasoningEffort"] =
                     json!(selection);
                 forwarder

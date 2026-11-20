@@ -47,11 +47,14 @@ pub async fn get_providers(
 }
 
 #[tauri::command]
-pub fn migrate_codex_official_auth_ownership(
-    state: State<'_, AppState>,
+pub async fn migrate_codex_official_auth_ownership(
+    app_handle: AppHandle,
 ) -> Result<crate::services::provider::CodexOfficialAuthMigrationStatus, String> {
-    ProviderService::migrate_codex_official_auth_ownership(state.inner())
-        .map_err(|error| error.to_string())
+    run_app_state_blocking(&app_handle, |state| {
+        ProviderService::migrate_codex_official_auth_ownership(state)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1033,26 +1036,26 @@ fn aggregate_codex_effective_transport(
 
 #[tauri::command]
 pub async fn add_provider(
-    state: State<'_, AppState>,
+    app_handle: AppHandle,
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] addToLive: Option<bool>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    add_provider_internal(state.inner(), app_type, provider, addToLive.unwrap_or(true))
+    add_provider_command_internal(&app_handle, app_type, provider, addToLive.unwrap_or(true))
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn update_provider(
-    state: State<'_, AppState>,
+    app_handle: AppHandle,
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] originalId: Option<String>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    update_provider_internal(state.inner(), app_type, originalId.as_deref(), provider)
+    update_provider_command_internal(&app_handle, app_type, originalId, provider, None)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1061,19 +1064,19 @@ pub async fn update_provider(
 /// older native binary cannot silently ignore the compare-and-set precondition.
 #[tauri::command]
 pub async fn update_provider_if_unchanged(
-    state: State<'_, AppState>,
+    app_handle: AppHandle,
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] originalId: Option<String>,
     #[allow(non_snake_case)] expectedProvider: Provider,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    update_provider_internal_if_unchanged(
-        state.inner(),
+    update_provider_command_internal(
+        &app_handle,
         app_type,
-        originalId.as_deref(),
+        originalId,
         provider,
-        Some(&expectedProvider),
+        Some(expectedProvider),
     )
     .await
     .map_err(|e| e.to_string())
@@ -1084,14 +1087,155 @@ pub async fn update_provider_if_unchanged(
 #[tauri::command]
 #[allow(non_snake_case)]
 pub async fn update_codex_router_if_unchanged(
-    state: State<'_, AppState>,
+    app_handle: AppHandle,
     provider: Provider,
     #[allow(non_snake_case)] expectedProvider: Provider,
 ) -> Result<bool, String> {
-    ProviderService::update_codex_router_if_unchanged(state.inner(), provider, &expectedProvider)
-        .map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::update_codex_router_if_unchanged(state, provider, &expectedProvider)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
+async fn add_provider_command_internal(
+    app_handle: &AppHandle,
+    app_type: AppType,
+    provider: Provider,
+    add_to_live: bool,
+) -> Result<bool, AppError> {
+    if app_type != AppType::Codex {
+        return run_app_state_blocking(app_handle, move |state| {
+            ProviderService::add(state, app_type, provider, add_to_live)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(AppError::Message);
+    }
+
+    let app_type_for_prepare = app_type.clone();
+    let provider = run_app_state_blocking(app_handle, move |state| {
+        ProviderService::prepare_provider_for_mutation(state, &app_type_for_prepare, provider)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(AppError::Message)?;
+    let app_handle_for_probe = app_handle.clone();
+    let (provider, records, observations) = resolve_automatic_probe_outcome(provider, move |provider| {
+        let app_handle = app_handle_for_probe.clone();
+        async move {
+            crate::commands::protocol_compatibility::automatic_codex_provider_preflight_with_app(
+                &app_handle,
+                provider,
+            )
+            .await
+        }
+    })
+    .await?;
+    run_app_state_blocking(app_handle, move |state| {
+        ProviderService::add_with_prepared_protocol_state(
+            state,
+            app_type,
+            provider,
+            add_to_live,
+            &records,
+            &observations,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(AppError::Message)
+}
+
+async fn update_provider_command_internal(
+    app_handle: &AppHandle,
+    app_type: AppType,
+    original_id: Option<String>,
+    provider: Provider,
+    expected_provider: Option<Provider>,
+) -> Result<bool, AppError> {
+    if app_type != AppType::Codex {
+        if expected_provider.is_some() {
+            return Err(AppError::Message("provider_update_conflict".to_string()));
+        }
+        return run_app_state_blocking(app_handle, move |state| {
+            ProviderService::update(state, app_type, original_id.as_deref(), provider)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(AppError::Message);
+    }
+
+    let expected_for_validation = expected_provider.clone();
+    let original_id_for_validation = original_id.clone();
+    let app_type_for_validation = app_type.clone();
+    let provider = run_app_state_blocking(app_handle, move |state| {
+        if let Some(expected) = expected_for_validation.as_ref() {
+            ProviderService::validate_background_provider_refresh(
+                &app_type_for_validation,
+                original_id_for_validation.as_deref(),
+                &provider,
+                expected,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let provider = ProviderService::prepare_provider_for_mutation(
+            state,
+            &app_type_for_validation,
+            provider,
+        )
+        .map_err(|error| error.to_string())?;
+        if original_id_for_validation
+            .as_deref()
+            .is_some_and(|original_id| original_id != provider.id)
+        {
+            return Err("Only additive-mode providers support changing provider key".to_string());
+        }
+        Ok(provider)
+    })
+    .await
+    .map_err(AppError::Message)?;
+    let app_handle_for_probe = app_handle.clone();
+    let probe = move |provider: Provider| {
+        let app_handle = app_handle_for_probe.clone();
+        async move {
+            if provider.uses_fixed_codex_responses_transport()
+                || provider.settings_config.get("codexRouting").is_some()
+            {
+                return Ok((provider, Vec::new(), Vec::new()));
+            }
+            run_app_state_blocking(&app_handle, move |state| {
+                let restored = crate::commands::protocol_compatibility::collect_saved_provider_protocol_evidence(
+                    state,
+                    provider,
+                    chrono::Utc::now().timestamp(),
+                )?
+                .ok_or_else(|| "codex_provider_set_probe_required".to_string())?;
+                Ok((restored.provider, restored.records, restored.observations))
+            })
+            .await
+        }
+    };
+    let (provider, records, observations) =
+        resolve_automatic_probe_outcome(provider, probe).await?;
+    let expected_for_commit = expected_provider;
+    run_app_state_blocking(app_handle, move |state| {
+        ProviderService::update_with_prepared_protocol_state_if_unchanged(
+            state,
+            app_type,
+            original_id.as_deref(),
+            provider,
+            &records,
+            &observations,
+            expected_for_commit.as_ref(),
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(AppError::Message)
+}
+
+#[cfg(test)]
 async fn add_provider_internal(
     state: &AppState,
     app_type: AppType,
@@ -1104,6 +1248,7 @@ async fn add_provider_internal(
     .await
 }
 
+#[cfg(test)]
 async fn update_provider_internal(
     state: &AppState,
     app_type: AppType,
@@ -1113,6 +1258,7 @@ async fn update_provider_internal(
     update_provider_internal_if_unchanged(state, app_type, original_id, provider, None).await
 }
 
+#[cfg(test)]
 async fn update_provider_internal_if_unchanged(
     state: &AppState,
     app_type: AppType,
@@ -1154,6 +1300,7 @@ async fn update_provider_internal_if_unchanged(
     }
 }
 
+#[cfg(test)]
 async fn add_provider_internal_with_probe<F, Fut>(
     state: &AppState,
     app_type: AppType,
@@ -1191,6 +1338,7 @@ where
     )
 }
 
+#[cfg(test)]
 async fn update_provider_internal_with_probe<F, Fut>(
     state: &AppState,
     app_type: AppType,
@@ -1222,6 +1370,7 @@ where
     .await
 }
 
+#[cfg(test)]
 async fn update_provider_internal_with_probe_and_expected_provider<F, Fut>(
     state: &AppState,
     app_type: AppType,
@@ -1529,17 +1678,26 @@ pub async fn switch_codex_provider_with_desktop_restart(
     app_handle: tauri::AppHandle,
     providerId: String,
 ) -> Result<SwitchResult, String> {
+    let provider_id_for_check = providerId.clone();
+    run_app_state_blocking(&app_handle, move |state| {
+        let exists = state
+            .db
+            .get_provider_by_id(&provider_id_for_check, AppType::Codex.as_str())
+            .map_err(|error| error.to_string())?
+            .is_some();
+        if exists {
+            Ok(())
+        } else {
+            Err(format!(
+                "Codex provider {provider_id_for_check} does not exist"
+            ))
+        }
+    })
+    .await?;
+
     let state = app_handle
         .try_state::<AppState>()
         .ok_or_else(|| "应用状态不可用".to_string())?;
-    if state
-        .db
-        .get_provider_by_id(&providerId, AppType::Codex.as_str())
-        .map_err(|error| error.to_string())?
-        .is_none()
-    {
-        return Err(format!("Codex provider {providerId} does not exist"));
-    }
 
     // Keep the lifecycle transaction serialized with proxy toggles and normal
     // provider switches while Desktop is stopped.
@@ -2765,6 +2923,7 @@ fn universal_provider_set_digest(
     Ok(hex::encode(Sha256::digest(encoded)))
 }
 
+#[cfg(test)]
 async fn sync_universal_provider_internal_with_probe<F, Fut>(
     state: &AppState,
     id: &str,
@@ -2798,6 +2957,7 @@ where
     )
 }
 
+#[cfg(test)]
 async fn save_and_sync_universal_provider_internal_with_probe<F, Fut>(
     state: &AppState,
     provider: UniversalProvider,
@@ -2838,6 +2998,120 @@ where
     )
 }
 
+async fn sync_universal_provider_internal_with_app_probe(
+    app: &AppHandle,
+    id: &str,
+) -> Result<bool, AppError> {
+    let id_for_prepare = id.to_string();
+    let prepared = run_app_state_blocking(app, move |state| {
+        ProviderService::prepare_universal_codex_provider(state, &id_for_prepare)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(AppError::Message)?;
+
+    let Some(provider) = prepared else {
+        let id_for_sync = id.to_string();
+        return run_app_state_blocking(app, move |state| {
+            ProviderService::sync_universal_to_apps(state, &id_for_sync)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(AppError::Message);
+    };
+
+    let app_for_probe = app.clone();
+    let (provider, profiles, observations) = resolve_automatic_probe_outcome(
+        provider,
+        move |provider| {
+            let app = app_for_probe.clone();
+            async move {
+                crate::commands::protocol_compatibility::automatic_codex_provider_preflight_with_app(
+                    &app, provider,
+                )
+                .await
+            }
+        },
+    )
+    .await?;
+
+    let id_for_commit = id.to_string();
+    run_app_state_blocking(app, move |state| {
+        validate_legacy_universal_provider_set_commit(state, &provider, &profiles)
+            .map_err(|error| error.to_string())?;
+        ProviderService::sync_universal_to_apps_with_codex_protocol_state(
+            state,
+            &id_for_commit,
+            Some(provider),
+            &profiles,
+            &observations,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(AppError::Message)
+}
+
+async fn save_and_sync_universal_provider_internal_with_app_probe(
+    app: &AppHandle,
+    provider: UniversalProvider,
+) -> Result<bool, AppError> {
+    let prepared_definition = provider.clone();
+    let prepared = run_app_state_blocking(app, move |state| {
+        ProviderService::prepare_universal_codex_provider_from_definition(
+            state,
+            &prepared_definition,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(AppError::Message)?;
+
+    let Some(codex_provider) = prepared else {
+        return run_app_state_blocking(app, move |state| {
+            ProviderService::save_and_sync_universal_to_apps_with_codex_profiles(
+                state,
+                provider,
+                None,
+                &[],
+            )
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(AppError::Message);
+    };
+
+    let app_for_probe = app.clone();
+    let (codex_provider, profiles, observations) = resolve_automatic_probe_outcome(
+        codex_provider,
+        move |provider| {
+            let app = app_for_probe.clone();
+            async move {
+                crate::commands::protocol_compatibility::automatic_codex_provider_preflight_with_app(
+                    &app, provider,
+                )
+                .await
+            }
+        },
+    )
+    .await?;
+
+    run_app_state_blocking(app, move |state| {
+        validate_legacy_universal_provider_set_commit(state, &codex_provider, &profiles)
+            .map_err(|error| error.to_string())?;
+        ProviderService::save_and_sync_universal_to_apps_with_codex_protocol_state(
+            state,
+            provider,
+            Some(codex_provider),
+            &profiles,
+            &observations,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(AppError::Message)
+}
+
 fn validate_legacy_universal_provider_set_commit(
     state: &AppState,
     provider: &Provider,
@@ -2870,19 +3144,10 @@ fn validate_legacy_universal_provider_set_commit(
 }
 
 #[tauri::command]
-pub async fn sync_universal_provider(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<bool, String> {
-    let result = sync_universal_provider_internal_with_probe(state.inner(), &id, |provider| {
-        crate::commands::protocol_compatibility::automatic_codex_provider_preflight(
-            state.inner(),
-            provider,
-        )
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+pub async fn sync_universal_provider(app: AppHandle, id: String) -> Result<bool, String> {
+    let result = sync_universal_provider_internal_with_app_probe(&app, &id)
+        .await
+        .map_err(|e| e.to_string())?;
 
     emit_universal_provider_synced(&app, "sync", &id);
 
@@ -2892,22 +3157,12 @@ pub async fn sync_universal_provider(
 #[tauri::command]
 pub async fn save_and_sync_universal_provider(
     app: AppHandle,
-    state: State<'_, AppState>,
     provider: UniversalProvider,
 ) -> Result<bool, String> {
     let id = provider.id.clone();
-    let result = save_and_sync_universal_provider_internal_with_probe(
-        state.inner(),
-        provider,
-        |codex_provider| {
-            crate::commands::protocol_compatibility::automatic_codex_provider_preflight(
-                state.inner(),
-                codex_provider,
-            )
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())?;
+    let result = save_and_sync_universal_provider_internal_with_app_probe(&app, provider)
+        .await
+        .map_err(|error| error.to_string())?;
 
     emit_universal_provider_synced(&app, "save-and-sync", &id);
 
@@ -2940,6 +3195,27 @@ mod provider_read_dispatch_tests {
 
     #[test]
     fn provider_commands_use_async_dispatch() {
+        fn sample_provider() -> Provider {
+            Provider::with_id(
+                "dispatch-test".to_string(),
+                "Dispatch test".to_string(),
+                serde_json::json!({"auth": {}}),
+                None,
+            )
+        }
+
+        fn sample_universal_provider() -> UniversalProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": "dispatch-test",
+                "name": "Dispatch test",
+                "providerType": "custom",
+                "apps": {},
+                "baseUrl": "https://example.invalid",
+                "apiKey": "redacted"
+            }))
+            .unwrap()
+        }
+
         fn assert_async_command<T, F>(_: impl FnOnce(AppHandle) -> F)
         where
             F: Future<Output = Result<T, String>> + Send,
@@ -2947,6 +3223,7 @@ mod provider_read_dispatch_tests {
         }
 
         assert_async_command(|app| get_providers(app, String::new()));
+        assert_async_command(migrate_codex_official_auth_ownership);
         assert_async_command(|app| get_current_provider(app, String::new()));
         assert_async_command(get_codex_editor_providers);
         assert_async_command(|app| get_codex_logical_provider_for_editing(app, String::new()));
@@ -2955,6 +3232,25 @@ mod provider_read_dispatch_tests {
         assert_async_command(|app| inspect_codex_multirouter_projection(app, String::new()));
         assert_async_command(inspect_active_codex_multirouter_projection);
         assert_async_command(|app| get_codex_multirouter_revision(app, String::new()));
+        assert_async_command(|app| add_provider(app, String::new(), sample_provider(), None));
+        assert_async_command(|app| update_provider(app, String::new(), sample_provider(), None));
+        assert_async_command(|app| {
+            update_provider_if_unchanged(
+                app,
+                String::new(),
+                sample_provider(),
+                None,
+                sample_provider(),
+            )
+        });
+        assert_async_command(|app| {
+            update_codex_router_if_unchanged(app, sample_provider(), sample_provider())
+        });
+        assert_async_command(|app| switch_codex_provider_with_desktop_restart(app, String::new()));
+        assert_async_command(|app| sync_universal_provider(app, String::new()));
+        assert_async_command(|app| {
+            save_and_sync_universal_provider(app, sample_universal_provider())
+        });
         assert_async_command(|_| get_opencode_live_provider_ids());
         assert_async_command(|_| read_live_provider_settings(String::new()));
         assert_async_command(|app| get_custom_endpoints(app, String::new(), String::new()));

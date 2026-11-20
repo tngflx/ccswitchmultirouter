@@ -27,6 +27,7 @@ type State = {
   appServerStatusAtoms?: object[];
   scopedAppServerScopeCandidates?: unknown;
   scopedAppServerScopeScanComplete?: boolean;
+  scopedAppServerScopeHintScan?: { status?: string; reason?: string };
   scopedAppServerRootIdentities?: object[];
   reasoningQueryCaches?: Map<object, object>;
   modelPickerQueryClients?: Map<object, object>;
@@ -743,6 +744,8 @@ const createReconciler = (state: State, document = fixtureDocument) =>
       uniqueBrandCount: number;
       hintCount: number;
       pendingNodeCount: number;
+      hintScanStatus: string;
+      hintScanReason: string | null;
     };
   };
 const createManagedCache = () => ({
@@ -832,6 +835,64 @@ describe("Codex Desktop retained native ownership provenance", () => {
       refusalReason: null,
     });
     expect(canonical.scope.get(atom).has("max")).toBe(true);
+  });
+
+  it("keeps a branded owner usable when unrelated Fiber values hit the queue cap", () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const canonical = createScope(cache, new Set(["high"]));
+    (canonical.scope as Record<string, unknown>).scope = atom.scope;
+    const values: Record<string, unknown> = { owner: canonical.scope };
+    for (let index = 0; index < 2048; index += 1)
+      values[`unrelated${index}`] = {};
+    const state = createState(atom, canonical.scope);
+    state.appServerStatusAtoms = [atom];
+    state.scopedAppServerScopeScanComplete = false;
+    const api = createScannedReconciler(state, { memoizedState: values });
+
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "known",
+      patchedScopes: 1,
+      canonicalOwnerRefusalReason: null,
+      canonicalOwnerCounts: {
+        hintCount: 1,
+        hintScanStatus: "capped",
+        hintScanReason: "value_limit",
+      },
+    });
+    expect(canonical.scope.get(atom).has("max")).toBe(true);
+  });
+
+  it("still rejects a visible conflicting cache when the hint walk is capped", () => {
+    const atom = createAtom();
+    const first = createScope(createManagedCache(), new Set(["high"]));
+    const second = createScope(createManagedCache(), new Set(["high"]));
+    (first.scope as Record<string, unknown>).scope = atom.scope;
+    (second.scope as Record<string, unknown>).scope = atom.scope;
+    const values: Record<string, unknown> = {
+      first: first.scope,
+      second: second.scope,
+    };
+    for (let index = 0; index < 2048; index += 1)
+      values[`unrelated${index}`] = {};
+    const state = createState(atom, first.scope, second.scope);
+    state.appServerStatusAtoms = [atom];
+    state.scopedAppServerScopeScanComplete = false;
+    const api = createScannedReconciler(state, { memoizedState: values });
+
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "unverified",
+      patchedScopes: 0,
+      canonicalOwnerRefusalReason: "hints_ambiguous",
+      canonicalOwnerCounts: {
+        hintCount: 2,
+        hintScanStatus: "capped",
+        hintScanReason: "value_limit",
+      },
+      ownerFailureCounts: { canonical_owner_unverified: 1 },
+    });
+    expect(first.scope.get).not.toHaveBeenCalled();
+    expect(second.scope.get).not.toHaveBeenCalled();
   });
 
   it("keeps the canonical proof complete across the observed mounted scope multiplicity", () => {

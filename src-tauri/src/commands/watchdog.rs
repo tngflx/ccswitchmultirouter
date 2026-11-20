@@ -55,81 +55,84 @@ fn listener_belongs_to_app(
 pub async fn get_watchdog_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<WatchdogStatus, String> {
-    let config_dir = crate::config::get_app_config_dir();
-    let supervisor_mode = if crate::watchdog::dev_supervisor_owned() {
-        "pnpm-dev"
-    } else {
-        "rust"
-    };
-    let port = state
-        .db
-        .get_proxy_config()
-        .await
-        .map(|config| config.listen_port)
-        .unwrap_or(0);
-    let app_pid = std::process::id();
-    let persisted_enabled = crate::settings::get_settings().watchdog_enabled;
-    let dev_status = (supervisor_mode == "pnpm-dev").then(|| {
-        crate::watchdog::dev_watchdog_status(
-            &crate::watchdog::dev_session_status_dir(),
-            persisted_enabled,
-        )
-    });
-    let supervisor_identity = dev_status.as_ref().map_or_else(
-        || crate::watchdog::live_supervisor_identity(&config_dir, app_pid),
-        |status| status.supervisor_identity.clone(),
-    );
-    let verified_supervisor_pid = supervisor_identity.as_ref().map(|identity| identity.pid);
-    let verified_supervisor_path = supervisor_identity
-        .as_ref()
-        .map(|identity| identity.executable_path.clone());
-    let listener_pid = if port > 0 {
-        crate::process_identity::tcp_listener_owner_pid(port)
-    } else {
-        None
-    };
-    let listener_identity = listener_pid.and_then(crate::process_identity::process_identity);
-    let app_identity = crate::process_identity::current_process_identity();
-    let port_ready = listener_belongs_to_app(listener_identity.as_ref(), app_identity.as_ref());
+    let db = state.db.clone();
+    super::run_command_blocking(move || {
+        let config_dir = crate::config::get_app_config_dir();
+        let supervisor_mode = if crate::watchdog::dev_supervisor_owned() {
+            "pnpm-dev"
+        } else {
+            "rust"
+        };
+        let port = tauri::async_runtime::block_on(db.get_proxy_config())
+            .map(|config| config.listen_port)
+            .unwrap_or(0);
+        let app_pid = std::process::id();
+        let persisted_enabled = crate::settings::get_settings().watchdog_enabled;
+        let dev_status = (supervisor_mode == "pnpm-dev").then(|| {
+            crate::watchdog::dev_watchdog_status(
+                &crate::watchdog::dev_session_status_dir(),
+                persisted_enabled,
+            )
+        });
+        let supervisor_identity = dev_status.as_ref().map_or_else(
+            || crate::watchdog::live_supervisor_identity(&config_dir, app_pid),
+            |status| status.supervisor_identity.clone(),
+        );
+        let verified_supervisor_pid = supervisor_identity.as_ref().map(|identity| identity.pid);
+        let verified_supervisor_path = supervisor_identity
+            .as_ref()
+            .map(|identity| identity.executable_path.clone());
+        let listener_pid = if port > 0 {
+            crate::process_identity::tcp_listener_owner_pid(port)
+        } else {
+            None
+        };
+        let listener_identity = listener_pid.and_then(crate::process_identity::process_identity);
+        let app_identity = crate::process_identity::current_process_identity();
+        let port_ready = listener_belongs_to_app(listener_identity.as_ref(), app_identity.as_ref());
 
-    Ok(WatchdogStatus {
-        enabled: dev_status
-            .as_ref()
-            .map_or(persisted_enabled, |status| status.enabled),
-        configured_enabled: persisted_enabled,
-        enabled_override: dev_status
-            .as_ref()
-            .and_then(|status| status.enabled_override),
-        supervisor_mode: supervisor_mode.to_string(),
-        app_pid,
-        supervisor_pid: verified_supervisor_pid,
-        supervisor_alive: supervisor_identity.is_some(),
-        supervisor_path: verified_supervisor_path,
-        restarts_in_window: dev_status.as_ref().map_or_else(
-            || crate::watchdog::recent_restart_count(&config_dir),
-            |status| status.restarts_in_window,
-        ),
-        port,
-        listener_pid,
-        listener_path: listener_identity.map(|identity| identity.executable_path),
-        port_ready,
-        port_diagnosis: if port > 0 {
-            crate::process_identity::describe_port_blockers(port)
-        } else {
-            String::new()
-        },
-        // A dev session must not display an unrelated release supervisor ledger.
-        recent_events: if dev_status.is_some() {
-            Vec::new()
-        } else {
-            crate::watchdog::recent_events(&config_dir, 8)
-        },
+        Ok(WatchdogStatus {
+            enabled: dev_status
+                .as_ref()
+                .map_or(persisted_enabled, |status| status.enabled),
+            configured_enabled: persisted_enabled,
+            enabled_override: dev_status
+                .as_ref()
+                .and_then(|status| status.enabled_override),
+            supervisor_mode: supervisor_mode.to_string(),
+            app_pid,
+            supervisor_pid: verified_supervisor_pid,
+            supervisor_alive: supervisor_identity.is_some(),
+            supervisor_path: verified_supervisor_path,
+            restarts_in_window: dev_status.as_ref().map_or_else(
+                || crate::watchdog::recent_restart_count(&config_dir),
+                |status| status.restarts_in_window,
+            ),
+            port,
+            listener_pid,
+            listener_path: listener_identity.map(|identity| identity.executable_path),
+            port_ready,
+            port_diagnosis: if port > 0 {
+                crate::process_identity::describe_port_blockers(port)
+            } else {
+                String::new()
+            },
+            // A dev session must not display an unrelated release supervisor ledger.
+            recent_events: if dev_status.is_some() {
+                Vec::new()
+            } else {
+                crate::watchdog::recent_events(&config_dir, 8)
+            },
+        })
     })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::run_command_blocking;
     use super::listener_belongs_to_app;
+    use std::time::Duration;
 
     #[test]
     fn recovery_status_requires_exact_app_listener_identity() {
@@ -152,5 +155,21 @@ mod tests {
         );
         assert!(!listener_belongs_to_app(None, Some(&app)));
         assert!(listener_belongs_to_app(Some(&app), Some(&app)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watchdog_blocking_dispatch_keeps_executor_schedulable() {
+        let command = run_command_blocking(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok::<_, String>(())
+        });
+        tokio::pin!(command);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut command)
+                .await
+                .is_err()
+        );
+        command.await.unwrap();
     }
 }

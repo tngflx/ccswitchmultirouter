@@ -122,7 +122,10 @@ pub async fn discover_available_skills(
     service: State<'_, SkillServiceState>,
     app_state: State<'_, AppState>,
 ) -> Result<Vec<DiscoverableSkill>, String> {
-    let repos = app_state.db.get_skill_repos().map_err(|e| e.to_string())?;
+    let db = app_state.db.clone();
+    let repos =
+        super::run_command_blocking(move || db.get_skill_repos().map_err(|e| e.to_string()))
+            .await?;
     service
         .0
         .discover_available(repos)
@@ -163,7 +166,11 @@ pub async fn migrate_skill_storage(
     target: SkillStorageLocation,
     app_state: State<'_, AppState>,
 ) -> Result<MigrationResult, String> {
-    SkillService::migrate_storage(&app_state.db, target).map_err(|e| e.to_string())
+    let db = app_state.db.clone();
+    super::run_command_blocking(move || {
+        SkillService::migrate_storage(&db, target).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// 搜索 skills.sh 公共目录
@@ -186,7 +193,10 @@ pub async fn get_skills(
     service: State<'_, SkillServiceState>,
     app_state: State<'_, AppState>,
 ) -> Result<Vec<Skill>, String> {
-    let repos = app_state.db.get_skill_repos().map_err(|e| e.to_string())?;
+    let db = app_state.db.clone();
+    let repos =
+        super::run_command_blocking(move || db.get_skill_repos().map_err(|e| e.to_string()))
+            .await?;
     service
         .0
         .list_skills(repos, &app_state.db)
@@ -227,7 +237,10 @@ pub async fn install_skill_for_app(
     let app_type = parse_app_type(&app)?;
 
     // 先获取技能信息
-    let repos = app_state.db.get_skill_repos().map_err(|e| e.to_string())?;
+    let db = app_state.db.clone();
+    let repos =
+        super::run_command_blocking(move || db.get_skill_repos().map_err(|e| e.to_string()))
+            .await?;
     let skills = service
         .0
         .discover_available(repos)
@@ -337,4 +350,26 @@ pub fn install_skills_from_zip(
     let path = std::path::Path::new(&file_path);
 
     SkillService::install_from_zip(&app_state.db, path, &app_type).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::run_command_blocking;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn skill_blocking_dispatch_keeps_executor_schedulable() {
+        let command = run_command_blocking(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok::<_, String>(())
+        });
+        tokio::pin!(command);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut command)
+                .await
+                .is_err()
+        );
+        command.await.unwrap();
+    }
 }

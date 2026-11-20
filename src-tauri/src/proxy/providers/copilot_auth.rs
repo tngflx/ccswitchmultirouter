@@ -21,7 +21,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 /// GitHub OAuth 客户端 ID（VS Code）- 用于 github.com
 const GITHUB_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -425,6 +425,8 @@ pub struct CopilotAuthManager {
     endpoint_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
     /// 存储路径
     storage_path: PathBuf,
+    /// Serializes account changes, snapshots, and logout deletion.
+    persistence_lock: Arc<Mutex<()>>,
     /// 待迁移的旧格式 token
     pending_migration: Arc<RwLock<Option<String>>>,
     /// 旧认证数据迁移失败时的状态消息
@@ -445,6 +447,7 @@ impl CopilotAuthManager {
             api_endpoints: Arc::new(RwLock::new(HashMap::new())),
             endpoint_locks: Arc::new(RwLock::new(HashMap::new())),
             storage_path,
+            persistence_lock: Arc::new(Mutex::new(())),
             pending_migration: Arc::new(RwLock::new(None)),
             migration_error: Arc::new(RwLock::new(None)),
         };
@@ -475,6 +478,7 @@ impl CopilotAuthManager {
     /// 移除指定账号
     pub async fn remove_account(&self, account_id: &str) -> Result<(), CopilotAuthError> {
         log::info!("[CopilotAuth] 移除账号: {account_id}");
+        let persist_guard = self.persistence_lock.clone().lock_owned().await;
 
         {
             let mut accounts = self.accounts.write().await;
@@ -515,7 +519,7 @@ impl CopilotAuthManager {
         }
 
         // 持久化
-        self.save_to_disk().await?;
+        self.save_to_disk(persist_guard).await?;
 
         Ok(())
     }
@@ -527,6 +531,7 @@ impl CopilotAuthManager {
         user: GitHubUser,
         github_domain: String,
     ) -> Result<GitHubAccount, CopilotAuthError> {
+        let persist_guard = self.persistence_lock.clone().lock_owned().await;
         let account_id = composite_account_id(&github_domain, user.id);
         let now = chrono::Utc::now().timestamp();
 
@@ -560,7 +565,7 @@ impl CopilotAuthManager {
         self.set_migration_error(None).await;
 
         // 持久化
-        self.save_to_disk().await?;
+        self.save_to_disk(persist_guard).await?;
 
         log::info!("[CopilotAuth] 添加账号成功: {}", user.login);
 
@@ -569,6 +574,7 @@ impl CopilotAuthManager {
 
     /// 设置默认账号
     pub async fn set_default_account(&self, account_id: &str) -> Result<(), CopilotAuthError> {
+        let persist_guard = self.persistence_lock.clone().lock_owned().await;
         {
             let accounts = self.accounts.read().await;
             if !accounts.contains_key(account_id) {
@@ -581,7 +587,7 @@ impl CopilotAuthManager {
             *default_account_id = Some(account_id.to_string());
         }
 
-        self.save_to_disk().await?;
+        self.save_to_disk(persist_guard).await?;
         Ok(())
     }
 
@@ -1125,6 +1131,7 @@ impl CopilotAuthManager {
     /// 清除所有认证（登出所有账号）
     pub async fn clear_auth(&self) -> Result<(), CopilotAuthError> {
         log::info!("[CopilotAuth] 清除所有认证");
+        let persist_guard = self.persistence_lock.clone().lock_owned().await;
 
         // 先清理内存状态，确保即使文件删除失败用户也能看到已登出
         {
@@ -1159,9 +1166,16 @@ impl CopilotAuthManager {
         }
 
         // 最后删除存储文件
-        if self.storage_path.exists() {
-            std::fs::remove_file(&self.storage_path)?;
-        }
+        let storage_path = self.storage_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let _persist_guard = persist_guard;
+            if storage_path.exists() {
+                std::fs::remove_file(storage_path)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|error| CopilotAuthError::IoError(error.to_string()))??;
 
         Ok(())
     }
@@ -1242,17 +1256,15 @@ impl CopilotAuthManager {
         *migration_error = message;
     }
 
-    fn write_store_atomic(&self, content: &str) -> Result<(), CopilotAuthError> {
-        if let Some(parent) = self.storage_path.parent() {
+    fn write_store_atomic(path: &std::path::Path, content: &str) -> Result<(), CopilotAuthError> {
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let parent = self
-            .storage_path
+        let parent = path
             .parent()
             .ok_or_else(|| CopilotAuthError::IoError("无效的存储路径".to_string()))?;
-        let file_name = self
-            .storage_path
+        let file_name = path
             .file_name()
             .ok_or_else(|| CopilotAuthError::IoError("无效的存储文件名".to_string()))?
             .to_string_lossy()
@@ -1275,8 +1287,8 @@ impl CopilotAuthManager {
             file.write_all(content.as_bytes())?;
             file.flush()?;
 
-            fs::rename(&tmp_path, &self.storage_path)?;
-            fs::set_permissions(&self.storage_path, fs::Permissions::from_mode(0o600))?;
+            fs::rename(&tmp_path, path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         }
 
         #[cfg(windows)]
@@ -1288,10 +1300,10 @@ impl CopilotAuthManager {
             file.write_all(content.as_bytes())?;
             file.flush()?;
 
-            if self.storage_path.exists() {
-                let _ = fs::remove_file(&self.storage_path);
+            if path.exists() {
+                let _ = fs::remove_file(path);
             }
-            fs::rename(&tmp_path, &self.storage_path)?;
+            fs::rename(&tmp_path, path)?;
         }
 
         Ok(())
@@ -1480,7 +1492,10 @@ impl CopilotAuthManager {
     }
 
     /// 保存到磁盘
-    async fn save_to_disk(&self) -> Result<(), CopilotAuthError> {
+    async fn save_to_disk(
+        &self,
+        persist_guard: OwnedMutexGuard<()>,
+    ) -> Result<(), CopilotAuthError> {
         let accounts = self.accounts.read().await.clone();
         let default_account_id = self.resolve_default_account_id().await;
 
@@ -1495,7 +1510,13 @@ impl CopilotAuthManager {
         let content = serde_json::to_string_pretty(&store)
             .map_err(|e| CopilotAuthError::ParseError(e.to_string()))?;
 
-        self.write_store_atomic(&content)?;
+        let storage_path = self.storage_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let _persist_guard = persist_guard;
+            Self::write_store_atomic(&storage_path, &content)
+        })
+        .await
+        .map_err(|error| CopilotAuthError::IoError(error.to_string()))??;
 
         log::info!(
             "[CopilotAuth] 保存到磁盘成功（{} 个账号）",

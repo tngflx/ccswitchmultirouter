@@ -968,6 +968,54 @@ describe("App integration with MSW", () => {
     }
   }, 30_000);
 
+  it("does not redirect into the router workspace after navigation changes during a switch", async () => {
+    setProviders("codex", {
+      "codex-router": {
+        id: "codex-router",
+        name: "OpenAI Multi-Model Router",
+        settingsConfig: {
+          codexRouting: { schemaVersion: 2, enabled: true, routes: [] },
+        },
+        category: "aggregator",
+        sortIndex: 0,
+        createdAt: Date.now(),
+      },
+    });
+    setCurrentProviderId("codex", "codex-router");
+
+    let releaseSwitch!: () => void;
+    const pendingSwitch = new Promise<Response>((resolve) => {
+      releaseSwitch = () => resolve(HttpResponse.json(true));
+    });
+    server.use(
+      http.post("http://tauri.local/switch_provider", () => pendingSwitch),
+    );
+
+    const { default: App } = await import("@/App");
+    renderApp(App);
+    fireEvent.click(screen.getByText("switch-codex"));
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-list").textContent).toContain(
+        "codex-router",
+      ),
+    );
+
+    fireEvent.click(screen.getByText("switch"));
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-list")).toHaveAttribute(
+        "aria-busy",
+        "true",
+      ),
+    );
+    fireEvent.click(screen.getByText("switch-claude"));
+    expect(screen.getByTestId("app-switcher")).toHaveTextContent("claude");
+
+    releaseSwitch();
+    await waitFor(() =>
+      expect(screen.queryByTestId("codex-router-workspace")).toBeNull(),
+    );
+  }, 30_000);
+
   it("starts a new Codex MultiRouter draft explicitly from the refreshed entry", async () => {
     const { default: App } = await import("@/App");
     renderApp(App);

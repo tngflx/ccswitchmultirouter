@@ -8475,7 +8475,33 @@ impl ProviderService {
             }
             return pi::add(state, provider, add_to_live);
         }
-        let mut provider = Self::prepare_provider_for_mutation(state, &app_type, provider)?;
+        let provider = Self::prepare_provider_for_mutation(state, &app_type, provider)?;
+        Self::add_with_prepared_protocol_state(
+            state,
+            app_type,
+            provider,
+            add_to_live,
+            protocol_profiles,
+            protocol_observations,
+        )
+    }
+
+    pub(crate) fn add_with_prepared_protocol_state(
+        state: &AppState,
+        app_type: AppType,
+        mut provider: Provider,
+        add_to_live: bool,
+        protocol_profiles: &[ProtocolCompatibilityRecord],
+        protocol_observations: &[ProtocolCompatibilityRecord],
+    ) -> Result<bool, AppError> {
+        if app_type == AppType::Pi {
+            if !protocol_profiles.is_empty() || !protocol_observations.is_empty() {
+                return Err(AppError::InvalidInput(
+                    "Pi providers do not accept Codex protocol evidence".to_string(),
+                ));
+            }
+            return pi::add(state, provider, add_to_live);
+        }
         if app_type.is_additive_mode() {
             Self::set_provider_live_config_managed(&mut provider, add_to_live);
         }
@@ -8608,11 +8634,60 @@ impl ProviderService {
         )
     }
 
+    pub(crate) fn update_with_prepared_protocol_state_if_unchanged(
+        state: &AppState,
+        app_type: AppType,
+        original_id: Option<&str>,
+        provider: Provider,
+        protocol_profiles: &[ProtocolCompatibilityRecord],
+        protocol_observations: &[ProtocolCompatibilityRecord],
+        expected_provider: Option<&Provider>,
+    ) -> Result<bool, AppError> {
+        if let Some(expected) = expected_provider {
+            Self::validate_background_provider_refresh(
+                &app_type,
+                original_id,
+                &provider,
+                expected,
+            )?;
+        }
+        Self::update_with_prepared_validated_precondition(
+            state,
+            app_type,
+            original_id,
+            provider,
+            protocol_profiles,
+            protocol_observations,
+            expected_provider,
+        )
+    }
+
     fn update_with_validated_precondition(
         state: &AppState,
         app_type: AppType,
         original_id: Option<&str>,
         provider: Provider,
+        protocol_profiles: &[ProtocolCompatibilityRecord],
+        protocol_observations: &[ProtocolCompatibilityRecord],
+        expected_provider: Option<&Provider>,
+    ) -> Result<bool, AppError> {
+        let provider = Self::prepare_provider_for_mutation(state, &app_type, provider)?;
+        Self::update_with_prepared_validated_precondition(
+            state,
+            app_type,
+            original_id,
+            provider,
+            protocol_profiles,
+            protocol_observations,
+            expected_provider,
+        )
+    }
+
+    fn update_with_prepared_validated_precondition(
+        state: &AppState,
+        app_type: AppType,
+        original_id: Option<&str>,
+        mut provider: Provider,
         protocol_profiles: &[ProtocolCompatibilityRecord],
         protocol_observations: &[ProtocolCompatibilityRecord],
         expected_provider: Option<&Provider>,
@@ -8632,7 +8707,6 @@ impl ProviderService {
         if let Some(existing_provider) = existing_provider.as_ref() {
             Self::ensure_codex_provider_is_user_operable(&app_type, existing_provider)?;
         }
-        let mut provider = Self::prepare_provider_for_mutation(state, &app_type, provider)?;
         let codex_official_auth_changed = app_type == AppType::Codex
             && provider.id == crate::database::CODEX_OFFICIAL_PROVIDER_ID
             && provider.category.as_deref() == Some("official")
