@@ -4908,6 +4908,7 @@ fn compile_configured_codex_subagent_roles(
 fn validate_codex_subagent_reasoning_completeness(
     compilation: &ConfiguredCodexSubagentCompilation,
 ) -> Result<(), AppError> {
+    let mut undeclared: Vec<String> = Vec::new();
     for (entry, compiled_status) in compilation
         .persisted
         .profiles
@@ -4926,12 +4927,24 @@ fn validate_codex_subagent_reasoning_completeness(
         if capability.is_none()
             || capability.is_some_and(|value| value.support_kind == ReasoningSupportKind::Unknown)
         {
-            return Err(AppError::InvalidInput(
-                "Codex subagent V2 configuration is incomplete (unknown_reasoning_capability_requires_declaration)".to_string(),
-            ));
+            let model = profile.model.trim();
+            if !model.is_empty()
+                && !undeclared
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(model))
+            {
+                undeclared.push(model.to_string());
+            }
         }
     }
-    Ok(())
+    if undeclared.is_empty() {
+        return Ok(());
+    }
+    undeclared.sort_by_key(|model| model.to_ascii_lowercase());
+    Err(AppError::InvalidInput(format!(
+        "Codex subagent V2 configuration is incomplete (unknown_reasoning_capability_requires_declaration): {}",
+        undeclared.join(", ")
+    )))
 }
 
 /// Only the app-owned marked region is compared at readback; user instructions
@@ -11911,6 +11924,43 @@ wire_api = "responses"
         assert!(error
             .to_string()
             .contains("unknown_reasoning_capability_requires_declaration"));
+    }
+
+    #[test]
+    fn codex_subagent_v2_save_lists_every_undeclared_reasoning_model() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({
+                "zeta-model": codex_subagent_profile_status_profile("zeta-model", true),
+                "alpha-model": codex_subagent_profile_status_profile("alpha-model", true),
+            }),
+            json!([
+                { "model": "zeta-model", "contextWindow": 128000 },
+                { "model": "alpha-model", "contextWindow": 128000 }
+            ]),
+            json!([
+                {
+                    "id": "zeta-route",
+                    "match": { "models": ["zeta-model"] },
+                    "upstream": { "auth": { "source": "provider_config" } }
+                },
+                {
+                    "id": "alpha-route",
+                    "match": { "models": ["alpha-model"] },
+                    "upstream": { "auth": { "source": "provider_config" } }
+                }
+            ]),
+        );
+
+        let error = validate_codex_subagent_v2_candidate(&settings, None, true)
+            .expect_err("every undeclared reasoning model must block provider save");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "(unknown_reasoning_capability_requires_declaration): alpha-model, zeta-model"
+            ),
+            "{message}"
+        );
     }
 
     #[test]
