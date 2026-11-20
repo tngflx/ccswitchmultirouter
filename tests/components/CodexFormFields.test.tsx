@@ -1981,16 +1981,10 @@ describe("CodexFormFields local model routing", () => {
       summaryFor("public-b").getByText("Default: medium"),
     ).toBeInTheDocument();
     expect(
-      summaryFor("public-a").getByLabelText(
-        "Provider reasoning effort used by public-a Ultra",
-      ),
+      summaryFor("public-a").getByLabelText("Send Ultra as (public-a)"),
     ).toHaveValue("max");
     expect(
-      within(
-        summaryFor("public-a").getByLabelText(
-          "Provider reasoning effort used by public-a Ultra",
-        ),
-      )
+      within(summaryFor("public-a").getByLabelText("Send Ultra as (public-a)"))
         .getAllByRole("option")
         .map((option) => option.getAttribute("value")),
     ).toEqual(["", "high", "max"]);
@@ -2309,7 +2303,7 @@ describe("CodexFormFields local model routing", () => {
         name: `Unlock Ultra for ${model}`,
       });
       const target = screen.getByRole("combobox", {
-        name: `Provider reasoning effort used by ${model} Ultra`,
+        name: `Send Ultra as (${model})`,
       });
       const expectedTarget = codexUltra?.providerEffort ?? "xhigh";
       await waitFor(() => expect(target).toHaveValue(expectedTarget));
@@ -2317,18 +2311,64 @@ describe("CodexFormFields local model routing", () => {
         expect(checkbox).toBeChecked();
         expect(target).toBeEnabled();
         expect(
-          screen.getByText(`Unlocked; uses ${expectedTarget}`),
-        ).toBeInTheDocument();
+          within(target).getByRole("option", { selected: true }),
+        ).toHaveTextContent(
+          expectedTarget === "max" ? "Max" : "Extra High (xhigh)",
+        );
       } else {
         expect(checkbox).not.toBeChecked();
         expect(target).toBeDisabled();
       }
       expect(
-        within(target).getByRole("option", { name: "max" }),
+        within(target).getByRole("option", { name: "Max" }),
       ).toBeInTheDocument();
       expect(latestCatalog()).toEqual([row]);
     },
   );
+
+  it("writes the selected main agent Ultra target to the model catalog", async () => {
+    const model = "gpt-6.2-sol";
+    reasoningApiMocks.resolve.mockResolvedValue(
+      createSupportedReasoningResolution(
+        model,
+        ["xhigh", "max"],
+        "xhigh",
+        true,
+      ),
+    );
+    const { latestCatalog } = renderCatalogHarness(
+      [{ model, codexUltra: { enabled: true, providerEffort: "max" } }],
+      { baseUrl: "https://api.sublyx.example/v1", providerName: "Sublyx" },
+    );
+    const target = screen.getByRole("combobox", {
+      name: `Send Ultra as (${model})`,
+    });
+    const user = userEvent.setup();
+
+    expect(screen.getByText("Main agent Ultra")).toBeInTheDocument();
+    const xhigh = await within(target).findByRole("option", {
+      name: "Extra High (xhigh)",
+    });
+    const max = within(target).getByRole("option", { name: "Max" });
+
+    await user.selectOptions(target, xhigh);
+    expect(latestCatalog()).toHaveLength(1);
+    expect(latestCatalog()[0].model).toBe(model);
+    expect(latestCatalog()[0].codexUltra).toEqual({
+      enabled: true,
+      providerEffort: "xhigh",
+      providerEffortSource: "user",
+    });
+    expect(target).toHaveValue("xhigh");
+
+    await user.selectOptions(target, max);
+    expect(latestCatalog()[0].codexUltra).toEqual({
+      enabled: true,
+      providerEffort: "max",
+      providerEffortSource: "user",
+    });
+    expect(target).toHaveValue("max");
+  });
 
   it("keeps Ultra independent from automatic reasoning discovery", async () => {
     reasoningApiMocks.resolve.mockImplementation(
@@ -2385,7 +2425,7 @@ describe("CodexFormFields local model routing", () => {
     );
     fireEvent.change(
       screen.getByRole("combobox", {
-        name: "Provider reasoning effort used by deepseek-v4-flash Ultra",
+        name: "Send Ultra as (deepseek-v4-flash)",
       }),
       { target: { value: "high" } },
     );

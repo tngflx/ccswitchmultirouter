@@ -52,6 +52,7 @@ use std::time::Duration;
 /// 普通流中断和容量类失败共用这一条硬上限；它们只在等待策略和
 /// 错误分类上不同，任何路径都不能把单个请求扩展到五次以上重试。
 pub(crate) const STREAM_MAX_RETRIES: u32 = 5;
+pub(crate) const UNLIMITED_RETRY_MIN_DELAY: Duration = Duration::from_millis(200);
 
 /// 明确要求稍后再试的容量/并发失败，在没有 `Retry-After` 时先等待五分钟。
 /// 后续尝试按 2^n 增长（5、10、20、40、80 分钟），避免在持续过载时
@@ -322,7 +323,7 @@ impl ReconnectWaitState {
         self.total_delay >= self.budget(long_wait)
     }
 
-    fn delay(&mut self, attempt: u32, long_wait: bool) -> Duration {
+    fn delay(&mut self, attempt: u32, long_wait: bool, unlimited: bool) -> Duration {
         self.long_wait_capacity |= long_wait;
         let long_wait = self.long_wait_capacity;
         let fallback = if long_wait {
@@ -336,13 +337,14 @@ impl ReconnectWaitState {
             CODEX_RATE_LIMIT_MAX_SINGLE_DELAY
         };
         // Clamp before adding to an Instant: Retry-After can contain u64::MAX.
-        let delay = self
-            .retry_after
-            .take()
-            .unwrap_or(fallback)
-            .min(single_cap)
-            .min(self.budget(long_wait).saturating_sub(self.total_delay));
-        self.total_delay += delay;
+        let requested = self.retry_after.take().unwrap_or(fallback).min(single_cap);
+        let delay = if unlimited {
+            // A gateway returning Retry-After: 0 must not create a busy loop.
+            requested.max(UNLIMITED_RETRY_MIN_DELAY)
+        } else {
+            requested.min(self.budget(long_wait).saturating_sub(self.total_delay))
+        };
+        self.total_delay = self.total_delay.saturating_add(delay);
         delay
     }
 }
@@ -357,6 +359,7 @@ pub struct StreamReconnector {
     first_byte_timeout: Duration,
     max_retries: u32,
     capacity_retry_enabled: bool,
+    unlimited_reconnects: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// 上游原生 Responses SSE 的最小排障关联信息。
@@ -505,6 +508,7 @@ impl StreamReconnector {
             first_byte_timeout,
             max_retries: STREAM_MAX_RETRIES,
             capacity_retry_enabled: false,
+            unlimited_reconnects: None,
         }
     }
 
@@ -518,8 +522,32 @@ impl StreamReconnector {
         self
     }
 
+    pub(crate) fn with_unlimited_reconnects(
+        mut self,
+        enabled: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.unlimited_reconnects = Some(Box::new(enabled));
+        self
+    }
+
+    fn unlimited(&self) -> bool {
+        self.max_retries > 0
+            && self
+                .unlimited_reconnects
+                .as_ref()
+                .is_some_and(|enabled| enabled())
+    }
+
     fn retry_limit(&self) -> u32 {
-        self.max_retries
+        if self.unlimited() {
+            u32::MAX
+        } else {
+            self.max_retries
+        }
+    }
+
+    fn exhausted(&self, attempts: u32, wait: &ReconnectWaitState, long_wait: bool) -> bool {
+        !self.unlimited() && (attempts >= self.max_retries || wait.exhausted(long_wait))
     }
 
     async fn connect(&self) -> Result<ProxyResponse, ReconnectFailure> {
@@ -534,8 +562,10 @@ impl StreamReconnector {
                 tokio::time::timeout(self.first_byte_timeout, (self.connect)())
                     .await
                     .map_err(|_| {
-                        ProxyError::Timeout(format!(
-                            "Responses stream reconnect timed out after {}s",
+                        // The factory can have sent a POST. No headers means
+                        // we cannot distinguish an unsent request from a live turn.
+                        ProxyError::ResponsePending(format!(
+                            "Responses stream reconnect received no headers within {}s",
                             self.first_byte_timeout.as_secs()
                         ))
                     })?
@@ -579,14 +609,32 @@ impl StreamReconnector {
             // A cold scheduled retry must reach the downstream before either
             // sleeping or refreshing credentials/dispatching another request.
             yield ReconnectProgress::Heartbeat;
-            let mut remaining = wait.delay(attempt, long_wait);
-            while !remaining.is_zero() {
+            let prior_delay = wait.total_delay;
+            let mut remaining = wait.delay(attempt, long_wait, self.unlimited());
+            let requires_unlimited = attempt > self.max_retries
+                || prior_delay >= wait.budget(long_wait)
+                || wait.total_delay > wait.budget(long_wait);
+            while !remaining.is_zero() && (!requires_unlimited || self.unlimited()) {
                 let slice = remaining.min(KEEPALIVE_INTERVAL);
                 tokio::time::sleep(slice).await;
                 remaining = remaining.saturating_sub(slice);
                 if !remaining.is_zero() {
                     yield ReconnectProgress::Heartbeat;
                 }
+            }
+
+            if requires_unlimited && !self.unlimited() {
+                // Let the caller report its ordinary bounded exhaustion. No
+                // upstream request was sent and no terminal rejection occurred.
+                yield ReconnectProgress::Finished(Err(ReconnectFailure {
+                    reason: "unlimited reconnects disabled".to_string(),
+                    reason_class: "unlimited_reconnects_disabled",
+                    terminal: None,
+                    retry_after: None,
+                    long_wait_capacity: false,
+                    capacity_retryable: true,
+                }));
+                return;
             }
 
             let connect = self.connect();
@@ -796,7 +844,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                 "stream_interrupted"
             };
             loop {
-                if retry_attempt >= retry_limit || retry_wait.exhausted(long_wait_capacity_mode) {
+                if reconnector.exhausted(retry_attempt, &retry_wait, long_wait_capacity_mode) {
                     let exhausted_class = if is_capacity_retry {
                         "capacity_retry_exhausted"
                     } else {
@@ -818,7 +866,7 @@ pub(crate) fn create_resilient_anthropic_upstream_sse_stream(
                     break 'attempts;
                 }
 
-                retry_attempt += 1;
+                retry_attempt = retry_attempt.saturating_add(1);
                 retry_activity.emit(
                     "anthropic_messages",
                     "retry_scheduled",
@@ -1586,7 +1634,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     break 'attempts;
                 };
                 let retry_limit = reconnector.retry_limit();
-                if retry_attempt >= retry_limit || retry_wait.exhausted(capacity_retry_long_wait_mode) {
+                if reconnector.exhausted(retry_attempt, &retry_wait, capacity_retry_long_wait_mode) {
                     let message = if retrying_capacity {
                         "上游模型持续处于容量压力，自动续跑次数已耗尽，请稍后重试"
                     } else {
@@ -1614,7 +1662,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     ));
                     break 'attempts;
                 }
-                retry_attempt += 1;
+                retry_attempt = retry_attempt.saturating_add(1);
                 if retrying_capacity {
                     log::warn!(
                         "[Codex/Responses] upstream capacity pressure before semantic output; reconnecting (attempt {retry_attempt}/{retry_limit})"
@@ -1874,7 +1922,7 @@ pub(crate) fn create_resilient_chat_sse_stream_with_context(
                 let capacity_retry = reason_class.starts_with("capacity_error");
                 loop {
                     let effective_max_retries = reconnector.retry_limit();
-                    if attempt >= effective_max_retries || retry_wait.exhausted(capacity_long_wait_mode) {
+                    if reconnector.exhausted(attempt, &retry_wait, capacity_long_wait_mode) {
                         let message = if capacity_retry {
                             "上游 Chat Completions 持续处于容量压力，自动重连已耗尽，请稍后重试"
                         } else {
@@ -2391,7 +2439,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
 
             loop {
                 let retry_limit = reconnector.retry_limit();
-                if attempt >= retry_limit || retry_wait.exhausted(false) {
+                if reconnector.exhausted(attempt, &retry_wait, false) {
                     retry_activity.emit(
                         "anthropic_messages",
                         "retries_exhausted",
@@ -2411,7 +2459,7 @@ pub(crate) fn create_resilient_anthropic_sse_stream_from_responses_with_web_sear
                     ));
                     break 'attempts;
                 }
-                attempt += 1;
+                attempt = attempt.saturating_add(1);
                 log::warn!(
                     "[Claude/Responses] upstream stream dropped before any content reached the client ({reason}); reconnecting (attempt {attempt}/{retry_limit})"
                 );
@@ -4437,6 +4485,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unlimited_reconnects_outlive_both_the_attempt_limit_and_wait_budget() {
+        for protocol in DEV_WATCHDOG_PROTOCOLS {
+            let (head, text, terminal) = dev_watchdog_frames(protocol);
+            let recovered = [head.clone(), text, terminal].concat();
+            let mut script = vec![Ok(streamed_response(&[&recovered]))];
+            for _ in 0..5 {
+                let mut headers = http::HeaderMap::new();
+                headers.insert(http::header::RETRY_AFTER, "60".parse().unwrap());
+                script.push(Ok(ProxyResponse::buffered(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    headers,
+                    Bytes::new(),
+                )));
+            }
+            let (reconnector, calls) = scripted_reconnector(script);
+            let started_at = tokio::time::Instant::now();
+            let out = collect(reconnect_test_stream(
+                protocol,
+                chunks_then_error(&[&head]),
+                reconnector.with_unlimited_reconnects(|| true),
+            ))
+            .await;
+
+            assert_eq!(calls.load(Ordering::SeqCst), 6, "{protocol:?}");
+            assert_eq!(
+                started_at.elapsed(),
+                Duration::from_secs(300) + backoff_delay(1)
+            );
+            assert!(out.contains("redacted-output"), "{protocol:?}: {out}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabling_unlimited_during_backoff_does_not_dispatch_an_extra_request() {
+        use std::sync::atomic::AtomicBool;
+
+        let enabled = Arc::new(AtomicBool::new(true));
+        let setting = enabled.clone();
+        let (reconnector, calls) = scripted_reconnector(vec![Err(ProxyError::ForwardFailed(
+            "redacted reconnect failure".into(),
+        ))]);
+        let mut stream = reconnect_test_stream(
+            DevWatchdogProtocol::Responses,
+            chunks_then_error(&[]),
+            reconnector
+                .with_max_retries(1)
+                .with_unlimited_reconnects(move || setting.load(Ordering::SeqCst)),
+        );
+        // The second cold heartbeat occurs before the second send starts.
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        enabled.store(false, Ordering::SeqCst);
+        assert!(collect(stream).await.contains("stream_error"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_header_timeout_is_terminal_even_with_unlimited_reconnects() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let factory_calls = calls.clone();
+        let reconnector = StreamReconnector::new(
+            Box::new(move || {
+                assert_eq!(factory_calls.fetch_add(1, Ordering::SeqCst), 0);
+                // The send may have happened, but no headers ever arrive.
+                Box::pin(std::future::pending())
+            }),
+            Duration::from_secs(1),
+        )
+        .with_unlimited_reconnects(|| true);
+        let out = collect(reconnect_test_stream(
+            DevWatchdogProtocol::Responses,
+            chunks_then_error(&[]),
+            reconnector,
+        ))
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(out.contains("response_pending"), "{out}");
+        assert!(out.contains("\"retryable\":false"), "{out}");
     }
 
     #[tokio::test(start_paused = true)]

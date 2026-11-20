@@ -89,6 +89,7 @@ describe("useSettings persistence", () => {
       enableStreamRetry: true,
       streamRetryMode: "aggressive" as const,
       streamRetryMaxAttempts: 2,
+      streamRetryUnlimitedReconnects: true,
     };
     await settingsApi.patch(retryPatch);
     await act(async () => {
@@ -120,7 +121,11 @@ describe("useSettings persistence", () => {
       await waitFor(() => expect(result.current.isLoading).toBe(false));
 
       await act(async () => {
-        const updates = { streamRetryMaxAttempts: 1, showInTray: false };
+        const updates = {
+          streamRetryMaxAttempts: 1,
+          streamRetryUnlimitedReconnects: true,
+          showInTray: false,
+        };
         if (saveKind === "auto") {
           await result.current.autoSaveSettings(updates);
         } else {
@@ -129,12 +134,16 @@ describe("useSettings persistence", () => {
       });
 
       expect(patch).toHaveBeenCalledTimes(1);
-      expect(patch).toHaveBeenCalledWith({ streamRetryMaxAttempts: 1 });
+      expect(patch).toHaveBeenCalledWith({
+        streamRetryMaxAttempts: 1,
+        streamRetryUnlimitedReconnects: true,
+      });
       expect(fullSave).toHaveBeenCalledTimes(1);
       expect(getSettings()).toMatchObject({
         enableStreamRetry: true,
         streamRetryMode: "aggressive",
         streamRetryMaxAttempts: 1,
+        streamRetryUnlimitedReconnects: true,
         showInTray: false,
       });
       unmount();

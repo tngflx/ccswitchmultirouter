@@ -37,6 +37,7 @@ export const settingsSchema = z.object({
   enableStreamRetry: z.boolean().optional(),
   streamRetryMode: z.enum(["off", "safe", "aggressive"]).optional(),
   streamRetryMaxAttempts: z.number().int().min(1).max(3).optional(),
+  streamRetryUnlimitedReconnects: z.boolean().optional(),
   usageDashboardRefreshIntervalMs: z.number().optional(),
   preserveCodexOfficialAuthOnSwitch: z.boolean().optional(),
   unifyCodexSessionHistory: z.boolean().optional(),

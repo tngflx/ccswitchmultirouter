@@ -1,4 +1,4 @@
-//! Sub-Agent-only reasoning overrides at the request boundary.
+//! Desktop Ultra recovery and Sub-Agent reasoning overrides at the request boundary.
 //!
 //! A role file is a default, not an enforcement boundary: native built-in roles
 //! and explicit spawn arguments can choose another effort. Only Codex's explicit
@@ -8,95 +8,12 @@ use super::codex_reasoning_controls::CodexReasoningProjection;
 use super::providers::codex_reasoning::{
     CodexReasoningEffort, ReasoningSupportKind, ResolvedSubagentReasoningCapability,
 };
+use crate::codex_multirouter::catalog::{lookup_catalog_model, CatalogModelLookup};
 use crate::provider::Provider;
+use crate::reasoning_capabilities::CapabilitySource;
 use axum::http::HeaderMap;
-use indexmap::IndexMap;
 use serde_json::Value;
 use std::borrow::Cow;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
-
-const MAX_TRACKED_TURNS: usize = 1024;
-const PARENT_TURN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
-
-#[derive(PartialEq, Eq, Hash)]
-struct TurnKey {
-    router: String,
-    installation: String,
-    thread: String,
-    turn: String,
-}
-
-/// Recent generation intent, keyed by exact Codex turn lineage. Router policy
-/// and model capabilities remain the only persisted inputs to the override.
-#[derive(Default)]
-pub(super) struct CodexParentTurnEfforts {
-    turns: Mutex<IndexMap<TurnKey, (bool, Instant)>>,
-}
-
-impl CodexParentTurnEfforts {
-    pub(super) fn observe_request(
-        &self,
-        router_id: &str,
-        headers: &HeaderMap,
-        body: &Value,
-        logical_override: Option<CodexReasoningEffort>,
-    ) {
-        let Some(key) = TurnMetadata::read(headers, body).and_then(|metadata| {
-            metadata.key(router_id, "thread_id", "thread_id", None, "turn_id")
-        }) else {
-            return;
-        };
-        let logical_effort = logical_override.or_else(|| {
-            let normalized =
-                super::providers::transform_codex_chat::normalized_codex_reasoning_request(body)
-                    .ok()?;
-            normalized
-                .pointer("/reasoning/effort")?
-                .as_str()?
-                .parse()
-                .ok()
-        });
-        let requests_max = matches!(
-            logical_effort,
-            Some(CodexReasoningEffort::Max | CodexReasoningEffort::Ultra)
-        );
-        if let Ok(mut turns) = self.turns.lock() {
-            turns.shift_remove(&key);
-            if turns.len() == MAX_TRACKED_TURNS {
-                turns.shift_remove_index(0);
-            }
-            turns.insert(key, (requests_max, Instant::now()));
-        }
-    }
-
-    pub(super) fn parent_requests_max(
-        &self,
-        router_id: &str,
-        headers: &HeaderMap,
-        body: &Value,
-    ) -> bool {
-        if !is_subagent_request(headers, body) {
-            return false;
-        }
-        let Some(key) = TurnMetadata::read(headers, body).and_then(|metadata| {
-            metadata.key(
-                router_id,
-                "parent_thread_id",
-                "x-codex-parent-thread-id",
-                Some("x-codex-parent-thread-id"),
-                "parent_turn_id",
-            )
-        }) else {
-            return false;
-        };
-        self.turns.lock().ok().is_some_and(|turns| {
-            turns.get(&key).is_some_and(|(requests_max, observed_at)| {
-                *requests_max && observed_at.elapsed() < PARENT_TURN_TTL
-            })
-        })
-    }
-}
 
 /// Codex HTTP uses compatibility headers. WebSocket response.create includes
 /// the same turn metadata and its identity fields in client_metadata.
@@ -131,57 +48,21 @@ impl<'a> TurnMetadata<'a> {
             client_metadata,
             client_turn,
         };
-        match metadata.identifier("request_kind", "request_kind", None) {
+        match metadata.identifier("request_kind", None) {
             Ok(None | Some("turn")) => Some(metadata),
             _ => None,
         }
     }
 
-    fn key(
-        &self,
-        router: &str,
-        thread_field: &str,
-        client_thread_key: &str,
-        header_thread_key: Option<&str>,
-        turn_field: &str,
-    ) -> Option<TurnKey> {
-        let installation = self
-            .identifier(
-                "installation_id",
-                "x-codex-installation-id",
-                Some("x-codex-installation-id"),
-            )
-            .ok()??;
-        let thread = self
-            .identifier(thread_field, client_thread_key, header_thread_key)
-            .ok()??;
-        let turn = self.identifier(turn_field, turn_field, None).ok()??;
-        Some(TurnKey {
-            router: router.to_owned(),
-            installation: installation.to_owned(),
-            thread: thread.to_owned(),
-            turn: turn.to_owned(),
-        })
-    }
-
-    fn identifier(
-        &self,
-        metadata_key: &str,
-        client_key: &str,
-        header_key: Option<&str>,
-    ) -> Result<Option<&str>, ()> {
+    fn identifier(&self, key: &str, header_key: Option<&str>) -> Result<Option<&str>, ()> {
         let mut resolved = match header_key {
             Some(key) => header_text(self.headers, key)?,
             None => None,
         };
         for candidate in [
-            self.header_turn
-                .as_ref()
-                .and_then(|value| value.get(metadata_key)),
-            self.client_turn
-                .as_ref()
-                .and_then(|value| value.get(metadata_key)),
-            self.client_metadata.and_then(|value| value.get(client_key)),
+            self.header_turn.as_ref().and_then(|value| value.get(key)),
+            self.client_turn.as_ref().and_then(|value| value.get(key)),
+            self.client_metadata.and_then(|value| value.get(key)),
         ]
         .into_iter()
         .flatten()
@@ -226,14 +107,6 @@ fn parse_turn_metadata(raw: &str) -> Result<Value, ()> {
     value.is_object().then_some(value).ok_or(())
 }
 
-pub(super) fn is_generation_endpoint(endpoint: &str) -> bool {
-    let path = endpoint.split('?').next().unwrap_or(endpoint);
-    matches!(
-        path,
-        "/responses" | "/v1/responses" | "/chat/completions" | "/v1/chat/completions"
-    )
-}
-
 /// Desktop records the selected Ultra tier before serializing it as xhigh.
 /// Only the local record for this exact turn and model can distinguish those
 /// two selections. Keep the original body available for request diagnostics.
@@ -265,16 +138,12 @@ fn desktop_ultra_candidate(
         || !super::handlers::is_verified_codex_desktop_request(headers)
         || is_subagent_request(headers, incoming)
         || diagnostic_effort(incoming) != "xhigh"
-        || crate::reasoning_capabilities::provider_metadata::detect_platform(provider)
-            != Some("sublyx")
     {
         return None;
     }
     let metadata = TurnMetadata::read(headers, incoming)?;
-    let thread = metadata
-        .identifier("thread_id", "thread_id", Some("thread-id"))
-        .ok()??;
-    let turn = metadata.identifier("turn_id", "turn_id", None).ok()??;
+    let thread = metadata.identifier("thread_id", Some("thread-id")).ok()??;
+    let turn = metadata.identifier("turn_id", None).ok()??;
     if uuid::Uuid::parse_str(thread).is_err() || uuid::Uuid::parse_str(turn).is_err() {
         return None;
     }
@@ -286,9 +155,24 @@ fn desktop_ultra_candidate(
         return None;
     }
     let capability_model = canonical_route_model(provider).unwrap_or(model);
-    let capability = resolved_reasoning_capability(provider, capability_model);
-    (capability.effort_map.get(&CodexReasoningEffort::Ultra) == Some(&CodexReasoningEffort::Max))
-        .then(|| (thread.to_owned(), turn.to_owned(), model.to_owned()))
+    let (capability, source) = resolved_reasoning_capability(provider, capability_model);
+    let ultra = CodexReasoningEffort::Ultra;
+    // An unlisted model can pick up a provider-wide fallback with identical
+    // wire values for Ultra and XHigh. That fallback needs no rollout lookup.
+    if source == CapabilitySource::ProviderFallback
+        && capability.effort_map.get(&ultra)
+            == capability.effort_map.get(&CodexReasoningEffort::XHigh)
+        && matches!(
+            lookup_catalog_model(&provider.settings_config, capability_model),
+            CatalogModelLookup::Missing
+        )
+    {
+        return None;
+    }
+    // The effort map also contains nearest-tier fallbacks for unconfigured inputs.
+    (capability.support_kind == ReasoningSupportKind::EffortLevels
+        && capability.codex_selectable_efforts.contains(&ultra))
+    .then(|| (thread.to_owned(), turn.to_owned(), model.to_owned()))
 }
 
 fn apply_recorded_ultra_effort(
@@ -307,15 +191,18 @@ fn apply_recorded_ultra_effort(
 fn resolved_reasoning_capability(
     provider: &Provider,
     model: &str,
-) -> ResolvedSubagentReasoningCapability {
+) -> (ResolvedSubagentReasoningCapability, CapabilitySource) {
     let detection = crate::reasoning_capabilities::current_detection_for_provider(provider, model);
     let resolved = crate::reasoning_capabilities::resolve_codex_model_capability(
         provider,
         model,
         detection.as_ref(),
     );
-    super::providers::codex_reasoning::resolve_subagent_reasoning_capability(
-        resolved.capability.as_ref(),
+    (
+        super::providers::codex_reasoning::resolve_subagent_reasoning_capability(
+            resolved.capability.as_ref(),
+        ),
+        resolved.source,
     )
 }
 
@@ -349,11 +236,10 @@ pub(super) fn apply_subagent_reasoning_effort(
     headers: &HeaderMap,
     body: &mut Value,
     endpoint: &str,
-    parent_requests_max: bool,
 ) -> Option<CodexReasoningEffort> {
     let path = endpoint.split('?').next().unwrap_or(endpoint);
     let native_chat = matches!(path, "/chat/completions" | "/v1/chat/completions");
-    if !is_generation_endpoint(endpoint)
+    if !(native_chat || matches!(path, "/responses" | "/v1/responses"))
         || settings
             .pointer("/codexRouting/enabled")
             .and_then(Value::as_bool)
@@ -362,24 +248,13 @@ pub(super) fn apply_subagent_reasoning_effort(
     {
         return None;
     }
-    let policy = crate::codex_config::codex_subagent_reasoning_effort_override(settings)?;
     let request_model = body.get("model").and_then(Value::as_str)?;
     let model = canonical_route_model(provider).unwrap_or(request_model);
-    let capability = resolved_reasoning_capability(provider, model);
-    let effort = if parent_requests_max
-        && policy == CodexReasoningEffort::High
-        && capability.support_kind == ReasoningSupportKind::EffortLevels
-        && capability.effort_map.get(&CodexReasoningEffort::Max) == Some(&CodexReasoningEffort::Max)
-        && crate::reasoning_capabilities::provider_metadata::detect_platform(provider)
-            == Some("sublyx")
-    {
-        CodexReasoningEffort::Max
-    } else {
-        crate::codex_config::codex_subagent_reasoning_effort_override_for_capability(
-            settings,
-            &capability,
-        )?
-    };
+    let (capability, _) = resolved_reasoning_capability(provider, model);
+    let effort = crate::codex_config::codex_subagent_reasoning_effort_override_for_capability(
+        settings,
+        &capability,
+    )?;
     if native_chat {
         let logical = serde_json::json!({"model": model, "reasoning": {"effort": effort.as_str()}});
         let config = super::providers::resolve_codex_chat_reasoning_config(provider, &logical)?;
@@ -512,27 +387,13 @@ mod tests {
                 "gpt-6.2-sol".into(),
             ))
         );
-        let ledger = CodexParentTurnEfforts::default();
-        let child_headers = child_headers();
-        let child = json!({
-            "client_metadata": {
-                "x-codex-installation-id": "local-install",
-                "x-codex-parent-thread-id": "019c0000-0000-7000-8000-000000000001",
-                "parent_turn_id": "019c0000-0000-7000-8000-000000000002",
-            }
-        });
         for (recorded, expected) in [
             (None, "xhigh"),
             (Some(CodexReasoningEffort::XHigh), "xhigh"),
             (Some(CodexReasoningEffort::Ultra), "max"),
         ] {
             let mut prepared = incoming.clone();
-            let restored = apply_recorded_ultra_effort(&mut prepared, recorded);
-            ledger.observe_request("router", &headers, &incoming, restored);
-            assert_eq!(
-                ledger.parent_requests_max("router", &child_headers, &child),
-                expected == "max"
-            );
+            apply_recorded_ultra_effort(&mut prepared, recorded);
             super::super::providers::prepare_codex_native_responses_model(&provider, &mut prepared)
                 .expect("prepare Sublyx Responses payload");
             assert_eq!(prepared["reasoning"]["effort"], expected);
@@ -559,7 +420,7 @@ mod tests {
 
     #[test]
     fn desktop_ultra_route_alias_uses_canonical_capability_and_keeps_exact_lookup_model() {
-        let provider = Provider::with_id(
+        let mut provider = Provider::with_id(
             "router::route::sublyx".into(),
             "Sublyx route".into(),
             json!({
@@ -571,20 +432,98 @@ mod tests {
             }),
             None,
         );
-        let mut request = json!({
+        let request = json!({
             "model": "my-preferred-route",
             "reasoning": {"effort": "xhigh"}
         });
 
-        let (_, _, lookup_model) =
-            desktop_ultra_candidate(&provider, &desktop_parent_headers(), &request, "/responses")
-                .expect("compiled canonical model supports Ultra mapped to Max");
-        assert_eq!(lookup_model, "my-preferred-route");
+        for native_target in ["max", "xhigh"] {
+            if native_target == "xhigh" {
+                provider.settings_config["modelCatalog"]["models"][0]["codexUltra"] = json!({
+                    "enabled": true,
+                    "providerEffort": "xhigh",
+                    "providerEffortSource": "user"
+                });
+            }
+            let (_, _, lookup_model) = desktop_ultra_candidate(
+                &provider,
+                &desktop_parent_headers(),
+                &request,
+                "/responses",
+            )
+            .expect("compiled canonical model supports the configured Ultra target");
+            assert_eq!(lookup_model, "my-preferred-route");
 
-        apply_recorded_ultra_effort(&mut request, Some(CodexReasoningEffort::Ultra));
-        super::super::providers::prepare_codex_native_responses_model(&provider, &mut request)
-            .expect("prepare routed Sublyx Responses payload");
-        assert_eq!(request["reasoning"]["effort"], "max");
+            let mut prepared = request.clone();
+            apply_recorded_ultra_effort(&mut prepared, Some(CodexReasoningEffort::Ultra));
+            super::super::providers::prepare_codex_native_responses_model(&provider, &mut prepared)
+                .expect("prepare routed Sublyx Responses payload");
+            assert_eq!(prepared["reasoning"]["effort"], native_target);
+        }
+    }
+
+    #[test]
+    fn desktop_ultra_recovery_uses_the_configured_native_target_on_other_providers() {
+        let mut provider = Provider::with_id(
+            "relay".into(),
+            "Custom relay".into(),
+            json!({
+                "base_url": "https://relay.example/v1",
+                "modelCatalog": {"models": [{
+                    "model": "relay-test-model",
+                    "reasoning": {
+                        "schemaVersion": 2,
+                        "source": "user",
+                        "supportStatus": "confirmed_supported",
+                        "controlKind": "graded",
+                        "supportedEfforts": ["medium", "high", "xhigh", "max"],
+                        "defaultEffort": "medium",
+                        "disableAllowed": false,
+                        "upstream": {
+                            "format": "reasoning_object",
+                            "parameter": "reasoning.effort",
+                            "effortMap": {
+                                "medium": "medium", "high": "high", "xhigh": "medium", "max": "max"
+                            }
+                        }
+                    }
+                }]}
+            }),
+            None,
+        );
+        let headers = desktop_parent_headers();
+        let incoming = json!({"model": "relay-test-model", "reasoning": {"effort": "xhigh"}});
+        let candidate = |provider: &Provider| {
+            desktop_ultra_candidate(provider, &headers, &incoming, "/responses")
+        };
+        assert!(candidate(&provider).is_none());
+
+        for native_target in ["xhigh", "high", "max"] {
+            provider.settings_config["modelCatalog"]["models"][0]["codexUltra"] = json!({
+                "enabled": true,
+                "providerEffort": native_target,
+                "providerEffortSource": "user"
+            });
+            assert!(candidate(&provider).is_some());
+
+            for (recorded, expected) in [
+                (Some(CodexReasoningEffort::XHigh), "medium"),
+                (Some(CodexReasoningEffort::Ultra), native_target),
+            ] {
+                let mut prepared = incoming.clone();
+                apply_recorded_ultra_effort(&mut prepared, recorded);
+                crate::proxy::providers::prepare_codex_native_responses_model(
+                    &provider,
+                    &mut prepared,
+                )
+                .expect("prepare Responses request for the declared provider");
+                assert_eq!(prepared["reasoning"]["effort"], expected);
+            }
+        }
+
+        provider.settings_config["modelCatalog"]["models"][0]["codexUltra"]["enabled"] =
+            json!(false);
+        assert!(candidate(&provider).is_none());
     }
 
     fn provider() -> Provider {
@@ -636,119 +575,56 @@ mod tests {
         body: &mut Value,
         endpoint: &str,
     ) -> bool {
-        super::apply_subagent_reasoning_effort(settings, provider, headers, body, endpoint, false)
+        super::apply_subagent_reasoning_effort(settings, provider, headers, body, endpoint)
             .is_some()
     }
 
     #[test]
-    fn observes_exact_parent_across_http_and_websocket_turn_metadata() {
-        let tracker = CodexParentTurnEfforts::default();
-        let mut parent_headers = HeaderMap::new();
-        parent_headers.insert(
-            "x-codex-turn-metadata",
-            HeaderValue::from_static(
-                r#"{"installation_id":"desktop-a","thread_id":"parent-thread","turn_id":"parent-turn","request_kind":"turn"}"#,
-            ),
+    fn desktop_ultra_candidate_accepts_consistent_http_and_websocket_turn_metadata() {
+        let provider = Provider::with_id(
+            "sublyx".into(),
+            "Sublyx".into(),
+            json!({"base_url": "https://api.sublyx.org/v1"}),
+            None,
         );
-        let mut child = json!({"client_metadata": {
-            "x-openai-subagent": "collab_spawn",
-            "x-codex-installation-id": "desktop-a",
-            "x-codex-parent-thread-id": "parent-thread",
-            "parent_turn_id": "parent-turn",
-            "x-codex-turn-metadata": "{\"parent_thread_id\":\"parent-thread\",\"parent_turn_id\":\"parent-turn\"}"
-        }});
-        let no_headers = HeaderMap::new();
-        assert!(!tracker.parent_requests_max("router", &no_headers, &child));
-
-        for (parent, promoted) in [
-            (json!({"reasoning_effort": "max"}), true),
-            (json!({"reasoning": {"effort": "ultra"}}), true),
-            (json!({"reasoning": {"effort": "xhigh"}}), false),
-            (
-                json!({"reasoning": {"effort": "max", "enabled": false}}),
-                false,
-            ),
-            (
-                json!({"reasoning": {"effort": "max"}, "reasoning_effort": "high"}),
-                false,
-            ),
-        ] {
-            tracker.observe_request("router", &parent_headers, &parent, None);
-            assert_eq!(
-                tracker.parent_requests_max("router", &no_headers, &child),
-                promoted
-            );
-        }
-
-        tracker.observe_request(
-            "router",
-            &parent_headers,
-            &json!({"reasoning_effort": "high"}),
-            Some(CodexReasoningEffort::Max),
-        );
-        assert!(tracker.parent_requests_max("router", &no_headers, &child));
-        assert!(!tracker.parent_requests_max("other-router", &no_headers, &child));
-
-        let mut child_headers = child_headers();
-        child_headers.insert(
-            "x-codex-turn-metadata",
-            HeaderValue::from_static(
-                r#"{"installation_id":"desktop-a","parent_thread_id":"parent-thread","parent_turn_id":"parent-turn","request_kind":"turn"}"#,
-            ),
-        );
-        child_headers.insert(
-            "x-codex-parent-thread-id",
-            HeaderValue::from_static("parent-thread"),
-        );
-        assert!(tracker.parent_requests_max("router", &child_headers, &json!({})));
-        child_headers.insert(
-            "x-codex-parent-thread-id",
-            HeaderValue::from_static("other-thread"),
-        );
-        assert!(!tracker.parent_requests_max("router", &child_headers, &child));
-
-        child["client_metadata"]["parent_turn_id"] = json!("other-turn");
-        assert!(!tracker.parent_requests_max("router", &no_headers, &child));
-        child["client_metadata"]["parent_turn_id"] = json!("parent-turn");
-        child["client_metadata"]["x-codex-turn-metadata"] = json!("malformed");
-        assert!(!tracker.parent_requests_max("router", &no_headers, &child));
-        child["client_metadata"]["x-codex-turn-metadata"] = json!({"request_kind": "compaction"});
-        assert!(!tracker.parent_requests_max("router", &no_headers, &child));
-        let client_metadata = child["client_metadata"].as_object_mut().unwrap();
-        client_metadata.remove("x-codex-turn-metadata");
-        client_metadata.remove("parent_turn_id");
-        assert!(!tracker.parent_requests_max("router", &no_headers, &child));
-        child["client_metadata"]["parent_turn_id"] = json!("parent-turn");
-        child["client_metadata"]["x-codex-installation-id"] = json!("desktop-b");
-        assert!(!tracker.parent_requests_max("router", &no_headers, &child));
-    }
-
-    #[test]
-    fn parent_turn_observations_evict_oldest_at_capacity() {
-        let tracker = CodexParentTurnEfforts::default();
-        let headers = HeaderMap::new();
-        let mut parent = json!({"client_metadata": {
-            "x-codex-installation-id": "desktop-a",
-            "thread_id": "parent-thread",
-            "turn_id": "0"
-        }});
-        let child = json!({"client_metadata": {
-            "x-openai-subagent": "collab_spawn",
-            "x-codex-installation-id": "desktop-a",
-            "x-codex-parent-thread-id": "parent-thread",
-            "parent_turn_id": "0"
-        }});
-        let observe = |turn: usize, parent: &mut Value| {
-            parent["client_metadata"]["turn_id"] = json!(turn.to_string());
-            tracker.observe_request("router", &headers, parent, Some(CodexReasoningEffort::Max));
+        let thread = "019c0000-0000-7000-8000-000000000001";
+        let turn = "019c0000-0000-7000-8000-000000000002";
+        let mut body = json!({
+            "model": "gpt-6.2-sol",
+            "reasoning": {"effort": "xhigh"},
+            "client_metadata": {
+                "thread_id": thread,
+                "x-codex-turn-metadata": {"thread_id": thread, "turn_id": turn, "request_kind": "turn"}
+            }
+        });
+        let mut headers = desktop_parent_headers();
+        let candidate = |headers: &HeaderMap, body: &Value| {
+            desktop_ultra_candidate(&provider, headers, body, "/responses")
         };
-        for turn in 0..MAX_TRACKED_TURNS {
-            observe(turn, &mut parent);
-        }
-        assert!(tracker.parent_requests_max("router", &headers, &child));
-        observe(MAX_TRACKED_TURNS, &mut parent);
-        assert!(!tracker.parent_requests_max("router", &headers, &child));
-        assert_eq!(tracker.turns.lock().unwrap().len(), MAX_TRACKED_TURNS);
+        let expected = Some((thread.to_owned(), turn.to_owned(), "gpt-6.2-sol".to_owned()));
+        assert_eq!(candidate(&headers, &body), expected);
+
+        headers.remove("x-codex-turn-metadata");
+        assert_eq!(candidate(&headers, &body), expected);
+        body["client_metadata"]["x-codex-turn-metadata"] =
+            json!(body["client_metadata"]["x-codex-turn-metadata"].to_string());
+        assert_eq!(candidate(&headers, &body), expected);
+
+        headers.insert("thread-id", HeaderValue::from_static(turn));
+        assert!(candidate(&headers, &body).is_none());
+        headers.remove("thread-id");
+        body["client_metadata"]["x-openai-subagent"] = json!("collab_spawn");
+        assert!(candidate(&headers, &body).is_none());
+
+        body["client_metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("x-openai-subagent");
+        body["client_metadata"]["x-codex-turn-metadata"] = json!("malformed");
+        assert!(candidate(&headers, &body).is_none());
+        body["client_metadata"]["x-codex-turn-metadata"] =
+            json!({"thread_id": thread, "turn_id": turn, "request_kind": "compaction"});
+        assert!(candidate(&headers, &body).is_none());
     }
 
     #[test]
@@ -987,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_reasoning_effort_prepares_sublyx_native_max_for_marked_children() {
+    fn subagent_reasoning_effort_prepares_saved_effort_for_marked_sublyx_children() {
         let base_url = "https://api.sublyx.org/v1";
         let wire_model = "gpt-6.2-sol";
         let evidence_scope =
@@ -1028,16 +904,11 @@ mod tests {
             None,
         );
 
-        for (policy, promoted, expected) in [
-            (
-                json!({"codexRouting": {"enabled": true}}),
-                true,
-                Some("max"),
-            ),
-            (settings("high"), true, Some("max")),
-            (settings("high"), false, Some("high")),
-            (settings("xhigh"), true, Some("xhigh")),
-            (settings("profile"), true, None),
+        for (policy, expected) in [
+            (json!({"codexRouting": {"enabled": true}}), Some("high")),
+            (settings("high"), Some("high")),
+            (settings("xhigh"), Some("xhigh")),
+            (settings("profile"), None),
         ] {
             let mut body = request();
             body["model"] = json!("router-generated-public-alias");
@@ -1048,7 +919,6 @@ mod tests {
                 &child_headers(),
                 &mut body,
                 "/v1/responses",
-                promoted,
             );
             assert_eq!(effort.map(CodexReasoningEffort::as_str), expected);
             crate::proxy::providers::prepare_codex_native_responses_model(&provider, &mut body)
@@ -1064,7 +934,6 @@ mod tests {
                 &child_headers(),
                 &mut body,
                 "/v1/responses",
-                true,
             ),
             Some(CodexReasoningEffort::High),
         );

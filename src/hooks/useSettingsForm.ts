@@ -104,6 +104,8 @@ export function useSettingsForm(): UseSettingsFormResult {
       streamRetryMaxAttempts: clampStreamRetryMaxAttempts(
         data.streamRetryMaxAttempts,
       ),
+      streamRetryUnlimitedReconnects:
+        data.streamRetryUnlimitedReconnects ?? false,
       claudeConfigDir: sanitizeDir(data.claudeConfigDir),
       codexConfigDir: sanitizeDir(data.codexConfigDir),
       geminiConfigDir: sanitizeDir(data.geminiConfigDir),
@@ -152,6 +154,7 @@ export function useSettingsForm(): UseSettingsFormResult {
             enableStreamRetry: true,
             streamRetryMode: "safe",
             streamRetryMaxAttempts: 3,
+            streamRetryUnlimitedReconnects: false,
             language: readPersistedLanguage(),
           } as SettingsFormState);
 
@@ -203,6 +206,8 @@ export function useSettingsForm(): UseSettingsFormResult {
         streamRetryMaxAttempts: clampStreamRetryMaxAttempts(
           serverData.streamRetryMaxAttempts,
         ),
+        streamRetryUnlimitedReconnects:
+          serverData.streamRetryUnlimitedReconnects ?? false,
         claudeConfigDir: sanitizeDir(serverData.claudeConfigDir),
         codexConfigDir: sanitizeDir(serverData.codexConfigDir),
         geminiConfigDir: sanitizeDir(serverData.geminiConfigDir),

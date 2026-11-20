@@ -1,7 +1,8 @@
 import { Button } from "@/components/ui/button";
 import type { CodexCatalogModel, CodexReasoningEffort } from "@/types";
 import type { CodexModelReasoningResolution } from "@/types/codexSubagentV2";
-import { useState } from "react";
+import { useId, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 const CAPABILITY_SOURCE_LABELS: Record<string, string> = {
   automatic: "Automatic discovery or server default",
@@ -53,32 +54,59 @@ export function CodexModelReasoningSummary({
   expanded,
   onToggle,
 }: CodexModelReasoningSummaryProps) {
+  const { t } = useTranslation();
   const displayModel = model || "Unnamed model";
   const displaySource = formatCapabilitySource(source);
   const isBooleanOnly = supportKind === "boolean_only";
   const [requestedUltraSetup, setRequestedUltraSetup] = useState(false);
+  const ultraStatusId = useId();
+  const sendUltraAs = t("codexModelUltra.sendAs", {
+    defaultValue: "Send Ultra as",
+  });
+  const formatUltraEffort = (effort: CodexReasoningEffort) => {
+    if (effort === "max") {
+      return t("codexModelUltra.max", { defaultValue: "Max" });
+    }
+    if (effort === "xhigh") {
+      return t("codexModelUltra.xhigh", { defaultValue: "Extra High (xhigh)" });
+    }
+    return effort;
+  };
   const unavailableUltraEffort =
     ultraEffort && !ultraEfforts.includes(ultraEffort)
       ? ultraEffort
       : undefined;
-  let ultraStatus =
-    "Independent of the capability source; select a level after unlocking";
-  if (requestedUltraSetup || (ultraEnabled && ultraEfforts.length === 0)) {
+  let ultraStatus: string | undefined;
+  if (ultraEnabled && unavailableUltraEffort) {
+    const effort = formatUltraEffort(unavailableUltraEffort);
     ultraStatus =
-      "First confirm that this model accepts reasoning levels. The capability editor is open; complete it before saving.";
-  }
-  if (ultraEnabled && ultraEffort) {
-    ultraStatus = unavailableUltraEffort
-      ? ultraEfforts.length > 0
-        ? `Saved provider level ${ultraEffort} is unavailable. Choose a currently supported level before saving.`
-        : `Saved provider level ${ultraEffort} is unavailable. Confirm this model's reasoning capabilities, then choose a supported level before saving.`
-      : `Unlocked; uses ${ultraEffort}`;
+      ultraEfforts.length > 0
+        ? t("codexModelUltra.unsupported", {
+            effort,
+            defaultValue:
+              "Saved provider level {{effort}} is unavailable. Choose a currently supported level before saving.",
+          })
+        : t("codexModelUltra.unsupportedWithoutOptions", {
+            effort,
+            defaultValue:
+              "Saved provider level {{effort}} is unavailable. Confirm this model's reasoning capabilities, then choose a supported level before saving.",
+          });
+  } else if (
+    ultraEfforts.length === 0 &&
+    (requestedUltraSetup || ultraEnabled)
+  ) {
+    ultraStatus = t("codexModelUltra.needsCapabilities", {
+      defaultValue:
+        "Confirm this model's supported reasoning levels before saving.",
+    });
   }
 
   return (
     <div className="grid gap-3 rounded-md border bg-background p-3 text-xs lg:grid-cols-[minmax(10rem,1fr)_minmax(12rem,1.2fr)_minmax(16rem,1.2fr)_auto] lg:items-center">
       <div className="min-w-0">
-        <p className="font-medium text-foreground">{displayModel}</p>
+        <p className="break-words font-medium text-foreground">
+          {displayModel}
+        </p>
       </div>
       <div className="space-y-1 border-t pt-3 lg:border-l lg:border-t-0 lg:pl-3 lg:pt-0">
         <p className="text-muted-foreground">
@@ -99,12 +127,17 @@ export function CodexModelReasoningSummary({
           </>
         )}
       </div>
-      <div className="space-y-1 border-t pt-3 lg:border-l lg:border-t-0 lg:pl-3 lg:pt-0">
-        <span className="label text-muted-foreground">Ultra</span>
+      <div className="space-y-2 border-t pt-3 lg:border-l lg:border-t-0 lg:pl-3 lg:pt-0">
+        <p className="font-medium text-foreground">
+          {t("codexModelUltra.title", { defaultValue: "Main agent Ultra" })}
+        </p>
         <label className="flex items-center gap-2 font-medium">
           <input
             type="checkbox"
-            aria-label={`Unlock Ultra for ${displayModel}`}
+            aria-label={t("codexModelUltra.unlockForModel", {
+              model: displayModel,
+              defaultValue: "Unlock Ultra for {{model}}",
+            })}
             checked={ultraEnabled}
             onChange={(event) => {
               setRequestedUltraSetup(
@@ -126,37 +159,52 @@ export function CodexModelReasoningSummary({
               });
             }}
           />
-          Unlock Ultra
+          {t("codexModelUltra.unlock", { defaultValue: "Unlock Ultra" })}
         </label>
-        <select
-          className="w-full rounded border bg-background px-2 py-1"
-          aria-label={`Provider reasoning effort used by ${displayModel} Ultra`}
-          value={ultraEffort ?? ""}
-          disabled={!ultraEnabled || ultraEfforts.length === 0}
-          onChange={(event) => {
-            const providerEffort = ultraEfforts.find(
-              (effort) => effort === event.target.value,
-            );
-            onUltraChange({
-              enabled: ultraEnabled,
-              providerEffort,
-              ...(providerEffort ? { providerEffortSource: "user" } : {}),
-            });
-          }}
-        >
-          <option value="">Select provider level…</option>
-          {unavailableUltraEffort ? (
-            <option value={unavailableUltraEffort} disabled>
-              {unavailableUltraEffort} (unavailable)
+        <label className="grid gap-1 text-muted-foreground">
+          {sendUltraAs}
+          <select
+            className="w-full min-w-0 rounded border bg-background px-2 py-1 text-foreground disabled:opacity-60"
+            aria-label={`${sendUltraAs} (${displayModel})`}
+            aria-describedby={ultraStatus ? ultraStatusId : undefined}
+            value={ultraEffort ?? ""}
+            disabled={!ultraEnabled || ultraEfforts.length === 0}
+            onChange={(event) => {
+              const providerEffort = ultraEfforts.find(
+                (effort) => effort === event.target.value,
+              );
+              onUltraChange({
+                enabled: ultraEnabled,
+                providerEffort,
+                ...(providerEffort ? { providerEffortSource: "user" } : {}),
+              });
+            }}
+          >
+            <option value="">
+              {t("codexModelUltra.placeholder", {
+                defaultValue: "Select provider level…",
+              })}
             </option>
-          ) : null}
-          {ultraEfforts.map((effort) => (
-            <option key={effort} value={effort}>
-              {effort}
-            </option>
-          ))}
-        </select>
-        <p className="text-muted-foreground">{ultraStatus}</p>
+            {unavailableUltraEffort && (
+              <option value={unavailableUltraEffort} disabled>
+                {t("codexModelUltra.unavailableOption", {
+                  effort: formatUltraEffort(unavailableUltraEffort),
+                  defaultValue: "{{effort}} (unavailable)",
+                })}
+              </option>
+            )}
+            {ultraEfforts.map((effort) => (
+              <option key={effort} value={effort}>
+                {formatUltraEffort(effort)}
+              </option>
+            ))}
+          </select>
+        </label>
+        {ultraStatus && (
+          <p id={ultraStatusId} className="text-muted-foreground">
+            {ultraStatus}
+          </p>
+        )}
       </div>
       <Button
         type="button"

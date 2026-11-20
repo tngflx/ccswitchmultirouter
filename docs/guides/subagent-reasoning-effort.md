@@ -3,30 +3,27 @@
 In **Codex MultiRouter → Sub-Agent → Sub-agent settings**, use **All Sub-Agent
 reasoning effort**. Changing the selection saves it for the selected router plan:
 
-- **High**: the default. A verified Max or Ultra parent turn uses native Max
-  for a Sublyx child whose model declares native `max`. Otherwise the router
-  uses `high` where supported.
-- **Max**: an explicit opt-in Sub-Agent choice; it is applied only when the
-  current model capability advertises native `max`.
-- **Profile settings (override off)**: restore the original saved per-profile or
-  model-default policy. An explicitly saved selection remains unchanged.
+- **High** uses `high` where supported and is the default for plans with no
+  saved Sub-Agent effort.
+- **Max** uses `max` when the current model declares native `max`.
+- **Profile settings (override off)** uses each Sub-Agent's saved profile or
+  model-default policy.
 - Existing saved lower, Extra high, None, or Ultra values remain preserved as
   legacy read-only values; they are not offered as new choices and are not silently
   migrated. Provider-native/main-agent controls keep their full capability lists.
 
-The native effort settings apply to both Sub-Agent V1 and V2; Ultra is inactive
-in V1. They do **not** change the main
-agent's effort, saved profile reasoning policies, model catalogs, routes, or
-candidate selections. Unsupported or unknown models retain their existing policy;
-V2 previews/status explain when a model cannot use the override.
+The plan-level effort applies to Sub-Agent V1 and V2. Saved Ultra applies in V2
+only. A model with unknown capabilities or without the selected effort keeps its
+existing policy. The V2 preview and status report when a model cannot use the
+override.
 
 Wait for the save/projection result. For an active plan, restart Codex Desktop or
 its app-server and start a **new session** after successful projection so cached
-role files and parent guidance are reloaded. An inactive plan is saved without
-changing the current Codex files; it takes effect when that plan is activated.
-A pending projection requires a successful retry before treating activation as
-complete. Toggling off does not retrospectively rewrite an already running
-Sub-Agent's cached configuration.
+role files and parent guidance are reloaded. The router reads the latest saved
+plan policy when it prepares a marked Sub-Agent request, including requests from
+existing sessions. An inactive plan's projected role settings take effect when
+that plan is activated. A pending projection needs a successful retry before
+Codex can reload the updated role files.
 
 ## Configuration contract
 
@@ -63,14 +60,12 @@ profile policies.
 Generated managed role files, previews, and status are derived from current
 canonical settings. At the proxy request boundary, explicit Codex child markers
 (`x-openai-subagent` header or its top-level `client_metadata` equivalent)
-authorize the same override before protocol conversion. With High selected,
-the router matches the child's installation, parent thread, and parent turn to
-an observed generation request. A Max or Ultra match allows native Max on
-supported Sublyx models. Clients that omit the exact lineage use the selected
-fallback. Requests without a child marker keep their own effort. Generation
-requests are scoped explicitly to Responses and Chat;
-compact, search, and image-control endpoints are left unchanged. For native Chat,
-the same capability mapping chooses the provider's actual effort parameter.
+authorize the same override before protocol conversion. For a marked child,
+the router uses the plan's saved effort and the routed model's capabilities.
+In **Profile settings** mode, the child uses its own reasoning policy. Main-agent
+reasoning follows the main request and the provider model's mapping. The
+Sub-Agent override applies to Responses and Chat generation endpoints. For
+native Chat, the same capability mapping chooses the provider's effort parameter.
 The canonical reasoning boundary also applies to main-agent generation requests:
 flat and nested effort aliases must agree, and explicit Boolean intent must not
 contradict the effort. Native Chat maps controls once without rebuilding messages
@@ -102,8 +97,8 @@ After the updated backend is loaded, the existing router timeline at
   the same safe vocabulary. Budget/boolean-only controls do not invent a tier;
   an absent effort is reported as `unset`.
 
-For example, a marked child explicitly requesting Max under the High fallback
-without a matching parent turn can show `is_subagent=true`,
+For example, a marked child requesting Max for a model that supports High can
+show `is_subagent=true` when the plan has High selected, with
 `subagent_reasoning_override_applied=true`,
 `requested_reasoning_effort=max`, and `upstream_reasoning_effort=high`.
 This is an example, not a live verification receipt. The fields never serialize

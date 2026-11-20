@@ -63,6 +63,34 @@ describe("StreamRetryToggle", () => {
     });
   });
 
+  it("defaults aggressive unlimited reconnects off and saves them separately", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn().mockResolvedValue(true);
+    const props = { maxAttempts: 2, onChange };
+    const { rerender } = render(
+      <StreamRetryToggle mode="aggressive" {...props} />,
+    );
+    const name = "streamRetry.unlimitedReconnects";
+
+    expect(screen.getByRole("switch", { name })).not.toBeChecked();
+    await user.click(screen.getByRole("switch", { name }));
+    expect(onChange).toHaveBeenCalledWith({
+      streamRetryUnlimitedReconnects: true,
+    });
+    expect(screen.getByRole("slider")).toHaveValue("2");
+
+    rerender(<StreamRetryToggle mode="safe" unlimitedReconnects {...props} />);
+    expect(screen.queryByRole("switch", { name })).not.toBeInTheDocument();
+    rerender(
+      <StreamRetryToggle mode="aggressive" unlimitedReconnects {...props} />,
+    );
+    expect(screen.getByRole("switch", { name })).toBeChecked();
+    await user.click(screen.getByRole("switch", { name }));
+    expect(onChange).toHaveBeenLastCalledWith({
+      streamRetryUnlimitedReconnects: false,
+    });
+  });
+
   it("explains the Desktop prerequisite only for automatic continuation", () => {
     const { rerender } = render(
       <StreamRetryToggle mode="safe" onChange={vi.fn()} />,

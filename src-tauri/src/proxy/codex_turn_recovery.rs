@@ -18,7 +18,7 @@ use super::providers::codex_terminal::{
     classify_native_responses_terminal, terminal_error_code, terminal_error_code_from_body,
     NativeResponsesEvidence, NativeResponsesTerminalDisposition,
 };
-use super::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
+use super::sse::strip_sse_field;
 
 const RECOVERY_STATE_TTL: Duration = Duration::from_secs(15 * 60);
 const DESKTOP_READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -30,6 +30,7 @@ const MAX_OWNER_OPERATIONS_PER_THREAD: usize = 256;
 const MAX_IDLE_OWNER_EPOCHS: usize = 128;
 const IDLE_OWNER_EPOCH_TTL: Duration = Duration::from_secs(60);
 const MAX_RECOVERY_LEDGER_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RECOVERY_SSE_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Intent is recorded by the native transaction, never inferred from a proxy
 /// prompt/header. Literal `continue` can only retain a restrictive old budget.
@@ -755,6 +756,35 @@ fn mark_observed_tool_step_completed(context: &TurnRecoveryContext) {
             }
         }
     }
+}
+
+fn retire_uninspectable_stream(context: &TurnRecoveryContext) {
+    let Ok(mut states) = recovery_states().lock() else {
+        return;
+    };
+    let Some(state) = states.get_mut(&context.desktop_thread_id) else {
+        return;
+    };
+    if state.phase != RecoveryPhase::ActiveRequest
+        || state.tracked_epoch.as_deref() != Some(state.action_epoch.as_str())
+        || state
+            .tracked
+            .as_ref()
+            .is_none_or(|tracked| tracked.recovery_id != context.recovery_id)
+    {
+        return;
+    }
+    // An unreadable event might contain a success or a permanent failure. Do
+    // not leave crash-recovery evidence, but do not refund earlier attempts.
+    if state.submitted > 0 {
+        make_automatic_budget_dormant(state);
+    } else {
+        reset_automatic_state(state, false);
+        if state.continuations.is_empty() {
+            states.remove(&context.desktop_thread_id);
+        }
+    }
+    persist_states(&states);
 }
 
 /// Every unproven user input is a new native action epoch. A literal continue
@@ -1916,6 +1946,52 @@ fn log_recovery_event_with_blocker(
     crate::proxy::codex_router_log::append_event("turn_recovery", &fields);
 }
 
+#[derive(Default)]
+struct RecoverySseInspection {
+    frame: Vec<u8>,
+    evidence: NativeResponsesEvidence,
+}
+
+impl RecoverySseInspection {
+    fn inspect_chunk(&mut self, chunk: &[u8]) -> Result<Option<RecoveryDecision>, ()> {
+        // Inspect raw bytes up to one complete SSE frame at a time. This keeps
+        // UTF-8 and LF/CRLF delimiters intact across transport chunk boundaries
+        // without copying an arbitrarily large chunk into the frame buffer.
+        for line in chunk.split_inclusive(|byte| *byte == b'\n') {
+            if line.len() > MAX_RECOVERY_SSE_FRAME_BYTES.saturating_sub(self.frame.len()) {
+                return Err(());
+            }
+            self.frame.extend_from_slice(line);
+            let delimiter = if self.frame.ends_with(b"\r\n\r\n") {
+                4
+            } else if self.frame.ends_with(b"\n\n") {
+                2
+            } else {
+                continue;
+            };
+            let parsed = parse_event(&String::from_utf8_lossy(
+                &self.frame[..self.frame.len() - delimiter],
+            ));
+            self.frame.clear();
+            let Some((event_name, payload)) = parsed else {
+                continue;
+            };
+            self.evidence.observe_event(&event_name, &payload);
+            if let Some(disposition) =
+                classify_native_responses_terminal(&event_name, &payload, self.evidence)
+            {
+                return Ok(Some(recovery_decision(
+                    disposition,
+                    &event_name,
+                    &payload,
+                    self.evidence,
+                )));
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// Observe the final Responses SSE seen by Codex Desktop without altering it.
 /// This works for both native Responses providers and Chat-to-Responses routes.
 pub(crate) fn observe_responses_turn_stream(
@@ -1926,44 +2002,34 @@ pub(crate) fn observe_responses_turn_stream(
     async_stream::stream! {
         let _tracked = tracked;
         let mut stream = Box::pin(stream);
-        let mut buffer = String::new();
-        let mut utf8_remainder = Vec::new();
-        let mut evidence = NativeResponsesEvidence::default();
-        let mut terminal_seen = false;
+        let mut inspection = Some(RecoverySseInspection::default());
 
         while let Some(item) = stream.next().await {
-            match &item {
-                Ok(chunk) => {
-                    append_utf8_safe(&mut buffer, &mut utf8_remainder, chunk);
-                    while let Some(block) = take_sse_block(&mut buffer) {
-                        let Some((event_name, payload)) = parse_event(&block) else {
-                            continue;
-                        };
-                        if terminal_seen { continue; }
-                        evidence.observe_event(&event_name, &payload);
-                        let Some(disposition) = classify_native_responses_terminal(
-                            &event_name,
-                            &payload,
-                            evidence,
-                        ) else {
-                            continue;
-                        };
-                        terminal_seen = true;
-                        apply_recovery_decision(&context, recovery_decision(
-                            disposition, &event_name, &payload, evidence,
-                        ));
+            if let Some(observer) = inspection.as_mut() {
+                match &item {
+                    Ok(chunk) => match observer.inspect_chunk(chunk) {
+                        Ok(Some(decision)) => {
+                            apply_recovery_decision(&context, decision);
+                            inspection = None;
+                        }
+                        Ok(None) => {}
+                        Err(()) => {
+                            retire_uninspectable_stream(&context);
+                            log_recovery_event(&context, "not_scheduled", "sse_frame_too_large", None);
+                            inspection = None;
+                        }
+                    },
+                    Err(_) if stream_interruption_is_recoverable(observer.evidence) => {
+                        schedule_turn_recovery(context.clone(), "downstream_stream_error");
+                        inspection = None;
                     }
+                    Err(_) => {}
                 }
-                Err(_) if !terminal_seen && stream_interruption_is_recoverable(evidence) => {
-                    schedule_turn_recovery(context.clone(), "downstream_stream_error");
-                    terminal_seen = true;
-                }
-                Err(_) => {}
             }
             yield item;
         }
 
-        if !terminal_seen && stream_interruption_is_recoverable(evidence) {
+        if inspection.is_some_and(|observer| stream_interruption_is_recoverable(observer.evidence)) {
             schedule_turn_recovery(context, "terminal_event_missing");
         }
     }
@@ -4043,6 +4109,66 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key(&context.desktop_thread_id));
+    }
+
+    #[tokio::test]
+    async fn oversized_sse_event_passes_through_but_cannot_authorize_recovery() {
+        let mut context = context("recovery-oversized-sse", 2);
+        assert_eq!(reserve_recovery(&context), Some(1));
+        assert!(authorize_recovery_commit_for_test(&context));
+        begin_turn(&context.desktop_thread_id, true);
+        context.observed_at_ms += 1;
+        context.recovery_id.push_str("-continued");
+
+        // The frame remains unterminated. Its uninspected tail could have
+        // carried a permanent terminal error; EOF must not queue continue.
+        let frames = [
+            Bytes::from_static(b"event: response.failed\ndata: {\"padding\":\""),
+            Bytes::from(vec![b'x'; MAX_RECOVERY_SSE_FRAME_BYTES / 2]),
+            Bytes::from(vec![b'x'; MAX_RECOVERY_SSE_FRAME_BYTES / 2]),
+        ];
+        let output = observe_responses_turn_stream(
+            futures::stream::iter(frames.clone().map(Ok)),
+            context.clone(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(
+            output.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+            frames
+        );
+        let states = recovery_states().lock().unwrap();
+        let state = states.get(&context.desktop_thread_id).unwrap();
+        assert_eq!(state.phase, RecoveryPhase::AwaitingContinuation);
+        assert_eq!(state.submitted, 1);
+        drop(states);
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test]
+    async fn sse_inspection_budget_is_per_frame_and_supports_split_crlf() {
+        let context = context("recovery-bounded-sse-frames", 3);
+        let prefix = Bytes::from(": heartbeat\n\n".repeat(MAX_RECOVERY_SSE_FRAME_BYTES / 10));
+        assert!(prefix.len() > MAX_RECOVERY_SSE_FRAME_BYTES);
+        let frames = [
+            prefix,
+            Bytes::from_static(b"event: response.failed\r\n"),
+            Bytes::from_static(b"data: {\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"overloaded_error\"}}}\r\n\r"),
+            Bytes::from_static(b"\n"),
+        ];
+        let output = observe_responses_turn_stream(
+            futures::stream::iter(frames.clone().map(Ok)),
+            context.clone(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(
+            output.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+            frames
+        );
+        assert!(recovery_reserved_for_test(&context.desktop_thread_id));
+        mark_turn_completed(&context.desktop_thread_id);
     }
 
     #[tokio::test]

@@ -492,6 +492,7 @@ export const handlers = [
       enableStreamRetry: current.enableStreamRetry,
       streamRetryMode: current.streamRetryMode,
       streamRetryMaxAttempts: current.streamRetryMaxAttempts,
+      streamRetryUnlimitedReconnects: current.streamRetryUnlimitedReconnects,
     });
     return success(true);
   }),
@@ -533,6 +534,7 @@ export const handlers = [
         enableStreamRetry?: boolean;
         streamRetryMode?: Settings["streamRetryMode"];
         streamRetryMaxAttempts?: number;
+        streamRetryUnlimitedReconnects?: boolean;
         quotaCollaboration?: Partial<
           NonNullable<Settings["quotaCollaboration"]>
         >;
@@ -561,6 +563,9 @@ export const handlers = [
     }
     if ("streamRetryMaxAttempts" in patch) {
       next.streamRetryMaxAttempts = patch.streamRetryMaxAttempts;
+    }
+    if ("streamRetryUnlimitedReconnects" in patch) {
+      next.streamRetryUnlimitedReconnects = patch.streamRetryUnlimitedReconnects;
     }
     if (patch.quotaCollaboration) {
       next.quotaCollaboration = {

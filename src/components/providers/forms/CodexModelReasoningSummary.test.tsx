@@ -171,7 +171,7 @@ describe("CodexModelReasoningSummary", () => {
     expect(onToggle).toHaveBeenCalledOnce();
     expect(
       screen.getByText(
-        "First confirm that this model accepts reasoning levels. The capability editor is open; complete it before saving.",
+        "Confirm this model's supported reasoning levels before saving.",
       ),
     ).toBeInTheDocument();
   });
@@ -194,11 +194,13 @@ describe("CodexModelReasoningSummary", () => {
 
     expect(
       screen.getByRole("combobox", {
-        name: "Provider reasoning effort used by gpt-6.1 Ultra",
+        name: "Send Ultra as (gpt-6.1)",
       }),
     ).toHaveValue("max");
-    expect(screen.getByRole("option", { name: "max" })).toBeEnabled();
-    expect(screen.getByText("Unlocked; uses max")).toBeInTheDocument();
+    expect(screen.getByText("Main agent Ultra")).toBeInTheDocument();
+    expect(
+      screen.getByRole("option", { name: "Max", selected: true }),
+    ).toBeEnabled();
     expect(onUltraChange).not.toHaveBeenCalled();
   });
 
@@ -219,16 +221,18 @@ describe("CodexModelReasoningSummary", () => {
     );
 
     const effort = screen.getByRole("combobox", {
-      name: "Provider reasoning effort used by gpt-6.1 Ultra",
+      name: "Send Ultra as (gpt-6.1)",
     });
     expect(effort).toHaveValue("max");
     expect(
-      screen.getByRole("option", { name: "max (unavailable)" }),
+      screen.getByRole("option", { name: "Max (unavailable)", selected: true }),
     ).toBeDisabled();
-    expect(screen.queryByText("Unlocked; uses max")).toBeNull();
+    expect(
+      screen.getByRole("option", { name: "Extra High (xhigh)" }),
+    ).toBeEnabled();
     expect(
       screen.getByText(
-        "Saved provider level max is unavailable. Choose a currently supported level before saving.",
+        "Saved provider level Max is unavailable. Choose a currently supported level before saving.",
       ),
     ).toBeInTheDocument();
     expect(onUltraChange).not.toHaveBeenCalled();
@@ -283,16 +287,16 @@ describe("CodexModelReasoningSummary", () => {
     );
 
     const effort = screen.getByRole("combobox", {
-      name: "Provider reasoning effort used by gpt-6.1 Ultra",
+      name: "Send Ultra as (gpt-6.1)",
     });
     expect(effort).toHaveValue("max");
     expect(effort).toBeDisabled();
     expect(
-      screen.getByRole("option", { name: "max (unavailable)" }),
+      screen.getByRole("option", { name: "Max (unavailable)", selected: true }),
     ).toBeDisabled();
     expect(
       screen.getByText(
-        "Saved provider level max is unavailable. Confirm this model's reasoning capabilities, then choose a supported level before saving.",
+        "Saved provider level Max is unavailable. Confirm this model's reasoning capabilities, then choose a supported level before saving.",
       ),
     ).toBeInTheDocument();
     expect(onUltraChange).not.toHaveBeenCalled();

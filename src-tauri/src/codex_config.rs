@@ -5087,13 +5087,8 @@ fn project_codex_subagent_v2_parent_instructions(
         ),
     });
     if let Some(effort) = codex_subagent_reasoning_effort_override(settings) {
-        let parent_guidance = if effort == SubagentReasoningEffort::High {
-            "For a Max or Ultra parent turn, request native Max when delegating to a Sublyx model that declares it. High is the fallback."
-        } else {
-            "Use the configured child effort independently of the parent effort."
-        };
         let guidance = format!(
-            "CCSwitchMulti Sub-Agent reasoning override is `{}`. {parent_guidance} Apply the selected child effort to custom and built-in Sub-Agents only when the child model's declared capability supports it. For unsupported models, retain the saved profile/model policy. Keep the parent/session reasoning setting and saved profiles intact.",
+            "CCSwitchMulti Sub-Agent reasoning override is `{}`. Use the configured child effort independently of the parent effort. Apply the selected child effort to custom and built-in Sub-Agents only when the child model's declared capability supports it. For unsupported models, retain the saved profile/model policy. Keep the parent/session reasoning setting and saved profiles intact.",
             effort.as_str(),
         );
         policy = Some(match policy {
@@ -12269,7 +12264,9 @@ wire_api = "responses"
             assert_eq!(projected["model_reasoning_effort"].as_str(), Some("max"));
             let instructions = projected["developer_instructions"].as_str().unwrap();
             assert!(instructions.contains("Sub-Agent reasoning override is `high`"));
-            assert!(instructions.contains("For a Max or Ultra parent turn, request native Max"));
+            assert!(instructions
+                .contains("Use the configured child effort independently of the parent effort."));
+            assert!(!instructions.contains("request native Max"));
             settings["codexRouting"]["subagentReasoningEffort"] = json!("profile");
             let restored = project_codex_subagent_v2_parent_instructions(
                 &settings,

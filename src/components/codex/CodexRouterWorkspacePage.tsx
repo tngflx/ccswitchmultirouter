@@ -8708,13 +8708,13 @@ function SpawnAgentCandidatesPanel({
         <p className="mt-2 text-xs leading-5 text-muted-foreground">
           {t("codexSubagentReasoning.globalHint", {
             defaultValue:
-              "Applies to V1 and V2. With High selected, a verified Max or Ultra parent turn uses native Max for supported Sublyx children. High is the fallback. Profile settings restores saved choices.",
+              "Applies to V1 and V2. High and Max apply where supported. Choose Profile settings to use each Sub-Agent's saved policy.",
           })}
         </p>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
           {t("codexSubagentReasoning.globalActivation", {
             defaultValue:
-              "After saving, restart Codex/app-server, then start a new session to apply. Existing sessions keep their current effort.",
+              "After saving, restart Codex Desktop/app-server and create a new session to reload the projected role settings.",
           })}
         </p>
         {activeOperation === "reasoning" ? (

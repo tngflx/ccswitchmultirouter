@@ -53,6 +53,19 @@
     "permissionsHint": "Host sandbox and tool permissions are inherited separately. High/Max changes reasoning effort, not operational access. Instruction guidance does not guarantee model compliance.",
     "customInstructionsHint": "Custom text supplements the baseline; it cannot replace scope, ownership, or repository instructions. These are behavioral rules, not an execution sandbox."
   },
+  "codexModelUltra": {
+    "title": "Main agent Ultra",
+    "unlock": "Unlock Ultra",
+    "unlockForModel": "Unlock Ultra for {{model}}",
+    "sendAs": "Send Ultra as",
+    "placeholder": "Select provider level…",
+    "max": "Max",
+    "xhigh": "Extra High (xhigh)",
+    "unavailableOption": "{{effort}} (unavailable)",
+    "needsCapabilities": "Confirm this model's supported reasoning levels before saving.",
+    "unsupported": "Saved provider level {{effort}} is unavailable. Choose a currently supported level before saving.",
+    "unsupportedWithoutOptions": "Saved provider level {{effort}} is unavailable. Confirm this model's reasoning capabilities, then choose a supported level before saving."
+  },
   "codexSubagentReasoning": {
     "globalLabel": "All Sub-Agent reasoning effort",
     "globalProfileOption": "Profile settings (override off)",
@@ -60,8 +73,8 @@
     "globalInvalidOption": "Invalid saved reasoning effort",
     "globalHighOption": "High",
     "globalMaxOption": "Max",
-    "globalHint": "Applies to V1 and V2. With High selected, a verified Max or Ultra parent turn uses native Max for supported Sublyx children. High is the fallback. Profile settings restores saved choices.",
-    "globalActivation": "After saving, restart Codex/app-server, then start a new session to apply. Existing sessions keep their current effort.",
+    "globalHint": "Applies to V1 and V2. High and Max apply where supported. Choose Profile settings to use each Sub-Agent's saved policy.",
+    "globalActivation": "After saving, restart Codex Desktop/app-server and create a new session to reload the projected role settings.",
     "globalSaving": "Saving Sub-Agent reasoning effort…",
     "globalSaved": "Sub-Agent reasoning effort saved.",
     "globalSaveFailed": "Could not save Sub-Agent reasoning effort: {{error}}",
@@ -671,7 +684,7 @@
         "streamRetryAggressive": "Aggressive",
         "streamRetryAggressiveDescription": "Use safe reconnects and allow bounded Codex Desktop continuation after an interrupted turn.",
         "streamRetryContinuationPrerequisite": "Automatic continuation needs a ready Codex Desktop debugging bridge and local request client. If a debugging port is already available, first use “Unlock model picker” to repair the running app in place. Only if the debugging port is missing, save your work and fully exit Codex Desktop, then use “Unlock model picker” to relaunch with debugging enabled. Delivery is confirmed only when Codex accepts the new “continue” turn.",
-        "streamRetryMaxAttempts": "Continuation attempts",
+        "streamRetryMaxAttempts": "Desktop continuation attempts",
         "streamRetryMaxAttemptsDescription": "Maximum semantic continuation attempts for one Codex Desktop turn.",
         "running": "Running",
         "stopped": "Stopped"
@@ -3975,7 +3988,9 @@
       "safe": "Safe",
       "aggressive": "Aggressive"
     },
-    "maxAttempts": "Continue attempts",
+    "maxAttempts": "Desktop continuation attempts",
+    "unlimitedReconnects": "Unlimited pre-output reconnects",
+    "unlimitedReconnectsHelp": "Retry the same request on eligible failures before any text, reasoning, or tool calls are delivered. This does not change the Desktop continuation limit.",
     "help": {
       "off": "No transparent proxy reconnect or Desktop continuation.",
       "safe": "Reconnects up to 5 times before semantic output. Visible failures remain Codex-owned.",

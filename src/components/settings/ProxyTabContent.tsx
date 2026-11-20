@@ -141,6 +141,7 @@ export function ProxyTabContent({
                 mode={settings.streamRetryMode}
                 enableStreamRetry={settings.enableStreamRetry}
                 maxAttempts={settings.streamRetryMaxAttempts}
+                unlimitedReconnects={settings.streamRetryUnlimitedReconnects}
                 onChange={onAutoSave}
               />
             </div>

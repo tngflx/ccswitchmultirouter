@@ -8,6 +8,7 @@ export const STREAM_RETRY_SETTING_KEYS = [
   "enableStreamRetry",
   "streamRetryMode",
   "streamRetryMaxAttempts",
+  "streamRetryUnlimitedReconnects",
 ] as const;
 
 export type StreamRetrySettingsPatch = Partial<

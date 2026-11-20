@@ -143,6 +143,44 @@ describe("StreamRetryHeaderToggle", () => {
     });
   });
 
+  it("writes and refreshes the separate unlimited reconnect preference", async () => {
+    const user = userEvent.setup();
+    const aggressive = {
+      ...settings,
+      enableStreamRetry: true,
+      streamRetryMode: "aggressive",
+      streamRetryUnlimitedReconnects: false,
+    };
+    query.mockReturnValue({ data: aggressive, isLoading: false });
+    get.mockResolvedValue({
+      ...aggressive,
+      streamRetryUnlimitedReconnects: true,
+    });
+    render(<StreamRetryHeaderToggle />);
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "streamRetry.label: streamRetry.mode.aggressive",
+      }),
+    );
+    const control = screen.getByRole("switch", {
+      name: "streamRetry.unlimitedReconnects",
+    });
+    expect(control).not.toBeChecked();
+    await user.click(control);
+
+    expect(patch).toHaveBeenCalledWith({
+      streamRetryUnlimitedReconnects: true,
+    });
+    await waitFor(() =>
+      expect(setQueryData).toHaveBeenCalledWith(["settings"], {
+        ...aggressive,
+        streamRetryUnlimitedReconnects: true,
+      }),
+    );
+    expect(screen.getByRole("slider")).toHaveValue("3");
+  });
+
   it("opens live activity from the main-page control", async () => {
     const user = userEvent.setup();
     const openActivity = vi.fn();

@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { CircleOff, ShieldCheck, Zap } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import type { Settings } from "@/types";
 import {
@@ -18,6 +19,7 @@ interface StreamRetryToggleProps {
   mode?: Settings["streamRetryMode"];
   enableStreamRetry?: boolean;
   maxAttempts?: number;
+  unlimitedReconnects?: boolean;
   disabled?: boolean;
   onChange: (
     updates: StreamRetrySettingsUpdate,
@@ -54,10 +56,12 @@ export function StreamRetryToggle({
   mode,
   enableStreamRetry,
   maxAttempts,
+  unlimitedReconnects = false,
   disabled = false,
   onChange,
 }: StreamRetryToggleProps) {
   const { t } = useTranslation();
+  const unlimitedReconnectsId = useId();
   const [isSaving, setIsSaving] = useState(false);
   const resolvedMode = resolveStreamRetryMode(mode, enableStreamRetry);
   const attempts = clampStreamRetryMaxAttempts(maxAttempts);
@@ -132,6 +136,28 @@ export function StreamRetryToggle({
       <p className="text-xs leading-5 text-muted-foreground">
         {t(selectedMode.descriptionKey)}
       </p>
+
+      {resolvedMode === "aggressive" && (
+        <div
+          className="flex items-center justify-between gap-4 border-t border-border/50 pt-3"
+          title={t("streamRetry.unlimitedReconnectsHelp")}
+        >
+          <label
+            htmlFor={unlimitedReconnectsId}
+            className="text-sm font-medium"
+          >
+            {t("streamRetry.unlimitedReconnects")}
+          </label>
+          <Switch
+            id={unlimitedReconnectsId}
+            checked={unlimitedReconnects}
+            disabled={controlsDisabled}
+            onCheckedChange={(enabled) =>
+              void persist({ streamRetryUnlimitedReconnects: enabled })
+            }
+          />
+        </div>
+      )}
 
       {resolvedMode === "aggressive" && (
         <div className="space-y-2 border-t border-border/50 pt-3">

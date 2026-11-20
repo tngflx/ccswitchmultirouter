@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { Loader2, RadioTower, RefreshCw, Settings2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
@@ -32,6 +32,7 @@ export function StreamRetryHeaderToggle({
   onOpenActivity,
 }: StreamRetryHeaderToggleProps) {
   const { t } = useTranslation();
+  const unlimitedReconnectsId = useId();
   const queryClient = useQueryClient();
   const { data: settings, isLoading } = useSettingsQuery();
   const mode = resolveStreamRetryMode(
@@ -141,6 +142,24 @@ export function StreamRetryHeaderToggle({
                 </button>
               ))}
             </div>
+            {mode === "aggressive" && (
+              <div
+                className="flex items-center justify-between gap-3 text-xs"
+                title={t("streamRetry.unlimitedReconnectsHelp")}
+              >
+                <label htmlFor={unlimitedReconnectsId}>
+                  {t("streamRetry.unlimitedReconnects")}
+                </label>
+                <Switch
+                  id={unlimitedReconnectsId}
+                  checked={settings?.streamRetryUnlimitedReconnects ?? false}
+                  disabled={busy}
+                  onCheckedChange={(enabled) =>
+                    void update({ streamRetryUnlimitedReconnects: enabled })
+                  }
+                />
+              </div>
+            )}
             <label
               className={cn(
                 "flex items-center justify-between gap-3 text-xs",
@@ -149,13 +168,13 @@ export function StreamRetryHeaderToggle({
             >
               <span>
                 {t("streamRetry.maxAttempts", {
-                  defaultValue: "Continue attempts",
+                  defaultValue: "Desktop continuation attempts",
                 })}
                 : {attempts}
               </span>
               <input
                 aria-label={t("streamRetry.maxAttempts", {
-                  defaultValue: "Continue attempts",
+                  defaultValue: "Desktop continuation attempts",
                 })}
                 type="range"
                 min={1}

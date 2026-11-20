@@ -7009,12 +7009,12 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       expect(providersApi.update).not.toHaveBeenCalled();
       expect(
         screen.getByText(
-          /a verified Max or Ultra parent turn uses native Max for supported Sublyx children/,
+          /High and Max apply where supported\. Choose Profile settings to use each Sub-Agent's saved policy\./,
         ),
       ).toBeInTheDocument();
       expect(
         screen.getByText(
-          /restart Codex Desktop\/app-server and create a new session/i,
+          /restart Codex Desktop\/app-server and create a new session to reload the projected role settings/i,
         ),
       ).toBeInTheDocument();
     },
@@ -7294,7 +7294,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(screen.getByRole("button", { name: "Enable V2" })).toBeEnabled();
     expect(
       screen.getByText(
-        /restart Codex Desktop\/app-server and create a new session/i,
+        /after switching protocols, restart Codex Desktop\/app-server and create a new session/i,
       ),
     ).toBeInTheDocument();
     expect(

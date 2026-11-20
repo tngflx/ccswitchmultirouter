@@ -53,6 +53,19 @@
     "permissionsHint": "ホストのサンドボックスとツール権限は別に継承されます。High/Max は推論強度のみを変更し、操作権限は変更しません。指示による行動指針はモデルの遵守を保証しません。",
     "customInstructionsHint": "カスタム文章は基本指示を補足します。作業範囲、所有権、リポジトリの指示を置き換えることはできません。これらは行動ルールであり、実行サンドボックスではありません。"
   },
+  "codexModelUltra": {
+    "title": "メインエージェントの Ultra",
+    "unlock": "Ultra を有効にする",
+    "unlockForModel": "{{model}} の Ultra を有効にする",
+    "sendAs": "Ultra の送信強度",
+    "placeholder": "プロバイダーの強度を選択…",
+    "max": "Max（最大）",
+    "xhigh": "Extra High（xhigh）",
+    "unavailableOption": "{{effort}}（利用不可）",
+    "needsCapabilities": "保存する前に、このモデルが対応している推論強度を確認してください。",
+    "unsupported": "保存済みの強度 {{effort}} は利用できません。対応する強度を選んでから保存してください。",
+    "unsupportedWithoutOptions": "保存済みの強度 {{effort}} は利用できません。モデルの推論能力を確認し、対応する強度を選んでから保存してください。"
+  },
   "codexSubagentReasoning": {
     "globalLabel": "すべてのサブエージェントの推論強度",
     "globalProfileOption": "プロファイル設定（上書きなし）",
@@ -60,8 +73,8 @@
     "globalInvalidOption": "保存済みの推論強度が無効です",
     "globalHighOption": "High（高）",
     "globalMaxOption": "Max（最大）",
-    "globalHint": "V1 と V2 に適用されます。High を選択した場合、親ターンの Max または Ultra が確認されると、対応する Sublyx のサブエージェントはネイティブの Max を使用します。それ以外の場合は High が使われます。プロファイル設定を選ぶと保存済みの設定に戻ります。",
-    "globalActivation": "保存後、Codex Desktop/app-server を再起動し、新しいセッションを作成すると適用されます。既存のセッションは変更されません。",
+    "globalHint": "V1 と V2 に適用されます。High と Max はモデルが対応している場合に適用されます。プロファイル設定を選ぶと、各サブエージェントの保存済みポリシーが使われます。",
+    "globalActivation": "保存後、Codex Desktop/app-server を再起動して新しいセッションを作成すると、生成されたロール設定が再読み込みされます。",
     "globalSaving": "サブエージェントの推論強度を保存中…",
     "globalSaved": "サブエージェントの推論強度を保存しました。",
     "globalSaveFailed": "サブエージェントの推論強度を保存できませんでした：{{error}}",
@@ -671,7 +684,7 @@
         "streamRetryAggressive": "積極的",
         "streamRetryAggressiveDescription": "安全な再接続に加え、ターン中断後に Codex Desktop の継続を制限付きで許可します。",
         "streamRetryContinuationPrerequisite": "自動継続には、準備の整った Codex Desktop のデバッグブリッジとローカルリクエストクライアントが必要です。デバッグポートがすでに利用できる場合は、まず「Unlock model picker」で実行中のアプリを修復してください。ポートがない場合に限り、作業を保存して Codex Desktop を完全終了し、同じ操作でデバッグを有効にして再起動してください。Codex が新しい「continue」ターンを受け付けた場合のみ、送信を確認できます。",
-        "streamRetryMaxAttempts": "継続試行回数",
+        "streamRetryMaxAttempts": "Desktop の継続試行回数",
         "streamRetryMaxAttemptsDescription": "1 回の Codex Desktop ターンで許可する意味的な継続の最大試行回数です。",
         "running": "実行中",
         "stopped": "停止中"
@@ -3975,7 +3988,9 @@
       "safe": "安全",
       "aggressive": "積極的"
     },
-    "maxAttempts": "続行の試行回数",
+    "maxAttempts": "Desktop の継続試行回数",
+    "unlimitedReconnects": "出力前の再接続回数を無制限にする",
+    "unlimitedReconnectsHelp": "テキスト、推論、ツール呼び出しが届く前に再試行可能な障害が発生した場合、同じリクエストを再送します。Desktop の継続試行回数の上限は変わりません。",
     "help": {
       "off": "透過的なプロキシ再接続もデスクトップ続行も行いません。",
       "safe": "意味出力前に最大 5 回再接続します。表示された失敗は引き続き Codex が処理します。",

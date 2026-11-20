@@ -181,6 +181,8 @@ pub struct SettingsPatch {
     #[serde(default)]
     pub stream_retry_max_attempts: Option<u32>,
     #[serde(default)]
+    pub stream_retry_unlimited_reconnects: Option<bool>,
+    #[serde(default)]
     pub quota_collaboration: Option<QuotaCollaborationPatch>,
 }
 
@@ -216,6 +218,9 @@ fn apply_settings_patch(settings: &mut crate::settings::AppSettings, patch: Sett
     }
     if let Some(value) = patch.stream_retry_max_attempts {
         settings.stream_retry_max_attempts = value.clamp(1, 3);
+    }
+    if let Some(value) = patch.stream_retry_unlimited_reconnects {
+        settings.stream_retry_unlimited_reconnects = value;
     }
     if let Some(patch) = patch.quota_collaboration {
         if let Some(value) = patch.device_name {
@@ -616,12 +621,15 @@ mod tests {
         };
         crate::settings::update_settings(initial.clone()).expect("persist initial settings");
 
-        super::patch_settings(SettingsPatch {
-            enable_stream_retry: Some(true),
-            stream_retry_mode: Some(StreamRetryMode::Aggressive),
-            stream_retry_max_attempts: Some(2),
-            ..SettingsPatch::default()
-        })
+        super::patch_settings(
+            serde_json::from_value(serde_json::json!({
+                "enableStreamRetry": true,
+                "streamRetryMode": "aggressive",
+                "streamRetryMaxAttempts": 2,
+                "streamRetryUnlimitedReconnects": true,
+            }))
+            .expect("decode the retry control patch"),
+        )
         .await
         .expect("enable continuation through the dedicated retry control");
         crate::settings::reload_settings().expect("reload retry policy");
@@ -641,6 +649,7 @@ mod tests {
         assert_eq!(persisted.stream_retry_mode, StreamRetryMode::Aggressive);
         assert!(persisted.enable_stream_retry);
         assert_eq!(persisted.stream_retry_max_attempts, 2);
+        assert!(persisted.stream_retry_unlimited_reconnects_effective());
         assert_eq!(persisted.stream_recovery_budget(), 2);
         assert_eq!(persisted.language.as_deref(), Some("ja"));
 
@@ -667,7 +676,27 @@ mod tests {
             assert_eq!(current.enable_stream_retry, enabled);
             assert_eq!(current.stream_retry_max_attempts, 3);
             assert_eq!(current.stream_recovery_budget(), budget);
+            assert!(current.stream_retry_unlimited_reconnects);
+            assert_eq!(
+                current.stream_retry_unlimited_reconnects_effective(),
+                mode == StreamRetryMode::Aggressive
+            );
         }
+
+        let stale_opted_in_form = crate::settings::get_settings();
+        super::patch_settings(SettingsPatch {
+            stream_retry_unlimited_reconnects: Some(false),
+            ..SettingsPatch::default()
+        })
+        .await
+        .expect("turn off unlimited reconnects through the retry control");
+        crate::settings::update_settings_preserving_dedicated_settings(stale_opted_in_form)
+            .expect("save unrelated stale form after disabling unlimited reconnects");
+        crate::settings::reload_settings().expect("reload after disabling unlimited reconnects");
+        let current = crate::settings::get_settings();
+        assert!(!current.stream_retry_unlimited_reconnects);
+        assert!(!current.stream_retry_unlimited_reconnects_effective());
+        assert_eq!(current.stream_recovery_budget(), 3);
     }
 
     #[tokio::test]

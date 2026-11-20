@@ -709,17 +709,12 @@ impl RequestForwarder {
                 )
             })?;
         Ok(router.and_then(|router| {
-            let parent_requests_max = self
-                .router
-                .codex_parent_turn_efforts
-                .parent_requests_max(router_id, headers, body);
             super::codex_subagent_reasoning::apply_subagent_reasoning_effort(
                 &router.settings_config,
                 provider,
                 headers,
                 body,
                 endpoint,
-                parent_requests_max,
             )
         }))
     }
@@ -3621,18 +3616,6 @@ impl RequestForwarder {
             codex_responses_to_chat.then(|| summarize_codex_chat_request_shape(&filtered_body));
         let hosted_chat_tool_projection =
             codex_responses_to_chat.then(|| summarize_hosted_chat_tool_projection(&filtered_body));
-        if matches!(app_type, AppType::Codex)
-            && super::codex_subagent_reasoning::is_generation_endpoint(endpoint)
-        {
-            let (router_id, _) = super::providers::codex_route_persistent_provider(provider);
-            self.router.codex_parent_turn_efforts.observe_request(
-                router_id,
-                headers,
-                body,
-                subagent_reasoning_override.or(restored_desktop_effort),
-            );
-        }
-
         if let Some(trace_id) = codex_trace_id.as_deref() {
             let mut fields = vec![
                 ("trace", trace_id.to_string()),
@@ -4734,22 +4717,42 @@ impl RequestForwarder {
         // 在 headers/body 被移动之前捕获一份重放工厂，交给下游转换层做
         // 有界重连（见 providers::streaming_retry）。工厂只是重放同一
         // HTTP 请求；是否重试、重试多少次由转换层根据下游状态决定。
-        let stream_retry_budget = crate::settings::get_settings()
-            .stream_retry_budget(super::providers::streaming_retry::STREAM_MAX_RETRIES);
+        let settings = crate::settings::get_settings();
+        let stream_retry_budget =
+            settings.stream_retry_budget(super::providers::streaming_retry::STREAM_MAX_RETRIES);
         let capacity_retry_enabled = effective_codex_capacity_retry_enabled(
             self.capacity_retry_enabled,
             stream_retry_budget,
         );
+        let can_reconnect_stream = should_create_stream_reconnector(
+            app_type,
+            endpoint,
+            request_is_streaming,
+            resolved_claude_api_format.as_deref(),
+        );
+        let originally_opted_in = can_reconnect_stream
+            && matches!(app_type, AppType::Codex)
+            && body.get("stream").and_then(Value::as_bool) == Some(true)
+            && codex_request_metadata.request_kind != "compaction"
+            && settings.stream_retry_unlimited_reconnects_effective();
+        let unlimited_reconnects = move || {
+            originally_opted_in
+                && crate::settings::get_settings().stream_retry_unlimited_reconnects_effective()
+        };
+        let capacity_retry_policy = move || {
+            let settings = crate::settings::get_settings();
+            CodexCapacityRetryPolicy {
+                enabled: capacity_retry_enabled
+                    && settings
+                        .stream_retry_budget(super::providers::streaming_retry::STREAM_MAX_RETRIES)
+                        > 0,
+                unlimited: originally_opted_in
+                    && settings.stream_retry_unlimited_reconnects_effective(),
+            }
+        };
         let build_stream_reconnect =
             |replay_headers: http::HeaderMap, replay_payload: FinalizedRequestPayload| {
-                if stream_retry_budget == 0
-                    || !should_create_stream_reconnector(
-                        app_type,
-                        endpoint,
-                        request_is_streaming,
-                        resolved_claude_api_format.as_deref(),
-                    )
-                {
+                if stream_retry_budget == 0 || !can_reconnect_stream {
                     return None;
                 }
                 let first_byte_timeout = if self.streaming_first_byte_timeout.is_zero() {
@@ -4843,7 +4846,8 @@ impl RequestForwarder {
                 Some(
                     StreamReconnector::new(connect, first_byte_timeout)
                         .with_max_retries(stream_retry_budget)
-                        .with_capacity_retry(self.capacity_retry_enabled),
+                        .with_capacity_retry(self.capacity_retry_enabled)
+                        .with_unlimited_reconnects(unlimited_reconnects),
                 )
             };
         let mut stream_reconnect = build_stream_reconnect(ordered_headers.clone(), payload.clone());
@@ -4909,10 +4913,10 @@ impl RequestForwarder {
             )
         };
         let mut response = if matches!(app_type, AppType::Codex) {
-            send_codex_request_with_rate_limit_retry(
+            send_codex_request_with_capacity_retry_policy(
                 adapter.name(),
-                capacity_retry_enabled,
                 super::codex_traffic_policy::resolve_codex_traffic_policy(provider),
+                capacity_retry_policy,
                 send_once,
             )
             .await
@@ -5065,10 +5069,10 @@ impl RequestForwarder {
                         },
                     )
                 };
-                response = send_codex_request_with_rate_limit_retry(
+                response = send_codex_request_with_capacity_retry_policy(
                     adapter.name(),
-                    capacity_retry_enabled,
                     super::codex_traffic_policy::resolve_codex_traffic_policy(provider),
+                    capacity_retry_policy,
                     retry_send_once,
                 )
                 .await
@@ -8157,17 +8161,40 @@ fn effective_codex_capacity_retry_enabled(configured: bool, stream_retry_budget:
     configured && stream_retry_budget > 0
 }
 
-/// 对真实上游 HTTP 429 做有界、可等待的同请求重放。
-///
-/// 这里与 `ResponsePending` 严格分离：只有已经拿到上游明确 HTTP 429 的请求才会
-/// 进入本循环；请求是否到达上游仍不确定的 send/header/body timeout 继续禁止重放。
-/// HTTP 429 表示服务端拒绝处理当前请求，因此复用完全相同的 headers/body 不会重复
-/// 已开始的模型采样或工具调用。明确的订阅/余额耗尽则立即交回外层账号池或路由降级，
-/// 避免在同一账号上等待和空转。
+#[cfg(test)]
 async fn send_codex_request_with_rate_limit_retry<F, Fut>(
     app_tag: &str,
     capacity_retry_enabled: bool,
     traffic_policy: super::codex_traffic_policy::ResolvedCodexTrafficPolicy,
+    send: F,
+) -> Result<ProxyResponse, ProxyError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<ProxyResponse, ProxyError>>,
+{
+    send_codex_request_with_capacity_retry_policy(
+        app_tag,
+        traffic_policy,
+        || CodexCapacityRetryPolicy {
+            enabled: capacity_retry_enabled,
+            unlimited: false,
+        },
+        send,
+    )
+    .await
+}
+
+struct CodexCapacityRetryPolicy {
+    enabled: bool,
+    unlimited: bool,
+}
+
+/// Retry explicit upstream rejections, never an ambiguous `ResponsePending`.
+/// Only confirmed capacity errors admit the opt-in unlimited streaming policy.
+async fn send_codex_request_with_capacity_retry_policy<F, Fut>(
+    app_tag: &str,
+    traffic_policy: super::codex_traffic_policy::ResolvedCodexTrafficPolicy,
+    capacity_retry_policy: impl Fn() -> CodexCapacityRetryPolicy,
     mut send: F,
 ) -> Result<ProxyResponse, ProxyError>
 where
@@ -8195,7 +8222,8 @@ where
         let mut response_headers = response.headers().clone();
         let retry_after = parse_retry_after_delay(&response_headers);
         let body_text = read_decoded_error_body(response).await?;
-        let temporary_usage_limit = capacity_retry_enabled
+        let retry_policy = capacity_retry_policy();
+        let temporary_usage_limit = retry_policy.enabled
             && body_text
                 .as_deref()
                 .is_some_and(super::providers::streaming_retry::is_retryable_usage_limit_body);
@@ -8249,8 +8277,10 @@ where
                 super::providers::streaming_retry::capacity_error_body_requires_long_wait(
                     body_text.as_deref(),
                 );
-            if !capacity_retry_enabled
-                || retry_count >= super::providers::streaming_retry::STREAM_MAX_RETRIES as usize
+            let bounded_retry_limit =
+                super::providers::streaming_retry::STREAM_MAX_RETRIES as usize;
+            if !retry_policy.enabled
+                || (!retry_policy.unlimited && retry_count >= bounded_retry_limit)
             {
                 return Ok(rebuild_consumed_error_response(
                     status,
@@ -8258,11 +8288,12 @@ where
                     body_text,
                 ));
             }
+            let capacity_delay = super::providers::streaming_retry::capacity_retry_delay(
+                (retry_count.min(bounded_retry_limit) + 1) as u32,
+            );
             let requested_delay = retry_after.unwrap_or_else(|| {
                 if capacity_long_wait_mode {
-                    super::providers::streaming_retry::capacity_retry_delay(
-                        (retry_count + 1) as u32,
-                    )
+                    capacity_delay
                 } else {
                     codex_rate_limit_backoff(retry_count)
                 }
@@ -8273,33 +8304,49 @@ where
                 CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET
             };
             let remaining_budget = total_delay_budget.saturating_sub(total_delay);
-            if remaining_budget.is_zero() {
+            if !retry_policy.unlimited && remaining_budget.is_zero() {
                 return Ok(rebuild_consumed_error_response(
                     status,
                     &mut response_headers,
                     body_text,
                 ));
             }
-            let delay = requested_delay
-                .min(if capacity_long_wait_mode {
-                    super::providers::streaming_retry::capacity_retry_delay(
-                        (retry_count + 1) as u32,
-                    )
-                } else {
-                    CODEX_RATE_LIMIT_MAX_SINGLE_DELAY
-                })
-                .min(remaining_budget);
-            retry_count += 1;
+            let delay = requested_delay.min(if capacity_long_wait_mode {
+                capacity_delay
+            } else {
+                CODEX_RATE_LIMIT_MAX_SINGLE_DELAY
+            });
+            let delay = if retry_policy.unlimited {
+                delay.max(super::providers::streaming_retry::UNLIMITED_RETRY_MIN_DELAY)
+            } else {
+                delay.min(remaining_budget)
+            };
+            let next_retry_count = retry_count.saturating_add(1);
             log::warn!(
-                "[{app_tag}] Codex upstream capacity pressure (HTTP {}); replaying same request {}/{} after {}ms (long_wait={})",
+                "[{app_tag}] Codex upstream capacity pressure (HTTP {}); scheduling replay {} after {}ms (unlimited={}, long_wait={})",
                 status.as_u16(),
-                retry_count,
-                super::providers::streaming_retry::STREAM_MAX_RETRIES,
+                next_retry_count,
                 delay.as_millis(),
+                retry_policy.unlimited,
                 capacity_long_wait_mode,
             );
             tokio::time::sleep(delay).await;
-            total_delay += delay;
+            let next_total_delay = total_delay.saturating_add(delay);
+            // Recheck the live mode during backoff before dispatching again.
+            let live_policy = capacity_retry_policy();
+            if !live_policy.enabled
+                || (!live_policy.unlimited
+                    && (next_retry_count > bounded_retry_limit
+                        || next_total_delay > total_delay_budget))
+            {
+                return Ok(rebuild_consumed_error_response(
+                    status,
+                    &mut response_headers,
+                    body_text,
+                ));
+            }
+            retry_count = next_retry_count;
+            total_delay = next_total_delay;
             continue;
         }
 
@@ -11440,8 +11487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subagent_reasoning_effort_native_responses_preserves_parent_max_through_sublyx_alias()
-    {
+    async fn subagent_reasoning_effort_native_responses_keeps_child_policy_through_sublyx_alias() {
         for incoming_effort in ["max", "ultra"] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -11484,7 +11530,7 @@ mod tests {
                 api_format: Some("openai_responses".to_string()),
                 ..Default::default()
             });
-            let router = Provider::with_id(
+            let mut router = Provider::with_id(
                 "router".into(),
                 "Router".into(),
                 json!({"codexRouting": {"enabled": true, "subagentReasoningEffort": "high"}}),
@@ -11531,10 +11577,6 @@ mod tests {
             assert_eq!(sent["model"], "gpt-6.2-sol", "{incoming_effort}");
             assert_eq!(sent["reasoning"]["effort"], "max", "{incoming_effort}");
 
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            target.settings_config["base_url"] =
-                json!(format!("http://{}", listener.local_addr().unwrap()));
-            let capture = tokio::spawn(capture_single_http_request(listener));
             let mut child = body.clone();
             child["reasoning"]["effort"] = json!("low");
             child["client_metadata"] = json!({
@@ -11545,22 +11587,38 @@ mod tests {
                 "turn_id": "child-turn",
                 "x-openai-subagent": "collab_spawn",
             });
-            forwarder
-                .forward(
-                    &AppType::Codex,
-                    &http::Method::POST,
-                    &target,
-                    "/v1/responses",
-                    &child,
-                    &HeaderMap::new(),
-                    &Extensions::new(),
-                    adapter.as_ref(),
-                )
-                .await
-                .expect("child native Responses request must forward");
-            let (_, bytes) = capture.await.expect("captured Sublyx child request");
-            let sent: Value = serde_json::from_slice(&bytes).expect("outgoing child JSON");
-            assert_eq!(sent["reasoning"]["effort"], "max", "{incoming_effort}");
+            for (selection, expected) in [("high", "high"), ("max", "max"), ("profile", "low")] {
+                router.settings_config["codexRouting"]["subagentReasoningEffort"] =
+                    json!(selection);
+                forwarder
+                    .router
+                    .database()
+                    .save_provider("codex", &router)
+                    .unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                target.settings_config["base_url"] =
+                    json!(format!("http://{}", listener.local_addr().unwrap()));
+                let capture = tokio::spawn(capture_single_http_request(listener));
+                forwarder
+                    .forward(
+                        &AppType::Codex,
+                        &http::Method::POST,
+                        &target,
+                        "/v1/responses",
+                        &child,
+                        &HeaderMap::new(),
+                        &Extensions::new(),
+                        adapter.as_ref(),
+                    )
+                    .await
+                    .expect("child native Responses request must forward");
+                let (_, bytes) = capture.await.expect("captured Sublyx child request");
+                let sent: Value = serde_json::from_slice(&bytes).expect("outgoing child JSON");
+                assert_eq!(
+                    sent["reasoning"]["effort"], expected,
+                    "{incoming_effort}/{selection}"
+                );
+            }
         }
     }
 
@@ -16833,6 +16891,152 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    fn retry_policy_fixture_response(
+        status: http::StatusCode,
+        retry_after: Option<&'static str>,
+        body: &'static [u8],
+    ) -> ProxyResponse {
+        let mut headers = http::HeaderMap::new();
+        if let Some(value) = retry_after {
+            headers.insert(
+                http::header::RETRY_AFTER,
+                http::HeaderValue::from_static(value),
+            );
+        }
+        ProxyResponse::buffered(status, headers, Bytes::from_static(body))
+    }
+
+    const RETRY_POLICY_FIXTURE_CAPACITY: &[u8] =
+        br#"{"error":{"type":"overloaded_error","message":"Servers are currently overloaded"}}"#;
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_unlimited_initial_capacity_retries_beyond_bounded_count_and_delay() {
+        let started = tokio::time::Instant::now();
+        let mut sends = 0;
+        let response = send_codex_request_with_capacity_retry_policy(
+            "test",
+            safe_test_codex_traffic_policy(),
+            || CodexCapacityRetryPolicy {
+                enabled: true,
+                unlimited: true,
+            },
+            || {
+                sends += 1;
+                std::future::ready(Ok(if sends <= 6 {
+                    retry_policy_fixture_response(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        None,
+                        RETRY_POLICY_FIXTURE_CAPACITY,
+                    )
+                } else {
+                    retry_policy_fixture_response(http::StatusCode::OK, None, b"{}")
+                }))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(sends, 7);
+        assert_eq!(started.elapsed(), Duration::from_secs(235 * 60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_capacity_rechecks_off_or_revoked_unlimited_after_backoff() {
+        // Off stops the first bounded retry; revoking unlimited stops the sixth.
+        for (initially_unlimited, revoke_at, expected_sends) in [
+            (false, Duration::from_secs(5 * 60), 1),
+            (true, Duration::from_secs(235 * 60), 6),
+        ] {
+            let started = tokio::time::Instant::now();
+            let mut sends = 0;
+            let response = send_codex_request_with_capacity_retry_policy(
+                "test",
+                safe_test_codex_traffic_policy(),
+                || CodexCapacityRetryPolicy {
+                    enabled: initially_unlimited || started.elapsed() < revoke_at,
+                    unlimited: initially_unlimited && started.elapsed() < revoke_at,
+                },
+                || {
+                    sends += 1;
+                    // The next dispatch incorrectly succeeding would hide the
+                    // prior classified failure, so make any extra send visible.
+                    std::future::ready(Ok(if sends > expected_sends {
+                        retry_policy_fixture_response(http::StatusCode::OK, None, b"{}")
+                    } else {
+                        retry_policy_fixture_response(
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            None,
+                            RETRY_POLICY_FIXTURE_CAPACITY,
+                        )
+                    }))
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(sends, expected_sends);
+            assert_eq!(
+                response.bytes_with_limit(1024).await.unwrap().as_ref(),
+                RETRY_POLICY_FIXTURE_CAPACITY
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_unlimited_initial_retries_floor_zero_delay_and_keep_generic_429_bounded() {
+        let mut traffic_policy = safe_test_codex_traffic_policy();
+        traffic_policy.rate_limit_max_retries = 2;
+        let rate_limit_retries = traffic_policy.rate_limit_max_retries;
+        for (status, body, sends_to_success, expected_status, expected_sends) in [
+            (
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                RETRY_POLICY_FIXTURE_CAPACITY,
+                2,
+                http::StatusCode::OK,
+                2,
+            ),
+            (
+                http::StatusCode::TOO_MANY_REQUESTS,
+                br#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#.as_slice(),
+                rate_limit_retries + 2,
+                http::StatusCode::TOO_MANY_REQUESTS,
+                rate_limit_retries + 1,
+            ),
+        ] {
+            let started = tokio::time::Instant::now();
+            let mut sends = 0;
+            let response = send_codex_request_with_capacity_retry_policy(
+                "test",
+                traffic_policy.clone(),
+                || CodexCapacityRetryPolicy {
+                    enabled: true,
+                    unlimited: true,
+                },
+                || {
+                    sends += 1;
+                    std::future::ready(Ok(if sends == sends_to_success {
+                        retry_policy_fixture_response(http::StatusCode::OK, None, b"{}")
+                    } else {
+                        retry_policy_fixture_response(status, Some("0"), body)
+                    }))
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(sends, expected_sends);
+            if status == http::StatusCode::SERVICE_UNAVAILABLE {
+                assert!(
+                    started.elapsed()
+                        >= super::super::providers::streaming_retry::UNLIMITED_RETRY_MIN_DELAY
+                );
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

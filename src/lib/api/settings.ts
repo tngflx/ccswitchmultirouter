@@ -18,6 +18,7 @@ export interface SettingsPatch {
   enableStreamRetry?: boolean;
   streamRetryMode?: Settings["streamRetryMode"];
   streamRetryMaxAttempts?: number;
+  streamRetryUnlimitedReconnects?: boolean;
   quotaCollaboration?: {
     deviceName?: string;
     mode?: "observe" | "enforce";

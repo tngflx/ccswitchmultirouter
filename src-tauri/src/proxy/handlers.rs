@@ -688,7 +688,7 @@ fn is_codex_desktop_request(headers: &HeaderMap) -> bool {
             .is_some_and(is_desktop_identity)
 }
 
-fn is_verified_codex_desktop_request(headers: &HeaderMap) -> bool {
+pub(super) fn is_verified_codex_desktop_request(headers: &HeaderMap) -> bool {
     should_handle_as_codex_client(headers) && is_codex_desktop_request(headers)
 }
 

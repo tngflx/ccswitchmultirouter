@@ -53,6 +53,19 @@
     "permissionsHint": "主機沙箱和工具權限由主機另行繼承。High/Max 只改變推理強度，不改變操作存取權限。指令指引不能保證模型遵守。",
     "customInstructionsHint": "自訂文字用於補充基線，不能取代範圍、所有權或儲存庫指令。這些是行為規則，不是執行沙箱。"
   },
+  "codexModelUltra": {
+    "title": "主代理 Ultra",
+    "unlock": "解鎖 Ultra",
+    "unlockForModel": "為 {{model}} 解鎖 Ultra",
+    "sendAs": "Ultra 轉送檔位",
+    "placeholder": "選擇供應商檔位…",
+    "max": "Max（最高）",
+    "xhigh": "Extra High（xhigh）",
+    "unavailableOption": "{{effort}}（無法使用）",
+    "needsCapabilities": "請在儲存前確認此模型支援的推理檔位。",
+    "unsupported": "已儲存的供應商檔位 {{effort}} 無法使用。請在儲存前選擇目前支援的檔位。",
+    "unsupportedWithoutOptions": "已儲存的供應商檔位 {{effort}} 無法使用。請確認模型的推理能力，並在儲存前選擇支援的檔位。"
+  },
   "codexSubagentReasoning": {
     "globalLabel": "所有子代理推理強度",
     "globalProfileOption": "使用設定檔設定（關閉覆寫）",
@@ -60,8 +73,8 @@
     "globalInvalidOption": "儲存的推理檔位無效",
     "globalHighOption": "High（高）",
     "globalMaxOption": "Max（最高）",
-    "globalHint": "適用於 V1 和 V2。選擇 High 時，若確認父回合使用 Max 或 Ultra，支援原生 Max 的 Sublyx 子代理會使用 Max。其他情況下預設使用 High。選擇「使用設定檔設定」可還原已儲存的選擇。",
-    "globalActivation": "儲存後，請重新啟動 Codex Desktop/app-server 並建立新工作階段以套用。現有工作階段不會改變。",
+    "globalHint": "適用於 V1 和 V2。High 和 Max 在模型支援時生效。選擇「使用設定檔設定」可使用各子代理已儲存的策略。",
+    "globalActivation": "儲存後，請重新啟動 Codex Desktop/app-server 並建立新工作階段，以重新載入已產生的角色設定。",
     "globalSaving": "正在儲存子代理推理強度…",
     "globalSaved": "子代理推理強度已儲存。",
     "globalSaveFailed": "無法儲存子代理推理強度：{{error}}",
@@ -671,7 +684,7 @@
         "streamRetryAggressive": "積極",
         "streamRetryAggressiveDescription": "使用安全重新連線，並允許 Codex Desktop 在回合中斷後進行有限次數的續寫。",
         "streamRetryContinuationPrerequisite": "自動續跑需要已就緒的 Codex Desktop 偵錯橋和本機請求用戶端。如果偵錯連接埠已可用，請先使用「Unlock model picker」修復執行中的應用程式。僅在缺少偵錯連接埠時，先儲存工作並完全退出 Codex Desktop，再使用同一操作啟用偵錯重新啟動。只有 Codex 接受新的「continue」輪次後，才能確認已送達。",
-        "streamRetryMaxAttempts": "續寫嘗試次數",
+        "streamRetryMaxAttempts": "Desktop 續寫嘗試次數",
         "streamRetryMaxAttemptsDescription": "單一 Codex Desktop 回合允許的最大語意續寫次數。",
         "running": "執行中",
         "stopped": "已停止"
@@ -3976,7 +3989,9 @@
       "safe": "安全",
       "aggressive": "積極"
     },
-    "maxAttempts": "繼續嘗試次數",
+    "maxAttempts": "Desktop 續寫嘗試次數",
+    "unlimitedReconnects": "輸出前無限次重連",
+    "unlimitedReconnectsHelp": "在傳送正文、推理或工具呼叫前，遇到可重試的故障時重送同一請求。不會變更 Desktop 續寫次數上限。",
     "help": {
       "off": "不進行透明代理重新連線或桌面端繼續。",
       "safe": "在語意輸出前最多重新連線 5 次；可見故障仍由 Codex 處理。",

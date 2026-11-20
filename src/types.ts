@@ -847,6 +847,8 @@ export interface Settings {
   streamRetryMode?: "off" | "safe" | "aggressive";
   // Maximum semantic continuation attempts in aggressive mode (1-3).
   streamRetryMaxAttempts?: number;
+  // Opt in to unlimited eligible pre-output reconnects in aggressive mode.
+  streamRetryUnlimitedReconnects?: boolean;
   requestHealth?: RequestHealthConfig;
   showProfileSwitcher?: boolean;
   // Preserve Codex ChatGPT login in auth.json when switching third-party providers

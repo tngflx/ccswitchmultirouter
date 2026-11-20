@@ -643,6 +643,9 @@ pub struct AppSettings {
     /// Maximum aggressive recovery attempts after the original request (1..=3).
     #[serde(default = "default_stream_retry_max_attempts")]
     pub stream_retry_max_attempts: u32,
+    /// Opt in to unlimited pre-semantic reconnects in Aggressive mode.
+    #[serde(default)]
+    pub stream_retry_unlimited_reconnects: bool,
     /// Provider-neutral request size diagnostics and conservative JSON cleanup.
     #[serde(default)]
     pub request_health: RequestHealthConfig,
@@ -817,6 +820,7 @@ impl Default for AppSettings {
             enable_stream_retry: true,
             stream_retry_mode: StreamRetryMode::Safe,
             stream_retry_max_attempts: default_stream_retry_max_attempts(),
+            stream_retry_unlimited_reconnects: false,
             request_health: RequestHealthConfig::default(),
             show_profile_switcher: true,
             preserve_codex_official_auth_on_switch: false,
@@ -891,6 +895,12 @@ impl AppSettings {
             StreamRetryMode::Off => 0,
             StreamRetryMode::Safe | StreamRetryMode::Aggressive => safe_budget,
         }
+    }
+
+    /// The reconnect opt-in does not change the separate continuation budget.
+    pub fn stream_retry_unlimited_reconnects_effective(&self) -> bool {
+        self.stream_retry_unlimited_reconnects
+            && self.stream_retry_mode_effective() == StreamRetryMode::Aggressive
     }
 
     /// Number of post-semantic logical turn recoveries. Only Aggressive may type
@@ -1165,6 +1175,7 @@ pub(crate) fn preserve_dedicated_settings(incoming: &mut AppSettings, existing: 
     incoming.enable_stream_retry = existing.enable_stream_retry;
     incoming.stream_retry_mode = existing.stream_retry_mode;
     incoming.stream_retry_max_attempts = existing.stream_retry_max_attempts;
+    incoming.stream_retry_unlimited_reconnects = existing.stream_retry_unlimited_reconnects;
     incoming.current_provider_claude = existing.current_provider_claude.clone();
     incoming.current_provider_claude_desktop = existing.current_provider_claude_desktop.clone();
     incoming.current_provider_codex = existing.current_provider_codex.clone();
@@ -2294,5 +2305,38 @@ mod tests {
             assert_eq!(settings.stream_retry_budget(5), 5);
             assert_eq!(settings.stream_recovery_budget(), expected);
         }
+    }
+
+    #[test]
+    fn unlimited_reconnects_require_aggressive_mode_and_explicit_opt_in() {
+        assert!(!AppSettings::default().stream_retry_unlimited_reconnects);
+
+        let mut settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "streamRetryMode": "aggressive",
+            "streamRetryMaxAttempts": 2,
+        }))
+        .expect("legacy Aggressive settings remain readable");
+        assert!(!settings.stream_retry_unlimited_reconnects_effective());
+
+        settings.stream_retry_unlimited_reconnects = true;
+        for (mode, effective, reconnect_budget, recovery_budget) in [
+            (StreamRetryMode::Off, false, 0, 0),
+            (StreamRetryMode::Safe, false, 5, 0),
+            (StreamRetryMode::Aggressive, true, 5, 2),
+        ] {
+            settings.stream_retry_mode = mode;
+            assert_eq!(
+                settings.stream_retry_unlimited_reconnects_effective(),
+                effective
+            );
+            assert_eq!(settings.stream_retry_budget(5), reconnect_budget);
+            assert_eq!(settings.stream_recovery_budget(), recovery_budget);
+        }
+
+        let saved = serde_json::to_value(&settings).expect("serialize settings");
+        assert_eq!(
+            saved["streamRetryUnlimitedReconnects"].as_bool(),
+            Some(true)
+        );
     }
 }
