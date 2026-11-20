@@ -29,6 +29,7 @@ type State = {
   scopedAppServerRegistryInstances?: Set<object>;
   scopedAppServerScopesScannedAt?: number | null;
   scopedAppServerScopeScanComplete?: boolean;
+  scopedAppServerScopeHintScanComplete?: boolean;
   scopedAppServerRootIdentities?: object[];
   pendingReactNodes?: Set<object>;
   reactMutationGeneration?: number;
@@ -97,7 +98,7 @@ const createHarness = (
     "yieldReactDiscovery",
     "installationIsCurrent",
     "rememberCodexUserTurnAction",
-    `${source}\nreturn { patchAppServerModuleClients, patchCodexScopedAppServerClients, refreshCodexScopedAppServerClients, codexAppServerClientHasCurrentOwner, codexDeclaredDependencyScope, codexScopeQueryClient, codexQueryObserverPrototype, codexRendererScopeRootsMatchCurrent, codexRendererScopeCandidates, codexRendererScopeSnapshotIsCurrent };`,
+    `${source}\nreturn { patchAppServerModuleClients, patchCodexScopedAppServerClients, refreshCodexScopedAppServerClients, codexAppServerClientHasCurrentOwner, codexDeclaredDependencyScope, codexScopeQueryClient, codexQueryObserverPrototype, codexRendererScopeRootsMatchCurrent, codexRendererScopeCandidates, codexRendererScopeSnapshotIsCurrent, codexCurrentAppServerScopeHints, codexRendererMountedNodes };`,
   )(
     state,
     window,
@@ -125,6 +126,8 @@ const createHarness = (
     codexRendererScopeRootsMatchCurrent: () => boolean;
     codexRendererScopeCandidates: () => Promise<Scope[]>;
     codexRendererScopeSnapshotIsCurrent: () => boolean;
+    codexCurrentAppServerScopeHints: (completeInventory?: boolean) => Scope[];
+    codexRendererMountedNodes: (targets: Set<unknown>) => Set<unknown>;
   };
   return {
     state,
@@ -399,20 +402,67 @@ describe("Codex Desktop declared client discovery", () => {
     }
   });
 
+  it("finds an owner after repeated references without losing descriptor provenance", async () => {
+    const client = new QueryClient();
+    const brand = {};
+    const owner = Object.assign(createScope(client), { scope: brand });
+    const sharedValue = {};
+    const primitiveTarget = "mounted primitive";
+    const values: Record<string, unknown> = Object.fromEntries(
+      Array.from({ length: 2048 }, (_, index) => [
+        `alias${index}`,
+        sharedValue,
+      ]),
+    );
+    values.owner = owner;
+    values.primitiveTarget = primitiveTarget;
+    const root = { memoizedState: values, pendingProps: values };
+    const harness = createHarness(
+      { appServerStatusAtoms: [{ scope: brand }] },
+      { __codexRoot: { _internalRoot: { current: root } } },
+    );
+    try {
+      expect(harness.api.codexCurrentAppServerScopeHints()).toEqual([owner]);
+      expect(harness.api.codexCurrentAppServerScopeHints(true)).toEqual([
+        owner,
+      ]);
+      expect(harness.state.scopedAppServerScopeHintScanComplete).toBe(true);
+      const targets = new Set([owner.node, primitiveTarget]);
+      expect(harness.api.codexRendererMountedNodes(targets)).toEqual(targets);
+      expect(await harness.api.codexRendererScopeCandidates()).toEqual([owner]);
+      expect(harness.state.scopedAppServerScopeScanComplete).toBe(true);
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(true);
+
+      values.alias0 = {};
+      expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(false);
+    } finally {
+      client.clear();
+    }
+  });
+
   it("keeps the inventory incomplete when a Fiber value queue omits an owner", async () => {
     const client = new QueryClient();
+    const brand = {};
     const retained = createScope(client);
-    const omitted = createScope(client);
+    const omitted = Object.assign(createScope(client), { scope: brand });
     const values: Record<string, unknown> = Object.fromEntries(
       Array.from({ length: 2048 }, (_, index) => [`unrelated${index}`, {}]),
     );
     values.owner = omitted;
     const root = { memoizedState: values };
     const harness = createHarness(
-      { scopedAppServerScopeCandidates: new Set([retained]) },
+      {
+        appServerStatusAtoms: [{ scope: brand }],
+        scopedAppServerScopeCandidates: new Set([retained]),
+      },
       { __codexRoot: { _internalRoot: { current: root } } },
     );
     try {
+      expect(harness.api.codexCurrentAppServerScopeHints(true)).toEqual([]);
+      expect(harness.state.scopedAppServerScopeHintScanComplete).toBe(false);
+      expect(
+        harness.api.codexRendererMountedNodes(new Set([omitted.node])),
+      ).toEqual(new Set());
       expect(await harness.api.codexRendererScopeCandidates()).toEqual([
         retained,
       ]);

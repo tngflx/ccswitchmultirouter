@@ -60,7 +60,7 @@
     "globalInvalidOption": "Invalid saved reasoning effort",
     "globalHighOption": "High",
     "globalMaxOption": "Max",
-    "globalHint": "Applies to both V1 and V2 where the model supports the selected effort. Available overrides are Max or High. Saved profile choices and the main agent stay unchanged. Unsupported models keep their profile policy. Select Profile settings to restore saved choices.",
+    "globalHint": "Applies to V1 and V2. With High selected, a verified Max or Ultra parent turn uses native Max for supported Sublyx children. High is the fallback. Profile settings restores saved choices.",
     "globalActivation": "After saving, restart Codex/app-server, then start a new session to apply. Existing sessions keep their current effort.",
     "globalSaving": "Saving Sub-Agent reasoning effort…",
     "globalSaved": "Sub-Agent reasoning effort saved.",

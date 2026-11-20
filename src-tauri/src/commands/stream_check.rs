@@ -23,7 +23,10 @@ pub async fn stream_check_provider(
     let provider_id_for_load = provider_id.clone();
     let app_type_for_load = app_type.clone();
     let (config, provider) = crate::commands::run_app_state_blocking(&app, move |state| {
-        let config = state.db.get_stream_check_config().map_err(|e| e.to_string())?;
+        let config = state
+            .db
+            .get_stream_check_config()
+            .map_err(|e| e.to_string())?;
         let providers = state
             .db
             .get_all_providers(app_type_for_load.as_str())
@@ -74,7 +77,10 @@ pub async fn stream_check_all_providers(
 ) -> Result<Vec<(String, StreamCheckResult)>, AppError> {
     let app_type_for_load = app_type.clone();
     let (config, providers) = crate::commands::run_app_state_blocking(&app, move |state| {
-        let config = state.db.get_stream_check_config().map_err(|e| e.to_string())?;
+        let config = state
+            .db
+            .get_stream_check_config()
+            .map_err(|e| e.to_string())?;
         let providers = state
             .db
             .get_all_providers(app_type_for_load.as_str())
@@ -155,7 +161,10 @@ pub async fn stream_check_all_providers(
 #[tauri::command]
 pub async fn get_stream_check_config(app: AppHandle) -> Result<StreamCheckConfig, AppError> {
     crate::commands::run_app_state_blocking(&app, |state| {
-        state.db.get_stream_check_config().map_err(|e| e.to_string())
+        state
+            .db
+            .get_stream_check_config()
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(AppError::Message)

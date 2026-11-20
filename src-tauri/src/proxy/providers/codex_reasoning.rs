@@ -1024,6 +1024,24 @@ pub fn normalize_sublyx_reasoning_capability_for_model(
         && capability.validate().is_ok();
     if verified_detection {
         let supported_efforts = capability.supported_efforts.clone();
+        // Older scoped Sublyx probes could advertise native `max` while
+        // retaining the pre-Max compatibility mapping. Once the verified row
+        // proves Max is accepted, native Max must route to Max as well. The
+        // catalog's separate Ultra overlay can still keep an explicit user
+        // target such as `xhigh`.
+        if supported_efforts.iter().any(|effort| effort == "max")
+            && capability
+                .upstream
+                .effort_map
+                .get("max")
+                .map(String::as_str)
+                == Some("xhigh")
+        {
+            capability
+                .upstream
+                .effort_map
+                .insert("max".to_string(), "max".to_string());
+        }
         let default_ultra_target = || {
             supported_efforts
                 .iter()
@@ -2032,6 +2050,30 @@ mod tests {
     }
 
     #[test]
+    fn sublyx_verified_detection_repairs_legacy_max_mapping() {
+        let mut capability =
+            scoped_sublyx_detection("gpt-6.2-sol", &["low", "medium", "high", "xhigh", "max"]);
+        capability
+            .upstream
+            .effort_map
+            .insert("max".to_string(), "xhigh".to_string());
+        capability
+            .validate()
+            .expect("valid scoped native capability");
+
+        let normalized = normalize_sublyx_reasoning_capability_for_model("gpt-6.2-sol", capability);
+
+        assert_eq!(
+            normalized
+                .upstream
+                .effort_map
+                .get("max")
+                .map(String::as_str),
+            Some("max")
+        );
+    }
+
+    #[test]
     fn sublyx_verified_sparse_efforts_keep_picker_without_synthetic_ultra() {
         for model in ["gpt-6.1-sol", "gpt-6-astra"] {
             for native_efforts in [
@@ -2142,18 +2184,15 @@ mod tests {
 
     #[test]
     fn sublyx_verified_legacy_xhigh_ultra_migrates_to_native_max() {
-        let mut capability = scoped_sublyx_detection(
-            "gpt-6.2-sol",
-            &["low", "medium", "high", "xhigh", "max"],
-        );
+        let mut capability =
+            scoped_sublyx_detection("gpt-6.2-sol", &["low", "medium", "high", "xhigh", "max"]);
         capability.codex_ultra_orchestration = Some(CodexUltraOrchestrationCapability {
             enabled: true,
             provider_effort: Some("xhigh".to_string()),
         });
         capability.validate().expect("valid verified capability");
 
-        let normalized =
-            normalize_sublyx_reasoning_capability_for_model("gpt-6.2-sol", capability);
+        let normalized = normalize_sublyx_reasoning_capability_for_model("gpt-6.2-sol", capability);
 
         assert_eq!(
             normalized

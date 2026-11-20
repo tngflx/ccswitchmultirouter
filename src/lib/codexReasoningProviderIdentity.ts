@@ -418,6 +418,13 @@ function verifiedSublyxNativeEvidence(
   )
     return undefined;
 
+  // Older scoped Sublyx probes could advertise native `max` while retaining
+  // the pre-Max compatibility mapping. Once the verified row proves Max is
+  // accepted, native Max must route to Max too. Catalog Ultra ownership is a
+  // separate overlay and is preserved below.
+  if (efforts.includes("max") && effortMap.max === "xhigh")
+    effortMap.max = "max";
+
   // Ultra is a separate product overlay, not an alias for native Max.
   const defaultUltraTarget: CodexReasoningEffort | undefined = efforts.includes(
     "max",

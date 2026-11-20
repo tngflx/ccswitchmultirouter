@@ -806,7 +806,9 @@ base_url = "https://gateway.example/v1"`,
       );
       expect(normalized.codexUltraOrchestration).toEqual({
         enabled: true,
-        providerEffort: maintainedEfforts.includes("max") ? "max" : "xhigh",
+        providerEffort: maintainedEfforts.some((effort) => effort === "max")
+          ? "max"
+          : "xhigh",
       });
     });
 
@@ -1049,6 +1051,51 @@ base_url = "https://gateway.example/v1"`,
       expect(capability).toEqual(before);
     },
   );
+
+  it("repairs a verified Sublyx legacy Max mapping", () => {
+    const capability: CodexModelReasoningCapability = {
+      schemaVersion: 2,
+      supportStatus: "confirmed_supported",
+      controlKind: "graded",
+      supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+      defaultEffort: "high",
+      disableAllowed: false,
+      upstream: {
+        format: "reasoning_object",
+        parameter: "reasoning.effort",
+        effortMap: {
+          low: "low",
+          medium: "medium",
+          high: "high",
+          xhigh: "xhigh",
+          max: "xhigh",
+        },
+      },
+      source: "detection",
+      confidence: "verified",
+      providerKey: "sublyx",
+      evidenceScope: {
+        transportFingerprint: "a".repeat(64),
+        model: "gpt-6.2-sol",
+      },
+      codexUltraOrchestration: {
+        enabled: true,
+        providerEffort: "xhigh",
+      },
+    };
+
+    const normalized = normalizeCodexReasoningCapabilityForProvider(
+      "gpt-6.2-sol",
+      capability,
+      { baseUrl: "https://api.sublyx.org/v1" },
+    );
+
+    expect(normalized.upstream.effortMap?.max).toBe("max");
+    expect(normalized.codexUltraOrchestration).toEqual({
+      enabled: true,
+      providerEffort: "max",
+    });
+  });
 
   it("does not generalize Sublyx native max to an unprobed GPT row", () => {
     const normalized = normalizeCodexReasoningCapabilityForProvider(
@@ -1508,10 +1555,9 @@ base_url = "https://gateway.example/v1"`,
       ),
     ).toEqual(row.codexUltra);
     expect(
-      normalizeCodexCatalogReasoningForProvider(
-        row,
-        { baseUrl: "https://api.sublyx.org/v1" },
-      ).codexUltra,
+      normalizeCodexCatalogReasoningForProvider(row, {
+        baseUrl: "https://api.sublyx.org/v1",
+      }).codexUltra,
     ).toEqual(row.codexUltra);
   });
 

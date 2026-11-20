@@ -14,6 +14,7 @@ use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::timeout;
 
+use super::codex_subagent_reasoning::CodexParentTurnEfforts;
 use super::codex_traffic_policy::resolve_codex_traffic_policy;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub struct ProviderRouter {
     /// Shared Codex admission gates. Permits are retained by the forwarder for the
     /// complete response lifetime, including streamed bodies.
     codex_route_admission: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
+    pub(super) codex_parent_turn_efforts: CodexParentTurnEfforts,
 }
 
 impl ProviderRouter {
@@ -41,6 +43,7 @@ impl ProviderRouter {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
             codex_route_admission: Arc::new(RwLock::new(HashMap::new())),
+            codex_parent_turn_efforts: CodexParentTurnEfforts::default(),
         }
     }
 

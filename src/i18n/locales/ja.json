@@ -60,7 +60,7 @@
     "globalInvalidOption": "保存済みの推論強度が無効です",
     "globalHighOption": "High（高）",
     "globalMaxOption": "Max（最大）",
-    "globalHint": "V1 と V2 の両方に適用され、選択した強度に対応するモデルのみ上書きします。上書きとして選べるのは Max と High のみです。保存済みのプロファイル設定とメインエージェントは変更されません。非対応モデルは元の推論ポリシーを維持します。プロファイル設定を選ぶと元に戻せます。",
+    "globalHint": "V1 と V2 に適用されます。High を選択した場合、親ターンの Max または Ultra が確認されると、対応する Sublyx のサブエージェントはネイティブの Max を使用します。それ以外の場合は High が使われます。プロファイル設定を選ぶと保存済みの設定に戻ります。",
     "globalActivation": "保存後、Codex Desktop/app-server を再起動し、新しいセッションを作成すると適用されます。既存のセッションは変更されません。",
     "globalSaving": "サブエージェントの推論強度を保存中…",
     "globalSaved": "サブエージェントの推論強度を保存しました。",

@@ -3,8 +3,9 @@
 In **Codex MultiRouter → Sub-Agent → Sub-agent settings**, use **All Sub-Agent
 reasoning effort**. Changing the selection saves it for the selected router plan:
 
-- **High**: the default new Sub-Agent choice; it is applied only when the
-  current model capability advertises native `high`.
+- **High**: the default. A verified Max or Ultra parent turn uses native Max
+  for a Sublyx child whose model declares native `max`. Otherwise the router
+  uses `high` where supported.
 - **Max**: an explicit opt-in Sub-Agent choice; it is applied only when the
   current model capability advertises native `max`.
 - **Profile settings (override off)**: restore the original saved per-profile or
@@ -56,17 +57,18 @@ extra-high, Ultra, or otherwise unavailable fixed policies remain canonical and
 are preserved as read-only choices rather than being silently rewritten. This
 per-profile UI restriction does not narrow the native effort vocabulary or the
 parser/runtime contract. The High default does not change an active plan's
-explicit saved override, including Profile settings or Max. Select **High** in
-**All Sub-Agent reasoning effort** to apply that reversible override to current
-child requests. **Profile settings** restores saved profile policies.
+explicit saved Profile settings or Max. **Profile settings** restores saved
+profile policies.
 
 Generated managed role files, previews, and status are derived from current
 canonical settings. At the proxy request boundary, explicit Codex child markers
 (`x-openai-subagent` header or its top-level `client_metadata` equivalent)
-authorize the same override before protocol conversion. It overrides an explicit
-child `max` request while High is selected. Requests without a child marker are
-not reclassified by their model name or prompt text, so main-agent requests stay
-unchanged. Generation requests are scoped explicitly to Responses and Chat;
+authorize the same override before protocol conversion. With High selected,
+the router matches the child's installation, parent thread, and parent turn to
+an observed generation request. A Max or Ultra match allows native Max on
+supported Sublyx models. Clients that omit the exact lineage use the selected
+fallback. Requests without a child marker keep their own effort. Generation
+requests are scoped explicitly to Responses and Chat;
 compact, search, and image-control endpoints are left unchanged. For native Chat,
 the same capability mapping chooses the provider's actual effort parameter.
 The canonical reasoning boundary also applies to main-agent generation requests:
@@ -100,8 +102,8 @@ After the updated backend is loaded, the existing router timeline at
   the same safe vocabulary. Budget/boolean-only controls do not invent a tier;
   an absent effort is reported as `unset`.
 
-For example, a marked child explicitly requesting Max under the High override
-can show `is_subagent=true`,
+For example, a marked child explicitly requesting Max under the High fallback
+without a matching parent turn can show `is_subagent=true`,
 `subagent_reasoning_override_applied=true`,
 `requested_reasoning_effort=max`, and `upstream_reasoning_effort=high`.
 This is an example, not a live verification receipt. The fields never serialize

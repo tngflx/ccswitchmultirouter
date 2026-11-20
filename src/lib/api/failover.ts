@@ -91,7 +91,9 @@ export const failoverApi = {
 
   // 获取可添加到队列的供应商（不在队列中的）
   async getAvailableProvidersForFailover(appType: string): Promise<Provider[]> {
-    return invokeFailoverRead("get_available_providers_for_failover", { appType });
+    return invokeFailoverRead("get_available_providers_for_failover", {
+      appType,
+    });
   },
 
   // 添加供应商到故障转移队列

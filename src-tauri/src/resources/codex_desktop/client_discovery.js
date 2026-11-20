@@ -883,6 +883,58 @@ const CODEX_RENDERER_SCOPE_VALUE_LIMIT = 2048;
 // the full snapshot so replacing one with an object invalidates the scan.
 const codexRendererScopeObjectValue = (value) =>
   value !== null && typeof value === "object";
+const codexRendererScopeValueQueue = (
+  fiberValues,
+  limit,
+  canReach = codexRendererScopeObjectValue,
+  fiberPath,
+) => {
+  const values = [];
+  const seen = new Set();
+  let capped = false;
+  const enqueue = (value, depth, owner, key, parent) => {
+    if (
+      capped ||
+      seen.has(value) ||
+      !canReach(value) ||
+      (owner && codexRendererScopeNonBindingLink(owner, key))
+    )
+      return;
+    if (values.length === limit) {
+      capped = true;
+      return;
+    }
+    // Breadth-first order preserves the first, shallowest descriptor path.
+    seen.add(value);
+    values.push({ value, depth, parent, key });
+  };
+  for (const key of [
+    "memoizedState",
+    "dependencies",
+    "memoizedProps",
+    "pendingProps",
+  ])
+    enqueue(
+      Object.getOwnPropertyDescriptor(fiberValues, key)?.value,
+      0,
+      undefined,
+      key,
+      fiberPath,
+    );
+  return {
+    values,
+    enqueueChildren(owner, descriptors, depth, parent) {
+      for (const [key, field] of Object.entries(descriptors)) {
+        if (capped) break;
+        if ("value" in field)
+          enqueue(field.value, depth + 1, owner, key, parent);
+      }
+    },
+    get capped() {
+      return capped;
+    },
+  };
+};
 const codexCurrentAppServerScopeHints = (completeInventory = false) => {
   const scopesByBrand = new Map();
   const scopeValues = new Set();
@@ -914,31 +966,13 @@ const codexCurrentAppServerScopeHints = (completeInventory = false) => {
       const next = Object.getOwnPropertyDescriptor(fiber, key)?.value;
       if (next) fibers.push(next);
     }
-    const visited = new Set();
-    const values = [
-      "memoizedState",
-      "dependencies",
-      "memoizedProps",
-      "pendingProps",
-    ]
-      .map((key) => ({
-        value: Object.getOwnPropertyDescriptor(fiber, key)?.value,
-        depth: 0,
-      }))
-      .filter(({ value }) => codexRendererScopeObjectValue(value));
-    for (
-      let index = 0;
-      index < values.length && index < valueLimit;
-      index += 1
-    ) {
-      const { value, depth } = values[index];
+    const queue = codexRendererScopeValueQueue(fiber, valueLimit);
+    for (const { value, depth } of queue.values) {
       if (
-        visited.has(value) ||
         value === window ||
         (typeof Node !== "undefined" && value instanceof Node)
       )
         continue;
-      visited.add(value);
       if (codexDeclaredDependencyScope(value)) {
         const brand = Object.getOwnPropertyDescriptor(value, "scope")?.value;
         if (scopesByBrand.has(brand)) {
@@ -964,17 +998,11 @@ const codexCurrentAppServerScopeHints = (completeInventory = false) => {
         // Unknown own-data edges can hide another scope with the same brand.
         valueReadFailed = true;
       }
-      for (const [key, field] of Object.entries(descriptors))
-        if (
-          "value" in field &&
-          codexRendererScopeObjectValue(field.value) &&
-          !codexRendererScopeNonBindingLink(value, key)
-        )
-          values.push({ value: field.value, depth: depth + 1 });
+      queue.enqueueChildren(value, descriptors, depth);
     }
     // A first matching brand is not uniqueness proof if another owner can be
     // hidden in this Fiber's uninspected value suffix.
-    if (values.length > valueLimit) valueScanComplete = false;
+    if (queue.capped) valueScanComplete = false;
   }
   if (completeInventory) {
     state.scopedAppServerScopeHintScanComplete =
@@ -1009,36 +1037,22 @@ const codexRendererMountedNodes = (targets) => {
       const next = Object.getOwnPropertyDescriptor(fiber, key)?.value;
       if (next) fibers.push(next);
     }
-    const seenValues = new Set();
-    const values = [
-      "memoizedState",
-      "dependencies",
-      "memoizedProps",
-      "pendingProps",
-    ]
-      .map((key) => ({
-        value: Object.getOwnPropertyDescriptor(fiber, key)?.value,
-        depth: 0,
-      }))
-      .filter(({ value }) => canReachTarget(value));
-    for (
-      let index = 0;
-      index < values.length && index < CODEX_RENDERER_SCOPE_VALUE_LIMIT;
-      index += 1
-    ) {
-      const { value, depth } = values[index];
+    const queue = codexRendererScopeValueQueue(
+      fiber,
+      CODEX_RENDERER_SCOPE_VALUE_LIMIT,
+      canReachTarget,
+    );
+    for (const { value, depth } of queue.values) {
       if (targets.has(value)) {
         mounted.add(value);
         if (mounted.size === targets.size) return mounted;
       }
       if (
         !codexRendererScopeObjectValue(value) ||
-        seenValues.has(value) ||
         value === window ||
         (typeof Node !== "undefined" && value instanceof Node)
       )
         continue;
-      seenValues.add(value);
       if (codexDeclaredDependencyScope(value)) {
         const node = Object.getOwnPropertyDescriptor(value, "node")?.value;
         if (targets.has(node)) {
@@ -1052,14 +1066,7 @@ const codexRendererMountedNodes = (targets) => {
       try {
         descriptors = Object.getOwnPropertyDescriptors(value);
       } catch {}
-      for (const [key, descriptor] of Object.entries(descriptors)) {
-        if (
-          "value" in descriptor &&
-          canReachTarget(descriptor.value) &&
-          !codexRendererScopeNonBindingLink(value, key)
-        )
-          values.push({ value: descriptor.value, depth: depth + 1 });
-      }
+      queue.enqueueChildren(value, descriptors, depth);
     }
   }
   return mounted;
@@ -1265,34 +1272,19 @@ const codexDiscoverRendererScopeCandidates = async () => {
       }
       // Fiber depth must not consume the object depth budget: the application
       // scope lives below many providers in current Codex Desktop builds.
-      const seenValues = new Set();
-      const values = [
-        "memoizedState",
-        "dependencies",
-        "memoizedProps",
-        "pendingProps",
-      ]
-        .map((key) => ({
-          value: snapshot[key],
-          depth: 0,
-          parent: fiberPath,
-          key,
-        }))
-        .filter(({ value }) => codexRendererScopeObjectValue(value));
-      for (
-        let index = 0;
-        index < values.length && index < CODEX_RENDERER_SCOPE_VALUE_LIMIT;
-        index += 1
-      ) {
-        const binding = values[index];
+      const queue = codexRendererScopeValueQueue(
+        snapshot,
+        CODEX_RENDERER_SCOPE_VALUE_LIMIT,
+        codexRendererScopeObjectValue,
+        fiberPath,
+      );
+      for (const binding of queue.values) {
         const { value, depth } = binding;
         if (
-          seenValues.has(value) ||
           value === window ||
           (typeof Node !== "undefined" && value instanceof Node)
         )
           continue;
-        seenValues.add(value);
         if (codexScopedRegistryInstance(value)) {
           registryInstances.add(value);
           const registryScope = Object.getOwnPropertyDescriptor(
@@ -1342,27 +1334,11 @@ const codexDiscoverRendererScopeCandidates = async () => {
           objectSnapshots.set(value, descriptors);
           snapshotFieldCount += fieldCount;
         }
-        for (const [key, descriptor] of Object.entries(descriptors)) {
-          if (
-            "value" in descriptor &&
-            codexRendererScopeObjectValue(descriptor.value) &&
-            !codexRendererScopeNonBindingLink(value, key)
-          ) {
-            values.push({
-              value: descriptor.value,
-              depth: depth + 1,
-              parent: binding,
-              key,
-            });
-          }
-        }
+        queue.enqueueChildren(value, descriptors, depth, binding);
       }
       // The per-Fiber queue is independently bounded. An omitted own-data edge
       // may contain another owner, so it cannot produce a complete inventory.
-      if (
-        !objectScanCapped &&
-        values.length > CODEX_RENDERER_SCOPE_VALUE_LIMIT
-      ) {
+      if (!objectScanCapped && queue.capped) {
         objectScanCapped = true;
         objectScanCapReason = "value_limit";
       }

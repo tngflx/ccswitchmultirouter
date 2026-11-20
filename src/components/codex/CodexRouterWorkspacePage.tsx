@@ -8708,7 +8708,7 @@ function SpawnAgentCandidatesPanel({
         <p className="mt-2 text-xs leading-5 text-muted-foreground">
           {t("codexSubagentReasoning.globalHint", {
             defaultValue:
-              "Applies to both V1 and V2 where the model supports the selected effort. Saved profile choices and the main agent stay unchanged. Unsupported models keep their profile policy. Select Profile settings to restore saved choices.",
+              "Applies to V1 and V2. With High selected, a verified Max or Ultra parent turn uses native Max for supported Sublyx children. High is the fallback. Profile settings restores saved choices.",
           })}
         </p>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">

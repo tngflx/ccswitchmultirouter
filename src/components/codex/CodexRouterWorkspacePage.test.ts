@@ -7009,7 +7009,7 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
       expect(providersApi.update).not.toHaveBeenCalled();
       expect(
         screen.getByText(
-          /Saved profile choices and the main agent stay unchanged/,
+          /a verified Max or Ultra parent turn uses native Max for supported Sublyx children/,
         ),
       ).toBeInTheDocument();
       expect(

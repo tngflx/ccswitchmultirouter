@@ -693,11 +693,11 @@ impl RequestForwarder {
         headers: &http::HeaderMap,
         body: &mut Value,
         endpoint: &str,
-    ) -> Result<bool, ProxyError> {
+    ) -> Result<Option<super::providers::codex_reasoning::CodexReasoningEffort>, ProxyError> {
         if !matches!(app_type, AppType::Codex)
             || !super::codex_subagent_reasoning::is_subagent_request(headers, body)
         {
-            return Ok(false);
+            return Ok(None);
         }
         let (router_id, _) = super::providers::codex_route_persistent_provider(provider);
         let router = self
@@ -708,13 +708,18 @@ impl RequestForwarder {
                     "Unable to read the current Sub-Agent reasoning policy".to_string(),
                 )
             })?;
-        Ok(router.is_some_and(|router| {
+        Ok(router.and_then(|router| {
+            let parent_requests_max = self
+                .router
+                .codex_parent_turn_efforts
+                .parent_requests_max(router_id, headers, body);
             super::codex_subagent_reasoning::apply_subagent_reasoning_effort(
                 &router.settings_config,
                 provider,
                 headers,
                 body,
                 endpoint,
+                parent_requests_max,
             )
         }))
     }
@@ -2850,13 +2855,14 @@ impl RequestForwarder {
 
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
         let mut mapped_body = normalize_thinking_type(mapped_body);
-        let subagent_reasoning_overridden = self.apply_codex_subagent_reasoning_effort(
+        let subagent_reasoning_override = self.apply_codex_subagent_reasoning_effort(
             app_type,
             provider,
             headers,
             &mut mapped_body,
             endpoint,
         )?;
+        let subagent_reasoning_overridden = subagent_reasoning_override.is_some();
         if matches!(app_type, AppType::Codex)
             && !subagent_reasoning_overridden
             && is_native_codex_chat_endpoint(endpoint)
@@ -3596,6 +3602,18 @@ impl RequestForwarder {
             codex_responses_to_chat.then(|| summarize_codex_chat_request_shape(&filtered_body));
         let hosted_chat_tool_projection =
             codex_responses_to_chat.then(|| summarize_hosted_chat_tool_projection(&filtered_body));
+        if matches!(app_type, AppType::Codex)
+            && super::codex_subagent_reasoning::is_generation_endpoint(endpoint)
+        {
+            let (router_id, _) = super::providers::codex_route_persistent_provider(provider);
+            self.router.codex_parent_turn_efforts.observe_request(
+                router_id,
+                headers,
+                body,
+                subagent_reasoning_override,
+            );
+        }
+
         if let Some(trace_id) = codex_trace_id.as_deref() {
             let mut fields = vec![
                 ("trace", trace_id.to_string()),
@@ -11397,7 +11415,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_responses_parent_sublyx_alias_preserves_native_max_reasoning() {
+    async fn subagent_reasoning_effort_native_responses_preserves_parent_max_through_sublyx_alias()
+    {
         for incoming_effort in ["max", "ultra"] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -11411,6 +11430,7 @@ mod tests {
                 "api_key": "REDACTED_TEST_KEY",
                 "codexRouterParentProviderId": "router",
                 "codexResolvedRouteId": "sublyx",
+                "codexResolvedTargetProviderName": "Sublyx",
                 "codexResolvedCanonicalModel": "sol-public-alias",
                 "codexResolvedUpstreamModelOverride": "gpt-6.2-sol",
                 "modelCatalog": {"models": [{
@@ -11442,7 +11462,7 @@ mod tests {
             let router = Provider::with_id(
                 "router".into(),
                 "Router".into(),
-                json!({"codexRouting": {"enabled": true, "subagentReasoningEffort": "max"}}),
+                json!({"codexRouting": {"enabled": true, "subagentReasoningEffort": "high"}}),
                 None,
             );
             let mut forwarder = test_forwarder(Duration::from_secs(5), Duration::ZERO);
@@ -11460,6 +11480,13 @@ mod tests {
                 "tools": [],
                 "stream": false
             });
+            let mut parent_headers = HeaderMap::new();
+            parent_headers.insert(
+                "x-codex-turn-metadata",
+                http::HeaderValue::from_static(
+                    r#"{"installation_id":"installation","thread_id":"parent","turn_id":"turn","request_kind":"turn"}"#,
+                ),
+            );
             let adapter = get_adapter(&AppType::Codex);
             forwarder
                 .forward(
@@ -11468,7 +11495,7 @@ mod tests {
                     &target,
                     "/v1/responses",
                     &body,
-                    &HeaderMap::new(),
+                    &parent_headers,
                     &Extensions::new(),
                     adapter.as_ref(),
                 )
@@ -11477,6 +11504,37 @@ mod tests {
             let (_, bytes) = capture.await.expect("captured Sublyx request");
             let sent: Value = serde_json::from_slice(&bytes).expect("outgoing JSON");
             assert_eq!(sent["model"], "gpt-6.2-sol", "{incoming_effort}");
+            assert_eq!(sent["reasoning"]["effort"], "max", "{incoming_effort}");
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            target.settings_config["base_url"] =
+                json!(format!("http://{}", listener.local_addr().unwrap()));
+            let capture = tokio::spawn(capture_single_http_request(listener));
+            let mut child = body.clone();
+            child["reasoning"]["effort"] = json!("low");
+            child["client_metadata"] = json!({
+                "x-codex-installation-id": "installation",
+                "x-codex-parent-thread-id": "parent",
+                "parent_turn_id": "turn",
+                "thread_id": "child",
+                "turn_id": "child-turn",
+                "x-openai-subagent": "collab_spawn",
+            });
+            forwarder
+                .forward(
+                    &AppType::Codex,
+                    &http::Method::POST,
+                    &target,
+                    "/v1/responses",
+                    &child,
+                    &HeaderMap::new(),
+                    &Extensions::new(),
+                    adapter.as_ref(),
+                )
+                .await
+                .expect("child native Responses request must forward");
+            let (_, bytes) = capture.await.expect("captured Sublyx child request");
+            let sent: Value = serde_json::from_slice(&bytes).expect("outgoing child JSON");
             assert_eq!(sent["reasoning"]["effort"], "max", "{incoming_effort}");
         }
     }

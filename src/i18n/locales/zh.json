@@ -60,7 +60,7 @@
     "globalInvalidOption": "保存的推理档位无效",
     "globalHighOption": "High（高）",
     "globalMaxOption": "Max（最高）",
-    "globalHint": "同时适用于 V1 和 V2，且仅覆盖支持所选强度的模型。可用覆盖仅为 Max 或 High。已保存的配置档选择和主代理保持不变；不支持的模型继续使用自身推理策略。选择“使用配置档设置”即可恢复原设置。",
+    "globalHint": "适用于 V1 和 V2。选择 High 时，如果确认父回合使用 Max 或 Ultra，支持原生 Max 的 Sublyx 子代理会使用 Max。其他情况下默认使用 High。选择“使用配置档设置”可恢复已保存的选择。",
     "globalActivation": "保存后，请重启 Codex Desktop/app-server 并创建新会话以应用。现有会话不会改变。",
     "globalSaving": "正在保存子代理推理强度…",
     "globalSaved": "子代理推理强度已保存。",
