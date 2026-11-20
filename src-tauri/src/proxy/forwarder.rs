@@ -2855,6 +2855,25 @@ impl RequestForwarder {
 
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
         let mut mapped_body = normalize_thinking_type(mapped_body);
+        let restored_desktop_effort = if matches!(app_type, AppType::Codex)
+            && !codex_responses_to_chat
+            && !codex_responses_to_messages
+            && !codex_responses_to_anthropic
+            && !codex_official_auth_passthrough
+            && !provider.uses_managed_account_auth()
+            && !super::providers::is_codex_official_provider(provider)
+        {
+            super::codex_subagent_reasoning::restore_desktop_ultra_effort(
+                provider,
+                headers,
+                body,
+                &mut mapped_body,
+                endpoint,
+            )
+            .await
+        } else {
+            None
+        };
         let subagent_reasoning_override = self.apply_codex_subagent_reasoning_effort(
             app_type,
             provider,
@@ -3610,7 +3629,7 @@ impl RequestForwarder {
                 router_id,
                 headers,
                 body,
-                subagent_reasoning_override,
+                subagent_reasoning_override.or(restored_desktop_effort),
             );
         }
 
@@ -3680,6 +3699,12 @@ impl RequestForwarder {
                 &filtered_body,
                 subagent_reasoning_overridden,
             ));
+            if let Some(effort) = restored_desktop_effort {
+                fields.push((
+                    "restored_desktop_reasoning_effort",
+                    effort.as_str().to_string(),
+                ));
+            }
             super::codex_router_log::append_event("request_prepared", &fields);
         }
 
