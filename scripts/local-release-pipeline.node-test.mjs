@@ -91,6 +91,7 @@ test("local release parser accepts Node and legacy PowerShell spellings", () => 
     {
       releaseRoot: "D:/release",
       skipBuild: true,
+      confirmBuild: false,
       noTypecheck: true,
       reason: "post-commit",
       help: false,
@@ -100,6 +101,38 @@ test("local release parser accepts Node and legacy PowerShell spellings", () => 
   assert.throws(
     () => parseLocalReleaseOptions(["--unknown"]),
     /Unknown local release option/,
+  );
+});
+
+test("local release build refuses before lock, install, or target creation", (t) => {
+  const root = fixture(t);
+  let called = false;
+  assert.throws(
+    () =>
+      runLocalRelease(
+        {
+          releaseRoot: path.join(root, "output"),
+          skipBuild: false,
+          confirmBuild: true,
+        },
+        {
+          repoRoot: root,
+          getIdentity() {
+            called = true;
+            throw new Error("identity lookup must not run");
+          },
+          run() {
+            called = true;
+            throw new Error("build command must not run");
+          },
+        },
+      ),
+    /explicit user approval/,
+  );
+  assert.equal(called, false);
+  assert.equal(
+    existsSync(path.join(root, "scripts", "logs", "local-release.lock")),
+    false,
   );
 });
 

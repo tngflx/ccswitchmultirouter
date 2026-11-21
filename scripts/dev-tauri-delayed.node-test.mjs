@@ -13,6 +13,8 @@ import { DEV_RECOVERY_FLAG } from "./dev-session-launch.mjs";
 
 import {
   assertNormalCargoTargetDirectory,
+  AUTOMATIC_DEV_REBUILD_ENABLED,
+  AUTOMATIC_DEV_RECOVERY_ENABLED,
   createBackendContentTracker,
   createBackendRebuildGate,
   createChangeEventBatcher,
@@ -39,6 +41,9 @@ import {
   observeDevChildTermination,
   parseDelayMs,
   parseNoRebuild,
+  parseRebuildApproval,
+  requireDevBuildApproval,
+  requireDetachedDevWatchdogApproval,
   parsePort,
   preserveManualTakeoverHandoff,
   retireDevWorkerForManualHandoff,
@@ -166,6 +171,80 @@ test("parseNoRebuild supports the CLI flag and environment override", () => {
     () => parseNoRebuild([], { TAURI_DEV_NO_REBUILD: "sometimes" }),
     /Invalid TAURI_DEV_NO_REBUILD/,
   );
+});
+
+test("source-edit rebuild approval is explicit", () => {
+  assert.equal(parseRebuildApproval([]), false);
+  assert.equal(parseRebuildApproval(["--confirm-build"]), true);
+  assert.throws(
+    () => parseRebuildApproval(["--confirm-build", "--confirm-build"]),
+    /only be specified once/,
+  );
+});
+
+test("development lifecycle approval is required before launch", () => {
+  assert.throws(
+    () => requireDevBuildApproval([]),
+    /Development sessions require explicit --confirm-build approval/,
+  );
+  assert.doesNotThrow(() => requireDevBuildApproval(["--confirm-build"]));
+  assert.throws(
+    () => requireDevBuildApproval(["--confirm-build", "--confirm-build"]),
+    /only be specified once/,
+  );
+  assert.throws(
+    () => requireDevBuildApproval([], { CCSWITCH_BUILD_APPROVED: "1" }),
+    /Development sessions require explicit --confirm-build approval/,
+  );
+});
+
+test("detached watchdog approval comes from the owned supervisor session", () => {
+  assert.doesNotThrow(() =>
+    requireDetachedDevWatchdogApproval(42, {
+      markerPath: "ignored",
+      readSession: () => ({
+        supervisorPid: 42,
+        args: ["--confirm-build"],
+      }),
+    }),
+  );
+  assert.throws(
+    () =>
+      requireDetachedDevWatchdogApproval(42, {
+        markerPath: "ignored",
+        readSession: () => ({ supervisorPid: 42, args: [] }),
+      }),
+    /Development sessions require explicit --confirm-build approval/,
+  );
+});
+
+test("development entry points reject unapproved launches before side effects", () => {
+  const scriptPath = fileURLToPath(
+    new URL("./dev-tauri-delayed.mjs", import.meta.url),
+  );
+  const environment = { ...process.env };
+  environment.CCSWITCH_BUILD_APPROVED = "1";
+  environment.CC_SWITCH_TEST_HOME = path.join(
+    process.cwd(),
+    "unapproved-dev-entry-test-home",
+  );
+  for (const args of [
+    ["--ccsm-dev-worker"],
+    [],
+    ["--ccsm-dev-watchdog", "123"],
+  ]) {
+    const result = spawnSync(process.execPath, [scriptPath, ...args], {
+      cwd: path.resolve(path.dirname(scriptPath), ".."),
+      env: environment,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    assert.equal(result.status, 1, JSON.stringify({ args, result }));
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /Development sessions require explicit --confirm-build approval/,
+    );
+  }
 });
 
 test("parsePort supports isolated development sessions", () => {
@@ -958,6 +1037,7 @@ test("development supervisor waits for cleanup before relaunching a full worker"
     finishCleanup = resolve;
   });
   const supervising = superviseDevSessions({
+    allowAutomaticRestart: true,
     spawnSession: () => {
       const child = fakeDevWorker(workers.length + 1);
       workers.push(child);
@@ -993,6 +1073,55 @@ test("development supervisor waits for cleanup before relaunching a full worker"
   assert.equal(await supervising, 0);
 });
 
+test("approved development sessions keep automatic rebuild and recovery disabled", async () => {
+  assert.equal(AUTOMATIC_DEV_REBUILD_ENABLED, false);
+  assert.equal(AUTOMATIC_DEV_RECOVERY_ENABLED, false);
+
+  const workers = [];
+  const actions = [];
+  const supervising = superviseDevSessions({
+    allowAutomaticRestart: AUTOMATIC_DEV_RECOVERY_ENABLED,
+    spawnSession: () => {
+      const child = fakeDevWorker(workers.length + 1);
+      workers.push(child);
+      actions.push(`launch-worker:${child.pid}`);
+      return child;
+    },
+    cleanSession: async (child) => {
+      actions.push(`cleanup:${child.pid}`);
+    },
+    readEnabled: () => true,
+    waitToRestart: async () => {
+      throw new Error("automatic recovery must not wait for a restart");
+    },
+  });
+
+  workers[0].finish(1);
+  assert.equal(await supervising, 1);
+  assert.deepEqual(actions, ["launch-worker:1", "cleanup:1"]);
+  assert.equal(workers.length, 1);
+});
+
+test("imported supervisor callers default to no automatic recovery", async () => {
+  let launches = 0;
+  const child = fakeDevWorker(1);
+  const supervising = superviseDevSessions({
+    spawnSession: () => {
+      launches += 1;
+      return child;
+    },
+    cleanSession: async () => {},
+    readEnabled: () => true,
+    waitToRestart: async () => {
+      assert.fail("automatic recovery must require an explicit opt-in");
+    },
+  });
+
+  child.finish(1);
+  assert.equal(await supervising, 1);
+  assert.equal(launches, 1);
+});
+
 test("live reconnect recovery restarts the full dev session after cleanup even with no source rebuilds", async () => {
   const args = ["--delay", "14400000", "--no-rebuild"];
   const workers = [];
@@ -1003,6 +1132,7 @@ test("live reconnect recovery restarts the full dev session after cleanup even w
     releaseCleanup = resolve;
   });
   const supervising = superviseDevSessions({
+    allowAutomaticRestart: true,
     spawnSession: () => {
       assert.deepEqual(devWorkerCommand(args).args.slice(2), args);
       const child = fakeDevWorker(workers.length + 1);
@@ -1081,6 +1211,7 @@ test("live reconnect and process crashes share the full-session five-restart lim
   const recoveryReasons = [];
   const decisions = [];
   const code = await superviseDevSessions({
+    allowAutomaticRestart: true,
     spawnSession: () => {
       const child = fakeDevWorker(++launches);
       const reason =
@@ -1130,6 +1261,7 @@ test("replacement supervisors respect persisted worker and launcher restart hist
   let launches = 0;
   const decisions = [];
   const code = await superviseDevSessions({
+    allowAutomaticRestart: true,
     spawnSession: () => {
       const child = fakeDevWorker(++launches);
       queueMicrotask(() => child.finish(1));
@@ -1154,6 +1286,7 @@ test("development rate limit exposes one durable event for the exact supervisor"
   const events = [];
   let launches = 0;
   const code = await superviseDevSessions({
+    allowAutomaticRestart: true,
     spawnSession: () => {
       const child = fakeDevWorker(++launches);
       queueMicrotask(() => child.finish(1));
@@ -1186,6 +1319,7 @@ test("worker recovery persists the shared restart budget before its restart dela
   let persisted;
   let launches = 0;
   const code = await superviseDevSessions({
+    allowAutomaticRestart: true,
     spawnSession: () => {
       const child = fakeDevWorker(++launches);
       queueMicrotask(() => child.finish(1));
@@ -1218,6 +1352,7 @@ test("four worker recoveries and one launcher recovery block the next restart", 
   let workerLaunches = 0;
   await assert.rejects(
     superviseDevSessions({
+      allowAutomaticRestart: true,
       spawnSession: () => {
         const child = fakeDevWorker(++workerLaunches);
         queueMicrotask(() => child.finish(1));
@@ -1259,6 +1394,7 @@ test("four worker recoveries and one launcher recovery block the next restart", 
   let replacementLaunches = 0;
   const decisions = [];
   const code = await superviseDevSessions({
+    allowAutomaticRestart: true,
     spawnSession: () => {
       const child = fakeDevWorker(++replacementLaunches);
       queueMicrotask(() => child.finish(1));
@@ -1283,6 +1419,7 @@ test("development supervisor rebuilds a new worker after a startup error", async
   const outcomes = [];
   let launches = 0;
   const code = await superviseDevSessions({
+    allowAutomaticRestart: true,
     spawnSession: () => {
       const child = fakeDevWorker(++launches);
       actions.push(`launch-worker:${child.pid}`);
@@ -1329,6 +1466,7 @@ test("development supervisor leaves clean and disabled sessions stopped", async 
     const restartTimesMs = Array(4).fill(Date.now());
     const previousHistory = [...restartTimesMs];
     const code = await superviseDevSessions({
+      allowAutomaticRestart: true,
       spawnSession: () => {
         const child = fakeDevWorker(++launches);
         queueMicrotask(() => child.finish(exitCode));
@@ -1362,6 +1500,7 @@ test("development supervisor stops a repeated startup crash loop at five restart
   let delays = 0;
   const decisions = [];
   const code = await superviseDevSessions({
+    allowAutomaticRestart: true,
     spawnSession: () => {
       const child = fakeDevWorker(++launches);
       queueMicrotask(() => child.finish(1));
@@ -1391,6 +1530,7 @@ test("development supervisor reports budget exhaustion without throwing", async 
   const nowMs = 1_800_000;
   let launches = 0;
   const code = await superviseDevSessions({
+    allowAutomaticRestart: true,
     spawnSession: () => {
       const child = fakeDevWorker(++launches);
       queueMicrotask(() => child.finish(1));
@@ -1419,6 +1559,7 @@ test("development supervisor cancels a delayed restart when shutting down", asyn
   let stopping = false;
   let launches = 0;
   const code = await superviseDevSessions({
+    allowAutomaticRestart: true,
     spawnSession: () => {
       const child = fakeDevWorker(++launches);
       queueMicrotask(() => child.finish(1));
@@ -1439,6 +1580,7 @@ test("development supervisor rereads the watchdog toggle after the restart delay
   let enabled = true;
   let launches = 0;
   const code = await superviseDevSessions({
+    allowAutomaticRestart: true,
     spawnSession: () => {
       const child = fakeDevWorker(++launches);
       queueMicrotask(() => child.finish(1));
@@ -2049,6 +2191,7 @@ test("Windows worker relaunch waits for old app and Vite listeners to release", 
     releaseFrontend = resolve;
   });
   const supervising = superviseDevSessions({
+    allowAutomaticRestart: true,
     spawnSession: () => {
       const child = fakeDevWorker(workers.length === 0 ? 10 : 11);
       workers.push(child);
@@ -3332,7 +3475,7 @@ test("detached watchdog relaunches the pnpm dev entry point after supervisor dea
     ...replacementDevSession(),
     supervisorPid: 100,
     supervisorExecutablePath: process.execPath,
-    args: ["--delay", "0"],
+    args: ["--delay", "0", "--confirm-build"],
     environment: { TAURI_DEV_NO_REBUILD: "0" },
   };
   const persisted = [];
@@ -3348,6 +3491,7 @@ test("detached watchdog relaunches the pnpm dev entry point after supervisor dea
     supervisorPid: session.supervisorPid,
     markerPath: path.join("isolated", "dev-session.json"),
     session,
+    allowAutomaticRestart: true,
     scriptPath: session.scriptPath,
     repoRoot: session.repoRoot,
     now: () => 1_000,
@@ -3381,6 +3525,7 @@ test("detached watchdog relaunches the pnpm dev entry point after supervisor dea
     String(session.supervisorPid),
     "--delay",
     "0",
+    "--confirm-build",
   ]);
   assert.equal(launches[0].options.cwd, session.repoRoot);
   assert.equal(launches[0].options.env.TAURI_DEV_NO_REBUILD, "0");
@@ -3402,6 +3547,36 @@ test("detached watchdog relaunches the pnpm dev entry point after supervisor dea
       detail: { oldPid: session.supervisorPid, newPid: replacement.pid },
     },
   ]);
+});
+
+test("detached watchdog helpers require explicit automatic restart opt-in", async () => {
+  let launched = false;
+  let waited = false;
+  const handoff = await handoffDetachedDevSupervisor({
+    supervisorPid: 100,
+    markerPath: "isolated/dev-session.json",
+    session: {},
+    spawnReplacement: async () => {
+      launched = true;
+      throw new Error("automatic restart should be disabled");
+    },
+  });
+  assert.deepEqual(handoff, {
+    restarted: false,
+    decision: { restart: false, reason: "disabled" },
+  });
+  const watchdog = await runDetachedDevWatchdog(100, {
+    markerPath: "isolated/dev-session.json",
+    wait: async () => {
+      waited = true;
+    },
+    handoff: async () => {
+      launched = true;
+    },
+  });
+  assert.deepEqual(watchdog, { watched: false, reason: "disabled" });
+  assert.equal(launched, false);
+  assert.equal(waited, false);
 });
 
 test("detached watchdog retries when the replacement pnpm dev supervisor dies before claiming ownership", async () => {
@@ -3426,6 +3601,7 @@ test("detached watchdog retries when the replacement pnpm dev supervisor dies be
   let waits = 0;
   let released = 0;
   await runDetachedDevWatchdog(100, {
+    allowAutomaticRestart: true,
     markerPath: path.join("isolated", "dev-session.json"),
     readSession: () => session,
     wait: async () =>
@@ -3526,6 +3702,7 @@ test("detached watchdog stops failed replacement launches at the shared restart 
   let launches = 0;
   let iterations = 0;
   await runDetachedDevWatchdog(100, {
+    allowAutomaticRestart: true,
     markerPath: path.join("isolated", "dev-session.json"),
     readSession: () => session,
     queryProcesses: () => [],
@@ -3576,6 +3753,7 @@ test("detached watchdog preserves recovery ownership across a failed process que
   let handoffs = 0;
   const events = [];
   await runDetachedDevWatchdog(100, {
+    allowAutomaticRestart: true,
     markerPath: path.join("isolated", "dev-session.json"),
     readSession: () => session,
     wait: async () => {},
@@ -3699,6 +3877,7 @@ test("detached watchdog uses absence fallback after repeated process-query timeo
   let handoffs = 0;
   const events = [];
   await runDetachedDevWatchdog(100, {
+    allowAutomaticRestart: true,
     markerPath: path.join("isolated", "dev-session.json"),
     readSession: () => session,
     wait: async () => {},
@@ -3747,6 +3926,7 @@ test("detached watchdog never hands off on a present or unknown fallback", async
     let handoffs = 0;
     const events = [];
     await runDetachedDevWatchdog(100, {
+      allowAutomaticRestart: true,
       markerPath: path.join("isolated", "dev-session.json"),
       readSession: () => session,
       wait: async () => {
@@ -3784,6 +3964,7 @@ test("detached watchdog retries at the lower cadence without flooding repeat dia
   const events = [];
   let waits = 0;
   await runDetachedDevWatchdog(100, {
+    allowAutomaticRestart: true,
     markerPath: path.join("isolated", "dev-session.json"),
     readSession() {
       if (waits === times.length) return { ...session, state: "stopping" };
@@ -4727,6 +4908,7 @@ function detachedRecoveryClaimFixture() {
     supervisorPid: observed.supervisorPid,
     markerPath: path.join("isolated", "dev-session.json"),
     session: structuredClone(observed),
+    allowAutomaticRestart: true,
     repoRoot: observed.repoRoot,
     scriptPath: observed.scriptPath,
     executable: observed.supervisorExecutablePath,

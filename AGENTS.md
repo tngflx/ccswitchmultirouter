@@ -46,6 +46,13 @@ subtree, but must not silently weaken these repository invariants.
 
 ## Sub-Agent Delegation and Shared Runtime Ownership
 
+- Build authorization comes from a direct user request in the current turn.
+  Keep `pnpm build`, `pnpm build:renderer`, `pnpm tauri build`,
+  `pnpm tauri dev`, `pnpm dev`, `pnpm release:local`, release exports, and
+  backend source-edit rebuilds
+  blocked without that request. Source changes and verification requirements
+  do not grant build authorization. Use the repository's explicit
+  `--confirm-build` gate only after the user authorizes the build.
 - These guardrails apply to the main agent and every Sub-Agent. Each delegation
   must repeat the applicable repository/user restrictions, assigned files or
   read-only scope, allowed verification, shared-resource owner, and forbidden

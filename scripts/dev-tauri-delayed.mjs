@@ -56,15 +56,17 @@ import {
   parseWindowsJsonQueryOutput,
   runWindowsJsonQuery,
 } from "./windows-json-query.mjs";
+import { hasBuildApproval } from "./build-approval.mjs";
 export {
   windowsJsonQueryCommand,
   parseWindowsJsonQueryOutput,
   runWindowsJsonQuery,
 } from "./windows-json-query.mjs";
 
-// A four-hour quiet period keeps the running Tauri binary stable during normal
-// development while still rebuilding automatically after sustained backend
-// editing. Use --delay 0 when an immediate backend rebuild is intentional.
+// Backend rebuilds and crash recovery are manual operations. A prior
+// --confirm-build launch must never authorize a later unattended compile.
+export const AUTOMATIC_DEV_REBUILD_ENABLED = false;
+export const AUTOMATIC_DEV_RECOVERY_ENABLED = false;
 const DEFAULT_DELAY_MS = 14_400_000;
 const DEFAULT_FRONTEND_PORT = 3000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -122,7 +124,7 @@ export function parseDelayMs(args, environment = process.env) {
       index += 1;
       continue;
     }
-    if (argument === "--no-rebuild") {
+    if (argument === "--no-rebuild" || argument === "--confirm-build") {
       continue;
     }
     if (argument !== "--help" && argument !== "-h") {
@@ -200,6 +202,24 @@ export function parseNoRebuild(args, environment = process.env) {
   throw new Error(
     `Invalid TAURI_DEV_NO_REBUILD value "${rawValue}". Use 1/true or 0/false.`,
   );
+}
+
+export function parseRebuildApproval(args) {
+  const flagCount = args.filter(
+    (argument) => argument === "--confirm-build",
+  ).length;
+  if (flagCount > 1) {
+    throw new Error("The --confirm-build flag may only be specified once.");
+  }
+  return hasBuildApproval(args, {});
+}
+
+export function requireDevBuildApproval(args) {
+  if (!parseRebuildApproval(args)) {
+    throw new Error(
+      "Development sessions require explicit --confirm-build approval. Re-run with --confirm-build.",
+    );
+  }
 }
 
 export function parsePort(environment = process.env) {
@@ -1749,6 +1769,10 @@ export async function superviseDevSessions({
   spawnSession,
   cleanSession,
   readEnabled = readDevWatchdogEnabled,
+  // Imported callers must opt into restart behavior explicitly. The production
+  // entrypoint passes the hard-disabled policy constant, and omission must
+  // never turn a helper call into an unattended respawn loop.
+  allowAutomaticRestart = false,
   isStopping = () => false,
   waitToRestart = () =>
     new Promise((resolve) => setTimeout(resolve, DEV_AUTO_RESTART_DELAY_MS)),
@@ -1778,7 +1802,7 @@ export async function superviseDevSessions({
     const decision = devWorkerRestartDecision({
       ...outcome,
       expectedExit: isStopping(),
-      watchdogEnabled: readEnabled(),
+      watchdogEnabled: allowAutomaticRestart && readEnabled(),
       nowMs: decisionAtMs,
       restartTimesMs,
     });
@@ -1807,7 +1831,9 @@ export async function superviseDevSessions({
     // Persist before waiting so launcher recovery cannot reset this budget.
     onRestart();
     await waitToRestart();
-    if (!readEnabled()) return outcome.exitCode ?? 1;
+    if (!allowAutomaticRestart || !readEnabled()) {
+      return outcome.exitCode ?? 1;
+    }
   }
   return 0;
 }
@@ -1840,6 +1866,30 @@ function devSessionPath() {
   return settingsPath
     ? path.join(path.dirname(settingsPath), "logs", "dev-session.json")
     : null;
+}
+
+export function requireDetachedDevWatchdogApproval(
+  supervisorPid,
+  {
+    markerPath = devSessionPath(),
+    readSession = () => JSON.parse(readFileSync(markerPath, "utf8")),
+  } = {},
+) {
+  let session;
+  try {
+    session = markerPath ? readSession() : undefined;
+  } catch {
+    session = undefined;
+  }
+  if (
+    session?.supervisorPid !== supervisorPid ||
+    !Array.isArray(session?.args)
+  ) {
+    throw new Error(
+      "Development sessions require explicit --confirm-build approval before watchdog recovery.",
+    );
+  }
+  requireDevBuildApproval(session.args);
 }
 
 export function devSessionEnvironment(environment) {
@@ -2302,6 +2352,7 @@ export async function handoffDetachedDevSupervisor({
   supervisorPid,
   markerPath,
   session,
+  allowAutomaticRestart = false,
   now = Date.now,
   readEnabled = readDevWatchdogEnabled,
   persistSession = (nextSession) =>
@@ -2341,6 +2392,12 @@ export async function handoffDetachedDevSupervisor({
   repoRoot = REPO_ROOT,
   environment = process.env,
 }) {
+  if (!allowAutomaticRestart) {
+    return {
+      restarted: false,
+      decision: { restart: false, reason: "disabled" },
+    };
+  }
   // This snapshot is the version observed by the detached watcher. It is not
   // authority to overwrite a marker that an explicit/newer launcher published.
   const observedSession = structuredClone(session);
@@ -2496,6 +2553,7 @@ export async function handoffDetachedDevSupervisor({
 export async function runDetachedDevWatchdog(
   supervisorPid,
   {
+    allowAutomaticRestart = false,
     markerPath = devSessionPath(),
     readSession = () => JSON.parse(readFileSync(markerPath, "utf8")),
     wait = (milliseconds) =>
@@ -2508,6 +2566,9 @@ export async function runDetachedDevWatchdog(
     now = Date.now,
   } = {},
 ) {
+  if (!allowAutomaticRestart) {
+    return { watched: false, reason: "disabled" };
+  }
   if (!markerPath) return;
   const diagnosticTimes = new Map();
   const writeDiagnostic = (event, detail) => {
@@ -2570,6 +2631,7 @@ export async function runDetachedDevWatchdog(
         supervisorPid,
         markerPath,
         session,
+        allowAutomaticRestart,
         readSession,
         queryProcesses,
       });
@@ -2711,6 +2773,7 @@ export function persistIndependentWatchdog({
 
 async function runDevSupervisor(launchArgs) {
   const launch = parseDevSupervisorLaunchArgs(launchArgs);
+  requireDevBuildApproval(launch.args);
   const { args } = launch;
   // Validate the requested settings before retiring a working development session.
   parseDelayMs(args);
@@ -2777,10 +2840,6 @@ async function runDevSupervisor(launchArgs) {
         throw new Error(
           "Could not verify this development supervisor's process identity.",
         );
-        writeDevLifecycleEvent("dev-live-owner-handoff", {
-          supervisor_pid: current.supervisorPid,
-          stage: "app_cleanup_committed",
-        });
       }
     }
     let worker;
@@ -2909,7 +2968,7 @@ async function runDevSupervisor(launchArgs) {
     const handoffTimer = setInterval(() => {
       if (!stopping) handoff.request();
     }, 250);
-    if (markerPath) {
+    if (markerPath && AUTOMATIC_DEV_RECOVERY_ENABLED) {
       const outputPath = devRecoveryLogPath(markerPath);
       console.log(
         `[dev watchdog] Launcher recovery output: ${outputPath}. Follow it with Get-Content -LiteralPath '${outputPath.replaceAll("'", "''")}' -Tail 60 -Wait.`,
@@ -2976,10 +3035,15 @@ async function runDevSupervisor(launchArgs) {
           "[dev watchdog] Could not start launcher recovery; see dev-watchdog.jsonl.",
         );
       }
+    } else if (markerPath) {
+      console.log(
+        "[dev watchdog] Automatic recovery is disabled. Start a new approved development session after a crash.",
+      );
     }
     let completed = false;
     try {
       const code = await superviseDevSessions({
+        allowAutomaticRestart: AUTOMATIC_DEV_RECOVERY_ENABLED,
         spawnSession() {
           roots = new Map();
           const command = devWorkerCommand(args);
@@ -3130,23 +3194,19 @@ async function runDevWorker(args) {
     });
   }
   if (args.includes("--help") || args.includes("-h")) {
-    console.log(`Usage: pnpm dev:delayed -- [--delay milliseconds] [--no-rebuild]
+    console.log(`Usage: pnpm dev:delayed -- [--delay milliseconds] [--confirm-build] [--no-rebuild]
 
-Runs Vite with immediate frontend HMR and rebuilds the Tauri backend only after
-backend files have remained unchanged for the configured quiet period.
+Runs the complete Vite + Cargo/Tauri development session. Explicit approval
+is required before the session can acquire its launch lock or start any process.
 
 Options:
-  -d, --delay <ms>  Quiet period before a backend rebuild (default: 14400000 / 4 hours)
-  --no-rebuild      Disable source-edit rebuilds (watchdog crash recovery still applies)
+  -d, --delay <ms>  Retained for compatibility; backend rebuilds remain manual
+  --confirm-build   Explicitly authorize this complete development session
+  --no-rebuild      Retained for compatibility; backend rebuilds remain disabled
 
 Watchdog:
-  watchdogEnabled recovers crashes and sustained reconnect loops immediately,
-  without the source-edit delay (maximum 5 automatic restarts / 30 minutes).
-  A worker crash is restarted by the supervisor in the launching terminal.
-  If the supervisor itself disappears, a detached watchdog relaunches the
-  complete pnpm dev session independently and writes output to dev-recovery.log.
-  Ctrl+C, a clean/manual quit, a disabled watchdog, or the restart limit does
-  not trigger another launch.
+  Automatic crash recovery is disabled. A crash stops the session and requires
+  a new explicit --confirm-build launch.
 
 Environment:
   TAURI_DEV_REBUILD_DELAY_MS  Same setting as --delay; CLI option takes priority
@@ -3156,8 +3216,11 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     return;
   }
 
+  requireDevBuildApproval(args);
   const delayMs = parseDelayMs(args);
-  const noRebuild = parseNoRebuild(args);
+  parseNoRebuild(args);
+  parseRebuildApproval(args);
+  const noRebuild = !AUTOMATIC_DEV_REBUILD_ENABLED;
   const frontendPort = parsePort();
   assertNormalCargoTargetDirectory(path.join(TAURI_DIR, "target"));
   assertNormalCargoTargetDirectory(queryCargoTargetDirectory(), {});
@@ -3180,7 +3243,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
   }
 
   console.log(
-    `[dev] Frontend HMR is immediate; backend ${noRebuild ? "rebuilds are disabled (--no-rebuild)" : `rebuilds after ${delayMs}ms without changes`}.`,
+    "[dev] Frontend HMR is immediate; backend rebuilds and crash recovery require a new explicit --confirm-build launch.",
   );
 
   const vite = startProcess(process.execPath, [
@@ -3440,6 +3503,8 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     };
     const recovery = createDevWorkerRecovery({
       isCurrent: () => !shuttingDown && !restartInProgress && tauri === child,
+      readEnabled: () =>
+        AUTOMATIC_DEV_RECOVERY_ENABLED && readDevWatchdogEnabled(),
       readMarkerPresent: () =>
         readDevRunMarkerPresent(
           process.env,
@@ -3533,7 +3598,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
           uncleanExit,
           // The outer supervisor reads the persisted toggle at the restart
           // boundary. Here we only classify the worker's exit as clean/crashed.
-          watchdogEnabled: true,
+          watchdogEnabled: AUTOMATIC_DEV_RECOVERY_ENABLED,
         });
         if (outcome.reason === "clean-exit" || outcome.reason === "signal") {
           void shutdown(0);
@@ -3549,6 +3614,12 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
   };
 
   const restartTauri = async (reason = "backend-edit") => {
+    if (!AUTOMATIC_DEV_REBUILD_ENABLED) {
+      logBackendEvent(
+        `Backend rebuild blocked (${reason}); start a new session with explicit --confirm-build approval.`,
+      );
+      return;
+    }
     if (restartInProgress || shuttingDown) {
       return;
     }
@@ -3743,13 +3814,22 @@ if (isMainModule) {
   const cliArgs = normalizeCliArgs(process.argv.slice(2));
   const isWorker = cliArgs[0] === DEV_WORKER_FLAG;
   const isDetachedWatchdog = cliArgs[0] === DEV_WATCHDOG_FLAG;
-  const task = isDetachedWatchdog
-    ? runDetachedDevWatchdog(Number(cliArgs[1]))
-    : isWorker
-      ? runDevWorker(cliArgs.slice(1))
-      : cliArgs.includes("--help") || cliArgs.includes("-h")
-        ? runDevWorker(cliArgs)
-        : runDevSupervisor(cliArgs);
+  let task;
+  if (isDetachedWatchdog) {
+    requireDetachedDevWatchdogApproval(Number(cliArgs[1]));
+    if (!AUTOMATIC_DEV_RECOVERY_ENABLED) {
+      throw new Error(
+        "Automatic development recovery is disabled. Start a new session with explicit --confirm-build approval.",
+      );
+    }
+    task = runDetachedDevWatchdog(Number(cliArgs[1]));
+  } else if (isWorker) {
+    task = runDevWorker(cliArgs.slice(1));
+  } else if (cliArgs.includes("--help") || cliArgs.includes("-h")) {
+    task = runDevWorker(cliArgs);
+  } else {
+    task = runDevSupervisor(cliArgs);
+  }
   task.catch((error) => {
     console.error(`[dev] ${error.message}`);
     process.exitCode = 1;

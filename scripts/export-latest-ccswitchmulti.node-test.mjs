@@ -54,6 +54,7 @@ test("export parser accepts explicit root and skip-build", () => {
     {
       releaseRoot: "D:/release",
       skipBuild: true,
+      confirmBuild: false,
       help: false,
     },
   );
@@ -94,4 +95,29 @@ test("skip-build export stays entirely in Node and promotes artifacts", (t) => {
     true,
   );
   assert.equal(existsSync(path.join(output, "SHA256SUMS.txt")), true);
+});
+
+test("build export requires approval before creating release output", (t) => {
+  const root = fixture(t);
+  const output = path.join(root, "output", "blocked");
+  const calls = [];
+  assert.throws(
+    () =>
+      runExport(
+        { releaseRoot: output, skipBuild: false, confirmBuild: true, help: false },
+        {
+          repoRoot: root,
+          resolveRoot: (_repo, requested) => requested,
+          run: (_executable, args) => {
+            calls.push(args);
+            return { status: 0 };
+          },
+          warn() {},
+          log() {},
+        },
+      ),
+    /explicit user approval/,
+  );
+  assert.equal(calls.length, 0);
+  assert.equal(existsSync(output), false);
 });

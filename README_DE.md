@@ -435,7 +435,7 @@ Laden Sie den neuesten Linux-Build von der Seite [Releases](../../releases) heru
 pnpm install
 
 # Entwicklungsmodus (Hot Reload)
-pnpm dev
+pnpm dev -- --confirm-build
 
 # Typprüfung
 pnpm typecheck
@@ -453,10 +453,10 @@ pnpm test:unit
 pnpm test:unit:watch
 
 # Anwendung bauen
-pnpm build
+pnpm build -- --confirm-build
 
 # Debug-Version bauen
-pnpm tauri build --debug
+pnpm tauri build --confirm-build --debug
 ```
 
 ### Entwicklung des Rust-Backends

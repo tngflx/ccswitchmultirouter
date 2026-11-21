@@ -79,7 +79,7 @@ jobs:
           set -euxo pipefail
           config="$(mktemp)"
           printf '{"bundle":{"createUpdaterArtifacts":false}}' > "$config"
-          pnpm tauri build --bundles appimage,deb,rpm --config "$config"
+          pnpm tauri build --confirm-build --bundles appimage,deb,rpm --config "$config"
           rm -f "$config"
 
       - name: Stage release assets
