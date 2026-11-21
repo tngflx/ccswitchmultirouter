@@ -367,7 +367,8 @@ fn copied_root_late_resume_marker_cannot_swallow_earlier_live_usage() -> Result<
 
 #[test]
 #[serial_test::serial]
-fn copied_root_rejects_deleted_changed_or_extra_non_token_history() -> Result<(), AppError> {
+fn copied_root_requires_boundaries_for_non_token_shape_changes_but_allows_rewrites(
+) -> Result<(), AppError> {
     for mutation in 0..3 {
         clear_codex_replay_caches();
         let dir = tempdir().unwrap();
@@ -378,16 +379,44 @@ fn copied_root_rejects_deleted_changed_or_extra_non_token_history() -> Result<()
         write_parent_records(&parent, &history);
         let mut values = child_before_marker(&history);
         match mutation {
-            0 => { values.remove(3); }
-            1 => { values[3]["payload"]["id"] = json!("fixture-different-message"); }
-            _ => values.insert(3, record("2026-07-10T03:00:05.500Z", "response_item", json!({
-                "type": "function_call", "call_id": "fixture-tool-call", "name": "fixture_tool", "arguments": "{}"
-            }))),
+            0 => {
+                values.remove(3);
+            }
+            1 => {
+                values[3]["payload"]["id"] = json!("fixture-different-message");
+            }
+            _ => {
+                values.insert(
+                    3,
+                    record(
+                        "2026-07-10T03:00:05.500Z",
+                        "response_item",
+                        json!({
+                            "type": "function_call",
+                            "call_id": "fixture-tool-call",
+                            "name": "fixture_tool",
+                            "arguments": "{}"
+                        }),
+                    ),
+                );
+            }
         }
         values.push(settings(json!(CHILD)));
         values.extend(live(true));
         write_child_records(&child, &values);
-        assert_unverified(&db, &child, &sync(&db, &child, &parent)?)?;
+        let result = sync(&db, &child, &parent)?;
+        if mutation == 1 {
+            // fc534's token-only proof permits a recorder rewrite of a
+            // non-accounting record when the explicit copied boundary remains
+            // physically coherent; the inherited token totals still match.
+            assert!(!result.deferred);
+            assert_eq!(result.imported, 1);
+            assert_eq!(rows(&db)?, vec![expected_live(2, 60)]);
+        } else {
+            // Deleting/inserting a record without updating the explicit own
+            // boundary is still unsafe and must remain deferred.
+            assert_unverified(&db, &child, &result)?;
+        }
     }
     Ok(())
 }
@@ -622,10 +651,21 @@ fn copied_root_test_reader_agrees_with_collector_on_live_and_unverified_history(
         assert_eq!(sync(&db, &child, &parent)?.imported, 1);
         assert_eq!(rows(&db)?, vec![expected_live(2, 60)]);
 
-        // Equal token totals cannot compensate for a changed non-token item.
-        values[3]["payload"]["id"] = json!("fixture-unverified-reader-message");
+        // Token-only proof permits a recorder rewrite of a non-accounting item
+        // as long as the explicit copied boundary and token totals remain valid.
+        values[3]["payload"]["id"] = json!("fixture-rewritten-reader-message");
         write_child_records(&child, &values);
-        assert!(read_verified_codex_rollout_usage(&child, &index)?.is_none());
+        let rewritten = read_verified_codex_rollout_usage(&child, &index)?
+            .expect("non-accounting rewrites must not invalidate token proof");
+        assert_eq!(rewritten.len(), 1);
+        assert_eq!(
+            (
+                rewritten[0].input_tokens,
+                rewritten[0].cached_input_tokens,
+                rewritten[0].output_tokens
+            ),
+            (60, 12, 6)
+        );
     }
     Ok(())
 }
@@ -963,7 +1003,8 @@ fn copied_root_uuid_context_does_not_replace_missing_ordinal_authority() -> Resu
 
 #[test]
 #[serial_test::serial]
-fn copied_root_contradictory_declared_or_physical_ordinals_stay_deferred() -> Result<(), AppError> {
+fn copied_root_invalid_ordinals_defer_but_a_valid_alternate_boundary_can_certify(
+) -> Result<(), AppError> {
     for contradiction in 0..4 {
         clear_codex_replay_caches();
         let dir = tempdir().unwrap();
@@ -982,9 +1023,18 @@ fn copied_root_contradictory_declared_or_physical_ordinals_stay_deferred() -> Re
         // Literal writer preserves the intended contradiction; never repair a
         // malformed ordinal fixture with the positive-fixture numberer.
         write_records(&child, &values);
-        assert_unverified(&db, &child, &sync(&db, &child, &parent)?)?;
-        let index = build_rollout_index(&[parent, child.clone()]);
-        assert!(read_verified_codex_rollout_usage(&child, &index)?.is_none());
+        let result = sync(&db, &child, &parent)?;
+        if contradiction == 1 {
+            // The independent fork boundary remains valid, so fc534's contract
+            // allows it to certify the same token prefix.
+            assert!(!result.deferred);
+            assert_eq!(result.imported, 1);
+            assert_eq!(rows(&db)?, vec![expected_live(2, 60)]);
+        } else {
+            assert_unverified(&db, &child, &result)?;
+            let index = build_rollout_index(&[parent, child.clone()]);
+            assert!(read_verified_codex_rollout_usage(&child, &index)?.is_none());
+        }
     }
     Ok(())
 }
