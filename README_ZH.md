@@ -438,7 +438,7 @@ paru -S cc-switch-bin
 pnpm install
 
 # 开发模式（热重载）
-pnpm dev
+pnpm dev -- --confirm-build
 
 # 类型检查
 pnpm typecheck
@@ -456,10 +456,10 @@ pnpm test:unit
 pnpm test:unit:watch
 
 # 构建应用
-pnpm build
+pnpm build -- --confirm-build
 
 # 构建调试版本
-pnpm tauri build --debug
+pnpm tauri build --confirm-build --debug
 ```
 
 ### Rust 后端开发

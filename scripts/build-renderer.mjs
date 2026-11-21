@@ -1,9 +1,20 @@
 import { checkRepositoryScriptPolicy } from "./no-powershell-scripts.mjs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  removeBuildApprovalFlag,
+  requireBuildApproval,
+} from "./build-approval.mjs";
 import { verifyCodexCatalog } from "./verify-codex-catalog.mjs";
 import { buildOwnerRemoteAssets } from "./build-owner-remote-assets.mjs";
 import { main as verifyResponsesContract } from "./check-openai-responses-contract.mjs";
+
+const buildArguments = process.argv.slice(2);
+requireBuildApproval({
+  args: buildArguments,
+  allowEnvironmentApproval: true,
+  operation: "the renderer build",
+});
 
 checkRepositoryScriptPolicy();
 
@@ -16,7 +27,7 @@ const result = spawnSync(
   [
     fileURLToPath(new URL("../node_modules/vite/bin/vite.js", import.meta.url)),
     "build",
-    ...process.argv.slice(2),
+    ...removeBuildApprovalFlag(buildArguments),
   ],
   { stdio: "inherit" },
 );

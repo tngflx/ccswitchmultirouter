@@ -435,7 +435,7 @@ paru -S cc-switch-bin
 pnpm install
 
 # ホットリロード付き開発モード
-pnpm dev
+pnpm dev -- --confirm-build
 
 # 型チェック
 pnpm typecheck
@@ -453,10 +453,10 @@ pnpm test:unit
 pnpm test:unit:watch
 
 # アプリをビルド
-pnpm build
+pnpm build -- --confirm-build
 
 # デバッグビルド
-pnpm tauri build --debug
+pnpm tauri build --confirm-build --debug
 ```
 
 ### Rust バックエンド開発

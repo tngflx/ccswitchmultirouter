@@ -88,6 +88,20 @@ fn take_codex_append_bytes_read(file: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
+thread_local! {
+    static CODEX_SNAPSHOT_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_codex_snapshot_test_hook(file_path: &Path) {
+    let hook = CODEX_SNAPSHOT_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(file_path);
+    }
+}
+
 #[derive(Debug)]
 struct CodexCheckpoint {
     source_path: String,
@@ -222,14 +236,25 @@ struct ParentFileStamp {
     file_id: [u8; 16],
 }
 
-impl ParentFileStamp {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParentFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
+}
+
+impl ParentFileIdentity {
     fn from_file(file: &fs::File) -> Option<Self> {
+        #[cfg(unix)]
         let metadata = file.metadata().ok()?;
         #[cfg(windows)]
         let (volume_serial, file_id) = windows_file_identity(file)?;
         Some(Self {
-            modified_nanos: metadata_modified_nanos(&metadata),
-            size: metadata.len(),
             #[cfg(unix)]
             device: metadata.dev(),
             #[cfg(unix)]
@@ -239,6 +264,53 @@ impl ParentFileStamp {
             #[cfg(windows)]
             file_id,
         })
+    }
+}
+
+impl ParentFileStamp {
+    fn from_file(file: &fs::File) -> Option<Self> {
+        let metadata = file.metadata().ok()?;
+        let identity = ParentFileIdentity::from_file(file)?;
+        Some(Self {
+            modified_nanos: metadata_modified_nanos(&metadata),
+            size: metadata.len(),
+            #[cfg(unix)]
+            device: identity.device,
+            #[cfg(unix)]
+            inode: identity.inode,
+            #[cfg(windows)]
+            volume_serial: identity.volume_serial,
+            #[cfg(windows)]
+            file_id: identity.file_id,
+        })
+    }
+
+    fn identity(&self) -> ParentFileIdentity {
+        ParentFileIdentity {
+            #[cfg(unix)]
+            device: self.device,
+            #[cfg(unix)]
+            inode: self.inode,
+            #[cfg(windows)]
+            volume_serial: self.volume_serial,
+            #[cfg(windows)]
+            file_id: self.file_id,
+        }
+    }
+
+    pub(super) fn same_identity(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+
+    /// Compare a stamp captured before a bounded read with a later stamp.
+    ///
+    /// An active rollout is allowed to grow while it is being parsed. A
+    /// shrink is always a replacement/truncation, and an equal-size mtime
+    /// change indicates an in-place rewrite that must be retried.
+    pub(super) fn same_identity_and_not_shrunk(&self, other: &Self) -> bool {
+        self.same_identity(other)
+            && other.size >= self.size
+            && (other.size > self.size || other.modified_nanos == self.modified_nanos)
     }
 }
 
@@ -1858,34 +1930,29 @@ fn parse_codex_incremental_line(
     }
 }
 
-/// Read one bounded file snapshot.  The caller captures size/mtime once and
-/// this reader is capped at that size, so a concurrent append is deliberately
-/// left for the next pass rather than being accidentally checkpointed.
+/// Read one bounded file snapshot. The opened handle captures the size/mtime
+/// boundary and this reader is capped at that size, so a concurrent append is
+/// deliberately left for the next pass rather than being accidentally
+/// checkpointed.
 fn parse_codex_snapshot(
     file_path: &Path,
     baseline: Option<CumulativeTokens>,
 ) -> Result<CodexParseSnapshot, AppError> {
-    let metadata = fs::metadata(file_path)
-        .map_err(|e| AppError::Config(format!("读取 Codex snapshot 元数据失败: {e}")))?;
-    let file_size = metadata.len() as i64;
-    let file_modified = metadata_modified_nanos(&metadata);
     let mut file = fs::File::open(file_path)
         .map_err(|e| AppError::Config(format!("打开 Codex snapshot 失败: {e}")))?;
     let file_stamp = ParentFileStamp::from_file(&file);
     let opened_metadata = file
         .metadata()
         .map_err(|e| AppError::Config(format!("读取 Codex snapshot handle 元数据失败: {e}")))?;
-    if opened_metadata.len() as i64 != file_size
-        || metadata_modified_nanos(&opened_metadata) != file_modified
-    {
-        return Err(AppError::Config(
-            "Codex snapshot 文件在打开时变化；下轮重试".to_string(),
-        ));
-    }
+    let file_size = opened_metadata.len() as i64;
+    let file_modified = metadata_modified_nanos(&opened_metadata);
     let head_window_len = codex_head_window_len(file_size);
     let head_fingerprint = codex_head_before(&mut file, head_window_len)?;
+    let initial_tail_fingerprint = codex_tail_before(&mut file, file_size)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|e| AppError::Config(format!("定位 Codex snapshot 失败: {e}")))?;
+    #[cfg(test)]
+    run_codex_snapshot_test_hook(file_path);
     let mut reader = BufReader::new(file.take(file_size.max(0) as u64));
     let mut state = CodexParserState::initial(thread_id_from_filename(file_path));
     state.total_high_water = baseline;
@@ -1912,11 +1979,13 @@ fn parse_codex_snapshot(
             }
         }
     }
-    if file_stamp.is_some() && ParentFileStamp::from_file(reader.get_ref().get_ref()) != file_stamp
-    {
-        return Err(AppError::Config(
-            "Codex snapshot 在解析期间变化；下轮重试".to_string(),
-        ));
+    let reader_stamp = ParentFileStamp::from_file(reader.get_ref().get_ref());
+    if let (Some(initial), Some(current)) = (file_stamp, reader_stamp) {
+        if !initial.same_identity_and_not_shrunk(&current) {
+            return Err(AppError::Config(
+                "Codex snapshot 在解析期间变化；下轮重试".to_string(),
+            ));
+        }
     }
     let parsed = ParsedCodexFile {
         root_thread_id: state.root_thread_id.clone(),
@@ -1931,9 +2000,24 @@ fn parse_codex_snapshot(
     };
     let mut fingerprint_file = fs::File::open(file_path)
         .map_err(|e| AppError::Config(format!("打开 Codex snapshot prefix 指纹失败: {e}")))?;
-    if file_stamp.is_some() && ParentFileStamp::from_file(&fingerprint_file) != file_stamp {
+    let fingerprint_stamp = ParentFileStamp::from_file(&fingerprint_file);
+    if let (Some(initial), Some(current)) = (file_stamp, fingerprint_stamp) {
+        if !initial.same_identity_and_not_shrunk(&current) {
+            return Err(AppError::Config(
+                "Codex snapshot 在指纹读取前被替换；下轮重试".to_string(),
+            ));
+        }
+    }
+    let current_head_fingerprint = codex_head_before(&mut fingerprint_file, head_window_len)?;
+    if current_head_fingerprint != head_fingerprint {
         return Err(AppError::Config(
-            "Codex snapshot 在指纹读取前被替换；下轮重试".to_string(),
+            "Codex snapshot 在解析期间前缀被替换；下轮重试".to_string(),
+        ));
+    }
+    let current_tail_fingerprint = codex_tail_before(&mut fingerprint_file, file_size)?;
+    if current_tail_fingerprint != initial_tail_fingerprint {
+        return Err(AppError::Config(
+            "Codex snapshot 在解析期间内容被改写；下轮重试".to_string(),
         ));
     }
     let tail_fingerprint = codex_tail_before(&mut fingerprint_file, complete_bytes)?;
@@ -1946,7 +2030,7 @@ fn parse_codex_snapshot(
         head_window_len,
         head_fingerprint,
         tail_fingerprint,
-        file_stamp,
+        file_stamp: fingerprint_stamp.or(file_stamp),
     })
 }
 
@@ -2453,6 +2537,13 @@ fn sync_codex_append(
 ) -> Result<CodexFileSyncResult, AppError> {
     let mut file = fs::File::open(file_path)
         .map_err(|e| AppError::Config(format!("无法打开 Codex append 文件: {e}")))?;
+    let initial_stamp = ParentFileStamp::from_file(&file);
+    let target_size = file_size.max(0) as u64;
+    if initial_stamp.is_some_and(|stamp| stamp.size < target_size) {
+        return Err(AppError::Config(
+            "Codex append 文件在读取前尚未达到目标 snapshot 大小；下轮重试".to_string(),
+        ));
+    }
     file.seek(SeekFrom::Start(checkpoint.last_byte_offset.max(0) as u64))
         .map_err(|e| AppError::Config(format!("定位 Codex append cursor 失败: {e}")))?;
     let remaining = file_size.saturating_sub(checkpoint.last_byte_offset).max(0) as u64;
@@ -2506,6 +2597,28 @@ fn sync_codex_append(
     }
     let mut committed_fingerprint_file = fs::File::open(file_path)
         .map_err(|e| AppError::Config(format!("打开 Codex append prefix 指纹失败: {e}")))?;
+    let current_stamp = ParentFileStamp::from_file(&committed_fingerprint_file);
+    if let (Some(initial), Some(current)) = (initial_stamp, current_stamp) {
+        if !initial.same_identity_and_not_shrunk(&current) || current.size < target_size {
+            return Err(AppError::Config(
+                "Codex append 在读取期间变化；下轮重试".to_string(),
+            ));
+        }
+    }
+    let current_head_fingerprint =
+        codex_head_before(&mut committed_fingerprint_file, head_window_len)?;
+    if current_head_fingerprint != head_fingerprint {
+        return Err(AppError::Config(
+            "Codex append 的固定前缀在读取期间被改写；下轮重试".to_string(),
+        ));
+    }
+    let old_checkpoint_tail =
+        codex_tail_before(&mut committed_fingerprint_file, checkpoint.last_byte_offset)?;
+    if checkpoint.tail_fingerprint != Some(old_checkpoint_tail) {
+        return Err(AppError::Config(
+            "Codex append 的历史前缀在读取期间被改写；下轮重试".to_string(),
+        ));
+    }
     let committed_tail_fingerprint = codex_tail_before(&mut committed_fingerprint_file, offset)?;
     let checkpoint_facts = CodexCheckpointFacts {
         file_size,
@@ -2583,8 +2696,8 @@ fn sync_single_codex_file(
     // 获取文件元数据
     let metadata = fs::metadata(file_path)
         .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
-    let file_modified = metadata_modified_nanos(&metadata);
-    let file_size = metadata.len();
+    let mut file_modified = metadata_modified_nanos(&metadata);
+    let mut file_size = metadata.len();
 
     // A checkpoint is authoritative only when the physical prefix still
     // matches. A same-size file whose head/tail fingerprints no longer match
@@ -2740,11 +2853,8 @@ fn sync_single_codex_file(
     }
 
     let preliminary = parse_codex_snapshot(file_path, None)?;
-    if preliminary.file_size != file_size as i64 || preliminary.file_modified != file_modified {
-        return Err(AppError::Config(
-            "Codex rollout 在读取 snapshot 期间变化；下轮重试".to_string(),
-        ));
-    }
+    file_modified = preliminary.file_modified;
+    file_size = preliminary.file_size.max(0) as u64;
     let continuation_baseline = if let Some(continuation) = preliminary.parsed.continuation.as_ref()
     {
         let source = read_continuation_source(file_path, None).ok();
@@ -2802,11 +2912,8 @@ fn sync_single_codex_file(
         None
     };
     let mut snapshot = parse_codex_snapshot(file_path, continuation_baseline)?;
-    if snapshot.file_size != file_size as i64 || snapshot.file_modified != file_modified {
-        return Err(AppError::Config(
-            "Codex rollout 在读取 snapshot 期间变化；下轮重试".to_string(),
-        ));
-    }
+    file_modified = snapshot.file_modified;
+    file_size = snapshot.file_size.max(0) as u64;
     let checkpoint_facts = snapshot.checkpoint_facts();
     let parsed = snapshot.parsed;
     // Parent ownership must be resolved even for a metadata-only initial
@@ -3118,6 +3225,7 @@ fn find_codex_pricing(conn: &rusqlite::Connection, model_id: &str) -> Option<Mod
 mod tests {
     use super::*;
     use crate::services::session_usage::get_sync_state;
+    use std::io::Write;
 
     #[test]
     fn exact_checkpoint_lookup_does_not_scan_aliases() -> Result<(), AppError> {
@@ -3534,6 +3642,89 @@ mod tests {
         assert!(std::str::from_utf8(partial).is_err());
         // The byte reader never calls the state machine for this un-terminated tail.
         assert_eq!(state.event_index, before);
+        Ok(())
+    }
+
+    #[test]
+    fn codex_snapshot_accepts_append_after_bounded_boundary_is_captured() -> Result<(), AppError> {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let file = rollout_path(temp.path(), PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count_at(10, 2, 3, "2026-09-14T00:00:01Z"),
+            ],
+        );
+        let initial_size = fs::metadata(&file).unwrap().len();
+        let appended = turn_context_at("2026-09-14T00:00:02Z").to_string() + "\n";
+        CODEX_SNAPSHOT_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .unwrap()
+                    .write_all(appended.as_bytes())
+                    .unwrap();
+            }));
+        });
+
+        let snapshot = parse_codex_snapshot(&file, None)?;
+
+        assert_eq!(snapshot.file_size, initial_size as i64);
+        assert_eq!(snapshot.complete_bytes, initial_size as i64);
+        assert!(snapshot
+            .file_stamp
+            .is_some_and(|stamp| stamp.size > initial_size));
+        assert_eq!(snapshot.parsed.line_offset, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn codex_snapshot_rejects_same_size_rewrite_with_preserved_mtime() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().unwrap();
+        let file = rollout_path(temp.path(), PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count_at(10, 2, 3, "2026-09-14T00:00:01Z"),
+            ],
+        );
+        let original_metadata = fs::metadata(&file).unwrap();
+        let original_mtime = original_metadata.modified().unwrap();
+        let original = fs::read_to_string(&file).unwrap();
+        let rewritten = original.replace("gpt-5.6-sol", "gpt-5.6-sun");
+        assert_eq!(rewritten.len(), original.len());
+        let mut rewrite_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file)
+            .unwrap();
+        CODEX_SNAPSHOT_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |_path| {
+                rewrite_file.seek(SeekFrom::Start(0)).unwrap();
+                rewrite_file.set_len(0).unwrap();
+                rewrite_file.write_all(rewritten.as_bytes()).unwrap();
+                rewrite_file.flush().unwrap();
+                rewrite_file
+                    .set_times(fs::FileTimes::new().set_modified(original_mtime))
+                    .unwrap();
+            }));
+        });
+
+        let error = parse_codex_snapshot(&file, None).unwrap_err();
+        let AppError::Config(reason) = error else {
+            panic!("expected a configuration error for a rewritten snapshot");
+        };
+        assert!(
+            reason.contains("前缀被替换") || reason.contains("内容被改写"),
+            "unexpected rewrite error: {reason}"
+        );
         Ok(())
     }
 
@@ -5387,6 +5578,8 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn test_parent_file_stamp_distinguishes_same_size_same_mtime_files() {
+        use std::io::Write;
+
         let temp = tempdir().unwrap();
         let parent = rollout_path(temp.path(), PARENT_ID);
         let replacement = temp.path().join("replacement.jsonl");
@@ -5409,6 +5602,21 @@ mod tests {
             (replacement_stamp.size, replacement_stamp.modified_nanos)
         );
         assert_ne!(original_stamp, replacement_stamp);
+
+        let mut append_file = fs::OpenOptions::new().append(true).open(&parent).unwrap();
+        append_file.write_all(b"{\"future\":true}\n").unwrap();
+        let grown_stamp = ParentFileStamp::from_file(&append_file).unwrap();
+        assert!(original_stamp.same_identity(&grown_stamp));
+        assert!(original_stamp.same_identity_and_not_shrunk(&grown_stamp));
+        assert!(!original_stamp.same_identity_and_not_shrunk(&replacement_stamp));
+
+        drop(append_file);
+        let truncating_file = fs::OpenOptions::new().write(true).open(&parent).unwrap();
+        truncating_file
+            .set_len(original_stamp.size.saturating_sub(1))
+            .unwrap();
+        let shrunk_stamp = ParentFileStamp::from_file(&truncating_file).unwrap();
+        assert!(!original_stamp.same_identity_and_not_shrunk(&shrunk_stamp));
     }
 
     #[test]

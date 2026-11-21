@@ -5,7 +5,7 @@
 //! itself proves which token records were inherited. Even a matching prefix
 //! can include genuine live work from an old fork before its first resume
 //! marker. This module requires an explicit, validated snapshot ordinal
-//! boundary AND complete equality against an anchored parent prefix.
+//! boundary and exact matching for any inherited token usage records.
 
 use super::{
     explicit_parent_from_meta, leading_thread_id_from_filename, parse_timestamp,
@@ -100,24 +100,37 @@ fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, &'static str>
     Ok(Some(record))
 }
 
-fn same_persisted_record(mut child: Value, mut parent: Value) -> bool {
-    // Preserve every payload field and every unknown outer field. Only these
-    // two recorder-owned envelope fields are intentionally rewritten on copy.
-    for record in [&mut child, &mut parent] {
-        let Some(object) = record.as_object_mut() else {
+fn token_usage_signature(record: &Value) -> Option<&Value> {
+    (record.get("type").and_then(Value::as_str) == Some("event_msg")
+        && record.pointer("/payload/type").and_then(Value::as_str) == Some("token_count"))
+    .then(|| record.pointer("/payload/info/total_token_usage"))
+    .flatten()
+}
+
+/// Codex may replay, omit, or add non-accounting records while materializing a
+/// fork. Token usage records are the boundary where content must remain exact.
+/// Their cumulative totals must occur in the parent history in order. A
+/// rewritten total defers the proof instead of risking double-counting.
+fn token_usage_subsequence(child: &[Value], parent: &[Value]) -> bool {
+    let child_tokens = child.iter().filter_map(token_usage_signature);
+    let mut parent_tokens = parent.iter().filter_map(token_usage_signature);
+    for child_token in child_tokens {
+        if !parent_tokens.any(|parent_token| parent_token == child_token) {
             return false;
-        };
-        object.remove("timestamp");
-        object.remove("ordinal");
+        }
     }
-    child == parent
+    true
+}
+
+fn stamp_unchanged_or_grew(current: ParentFileStamp, expected: ParentFileStamp) -> bool {
+    expected.same_identity_and_not_shrunk(&current)
 }
 
 fn path_still_names(path: &Path, expected: ParentFileStamp) -> bool {
     File::open(path)
         .ok()
         .and_then(|file| ParentFileStamp::from_file(&file))
-        == Some(expected)
+        .is_some_and(|current| stamp_unchanged_or_grew(current, expected))
 }
 
 fn inspect_child(
@@ -245,58 +258,17 @@ fn compare_parent(
     let mut child = File::open(child_path).map_err(|_| "fork 复制验证无法重开 child rollout")?;
     let child_before =
         ParentFileStamp::from_file(&child).ok_or("fork 复制验证无法保留 child rollout 文件身份")?;
-    if child_before != expected_child_stamp {
+    if !stamp_unchanged_or_grew(child_before, expected_child_stamp) {
         return Err("fork child 重开后的文件代际与已解析快照不一致；下轮重试");
     }
     let mut child_reader = BufReader::new((&mut child).take(complete_bytes));
-    let mut parent_reader = BufReader::new(&mut parent);
     read_record(&mut child_reader)?.ok_or("fork child 首条记录在验证期间消失")?;
-    let mut last_parent_ordinal = None;
-    for offset in 0..boundary.copied_records {
-        let child_record =
-            read_record(&mut child_reader)?.ok_or("fork child 复制前缀在验证期间缩短")?;
-        let parent_record =
-            read_record(&mut parent_reader)?.ok_or("fork 父 rollout 尚未发布完整的复制前缀")?;
-        if offset == 0 {
-            let parent_string = parent_id.hyphenated().to_string();
-            if meta_id(&parent_record) != Some(parent_id)
-                || (thread_id_from_filename(parent_path).as_deref() != Some(parent_string.as_str())
-                    && leading_thread_id_from_filename(parent_path).as_deref()
-                        != Some(parent_string.as_str()))
-            {
-                return Err("fork 父 rollout 的 canonical session_meta/文件身份不一致");
-            }
-            match explicit_parent_from_meta(
-                parent_record
-                    .get("payload")
-                    .ok_or("fork 父 session_meta 缺少 payload")?,
-            ) {
-                ParentResolution::None => {}
-                ParentResolution::Parent(ancestor) => {
-                    let ancestor = uuid::Uuid::parse_str(&ancestor)
-                        .map_err(|_| "fork 父 session_meta 含无效的显式 lineage UUID")?;
-                    if ancestor == parent_id || ancestor == child_id {
-                        return Err("fork 父 session_meta 的显式 lineage 存在直接环");
-                    }
-                }
-                ParentResolution::Deferred(_) => {
-                    return Err("fork 父 session_meta 的显式 lineage 不一致");
-                }
-            }
-            if parent_record
-                .pointer("/payload/history_base")
-                .is_some_and(|value| !value.is_null())
-            {
-                return Err("fork 父 rollout 含引用历史，不能推断为完整物理复制前缀");
-            }
-        }
-        last_parent_ordinal = parent_record.get("ordinal").and_then(Value::as_u64);
-        if boundary.parent_ordinal_end.is_some() && last_parent_ordinal != Some(offset) {
-            return Err("fork 父复制前缀 ordinal 不连续或缺失");
-        }
-        if !same_persisted_record(child_record, parent_record) {
-            return Err("fork 完整复制前缀与父 rollout 不一致；不能按 token 相似度推断继承");
-        }
+    let mut child_prefix = Vec::with_capacity(
+        usize::try_from(boundary.copied_records).map_err(|_| "fork child 复制前缀过大")?,
+    );
+    for _ in 0..boundary.copied_records {
+        child_prefix
+            .push(read_record(&mut child_reader)?.ok_or("fork child 复制前缀在验证期间缩短")?);
     }
     let marker = read_record(&mut child_reader)?.ok_or("fork child own-settings 边界消失")?;
     if !own_settings(&marker, child_id) {
@@ -308,16 +280,74 @@ fn compare_parent(
     {
         return Err("fork child own-settings ordinal 在验证期间变化");
     }
-    if boundary.parent_ordinal_end.is_some_and(|expected| {
-        last_parent_ordinal.and_then(|value| value.checked_add(1)) != Some(expected)
-    }) {
-        return Err("fork 复制前缀不符合声明的 parent ordinal 边界");
+    let mut parent_reader = BufReader::new(&mut parent);
+    let mut parent_records = Vec::new();
+    while let Some(record) = read_record(&mut parent_reader)? {
+        parent_records.push(record);
+    }
+    let parent_root = parent_records
+        .first()
+        .ok_or("fork 父 rollout 缺少 canonical session_meta")?;
+    let parent_string = parent_id.hyphenated().to_string();
+    if meta_id(parent_root) != Some(parent_id)
+        || (thread_id_from_filename(parent_path).as_deref() != Some(parent_string.as_str())
+            && leading_thread_id_from_filename(parent_path).as_deref()
+                != Some(parent_string.as_str()))
+    {
+        return Err("fork 父 rollout 的 canonical session_meta/文件身份不一致");
+    }
+    match explicit_parent_from_meta(
+        parent_root
+            .get("payload")
+            .ok_or("fork 父 session_meta 缺少 payload")?,
+    ) {
+        ParentResolution::None => {}
+        ParentResolution::Parent(ancestor) => {
+            let ancestor = uuid::Uuid::parse_str(&ancestor)
+                .map_err(|_| "fork 父 session_meta 含无效的显式 lineage UUID")?;
+            if ancestor == parent_id || ancestor == child_id {
+                return Err("fork 父 session_meta 的显式 lineage 存在直接环");
+            }
+        }
+        ParentResolution::Deferred(_) => {
+            return Err("fork 父 session_meta 的显式 lineage 不一致");
+        }
+    }
+    if parent_root
+        .pointer("/payload/history_base")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err("fork 父 rollout 含引用历史，不能推断为完整物理复制前缀");
+    }
+
+    if child_prefix
+        .first()
+        .is_none_or(|record| meta_id(record) != Some(parent_id))
+        || !token_usage_subsequence(&child_prefix, &parent_records)
+    {
+        return Err("fork 复制前缀含无法与 parent 对齐的 token usage；下轮重试");
+    }
+    if let Some(expected) = boundary.parent_ordinal_end {
+        let expected = usize::try_from(expected).map_err(|_| "fork 父复制前缀 ordinal 边界过大")?;
+        if parent_records.len() < expected
+            || parent_records
+                .iter()
+                .take(expected)
+                .enumerate()
+                .any(|(offset, record)| {
+                    record.get("ordinal").and_then(Value::as_u64) != Some(offset as u64)
+                })
+        {
+            return Err("fork 父复制前缀 ordinal 不连续或缺失");
+        }
     }
     drop(parent_reader);
     drop(child_reader);
-    if ParentFileStamp::from_file(&parent) != Some(before)
+    if !ParentFileStamp::from_file(&parent)
+        .is_some_and(|current| stamp_unchanged_or_grew(current, before))
         || !path_still_names(parent_path, before)
-        || ParentFileStamp::from_file(&child) != Some(child_before)
+        || !ParentFileStamp::from_file(&child)
+            .is_some_and(|current| stamp_unchanged_or_grew(current, child_before))
         || !path_still_names(child_path, child_before)
     {
         return Err("fork rollout 在复制前缀验证期间变化；下轮重试");
@@ -357,7 +387,8 @@ pub(super) fn certify_copied_rollout(
     let Some(child_before) = ParentFileStamp::from_file(&child) else {
         return Ok(deferred("fork 复制验证无法保留 child rollout 文件身份"));
     };
-    if expected_child_stamp != Some(child_before) {
+    if !expected_child_stamp.is_some_and(|expected| stamp_unchanged_or_grew(child_before, expected))
+    {
         return Ok(deferred(
             "fork child 文件代际与已解析快照不一致或快照身份缺失；下轮重试",
         ));
@@ -368,7 +399,8 @@ pub(super) fn certify_copied_rollout(
     let boundary = match inspect_child(&mut child, complete_bytes, child_id, parent_id) {
         Ok(Some(boundary)) => boundary,
         Ok(None) => {
-            if ParentFileStamp::from_file(&child) != Some(child_before)
+            if !ParentFileStamp::from_file(&child)
+                .is_some_and(|current| stamp_unchanged_or_grew(current, child_before))
                 || !path_still_names(child_path, child_before)
             {
                 return Ok(deferred("fork child 在复制前缀验证期间变化；下轮重试"));
@@ -384,8 +416,10 @@ pub(super) fn certify_copied_rollout(
     else {
         return Ok(deferred("fork 复制前缀缺少可验证的父 rollout"));
     };
+    let mut matching_parent = false;
+    let mut last_reason = None;
     for candidate in candidates {
-        if let Err(reason) = compare_parent(
+        match compare_parent(
             child_path,
             complete_bytes,
             child_before,
@@ -394,10 +428,20 @@ pub(super) fn certify_copied_rollout(
             parent_id,
             &boundary,
         ) {
-            return Ok(deferred(reason));
+            Ok(()) => {
+                matching_parent = true;
+                break;
+            }
+            Err(reason) => last_reason = Some(reason),
         }
     }
-    if ParentFileStamp::from_file(&child) != Some(child_before)
+    if !matching_parent {
+        return Ok(deferred(
+            last_reason.unwrap_or("fork 复制前缀缺少匹配的父 rollout"),
+        ));
+    }
+    if !ParentFileStamp::from_file(&child)
+        .is_some_and(|current| stamp_unchanged_or_grew(current, child_before))
         || !path_still_names(child_path, child_before)
     {
         return Ok(deferred("fork child 在复制前缀验证期间变化；下轮重试"));
@@ -413,6 +457,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+    use std::io::Write;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -470,7 +515,7 @@ mod tests {
         let mut root = meta(CHILD, Some(PARENT));
         root["ordinal"] = json!(0);
         root["payload"]["subagent_history_start_ordinal"] = json!(copied_records + 1);
-        root["payload"]["forked_from_ordinal_exclusive"] = json!(copied_records);
+        root["payload"]["forked_from_ordinal_exclusive"] = json!(parent_records.len());
         let mut records = vec![root];
         for (offset, record) in child_prefix.iter().enumerate() {
             let mut record = record.clone();
@@ -536,6 +581,159 @@ mod tests {
             proof(&child, &index),
             CopiedForkProof::Verified { first_live_line: 5 }
         );
+    }
+
+    #[test]
+    fn complete_parent_prefix_survives_child_growth_after_snapshot() {
+        let parent = vec![meta(PARENT, None), token()];
+        let copied = parent
+            .iter()
+            .cloned()
+            .map(|mut record| {
+                record["timestamp"] = json!("2026-10-21T00:00:00Z");
+                record
+            })
+            .collect::<Vec<_>>();
+        let (_directory, child, index) = fixture(&parent, &copied);
+        let expected = ParentFileStamp::from_file(&File::open(&child).unwrap()).unwrap();
+        let complete_bytes = expected.size as i64;
+        let mut append = fs::OpenOptions::new().append(true).open(&child).unwrap();
+        append.write_all(b"{\"future\":true}\n").unwrap();
+        let result = certify_copied_rollout(
+            &child,
+            complete_bytes,
+            CHILD,
+            PARENT,
+            &index,
+            Some(expected),
+        )
+        .unwrap();
+        assert_eq!(result, CopiedForkProof::Verified { first_live_line: 5 });
+    }
+
+    #[test]
+    fn replayed_prefix_without_token_usage_accepts_codex_rewrites() {
+        let parent = vec![
+            meta(PARENT, None),
+            json!({
+                "timestamp": "2026-10-20T00:00:02Z",
+                "type": "compacted",
+                "payload": { "compaction_response_id": "resp_parent" }
+            }),
+            json!({
+                "timestamp": "2026-10-20T00:00:03Z",
+                "type": "world_state",
+                "payload": { "state": { "cwd": "D:\\repos\\parent" } }
+            }),
+        ];
+        let replayed = vec![
+            meta(PARENT, None),
+            json!({
+                "timestamp": "2026-10-21T00:00:02Z",
+                "type": "compacted",
+                "payload": { "compaction_response_id": "resp_rewritten" }
+            }),
+            json!({
+                "timestamp": "2026-10-21T00:00:03Z",
+                "type": "world_state",
+                "payload": { "state": { "cwd": "D:\\repos\\child" } }
+            }),
+        ];
+        let (_directory, child, index) = fixture(&parent, &replayed);
+        assert_eq!(
+            proof(&child, &index),
+            CopiedForkProof::Verified { first_live_line: 6 }
+        );
+    }
+
+    #[test]
+    fn replayed_prefix_accepts_child_only_non_accounting_records() {
+        let parent = vec![
+            meta(PARENT, None),
+            json!({
+                "timestamp": "2026-10-20T00:00:02Z",
+                "type": "compacted",
+                "payload": { "compaction_response_id": "resp_parent" }
+            }),
+        ];
+        let replayed = vec![
+            meta(PARENT, None),
+            json!({
+                "timestamp": "2026-10-21T00:00:02Z",
+                "type": "compacted",
+                "payload": { "compaction_response_id": "resp_rewritten" }
+            }),
+            json!({
+                "timestamp": "2026-10-21T00:00:03Z",
+                "type": "event_msg",
+                "payload": { "type": "turn_aborted", "reason": "harness" }
+            }),
+            json!({
+                "timestamp": "2026-10-21T00:00:04Z",
+                "type": "response_item",
+                "payload": { "type": "message", "role": "developer" }
+            }),
+        ];
+        let (_directory, child, index) = fixture(&parent, &replayed);
+        assert_eq!(
+            proof(&child, &index),
+            CopiedForkProof::Verified { first_live_line: 7 }
+        );
+    }
+
+    #[test]
+    fn proof_accepts_a_matching_parent_candidate_after_a_stale_rollout() {
+        let parent = vec![meta(PARENT, None), token()];
+        let (directory, child, mut index) = fixture(&parent, &parent);
+        let stale = directory
+            .path()
+            .join(format!("rollout-stale-{PARENT}.jsonl"));
+        let mut stale_records = parent.clone();
+        for (ordinal, record) in stale_records.iter_mut().enumerate() {
+            record["ordinal"] = json!(ordinal);
+        }
+        stale_records[1]["payload"]["info"]["total_token_usage"]["output_tokens"] = json!(999);
+        write(&stale, &stale_records);
+        index.get_mut(PARENT).unwrap().insert(0, stale);
+
+        assert_eq!(
+            proof(&child, &index),
+            CopiedForkProof::Verified { first_live_line: 5 }
+        );
+    }
+
+    #[test]
+    fn transformed_token_count_cannot_certify_inherited_usage() {
+        let parent = vec![meta(PARENT, None), token()];
+        let (_directory, child, index) = fixture(&parent, &parent);
+        rewrite(&child, |records| {
+            records[2]["payload"]["info"]["total_token_usage"]["output_tokens"] = json!(999);
+        });
+        assert!(matches!(
+            proof(&child, &index),
+            CopiedForkProof::Deferred(_)
+        ));
+    }
+
+    #[test]
+    fn short_parent_cannot_satisfy_declared_ordinal_boundary() {
+        let parent = vec![meta(PARENT, None)];
+        let copied = vec![
+            meta(PARENT, None),
+            json!({
+                "timestamp": "2026-10-20T00:00:02Z",
+                "type": "compacted",
+                "payload": { "compaction_response_id": "resp_rewritten" }
+            }),
+        ];
+        let (_directory, child, index) = fixture(&parent, &copied);
+        rewrite(&child, |records| {
+            records[0]["payload"]["forked_from_ordinal_exclusive"] = json!(3);
+        });
+        assert!(matches!(
+            proof(&child, &index),
+            CopiedForkProof::Deferred(_)
+        ));
     }
 
     #[test]
