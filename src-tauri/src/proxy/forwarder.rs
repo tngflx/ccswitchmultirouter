@@ -709,19 +709,12 @@ impl RequestForwarder {
                 )
             })?;
         Ok(router.and_then(|router| {
-            let parent_requests_max = self
-                .router
-                .codex_parent_turn_efforts
-                .parent_requests_max(router_id, headers, body);
-            super::codex_subagent_reasoning::apply_subagent_reasoning_effort_with_parent(
-                // The parent lineage can promote the default High child policy
-                // to native Max when the exact parent turn requested Max/Ultra.
+            super::codex_subagent_reasoning::apply_subagent_reasoning_effort(
                 &router.settings_config,
                 provider,
                 headers,
                 body,
                 endpoint,
-                parent_requests_max,
             )
         }))
     }
@@ -3623,17 +3616,6 @@ impl RequestForwarder {
             codex_responses_to_chat.then(|| summarize_codex_chat_request_shape(&filtered_body));
         let hosted_chat_tool_projection =
             codex_responses_to_chat.then(|| summarize_hosted_chat_tool_projection(&filtered_body));
-        if matches!(app_type, AppType::Codex)
-            && super::codex_subagent_reasoning::is_generation_endpoint(endpoint)
-        {
-            let (router_id, _) = super::providers::codex_route_persistent_provider(provider);
-            self.router.codex_parent_turn_efforts.observe_request(
-                router_id,
-                headers,
-                body,
-                subagent_reasoning_override.or(restored_desktop_effort),
-            );
-        }
         if let Some(trace_id) = codex_trace_id.as_deref() {
             let mut fields = vec![
                 ("trace", trace_id.to_string()),
@@ -11505,7 +11487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subagent_reasoning_effort_native_responses_inherits_parent_max_for_sublyx_alias() {
+    async fn subagent_reasoning_effort_native_responses_follows_saved_policy_with_max_parent() {
         for incoming_effort in ["max", "ultra"] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -11596,7 +11578,6 @@ mod tests {
             assert_eq!(sent["reasoning"]["effort"], "max", "{incoming_effort}");
 
             let mut child = body.clone();
-            child["reasoning"]["effort"] = json!("low");
             child["client_metadata"] = json!({
                 "x-codex-installation-id": "installation",
                 "x-codex-parent-thread-id": "parent",
@@ -11605,9 +11586,21 @@ mod tests {
                 "turn_id": "child-turn",
                 "x-openai-subagent": "collab_spawn",
             });
-            for (selection, expected) in [("high", "max"), ("max", "max"), ("profile", "low")] {
-                router.settings_config["codexRouting"]["subagentReasoningEffort"] =
-                    json!(selection);
+            for (selection, child_effort, expected) in [
+                (Some("high"), "max", "high"),
+                (None, "max", "high"),
+                (Some("max"), "low", "max"),
+                (Some("profile"), "low", "low"),
+            ] {
+                let routing = router.settings_config["codexRouting"]
+                    .as_object_mut()
+                    .unwrap();
+                if let Some(selection) = selection {
+                    routing.insert("subagentReasoningEffort".into(), json!(selection));
+                } else {
+                    routing.remove("subagentReasoningEffort");
+                }
+                child["reasoning"]["effort"] = json!(child_effort);
                 forwarder
                     .router
                     .database()
@@ -11634,7 +11627,7 @@ mod tests {
                 let sent: Value = serde_json::from_slice(&bytes).expect("outgoing child JSON");
                 assert_eq!(
                     sent["reasoning"]["effort"], expected,
-                    "{incoming_effort}/{selection}"
+                    "parent={incoming_effort}, child={child_effort}, selection={selection:?}"
                 );
             }
         }
