@@ -2735,9 +2735,11 @@ mod tests {
         for model in [
             "gpt-6-sol",
             "gpt-6-luna",
+            "gpt-6.2-astra",
             "gpt-6.2-sol",
             "GPT-6-SOL",
             "GPT-6-LUNA",
+            "GPT-6.2-ASTRA",
             "GPT-6.2-SOL",
         ] {
             for oauth in [false, true] {

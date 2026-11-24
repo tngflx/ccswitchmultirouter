@@ -75,6 +75,8 @@ pub use claude::{
     ClaudeAdapter,
 };
 pub use codex::CodexAdapter;
+#[cfg(test)]
+pub(crate) use codex::CODEX_MODEL_RESOLUTION_INPUT;
 pub(crate) use codex::{
     adapt_codex_reasoning_projection_for_desktop, apply_codex_native_chat_reasoning,
     apply_detected_codex_transport_to_effective_provider, codex_provider_remote_compaction_enabled,
@@ -100,9 +102,10 @@ pub use codex::{
     provider_needs_responses_namespace_flatten, resolve_codex_cache_config,
     resolve_codex_catalog_tool_profile, resolve_codex_chat_reasoning_config,
     resolve_codex_model_routed_provider, resolve_codex_model_routed_providers,
-    resolve_codex_v2_raw_passthrough_provider, resolve_codex_v2_routed_provider,
-    should_convert_codex_responses_to_anthropic, should_convert_codex_responses_to_chat,
-    should_convert_codex_responses_to_messages, CodexMultiRouterAuthFacade, ResolvedCodexRoute,
+    resolve_codex_upstream_model, resolve_codex_v2_raw_passthrough_provider,
+    resolve_codex_v2_routed_provider, should_convert_codex_responses_to_anthropic,
+    should_convert_codex_responses_to_chat, should_convert_codex_responses_to_messages,
+    CodexMultiRouterAuthFacade, ResolvedCodexRoute,
 };
 // These names are an intentionally dormant compatibility surface. Production
 // request preparation remains owned by HistoryReplay.

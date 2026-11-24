@@ -70,12 +70,12 @@ beforeEach(() => {
 describe("useDeleteProviderMutation", () => {
   it("删除 Codex 供应商交给后端 SSOT coordinator 做级联", async () => {
     const { wrapper } = createWrapper();
-    const { result } = renderHook(() => useDeleteProviderMutation("codex"), {
+    const { result } = renderHook(useDeleteProviderMutation, {
       wrapper,
     });
 
     await act(async () => {
-      await result.current.mutateAsync("beta");
+      await result.current.mutateAsync({ appId: "codex", providerId: "beta" });
     });
 
     expect(apiMocks.delete).toHaveBeenCalledWith("beta", "codex");
@@ -85,12 +85,15 @@ describe("useDeleteProviderMutation", () => {
 
   it("非 Codex 应用删除供应商不触发 MultiRouter 同步", async () => {
     const { wrapper } = createWrapper();
-    const { result } = renderHook(() => useDeleteProviderMutation("claude"), {
+    const { result } = renderHook(useDeleteProviderMutation, {
       wrapper,
     });
 
     await act(async () => {
-      await result.current.mutateAsync("provider-1");
+      await result.current.mutateAsync({
+        appId: "claude",
+        providerId: "provider-1",
+      });
     });
 
     expect(apiMocks.delete).toHaveBeenCalledWith("provider-1", "claude");

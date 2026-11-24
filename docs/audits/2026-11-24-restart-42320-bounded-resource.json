@@ -1,0 +1,353 @@
+{
+  "SchemaVersion": 1,
+  "ClientTimezone": "Asia/Singapore",
+  "StartedAtUtc": "2026-11-23T18:52:22.2773857+00:00",
+  "EndedAtUtc": "2026-11-23T18:53:23.6622218+00:00",
+  "TargetPid": 42320,
+  "TargetExecutable": "H:\\repos\\ccswitchmulti-refork\\src-tauri\\target\\debug\\cc-switch.exe",
+  "TargetStartedAtUtc": "2026-11-23T18:05:50.2287594Z",
+  "LogicalProcessors": 16,
+  "DurationSeconds": 60.169,
+  "SampleCount": 13,
+  "RootCpuSeconds": 109.234375,
+  "TreeCpuSeconds": 109.234375,
+  "RootCpuPercentOneCore": 181.5459372766707,
+  "RootCpuPercentMachine": 11.34662107979192,
+  "TreeCpuPercentOneCore": 181.5459372766707,
+  "TreeCpuPercentMachine": 11.34662107979192,
+  "PeakTreeCpuPercentMachine": 22.006253583715598,
+  "TreeWorkingSetMiBStart": 201,
+  "TreeWorkingSetMiBEnd": 213.26,
+  "TreePrivateMiBStart": 138.57,
+  "TreePrivateMiBEnd": 151.89,
+  "PeakTreeWorkingSetMiB": 220.43,
+  "PeakTreePrivateMiB": 158.71,
+  "ScopedParentProcessQueryCount": 41,
+  "ConfiguredBackgroundMonitorAvailable": false,
+  "AppBuildRestartInstallOrReplacement": false,
+  "SourceEditsOrTestsDuringMeasurement": false,
+  "Caveats": [
+    "Read-only target-PID counters and parent-filtered descendant discovery, not native stack attribution.",
+    "No app workload was generated; external workload is uncontrolled.",
+    "A child exiting between snapshots may have unobserved final CPU.",
+    "Working sets include shared pages and are not a leak proof.",
+    "PowerShell-derived aggregate/interval arithmetic was discarded and recomputed from raw CPU snapshots."
+  ],
+  "Samples": [
+    {
+      "ObservedAtUtc": "2026-11-23T18:52:23.5118545+00:00",
+      "ElapsedSeconds": 1.196,
+      "IntervalSeconds": 1.196,
+      "RootIntervalCpuSeconds": 0,
+      "TreeIntervalCpuSeconds": 0,
+      "RootCpuPercentOneCore": null,
+      "RootCpuPercentMachine": null,
+      "TreeCpuPercentOneCore": null,
+      "TreeCpuPercentMachine": null,
+      "TreeWorkingSetMiB": 201,
+      "TreePrivateMiB": 138.57,
+      "Processes": [
+        {
+          "Pid": 42320,
+          "ParentPid": null,
+          "Name": "cc-switch",
+          "CpuSeconds": 482.421875,
+          "IntervalCpuSeconds": null,
+          "WorkingSetMiB": 201,
+          "PrivateMiB": 138.57
+        }
+      ]
+    },
+    {
+      "ObservedAtUtc": "2026-11-23T18:52:27.3326113+00:00",
+      "ElapsedSeconds": 5.032,
+      "IntervalSeconds": 3.836,
+      "RootIntervalCpuSeconds": 11.5,
+      "TreeIntervalCpuSeconds": 11.5,
+      "RootCpuPercentOneCore": 299.79144942648594,
+      "RootCpuPercentMachine": 18.73696558915537,
+      "TreeCpuPercentOneCore": 299.79144942648594,
+      "TreeCpuPercentMachine": 18.73696558915537,
+      "TreeWorkingSetMiB": 188.66,
+      "TreePrivateMiB": 124.64,
+      "Processes": [
+        {
+          "Pid": 42320,
+          "ParentPid": null,
+          "Name": "cc-switch",
+          "CpuSeconds": 493.921875,
+          "IntervalCpuSeconds": 11.5,
+          "WorkingSetMiB": 188.66,
+          "PrivateMiB": 124.64
+        }
+      ]
+    },
+    {
+      "ObservedAtUtc": "2026-11-23T18:52:32.2922796+00:00",
+      "ElapsedSeconds": 10.001,
+      "IntervalSeconds": 4.969,
+      "RootIntervalCpuSeconds": 8.171875,
+      "TreeIntervalCpuSeconds": 8.171875,
+      "RootCpuPercentOneCore": 164.45713423223987,
+      "RootCpuPercentMachine": 10.278570889514992,
+      "TreeCpuPercentOneCore": 164.45713423223987,
+      "TreeCpuPercentMachine": 10.278570889514992,
+      "TreeWorkingSetMiB": 205.77,
+      "TreePrivateMiB": 142.19,
+      "Processes": [
+        {
+          "Pid": 42320,
+          "ParentPid": null,
+          "Name": "cc-switch",
+          "CpuSeconds": 502.09375,
+          "IntervalCpuSeconds": 8.171875,
+          "WorkingSetMiB": 205.77,
+          "PrivateMiB": 142.19
+        }
+      ]
+    },
+    {
+      "ObservedAtUtc": "2026-11-23T18:52:38.8145006+00:00",
+      "ElapsedSeconds": 16.524,
+      "IntervalSeconds": 6.523,
+      "RootIntervalCpuSeconds": 15.375,
+      "TreeIntervalCpuSeconds": 15.375,
+      "RootCpuPercentOneCore": 235.7044304767745,
+      "RootCpuPercentMachine": 14.731526904798406,
+      "TreeCpuPercentOneCore": 235.7044304767745,
+      "TreeCpuPercentMachine": 14.731526904798406,
+      "TreeWorkingSetMiB": 220.43,
+      "TreePrivateMiB": 158.71,
+      "Processes": [
+        {
+          "Pid": 42320,
+          "ParentPid": null,
+          "Name": "cc-switch",
+          "CpuSeconds": 517.46875,
+          "IntervalCpuSeconds": 15.375,
+          "WorkingSetMiB": 220.43,
+          "PrivateMiB": 158.71
+        }
+      ]
+    },
+    {
+      "ObservedAtUtc": "2026-11-23T18:52:42.3015254+00:00",
+      "ElapsedSeconds": 20.011,
+      "IntervalSeconds": 3.488,
+      "RootIntervalCpuSeconds": 12.28125,
+      "TreeIntervalCpuSeconds": 12.28125,
+      "RootCpuPercentOneCore": 352.10005733944956,
+      "RootCpuPercentMachine": 22.006253583715598,
+      "TreeCpuPercentOneCore": 352.10005733944956,
+      "TreeCpuPercentMachine": 22.006253583715598,
+      "TreeWorkingSetMiB": 200.48,
+      "TreePrivateMiB": 141.58,
+      "Processes": [
+        {
+          "Pid": 42320,
+          "ParentPid": null,
+          "Name": "cc-switch",
+          "CpuSeconds": 529.75,
+          "IntervalCpuSeconds": 12.28125,
+          "WorkingSetMiB": 200.48,
+          "PrivateMiB": 141.58
+        }
+      ]
+    },
+    {
+      "ObservedAtUtc": "2026-11-23T18:52:47.2951797+00:00",
+      "ElapsedSeconds": 25.005,
+      "IntervalSeconds": 4.994,
+      "RootIntervalCpuSeconds": 8.96875,
+      "TreeIntervalCpuSeconds": 8.96875,
+      "RootCpuPercentOneCore": 179.59050861033242,
+      "RootCpuPercentMachine": 11.224406788145776,
+      "TreeCpuPercentOneCore": 179.59050861033242,
+      "TreeCpuPercentMachine": 11.224406788145776,
+      "TreeWorkingSetMiB": 207.94,
+      "TreePrivateMiB": 146.5,
+      "Processes": [
+        {
+          "Pid": 42320,
+          "ParentPid": null,
+          "Name": "cc-switch",
+          "CpuSeconds": 538.71875,
+          "IntervalCpuSeconds": 8.96875,
+          "WorkingSetMiB": 207.94,
+          "PrivateMiB": 146.5
+        }
+      ]
+    },
+    {
+      "ObservedAtUtc": "2026-11-23T18:52:53.7998737+00:00",
+      "ElapsedSeconds": 31.509,
+      "IntervalSeconds": 6.503,
+      "RootIntervalCpuSeconds": 12.375,
+      "TreeIntervalCpuSeconds": 12.375,
+      "RootCpuPercentOneCore": 190.29678609872366,
+      "RootCpuPercentMachine": 11.893549131170229,
+      "TreeCpuPercentOneCore": 190.29678609872366,
+      "TreeCpuPercentMachine": 11.893549131170229,
+      "TreeWorkingSetMiB": 214.54,
+      "TreePrivateMiB": 153.23,
+      "Processes": [
+        {
+          "Pid": 42320,
+          "ParentPid": null,
+          "Name": "cc-switch",
+          "CpuSeconds": 551.09375,
+          "IntervalCpuSeconds": 12.375,
+          "WorkingSetMiB": 214.54,
+          "PrivateMiB": 153.23
+        }
+      ]
+    },
+    {
+      "ObservedAtUtc": "2026-11-23T18:52:57.2929498+00:00",
+      "ElapsedSeconds": 35.003,
+      "IntervalSeconds": 3.494,
+      "RootIntervalCpuSeconds": 3.40625,
+      "TreeIntervalCpuSeconds": 3.40625,
+      "RootCpuPercentOneCore": 97.48855180309101,
+      "RootCpuPercentMachine": 6.093034487693188,
+      "TreeCpuPercentOneCore": 97.48855180309101,
+      "TreeCpuPercentMachine": 6.093034487693188,
+      "TreeWorkingSetMiB": 218.73,
+      "TreePrivateMiB": 157.37,
+      "Processes": [
+        {
+          "Pid": 42320,
+          "ParentPid": null,
+          "Name": "cc-switch",
+          "CpuSeconds": 554.5,
+          "IntervalCpuSeconds": 3.40625,
+          "WorkingSetMiB": 218.73,
+          "PrivateMiB": 157.37
+        }
+      ]
+    },
+    {
+      "ObservedAtUtc": "2026-11-23T18:53:02.2907719+00:00",
+      "ElapsedSeconds": 40,
+      "IntervalSeconds": 4.998,
+      "RootIntervalCpuSeconds": 10.515625,
+      "TreeIntervalCpuSeconds": 10.515625,
+      "RootCpuPercentOneCore": 210.3966586634654,
+      "RootCpuPercentMachine": 13.149791166466587,
+      "TreeCpuPercentOneCore": 210.3966586634654,
+      "TreeCpuPercentMachine": 13.149791166466587,
+      "TreeWorkingSetMiB": 202.37,
+      "TreePrivateMiB": 141.38,
+      "Processes": [
+        {
+          "Pid": 42320,
+          "ParentPid": null,
+          "Name": "cc-switch",
+          "CpuSeconds": 565.015625,
+          "IntervalCpuSeconds": 10.515625,
+          "WorkingSetMiB": 202.37,
+          "PrivateMiB": 141.38
+        }
+      ]
+    },
+    {
+      "ObservedAtUtc": "2026-11-23T18:53:08.6160029+00:00",
+      "ElapsedSeconds": 46.324,
+      "IntervalSeconds": 6.324,
+      "RootIntervalCpuSeconds": 3.015625,
+      "TreeIntervalCpuSeconds": 3.015625,
+      "RootCpuPercentOneCore": 47.685404807084126,
+      "RootCpuPercentMachine": 2.980337800442758,
+      "TreeCpuPercentOneCore": 47.685404807084126,
+      "TreeCpuPercentMachine": 2.980337800442758,
+      "TreeWorkingSetMiB": 211.73,
+      "TreePrivateMiB": 150.44,
+      "Processes": [
+        {
+          "Pid": 42320,
+          "ParentPid": null,
+          "Name": "cc-switch",
+          "CpuSeconds": 568.03125,
+          "IntervalCpuSeconds": 3.015625,
+          "WorkingSetMiB": 211.73,
+          "PrivateMiB": 150.44
+        }
+      ]
+    },
+    {
+      "ObservedAtUtc": "2026-11-23T18:53:12.2944427+00:00",
+      "ElapsedSeconds": 50.01,
+      "IntervalSeconds": 3.686,
+      "RootIntervalCpuSeconds": 2.03125,
+      "TreeIntervalCpuSeconds": 2.03125,
+      "RootCpuPercentOneCore": 55.107162235485625,
+      "RootCpuPercentMachine": 3.4441976397178515,
+      "TreeCpuPercentOneCore": 55.107162235485625,
+      "TreeCpuPercentMachine": 3.4441976397178515,
+      "TreeWorkingSetMiB": 210.24,
+      "TreePrivateMiB": 148.99,
+      "Processes": [
+        {
+          "Pid": 42320,
+          "ParentPid": null,
+          "Name": "cc-switch",
+          "CpuSeconds": 570.0625,
+          "IntervalCpuSeconds": 2.03125,
+          "WorkingSetMiB": 210.24,
+          "PrivateMiB": 148.99
+        }
+      ]
+    },
+    {
+      "ObservedAtUtc": "2026-11-23T18:53:17.2910361+00:00",
+      "ElapsedSeconds": 55.001,
+      "IntervalSeconds": 4.991,
+      "RootIntervalCpuSeconds": 10.9375,
+      "TreeIntervalCpuSeconds": 10.9375,
+      "RootCpuPercentOneCore": 219.1444600280505,
+      "RootCpuPercentMachine": 13.696528751753156,
+      "TreeCpuPercentOneCore": 219.1444600280505,
+      "TreeCpuPercentMachine": 13.696528751753156,
+      "TreeWorkingSetMiB": 203.12,
+      "TreePrivateMiB": 140.01,
+      "Processes": [
+        {
+          "Pid": 42320,
+          "ParentPid": null,
+          "Name": "cc-switch",
+          "CpuSeconds": 581,
+          "IntervalCpuSeconds": 10.9375,
+          "WorkingSetMiB": 203.12,
+          "PrivateMiB": 140.01
+        }
+      ]
+    },
+    {
+      "ObservedAtUtc": "2026-11-23T18:53:23.6516060+00:00",
+      "ElapsedSeconds": 61.365,
+      "IntervalSeconds": 6.364,
+      "RootIntervalCpuSeconds": 10.65625,
+      "TreeIntervalCpuSeconds": 10.65625,
+      "RootCpuPercentOneCore": 167.4457888120679,
+      "RootCpuPercentMachine": 10.465361800754243,
+      "TreeCpuPercentOneCore": 167.4457888120679,
+      "TreeCpuPercentMachine": 10.465361800754243,
+      "TreeWorkingSetMiB": 213.26,
+      "TreePrivateMiB": 151.89,
+      "Processes": [
+        {
+          "Pid": 42320,
+          "ParentPid": null,
+          "Name": "cc-switch",
+          "CpuSeconds": 591.65625,
+          "IntervalCpuSeconds": 10.65625,
+          "WorkingSetMiB": 213.26,
+          "PrivateMiB": 151.89
+        }
+      ]
+    }
+  ],
+  "ActualMeasuredScope": "Backend root process ONLY. Descendant creation-time precision mismatch excluded children; not valid as process-tree total.",
+  "FirstPassSummaryRecomputedFromRawCpuCounters": true,
+  "SupersededForTreeMeasurementBy": "docs/audits/2026-11-24-restart-42320-process-tree-resource.json"
+}

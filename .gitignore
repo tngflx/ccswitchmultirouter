@@ -1,12 +1,17 @@
+# Dependencies and build outputs
 node_modules/
 dist/
 release/
+
+# Local settings, logs, and caches
 .DS_Store
 *.log
 .env
 .env.local
 *.tsbuildinfo
 .npmrc
+
+# Local agent, app, and editor settings
 CLAUDE.md
 AGENTS.md
 # Keep shared repository guardrails; nested agent instructions stay local.
@@ -18,29 +23,31 @@ GEMINI.md
 /.cc-switch
 /.idea
 /.vscode
+
+# Vitest reports and coverage
 vitest-report.json
+/coverage/
+
+# Windows reserved device name
 nul
 
 # Flatpak build artifacts
 flatpak/cc-switch.deb
 flatpak-build/
 flatpak-repo/
+
+# Local worktrees, editor history, and CodeBuddy instructions
 .worktrees/
-.spec-workflow/
-copilot-api
 .history
 CODEBUDDY.md
-mainWindow.js
-/scripts/codex-history-tool/.venv/
-/scripts/codex-history-tool/build/
-/scripts/codex-history-tool/dist/
-/scripts/codex-history-tool/release/
-/scripts/codex-history-tool/__pycache__/
-/scripts/codex-history-tool/*.spec
-/scripts/logs/
-/.tmp/
-/target/
-/output/production/
+
+# Python bytecode caches
+__pycache__/
 
 # Local audit/release evidence and extracted app fixtures
-/output/continuation-*/
+/scripts/logs/
+/.tmp/
+
+# Cargo build output and local production releases
+/target/
+/output/production/

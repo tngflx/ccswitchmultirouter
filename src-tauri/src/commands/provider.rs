@@ -7,6 +7,7 @@ use crate::commands::copilot::CopilotAuthState;
 use crate::commands::run_app_state_blocking;
 use crate::commands::xai_oauth::XaiOAuthState;
 use crate::error::AppError;
+use crate::protocol_compatibility::ProtocolCompatibilityRecord;
 use crate::provider::{ClaudeDesktopMode, CodexProtocolOverride, Provider};
 use crate::services::{
     EndpointLatency, ProviderService, ProviderSortUpdate, SpeedtestService, SwitchResult,
@@ -367,6 +368,9 @@ fn build_codex_provider_editor_snapshot(
 
     let persistence_transports = persisted_protocols_by_model(persisted, providers);
     let catalog_models = codex_adaptation_catalog_models(&logical_provider);
+    let (latest_profiles_by_model, latest_profiles_by_model_transport) =
+        index_latest_codex_model_profiles(&profiles);
+    let latest_observations_by_model_transport = index_latest_codex_protocol_records(&observations);
     let mut any_evidence = false;
     let mut any_stale = false;
     let mut any_verified = false;
@@ -410,34 +414,48 @@ fn build_codex_provider_editor_snapshot(
         let responses_target =
             current_target(crate::protocol_compatibility::TransportKind::OpenAiResponses);
         let chat_target = current_target(crate::protocol_compatibility::TransportKind::OpenAiChat);
-        let responses = latest_codex_protocol_record(
-            &observations,
-            &public_model,
-            &upstream_model,
-            crate::protocol_compatibility::TransportKind::OpenAiResponses,
-        );
-        let chat = latest_codex_protocol_record(
-            &observations,
-            &public_model,
-            &upstream_model,
-            crate::protocol_compatibility::TransportKind::OpenAiChat,
-        );
-        let selected_profile =
-            latest_codex_model_profile(&profiles, &public_model, &upstream_model);
+        let responses = latest_observations_by_model_transport
+            .get(&codex_model_transport_index_key(
+                &public_model,
+                &upstream_model,
+                crate::protocol_compatibility::TransportKind::OpenAiResponses,
+            ))
+            .copied();
+        let chat = latest_observations_by_model_transport
+            .get(&codex_model_transport_index_key(
+                &public_model,
+                &upstream_model,
+                crate::protocol_compatibility::TransportKind::OpenAiChat,
+            ))
+            .copied();
+        let model_key = (public_model.clone(), upstream_model.clone());
+        let selected_profile = latest_profiles_by_model.get(&model_key).copied();
         any_evidence |= responses.is_some() || chat.is_some() || selected_profile.is_some();
-        let current_profile = profiles
-            .iter()
-            .filter(|profile| {
-                profile.target.public_model == public_model
-                    && profile.target.upstream_model == upstream_model
-                    && current_target(profile.target.transport)
-                        .as_ref()
-                        .is_some_and(|target| {
-                            codex_protocol_record_matches_current_target(profile, target)
-                                && codex_protocol_record_is_fresh(profile, now)
-                        })
+        let current_profile = [
+            crate::protocol_compatibility::TransportKind::OpenAiResponses,
+            crate::protocol_compatibility::TransportKind::OpenAiChat,
+        ]
+        .into_iter()
+        .filter_map(|transport| {
+            current_target(transport).and_then(|target| {
+                let model_transport_key =
+                    codex_model_transport_index_key(&public_model, &upstream_model, transport);
+                latest_profiles_by_model_transport
+                    .get(&model_transport_key)
+                    .and_then(|records| {
+                        records
+                            .iter()
+                            .filter(|(_, profile)| {
+                                codex_protocol_record_matches_current_target(profile, &target)
+                                    && codex_protocol_record_is_fresh(profile, now)
+                            })
+                            .max_by_key(|(position, profile)| (profile.tested_at, *position))
+                            .copied()
+                    })
             })
-            .max_by_key(|profile| profile.tested_at);
+        })
+        .max_by_key(|(position, profile)| (profile.tested_at, *position))
+        .map(|(_, profile)| profile);
         let current_selected = current_profile
             .filter(|profile| profile.result.selected_transport == Some(profile.target.transport));
         let declared_transport =
@@ -977,18 +995,78 @@ fn latest_codex_protocol_record<'a>(
         .max_by_key(|record| record.tested_at)
 }
 
-fn latest_codex_model_profile<'a>(
-    records: &'a [crate::protocol_compatibility::ProtocolCompatibilityRecord],
+type CodexModelTransportKey = (String, String, u8);
+type CodexModelProfiles<'a> = HashMap<(String, String), &'a ProtocolCompatibilityRecord>;
+type CodexTransportProfiles<'a> =
+    HashMap<CodexModelTransportKey, Vec<(usize, &'a ProtocolCompatibilityRecord)>>;
+
+fn codex_transport_index_key(transport: crate::protocol_compatibility::TransportKind) -> u8 {
+    match transport {
+        crate::protocol_compatibility::TransportKind::OpenAiResponses => 0,
+        crate::protocol_compatibility::TransportKind::OpenAiChat => 1,
+    }
+}
+
+fn codex_model_transport_index_key(
     public_model: &str,
     upstream_model: &str,
-) -> Option<&'a crate::protocol_compatibility::ProtocolCompatibilityRecord> {
-    records
-        .iter()
-        .filter(|record| {
-            record.target.public_model == public_model
-                && record.target.upstream_model == upstream_model
-        })
-        .max_by_key(|record| record.tested_at)
+    transport: crate::protocol_compatibility::TransportKind,
+) -> CodexModelTransportKey {
+    (
+        public_model.to_string(),
+        upstream_model.to_string(),
+        codex_transport_index_key(transport),
+    )
+}
+
+fn index_latest_codex_protocol_records(
+    records: &[ProtocolCompatibilityRecord],
+) -> HashMap<CodexModelTransportKey, &ProtocolCompatibilityRecord> {
+    let mut index: HashMap<CodexModelTransportKey, &ProtocolCompatibilityRecord> =
+        HashMap::with_capacity(records.len());
+    for record in records {
+        let key = codex_model_transport_index_key(
+            &record.target.public_model,
+            &record.target.upstream_model,
+            record.target.transport,
+        );
+        if index
+            .get(&key)
+            .is_none_or(|current| current.tested_at <= record.tested_at)
+        {
+            index.insert(key, record);
+        }
+    }
+    index
+}
+
+fn index_latest_codex_model_profiles<'a>(
+    records: &'a [ProtocolCompatibilityRecord],
+) -> (CodexModelProfiles<'a>, CodexTransportProfiles<'a>) {
+    let mut by_model = CodexModelProfiles::with_capacity(records.len());
+    let mut by_model_transport = CodexTransportProfiles::with_capacity(records.len());
+    for (position, record) in records.iter().enumerate() {
+        let model_key = (
+            record.target.public_model.clone(),
+            record.target.upstream_model.clone(),
+        );
+        if by_model
+            .get(&model_key)
+            .is_none_or(|current| current.tested_at <= record.tested_at)
+        {
+            by_model.insert(model_key, record);
+        }
+        let model_transport_key = codex_model_transport_index_key(
+            &record.target.public_model,
+            &record.target.upstream_model,
+            record.target.transport,
+        );
+        by_model_transport
+            .entry(model_transport_key)
+            .or_default()
+            .push((position, record));
+    }
+    (by_model, by_model_transport)
 }
 
 fn codex_protocol_record_matches_current_target(
@@ -1461,51 +1539,62 @@ where
 
 #[tauri::command]
 #[allow(non_snake_case)]
-pub fn update_codex_subagent_policy(
-    state: State<'_, AppState>,
+pub async fn update_codex_subagent_policy(
+    app_handle: AppHandle,
     providerId: String,
     patch: crate::services::provider::CodexSubagentPolicyPatch,
 ) -> Result<crate::services::CodexSubagentV2MutationResult, String> {
-    ProviderService::update_codex_subagent_policy(state.inner(), &providerId, patch)
-        .map_err(|error| error.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::update_codex_subagent_policy(state, &providerId, patch)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 #[allow(non_snake_case)]
-pub fn update_codex_subagent_v2(
-    state: State<'_, AppState>,
+pub async fn update_codex_subagent_v2(
+    app_handle: AppHandle,
     providerId: String,
     subagentV2: serde_json::Value,
 ) -> Result<crate::services::CodexSubagentV2MutationResult, String> {
-    ProviderService::update_codex_subagent_v2(state.inner(), &providerId, subagentV2)
-        .map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::update_codex_subagent_v2(state, &providerId, subagentV2)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 #[allow(non_snake_case)]
-pub fn initialize_codex_subagent_v2(
-    state: State<'_, AppState>,
+pub async fn initialize_codex_subagent_v2(
+    app_handle: AppHandle,
     providerId: String,
 ) -> Result<crate::services::CodexSubagentV2MutationResult, String> {
-    ProviderService::initialize_codex_subagent_v2(state.inner(), &providerId)
-        .map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::initialize_codex_subagent_v2(state, &providerId).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 #[allow(non_snake_case)]
-pub fn reconcile_codex_subagent_v2_profiles(
-    state: State<'_, AppState>,
+pub async fn reconcile_codex_subagent_v2_profiles(
+    app_handle: AppHandle,
     providerId: String,
     action: crate::codex_config::CodexSubagentV2ReconcileAction,
     subagentV2: Option<serde_json::Value>,
 ) -> Result<crate::services::CodexSubagentV2MutationResult, String> {
-    ProviderService::reconcile_codex_subagent_v2_profiles(
-        state.inner(),
-        &providerId,
-        action,
-        subagentV2,
-    )
-    .map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::reconcile_codex_subagent_v2_profiles(
+            state,
+            &providerId,
+            action,
+            subagentV2,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1537,16 +1626,19 @@ pub async fn inspect_active_codex_multirouter_projection(
 
 #[tauri::command]
 #[allow(non_snake_case)]
-pub fn retry_codex_multirouter_projection(
-    state: State<'_, AppState>,
+pub async fn retry_codex_multirouter_projection(
+    app_handle: AppHandle,
     providerId: String,
 ) -> Result<crate::codex_multirouter::projection::CodexRoutingProjectionStatus, String> {
-    crate::codex_multirouter::projection::ensure_codex_multirouter_projection(
-        &state.db,
-        &providerId,
-        true,
-    )
-    .map_err(|error| error.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        crate::codex_multirouter::projection::ensure_codex_multirouter_projection(
+            &state.db,
+            &providerId,
+            true,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1564,47 +1656,53 @@ pub async fn get_codex_multirouter_revision(
 
 #[tauri::command]
 #[allow(non_snake_case)]
-pub fn preview_codex_multirouter_migration(
-    state: State<'_, AppState>,
+pub async fn preview_codex_multirouter_migration(
+    app_handle: AppHandle,
     providerId: String,
     expectedRevision: String,
 ) -> Result<crate::codex_multirouter::migration::CodexMultiRouterMigrationPreview, String> {
-    crate::codex_multirouter::migration::preview_codex_multirouter_migration(
-        &state.db,
-        &providerId,
-        &expectedRevision,
-    )
-    .map_err(|error| error.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        crate::codex_multirouter::migration::preview_codex_multirouter_migration(
+            &state.db,
+            &providerId,
+            &expectedRevision,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 #[allow(non_snake_case)]
-pub fn apply_codex_multirouter_migration(
-    state: State<'_, AppState>,
+pub async fn apply_codex_multirouter_migration(
+    app_handle: AppHandle,
     providerId: String,
     expectedRevision: String,
     planToken: String,
 ) -> Result<crate::codex_multirouter::migration::CodexMultiRouterMigrationApplyOutcome, String> {
-    let outcome = crate::codex_multirouter::migration::apply_codex_multirouter_migration(
-        &state.db,
-        &providerId,
-        &expectedRevision,
-        &planToken,
-    )
-    .map_err(|error| error.to_string())?;
-    if crate::codex_multirouter::active_codex_router_id(&state.db)
-        .map_err(|error| error.to_string())?
-        .as_deref()
-        == Some(providerId.as_str())
-    {
-        crate::codex_multirouter::projection::ensure_codex_multirouter_projection(
+    run_app_state_blocking(&app_handle, move |state| {
+        let outcome = crate::codex_multirouter::migration::apply_codex_multirouter_migration(
             &state.db,
             &providerId,
-            false,
+            &expectedRevision,
+            &planToken,
         )
         .map_err(|error| error.to_string())?;
-    }
-    Ok(outcome)
+        if crate::codex_multirouter::active_codex_router_id(&state.db)
+            .map_err(|error| error.to_string())?
+            .as_deref()
+            == Some(providerId.as_str())
+        {
+            crate::codex_multirouter::projection::ensure_codex_multirouter_projection(
+                &state.db,
+                &providerId,
+                false,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(outcome)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1969,87 +2067,101 @@ pub fn get_claude_desktop_default_routes(
 }
 
 #[tauri::command]
-pub fn import_claude_desktop_providers_from_claude(
-    state: State<'_, AppState>,
+pub async fn import_claude_desktop_providers_from_claude(
+    app_handle: AppHandle,
 ) -> Result<usize, String> {
-    let claude_providers = state
-        .db
-        .get_all_providers(AppType::Claude.as_str())
-        .map_err(|e| e.to_string())?;
-    let existing_ids = state
-        .db
-        .get_provider_ids(AppType::ClaudeDesktop.as_str())
-        .map_err(|e| e.to_string())?;
-
-    let mut imported = 0usize;
-    for provider in claude_providers.values() {
-        if existing_ids.contains(&provider.id) {
-            continue;
-        }
-
-        let mut desktop_provider = provider.clone();
-        desktop_provider.in_failover_queue = false;
-        let meta = desktop_provider.meta.get_or_insert_with(Default::default);
-
-        if crate::claude_desktop_config::is_compatible_direct_provider(provider)
-            && claude_provider_models_are_claude_safe(provider)
-        {
-            meta.claude_desktop_mode = Some(ClaudeDesktopMode::Direct);
-        } else if let Some(routes) = suggested_claude_desktop_routes(provider) {
-            meta.claude_desktop_mode = Some(ClaudeDesktopMode::Proxy);
-            meta.claude_desktop_model_routes = routes;
-        } else {
-            continue;
-        }
-
-        state
+    run_app_state_blocking(&app_handle, |state| {
+        let claude_providers = state
             .db
-            .save_provider(AppType::ClaudeDesktop.as_str(), &desktop_provider)
+            .get_all_providers(AppType::Claude.as_str())
             .map_err(|e| e.to_string())?;
-        imported += 1;
-    }
+        let existing_ids = state
+            .db
+            .get_provider_ids(AppType::ClaudeDesktop.as_str())
+            .map_err(|e| e.to_string())?;
 
-    // Safety net: 用户可能手动删除过 claude-desktop-official seed。
-    // 用户主动点 import 是"重新整理 ClaudeDesktop 表"的隐式信号，把官方入口补回来。
-    // 失败只 warn，不影响 imported 主流程；imported 计数语义保持纯净。
-    if let Err(e) = state.db.ensure_official_seed_by_id(
-        crate::database::CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID,
-        AppType::ClaudeDesktop,
-    ) {
-        log::warn!("Failed to ensure claude-desktop-official seed during import: {e}");
-    }
+        let mut imported = 0usize;
+        for provider in claude_providers.values() {
+            if existing_ids.contains(&provider.id) {
+                continue;
+            }
 
-    Ok(imported)
-}
+            let mut desktop_provider = provider.clone();
+            desktop_provider.in_failover_queue = false;
+            let meta = desktop_provider.meta.get_or_insert_with(Default::default);
 
-#[tauri::command]
-pub fn ensure_claude_desktop_official_provider(state: State<'_, AppState>) -> Result<bool, String> {
-    state
-        .db
-        .ensure_official_seed_by_id(
+            if crate::claude_desktop_config::is_compatible_direct_provider(provider)
+                && claude_provider_models_are_claude_safe(provider)
+            {
+                meta.claude_desktop_mode = Some(ClaudeDesktopMode::Direct);
+            } else if let Some(routes) = suggested_claude_desktop_routes(provider) {
+                meta.claude_desktop_mode = Some(ClaudeDesktopMode::Proxy);
+                meta.claude_desktop_model_routes = routes;
+            } else {
+                continue;
+            }
+
+            state
+                .db
+                .save_provider(AppType::ClaudeDesktop.as_str(), &desktop_provider)
+                .map_err(|e| e.to_string())?;
+            imported += 1;
+        }
+
+        // Safety net: 用户可能手动删除过 claude-desktop-official seed。
+        // 用户主动点 import 是"重新整理 ClaudeDesktop 表"的隐式信号，把官方入口补回来。
+        // 失败只 warn，不影响 imported 主流程；imported 计数语义保持纯净。
+        if let Err(e) = state.db.ensure_official_seed_by_id(
             crate::database::CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID,
             AppType::ClaudeDesktop,
-        )
-        .map_err(|e| e.to_string())
+        ) {
+            log::warn!("Failed to ensure claude-desktop-official seed during import: {e}");
+        }
+
+        Ok(imported)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn ensure_codex_official_provider(state: State<'_, AppState>) -> Result<bool, String> {
-    state
-        .db
-        .ensure_official_seed_by_id(crate::database::CODEX_OFFICIAL_PROVIDER_ID, AppType::Codex)
-        .map_err(|e| e.to_string())
+pub async fn ensure_claude_desktop_official_provider(
+    app_handle: AppHandle,
+) -> Result<bool, String> {
+    run_app_state_blocking(&app_handle, |state| {
+        state
+            .db
+            .ensure_official_seed_by_id(
+                crate::database::CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID,
+                AppType::ClaudeDesktop,
+            )
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn ensure_grokbuild_official_provider(state: State<'_, AppState>) -> Result<bool, String> {
-    state
-        .db
-        .ensure_official_seed_by_id(
-            crate::database::GROKBUILD_OFFICIAL_PROVIDER_ID,
-            AppType::GrokBuild,
-        )
-        .map_err(|e| e.to_string())
+pub async fn ensure_codex_official_provider(app_handle: AppHandle) -> Result<bool, String> {
+    run_app_state_blocking(&app_handle, |state| {
+        state
+            .db
+            .ensure_official_seed_by_id(crate::database::CODEX_OFFICIAL_PROVIDER_ID, AppType::Codex)
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn ensure_grokbuild_official_provider(app_handle: AppHandle) -> Result<bool, String> {
+    run_app_state_blocking(&app_handle, |state| {
+        state
+            .db
+            .ensure_official_seed_by_id(
+                crate::database::GROKBUILD_OFFICIAL_PROVIDER_ID,
+                AppType::GrokBuild,
+            )
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 fn claude_provider_models_are_claude_safe(provider: &Provider) -> bool {
@@ -2566,39 +2678,48 @@ pub async fn get_custom_endpoints(
 }
 
 #[tauri::command]
-pub fn add_custom_endpoint(
-    state: State<'_, AppState>,
+pub async fn add_custom_endpoint(
+    app_handle: AppHandle,
     app: String,
     #[allow(non_snake_case)] providerId: String,
     url: String,
 ) -> Result<(), String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::add_custom_endpoint(state.inner(), app_type, &providerId, url)
-        .map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::add_custom_endpoint(state, app_type, &providerId, url)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn remove_custom_endpoint(
-    state: State<'_, AppState>,
+pub async fn remove_custom_endpoint(
+    app_handle: AppHandle,
     app: String,
     #[allow(non_snake_case)] providerId: String,
     url: String,
 ) -> Result<(), String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::remove_custom_endpoint(state.inner(), app_type, &providerId, url)
-        .map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::remove_custom_endpoint(state, app_type, &providerId, url)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn update_endpoint_last_used(
-    state: State<'_, AppState>,
+pub async fn update_endpoint_last_used(
+    app_handle: AppHandle,
     app: String,
     #[allow(non_snake_case)] providerId: String,
     url: String,
 ) -> Result<(), String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::update_endpoint_last_used(state.inner(), app_type, &providerId, url)
-        .map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::update_endpoint_last_used(state, app_type, &providerId, url)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2634,29 +2755,36 @@ fn emit_universal_provider_synced(app: &AppHandle, action: &str, id: &str) {
 }
 
 #[tauri::command]
-pub fn get_universal_providers(
-    state: State<'_, AppState>,
+pub async fn get_universal_providers(
+    app_handle: AppHandle,
 ) -> Result<HashMap<String, UniversalProvider>, String> {
-    ProviderService::list_universal(state.inner()).map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, |state| {
+        ProviderService::list_universal(state).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn get_universal_provider(
-    state: State<'_, AppState>,
+pub async fn get_universal_provider(
+    app_handle: AppHandle,
     id: String,
 ) -> Result<Option<UniversalProvider>, String> {
-    ProviderService::get_universal(state.inner(), &id).map_err(|e| e.to_string())
+    run_app_state_blocking(&app_handle, move |state| {
+        ProviderService::get_universal(state, &id).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn upsert_universal_provider(
+pub async fn upsert_universal_provider(
     app: AppHandle,
-    state: State<'_, AppState>,
     provider: UniversalProvider,
 ) -> Result<bool, String> {
     let id = provider.id.clone();
-    let result =
-        ProviderService::upsert_universal(state.inner(), provider).map_err(|e| e.to_string())?;
+    let result = run_app_state_blocking(&app, move |state| {
+        ProviderService::upsert_universal(state, provider).map_err(|e| e.to_string())
+    })
+    .await?;
 
     emit_universal_provider_synced(&app, "upsert", &id);
 
@@ -2664,13 +2792,12 @@ pub fn upsert_universal_provider(
 }
 
 #[tauri::command]
-pub fn delete_universal_provider(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<bool, String> {
-    let result =
-        ProviderService::delete_universal(state.inner(), &id).map_err(|e| e.to_string())?;
+pub async fn delete_universal_provider(app: AppHandle, id: String) -> Result<bool, String> {
+    let id_for_delete = id.clone();
+    let result = run_app_state_blocking(&app, move |state| {
+        ProviderService::delete_universal(state, &id_for_delete).map_err(|e| e.to_string())
+    })
+    .await?;
 
     emit_universal_provider_synced(&app, "delete", &id);
 
@@ -2714,19 +2841,25 @@ pub struct UniversalProviderSetCommitOutcome {
 }
 
 #[tauri::command]
-pub fn prepare_universal_provider_set(
-    state: State<'_, AppState>,
+pub async fn prepare_universal_provider_set(
+    app_handle: AppHandle,
     request: PrepareUniversalProviderSetRequest,
 ) -> Result<UniversalProviderSetPreview, String> {
-    prepare_universal_provider_set_internal(state.inner(), request, chrono::Utc::now().timestamp())
+    run_app_state_blocking(&app_handle, move |state| {
+        prepare_universal_provider_set_internal(state, request, chrono::Utc::now().timestamp())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn commit_universal_provider_set(
-    state: State<'_, AppState>,
+pub async fn commit_universal_provider_set(
+    app_handle: AppHandle,
     request: CommitUniversalProviderSetRequest,
 ) -> Result<UniversalProviderSetCommitOutcome, String> {
-    commit_universal_provider_set_internal(state.inner(), request, chrono::Utc::now().timestamp())
+    run_app_state_blocking(&app_handle, move |state| {
+        commit_universal_provider_set_internal(state, request, chrono::Utc::now().timestamp())
+    })
+    .await
 }
 
 fn prepare_universal_provider_set_internal(
@@ -2788,6 +2921,7 @@ where
         &crate::codex_multirouter::projection::CodexRoutingProjectionArtifact,
     ) -> Result<crate::codex_multirouter::projection::ProjectionReadBack, String>,
 {
+    let _commit = state.lock_codex_provider_set_commit();
     let receipt_claim = state.claim_codex_provider_set_probe_receipts(&request.receipt_ids)?;
     let preview = prepare_universal_provider_set_internal(
         state,
@@ -3170,9 +3304,12 @@ pub async fn save_and_sync_universal_provider(
 }
 
 #[tauri::command]
-pub fn import_opencode_providers_from_live(state: State<'_, AppState>) -> Result<usize, String> {
-    crate::services::provider::import_opencode_providers_from_live(state.inner())
-        .map_err(|e| e.to_string())
+pub async fn import_opencode_providers_from_live(app_handle: AppHandle) -> Result<usize, String> {
+    run_app_state_blocking(&app_handle, |state| {
+        crate::services::provider::import_opencode_providers_from_live(state)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3231,7 +3368,29 @@ mod provider_read_dispatch_tests {
         assert_async_command(list_codex_provider_adaptation_summaries);
         assert_async_command(|app| inspect_codex_multirouter_projection(app, String::new()));
         assert_async_command(inspect_active_codex_multirouter_projection);
+        assert_async_command(|app| retry_codex_multirouter_projection(app, String::new()));
         assert_async_command(|app| get_codex_multirouter_revision(app, String::new()));
+        assert_async_command(|app| {
+            preview_codex_multirouter_migration(app, String::new(), String::new())
+        });
+        assert_async_command(|app| {
+            apply_codex_multirouter_migration(app, String::new(), String::new(), String::new())
+        });
+        assert_async_command(|app| {
+            update_codex_subagent_policy(app, String::new(), Default::default())
+        });
+        assert_async_command(|app| {
+            update_codex_subagent_v2(app, String::new(), serde_json::json!({}))
+        });
+        assert_async_command(|app| initialize_codex_subagent_v2(app, String::new()));
+        assert_async_command(|app| {
+            reconcile_codex_subagent_v2_profiles(
+                app,
+                String::new(),
+                crate::codex_config::CodexSubagentV2ReconcileAction::SyncCatalog,
+                None,
+            )
+        });
         assert_async_command(|app| add_provider(app, String::new(), sample_provider(), None));
         assert_async_command(|app| update_provider(app, String::new(), sample_provider(), None));
         assert_async_command(|app| {
@@ -3251,9 +3410,35 @@ mod provider_read_dispatch_tests {
         assert_async_command(|app| {
             save_and_sync_universal_provider(app, sample_universal_provider())
         });
+        assert_async_command(get_universal_providers);
+        assert_async_command(|app| get_universal_provider(app, String::new()));
+        assert_async_command(|app| upsert_universal_provider(app, sample_universal_provider()));
+        assert_async_command(|app| delete_universal_provider(app, String::new()));
+        assert_async_command(import_claude_desktop_providers_from_claude);
+        assert_async_command(ensure_claude_desktop_official_provider);
+        assert_async_command(ensure_codex_official_provider);
+        assert_async_command(ensure_grokbuild_official_provider);
+        assert_async_command(|app| {
+            prepare_universal_provider_set(
+                app,
+                PrepareUniversalProviderSetRequest {
+                    provider: sample_universal_provider(),
+                    receipt_ids: Vec::new(),
+                },
+            )
+        });
         assert_async_command(|_| get_opencode_live_provider_ids());
         assert_async_command(|_| read_live_provider_settings(String::new()));
         assert_async_command(|app| get_custom_endpoints(app, String::new(), String::new()));
+        assert_async_command(|app| {
+            add_custom_endpoint(app, String::new(), String::new(), String::new())
+        });
+        assert_async_command(|app| {
+            remove_custom_endpoint(app, String::new(), String::new(), String::new())
+        });
+        assert_async_command(|app| {
+            update_endpoint_last_used(app, String::new(), String::new(), String::new())
+        });
         assert_async_command(get_claude_desktop_status);
         assert_async_command(|app| delete_provider(app, String::new(), String::new()));
         assert_async_command(|app| {
@@ -3262,6 +3447,7 @@ mod provider_read_dispatch_tests {
         assert_async_command(|app| import_default_config(app, String::new()));
         assert_async_command(switch_codex_to_official_and_repair_history);
         assert_async_command(|app| update_providers_sort_order(app, String::new(), Vec::new()));
+        assert_async_command(import_opencode_providers_from_live);
     }
 }
 
@@ -3675,10 +3861,11 @@ mod native_query_credentials_tests {
 mod codex_protocol_preflight_save_tests {
     use super::{
         build_codex_provider_adaptation_preview, get_codex_logical_provider_for_editing_internal,
-        get_codex_provider_editor_snapshot_internal,
-        list_codex_provider_adaptation_summaries_internal, update_provider_internal_with_probe,
-        CodexAdaptationStatus, CodexEffectiveTransport, CodexProtocolChoice,
-        CodexProtocolChoiceSource, CodexProtocolResolutionSource, CodexProviderPersistence,
+        get_codex_provider_editor_snapshot_internal, index_latest_codex_model_profiles,
+        index_latest_codex_protocol_records, list_codex_provider_adaptation_summaries_internal,
+        update_provider_internal_with_probe, CodexAdaptationStatus, CodexEffectiveTransport,
+        CodexProtocolChoice, CodexProtocolChoiceSource, CodexProtocolResolutionSource,
+        CodexProviderPersistence,
     };
     use crate::{
         app_config::AppType,
@@ -5209,6 +5396,132 @@ mod codex_protocol_preflight_save_tests {
         assert_eq!(summary.model_count, 2);
         assert_eq!(summary.tested_at, snapshot.adaptation.tested_at);
         assert_eq!(summary.expires_at, snapshot.adaptation.expires_at);
+    }
+
+    #[test]
+    fn editor_snapshot_preserves_profile_order_for_equal_cross_transport_timestamps() {
+        let db = Arc::new(Database::memory().expect("memory database"));
+        let state = AppState::new(db.clone());
+        let now = 1_000;
+
+        // DAO order uses hashed target keys to break timestamp ties. Pick a
+        // fixture whose Responses record sorts after Chat.
+        let (source, profiles) = (0..64)
+            .find_map(|index| {
+                let mut source = codex_provider();
+                source.id = format!("qwen-provider-{index}");
+                let candidate =
+                    crate::protocol_compatibility::compile_provider_probe_candidate_for_model(
+                        &source,
+                        "qwen-visible".to_string(),
+                        "Qwen/Qwen3.8".to_string(),
+                    )
+                    .expect("compile candidate");
+                let profiles =
+                    [TransportKind::OpenAiChat, TransportKind::OpenAiResponses].map(|transport| {
+                        ProtocolCompatibilityRecord::new(
+                            candidate.target_key(transport).expect("target"),
+                            ProtocolCompatibilityProbeResult {
+                                selected_transport: Some(transport),
+                                readiness: ProbeReadiness::Verified,
+                                branches: Vec::new(),
+                            },
+                            now,
+                            now + 600,
+                        )
+                    });
+                (profiles[0].storage_key() < profiles[1].storage_key())
+                    .then_some((source, profiles))
+            })
+            .expect("fixture with Responses last in DAO order");
+        db.save_provider_with_protocol_profiles("codex", &source, &profiles)
+            .expect("seed provider and profiles");
+
+        let snapshot = get_codex_provider_editor_snapshot_internal(&state, &source.id, now)
+            .expect("read editor snapshot");
+        assert_eq!(
+            snapshot.adaptation.models[0].effective_transport,
+            Some(TransportKind::OpenAiResponses)
+        );
+        assert_eq!(
+            snapshot.adaptation.models[0].resolution_source,
+            Some(super::CodexProtocolResolutionSource::Probe)
+        );
+    }
+
+    #[test]
+    fn editor_snapshot_record_indexes_keep_latest_summary_evidence() {
+        let source = codex_provider();
+        let record = |transport: TransportKind, tested_at: i64, readiness: ProbeReadiness| {
+            let target = crate::protocol_compatibility::compile_provider_probe_candidate_for_model(
+                &source,
+                "qwen-visible".to_string(),
+                "Qwen/Qwen3.8".to_string(),
+            )
+            .expect("compile candidate")
+            .target_key(transport)
+            .expect("target");
+            ProtocolCompatibilityRecord::new(
+                target,
+                ProtocolCompatibilityProbeResult {
+                    selected_transport: Some(transport),
+                    readiness,
+                    branches: Vec::new(),
+                },
+                tested_at,
+                tested_at + 600,
+            )
+        };
+        let profiles = vec![
+            record(
+                TransportKind::OpenAiResponses,
+                100,
+                ProbeReadiness::Verified,
+            ),
+            record(TransportKind::OpenAiResponses, 300, ProbeReadiness::Partial),
+            record(
+                TransportKind::OpenAiResponses,
+                300,
+                ProbeReadiness::Verified,
+            ),
+            record(TransportKind::OpenAiChat, 200, ProbeReadiness::Verified),
+        ];
+        let (by_model, by_model_transport) = index_latest_codex_model_profiles(&profiles);
+        let model_profile = by_model
+            .get(&("qwen-visible".to_string(), "Qwen/Qwen3.8".to_string()))
+            .expect("latest model profile");
+        assert_eq!(model_profile.tested_at, 300);
+        assert_eq!(model_profile.result.readiness, ProbeReadiness::Verified);
+        assert_eq!(
+            by_model_transport.len(),
+            2,
+            "model/transport index retains each transport"
+        );
+        assert_eq!(
+            by_model_transport.values().map(Vec::len).sum::<usize>(),
+            profiles.len(),
+            "index retains all candidates for current-target matching"
+        );
+
+        let observations = vec![
+            record(
+                TransportKind::OpenAiResponses,
+                100,
+                ProbeReadiness::Verified,
+            ),
+            record(TransportKind::OpenAiResponses, 250, ProbeReadiness::Partial),
+            record(TransportKind::OpenAiChat, 200, ProbeReadiness::Verified),
+        ];
+        let by_model_transport = index_latest_codex_protocol_records(&observations);
+        let responses = by_model_transport
+            .get(&("qwen-visible".to_string(), "Qwen/Qwen3.8".to_string(), 0))
+            .expect("latest Responses observation");
+        assert_eq!(responses.tested_at, 250);
+        assert_eq!(responses.result.readiness, ProbeReadiness::Partial);
+        let chat = by_model_transport
+            .get(&("qwen-visible".to_string(), "Qwen/Qwen3.8".to_string(), 1))
+            .expect("latest Chat observation");
+        assert_eq!(chat.tested_at, 200);
     }
 
     #[test]

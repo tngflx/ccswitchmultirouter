@@ -16,6 +16,9 @@ pub async fn start_owner_remote(
     state: tauri::State<'_, AppState>,
     https_origin: String,
 ) -> Result<OwnerRemoteStatus, String> {
+    let _setup = super::tailscale::OWNER_REMOTE_SETUP
+        .try_lock()
+        .map_err(|_| "tailscale_setup_in_progress".to_owned())?;
     state
         .owner_remote
         .start(&https_origin)
@@ -27,6 +30,9 @@ pub async fn start_owner_remote(
 pub async fn stop_owner_remote(
     state: tauri::State<'_, AppState>,
 ) -> Result<OwnerRemoteStatus, String> {
+    let _setup = super::tailscale::OWNER_REMOTE_SETUP
+        .try_lock()
+        .map_err(|_| "tailscale_setup_in_progress".to_owned())?;
     state
         .owner_remote
         .stop()

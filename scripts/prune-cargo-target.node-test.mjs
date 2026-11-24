@@ -124,7 +124,7 @@ test("cleanup options use a bounded default and accept overrides", () => {
   assert.deepEqual(parseCleanupOptions([], {}), {
     dryRun: false,
     force: false,
-    maxGb: 5,
+    maxGb: 6,
   });
   assert.equal(
     parseCleanupOptions([], { CCSM_CARGO_TARGET_MAX_GB: "12.5" }).maxGb,
@@ -133,12 +133,36 @@ test("cleanup options use a bounded default and accept overrides", () => {
   assert.deepEqual(parseCleanupOptions(["--force", "--dry-run"], {}), {
     dryRun: true,
     force: true,
-    maxGb: 5,
+    maxGb: 6,
   });
   assert.throws(() => parseCleanupOptions(["--max-gb"], {}), /Missing value/);
   assert.throws(
     () => parseCleanupOptions(["--max-gb", "-1"], {}),
     /Invalid Cargo target limit/,
+  );
+});
+
+test("the default cleanup threshold keeps exactly 6 GB and cleans above it", () => {
+  const gb = 1024 ** 3;
+  const { maxGb } = parseCleanupOptions([], {});
+
+  assert.equal(
+    cleanupDecision({
+      sizeBytes: maxGb * gb,
+      maxGb,
+      force: false,
+      ownerCount: 0,
+    }),
+    "keep",
+  );
+  assert.equal(
+    cleanupDecision({
+      sizeBytes: maxGb * gb + 1,
+      maxGb,
+      force: false,
+      ownerCount: 0,
+    }),
+    "clean",
   );
 });
 

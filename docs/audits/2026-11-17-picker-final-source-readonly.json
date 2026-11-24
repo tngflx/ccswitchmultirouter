@@ -1,0 +1,4461 @@
+{
+  "verified": false,
+  "readinessVerified": false,
+  "pickerInspectionPerformed": true,
+  "desktopCdpVerified": false,
+  "noTestThreadCreated": true,
+  "existingThreadsTouched": false,
+  "existingThreadsPrompted": false,
+  "renderedMenuVerified": false,
+  "pickerInspection": {
+    "runtimeInstalled": true,
+    "expectedRuntimeFingerprint": "sha256-4dc164bae9130aed2719091cf4641f74661bcecfcb1850e9fef508282e752929",
+    "installedRuntimeFingerprint": "sha256-44a79b8a9e351b5da7c5da212f7abc80b44cee2ac18b9cebe895c7a2c811bb4a",
+    "fingerprintMatches": false,
+    "runtimeStatus": "mismatch",
+    "renderedMenuVerified": false,
+    "catalog": {
+      "available": true,
+      "declaredOnly": true,
+      "truncated": false,
+      "models": [
+        {
+          "model": "gpt-6.1-sol-sublyx",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-6-astra-sublyx",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-6-luna-sublyx",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-6-sol-sublyx",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-5.6-luna-sublyx",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-5.6-sol-sublyx",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-5.6-terra-sublyx",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-5.6-openai-compact",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-6",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-6.1-terra",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-5.6",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-image-2.6-flare",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-image-2.6-sunburst",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        },
+        {
+          "model": "claude-fable-5-1-zmhub",
+          "declaredEfforts": []
+        },
+        {
+          "model": "gpt-6.1-sol-zmhub",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-6-astra-zmhub",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "claude-fable-5-1-s1a",
+          "declaredEfforts": []
+        },
+        {
+          "model": "claude-opus-5-5",
+          "declaredEfforts": []
+        },
+        {
+          "model": "claude-sonnet-5-5",
+          "declaredEfforts": []
+        },
+        {
+          "model": "gpt-6.1-sol-s1a",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "cohere/north-mini-code:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "dots-studio/dots-3-note-preview:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "google/gemma-4-26b-a4b-it:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "nvidia/nemotron-3.5-lightning:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+          "declaredEfforts": [
+            "medium",
+            "high"
+          ]
+        },
+        {
+          "model": "openrouter/free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "~deepseek/deepseek-flash-latest",
+          "declaredEfforts": [
+            "low",
+            "high",
+            "max"
+          ]
+        },
+        {
+          "model": "liquid/lfm-3-1.7b:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "minimax/minimax-m3",
+          "declaredEfforts": []
+        },
+        {
+          "model": "minimax/minimax-m3.1-flash",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          "model": "nvidia/nemotron-3.5-super-vl:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "recursive/flint-v1.0:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "thinkingmachines/inkling-2-small:free",
+          "declaredEfforts": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        },
+        {
+          "model": "xiaomi/mimo-v2.6-flash",
+          "declaredEfforts": []
+        },
+        {
+          "model": "xiaomi/mimo-v2.6-pro",
+          "declaredEfforts": []
+        },
+        {
+          "model": "~deepseek/deepseek-pro-latest",
+          "declaredEfforts": [
+            "low",
+            "high",
+            "max"
+          ]
+        },
+        {
+          "model": "~deepseek/deepseek-v4-flash-latest",
+          "declaredEfforts": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ]
+    },
+    "pickerDiagnostics": {
+      "available": true,
+      "status": "mismatch",
+      "pickerObserverCount": 3,
+      "successObserverCount": 3,
+      "errorObserverCount": 0,
+      "pendingObserverCount": 0,
+      "unsupportedObserverCount": 0,
+      "unreadableObserverCount": 0,
+      "nativeVisibilityUnverifiedObserverCount": 0,
+      "booleanControlUnverifiedModelCount": 9,
+      "booleanControlReadyModelCount": 0,
+      "effortMismatchCount": 16,
+      "flagMismatchCount": 0,
+      "missingMaxModelCount": 16,
+      "missingUltraModelCount": 0,
+      "selectedMaxModelCount": 16,
+      "selectedUltraModelCount": 16
+    },
+    "mountedReasoningLabels": {
+      "available": true,
+      "truncated": false,
+      "renderedMenuVerified": false,
+      "rows": [
+        {
+          "effort": "none",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "minimal",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "low",
+          "labelMatches": false,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "medium",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "high",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "xhigh",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "max",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "ultra",
+          "labelMatches": true,
+          "opacityState": "one"
+        }
+      ]
+    },
+    "nativePowerSelections": {
+      "available": false,
+      "truncated": false,
+      "renderedMenuVerified": false,
+      "rows": [],
+      "refusalReasons": [
+        "runtime_not_current"
+      ]
+    },
+    "nativeVisibility": {
+      "required": true,
+      "atomCount": 1,
+      "scopeScanComplete": true,
+      "scopeCandidateCount": 765,
+      "scopeScan": {
+        "status": "complete",
+        "visitedFiberCount": 9804,
+        "scopeCount": 765,
+        "fiberLimit": 30000,
+        "elapsedMs": 479
+      },
+      "lastSettledScopeScan": {
+        "status": "complete",
+        "visitedFiberCount": 9804,
+        "scopeCount": 765,
+        "fiberLimit": 30000,
+        "elapsedMs": 479
+      },
+      "schedulerCapabilities": {
+        "messageChannelAvailable": true
+      },
+      "ownershipStatus": "unverified",
+      "reconciliation": {
+        "status": "unverified",
+        "managed": true,
+        "patchedScopes": 0,
+        "restoredScopes": 0,
+        "refusalReason": "renderer_scope_snapshot_unverified",
+        "ownerScopeCount": 0,
+        "ownerFailureCounts": {
+          "scope_contract": 0,
+          "node_unavailable": 0,
+          "node_client_absent": 0,
+          "node_client_accessor": 0,
+          "node_client_uninitialized": 0,
+          "client_mismatch": 0,
+          "client_methods_unavailable": 0,
+          "cache_unavailable": 0,
+          "scope_read_failed": 0,
+          "inventory_empty": 0,
+          "inventory_capped": 0,
+          "inventory_read_failed": 0,
+          "owner_snapshot_unverified": 0
+        }
+      }
+    },
+    "modelObservations": {
+      "renderedMenuVerified": false,
+      "queryRowsVerified": false,
+      "truncated": false,
+      "unavailable": true,
+      "unavailableReasons": [
+        "runtime_not_current"
+      ],
+      "rows": [
+        {
+          "model": "gpt-6.1-sol-sublyx",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "gpt-6-astra-sublyx",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "gpt-6-luna-sublyx",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "gpt-6-sol-sublyx",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "gpt-5.6-luna-sublyx",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "gpt-5.6-sol-sublyx",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "gpt-5.6-terra-sublyx",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "gpt-5.6-openai-compact",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "gpt-6",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "gpt-6.1-terra",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "gpt-5.6",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "gpt-image-2.6-flare",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "gpt-image-2.6-sunburst",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "claude-fable-5-1-zmhub",
+          "expectedEfforts": [],
+          "observedEfforts": [],
+          "nativeVisibleEfforts": [],
+          "missingEfforts": []
+        },
+        {
+          "model": "gpt-6.1-sol-zmhub",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "gpt-6-astra-zmhub",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "claude-fable-5-1-s1a",
+          "expectedEfforts": [],
+          "observedEfforts": [],
+          "nativeVisibleEfforts": [],
+          "missingEfforts": []
+        },
+        {
+          "model": "claude-opus-5-5",
+          "expectedEfforts": [],
+          "observedEfforts": [],
+          "nativeVisibleEfforts": [],
+          "missingEfforts": []
+        },
+        {
+          "model": "claude-sonnet-5-5",
+          "expectedEfforts": [],
+          "observedEfforts": [],
+          "nativeVisibleEfforts": [],
+          "missingEfforts": []
+        },
+        {
+          "model": "gpt-6.1-sol-s1a",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "cohere/north-mini-code:free",
+          "expectedEfforts": [],
+          "observedEfforts": [
+            "none",
+            "medium"
+          ],
+          "nativeVisibleEfforts": [
+            "medium"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "dots-studio/dots-3-note-preview:free",
+          "expectedEfforts": [],
+          "observedEfforts": [
+            "none",
+            "medium"
+          ],
+          "nativeVisibleEfforts": [
+            "medium"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "google/gemma-4-26b-a4b-it:free",
+          "expectedEfforts": [],
+          "observedEfforts": [
+            "none",
+            "medium"
+          ],
+          "nativeVisibleEfforts": [
+            "medium"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "expectedEfforts": [],
+          "observedEfforts": [
+            "none",
+            "medium"
+          ],
+          "nativeVisibleEfforts": [
+            "medium"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "nvidia/nemotron-3.5-lightning:free",
+          "expectedEfforts": [],
+          "observedEfforts": [
+            "none",
+            "medium"
+          ],
+          "nativeVisibleEfforts": [
+            "medium"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+          "expectedEfforts": [],
+          "observedEfforts": [],
+          "nativeVisibleEfforts": [],
+          "missingEfforts": []
+        },
+        {
+          "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+          "expectedEfforts": [
+            "medium",
+            "high"
+          ],
+          "observedEfforts": [
+            "medium",
+            "high"
+          ],
+          "nativeVisibleEfforts": [
+            "medium",
+            "high"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "openrouter/free",
+          "expectedEfforts": [],
+          "observedEfforts": [],
+          "nativeVisibleEfforts": [],
+          "missingEfforts": []
+        },
+        {
+          "model": "~deepseek/deepseek-flash-latest",
+          "expectedEfforts": [
+            "low",
+            "high",
+            "max"
+          ],
+          "observedEfforts": [
+            "low",
+            "high",
+            "max"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "high"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "liquid/lfm-3-1.7b:free",
+          "expectedEfforts": [],
+          "observedEfforts": [],
+          "nativeVisibleEfforts": [],
+          "missingEfforts": []
+        },
+        {
+          "model": "minimax/minimax-m3",
+          "expectedEfforts": [],
+          "observedEfforts": [
+            "none",
+            "medium"
+          ],
+          "nativeVisibleEfforts": [
+            "medium"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "minimax/minimax-m3.1-flash",
+          "expectedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "observedEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "nvidia/nemotron-3.5-super-vl:free",
+          "expectedEfforts": [],
+          "observedEfforts": [
+            "none",
+            "medium"
+          ],
+          "nativeVisibleEfforts": [
+            "medium"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "recursive/flint-v1.0:free",
+          "expectedEfforts": [],
+          "observedEfforts": [],
+          "nativeVisibleEfforts": [],
+          "missingEfforts": []
+        },
+        {
+          "model": "thinkingmachines/inkling-2-small:free",
+          "expectedEfforts": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "observedEfforts": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "missingEfforts": [
+            "minimal",
+            "max"
+          ]
+        },
+        {
+          "model": "xiaomi/mimo-v2.6-flash",
+          "expectedEfforts": [],
+          "observedEfforts": [
+            "none",
+            "medium"
+          ],
+          "nativeVisibleEfforts": [
+            "medium"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "xiaomi/mimo-v2.6-pro",
+          "expectedEfforts": [],
+          "observedEfforts": [
+            "none",
+            "medium"
+          ],
+          "nativeVisibleEfforts": [
+            "medium"
+          ],
+          "missingEfforts": []
+        },
+        {
+          "model": "~deepseek/deepseek-pro-latest",
+          "expectedEfforts": [
+            "low",
+            "high",
+            "max"
+          ],
+          "observedEfforts": [
+            "low",
+            "high",
+            "max"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "high"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        },
+        {
+          "model": "~deepseek/deepseek-v4-flash-latest",
+          "expectedEfforts": [
+            "low",
+            "high",
+            "max"
+          ],
+          "observedEfforts": [
+            "low",
+            "high",
+            "max"
+          ],
+          "nativeVisibleEfforts": [
+            "low",
+            "high"
+          ],
+          "missingEfforts": [
+            "max"
+          ]
+        }
+      ]
+    }
+  },
+  "pickerTargetInspections": {
+    "scope": "pinned_native_verified_endpoint",
+    "host": "127.0.0.1",
+    "port": 9229,
+    "renderedMenuVerified": false,
+    "targetLimit": 8,
+    "eligibleTargetCount": 1,
+    "uniqueTargetCount": 1,
+    "duplicateTargetCount": 0,
+    "attemptedTargetCount": 1,
+    "inspectedTargetCount": 1,
+    "unavailableTargetCount": 0,
+    "truncated": false,
+    "complete": true,
+    "selectedTargetId": "d9d57fff8d7f1dc76fc32098e92ebdad",
+    "selectedTargetRef": "sha256-267411a0d920f68f024d0b904c9ba07877b12c18fe1b16799b20b862e4b5d760",
+    "targets": [
+      {
+        "targetId": "d9d57fff8d7f1dc76fc32098e92ebdad",
+        "targetRef": "sha256-267411a0d920f68f024d0b904c9ba07877b12c18fe1b16799b20b862e4b5d760",
+        "inspection": {
+          "runtimeInstalled": true,
+          "expectedRuntimeFingerprint": "sha256-4dc164bae9130aed2719091cf4641f74661bcecfcb1850e9fef508282e752929",
+          "installedRuntimeFingerprint": "sha256-44a79b8a9e351b5da7c5da212f7abc80b44cee2ac18b9cebe895c7a2c811bb4a",
+          "fingerprintMatches": false,
+          "runtimeStatus": "mismatch",
+          "renderedMenuVerified": false,
+          "catalog": {
+            "available": true,
+            "declaredOnly": true,
+            "truncated": false,
+            "models": [
+              {
+                "model": "gpt-6.1-sol-sublyx",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-6-astra-sublyx",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-6-luna-sublyx",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-6-sol-sublyx",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-5.6-luna-sublyx",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-5.6-sol-sublyx",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-5.6-terra-sublyx",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-5.6-openai-compact",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-6",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-6.1-terra",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-5.6",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-image-2.6-flare",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-image-2.6-sunburst",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "claude-fable-5-1-zmhub",
+                "declaredEfforts": []
+              },
+              {
+                "model": "gpt-6.1-sol-zmhub",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-6-astra-zmhub",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "claude-fable-5-1-s1a",
+                "declaredEfforts": []
+              },
+              {
+                "model": "claude-opus-5-5",
+                "declaredEfforts": []
+              },
+              {
+                "model": "claude-sonnet-5-5",
+                "declaredEfforts": []
+              },
+              {
+                "model": "gpt-6.1-sol-s1a",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "cohere/north-mini-code:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "dots-studio/dots-3-note-preview:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "google/gemma-4-26b-a4b-it:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "google/gemma-4-31b-it:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "nvidia/nemotron-3.5-lightning:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+                "declaredEfforts": [
+                  "medium",
+                  "high"
+                ]
+              },
+              {
+                "model": "openrouter/free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "~deepseek/deepseek-flash-latest",
+                "declaredEfforts": [
+                  "low",
+                  "high",
+                  "max"
+                ]
+              },
+              {
+                "model": "liquid/lfm-3-1.7b:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "minimax/minimax-m3",
+                "declaredEfforts": []
+              },
+              {
+                "model": "minimax/minimax-m3.1-flash",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max"
+                ]
+              },
+              {
+                "model": "nvidia/nemotron-3.5-super-vl:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "recursive/flint-v1.0:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "thinkingmachines/inkling-2-small:free",
+                "declaredEfforts": [
+                  "minimal",
+                  "low",
+                  "medium",
+                  "high",
+                  "max"
+                ]
+              },
+              {
+                "model": "xiaomi/mimo-v2.6-flash",
+                "declaredEfforts": []
+              },
+              {
+                "model": "xiaomi/mimo-v2.6-pro",
+                "declaredEfforts": []
+              },
+              {
+                "model": "~deepseek/deepseek-pro-latest",
+                "declaredEfforts": [
+                  "low",
+                  "high",
+                  "max"
+                ]
+              },
+              {
+                "model": "~deepseek/deepseek-v4-flash-latest",
+                "declaredEfforts": [
+                  "low",
+                  "high",
+                  "max"
+                ]
+              }
+            ]
+          },
+          "pickerDiagnostics": {
+            "available": true,
+            "status": "mismatch",
+            "pickerObserverCount": 3,
+            "successObserverCount": 3,
+            "errorObserverCount": 0,
+            "pendingObserverCount": 0,
+            "unsupportedObserverCount": 0,
+            "unreadableObserverCount": 0,
+            "nativeVisibilityUnverifiedObserverCount": 0,
+            "booleanControlUnverifiedModelCount": 9,
+            "booleanControlReadyModelCount": 0,
+            "effortMismatchCount": 16,
+            "flagMismatchCount": 0,
+            "missingMaxModelCount": 16,
+            "missingUltraModelCount": 0,
+            "selectedMaxModelCount": 16,
+            "selectedUltraModelCount": 16
+          },
+          "mountedReasoningLabels": {
+            "available": true,
+            "truncated": false,
+            "renderedMenuVerified": false,
+            "rows": [
+              {
+                "effort": "none",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "minimal",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "low",
+                "labelMatches": false,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "medium",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "high",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "xhigh",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "max",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "ultra",
+                "labelMatches": true,
+                "opacityState": "one"
+              }
+            ]
+          },
+          "nativePowerSelections": {
+            "available": false,
+            "truncated": false,
+            "renderedMenuVerified": false,
+            "rows": [],
+            "refusalReasons": [
+              "runtime_not_current"
+            ]
+          },
+          "nativeVisibility": {
+            "required": true,
+            "atomCount": 1,
+            "scopeScanComplete": true,
+            "scopeCandidateCount": 765,
+            "scopeScan": {
+              "status": "complete",
+              "visitedFiberCount": 9804,
+              "scopeCount": 765,
+              "fiberLimit": 30000,
+              "elapsedMs": 479
+            },
+            "lastSettledScopeScan": {
+              "status": "complete",
+              "visitedFiberCount": 9804,
+              "scopeCount": 765,
+              "fiberLimit": 30000,
+              "elapsedMs": 479
+            },
+            "schedulerCapabilities": {
+              "messageChannelAvailable": true
+            },
+            "ownershipStatus": "unverified",
+            "reconciliation": {
+              "status": "unverified",
+              "managed": true,
+              "patchedScopes": 0,
+              "restoredScopes": 0,
+              "refusalReason": "renderer_scope_snapshot_unverified",
+              "ownerScopeCount": 0,
+              "ownerFailureCounts": {
+                "scope_contract": 0,
+                "node_unavailable": 0,
+                "node_client_absent": 0,
+                "node_client_accessor": 0,
+                "node_client_uninitialized": 0,
+                "client_mismatch": 0,
+                "client_methods_unavailable": 0,
+                "cache_unavailable": 0,
+                "scope_read_failed": 0,
+                "inventory_empty": 0,
+                "inventory_capped": 0,
+                "inventory_read_failed": 0,
+                "owner_snapshot_unverified": 0
+              }
+            }
+          },
+          "modelObservations": {
+            "renderedMenuVerified": false,
+            "queryRowsVerified": false,
+            "truncated": false,
+            "unavailable": true,
+            "unavailableReasons": [
+              "runtime_not_current"
+            ],
+            "rows": [
+              {
+                "model": "gpt-6.1-sol-sublyx",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "gpt-6-astra-sublyx",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "gpt-6-luna-sublyx",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "gpt-6-sol-sublyx",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "gpt-5.6-luna-sublyx",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "gpt-5.6-sol-sublyx",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "gpt-5.6-terra-sublyx",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "gpt-5.6-openai-compact",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "gpt-6",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "gpt-6.1-terra",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "gpt-5.6",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "gpt-image-2.6-flare",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "gpt-image-2.6-sunburst",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "claude-fable-5-1-zmhub",
+                "expectedEfforts": [],
+                "observedEfforts": [],
+                "nativeVisibleEfforts": [],
+                "missingEfforts": []
+              },
+              {
+                "model": "gpt-6.1-sol-zmhub",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "gpt-6-astra-zmhub",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "claude-fable-5-1-s1a",
+                "expectedEfforts": [],
+                "observedEfforts": [],
+                "nativeVisibleEfforts": [],
+                "missingEfforts": []
+              },
+              {
+                "model": "claude-opus-5-5",
+                "expectedEfforts": [],
+                "observedEfforts": [],
+                "nativeVisibleEfforts": [],
+                "missingEfforts": []
+              },
+              {
+                "model": "claude-sonnet-5-5",
+                "expectedEfforts": [],
+                "observedEfforts": [],
+                "nativeVisibleEfforts": [],
+                "missingEfforts": []
+              },
+              {
+                "model": "gpt-6.1-sol-s1a",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "cohere/north-mini-code:free",
+                "expectedEfforts": [],
+                "observedEfforts": [
+                  "none",
+                  "medium"
+                ],
+                "nativeVisibleEfforts": [
+                  "medium"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "dots-studio/dots-3-note-preview:free",
+                "expectedEfforts": [],
+                "observedEfforts": [
+                  "none",
+                  "medium"
+                ],
+                "nativeVisibleEfforts": [
+                  "medium"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "google/gemma-4-26b-a4b-it:free",
+                "expectedEfforts": [],
+                "observedEfforts": [
+                  "none",
+                  "medium"
+                ],
+                "nativeVisibleEfforts": [
+                  "medium"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "google/gemma-4-31b-it:free",
+                "expectedEfforts": [],
+                "observedEfforts": [
+                  "none",
+                  "medium"
+                ],
+                "nativeVisibleEfforts": [
+                  "medium"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "nvidia/nemotron-3.5-lightning:free",
+                "expectedEfforts": [],
+                "observedEfforts": [
+                  "none",
+                  "medium"
+                ],
+                "nativeVisibleEfforts": [
+                  "medium"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+                "expectedEfforts": [],
+                "observedEfforts": [],
+                "nativeVisibleEfforts": [],
+                "missingEfforts": []
+              },
+              {
+                "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+                "expectedEfforts": [
+                  "medium",
+                  "high"
+                ],
+                "observedEfforts": [
+                  "medium",
+                  "high"
+                ],
+                "nativeVisibleEfforts": [
+                  "medium",
+                  "high"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "openrouter/free",
+                "expectedEfforts": [],
+                "observedEfforts": [],
+                "nativeVisibleEfforts": [],
+                "missingEfforts": []
+              },
+              {
+                "model": "~deepseek/deepseek-flash-latest",
+                "expectedEfforts": [
+                  "low",
+                  "high",
+                  "max"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "high",
+                  "max"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "high"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "liquid/lfm-3-1.7b:free",
+                "expectedEfforts": [],
+                "observedEfforts": [],
+                "nativeVisibleEfforts": [],
+                "missingEfforts": []
+              },
+              {
+                "model": "minimax/minimax-m3",
+                "expectedEfforts": [],
+                "observedEfforts": [
+                  "none",
+                  "medium"
+                ],
+                "nativeVisibleEfforts": [
+                  "medium"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "minimax/minimax-m3.1-flash",
+                "expectedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "nvidia/nemotron-3.5-super-vl:free",
+                "expectedEfforts": [],
+                "observedEfforts": [
+                  "none",
+                  "medium"
+                ],
+                "nativeVisibleEfforts": [
+                  "medium"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "recursive/flint-v1.0:free",
+                "expectedEfforts": [],
+                "observedEfforts": [],
+                "nativeVisibleEfforts": [],
+                "missingEfforts": []
+              },
+              {
+                "model": "thinkingmachines/inkling-2-small:free",
+                "expectedEfforts": [
+                  "minimal",
+                  "low",
+                  "medium",
+                  "high",
+                  "max"
+                ],
+                "observedEfforts": [
+                  "minimal",
+                  "low",
+                  "medium",
+                  "high",
+                  "max"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "medium",
+                  "high"
+                ],
+                "missingEfforts": [
+                  "minimal",
+                  "max"
+                ]
+              },
+              {
+                "model": "xiaomi/mimo-v2.6-flash",
+                "expectedEfforts": [],
+                "observedEfforts": [
+                  "none",
+                  "medium"
+                ],
+                "nativeVisibleEfforts": [
+                  "medium"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "xiaomi/mimo-v2.6-pro",
+                "expectedEfforts": [],
+                "observedEfforts": [
+                  "none",
+                  "medium"
+                ],
+                "nativeVisibleEfforts": [
+                  "medium"
+                ],
+                "missingEfforts": []
+              },
+              {
+                "model": "~deepseek/deepseek-pro-latest",
+                "expectedEfforts": [
+                  "low",
+                  "high",
+                  "max"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "high",
+                  "max"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "high"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              },
+              {
+                "model": "~deepseek/deepseek-v4-flash-latest",
+                "expectedEfforts": [
+                  "low",
+                  "high",
+                  "max"
+                ],
+                "observedEfforts": [
+                  "low",
+                  "high",
+                  "max"
+                ],
+                "nativeVisibleEfforts": [
+                  "low",
+                  "high"
+                ],
+                "missingEfforts": [
+                  "max"
+                ]
+              }
+            ]
+          }
+        },
+        "status": "inspected"
+      }
+    ],
+    "sampling": {
+      "scope": "same_pinned_target_session",
+      "requestedSampleCount": 3,
+      "intervalMs": 1000,
+      "complete": true,
+      "ownershipVerified": true,
+      "renderedMenuVerified": false,
+      "targetId": "d9d57fff8d7f1dc76fc32098e92ebdad",
+      "targetRef": "sha256-267411a0d920f68f024d0b904c9ba07877b12c18fe1b16799b20b862e4b5d760",
+      "samples": [
+        {
+          "index": 1,
+          "elapsedMs": 14,
+          "inspection": {
+            "runtimeInstalled": true,
+            "expectedRuntimeFingerprint": "sha256-4dc164bae9130aed2719091cf4641f74661bcecfcb1850e9fef508282e752929",
+            "installedRuntimeFingerprint": "sha256-44a79b8a9e351b5da7c5da212f7abc80b44cee2ac18b9cebe895c7a2c811bb4a",
+            "fingerprintMatches": false,
+            "runtimeStatus": "mismatch",
+            "renderedMenuVerified": false,
+            "catalog": {
+              "available": true,
+              "declaredOnly": true,
+              "truncated": false,
+              "models": [
+                {
+                  "model": "gpt-6.1-sol-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6-astra-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6-luna-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6-sol-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-luna-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-sol-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-terra-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-openai-compact",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6.1-terra",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-image-2.6-flare",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-image-2.6-sunburst",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "claude-fable-5-1-zmhub",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "gpt-6.1-sol-zmhub",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6-astra-zmhub",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "claude-fable-5-1-s1a",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "claude-opus-5-5",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "claude-sonnet-5-5",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "gpt-6.1-sol-s1a",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "cohere/north-mini-code:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "dots-studio/dots-3-note-preview:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "google/gemma-4-26b-a4b-it:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "google/gemma-4-31b-it:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "nvidia/nemotron-3.5-lightning:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+                  "declaredEfforts": [
+                    "medium",
+                    "high"
+                  ]
+                },
+                {
+                  "model": "openrouter/free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "~deepseek/deepseek-flash-latest",
+                  "declaredEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ]
+                },
+                {
+                  "model": "liquid/lfm-3-1.7b:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "minimax/minimax-m3",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "minimax/minimax-m3.1-flash",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max"
+                  ]
+                },
+                {
+                  "model": "nvidia/nemotron-3.5-super-vl:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "recursive/flint-v1.0:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "thinkingmachines/inkling-2-small:free",
+                  "declaredEfforts": [
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "max"
+                  ]
+                },
+                {
+                  "model": "xiaomi/mimo-v2.6-flash",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "xiaomi/mimo-v2.6-pro",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "~deepseek/deepseek-pro-latest",
+                  "declaredEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ]
+                },
+                {
+                  "model": "~deepseek/deepseek-v4-flash-latest",
+                  "declaredEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ]
+                }
+              ]
+            },
+            "pickerDiagnostics": {
+              "available": true,
+              "status": "unverified",
+              "pickerObserverCount": 3,
+              "successObserverCount": 3,
+              "errorObserverCount": 0,
+              "pendingObserverCount": 0,
+              "unsupportedObserverCount": 0,
+              "unreadableObserverCount": 0,
+              "nativeVisibilityUnverifiedObserverCount": 3,
+              "booleanControlUnverifiedModelCount": 9,
+              "booleanControlReadyModelCount": 0,
+              "effortMismatchCount": 0,
+              "flagMismatchCount": 0,
+              "missingMaxModelCount": 0,
+              "missingUltraModelCount": 0,
+              "selectedMaxModelCount": 16,
+              "selectedUltraModelCount": 16
+            },
+            "mountedReasoningLabels": {
+              "available": true,
+              "truncated": false,
+              "renderedMenuVerified": false,
+              "rows": [
+                {
+                  "effort": "none",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "minimal",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "low",
+                  "labelMatches": false,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "medium",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "high",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "xhigh",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "max",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "ultra",
+                  "labelMatches": true,
+                  "opacityState": "one"
+                }
+              ]
+            },
+            "nativePowerSelections": {
+              "available": false,
+              "truncated": false,
+              "renderedMenuVerified": false,
+              "rows": [],
+              "refusalReasons": [
+                "runtime_not_current"
+              ]
+            },
+            "nativeVisibility": {
+              "required": true,
+              "atomCount": 1,
+              "scopeScanComplete": true,
+              "scopeCandidateCount": 765,
+              "scopeScan": {
+                "status": "complete",
+                "visitedFiberCount": 9804,
+                "scopeCount": 765,
+                "fiberLimit": 30000,
+                "elapsedMs": 445
+              },
+              "lastSettledScopeScan": {
+                "status": "complete",
+                "visitedFiberCount": 9804,
+                "scopeCount": 765,
+                "fiberLimit": 30000,
+                "elapsedMs": 445
+              },
+              "schedulerCapabilities": {
+                "messageChannelAvailable": true
+              },
+              "ownershipStatus": "unverified",
+              "reconciliation": {
+                "status": "unverified",
+                "managed": true,
+                "patchedScopes": 0,
+                "restoredScopes": 765,
+                "refusalReason": "renderer_scope_snapshot_unverified",
+                "ownerScopeCount": 0,
+                "ownerFailureCounts": {
+                  "scope_contract": 0,
+                  "node_unavailable": 0,
+                  "node_client_absent": 0,
+                  "node_client_accessor": 0,
+                  "node_client_uninitialized": 0,
+                  "client_mismatch": 0,
+                  "client_methods_unavailable": 0,
+                  "cache_unavailable": 0,
+                  "scope_read_failed": 0,
+                  "inventory_empty": 0,
+                  "inventory_capped": 0,
+                  "inventory_read_failed": 0,
+                  "owner_snapshot_unverified": 0
+                }
+              }
+            },
+            "modelObservations": {
+              "renderedMenuVerified": false,
+              "queryRowsVerified": false,
+              "truncated": false,
+              "unavailable": true,
+              "unavailableReasons": [
+                "native_owner_unverified",
+                "native_visibility_unverified",
+                "no_verified_query_rows",
+                "runtime_not_current"
+              ],
+              "rows": []
+            }
+          }
+        },
+        {
+          "index": 2,
+          "elapsedMs": 1037,
+          "inspection": {
+            "runtimeInstalled": true,
+            "expectedRuntimeFingerprint": "sha256-4dc164bae9130aed2719091cf4641f74661bcecfcb1850e9fef508282e752929",
+            "installedRuntimeFingerprint": "sha256-44a79b8a9e351b5da7c5da212f7abc80b44cee2ac18b9cebe895c7a2c811bb4a",
+            "fingerprintMatches": false,
+            "runtimeStatus": "mismatch",
+            "renderedMenuVerified": false,
+            "catalog": {
+              "available": true,
+              "declaredOnly": true,
+              "truncated": false,
+              "models": [
+                {
+                  "model": "gpt-6.1-sol-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6-astra-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6-luna-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6-sol-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-luna-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-sol-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-terra-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-openai-compact",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6.1-terra",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-image-2.6-flare",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-image-2.6-sunburst",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "claude-fable-5-1-zmhub",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "gpt-6.1-sol-zmhub",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6-astra-zmhub",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "claude-fable-5-1-s1a",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "claude-opus-5-5",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "claude-sonnet-5-5",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "gpt-6.1-sol-s1a",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "cohere/north-mini-code:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "dots-studio/dots-3-note-preview:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "google/gemma-4-26b-a4b-it:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "google/gemma-4-31b-it:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "nvidia/nemotron-3.5-lightning:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+                  "declaredEfforts": [
+                    "medium",
+                    "high"
+                  ]
+                },
+                {
+                  "model": "openrouter/free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "~deepseek/deepseek-flash-latest",
+                  "declaredEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ]
+                },
+                {
+                  "model": "liquid/lfm-3-1.7b:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "minimax/minimax-m3",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "minimax/minimax-m3.1-flash",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max"
+                  ]
+                },
+                {
+                  "model": "nvidia/nemotron-3.5-super-vl:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "recursive/flint-v1.0:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "thinkingmachines/inkling-2-small:free",
+                  "declaredEfforts": [
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "max"
+                  ]
+                },
+                {
+                  "model": "xiaomi/mimo-v2.6-flash",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "xiaomi/mimo-v2.6-pro",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "~deepseek/deepseek-pro-latest",
+                  "declaredEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ]
+                },
+                {
+                  "model": "~deepseek/deepseek-v4-flash-latest",
+                  "declaredEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ]
+                }
+              ]
+            },
+            "pickerDiagnostics": {
+              "available": true,
+              "status": "unverified",
+              "pickerObserverCount": 3,
+              "successObserverCount": 3,
+              "errorObserverCount": 0,
+              "pendingObserverCount": 0,
+              "unsupportedObserverCount": 0,
+              "unreadableObserverCount": 0,
+              "nativeVisibilityUnverifiedObserverCount": 3,
+              "booleanControlUnverifiedModelCount": 9,
+              "booleanControlReadyModelCount": 0,
+              "effortMismatchCount": 0,
+              "flagMismatchCount": 0,
+              "missingMaxModelCount": 0,
+              "missingUltraModelCount": 0,
+              "selectedMaxModelCount": 16,
+              "selectedUltraModelCount": 16
+            },
+            "mountedReasoningLabels": {
+              "available": true,
+              "truncated": false,
+              "renderedMenuVerified": false,
+              "rows": [
+                {
+                  "effort": "none",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "minimal",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "low",
+                  "labelMatches": false,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "medium",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "high",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "xhigh",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "max",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "ultra",
+                  "labelMatches": true,
+                  "opacityState": "one"
+                }
+              ]
+            },
+            "nativePowerSelections": {
+              "available": false,
+              "truncated": false,
+              "renderedMenuVerified": false,
+              "rows": [],
+              "refusalReasons": [
+                "runtime_not_current"
+              ]
+            },
+            "nativeVisibility": {
+              "required": true,
+              "atomCount": 1,
+              "scopeScanComplete": true,
+              "scopeCandidateCount": 765,
+              "scopeScan": {
+                "status": "complete",
+                "visitedFiberCount": 9804,
+                "scopeCount": 765,
+                "fiberLimit": 30000,
+                "elapsedMs": 455
+              },
+              "lastSettledScopeScan": {
+                "status": "complete",
+                "visitedFiberCount": 9804,
+                "scopeCount": 765,
+                "fiberLimit": 30000,
+                "elapsedMs": 455
+              },
+              "schedulerCapabilities": {
+                "messageChannelAvailable": true
+              },
+              "ownershipStatus": "unverified",
+              "reconciliation": {
+                "status": "unverified",
+                "managed": true,
+                "patchedScopes": 0,
+                "restoredScopes": 0,
+                "refusalReason": "renderer_scope_snapshot_unverified",
+                "ownerScopeCount": 0,
+                "ownerFailureCounts": {
+                  "scope_contract": 0,
+                  "node_unavailable": 0,
+                  "node_client_absent": 0,
+                  "node_client_accessor": 0,
+                  "node_client_uninitialized": 0,
+                  "client_mismatch": 0,
+                  "client_methods_unavailable": 0,
+                  "cache_unavailable": 0,
+                  "scope_read_failed": 0,
+                  "inventory_empty": 0,
+                  "inventory_capped": 0,
+                  "inventory_read_failed": 0,
+                  "owner_snapshot_unverified": 0
+                }
+              }
+            },
+            "modelObservations": {
+              "renderedMenuVerified": false,
+              "queryRowsVerified": false,
+              "truncated": false,
+              "unavailable": true,
+              "unavailableReasons": [
+                "native_owner_unverified",
+                "native_visibility_unverified",
+                "no_verified_query_rows",
+                "runtime_not_current"
+              ],
+              "rows": []
+            }
+          }
+        },
+        {
+          "index": 3,
+          "elapsedMs": 2429,
+          "inspection": {
+            "runtimeInstalled": true,
+            "expectedRuntimeFingerprint": "sha256-4dc164bae9130aed2719091cf4641f74661bcecfcb1850e9fef508282e752929",
+            "installedRuntimeFingerprint": "sha256-44a79b8a9e351b5da7c5da212f7abc80b44cee2ac18b9cebe895c7a2c811bb4a",
+            "fingerprintMatches": false,
+            "runtimeStatus": "mismatch",
+            "renderedMenuVerified": false,
+            "catalog": {
+              "available": true,
+              "declaredOnly": true,
+              "truncated": false,
+              "models": [
+                {
+                  "model": "gpt-6.1-sol-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6-astra-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6-luna-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6-sol-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-luna-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-sol-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-terra-sublyx",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-openai-compact",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6.1-terra",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-image-2.6-flare",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-image-2.6-sunburst",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "claude-fable-5-1-zmhub",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "gpt-6.1-sol-zmhub",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "gpt-6-astra-zmhub",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "claude-fable-5-1-s1a",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "claude-opus-5-5",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "claude-sonnet-5-5",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "gpt-6.1-sol-s1a",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ]
+                },
+                {
+                  "model": "cohere/north-mini-code:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "dots-studio/dots-3-note-preview:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "google/gemma-4-26b-a4b-it:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "google/gemma-4-31b-it:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "nvidia/nemotron-3.5-lightning:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+                  "declaredEfforts": [
+                    "medium",
+                    "high"
+                  ]
+                },
+                {
+                  "model": "openrouter/free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "~deepseek/deepseek-flash-latest",
+                  "declaredEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ]
+                },
+                {
+                  "model": "liquid/lfm-3-1.7b:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "minimax/minimax-m3",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "minimax/minimax-m3.1-flash",
+                  "declaredEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max"
+                  ]
+                },
+                {
+                  "model": "nvidia/nemotron-3.5-super-vl:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "recursive/flint-v1.0:free",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "thinkingmachines/inkling-2-small:free",
+                  "declaredEfforts": [
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "max"
+                  ]
+                },
+                {
+                  "model": "xiaomi/mimo-v2.6-flash",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "xiaomi/mimo-v2.6-pro",
+                  "declaredEfforts": []
+                },
+                {
+                  "model": "~deepseek/deepseek-pro-latest",
+                  "declaredEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ]
+                },
+                {
+                  "model": "~deepseek/deepseek-v4-flash-latest",
+                  "declaredEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ]
+                }
+              ]
+            },
+            "pickerDiagnostics": {
+              "available": true,
+              "status": "mismatch",
+              "pickerObserverCount": 3,
+              "successObserverCount": 3,
+              "errorObserverCount": 0,
+              "pendingObserverCount": 0,
+              "unsupportedObserverCount": 0,
+              "unreadableObserverCount": 0,
+              "nativeVisibilityUnverifiedObserverCount": 0,
+              "booleanControlUnverifiedModelCount": 9,
+              "booleanControlReadyModelCount": 0,
+              "effortMismatchCount": 16,
+              "flagMismatchCount": 0,
+              "missingMaxModelCount": 16,
+              "missingUltraModelCount": 0,
+              "selectedMaxModelCount": 16,
+              "selectedUltraModelCount": 16
+            },
+            "mountedReasoningLabels": {
+              "available": true,
+              "truncated": false,
+              "renderedMenuVerified": false,
+              "rows": [
+                {
+                  "effort": "none",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "minimal",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "low",
+                  "labelMatches": false,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "medium",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "high",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "xhigh",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "max",
+                  "labelMatches": true,
+                  "opacityState": "zero"
+                },
+                {
+                  "effort": "ultra",
+                  "labelMatches": true,
+                  "opacityState": "one"
+                }
+              ]
+            },
+            "nativePowerSelections": {
+              "available": false,
+              "truncated": false,
+              "renderedMenuVerified": false,
+              "rows": [],
+              "refusalReasons": [
+                "runtime_not_current"
+              ]
+            },
+            "nativeVisibility": {
+              "required": true,
+              "atomCount": 1,
+              "scopeScanComplete": true,
+              "scopeCandidateCount": 765,
+              "scopeScan": {
+                "status": "complete",
+                "visitedFiberCount": 9804,
+                "scopeCount": 765,
+                "fiberLimit": 30000,
+                "elapsedMs": 479
+              },
+              "lastSettledScopeScan": {
+                "status": "complete",
+                "visitedFiberCount": 9804,
+                "scopeCount": 765,
+                "fiberLimit": 30000,
+                "elapsedMs": 479
+              },
+              "schedulerCapabilities": {
+                "messageChannelAvailable": true
+              },
+              "ownershipStatus": "unverified",
+              "reconciliation": {
+                "status": "unverified",
+                "managed": true,
+                "patchedScopes": 0,
+                "restoredScopes": 0,
+                "refusalReason": "renderer_scope_snapshot_unverified",
+                "ownerScopeCount": 0,
+                "ownerFailureCounts": {
+                  "scope_contract": 0,
+                  "node_unavailable": 0,
+                  "node_client_absent": 0,
+                  "node_client_accessor": 0,
+                  "node_client_uninitialized": 0,
+                  "client_mismatch": 0,
+                  "client_methods_unavailable": 0,
+                  "cache_unavailable": 0,
+                  "scope_read_failed": 0,
+                  "inventory_empty": 0,
+                  "inventory_capped": 0,
+                  "inventory_read_failed": 0,
+                  "owner_snapshot_unverified": 0
+                }
+              }
+            },
+            "modelObservations": {
+              "renderedMenuVerified": false,
+              "queryRowsVerified": false,
+              "truncated": false,
+              "unavailable": true,
+              "unavailableReasons": [
+                "runtime_not_current"
+              ],
+              "rows": [
+                {
+                  "model": "gpt-6.1-sol-sublyx",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "gpt-6-astra-sublyx",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "gpt-6-luna-sublyx",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "gpt-6-sol-sublyx",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-luna-sublyx",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-sol-sublyx",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-terra-sublyx",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6-openai-compact",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "gpt-6",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "gpt-6.1-terra",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "gpt-5.6",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "gpt-image-2.6-flare",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "gpt-image-2.6-sunburst",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "claude-fable-5-1-zmhub",
+                  "expectedEfforts": [],
+                  "observedEfforts": [],
+                  "nativeVisibleEfforts": [],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "gpt-6.1-sol-zmhub",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "gpt-6-astra-zmhub",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "claude-fable-5-1-s1a",
+                  "expectedEfforts": [],
+                  "observedEfforts": [],
+                  "nativeVisibleEfforts": [],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "claude-opus-5-5",
+                  "expectedEfforts": [],
+                  "observedEfforts": [],
+                  "nativeVisibleEfforts": [],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "claude-sonnet-5-5",
+                  "expectedEfforts": [],
+                  "observedEfforts": [],
+                  "nativeVisibleEfforts": [],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "gpt-6.1-sol-s1a",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "ultra"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "cohere/north-mini-code:free",
+                  "expectedEfforts": [],
+                  "observedEfforts": [
+                    "none",
+                    "medium"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "medium"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "dots-studio/dots-3-note-preview:free",
+                  "expectedEfforts": [],
+                  "observedEfforts": [
+                    "none",
+                    "medium"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "medium"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "google/gemma-4-26b-a4b-it:free",
+                  "expectedEfforts": [],
+                  "observedEfforts": [
+                    "none",
+                    "medium"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "medium"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "google/gemma-4-31b-it:free",
+                  "expectedEfforts": [],
+                  "observedEfforts": [
+                    "none",
+                    "medium"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "medium"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "nvidia/nemotron-3.5-lightning:free",
+                  "expectedEfforts": [],
+                  "observedEfforts": [
+                    "none",
+                    "medium"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "medium"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+                  "expectedEfforts": [],
+                  "observedEfforts": [],
+                  "nativeVisibleEfforts": [],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+                  "expectedEfforts": [
+                    "medium",
+                    "high"
+                  ],
+                  "observedEfforts": [
+                    "medium",
+                    "high"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "medium",
+                    "high"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "openrouter/free",
+                  "expectedEfforts": [],
+                  "observedEfforts": [],
+                  "nativeVisibleEfforts": [],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "~deepseek/deepseek-flash-latest",
+                  "expectedEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "high"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "liquid/lfm-3-1.7b:free",
+                  "expectedEfforts": [],
+                  "observedEfforts": [],
+                  "nativeVisibleEfforts": [],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "minimax/minimax-m3",
+                  "expectedEfforts": [],
+                  "observedEfforts": [
+                    "none",
+                    "medium"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "medium"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "minimax/minimax-m3.1-flash",
+                  "expectedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "nvidia/nemotron-3.5-super-vl:free",
+                  "expectedEfforts": [],
+                  "observedEfforts": [
+                    "none",
+                    "medium"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "medium"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "recursive/flint-v1.0:free",
+                  "expectedEfforts": [],
+                  "observedEfforts": [],
+                  "nativeVisibleEfforts": [],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "thinkingmachines/inkling-2-small:free",
+                  "expectedEfforts": [
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "max"
+                  ],
+                  "observedEfforts": [
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "max"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "medium",
+                    "high"
+                  ],
+                  "missingEfforts": [
+                    "minimal",
+                    "max"
+                  ]
+                },
+                {
+                  "model": "xiaomi/mimo-v2.6-flash",
+                  "expectedEfforts": [],
+                  "observedEfforts": [
+                    "none",
+                    "medium"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "medium"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "xiaomi/mimo-v2.6-pro",
+                  "expectedEfforts": [],
+                  "observedEfforts": [
+                    "none",
+                    "medium"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "medium"
+                  ],
+                  "missingEfforts": []
+                },
+                {
+                  "model": "~deepseek/deepseek-pro-latest",
+                  "expectedEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "high"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                },
+                {
+                  "model": "~deepseek/deepseek-v4-flash-latest",
+                  "expectedEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ],
+                  "observedEfforts": [
+                    "low",
+                    "high",
+                    "max"
+                  ],
+                  "nativeVisibleEfforts": [
+                    "low",
+                    "high"
+                  ],
+                  "missingEfforts": [
+                    "max"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  "verifiedAtUtc": "2026-11-17T04:59:31.392Z"
+}

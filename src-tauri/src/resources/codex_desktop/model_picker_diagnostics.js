@@ -52,6 +52,44 @@ const codexPickerModelSnapshot = (model) => {
   }
   return snapshot;
 };
+const codexPickerCatalogHasOnlyNonGradedControls = (catalog) => {
+  if (
+    state.catalogReleased === true ||
+    catalog.catalogReleased === true ||
+    typeof catalog.modelProvider !== "string" ||
+    !catalog.modelProvider.trim() ||
+    catalog.modelProvider.trim() === "openai"
+  )
+    return false;
+  try {
+    const names = modelNames();
+    return (
+      names.length > 0 &&
+      names.every((name) => {
+        const descriptor = descriptorFor(name);
+        if (descriptor.ccSwitchReasoningControl?.kind === "boolean")
+          return true;
+        const row = catalogRowForName(name);
+        if (codexPickerOwnData(row, "ccSwitchReasoningControl") !== undefined)
+          return false;
+        const levels = codexPickerDataArray(
+          codexPickerOwnData(row, "supported_reasoning_levels"),
+        );
+        const control =
+          descriptor.reasoning?.controlKind ??
+          descriptor.reasoning?.control_kind;
+        return (
+          levels?.length === 0 &&
+          descriptor.supportedReasoningEfforts.length === 0 &&
+          (control === undefined ||
+            ["none", "budget", "fixed"].includes(control))
+        );
+      })
+    );
+  } catch {
+    return false;
+  }
+};
 const codexModelPickerDiagnostics = (options) => {
   let includeModelObservations = false;
   try {
@@ -128,31 +166,39 @@ const codexModelPickerDiagnostics = (options) => {
   const booleanReadyModels = new Set();
   const booleanUnverifiedModels = new Set();
   const booleanNotObservedModels = new Set();
+  let currentBooleanSelections;
   // Keep old hooks for orderly release, but a complete current owner snapshot
   // can exclude orphaned cache observers from readiness after navigation. An
   // incomplete/unloaded snapshot is unknown, never an authoritative empty set.
-  const currentNativeCaches =
+  const ownerProof =
     state.nativeReasoningVisibilityRequired === true &&
-    typeof codexCurrentNativeReasoningQueryCaches === "function"
-      ? codexCurrentNativeReasoningQueryCaches()
+    typeof codexCurrentNativeReasoningOwnerProof === "function"
+      ? codexCurrentNativeReasoningOwnerProof()
       : null;
+  const currentNativeCaches = ownerProof?.caches ?? null;
   const nativeVisibilityPending =
     state.nativeReasoningVisibilityRequired === true &&
     !authoritativeEmptyCatalog &&
     currentNativeCaches === null &&
     state.scopedAppServerScopeScanComplete === false;
+  // Prove current cache ownership independently. An explicitly non-graded
+  // catalog has no native effort menu to check, while Boolean controls still
+  // need their own proof below.
+  const nativeProofRequired =
+    state.nativeReasoningVisibilityRequired === true &&
+    !authoritativeEmptyCatalog &&
+    (currentNativeCaches === null ||
+      !codexPickerCatalogHasOnlyNonGradedControls(catalog));
   if (modelObservations && !currentNativeCaches)
     observationUnavailable("native_owner_unverified");
   for (const cache of state.reasoningQueryCaches?.keys() || []) {
     if (currentNativeCaches && !currentNativeCaches.has(cache)) continue;
     let nativeVisibility = {
-      status:
-        state.nativeReasoningVisibilityRequired === true &&
-        !authoritativeEmptyCatalog
-          ? nativeVisibilityPending
-            ? "pending"
-            : "unverified"
-          : "not_required",
+      status: nativeProofRequired
+        ? nativeVisibilityPending
+          ? "pending"
+          : "unverified"
+        : "not_required",
       missingEfforts: [],
     };
     let nativeHiddenEfforts = new Set();
@@ -176,11 +222,7 @@ const codexModelPickerDiagnostics = (options) => {
         return false;
       }
     });
-    if (
-      hasManagedQuery &&
-      state.nativeReasoningVisibilityRequired === true &&
-      !authoritativeEmptyCatalog
-    ) {
+    if (hasManagedQuery && nativeProofRequired) {
       // A null current-owner snapshot is unknown, never permission to trust an
       // older cache. Avoid reading the native signal at all for caches with no
       // managed local picker query (remote/empty owners remain Pending).
@@ -200,7 +242,11 @@ const codexModelPickerDiagnostics = (options) => {
                   ),
                 ),
               );
-          nativeVisibility = readCodexNativeReasoningVisibility(cache, efforts);
+          nativeVisibility = readCodexNativeReasoningVisibility(
+            cache,
+            efforts,
+            ownerProof,
+          );
         } catch {}
       }
       nativeHiddenEfforts = new Set(nativeVisibility.missingEfforts);
@@ -283,13 +329,23 @@ const codexModelPickerDiagnostics = (options) => {
             const control = descriptor.ccSwitchReasoningControl;
             if (control?.kind === "boolean") {
               try {
+                if (currentBooleanSelections === undefined) {
+                  const readSelections = codexPickerOwnData(
+                    state,
+                    "readNativeBooleanReasoningSelectionDiagnostics",
+                  );
+                  currentBooleanSelections =
+                    typeof readSelections === "function"
+                      ? (readSelections() ?? null)
+                      : null;
+                }
                 const readControl = codexPickerOwnData(
                   state,
                   "readNativeBooleanReasoningControlDiagnostics",
                 );
                 const proof =
                   typeof readControl === "function"
-                    ? readControl(row.model)
+                    ? readControl(row.model, currentBooleanSelections)
                     : null;
                 const visibleStates = codexPickerDataArray(
                   codexPickerOwnData(proof, "visibleStates"),
@@ -309,7 +365,10 @@ const codexModelPickerDiagnostics = (options) => {
                       control.disableAllowed ? ["off", "on"] : ["on"],
                     );
                 if (binaryUiReady) booleanReadyModels.add(row.model);
-                else if (codexPickerOwnData(proof, "status") === "not_observed")
+                else if (
+                  codexPickerOwnData(proof, "status") === "not_observed" ||
+                  codexPickerOwnData(proof, "status") === "not_active"
+                )
                   booleanNotObservedModels.add(row.model);
                 else booleanUnverifiedModels.add(row.model);
               } catch (error) {
@@ -465,3 +524,4 @@ const codexModelPickerDiagnostics = (options) => {
     diagnostics.status = "ready";
   return finishDiagnostics();
 };
+Object.defineProperty(codexModelPickerDiagnostics, "readOnly", { value: true });

@@ -191,49 +191,73 @@ owner tablet/laptop browser
   -> exact owner-selected conversation
 ```
 
-These steps describe the new source, not a claim that an older installed binary
-already has the settings panel:
+Keep the host online with CCSwitch and a compatible, accessible Codex runtime.
+Keep OS lock and security policies in effect. Each remote device needs its own
+access to the private network. These steps describe the current source. Live
+verification of this Tailscale setup and access from another device are pending.
 
-1. Keep the host online with CCSwitch and a compatible, accessible Codex runtime.
-   Do not disable OS lock/security policy to make access work.
-2. Configure private-network access on the host and the tablet/laptop. Tailscale
-   Serve is the reference deployment; the remote device also needs the private
-   network client/account access. This is not a VPN-free public website.
-3. Configure the host's private HTTPS proxy. The settings panel shows this
-   reference command; no firewall/router changes are made by CCSwitch:
+### Connect with Tailscale
+
+1. Open **Settings → Connections & recovery → Remote connection (owner access)**
+   or use the shortcut at the top of General. Click **Connect with Tailscale**.
+2. If Tailscale is missing on Windows, CCSwitch requests a silent install of
+   the official `Tailscale.Tailscale` package through WinGet. Complete a Windows
+   administrator prompt if one appears. On other platforms, install the
+   Tailscale client before connecting.
+3. If the host needs to sign in, CCSwitch opens the Tailscale sign-in page in
+   your browser and waits for the host to connect. Complete sign-in there. If
+   your tailnet requires device approval, approve the host in the Tailscale admin
+   console and retry **Connect with Tailscale**.
+4. CCSwitch checks the tailnet hostname and the existing Serve configuration,
+   starts Owner Remote on `127.0.0.1:15723`, then configures or reuses private
+   HTTPS Serve on port `443` for that exact loopback target. If Tailscale asks
+   for HTTPS approval, CCSwitch opens the consent page and waits for you to
+   finish in the browser. A conflicting route or a hostname that differs from
+   the pinned Owner Remote origin stops setup.
+5. CCSwitch requests `/remote/` over HTTPS at that exact origin and checks for
+   the Owner Remote page. **Verified from this computer** means the host could
+   load that page. To verify off-device access, open `/remote/` on a second
+   device signed in to the same tailnet, then follow the enrollment steps below.
+
+### Manual private HTTPS setup
+
+1. Configure the private network on the host and remote device. For manual
+   Tailscale Serve setup, run this on the host:
 
    ```text
    tailscale serve --bg http://127.0.0.1:15723
    ```
 
-   This is the reference Tailscale-first route. Tailscale supplies the private
-   network and Serve supplies the HTTPS website; CCSwitch remains the owner
-   console and Codex bridge. The current audit machine did **not** have the
-   Tailscale CLI or the standard Windows installation path available, so this
-   guide does not claim that the route is installed or reachable yet.
+   Tailscale supplies the private network and Serve supplies the HTTPS website.
+   For a separately operated private HTTPS proxy, point it at the same loopback
+   listener. CCSwitch requires no firewall or router changes for this setup.
 
-4. Open **Settings → Connections & recovery → Remote connection (owner access)**
+2. Open **Settings → Connections & recovery → Remote connection (owner access)**
    (or the shortcut at the top of General). Enter the exact HTTPS origin reported
    by that deployment, for example `https://your-machine.your-tailnet.ts.net`,
    with no path, credentials, query, or fragment. Choose a stable hostname;
    existing passkey trust is not silently rebound to another origin. Once configured,
    the address is read-only here, even while access is off. Changing it requires a
    separate explicit reset and browser re-enrollment.
-5. Turn on the **Remote connection (owner access)** switch, then click
-   **Create one-use enrollment link**. Open
-   that private link on your own tablet/laptop within **60 seconds** and register
-   a passkey there. The link secret is removed from the address/history before
-   the browser makes a request. Do not share or log the link.
-6. Use `https://<configured-host>/remote/`, select the desired conversation, and
+3. Turn on the **Remote connection (owner access)** switch. From another device
+   on the private network, check that `https://<configured-host>/remote/` opens.
+
+### Enroll and use a remote device
+
+1. Click **Create one-use enrollment link**. Open that private link on your own
+   tablet/laptop within **60 seconds** and register a passkey there. The link
+   secret is removed from the address/history before the browser makes a request.
+   Do not share or log the link.
+2. Use `https://<configured-host>/remote/`, select the desired conversation, and
    view the recent snapshot. Continue is available only when the native adapter
    returns a fresh mutation capability and positively proves the exact thread is
    in a supported non-active state with no pending operation: idle, or explicit
    loaded `systemError` with its actual latest turn failed/interrupted. The latter
    remains visibly an error; it is not relabeled idle.
-7. Press Continue once to send the literal user message `continue` to that
+3. Press Continue once to send the literal user message `continue` to that
    conversation. **No person at the unattended host approves this action.**
    A lost acknowledgement is shown as uncertain, not retried.
-8. When the browser session expires, sign in with its passkey **on the remote
+4. When the browser session expires, sign in with its passkey **on the remote
    device**. An enrolled owner can invite/revoke devices while away using
    owner-side passkey reauthentication; that step-up is not required per Continue.
 

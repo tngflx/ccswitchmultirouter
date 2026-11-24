@@ -260,7 +260,7 @@ pub async fn send_request(
     method: http::Method,
     headers: http::HeaderMap,
     original_extensions: http::Extensions,
-    body: Vec<u8>,
+    body: Bytes,
     timeout: std::time::Duration,
     proxy_url: Option<&str>,
 ) -> Result<ProxyResponse, ProxyError> {
@@ -317,7 +317,7 @@ pub async fn send_request(
     let mut req = http::Request::builder()
         .method(method)
         .uri(&uri)
-        .body(http_body_util::Full::new(Bytes::from(body)))
+        .body(http_body_util::Full::new(body))
         .map_err(|e| ProxyError::ForwardFailed(format!("Failed to build request: {e}")))?;
 
     *req.headers_mut() = headers;
@@ -423,8 +423,6 @@ async fn send_raw_request(
     body: &[u8],
     proxy_url: Option<&str>,
 ) -> Result<ProxyResponse, ProxyError> {
-    use tokio::io::AsyncWriteExt;
-
     let scheme = uri.scheme_str().unwrap_or("https");
     let host = uri
         .host()
@@ -434,15 +432,14 @@ async fn send_raw_request(
         .unwrap_or(if scheme == "https" { 443 } else { 80 });
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-    // Build raw HTTP request bytes
-    let raw = build_raw_request(method, path_and_query, headers, original_cases, body);
+    let head = build_raw_request_head(method, path_and_query, headers, original_cases, body.len());
 
     // Establish TCP connection — either direct or through HTTP CONNECT proxy
     let stream = if let Some(proxy) = proxy_url {
         connect_via_proxy(proxy, host, port).await?
     } else {
         ProxyStream::Tcp(
-            tokio::net::TcpStream::connect((host, port))
+            connect_raw_tcp(host, port)
                 .await
                 .map_err(|e| ProxyError::ForwardFailed(format!("TCP connect failed: {e}")))?,
         )
@@ -457,31 +454,43 @@ async fn send_raw_request(
             .await
             .map_err(|e| ProxyError::ForwardFailed(format!("TLS handshake failed: {e}")))?;
 
-        tls_stream
-            .write_all(&raw)
-            .await
-            .map_err(|e| ProxyError::ResponsePending(format!("请求体发送中断: {e}")))?;
-        tls_stream
-            .flush()
-            .await
-            .map_err(|e| ProxyError::ResponsePending(format!("请求体发送后刷新中断: {e}")))?;
+        write_raw_request(&mut tls_stream, &head, body).await?;
 
         let filtered = WriteFilter::new(tls_stream);
         do_hyper_response(filtered, method.clone()).await
     } else {
         let mut stream = stream;
-        stream
-            .write_all(&raw)
-            .await
-            .map_err(|e| ProxyError::ResponsePending(format!("请求体发送中断: {e}")))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| ProxyError::ResponsePending(format!("请求体发送后刷新中断: {e}")))?;
+        write_raw_request(&mut stream, &head, body).await?;
 
         let filtered = WriteFilter::new(stream);
         do_hyper_response(filtered, method.clone()).await
     }
+}
+
+async fn connect_raw_tcp(host: &str, port: u16) -> std::io::Result<tokio::net::TcpStream> {
+    let stream = tokio::net::TcpStream::connect((host, port)).await?;
+    // The request head and borrowed body are separate writes, including over CONNECT.
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
+
+async fn write_raw_request(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    head: &[u8],
+    body: &[u8],
+) -> Result<(), ProxyError> {
+    use tokio::io::AsyncWriteExt;
+
+    for part in [head, body] {
+        stream
+            .write_all(part)
+            .await
+            .map_err(|e| ProxyError::ResponsePending(format!("请求体发送中断: {e}")))?;
+    }
+    stream
+        .flush()
+        .await
+        .map_err(|e| ProxyError::ResponsePending(format!("请求体发送后刷新中断: {e}")))
 }
 
 /// Establish a connection through an HTTP CONNECT proxy tunnel.
@@ -519,7 +528,7 @@ async fn connect_via_proxy(
     };
 
     // Connect to the proxy
-    let tcp = tokio::net::TcpStream::connect((proxy_host, proxy_port))
+    let tcp = connect_raw_tcp(proxy_host, proxy_port)
         .await
         .map_err(|e| ProxyError::ForwardFailed(format!("Proxy TCP connect failed: {e}")))?;
 
@@ -623,15 +632,15 @@ fn global_tls_connector() -> &'static tokio_rustls::TlsConnector {
     })
 }
 
-/// Build raw HTTP/1.1 request bytes with original header casing.
-fn build_raw_request(
+/// Build the HTTP/1.1 request head with original header casing.
+fn build_raw_request_head(
     method: &http::Method,
     path_and_query: &str,
     headers: &http::HeaderMap,
     original_cases: &OriginalHeaderCases,
-    body: &[u8],
+    body_len: usize,
 ) -> Vec<u8> {
-    let mut raw = Vec::with_capacity(4096 + body.len());
+    let mut raw = Vec::with_capacity(4096);
 
     // Request line
     raw.extend_from_slice(method.as_str().as_bytes());
@@ -692,13 +701,11 @@ fn build_raw_request(
     // Add Content-Length if not already present
     if !headers.contains_key(http::header::CONTENT_LENGTH) {
         raw.extend_from_slice(b"Content-Length: ");
-        raw.extend_from_slice(body.len().to_string().as_bytes());
+        raw.extend_from_slice(body_len.to_string().as_bytes());
         raw.extend_from_slice(b"\r\n");
     }
 
-    // End of headers + body
     raw.extend_from_slice(b"\r\n");
-    raw.extend_from_slice(body);
 
     raw
 }
@@ -822,6 +829,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_tcp_connector_enables_nodelay_before_tls_or_tunneling() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let stream = connect_raw_tcp("127.0.0.1", listener.local_addr().unwrap().port())
+            .await
+            .unwrap();
+        assert!(stream.nodelay().unwrap());
+    }
+
+    #[tokio::test]
+    async fn raw_transport_completes_short_writes_and_classifies_interrupted_body_as_pending() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let mut received = [0; 8];
+        let (result, read) = tokio::join!(
+            write_raw_request(&mut writer, b"head", b"body"),
+            reader.read_exact(&mut received),
+        );
+        result.unwrap();
+        read.unwrap();
+        assert_eq!(&received, b"headbody");
+
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let (result, ()) = tokio::join!(
+            write_raw_request(&mut writer, b"head", b"body"),
+            async move {
+                let mut prefix = [0; 5];
+                reader.read_exact(&mut prefix).await.unwrap();
+                assert_eq!(&prefix, b"headb");
+                drop(reader);
+            }
+        );
+        assert!(matches!(result, Err(ProxyError::ResponsePending(_))));
+    }
+
+    #[tokio::test]
+    async fn raw_transport_writes_the_original_body_allocation_after_the_exact_header_bytes() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::AsyncWrite;
+
+        #[derive(Default)]
+        struct WriteProbe {
+            writes: Vec<(usize, usize)>,
+            flushes: usize,
+        }
+        impl AsyncWrite for WriteProbe {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                self.writes.push((buf.as_ptr() as usize, buf.len()));
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                self.flushes += 1;
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let body = Bytes::from(vec![b'x'; 1024 * 1024]);
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-test", http::HeaderValue::from_static("one"));
+        let cases = OriginalHeaderCases {
+            cases: vec![("x-test".to_owned(), b"X-TEST".to_vec())],
+        };
+        let head = build_raw_request_head(
+            &http::Method::POST,
+            "/v1/responses?a=1",
+            &headers,
+            &cases,
+            body.len(),
+        );
+        assert_eq!(
+            &head[..],
+            b"POST /v1/responses?a=1 HTTP/1.1\r\nX-TEST: one\r\nContent-Length: 1048576\r\n\r\n"
+        );
+        let mut probe = WriteProbe::default();
+        write_raw_request(&mut probe, &head, &body).await.unwrap();
+        assert_eq!(
+            probe.writes,
+            [
+                (head.as_ptr() as usize, head.len()),
+                (body.as_ptr() as usize, body.len())
+            ]
+        );
+        assert_eq!(probe.flushes, 1);
+    }
+
+    #[tokio::test]
     async fn hyper_fallback_connect_failure_remains_safe_to_retry() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         // Keep a bound, non-listening socket so another fixture cannot claim
@@ -837,7 +946,7 @@ mod tests {
             http::Method::POST,
             http::HeaderMap::new(),
             http::Extensions::new(),
-            b"fixture-body".to_vec(),
+            Bytes::from_static(b"fixture-body"),
             std::time::Duration::from_secs(5),
             None,
         )

@@ -45,10 +45,10 @@ export function useProviderActions(
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
-  const addProviderMutation = useAddProviderMutation(activeApp);
-  const updateProviderMutation = useUpdateProviderMutation(activeApp);
-  const deleteProviderMutation = useDeleteProviderMutation(activeApp);
-  const switchProviderMutation = useSwitchProviderMutation(activeApp);
+  const addProviderMutation = useAddProviderMutation();
+  const updateProviderMutation = useUpdateProviderMutation();
+  const deleteProviderMutation = useDeleteProviderMutation();
+  const switchProviderMutation = useSwitchProviderMutation();
 
   // Claude 插件同步逻辑
   const syncClaudePlugin = useCallback(
@@ -91,7 +91,10 @@ export function useProviderActions(
       },
     ) => {
       const enhanced = injectCodingPlanUsageScript(activeApp, provider);
-      await addProviderMutation.mutateAsync(enhanced);
+      await addProviderMutation.mutateAsync({
+        ...enhanced,
+        appId: activeApp,
+      });
 
       // OpenClaw: register models to allowlist after adding provider
       if (activeApp === "openclaw" && provider.suggestedDefaults) {
@@ -150,6 +153,7 @@ export function useProviderActions(
       teDescriptor?: TeStaticProviderDescriptor,
     ) => {
       const result = await updateProviderMutation.mutateAsync({
+        appId: activeApp,
         provider,
         originalId,
         teDescriptor,
@@ -166,7 +170,7 @@ export function useProviderActions(
       }
       return result;
     },
-    [updateProviderMutation],
+    [activeApp, updateProviderMutation],
   );
 
   // 切换供应商
@@ -312,7 +316,10 @@ export function useProviderActions(
       }
 
       try {
-        const result = await switchProviderMutation.mutateAsync(provider.id);
+        const result = await switchProviderMutation.mutateAsync({
+          appId: activeApp,
+          providerId: provider.id,
+        });
         // Plugin synchronization is an optional post-switch side effect. Keep
         // it out of the provider switch completion path so a slow settings
         // backend cannot hold navigation or the success state hostage.
@@ -390,9 +397,12 @@ export function useProviderActions(
   // 删除供应商
   const deleteProvider = useCallback(
     async (id: string) => {
-      await deleteProviderMutation.mutateAsync(id);
+      await deleteProviderMutation.mutateAsync({
+        appId: activeApp,
+        providerId: id,
+      });
     },
-    [deleteProviderMutation],
+    [activeApp, deleteProviderMutation],
   );
 
   // 保存用量脚本

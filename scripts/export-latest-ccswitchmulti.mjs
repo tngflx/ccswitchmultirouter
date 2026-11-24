@@ -19,10 +19,6 @@ import {
   parseLocalReleaseOptions,
   writeReleaseChecksums,
 } from "./local-release-pipeline.mjs";
-import {
-  createBuildApprovalScope,
-  requireBuildApproval,
-} from "./build-approval.mjs";
 
 const SCRIPT_REPO = fileURLToPath(new URL("../", import.meta.url));
 
@@ -33,7 +29,6 @@ export function parseExportOptions(args) {
   return {
     releaseRoot: local.releaseRoot,
     skipBuild: local.skipBuild,
-    confirmBuild: local.confirmBuild,
     help: local.help,
   };
 }
@@ -63,14 +58,6 @@ export function runExport(
   } = {},
 ) {
   const repo = path.resolve(repoRoot);
-  if (!options.skipBuild) {
-    requireBuildApproval({
-      args: [],
-      environment,
-      operation: "the release export build",
-      allowEnvironmentApproval: true,
-    });
-  }
   const releaseRoot = assertReleaseOutputRoot(
     repo,
     path.resolve(resolveRoot(repo, options.releaseRoot)),
@@ -103,7 +90,6 @@ export function runExport(
         [
           "tauri",
           "build",
-          "--confirm-build",
           "--bundles",
           "nsis",
           "--config",
@@ -152,24 +138,9 @@ export function main(args = process.argv.slice(2), dependencies = {}) {
   const options = parseExportOptions(args);
   if (options.help) {
     console.log(
-      "Usage: node scripts/export-latest-ccswitchmulti.mjs [--confirm-build] [--release-root PATH] [--skip-build]",
+      "Usage: node scripts/export-latest-ccswitchmulti.mjs [--release-root PATH] [--skip-build]",
     );
     return;
-  }
-  if (!options.skipBuild) {
-    requireBuildApproval({
-      args,
-      operation: "the release export build",
-    });
-    const approval = createBuildApprovalScope(dependencies.environment);
-    try {
-      return runExport(options, {
-        ...dependencies,
-        environment: approval.environment,
-      });
-    } finally {
-      approval.cleanup();
-    }
   }
   return runExport(options, dependencies);
 }

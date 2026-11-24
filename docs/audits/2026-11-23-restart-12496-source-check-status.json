@@ -1,0 +1,69 @@
+{
+  "CapturedAtUtc": "2026-11-23T11:22:33.6909666+00:00",
+  "ObserverTestExit": 0,
+  "FormatExit": 0,
+  "FocusedFormatExit": 0,
+  "RunnerTestExit": 0,
+  "ScriptPolicyExit": 0,
+  "DiffExit": 0,
+  "ObserverSourcesStable": true,
+  "ObserverJsSha256": "B4B3E4B8F5036CCB6ED0DF09D4A21428685595273C730246B22955BC8596DAFC",
+  "ObserverTestsSha256": "4641FCBA410C71397D02825C8CF555213968DD18FA489DE8A895783CA7C3696F",
+  "TypecheckExit": 0,
+  "TypecheckCapturedAtUtc": "2026-11-23T11:32:49.935Z",
+  "SourceHashes": {
+    "src-tauri/src/services/session_usage_codex.rs": "c8e81e4ee396e2288fb0a4533b68f10a4c19d6b28da3fcf4e607c12d441d63cd",
+    "src-tauri/src/codex_guardian.rs": "9adf10de05be3552277b1dea118b952953ec6d6952440fcd217317b58152e0db",
+    "scripts/verify-resource-performance.mjs": "0ffa815063e8fff2cb5376aa00def8083c3c92d959201c2c9d50192dae79bd43",
+    "scripts/verify-resource-performance.node-test.mjs": "53d39e8dbe0eb2475453debf24289f70c2a511c2004ddde9d46ad2a1d50b161d",
+    "src-tauri/src/resources/codex_desktop/native_usage_limit_observer.js": "638f41d960c46213f6f288054241f03652f6d0e14c6706001d38ed977b5f375e",
+    "tests/lib/codexDesktopNativeUsageLimitObserver.test.ts": "f3fe5afd6e2de14435ecc66072a0e155abbd044eafa62909fb628c6c430fa0c7"
+  },
+  "ObserverMatchesStableValidation": false,
+  "CatalogVerification": {
+    "exit": 0,
+    "vitestFiles": 18,
+    "vitestTests": 895,
+    "catalogGuardTests": 23,
+    "discoveryGuardTests": 6
+  },
+  "RustBroadScope": {
+    "passed": 377,
+    "failed": 0,
+    "ignored": 1,
+    "ignoredTest": "replay_real_codex_corpus (existing manual real-history audit, not run)",
+    "scope": "services::session_usage_codex + codex_state_db::tests + proxy::codex_subagent_reasoning + codex_multirouter"
+  },
+  "PerformanceVerification": {
+    "passed": 22,
+    "failed": 0
+  },
+  "RustFmtExit": 0,
+  "StrictClippyExit": 0,
+  "ParentChildReasoning": {
+    "maintainedModelSourceMatrix": 10,
+    "parentUltraWireEffort": "max",
+    "childWireEffort": "saved policy, currently high",
+    "savedMediumStillHonored": true,
+    "liveObservationLimitedToLoggedModels": true
+  },
+  "ConcurrentObserverBoundary": "Other writer changed observer implementation; this agent stopped behavior edits and verified stable matching sources afterward. Regression test assertions were not weakened.",
+  "GuardianLintChange": "Only removed two compiler-reported redundant &inner references; same source scans and ownership checks remain.",
+  "DesktopBuildRunRestartInstallReplacementByAgent": false,
+  "AlternateBuildTargetOrOutputDirectoryChosenByAgent": false,
+  "FinalRouterTests": {
+    "passed": 196,
+    "failed": 0,
+    "ignored": 0
+  },
+  "FinalPerformanceTests": {
+    "passed": 22,
+    "failed": 0
+  },
+  "FinalRustFmtExit": 0,
+  "FinalDiffExit": 0,
+  "FinalCapturedAtUtc": "2026-11-23T11:36:47.180Z",
+  "ObserverCurrentMatchesLastStableTest": false,
+  "WholeCheckoutFinalSignoff": false,
+  "RebuildRequested": false
+}

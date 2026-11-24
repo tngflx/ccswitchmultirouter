@@ -21,6 +21,29 @@ const heartbeatEnd = renderer.indexOf(
 if (heartbeatStart < 0 || heartbeatEnd < 0)
   throw new Error("The production picker heartbeat could not be located");
 const heartbeat = renderer.slice(heartbeatStart, heartbeatEnd);
+const initialScanDeclaration = renderer.match(
+  /^  let initialUsageLimitScanPending\s*=[\s\S]*?;\r?$/m,
+)?.[0];
+const initialScanFunctionStart = renderer.indexOf(
+  "  const scanInitialUsageLimitIfReady = () => {",
+);
+const initialScanFunctionEnd = renderer.indexOf(
+  "\n  };",
+  initialScanFunctionStart,
+);
+if (
+  !initialScanDeclaration ||
+  initialScanFunctionStart < 0 ||
+  initialScanFunctionEnd < 0
+)
+  throw new Error(
+    "The production initial usage-limit scan could not be located",
+  );
+const initialUsageLimitScan = `${initialScanDeclaration}\n${renderer.slice(
+  initialScanFunctionStart,
+  initialScanFunctionEnd + "\n  };".length,
+)}`;
+
 const efforts = ["low", "medium", "high", "xhigh", "max", "ultra"];
 const key = ["models", "list", "local", "chatgpt", 100, "router"];
 type Scope = {
@@ -41,6 +64,7 @@ type State = Record<string, unknown> & {
 type Api = {
   patchCodexScopedAppServerClients: (module: object) => Promise<number>;
   installAppServerPatch: () => Promise<void>;
+  scanInitialUsageLimitIfReady: () => void;
 };
 class RequestClient {
   hostId = "local";
@@ -93,6 +117,8 @@ const createHarness = (
     realProjection?: boolean;
     module?: object;
     yieldDiscovery?: () => Promise<void>;
+    observeRecovery?: boolean;
+    localClients?: () => unknown[];
   } = {},
 ) => {
   const state: State = {
@@ -131,6 +157,9 @@ const createHarness = (
   const recordFailure = vi.fn();
   const api = new Function(
     "state",
+    "recoveryOnly",
+    "observeRecovery",
+    "codexContinuationLocalClients",
     "window",
     "document",
     "patchCodexModelReasoningQueryCache",
@@ -148,9 +177,12 @@ const createHarness = (
     "drainPendingReactNodes",
     "scheduleHistoryLineageHydration",
     "appServerRequestPatchVersion",
-    `${discoveryCore}\n${heartbeat}\nreturn { patchCodexScopedAppServerClients, installAppServerPatch };`,
+    `${discoveryCore}\n${initialUsageLimitScan}\n${heartbeat}\nreturn { patchCodexScopedAppServerClients, installAppServerPatch, scanInitialUsageLimitIfReady };`,
   )(
     state,
+    false,
+    options.observeRecovery ?? false,
+    options.localClients ?? (() => []),
     { __codexRoot: { _internalRoot: { current: root } } },
     { getElementById: () => null },
     patchCache,
@@ -189,6 +221,48 @@ const createHarness = (
 
 describe("Codex Desktop scope ownership and production heartbeat", () => {
   afterEach(() => vi.useRealTimers());
+
+  it("retains the production initial scan until a verified local client is ready and collects only once", async () => {
+    const collect = vi.fn(async () => null);
+    let localClients: unknown[] = [];
+    const discoverLocalClients = vi.fn(() => localClients);
+    const harness = createHarness(undefined, {
+      observeRecovery: true,
+      localClients: discoverLocalClients,
+      state: { collectCodexNativeUsageLimitCandidates: collect },
+    });
+    try {
+      harness.api.scanInitialUsageLimitIfReady();
+      expect(discoverLocalClients).toHaveBeenCalledTimes(1);
+      expect(collect).not.toHaveBeenCalled();
+      localClients = [new RequestClient("verified-local")];
+      harness.api.scanInitialUsageLimitIfReady();
+      expect(discoverLocalClients).toHaveBeenCalledTimes(2);
+      expect(collect).toHaveBeenCalledTimes(1);
+      harness.api.scanInitialUsageLimitIfReady();
+      expect(discoverLocalClients).toHaveBeenCalledTimes(2);
+      expect(collect).toHaveBeenCalledTimes(1);
+      expect(harness.recordFailure).not.toHaveBeenCalled();
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("does not schedule an initial usage scan for a normal catalog-only heartbeat", () => {
+    const collect = vi.fn(async () => null);
+    const localClients = vi.fn(() => [new RequestClient("verified-local")]);
+    const harness = createHarness(undefined, {
+      localClients,
+      state: { collectCodexNativeUsageLimitCandidates: collect },
+    });
+    try {
+      harness.api.scanInitialUsageLimitIfReady();
+      expect(localClients).not.toHaveBeenCalled();
+      expect(collect).not.toHaveBeenCalled();
+    } finally {
+      harness.dispose();
+    }
+  });
 
   it("binds a function-valued node through its own queryClient slot without invoking the scope getter", async () => {
     const client = new QueryClient();

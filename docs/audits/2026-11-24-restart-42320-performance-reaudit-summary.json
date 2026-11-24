@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "recordedAtUtc": "2026-11-23T19:00:07.012Z",
+  "clientTimezone": "Asia/Singapore",
+  "target": {
+    "pid": 42320,
+    "executable": "H:\\repos\\ccswitchmulti-refork\\src-tauri\\target\\debug\\cc-switch.exe",
+    "startedAtUtc": "2026-11-23T18:05:50.2287594Z",
+    "startedAtSingapore": "2026-11-24T02:05:50.2287594+08:00"
+  },
+  "scope": {
+    "configuredMonitorAvailable": false,
+    "method": "Read-only exact target process counters, parent-filtered descendant queries, bounded4MiB tails of each configured app log. No UI/CDP/provider requests or broad workspace/process enumeration.",
+    "sourceEdits": false,
+    "appBuildOrDevOrRelease": false,
+    "appRestartOrInstallOrReplacement": false,
+    "alternateTargetsOrOutputFolders": false,
+    "testsOrCompilers": false,
+    "rawLogsBodiesPromptsCredentialsOrSessionIdentifiersPersisted": false
+  },
+  "findings": {
+    "newMajorSourceDefectProven": false,
+    "additionalFixMade": false,
+    "conclusion": "No current logged retry/error/warning storm. Active-request throughput and wire volume differ between samples and track CPU direction. CPU is nonzero and occasionally substantial; no native-stack attribution or all-hogging-eliminated claim.",
+    "stopReason": "User permits stopping when no further major issue is established; no speculative source edits or rebuild.",
+    "firstSample": {
+      "scope": "backend only",
+      "startedAtUtc": "2026-11-23T18:52:23.5118545+00:00",
+      "endedAtUtc": "2026-11-23T18:53:23.6516060+00:00",
+      "cpuPercentMachine": 11.34662107979192,
+      "requestSends": 30,
+      "wireMiB": 21.273,
+      "returnedStatuses": 30,
+      "statusCodes": [
+        200
+      ]
+    },
+    "finalSample": {
+      "scope": "backend plus observed descendants",
+      "startedAtUtc": "2026-11-23T18:56:25.9357972+00:00",
+      "endedAtUtc": "2026-11-23T18:57:25.9569782+00:00",
+      "backendCpuPercentMachine": 4.966271257638159,
+      "treeCpuPercentMachine": 5.221577278413926,
+      "peakTreeIntervalCpuPercentMachine": 12.884363199485053,
+      "requestSends": 14,
+      "wireMiB": 10.547,
+      "returnedStatuses": 12,
+      "statusCodes": [
+        200
+      ],
+      "backendWorkingSetMiB": 211.316,
+      "backendPrivateMiB": 150.445,
+      "treeWorkingSetMiB": 693.711,
+      "treePrivateMiB": 558.57,
+      "treePeakWorkingSetMiB": 852.469,
+      "backendShareOfObservedCpu": 0.951105574587356
+    },
+    "currentLogs": {
+      "recordCounts": 299,
+      "deferredWarnings": 127,
+      "deferredWarningTiming": "Startup first scan only02:06:31–02:07:02Singapore",
+      "deferredDependencyCategories": {
+        "missingParent": 6,
+        "unavailablePrefixProof": 116,
+        "unavailableContinuationProof": 5
+      },
+      "syncSummaries": 45,
+      "syncIntervalApproxSeconds": 62,
+      "latestScannedFiles": 1378,
+      "capacity429DnsDroppedStreamDatabaseFullParseFailureGuardianInjectionFailureMarkers": 0,
+      "explicitChildHigh": 33,
+      "explicitChildTotal": 33,
+      "exactUltraParentMax": 41,
+      "exactUltraParentTotal": 41
+    },
+    "memoryCaveats": "Observed memory changes over short windows do not establish a leak or leak-free behavior. Tree sums include shared pages and transient PowerShell children.",
+    "remainingCosts": "Large active request histories are present; exact parent-byte validation and distinct client ownership checks remain intentional. Logs alone do not establish their CPU contribution."
+  },
+  "historicalComparison": {
+    "pid": 57564,
+    "sampledAtUtc": "2026-11-23T16:56:30.7927057+00:00",
+    "treeCpuPercentMachine": 17.4,
+    "label": "Before current restart, not a current warning/performance result",
+    "caveat": "Uncontrolled workloads; no matched before/after performance percentage claim."
+  },
+  "evidence": {
+    "firstBackendSample": "docs/audits/2026-11-24-restart-42320-bounded-resource.json",
+    "validatedTreeSample": "docs/audits/2026-11-24-restart-42320-process-tree-resource.json",
+    "logsAndWindowCorrelation": "docs/audits/2026-11-24-restart-42320-bounded-log-audit.json"
+  },
+  "rebuildRequested": false,
+  "allPerformanceIssuesEliminated": false
+}

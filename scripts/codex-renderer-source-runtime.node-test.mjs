@@ -30,6 +30,27 @@ test("renderer assembly includes the owned remote view foundation in its fingerp
   assert.match(runtime.fingerprint, /^sha256-[a-f0-9]{64}$/);
 });
 
+test("renderer assembly fingerprints the native usage-limit observer after its dependencies", async () => {
+  const runtime = await loadCodexRendererSourceRuntime();
+  const source = await readFile(
+    new URL(
+      "../src-tauri/src/resources/codex_desktop/native_usage_limit_observer.js",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  const observer = runtime.template.indexOf(source.trim());
+  assert.ok(observer > -1, "native usage-limit observer must be fingerprinted");
+  for (const dependency of [
+    "const classifyCodexUsageLimitContinuationThread =",
+    "state.readCodexOwnerRemoteView =",
+  ]) {
+    const index = runtime.template.indexOf(dependency);
+    assert.ok(index > -1 && index < observer);
+  }
+  assert.doesNotThrow(() => new Function(runtime.template));
+});
+
 const assemblyFixture = `
 fn direct_core_script() -> &'static str {
     include_str!("resources/codex_desktop/direct.js")

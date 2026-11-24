@@ -41,11 +41,6 @@ function fixture(t, overrides = {}) {
     }),
     ...overrides,
   };
-  if (
-    overrides.ConfirmBuild === undefined &&
-    overrides.DevelopmentMode === true
-  )
-    plan.ConfirmBuild = true;
   const repo = path.join(root, "repo");
   const node = path.join(root, "node.exe");
   const script = path.join(repo, "scripts", "dev-tauri-delayed.mjs");
@@ -166,7 +161,6 @@ test("guardian CLI requires explicit development opt-in and preserves PowerShell
     "1",
   ]);
   assert.equal(plan.DevelopmentMode, true);
-  assert.equal(plan.ConfirmBuild, false);
   assert.equal(plan.NoRestart, false);
   assert.equal(plan.PlanOnly, true);
   assert.equal(plan.PollSeconds, 2);
@@ -311,40 +305,6 @@ test("direct imported runner refuses production recovery before lock or native o
       },
     }),
     /Production recovery is owned by the built-in Rust watchdog/,
-  );
-  assert.equal(lockAttempts, 0);
-  assert.equal(f.launches.length, 0);
-});
-
-test("legacy development recovery rejects stale persisted approval without current guardian approval", async (t) => {
-  const f = fixture(t, { DevelopmentMode: true, ConfirmBuild: false });
-  f.writeSession({
-    ...f.session,
-    args: ["--confirm-build", "--delay", "0"],
-  });
-  await f.policy();
-  assert.equal(f.launches.length, 0);
-  assert.deepEqual(f.events, [
-    {
-      level: "warning",
-      event: "dev-session-recovery-requires-current-approval",
-      detail: null,
-    },
-  ]);
-});
-
-test("legacy development runner refuses to acquire a lock without current approval", async (t) => {
-  const f = fixture(t, { DevelopmentMode: true, ConfirmBuild: false });
-  let lockAttempts = 0;
-  await assert.rejects(
-    runGuardian(f.plan, {
-      runtime: f.runtime,
-      acquireLock: async () => {
-        lockAttempts++;
-        throw new Error("Unexpected fixture lock operation");
-      },
-    }),
-    /current explicit approval/,
   );
   assert.equal(lockAttempts, 0);
   assert.equal(f.launches.length, 0);
@@ -848,7 +808,6 @@ test("runtime development launcher uses Node argv without a shell or PS1 and fil
     f.script,
     "--ccsm-dev-recover",
     "4040",
-    "--confirm-build",
     "--delay",
     "0",
     "value with spaces",
@@ -1289,36 +1248,4 @@ test("direct runtime launch refuses production and explicit no-restart modes bef
     );
     assert.equal(launches, 0);
   }
-});
-
-test("development recovery forwards only the current approval flag", async (t) => {
-  const f = fixture(t, { DevelopmentMode: true, ConfirmBuild: true });
-  f.writeSession({ ...f.session, args: ["--confirm-build", "--delay", "0"] });
-  const invocations = [];
-  const runtime = createGuardianRuntime(f.plan, {
-    spawnProcess: (executable, args, options) => {
-      invocations.push({ executable, args, options });
-      const child = new EventEmitter();
-      child.pid = 1234;
-      child.stdout = new PassThrough();
-      child.stderr = new PassThrough();
-      child.unref = () => {};
-      queueMicrotask(() => child.emit("spawn"));
-      return child;
-    },
-  });
-  await runtime.startDevSession({
-    Executable: f.node,
-    ScriptPath: f.script,
-    SupervisorPid: 4242,
-    Args: ["--delay", "0"],
-    RepoRoot: f.repo,
-    Environment: {},
-  });
-  assert.equal(invocations.length, 1);
-  assert.deepEqual(invocations[0].args.slice(-3), [
-    "--confirm-build",
-    "--delay",
-    "0",
-  ]);
 });

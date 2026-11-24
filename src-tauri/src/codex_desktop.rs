@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::proxy::codex_turn_recovery::{
+    valid_continuation_identifier, ObservedUsageLimitTurn, ProxyUsageLimitTurn,
+};
+
 #[path = "codex_windows_launch.rs"]
 mod windows_launch;
 
@@ -1433,7 +1437,7 @@ fn codex_renderer_compatibility_probe_script(catalog: &CodexModelCatalogProjecti
           }};
           const state = window[{MODEL_PICKER_PATCH_KEY:?}];
           if (!state || state.rendererRuntimeFingerprint !== {runtime_fingerprint:?}
-              || !state.interval || !state.messagePatchInstalled) return unavailable;
+              || state.recoveryOnly === true || !state.interval || !state.messagePatchInstalled) return unavailable;
           {catalog_payload_selection_core}
           const expected = selectCatalogPayload(state.payload, {payload});
           if (JSON.stringify(state.payload) !== JSON.stringify(expected)) return unavailable;
@@ -1746,6 +1750,15 @@ async fn evaluate_cdp_expression_if_authorized(
     expression: &str,
     authorize: &(impl Fn(bool) -> bool + Sync),
 ) -> Result<Option<Value>, String> {
+    evaluate_cdp_expression_with_options(websocket_url, expression, false, authorize).await
+}
+
+async fn evaluate_cdp_expression_with_options(
+    websocket_url: &str,
+    expression: &str,
+    await_promise: bool,
+    authorize: &(impl Fn(bool) -> bool + Sync),
+) -> Result<Option<Value>, String> {
     if !authorize(false) {
         return Ok(None);
     }
@@ -1769,6 +1782,7 @@ async fn evaluate_cdp_expression_if_authorized(
             "Runtime.evaluate",
             json!({
                 "expression": expression,
+                "awaitPromise": await_promise,
                 "returnByValue": true,
                 "allowUnsafeEvalBlockedByCSP": true
             }),
@@ -2195,6 +2209,8 @@ pub(crate) async fn summarize_and_restart_codex_session(
 pub(crate) struct CodexContinuationResult {
     pub submitted: bool,
     pub mutation_attempted: bool,
+    pub usage_limit_deferred: bool,
+    pub turn_id: Option<String>,
     pub debug_port: Option<u16>,
     pub target_id: Option<String>,
     pub message: String,
@@ -2226,6 +2242,132 @@ fn codex_continuation_bridge_script(method: &str, arguments: &str) -> String {
     )
 }
 
+const NATIVE_USAGE_LIMIT_COLLECT_METHOD: &str = "collectCodexNativeUsageLimitCandidates";
+
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct NativeUsageLimitSnapshot {
+    pub(crate) candidates: Vec<ObservedUsageLimitTurn>,
+    pub(crate) conflicting_thread_ids: Vec<String>,
+    pub(crate) stale_proxy_turns: Vec<ProxyUsageLimitTurn>,
+    pub(crate) complete: bool,
+}
+
+fn codex_native_recovery_install_script() -> &'static str {
+    static SCRIPT: OnceLock<String> = OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        let payload = serde_json::to_string(&CodexModelCatalogProjection::empty())
+            .expect("serialize empty renderer catalog");
+        let runtime_fingerprint = codex_renderer_runtime_fingerprint();
+        let runtime = assemble_codex_renderer_runtime_script(
+            &payload,
+            false,
+            true,
+            true,
+            runtime_fingerprint,
+        );
+        guarded_codex_native_recovery_install_script(runtime_fingerprint, &runtime)
+    })
+}
+
+fn guarded_codex_native_recovery_install_script(fingerprint: &str, runtime: &str) -> String {
+    format!(
+        r#"(() => {{
+          const state = window[{MODEL_PICKER_PATCH_KEY:?}];
+          const operation = state && Object.getOwnPropertyDescriptor(state, {NATIVE_USAGE_LIMIT_COLLECT_METHOD:?})?.value;
+          if (state?.rendererRuntimeFingerprint === {fingerprint:?} &&
+              (typeof operation === 'function' || state.runPromise)) return;
+          return {runtime};
+        }})()"#,
+    )
+}
+
+/// Collect active-to-failed observations from a guardian-verified renderer.
+/// A missing or stale bridge is installed in place, then sampled on the next
+/// guardian pass after the renderer discovers its local app-server client.
+pub(crate) async fn collect_native_usage_limit_candidates(
+    websocket_url: &str,
+    proxy_turns_json: &str,
+    authorize: &(impl Fn(bool) -> bool + Sync),
+) -> NativeUsageLimitSnapshot {
+    let script =
+        codex_continuation_bridge_script(NATIVE_USAGE_LIMIT_COLLECT_METHOD, proxy_turns_json);
+    let Ok(Some(evaluation)) =
+        evaluate_cdp_expression_with_options(websocket_url, &script, true, authorize).await
+    else {
+        return NativeUsageLimitSnapshot::default();
+    };
+    if evaluation
+        .pointer("/result/result/value/status")
+        .and_then(Value::as_str)
+        == Some("unavailable")
+    {
+        let _ = evaluate_cdp_expression_if_authorized(
+            websocket_url,
+            codex_native_recovery_install_script(),
+            authorize,
+        )
+        .await;
+    }
+    native_usage_limit_candidates_from_evaluation(&evaluation)
+}
+
+fn native_usage_limit_candidates_from_evaluation(evaluation: &Value) -> NativeUsageLimitSnapshot {
+    if evaluation.pointer("/result/exceptionDetails").is_some() {
+        return NativeUsageLimitSnapshot::default();
+    }
+    let Some(snapshot) = evaluation.pointer("/result/result/value") else {
+        return NativeUsageLimitSnapshot::default();
+    };
+    let Some(complete) = snapshot.get("complete").and_then(Value::as_bool) else {
+        return NativeUsageLimitSnapshot::default();
+    };
+    let Some(values) = snapshot.get("candidates").and_then(Value::as_array) else {
+        return NativeUsageLimitSnapshot::default();
+    };
+    let candidates: Vec<_> = values
+        .iter()
+        .filter_map(|value| ObservedUsageLimitTurn::deserialize(value).ok())
+        .filter(ObservedUsageLimitTurn::is_valid)
+        .collect();
+    let mut conflicting_thread_ids = Vec::new();
+    let conflicts_valid = match snapshot.get("conflictingThreadIds") {
+        None => true,
+        Some(Value::Array(ids)) => {
+            conflicting_thread_ids.extend(
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .filter(|id| valid_continuation_identifier(id))
+                    .map(str::to_owned),
+            );
+            conflicting_thread_ids.len() == ids.len()
+        }
+        Some(_) => false,
+    };
+    let mut stale_proxy_turns = Vec::new();
+    let stale_proxy_turns_valid = match snapshot.get("staleProxyTurns") {
+        None => true,
+        Some(Value::Array(turns)) => {
+            stale_proxy_turns.extend(
+                turns
+                    .iter()
+                    .filter_map(|value| ProxyUsageLimitTurn::deserialize(value).ok())
+                    .filter(ProxyUsageLimitTurn::is_valid),
+            );
+            stale_proxy_turns.len() == turns.len()
+        }
+        Some(_) => false,
+    };
+    NativeUsageLimitSnapshot {
+        complete: complete
+            && candidates.len() == values.len()
+            && conflicts_valid
+            && stale_proxy_turns_valid,
+        candidates,
+        conflicting_thread_ids,
+        stale_proxy_turns,
+    }
+}
+
 /// Submit a literal `continue` to the exact failed Codex thread through the
 /// renderer-owned app-server client. Recovery never changes a visible draft or
 /// uses the currently selected model/provider. A renderer job and a persisted
@@ -2237,12 +2379,55 @@ pub(crate) async fn submit_codex_continuation(
     observed_at_ms: i64,
     authorize: impl Fn(bool) -> bool + Send + Sync,
 ) -> Result<CodexContinuationResult, String> {
+    submit_codex_continuation_with_intent(
+        thread_id,
+        recovery_id,
+        Some(expected_model),
+        observed_at_ms,
+        None,
+        authorize,
+    )
+    .await
+}
+
+pub(crate) async fn submit_codex_usage_limit_continuation(
+    thread_id: &str,
+    recovery_id: &str,
+    expected_model: Option<&str>,
+    observed_at_ms: i64,
+    expected_turn_id: &str,
+    require_native_observation: bool,
+    authorize: impl Fn(bool) -> bool + Send + Sync,
+) -> Result<CodexContinuationResult, String> {
+    if expected_turn_id.trim().is_empty() {
+        return Err("The usage-limited Codex turn is required".to_string());
+    }
+    submit_codex_continuation_with_intent(
+        thread_id,
+        recovery_id,
+        expected_model,
+        observed_at_ms,
+        Some((expected_turn_id, require_native_observation)),
+        authorize,
+    )
+    .await
+}
+
+fn codex_continuation_start_script(
+    thread_id: &str,
+    recovery_id: &str,
+    expected_model: Option<&str>,
+    observed_at_ms: i64,
+    usage_limit_binding: Option<(&str, bool)>,
+) -> Result<(String, String), String> {
     if thread_id.trim().is_empty() || recovery_id.trim().is_empty() {
         return Err("An exact Codex thread and recovery id are required".to_string());
     }
-    if expected_model.trim().is_empty() || expected_model.trim().eq_ignore_ascii_case("unknown") {
-        return Err("The interrupted Codex model is required".to_string());
-    }
+    let expected_model = match expected_model.map(str::trim) {
+        Some(model) if !model.is_empty() && !model.eq_ignore_ascii_case("unknown") => Some(model),
+        None if matches!(usage_limit_binding, Some((_, true))) => None,
+        _ => return Err("The interrupted Codex model is required".to_string()),
+    };
     if observed_at_ms <= 0 {
         return Err("The interrupted turn observation time is required".to_string());
     }
@@ -2251,11 +2436,37 @@ pub(crate) async fn submit_codex_continuation(
     let recovery_id_json =
         serde_json::to_string(recovery_id.trim()).map_err(|error| error.to_string())?;
     let expected_model_json =
-        serde_json::to_string(expected_model.trim()).map_err(|error| error.to_string())?;
-    let start_script = codex_continuation_bridge_script(
-        "startCodexContinuation",
-        &format!("{thread_id_json}, {recovery_id_json}, {expected_model_json}, {observed_at_ms}"),
-    );
+        serde_json::to_string(&expected_model).map_err(|error| error.to_string())?;
+    let arguments =
+        format!("{thread_id_json}, {recovery_id_json}, {expected_model_json}, {observed_at_ms}");
+    let start_script = match usage_limit_binding {
+        Some((turn_id, require_native_observation)) => {
+            let turn_id_json = serde_json::to_string(turn_id).map_err(|error| error.to_string())?;
+            codex_continuation_bridge_script(
+                "startCodexUsageLimitContinuation",
+                &format!("{arguments}, {turn_id_json}, {require_native_observation}"),
+            )
+        }
+        None => codex_continuation_bridge_script("startCodexContinuation", &arguments),
+    };
+    Ok((start_script, recovery_id_json))
+}
+
+async fn submit_codex_continuation_with_intent(
+    thread_id: &str,
+    recovery_id: &str,
+    expected_model: Option<&str>,
+    observed_at_ms: i64,
+    usage_limit_binding: Option<(&str, bool)>,
+    authorize: impl Fn(bool) -> bool + Send + Sync,
+) -> Result<CodexContinuationResult, String> {
+    let (start_script, recovery_id_json) = codex_continuation_start_script(
+        thread_id,
+        recovery_id,
+        expected_model,
+        observed_at_ms,
+        usage_limit_binding,
+    )?;
     let mut diagnostics = Vec::new();
     for port in candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT) {
         let targets = match list_cdp_targets(port).await {
@@ -2318,6 +2529,8 @@ async fn abandon_codex_continuation_preparation(
         return Some(CodexContinuationResult {
             submitted: value.get("submitted").and_then(Value::as_bool) == Some(true),
             mutation_attempted: true,
+            usage_limit_deferred: false,
+            turn_id: None,
             debug_port: Some(port),
             target_id: Some(target.id.clone()),
             message: "A continuation was already attempted; its result is uncertain".to_string(),
@@ -2413,6 +2626,12 @@ async fn submit_codex_continuation_to_targets(
                     return Ok(Some(CodexContinuationResult {
                         submitted,
                         mutation_attempted: true,
+                        usage_limit_deferred: false,
+                        turn_id: value
+                            .get("turnId")
+                            .and_then(Value::as_str)
+                            .filter(|_| submitted)
+                            .map(str::to_owned),
                         debug_port: Some(port),
                         target_id: Some(target.id),
                         message: value
@@ -2437,11 +2656,21 @@ async fn submit_codex_continuation_to_targets(
                             .get("reason")
                             .and_then(Value::as_str)
                             .unwrap_or("Codex did not confirm the targeted continuation");
+                        let initial_usage_limit_read_unavailable = !confirmation_requested
+                            && value.get("intent").and_then(Value::as_str)
+                                == Some("UsageLimitResume")
+                            && value
+                                .get("usageLimitInitialReadUnavailable")
+                                .and_then(Value::as_bool)
+                                == Some(true)
+                            && value.get("usageLimitDeferred").and_then(Value::as_bool)
+                                == Some(true);
                         if !commit_requested
                             && value.get("submitted").and_then(Value::as_bool) == Some(false)
                             && value.get("mutationAttempted").and_then(Value::as_bool)
                                 == Some(false)
-                            && reason.starts_with("Codex Desktop request client was not found")
+                            && (initial_usage_limit_read_unavailable
+                                || reason.starts_with("Codex Desktop request client was not found"))
                         {
                             break 'preparation format!("target {}: {reason}", target.id);
                         }
@@ -2450,6 +2679,11 @@ async fn submit_codex_continuation_to_targets(
                         return Ok(Some(CodexContinuationResult {
                             submitted: false,
                             mutation_attempted: false,
+                            usage_limit_deferred: value
+                                .get("usageLimitDeferred")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            turn_id: None,
                             debug_port: Some(port),
                             target_id: Some(target.id),
                             message: reason.to_string(),
@@ -2515,6 +2749,10 @@ async fn submit_codex_continuation_to_targets(
                             return Ok(Some(CodexContinuationResult {
                                 submitted: false,
                                 mutation_attempted: false,
+                                // Authorization can be revoked by a scan during
+                                // preparation. A fresh binding can be tried again.
+                                usage_limit_deferred: true,
+                                turn_id: None,
                                 debug_port: Some(port),
                                 target_id: Some(target.id),
                                 message: "Continuation authorization was revoked".to_string(),
@@ -2536,6 +2774,8 @@ async fn submit_codex_continuation_to_targets(
                             return Ok(Some(CodexContinuationResult {
                                 submitted: false,
                                 mutation_attempted: false,
+                                usage_limit_deferred: false,
+                                turn_id: None,
                                 debug_port: Some(port),
                                 target_id: Some(target.id),
                                 message: committed
@@ -2600,6 +2840,7 @@ fn assemble_codex_renderer_runtime_script(
     catalog_payload: &str,
     catalog_released: bool,
     request_health_warning_suppressed: bool,
+    recovery_only: bool,
     runtime_fingerprint: &str,
 ) -> String {
     let catalog_payload_selection_core = catalog_payload_selection_core_script();
@@ -2624,6 +2865,8 @@ fn assemble_codex_renderer_runtime_script(
     let summary_handoff_core = summary_handoff_core_script();
     let codex_continuation_core = codex_continuation_core_script();
     let owner_remote_view_core = include_str!("resources/codex_desktop/owner_remote_view.js");
+    let native_usage_limit_observer_core =
+        include_str!("resources/codex_desktop/native_usage_limit_observer.js");
 
     // Resolve executable fragments before inserting opaque provider metadata.
     include_str!("resources/codex_desktop/renderer_runtime.js")
@@ -2689,12 +2932,20 @@ fn assemble_codex_renderer_runtime_script(
             owner_remote_view_core,
         )
         .replace(
+            "/*__CCSWITCH_NATIVE_USAGE_LIMIT_OBSERVER_CORE__*/",
+            native_usage_limit_observer_core,
+        )
+        .replace(
             "/*__CCSWITCH_APP_SERVER_MODEL_LIST_SCOPE_CORE__*/",
             app_server_model_list_scope_core,
         )
         .replace(
             "__CCSWITCH_CATALOG_RELEASED__",
             if catalog_released { "true" } else { "false" },
+        )
+        .replace(
+            "__CCSWITCH_RECOVERY_ONLY__",
+            if recovery_only { "true" } else { "false" },
         )
         .replace(
             "__CCSWITCH_PATCH_KEY__",
@@ -2715,6 +2966,7 @@ fn codex_renderer_runtime_template_for_fingerprint() -> String {
         r#"{"__ccswitch_catalog_slot__":true}"#,
         false,
         false,
+        false,
         "__ccswitch_runtime_fingerprint_slot__",
     )
 }
@@ -2733,6 +2985,7 @@ fn build_model_picker_unlock_script_with_state(
         &payload,
         catalog_released,
         request_health_warning_suppressed,
+        false,
         runtime_fingerprint,
     )
 }
@@ -5073,7 +5326,15 @@ state.appServerClients = [
     sendRequest: async () => { throw new Error("the picker wrapper must not be called"); },
     __ccSwitchOriginalSendRequest: async (method, params) => {
       calls.push({ method, params });
-      return method === "thread/read" ? { thread: failed } : { turn: { id: "continue-turn" } };
+      if (method === "thread/read") {
+        if (params.includeTurns !== false) throw new Error("Recovery must request metadata only");
+        return { thread: { ...failed, turns: [] } };
+      }
+      if (method === "thread/turns/list") {
+        return { data: failed.turns.map((turn) => ({ ...turn, items: [], itemsView: "notLoaded" })), nextCursor: null };
+      }
+      if (method === "turn/start") return { turn: { id: "continue-turn" } };
+      throw new Error("Unexpected recovery RPC");
     },
   },
 ];
@@ -5086,9 +5347,12 @@ void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.no
         assert_eq!(
             result["calls"],
             json!([
-                { "method": "thread/read", "params": { "threadId": "exact-thread", "includeTurns": true } },
-                { "method": "thread/read", "params": { "threadId": "exact-thread", "includeTurns": true } },
-                { "method": "thread/read", "params": { "threadId": "exact-thread", "includeTurns": true } },
+                { "method": "thread/read", "params": { "threadId": "exact-thread", "includeTurns": false } },
+                { "method": "thread/turns/list", "params": { "threadId": "exact-thread", "cursor": null, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded" } },
+                { "method": "thread/read", "params": { "threadId": "exact-thread", "includeTurns": false } },
+                { "method": "thread/turns/list", "params": { "threadId": "exact-thread", "cursor": null, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded" } },
+                { "method": "thread/read", "params": { "threadId": "exact-thread", "includeTurns": false } },
+                { "method": "thread/turns/list", "params": { "threadId": "exact-thread", "cursor": null, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded" } },
                 { "method": "turn/start", "params": { "threadId": "exact-thread", "input": [{ "type": "text", "text": "continue" }] } },
             ])
         );
@@ -5158,15 +5422,24 @@ void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.no
             codex_continuation_bridge_script("commitCodexContinuation", "'isolated-recovery'");
         let cancel =
             codex_continuation_bridge_script("cancelCodexContinuation", "'isolated-recovery'");
+        let proxy_turns = json!([{
+            "threadId": "exact-thread",
+            "turnId": "failed-turn",
+            "observedAtMs": 1000,
+        }]);
+        let collect = codex_continuation_bridge_script(
+            NATIVE_USAGE_LIMIT_COLLECT_METHOD,
+            &proxy_turns.to_string(),
+        );
         let runtime_fingerprint = codex_renderer_runtime_fingerprint();
         let script = format!(
             r#"
 const window = {{}};
 const calls = [];
-const operations = [() => {start}, () => {poll}, () => {confirm}, () => {commit}, () => {cancel}];
+const operations = [() => {start}, () => {poll}, () => {confirm}, () => {commit}, () => {cancel}, () => {collect}];
 const missing = operations.map((operation) => operation());
 const state = {{rendererRuntimeFingerprint: 'stale-runtime'}};
-for (const method of ['startCodexContinuation', 'readCodexContinuationJob', 'confirmCodexContinuation', 'commitCodexContinuation', 'cancelCodexContinuation']) {{
+for (const method of ['startCodexContinuation', 'readCodexContinuationJob', 'confirmCodexContinuation', 'commitCodexContinuation', 'cancelCodexContinuation', 'collectCodexNativeUsageLimitCandidates']) {{
   state[method] = function(...args) {{ calls.push({{method, args, bound: this === state}}); return {{accepted: true}}; }};
 }}
 window[{MODEL_PICKER_PATCH_KEY:?}] = state;
@@ -5175,7 +5448,7 @@ const staleCalls = calls.length;
 state.rendererRuntimeFingerprint = {runtime_fingerprint:?};
 const current = operations.map((operation) => operation());
 state.rendererRuntimeFingerprint = 'replaced-after-preparation';
-const replaced = [operations[1](), operations[2](), operations[3]()];
+const replaced = [operations[1](), operations[2](), operations[3](), operations[5]()];
 const replacedCalls = calls.length;
 state.rendererRuntimeFingerprint = {runtime_fingerprint:?};
 const inheritedState = Object.create(state);
@@ -5203,12 +5476,12 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                 }
             }
             assert_eq!(result["staleCalls"], 0);
-            assert_eq!(result["replacedCalls"], 5);
+            assert_eq!(result["replacedCalls"], 6);
             assert_eq!(
                 result["current"],
                 json!([
                     {"accepted": true}, {"accepted": true}, {"accepted": true},
-                    {"accepted": true}, {"accepted": true}
+                    {"accepted": true}, {"accepted": true}, {"accepted": true}
                 ])
             );
             assert_eq!(
@@ -5218,7 +5491,8 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                     {"method": "readCodexContinuationJob", "args": ["isolated-recovery"], "bound": true},
                     {"method": "confirmCodexContinuation", "args": ["isolated-recovery"], "bound": true},
                     {"method": "commitCodexContinuation", "args": ["isolated-recovery"], "bound": true},
-                    {"method": "cancelCodexContinuation", "args": ["isolated-recovery"], "bound": true}
+                    {"method": "cancelCodexContinuation", "args": ["isolated-recovery"], "bound": true},
+                    {"method": "collectCodexNativeUsageLimitCandidates", "args": [proxy_turns], "bound": true}
                 ])
             );
         });
@@ -5351,6 +5625,283 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
         (targets, address.port(), expressions, server)
     }
 
+    #[test]
+    fn codex_continuation_bridge_allows_null_model_only_for_native_usage_limits() {
+        let (script, recovery_id) = codex_continuation_start_script(
+            "exact-thread",
+            "exact-recovery",
+            None,
+            1000,
+            Some(("failed-turn", true)),
+        )
+        .unwrap();
+        assert_eq!(recovery_id, r#""exact-recovery""#);
+        assert!(script.contains("\"startCodexUsageLimitContinuation\""));
+        assert!(script.contains(
+            r#"operation.call(state, "exact-thread", "exact-recovery", null, 1000, "failed-turn", true)"#
+        ));
+
+        for binding in [None, Some(("failed-turn", false))] {
+            let missing_model = codex_continuation_start_script(
+                "exact-thread",
+                "exact-recovery",
+                None,
+                1000,
+                binding,
+            );
+            assert_eq!(
+                missing_model.unwrap_err(),
+                "The interrupted Codex model is required"
+            );
+            let (script, _) = codex_continuation_start_script(
+                "exact-thread",
+                "exact-recovery",
+                Some(" request-model "),
+                1000,
+                binding,
+            )
+            .unwrap();
+            assert!(script.contains(r#""exact-thread", "exact-recovery", "request-model", 1000"#));
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_usage_limit_continuation_keeps_a_deferred_turn_unsubmitted() {
+        let (targets, port, _, server) = codex_continuation_test_targets(vec![
+            json!({"started": true}),
+            json!({
+                "status": "completed", "submitted": false, "mutationAttempted": false,
+                "usageLimitDeferred": true
+            }),
+        ])
+        .await;
+        let result = submit_codex_continuation_to_targets(
+            targets,
+            port,
+            "start-usage-limit-continuation",
+            "\"isolated-recovery\"",
+            &|_| panic!("a deferred turn cannot be authorized"),
+            &mut Vec::new(),
+        )
+        .await;
+        server.abort();
+        let result = result.unwrap().unwrap();
+        assert!(result.usage_limit_deferred);
+        assert!(!result.submitted);
+        assert!(!result.mutation_attempted);
+        assert!(result.turn_id.is_none());
+    }
+
+    #[test]
+    fn native_usage_limit_collection_accepts_only_valid_observations() {
+        let candidate = json!({
+            "threadId": "exact-thread",
+            "turnId": "failed-turn",
+            "model": "request-model",
+            "observedAtMs": 1000,
+        });
+        let mut invalid_model = candidate.clone();
+        invalid_model["model"] = json!("unknown");
+        let mut invalid_time = candidate.clone();
+        invalid_time["observedAtMs"] = json!(0);
+        let mut invalid_id = candidate.clone();
+        invalid_id["threadId"] = json!("x".repeat(257));
+        let evaluation = json!({"result": {"result": {"value": {
+            "complete": true,
+            "candidates": [&candidate, invalid_model, invalid_time, invalid_id, {"threadId": "incomplete"}]
+        }}}});
+        let observations = native_usage_limit_candidates_from_evaluation(&evaluation);
+        assert!(!observations.complete);
+        assert_eq!(
+            observations.candidates,
+            vec![ObservedUsageLimitTurn::deserialize(&candidate).unwrap()]
+        );
+    }
+
+    #[test]
+    fn native_usage_limit_collection_distinguishes_empty_from_unavailable() {
+        let evaluation = |value: Value| json!({"result": {"result": {"value": value}}});
+        assert_eq!(
+            native_usage_limit_candidates_from_evaluation(&evaluation(json!({
+                "complete": true,
+                "candidates": []
+            }))),
+            NativeUsageLimitSnapshot {
+                complete: true,
+                ..Default::default()
+            }
+        );
+        for unavailable in [
+            Value::Null,
+            json!({"status": "unavailable"}),
+            json!({"complete": false, "candidates": []}),
+            json!({"candidates": []}),
+        ] {
+            assert_eq!(
+                native_usage_limit_candidates_from_evaluation(&evaluation(unavailable)),
+                NativeUsageLimitSnapshot::default()
+            );
+        }
+    }
+
+    #[test]
+    fn native_usage_limit_collection_validates_thread_conflicts_in_partial_snapshots() {
+        let evaluation = |complete, conflicts: Value| {
+            json!({"result": {"result": {"value": {
+                "complete": complete,
+                "candidates": [{
+                    "threadId": "other-thread",
+                    "turnId": "failed-turn",
+                    "model": "request-model",
+                    "observedAtMs": 1000,
+                }],
+                "conflictingThreadIds": conflicts,
+            }}}})
+        };
+        for complete in [false, true] {
+            let snapshot = native_usage_limit_candidates_from_evaluation(&evaluation(
+                complete,
+                json!(["shared-thread"]),
+            ));
+            assert_eq!(snapshot.complete, complete);
+            assert_eq!(snapshot.conflicting_thread_ids, vec!["shared-thread"]);
+            assert_eq!(snapshot.candidates.len(), 1);
+        }
+
+        let snapshot = native_usage_limit_candidates_from_evaluation(&evaluation(
+            true,
+            json!([
+                "shared-thread",
+                "",
+                " padded-id",
+                "x".repeat(257),
+                "tab\tid",
+                42
+            ]),
+        ));
+        assert!(!snapshot.complete);
+        assert_eq!(snapshot.conflicting_thread_ids, vec!["shared-thread"]);
+        assert_eq!(snapshot.candidates.len(), 1);
+
+        let snapshot = native_usage_limit_candidates_from_evaluation(&evaluation(
+            true,
+            json!("shared-thread"),
+        ));
+        assert!(!snapshot.complete);
+        assert!(snapshot.conflicting_thread_ids.is_empty());
+        assert_eq!(snapshot.candidates.len(), 1);
+    }
+
+    #[test]
+    fn native_usage_limit_collection_validates_exact_stale_proxy_turns() {
+        let stale_turn = json!({
+            "threadId": "exact-thread",
+            "turnId": "failed-turn",
+            "observedAtMs": 1000,
+        });
+        let expected = ProxyUsageLimitTurn::deserialize(&stale_turn).unwrap();
+        let evaluation = |complete, stale_proxy_turns: Value| {
+            json!({"result": {"result": {"value": {
+                "complete": complete,
+                "candidates": [],
+                "staleProxyTurns": stale_proxy_turns,
+            }}}})
+        };
+        for complete in [true, false] {
+            let snapshot = native_usage_limit_candidates_from_evaluation(&evaluation(
+                complete,
+                json!([&stale_turn]),
+            ));
+            assert_eq!(snapshot.complete, complete);
+            assert_eq!(snapshot.stale_proxy_turns, vec![expected.clone()]);
+        }
+
+        let snapshot = native_usage_limit_candidates_from_evaluation(&evaluation(
+            true,
+            json!([
+                &stale_turn,
+                {"threadId": "", "turnId": "failed-turn", "observedAtMs": 1000},
+                {"threadId": "exact-thread", "turnId": " padded-id", "observedAtMs": 1000},
+                {"threadId": "exact-thread", "turnId": "failed-turn", "observedAtMs": 0},
+                {"threadId": "exact-thread", "turnId": "failed-turn"}
+            ]),
+        ));
+        assert!(!snapshot.complete);
+        assert_eq!(snapshot.stale_proxy_turns, vec![expected]);
+
+        let snapshot = native_usage_limit_candidates_from_evaluation(&evaluation(true, stale_turn));
+        assert_eq!(snapshot, NativeUsageLimitSnapshot::default());
+    }
+
+    #[test]
+    fn native_usage_limit_collection_keeps_every_valid_session() {
+        let candidates: Vec<_> = (0..70)
+            .map(|index| {
+                json!({
+                    "threadId": format!("thread-{index}"),
+                    "turnId": format!("turn-{index}"),
+                    "model": "request-model",
+                    "observedAtMs": 1000,
+                })
+            })
+            .collect();
+        let last = ObservedUsageLimitTurn::deserialize(candidates.last().unwrap()).unwrap();
+        for complete in [true, false] {
+            let evaluation = json!({"result": {"result": {"value": {
+                "complete": complete,
+                "candidates": &candidates
+            }}}});
+            let observations = native_usage_limit_candidates_from_evaluation(&evaluation);
+            assert_eq!(observations.complete, complete);
+            assert_eq!(observations.candidates.len(), 70);
+            assert_eq!(observations.candidates.last(), Some(&last));
+        }
+    }
+
+    #[test]
+    fn native_usage_limit_install_recovers_reload_and_preserves_current_full_bridge() {
+        let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
+        let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
+        let recovery_runtime = format!(
+            r#"(() => {{
+              installations++;
+              window[patchKey] = {{rendererRuntimeFingerprint: "current",
+                recoveryOnly: true, {NATIVE_USAGE_LIMIT_COLLECT_METHOD}() {{ return []; }}}};
+            }})()"#,
+        );
+        let install = guarded_codex_native_recovery_install_script("current", &recovery_runtime);
+        context.with(|ctx| {
+            let counts: Vec<u8> = ctx
+                .eval(format!(
+                    r#"const window = {{}};
+                    const patchKey = {MODEL_PICKER_PATCH_KEY:?};
+                    let installations = 0;
+                    const counts = [];
+                    {install};
+                    counts.push(installations);
+                    {install};
+                    counts.push(installations);
+                    delete window[patchKey];
+                    {install};
+                    counts.push(installations);
+                    window[patchKey] = {{rendererRuntimeFingerprint: "current",
+                      {NATIVE_USAGE_LIMIT_COLLECT_METHOD}() {{ return []; }}}};
+                    {install};
+                    counts.push(installations);
+                    window[patchKey] = {{rendererRuntimeFingerprint: "current", runPromise: {{}}}};
+                    {install};
+                    counts.push(installations);
+                    window[patchKey] = {{rendererRuntimeFingerprint: "stale",
+                      {NATIVE_USAGE_LIMIT_COLLECT_METHOD}() {{ return []; }}}};
+                    {install};
+                    counts.push(installations);
+                    counts;"#,
+                ))
+                .expect("run the guarded renderer install against each state");
+            assert_eq!(counts, [1, 1, 2, 2, 2, 3]);
+        });
+    }
+
     #[tokio::test]
     async fn codex_continuation_tries_ready_renderer_after_client_discovery_failure() {
         let (targets, port, expressions, server) = codex_continuation_test_targets(vec![
@@ -5367,6 +5918,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             json!({"started": true}),
             json!({
                 "status": "completed", "submitted": true, "mutationAttempted": true,
+                "turnId": "continued-turn",
                 "reason": "Continuation submitted to the interrupted Codex thread"
             }),
         ])
@@ -5392,6 +5944,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             "unready renderer must not starve a ready one"
         );
         assert!(result.mutation_attempted);
+        assert_eq!(result.turn_id.as_deref(), Some("continued-turn"));
         assert_eq!(result.target_id.as_deref(), Some("ready-renderer"));
         assert_eq!(*authorization_stages.lock().unwrap(), vec![false, true]);
         assert_eq!(
@@ -5410,11 +5963,76 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
     }
 
     #[tokio::test]
+    async fn usage_limit_continuation_tries_ready_renderer_after_initial_read_failure() {
+        let (targets, port, expressions, server) = codex_continuation_test_targets(vec![
+            json!({"started": true}),
+            json!({
+                "status": "completed", "submitted": false, "mutationAttempted": false,
+                "intent": "UsageLimitResume", "usageLimitDeferred": true,
+                "usageLimitInitialReadUnavailable": true,
+                "reason": "Codex thread/read timed out"
+            }),
+            json!({"cancelled": true, "mutationAttempted": false}),
+            json!({"started": true}),
+            json!({"status": "prepared"}),
+            json!({"started": true}),
+            json!({"status": "confirmed"}),
+            json!({"started": true}),
+            json!({
+                "status": "completed", "submitted": true, "mutationAttempted": true,
+                "turnId": "continued-turn"
+            }),
+        ])
+        .await;
+        let authorization_stages = Mutex::new(Vec::new());
+        let result = submit_codex_continuation_to_targets(
+            targets,
+            port,
+            "start-exact-usage-limit-continuation",
+            "\"isolated-recovery\"",
+            &|final_commit| {
+                authorization_stages.lock().unwrap().push(final_commit);
+                true
+            },
+            &mut Vec::new(),
+        )
+        .await;
+        server.abort();
+        let result = result.unwrap().expect("a ready renderer must submit");
+        assert!(result.submitted);
+        assert_eq!(result.target_id.as_deref(), Some("ready-renderer"));
+        assert_eq!(result.turn_id.as_deref(), Some("continued-turn"));
+        assert_eq!(*authorization_stages.lock().unwrap(), vec![false, true]);
+        let expressions = expressions.lock().unwrap();
+        assert_eq!(expressions.len(), 9);
+        assert!(expressions[2].contains("cancelCodexContinuation"));
+        assert_eq!(
+            expressions
+                .iter()
+                .filter(|expression| expression.contains("commitCodexContinuation"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn codex_continuation_never_falls_through_a_stop_or_uncertain_mutation() {
         for completed in [
             json!({
                 "status": "completed", "submitted": false, "mutationAttempted": true,
                 "reason": "Codex Desktop request client was not found"
+            }),
+            json!({
+                "status": "completed", "submitted": false, "mutationAttempted": true,
+                "intent": "UsageLimitResume", "usageLimitDeferred": true,
+                "usageLimitInitialReadUnavailable": true,
+                "reason": "Codex thread/read timed out"
+            }),
+            json!({
+                "status": "completed", "submitted": false, "mutationAttempted": false,
+                "intent": "AutoRecovery", "usageLimitDeferred": true,
+                "usageLimitInitialReadUnavailable": true,
+                "reason": "Codex thread/read timed out"
             }),
             json!({
                 "status": "completed", "submitted": false,
@@ -5427,6 +6045,11 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             json!({
                 "status": "completed", "submitted": false, "mutationAttempted": false,
                 "reason": "The interrupted Codex thread is still active"
+            }),
+            json!({
+                "status": "completed", "submitted": false, "mutationAttempted": false,
+                "intent": "UsageLimitResume", "usageLimitDeferred": true,
+                "reason": "The usage-limited Codex turn is still active"
             }),
             json!({
                 "status": "completed", "submitted": false, "mutationAttempted": false,
@@ -5681,6 +6304,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
         assert!(!result.mutation_attempted);
         assert_eq!(result.target_id.as_deref(), Some("unready-renderer"));
         assert!(result.message.contains("authorization was revoked"));
+        assert!(result.usage_limit_deferred);
         assert_eq!(*authorization_stages.lock().unwrap(), vec![false, true]);
         assert_eq!(diagnostics.len(), 1);
         let recorded = expressions.lock().unwrap();
@@ -6053,9 +6677,14 @@ state.clients = [proxy, verifiedProbeClient({
   hostId: "local",
   getCompatibleThreadSortKey() {},
   supportsPaginatedThreadHistory() {},
-  sendRequest: async (method) => {
+  sendRequest: async (method, params) => {
     if (method === "turn/start") { starts += 1; return { turn: { id: "continue-turn" } }; }
-    return { thread: { id: "exact-thread", model: "request-model", turns: [{ id: "failed-turn", model: "request-model", status: "failed" }] } };
+    if (method === "thread/read") {
+      if (params.includeTurns !== false) throw new Error("Recovery must request metadata only");
+      return { thread: { id: "exact-thread", model: "request-model", turns: [] } };
+    }
+    if (method === "thread/turns/list") return { data: [{ id: "failed-turn", model: "request-model", status: "failed", items: [], itemsView: "notLoaded" }], nextCursor: null };
+    throw new Error("Unexpected recovery RPC");
   },
 })];
 void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.now()).then((result) => {
@@ -6079,9 +6708,14 @@ globalThis.__continuationTimer = (callback) => { if (!firstTimer) firstTimer = c
 state.appServerClients = [
   { hostId: "remote", sendRequest: async () => { remoteCalls += 1; throw new Error("remote thread must not be used"); } },
   { sendRequest: () => new Promise(() => {}) },
-  { sendRequest: async (method) => {
+  { sendRequest: async (method, params) => {
     if (method === "turn/start") { starts += 1; return { turn: { id: "continue-turn" } }; }
-    return { thread: { id: "exact-thread", model: "request-model", turns: [{ id: "failed-turn", model: "request-model", status: "failed" }] } };
+    if (method === "thread/read") {
+      if (params.includeTurns !== false) throw new Error("Recovery must request metadata only");
+      return { thread: { id: "exact-thread", model: "request-model", turns: [] } };
+    }
+    if (method === "thread/turns/list") return { data: [{ id: "failed-turn", model: "request-model", status: "failed", items: [], itemsView: "notLoaded" }], nextCursor: null };
+    throw new Error("Unexpected recovery RPC");
   } },
 ];
 void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.now()).then((result) => {
@@ -6103,10 +6737,15 @@ void Promise.resolve().then(() => Promise.resolve()).then(() => { firstTimer(); 
 const replacementAfterPreparation = {replacement_after_preparation};
 let starts = 0;
 let reads = 0;
-const request = async (method) => {{
+const request = async (method, params) => {{
   if (method === "turn/start") {{ starts += 1; return {{turn: {{id: "continued"}}}}; }}
-  reads += 1;
-  return {{thread: {{id: "exact-thread", model: "request-model", turns: [{{id: "failed-turn", status: "failed"}}]}}}};
+  if (method === "thread/read") {{
+    reads += 1;
+    if (params.includeTurns !== false) throw new Error("Recovery must request metadata only");
+    return {{thread: {{id: "exact-thread", model: "request-model", turns: []}}}};
+  }}
+  if (method === "thread/turns/list") return {{data: [{{id: "failed-turn", status: "failed", items: [], itemsView: "notLoaded"}}], nextCursor: null}};
+  throw new Error("Unexpected recovery RPC");
 }};
 state.appServerClients = [{{sendRequest: request}}];
 const client = state.appServerClients[0];
@@ -6172,10 +6811,15 @@ globalThis.__codexContinuationResult = JSON.stringify(cases.map((value) => class
             r#"
 let reads = 0;
 let starts = 0;
-state.appServerClients = [{ sendRequest: async (method) => {
+state.appServerClients = [{ sendRequest: async (method, params) => {
   if (method === "turn/start") { starts += 1; return { turn: { id: "continued" } }; }
-  reads += 1;
-  return { thread: { id: "exact-thread", model: "request-model", turns: [{ id: reads === 1 ? "failed-turn" : "new-user-turn", model: "request-model", status: reads === 1 ? "failed" : "inProgress" }] } };
+  if (method === "thread/read") {
+    reads += 1;
+    if (params.includeTurns !== false) throw new Error("Recovery must request metadata only");
+    return { thread: { id: "exact-thread", model: "request-model", turns: [] } };
+  }
+  if (method === "thread/turns/list") return { data: [{ id: reads === 1 ? "failed-turn" : "new-user-turn", model: "request-model", status: reads === 1 ? "failed" : "inProgress", items: [], itemsView: "notLoaded" }], nextCursor: null };
+  throw new Error("Unexpected recovery RPC");
 } }];
 void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.now()).then((result) => {
   globalThis.__codexContinuationResult = JSON.stringify({ result, reads, starts });
@@ -6183,6 +6827,10 @@ void runCodexContinuation("exact-thread", "recovery-1", "request-model", Date.no
 "#,
         );
         assert_eq!(result["result"]["submitted"], false);
+        assert_eq!(
+            result["result"]["reason"],
+            "The latest Codex turn is inprogress"
+        );
         assert_eq!(result["reads"], 2);
         assert_eq!(result["starts"], 0);
     }
@@ -6195,10 +6843,17 @@ let starts = 0;
 let secondClientCalls = 0;
 const failed = { id: "exact-thread", model: "request-model", turns: [{ id: "failed-turn", model: "request-model", status: "failed" }] };
 state.appServerClients = [
-  { sendRequest: async (method) => {
-    if (method === "thread/read") return { thread: failed };
-    starts += 1;
-    throw new Error("connection closed after request was sent");
+  { sendRequest: async (method, params) => {
+    if (method === "thread/read") {
+      if (params.includeTurns !== false) throw new Error("Recovery must request metadata only");
+      return { thread: { ...failed, turns: [] } };
+    }
+    if (method === "thread/turns/list") return { data: failed.turns.map((turn) => ({ ...turn, items: [], itemsView: "notLoaded" })), nextCursor: null };
+    if (method === "turn/start") {
+      starts += 1;
+      throw new Error("connection closed after request was sent");
+    }
+    throw new Error("Unexpected recovery RPC");
   } },
   { sendRequest: async () => { secondClientCalls += 1; return { thread: failed }; } },
 ];
@@ -6280,18 +6935,34 @@ void runCodexContinuation("exact-thread", "recovery-1", "request-model", observe
 const observedAtMs = Date.now() - 1000;
 let reads = 0;
 let starts = 0;
-state.appServerClients = [{ sendRequest: async (method) => {
+state.appServerClients = [{ sendRequest: async (method, params) => {
   if (method === "turn/start") { starts += 1; return { turn: { id: "continued" } }; }
-  reads += 1;
-  if (reads === 2) rememberCodexUserTurnAction("turn/interrupt", { threadId: "exact-thread", turnId: "failed-turn" });
-  return { thread: { id: "exact-thread", model: "request-model", turns: [{ id: "failed-turn", model: "request-model", status: "failed" }] } };
+  if (method === "thread/read") {
+    reads += 1;
+    if (params.includeTurns !== false) throw new Error("Recovery must request metadata only");
+    if (reads === 2) rememberCodexUserTurnAction("turn/interrupt", { threadId: "exact-thread", turnId: "failed-turn" });
+    return { thread: { id: "exact-thread", model: "request-model", turns: [] } };
+  }
+  if (method === "thread/turns/list") return { data: [{ id: "failed-turn", model: "request-model", status: "failed", items: [], itemsView: "notLoaded" }], nextCursor: null };
+  throw new Error("Unexpected recovery RPC");
 } }];
 void runCodexContinuation("exact-thread", "recovery-1", "request-model", observedAtMs).then((result) => {
-  globalThis.__codexContinuationResult = JSON.stringify({ result, reads, starts });
+  // Without Crypto action IDs, the observed stop cannot acquire durable confirmation.
+  globalThis.__codexContinuationResult = JSON.stringify({
+    result, reads, starts,
+    localStopObserved: state.codexUserTurnActions?.["exact-thread"]?.method === "turn/interrupt",
+    persistenceFailed: state.codexUserTurnActionPersistenceFailed === true,
+  });
 });
 "#,
         );
         assert_eq!(result["result"]["submitted"], false);
+        assert_eq!(
+            result["result"]["reason"],
+            "Codex user-action persistence is uncertain"
+        );
+        assert_eq!(result["localStopObserved"], true);
+        assert_eq!(result["persistenceFailed"], true);
         assert_eq!(result["reads"], 2);
         assert_eq!(result["starts"], 0);
     }
@@ -7547,7 +8218,8 @@ const clearTimeout = () => {};
         let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
         let fingerprint = "stalled-native-history-test";
         let payload = r#"{"modelProvider":"codex_model_router_v2","catalogAvailable":true,"modelNames":["worker"],"models":[{"model":"worker"}]}"#;
-        let script = assemble_codex_renderer_runtime_script(payload, false, true, fingerprint);
+        let script =
+            assemble_codex_renderer_runtime_script(payload, false, true, false, fingerprint);
         let setup = renderer_lifecycle_test_setup();
         context.with(|ctx| {
             ctx.eval::<(), _>(format!(
@@ -7601,6 +8273,7 @@ void installation.then(
                 payload,
                 false,
                 true,
+                false,
                 "verified-request-hook-test",
             );
             let setup = renderer_lifecycle_test_setup();
@@ -7619,9 +8292,11 @@ const request = async (method, params) => {{
   }}
   if (method === "thread/read") {{
     reads += 1;
-    return {{ thread: {{ id: "exact-thread", model: "worker", turns: [{{id: "newer-failed-turn", status: "failed", error: {{message: "Our servers are currently overloaded"}}}}] }} }};
+    if (params.includeTurns !== false) throw new Error("Recovery must request metadata only");
+    return {{ thread: {{ id: "exact-thread", model: "worker", turns: [] }} }};
   }}
-  return {{data: []}};
+  if (method === "thread/turns/list") return {{data: [{{id: "newer-failed-turn", status: "failed", error: {{message: "Our servers are currently overloaded"}}, items: [], itemsView: "notLoaded"}}], nextCursor: null}};
+  throw new Error("Unexpected recovery RPC");
 }};
 if (mode === "mutable_inherited") {{
   delete client.sendRequest;
@@ -7700,6 +8375,7 @@ void installation.then(async () => {{
             r#"{"modelProvider":"codex_model_router_v2","catalogAvailable":true,"modelNames":["worker"],"models":[{"model":"worker"}]}"#,
             false,
             true,
+            false,
             "reaudit-runtime",
         );
         let setup = renderer_lifecycle_test_setup();
@@ -7748,8 +8424,13 @@ void installation.then(async () => {{
         let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
         let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
         let payload = r#"{"modelProvider":"codex_model_router_v2","catalogAvailable":true,"modelNames":["worker"],"models":[{"model":"worker","supported_reasoning_levels":["high","max","ultra"]}]}"#;
-        let script =
-            assemble_codex_renderer_runtime_script(payload, false, true, "scoped-discovery-test");
+        let script = assemble_codex_renderer_runtime_script(
+            payload,
+            false,
+            true,
+            false,
+            "scoped-discovery-test",
+        );
         let setup = renderer_lifecycle_test_setup();
         context.with(|ctx| {
             ctx.eval::<(), _>(format!(
@@ -7795,8 +8476,10 @@ installation.then(() => {{ globalThis.__installationCompleted = true; }});
         let runtime = rquickjs::Runtime::new().expect("create JavaScript runtime");
         let context = rquickjs::Context::full(&runtime).expect("create JavaScript context");
         let payload = r#"{"modelProvider":"codex_model_router_v2","catalogAvailable":true,"modelNames":["worker"],"models":[{"model":"worker"}]}"#;
-        let old = assemble_codex_renderer_runtime_script(payload, false, true, "old-runtime");
-        let new = assemble_codex_renderer_runtime_script(payload, false, true, "new-runtime");
+        let old =
+            assemble_codex_renderer_runtime_script(payload, false, true, false, "old-runtime");
+        let new =
+            assemble_codex_renderer_runtime_script(payload, false, true, false, "new-runtime");
         let setup = renderer_lifecycle_test_setup();
         context.with(|ctx| {
             ctx.eval::<(), _>(format!(
@@ -8204,6 +8887,7 @@ void (async () => {{
             payload,
             false,
             true,
+            false,
             "app-server-manager-hooks-test",
         );
         let setup = renderer_lifecycle_test_setup();
@@ -8283,6 +8967,7 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
             payload,
             false,
             true,
+            false,
             "app-initial-fallback-test",
         );
         let setup = renderer_lifecycle_test_setup();
@@ -8372,6 +9057,7 @@ installation.then(value => {{ globalThis.__fallbackInstallation = value; }}, err
             include_str!("resources/codex_desktop/summary_handoff.js"),
             codex_continuation_core_script(),
             include_str!("resources/codex_desktop/owner_remote_view.js"),
+            include_str!("resources/codex_desktop/native_usage_limit_observer.js"),
             include_str!("resources/codex_desktop/renderer_runtime.js"),
         ];
 

@@ -1,0 +1,1313 @@
+{
+  "verified": false,
+  "readinessVerified": false,
+  "pickerInspectionPerformed": true,
+  "desktopCdpVerified": false,
+  "noTestThreadCreated": true,
+  "existingThreadsTouched": false,
+  "existingThreadsPrompted": false,
+  "renderedMenuVerified": false,
+  "pickerInspection": {
+    "runtimeInstalled": true,
+    "expectedRuntimeFingerprint": "sha256-18e11a28a42b39e731a6e4ef17d15aac75cff8c9dba78f5fc14169e9a0a4b4ff",
+    "installedRuntimeFingerprint": "sha256-fcb80b86a006fdef7764584a741e94c5f3bf684fcb4f81740d1cd07375e48bd3",
+    "fingerprintMatches": false,
+    "runtimeStatus": "mismatch",
+    "renderedMenuVerified": false,
+    "catalog": {
+      "available": true,
+      "declaredOnly": true,
+      "truncated": false,
+      "models": [
+        {
+          "model": "gpt-6.1-sol-sublyx",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-6-luna-sublyx",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-5.6-luna-sublyx",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-5.6-sol-sublyx",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-5.6-terra-sublyx",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-6",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-6.1-terra",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-5.6",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-image-2.6-flare",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-image-2.6-sunburst",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-6.2-astra",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-6.2-sol",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        },
+        {
+          "model": "claude-fable-5-1-zmhub",
+          "declaredEfforts": []
+        },
+        {
+          "model": "gpt-6.1-sol-zmhub",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "gpt-6-astra-zmhub",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "claude-fable-5-1-s1a",
+          "declaredEfforts": []
+        },
+        {
+          "model": "claude-opus-5-5",
+          "declaredEfforts": []
+        },
+        {
+          "model": "claude-sonnet-5-5",
+          "declaredEfforts": []
+        },
+        {
+          "model": "gpt-6.1-sol-s1a",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "model": "cohere/north-mini-code:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "dots-studio/dots-3-note-preview:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "google/gemma-4-26b-a4b-it:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "nvidia/nemotron-3.5-lightning:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+          "declaredEfforts": [
+            "medium",
+            "high"
+          ]
+        },
+        {
+          "model": "openrouter/free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "~deepseek/deepseek-flash-latest",
+          "declaredEfforts": [
+            "low",
+            "high",
+            "max"
+          ]
+        },
+        {
+          "model": "liquid/lfm-3-1.7b:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "minimax/minimax-m3",
+          "declaredEfforts": []
+        },
+        {
+          "model": "minimax/minimax-m3.1-flash",
+          "declaredEfforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          "model": "nvidia/nemotron-3.5-super-vl:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "recursive/flint-v1.0:free",
+          "declaredEfforts": []
+        },
+        {
+          "model": "thinkingmachines/inkling-2-small:free",
+          "declaredEfforts": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        },
+        {
+          "model": "xiaomi/mimo-v2.6-flash",
+          "declaredEfforts": []
+        },
+        {
+          "model": "xiaomi/mimo-v2.6-pro",
+          "declaredEfforts": []
+        },
+        {
+          "model": "~deepseek/deepseek-pro-latest",
+          "declaredEfforts": [
+            "low",
+            "high",
+            "max"
+          ]
+        },
+        {
+          "model": "~deepseek/deepseek-v4-flash-latest",
+          "declaredEfforts": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ]
+    },
+    "pickerDiagnostics": {
+      "available": true,
+      "status": "unverified",
+      "pickerObserverCount": 4,
+      "successObserverCount": 4,
+      "errorObserverCount": 0,
+      "pendingObserverCount": 0,
+      "unsupportedObserverCount": 0,
+      "unreadableObserverCount": 0,
+      "nativeVisibilityUnverifiedObserverCount": 4,
+      "booleanControlUnverifiedModelCount": 9,
+      "booleanControlReadyModelCount": 0,
+      "effortMismatchCount": 0,
+      "flagMismatchCount": 0,
+      "missingMaxModelCount": 0,
+      "missingUltraModelCount": 0,
+      "selectedMaxModelCount": 14,
+      "selectedUltraModelCount": 15
+    },
+    "mountedReasoningLabels": {
+      "available": true,
+      "truncated": false,
+      "renderedMenuVerified": false,
+      "rows": [
+        {
+          "effort": "none",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "minimal",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "low",
+          "labelMatches": false,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "medium",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "high",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "xhigh",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "max",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "ultra",
+          "labelMatches": true,
+          "opacityState": "one"
+        },
+        {
+          "effort": "none",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "minimal",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "low",
+          "labelMatches": false,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "medium",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "high",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "xhigh",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "max",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "ultra",
+          "labelMatches": true,
+          "opacityState": "one"
+        },
+        {
+          "effort": "none",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "minimal",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "low",
+          "labelMatches": false,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "medium",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "high",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "xhigh",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "max",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "ultra",
+          "labelMatches": true,
+          "opacityState": "one"
+        },
+        {
+          "effort": "none",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "minimal",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "low",
+          "labelMatches": false,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "medium",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "high",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "xhigh",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "max",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "ultra",
+          "labelMatches": true,
+          "opacityState": "one"
+        },
+        {
+          "effort": "none",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "minimal",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "low",
+          "labelMatches": false,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "medium",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "high",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "xhigh",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "max",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "ultra",
+          "labelMatches": true,
+          "opacityState": "one"
+        },
+        {
+          "effort": "none",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "minimal",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "low",
+          "labelMatches": false,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "medium",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "high",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "xhigh",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "max",
+          "labelMatches": true,
+          "opacityState": "zero"
+        },
+        {
+          "effort": "ultra",
+          "labelMatches": true,
+          "opacityState": "one"
+        }
+      ]
+    },
+    "nativePowerSelections": {
+      "available": false,
+      "truncated": false,
+      "renderedMenuVerified": false,
+      "rows": [],
+      "refusalReasons": [
+        "runtime_not_current"
+      ]
+    },
+    "nativeVisibility": {
+      "required": true,
+      "atomCount": 1,
+      "scopeScanComplete": false,
+      "scopeCandidateCount": 5,
+      "scopeScan": {
+        "status": "capped",
+        "visitedFiberCount": 34,
+        "scopeCount": 5,
+        "fiberLimit": 30000,
+        "elapsedMs": 1,
+        "reason": "value_limit"
+      },
+      "lastSettledScopeScan": {
+        "status": "capped",
+        "visitedFiberCount": 34,
+        "scopeCount": 5,
+        "fiberLimit": 30000,
+        "elapsedMs": 1,
+        "reason": "value_limit"
+      },
+      "schedulerCapabilities": {
+        "messageChannelAvailable": true
+      },
+      "ownershipStatus": "unverified",
+      "reconciliation": {
+        "status": "unverified",
+        "managed": true,
+        "patchedScopes": 0,
+        "restoredScopes": 0,
+        "refusalReason": "renderer_scope_snapshot_unverified",
+        "ownerScopeCount": 0,
+        "canonicalOwnerCounts": {
+          "appServerStatusAtomCount": 1,
+          "uniqueBrandCount": 1,
+          "hintCount": 1,
+          "pendingNodeCount": 0
+        },
+        "canonicalOwnerRefusalReason": "hints_ambiguous",
+        "ownerFailureCounts": {
+          "scope_contract": 0,
+          "node_unavailable": 0,
+          "node_client_absent": 0,
+          "node_client_accessor": 0,
+          "node_client_uninitialized": 0,
+          "client_mismatch": 0,
+          "client_methods_unavailable": 0,
+          "cache_unavailable": 0,
+          "scope_read_failed": 0,
+          "inventory_empty": 0,
+          "inventory_capped": 0,
+          "inventory_read_failed": 0,
+          "owner_snapshot_unverified": 0,
+          "canonical_owner_unavailable": 0,
+          "canonical_owner_unverified": 1
+        }
+      }
+    },
+    "modelObservations": {
+      "renderedMenuVerified": false,
+      "queryRowsVerified": false,
+      "truncated": false,
+      "unavailable": true,
+      "unavailableReasons": [
+        "native_owner_unverified",
+        "native_visibility_unverified",
+        "no_verified_query_rows",
+        "runtime_not_current"
+      ],
+      "rows": []
+    }
+  },
+  "pickerTargetInspections": {
+    "scope": "pinned_native_verified_endpoint",
+    "host": "127.0.0.1",
+    "port": 9229,
+    "renderedMenuVerified": false,
+    "targetLimit": 8,
+    "eligibleTargetCount": 1,
+    "uniqueTargetCount": 1,
+    "duplicateTargetCount": 0,
+    "attemptedTargetCount": 1,
+    "inspectedTargetCount": 1,
+    "unavailableTargetCount": 0,
+    "truncated": false,
+    "complete": true,
+    "selectedTargetId": "ede2a64ecfb13d2d900019c1e9bf2335",
+    "selectedTargetRef": "sha256-085edfb4fae9429e897e7e88f72407ecf584b03f7781939b54565343c524fc5b",
+    "targets": [
+      {
+        "targetId": "ede2a64ecfb13d2d900019c1e9bf2335",
+        "targetRef": "sha256-085edfb4fae9429e897e7e88f72407ecf584b03f7781939b54565343c524fc5b",
+        "inspection": {
+          "runtimeInstalled": true,
+          "expectedRuntimeFingerprint": "sha256-18e11a28a42b39e731a6e4ef17d15aac75cff8c9dba78f5fc14169e9a0a4b4ff",
+          "installedRuntimeFingerprint": "sha256-fcb80b86a006fdef7764584a741e94c5f3bf684fcb4f81740d1cd07375e48bd3",
+          "fingerprintMatches": false,
+          "runtimeStatus": "mismatch",
+          "renderedMenuVerified": false,
+          "catalog": {
+            "available": true,
+            "declaredOnly": true,
+            "truncated": false,
+            "models": [
+              {
+                "model": "gpt-6.1-sol-sublyx",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-6-luna-sublyx",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-5.6-luna-sublyx",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-5.6-sol-sublyx",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-5.6-terra-sublyx",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-6",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-6.1-terra",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-5.6",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-image-2.6-flare",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-image-2.6-sunburst",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-6.2-astra",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-6.2-sol",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "claude-fable-5-1-zmhub",
+                "declaredEfforts": []
+              },
+              {
+                "model": "gpt-6.1-sol-zmhub",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "gpt-6-astra-zmhub",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "claude-fable-5-1-s1a",
+                "declaredEfforts": []
+              },
+              {
+                "model": "claude-opus-5-5",
+                "declaredEfforts": []
+              },
+              {
+                "model": "claude-sonnet-5-5",
+                "declaredEfforts": []
+              },
+              {
+                "model": "gpt-6.1-sol-s1a",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
+              },
+              {
+                "model": "cohere/north-mini-code:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "dots-studio/dots-3-note-preview:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "google/gemma-4-26b-a4b-it:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "google/gemma-4-31b-it:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "nvidia/nemotron-3.5-lightning:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+                "declaredEfforts": [
+                  "medium",
+                  "high"
+                ]
+              },
+              {
+                "model": "openrouter/free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "~deepseek/deepseek-flash-latest",
+                "declaredEfforts": [
+                  "low",
+                  "high",
+                  "max"
+                ]
+              },
+              {
+                "model": "liquid/lfm-3-1.7b:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "minimax/minimax-m3",
+                "declaredEfforts": []
+              },
+              {
+                "model": "minimax/minimax-m3.1-flash",
+                "declaredEfforts": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max"
+                ]
+              },
+              {
+                "model": "nvidia/nemotron-3.5-super-vl:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "recursive/flint-v1.0:free",
+                "declaredEfforts": []
+              },
+              {
+                "model": "thinkingmachines/inkling-2-small:free",
+                "declaredEfforts": [
+                  "minimal",
+                  "low",
+                  "medium",
+                  "high",
+                  "max"
+                ]
+              },
+              {
+                "model": "xiaomi/mimo-v2.6-flash",
+                "declaredEfforts": []
+              },
+              {
+                "model": "xiaomi/mimo-v2.6-pro",
+                "declaredEfforts": []
+              },
+              {
+                "model": "~deepseek/deepseek-pro-latest",
+                "declaredEfforts": [
+                  "low",
+                  "high",
+                  "max"
+                ]
+              },
+              {
+                "model": "~deepseek/deepseek-v4-flash-latest",
+                "declaredEfforts": [
+                  "low",
+                  "high",
+                  "max"
+                ]
+              }
+            ]
+          },
+          "pickerDiagnostics": {
+            "available": true,
+            "status": "unverified",
+            "pickerObserverCount": 4,
+            "successObserverCount": 4,
+            "errorObserverCount": 0,
+            "pendingObserverCount": 0,
+            "unsupportedObserverCount": 0,
+            "unreadableObserverCount": 0,
+            "nativeVisibilityUnverifiedObserverCount": 4,
+            "booleanControlUnverifiedModelCount": 9,
+            "booleanControlReadyModelCount": 0,
+            "effortMismatchCount": 0,
+            "flagMismatchCount": 0,
+            "missingMaxModelCount": 0,
+            "missingUltraModelCount": 0,
+            "selectedMaxModelCount": 14,
+            "selectedUltraModelCount": 15
+          },
+          "mountedReasoningLabels": {
+            "available": true,
+            "truncated": false,
+            "renderedMenuVerified": false,
+            "rows": [
+              {
+                "effort": "none",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "minimal",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "low",
+                "labelMatches": false,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "medium",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "high",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "xhigh",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "max",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "ultra",
+                "labelMatches": true,
+                "opacityState": "one"
+              },
+              {
+                "effort": "none",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "minimal",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "low",
+                "labelMatches": false,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "medium",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "high",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "xhigh",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "max",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "ultra",
+                "labelMatches": true,
+                "opacityState": "one"
+              },
+              {
+                "effort": "none",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "minimal",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "low",
+                "labelMatches": false,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "medium",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "high",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "xhigh",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "max",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "ultra",
+                "labelMatches": true,
+                "opacityState": "one"
+              },
+              {
+                "effort": "none",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "minimal",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "low",
+                "labelMatches": false,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "medium",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "high",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "xhigh",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "max",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "ultra",
+                "labelMatches": true,
+                "opacityState": "one"
+              },
+              {
+                "effort": "none",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "minimal",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "low",
+                "labelMatches": false,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "medium",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "high",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "xhigh",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "max",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "ultra",
+                "labelMatches": true,
+                "opacityState": "one"
+              },
+              {
+                "effort": "none",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "minimal",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "low",
+                "labelMatches": false,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "medium",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "high",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "xhigh",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "max",
+                "labelMatches": true,
+                "opacityState": "zero"
+              },
+              {
+                "effort": "ultra",
+                "labelMatches": true,
+                "opacityState": "one"
+              }
+            ]
+          },
+          "nativePowerSelections": {
+            "available": false,
+            "truncated": false,
+            "renderedMenuVerified": false,
+            "rows": [],
+            "refusalReasons": [
+              "runtime_not_current"
+            ]
+          },
+          "nativeVisibility": {
+            "required": true,
+            "atomCount": 1,
+            "scopeScanComplete": false,
+            "scopeCandidateCount": 5,
+            "scopeScan": {
+              "status": "capped",
+              "visitedFiberCount": 34,
+              "scopeCount": 5,
+              "fiberLimit": 30000,
+              "elapsedMs": 1,
+              "reason": "value_limit"
+            },
+            "lastSettledScopeScan": {
+              "status": "capped",
+              "visitedFiberCount": 34,
+              "scopeCount": 5,
+              "fiberLimit": 30000,
+              "elapsedMs": 1,
+              "reason": "value_limit"
+            },
+            "schedulerCapabilities": {
+              "messageChannelAvailable": true
+            },
+            "ownershipStatus": "unverified",
+            "reconciliation": {
+              "status": "unverified",
+              "managed": true,
+              "patchedScopes": 0,
+              "restoredScopes": 0,
+              "refusalReason": "renderer_scope_snapshot_unverified",
+              "ownerScopeCount": 0,
+              "canonicalOwnerCounts": {
+                "appServerStatusAtomCount": 1,
+                "uniqueBrandCount": 1,
+                "hintCount": 1,
+                "pendingNodeCount": 0
+              },
+              "canonicalOwnerRefusalReason": "hints_ambiguous",
+              "ownerFailureCounts": {
+                "scope_contract": 0,
+                "node_unavailable": 0,
+                "node_client_absent": 0,
+                "node_client_accessor": 0,
+                "node_client_uninitialized": 0,
+                "client_mismatch": 0,
+                "client_methods_unavailable": 0,
+                "cache_unavailable": 0,
+                "scope_read_failed": 0,
+                "inventory_empty": 0,
+                "inventory_capped": 0,
+                "inventory_read_failed": 0,
+                "owner_snapshot_unverified": 0,
+                "canonical_owner_unavailable": 0,
+                "canonical_owner_unverified": 1
+              }
+            }
+          },
+          "modelObservations": {
+            "renderedMenuVerified": false,
+            "queryRowsVerified": false,
+            "truncated": false,
+            "unavailable": true,
+            "unavailableReasons": [
+              "native_owner_unverified",
+              "native_visibility_unverified",
+              "no_verified_query_rows",
+              "runtime_not_current"
+            ],
+            "rows": []
+          }
+        },
+        "status": "inspected"
+      }
+    ]
+  },
+  "verifiedAtUtc": "2026-11-18T06:40:10.674Z"
+}

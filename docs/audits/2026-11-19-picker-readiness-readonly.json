@@ -1,0 +1,54 @@
+{
+  "observedDateLocal": "2026-11-19",
+  "picker": {
+    "method": "verify-codex-desktop-continuation --inspect-picker",
+    "allTargetsInspected": true,
+    "requestedSamples": 3,
+    "samplingComplete": true,
+    "runtimeInstalled": true,
+    "runtimeStatusWithAppLogAuthority": "expected_fingerprint_unavailable",
+    "runtimeStatusWithWorkspaceSourceFingerprint": "mismatch",
+    "allThreeWorkspaceComparisonSamplesAgreed": true,
+    "renderedMenuVerified": false,
+    "status": "unverified",
+    "successfulQueries": 3,
+    "pickerQueries": 3,
+    "nativeVisibilityUnverifiedObservers": 3,
+    "booleanModelsWithoutControlProof": 9,
+    "booleanModelsWithControlProof": 0,
+    "effortMismatches": 0,
+    "flagMismatches": 0,
+    "scopeScanStatus": "capped",
+    "scopeScanReason": "value_limit",
+    "reconciliationRefusal": "renderer_scope_snapshot_unverified",
+    "canonicalOwnerRefusal": "hints_incomplete",
+    "canonicalHintCount": 17
+  },
+  "logSample": {
+    "observedAtUtc": "2026-11-19T00:37:12.138Z",
+    "windowMinutes": 60,
+    "scope": "bounded configured app log and proxy journal tails",
+    "maximumBytesPerFile": 524288,
+    "appLevels": {
+      "INFO": 598,
+      "WARN": 312
+    },
+    "journalObservations": {
+      "upstream_http_error:503": 75,
+      "upstream_http_error:502": 6,
+      "sse_inspection_limit:200": 828,
+      "response_consumption_stopped:200": 14
+    },
+    "latestUsageSync": {
+      "imported": 6,
+      "skipped": 26,
+      "deferred": 921,
+      "scanned": 969
+    }
+  },
+  "limits": [
+    "No provider requests, picker interaction, runtime injection, or app restart were performed.",
+    "Without a matching runtime fingerprint, the picker sample does not validate workspace source or per-model query rows.",
+    "Log counts are observations within a bounded tail, not unique requests or full-window totals. HTTP 200 inspection limits and stopped reads do not by themselves prove an upstream failure."
+  ]
+}

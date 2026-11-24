@@ -48,6 +48,7 @@ export interface CatalogSyncResult<T extends CodexCatalogRowLike> {
   removed: number;
   removedModels: string[];
   removalSuppressed: boolean;
+  missingRows: T[];
 }
 
 export type ExistingCatalogMetadataMode = "fill-missing" | "refresh";
@@ -352,7 +353,7 @@ export function pruneMissingRemoteCodexCatalogRows<
   },
 ): Pick<
   CatalogSyncResult<T>,
-  "rows" | "removed" | "removedModels" | "removalSuppressed"
+  "rows" | "removed" | "removedModels" | "removalSuppressed" | "missingRows"
 > {
   const fetchedIdentities = new Set(
     fetchedModels.flatMap((model) => modelIdentityValues(model)),
@@ -362,7 +363,7 @@ export function pruneMissingRemoteCodexCatalogRows<
     (row) =>
       options?.includeUnboundRows === true || rowExplicitUpstreamModel(row),
   );
-  const missingRows = new Set(
+  const missing = new Set(
     consideredRows.filter((row) => {
       const explicitWire = catalogModelIdentity(rowExplicitUpstreamModel(row));
       return explicitWire
@@ -372,7 +373,8 @@ export function pruneMissingRemoteCodexCatalogRows<
           );
     }),
   );
-  const removedModels = [...missingRows]
+  const missingRows = [...missing];
+  const removedModels = missingRows
     .filter((row) => !options?.markMissingDisabled || row.enabled !== false)
     .map((row) => row.model);
   const consideredCount = options?.markMissingDisabled
@@ -385,25 +387,27 @@ export function pruneMissingRemoteCodexCatalogRows<
     removedModels.length > 0 &&
     removedModels.length / consideredCount > maxRemovalRatio;
   if (removalSuppressed) {
-    return { rows, removed: 0, removedModels, removalSuppressed: true };
+    return { rows, removed: 0, removedModels, removalSuppressed, missingRows };
   }
   if (options?.markMissingDisabled) {
     return {
       rows: rows.map((row) =>
-        missingRows.has(row) && row.enabled !== false
+        missing.has(row) && row.enabled !== false
           ? ({ ...row, enabled: false } as T)
           : row,
       ),
       removed: 0,
       removedModels,
       removalSuppressed: false,
+      missingRows,
     };
   }
   return {
-    rows: rows.filter((row) => !missingRows.has(row)),
+    rows: rows.filter((row) => !missing.has(row)),
     removed: removedModels.length,
     removedModels,
     removalSuppressed: false,
+    missingRows,
   };
 }
 
@@ -648,7 +652,13 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
         markMissingDisabled: options.markMissingRemoteDisabled,
         maxRemovalRatio: options.maxRemovalRatio,
       })
-    : { rows: next, removed: 0, removedModels: [], removalSuppressed: false };
+    : {
+        rows: next,
+        removed: 0,
+        removedModels: [],
+        removalSuppressed: false,
+        missingRows: [],
+      };
   return {
     rows: authoritativeResult.rows,
     added,
@@ -657,5 +667,6 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
     removed: authoritativeResult.removed,
     removedModels: authoritativeResult.removedModels,
     removalSuppressed: authoritativeResult.removalSuppressed,
+    missingRows: authoritativeResult.missingRows,
   };
 }

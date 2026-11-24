@@ -3390,36 +3390,34 @@ fn codex_catalog_request_model_is_blocked(provider: &Provider, model: &str) -> b
     validate_codex_catalog_request_model(provider, model).is_err()
 }
 
+/// Resolve route and catalog mappings shared by native and converted requests.
+/// Provider-wide defaults belong only to the converted-request resolver.
+fn codex_request_model_mapping(provider: &Provider, request_model: Option<&str>) -> Option<String> {
+    provider
+        .settings_config
+        .get(CODEX_RESOLVED_UPSTREAM_MODEL_OVERRIDE)
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            let request_model = request_model
+                .map(str::trim)
+                .filter(|model| !model.is_empty())?;
+            codex_provider_catalog_upstream_model_for_request(provider, request_model)
+        })
+}
+
 /// 将 Codex 请求体里的可见模型名改回真实上游模型名；route 显式覆盖优先于 catalog 默认映射。
 pub fn apply_codex_request_upstream_model(
     provider: &Provider,
     body: &mut JsonValue,
 ) -> Option<String> {
-    if body
-        .get("model")
-        .and_then(JsonValue::as_str)
-        .is_some_and(|model| codex_catalog_request_model_is_blocked(provider, model))
-    {
+    let request_model = body.get("model").and_then(JsonValue::as_str);
+    if request_model.is_some_and(|model| codex_catalog_request_model_is_blocked(provider, model)) {
         return None;
     }
-    if let Some(route_override) = provider
-        .settings_config
-        .get(CODEX_RESOLVED_UPSTREAM_MODEL_OVERRIDE)
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-    {
-        body["model"] = JsonValue::String(route_override.to_string());
-        return Some(route_override.to_string());
-    }
-
-    let request_model = body
-        .get("model")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|model| !model.is_empty())?;
-    let upstream_model =
-        codex_provider_catalog_upstream_model_for_request(provider, request_model)?;
+    let upstream_model = codex_request_model_mapping(provider, request_model)?;
     body["model"] = JsonValue::String(upstream_model.clone());
     Some(upstream_model)
 }
@@ -3436,33 +3434,42 @@ pub fn apply_codex_chat_upstream_model(
     apply_codex_upstream_model(provider, body)
 }
 
-/// Apply route or catalog model mapping for every converted Codex protocol.
-pub fn apply_codex_upstream_model(provider: &Provider, body: &mut JsonValue) -> Option<String> {
-    // Explicitly rejected catalog identities cannot fall through to a route
-    // override or configured default after shared row lookup rejects them.
-    if body
-        .get("model")
-        .and_then(JsonValue::as_str)
-        .is_some_and(|model| codex_catalog_request_model_is_blocked(provider, model))
-    {
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CODEX_MODEL_RESOLUTION_INPUT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Resolve converted-request routing from its borrowed model identity alone.
+/// History and tools are outside this API and cannot be copied by resolution.
+pub fn resolve_codex_upstream_model(
+    provider: &Provider,
+    request_model: Option<&str>,
+) -> Option<String> {
+    #[cfg(test)]
+    CODEX_MODEL_RESOLUTION_INPUT.with(|work| {
+        let (calls, bytes) = work.get();
+        work.set((calls + 1, bytes + request_model.map_or(0, str::len)));
+    });
+    // Excluded and ambiguous identities cannot revive an override or default.
+    if request_model.is_some_and(|model| codex_catalog_request_model_is_blocked(provider, model)) {
         return None;
     }
     if provider
         .settings_config
         .get("codexResolvedRouteMatched")
-        .and_then(|value| value.as_bool())
+        .and_then(JsonValue::as_bool)
         == Some(false)
     {
-        let upstream_model = codex_provider_upstream_model(provider)?;
-        body["model"] = JsonValue::String(upstream_model.clone());
-        return Some(upstream_model);
+        return codex_provider_upstream_model(provider);
     }
+    codex_request_model_mapping(provider, request_model)
+        .or_else(|| codex_provider_upstream_model(provider))
+}
 
-    if let Some(upstream_model) = apply_codex_request_upstream_model(provider, body) {
-        return Some(upstream_model);
-    }
-
-    let upstream_model = codex_provider_upstream_model(provider)?;
+/// Apply route or catalog model mapping for every converted Codex protocol.
+pub fn apply_codex_upstream_model(provider: &Provider, body: &mut JsonValue) -> Option<String> {
+    let upstream_model =
+        resolve_codex_upstream_model(provider, body.get("model").and_then(JsonValue::as_str))?;
     body["model"] = JsonValue::String(upstream_model.clone());
     Some(upstream_model)
 }
@@ -7322,6 +7329,146 @@ wire_api = "anthropic"
     }
 
     #[test]
+    fn borrowed_upstream_model_resolution_preserves_native_and_converted_precedence() {
+        let catalog = json!({"models":[{
+            "model":"public-model", "aliases":["alias-model"], "upstreamModel":"wire-model"
+        }]});
+        let cases = [
+            (
+                "catalog",
+                json!({"model":"default-model", "modelCatalog":catalog}),
+                Some(json!("public-model")),
+                Some("wire-model"),
+                Some("wire-model"),
+            ),
+            (
+                "alias",
+                json!({"model":"default-model", "modelCatalog":catalog}),
+                Some(json!("  ALIAS-MODEL  ")),
+                Some("wire-model"),
+                Some("wire-model"),
+            ),
+            (
+                "override",
+                json!({"model":"default-model", "modelCatalog":catalog, "codexResolvedUpstreamModelOverride":" route-model "}),
+                Some(json!("public-model")),
+                Some("route-model"),
+                Some("route-model"),
+            ),
+            (
+                "unmatched",
+                json!({"model":"default-model", "modelCatalog":catalog, "codexResolvedRouteMatched":false, "codexResolvedUpstreamModelOverride":"route-model"}),
+                Some(json!("public-model")),
+                Some("default-model"),
+                Some("route-model"),
+            ),
+            (
+                "unmatched catalog",
+                json!({"model":"default-model", "modelCatalog":catalog, "codexResolvedRouteMatched":false}),
+                Some(json!("public-model")),
+                Some("default-model"),
+                Some("wire-model"),
+            ),
+            (
+                "disabled",
+                json!({"model":"default-model", "modelCatalog":{"models":[{"model":"public-model", "enabled":false}]}, "codexResolvedRouteMatched":false, "codexResolvedUpstreamModelOverride":"route-model"}),
+                Some(json!("public-model")),
+                None,
+                None,
+            ),
+            (
+                "ambiguous",
+                json!({"model":"default-model", "modelCatalog":{"models":[{"model":"a", "aliases":["alias-model"]},{"model":"b", "aliases":["alias-model"]}]}, "codexResolvedUpstreamModelOverride":"route-model"}),
+                Some(json!("alias-model")),
+                None,
+                None,
+            ),
+            (
+                "missing",
+                json!({"model":"default-model"}),
+                None,
+                Some("default-model"),
+                None,
+            ),
+            (
+                "nonstring",
+                json!({"model":"default-model"}),
+                Some(json!(42)),
+                Some("default-model"),
+                None,
+            ),
+            (
+                "empty",
+                json!({"model":"default-model"}),
+                Some(json!(" ")),
+                Some("default-model"),
+                None,
+            ),
+            (
+                "missing with override",
+                json!({"model":"default-model", "codexResolvedUpstreamModelOverride":"route-model"}),
+                None,
+                Some("route-model"),
+                Some("route-model"),
+            ),
+            (
+                "toml default",
+                json!({"config":"model = \"toml-model\"\n"}),
+                Some(json!("unknown-model")),
+                Some("toml-model"),
+                None,
+            ),
+            (
+                "empty canonical catalog",
+                json!({"model":"default-model", "modelCatalog":{"models":[]}, "model_catalog":{"models":[{"model":"public-model", "upstreamModel":"stale-model"}]}}),
+                Some(json!("public-model")),
+                Some("default-model"),
+                None,
+            ),
+            (
+                "no mapping",
+                json!({}),
+                Some(json!("public-model")),
+                None,
+                None,
+            ),
+        ];
+        for (name, config, requested, converted_expected, native_expected) in cases {
+            let provider = create_provider(config);
+            let mut original = json!({"input":[{"role":"user", "content":"preserved history"}], "tools":[{"type":"web_search"}]});
+            if let Some(requested) = requested {
+                original["model"] = requested;
+            }
+            let borrowed = resolve_codex_upstream_model(
+                &provider,
+                original.get("model").and_then(JsonValue::as_str),
+            );
+            assert_eq!(borrowed.as_deref(), converted_expected, "{name}");
+            let mut converted = original.clone();
+            assert_eq!(
+                apply_codex_upstream_model(&provider, &mut converted),
+                borrowed,
+                "{name}"
+            );
+            let mut expected = original.clone();
+            if let Some(model) = converted_expected {
+                expected["model"] = json!(model);
+            }
+            assert_eq!(converted, expected, "converted {name}");
+            let mut native = original.clone();
+            assert_eq!(
+                apply_codex_request_upstream_model(&provider, &mut native).as_deref(),
+                native_expected,
+                "native {name}"
+            );
+            if let Some(model) = native_expected {
+                original["model"] = json!(model);
+            }
+            assert_eq!(native, original, "native payload {name}");
+        }
+    }
+
+    #[test]
     fn test_apply_codex_upstream_model_preserves_one_m_catalog_model() {
         // Regression for the [1m] path: a request model carrying the [1m] marker must
         // match its catalog entry and be preserved (not overridden by the provider
@@ -9453,7 +9600,8 @@ wire_api = "chat"
             ("gpt-6.1-sol", "xhigh", "xhigh"),
             ("gpt-6.1-sol", "max", "max"),
             ("gpt-6.1-sol", "ultra", "max"),
-            ("gpt-6.2-astra", "ultra", "xhigh"),
+            ("gpt-6.2-astra", "max", "max"),
+            ("gpt-6.2-astra", "ultra", "max"),
         ] {
             let mut native = json!({
                 "model": model, "input": "hello", "reasoning": {"effort": effort}

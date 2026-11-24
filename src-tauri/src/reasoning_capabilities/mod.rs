@@ -2242,6 +2242,10 @@ mod tests {
     #[test]
     fn sublyx_catalog_ultra_overlay_migrates_stale_xhigh_when_native_max_is_available() {
         for (wire_model, enabled, saved_target, effort_source, expected) in [
+            ("gpt-6.2-astra", true, "xhigh", None, Some("max")),
+            ("gpt-6.2-astra", true, "xhigh", Some("user"), Some("xhigh")),
+            ("gpt-6.2-astra", true, "high", None, Some("high")),
+            ("gpt-6.2-astra", false, "xhigh", None, None),
             ("gpt-6.2-sol", true, "xhigh", None, Some("max")),
             ("gpt-6.2-sol", true, "xhigh", Some("user"), Some("xhigh")),
             ("gpt-6.2-sol", true, "high", None, Some("high")),
@@ -2276,7 +2280,7 @@ mod tests {
                 expected,
                 "{wire_model}: {enabled} {saved_target} {effort_source:?}"
             );
-            if wire_model == "gpt-6.2-sol" {
+            if matches!(wire_model, "gpt-6.2-sol" | "gpt-6.2-astra") {
                 assert_eq!(capability.upstream.effort_map["max"], "max");
             }
         }

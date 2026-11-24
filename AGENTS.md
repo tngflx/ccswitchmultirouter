@@ -41,18 +41,46 @@ subtree, but must not silently weaken these repository invariants.
   tests explicitly rather than weakening an existing assertion or guard.
 - Keep credentials and other secrets out of fixtures, logs, diagnostics, and
   serialized previews. Redact test data when exercising error paths.
-- Do not remove, bypass, or weaken a guard, test, or build gate to make a
-  change pass. If a check cannot run, report the exact command and reason.
+- Do not remove, bypass, or weaken an ordinary guard or test to make a change
+  pass. If a check cannot run, report the exact command and reason.
+
+## Resource Usage Regression Tests
+
+- Changes to session collection, request forwarding, or stream inspection must
+  preserve deterministic work-count regressions alongside correctness tests.
+  Count parsed or scanned bytes, serialization passes, digest computations, and
+  retained records where relevant. Use small and large inputs and repeated polls
+  or retries so redundant whole-history work fails a test.
+- Cover unchanged imported sessions and locally rejected session prefixes without
+  full-history replay. Keep recovery tests for appends, replacement, same-size and
+  same-timestamp rewrites, and newly available parent history.
+- Cover shared request finalization across retries and compressed fallback bodies,
+  disabled diagnostics, and streaming delimiters split into tiny fragments.
+  Preserve accounting, protocol handling, redaction, and reasoning-effort policy
+  while reducing work.
+- Run `pnpm performance:verify` after these changes. It checks deterministic
+  work bounds through scoped library tests, without starting the application.
+  Keep the runner fail-closed when an expected test is absent or skipped; run
+  `pnpm performance:test` and `pnpm scripts:check` when changing the runner.
+  This is source regression coverage, not a live CPU or memory audit.
 
 ## Sub-Agent Delegation and Shared Runtime Ownership
 
-- Build authorization comes from a direct user request in the current turn.
-  Keep `pnpm build`, `pnpm build:renderer`, `pnpm tauri build`,
-  `pnpm tauri dev`, `pnpm dev`, `pnpm release:local`, release exports, and
-  backend source-edit rebuilds
-  blocked without that request. Source changes and verification requirements
-  do not grant build authorization. Use the repository's explicit
-  `--confirm-build` gate only after the user authorizes the build.
+- Builds, desktop runs, release exports, and backend-source rebuilds are
+  user-owned operations. Agents and Sub-Agents must not invoke `pnpm build`,
+  `pnpm build:renderer`, `pnpm tauri build`, `pnpm tauri dev`, `pnpm dev`,
+  `pnpm release:local`, release exports, or backend-source rebuilds. They must
+  not add approval flags, wrappers, or gates, or select, redirect, copy,
+  replace, or rebuild into alternate Cargo targets, renderer output folders,
+  release roots, bundle folders, or installed-app folders. The user chooses
+  the target and output folder and runs these operations.
+- Apply source changes directly in the current checkout, including when a
+  user-started dev watcher is active. Rebuilds scheduled by that watcher may
+  proceed under the user's existing dev settings.
+- The retired build-confirmation mechanism stays removed. Agents and
+  Sub-Agents must not reintroduce a build-confirmation flag, approval module,
+  approval-only test, or persisted approval marker in source, scripts, tests,
+  documentation, workflows, templates, or session state.
 - These guardrails apply to the main agent and every Sub-Agent. Each delegation
   must repeat the applicable repository/user restrictions, assigned files or
   read-only scope, allowed verification, shared-resource owner, and forbidden
@@ -140,10 +168,10 @@ cargo fmt --check --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 ```
 
-Before a renderer or desktop release, use the repository's gated build path
-(`pnpm build:renderer` or `pnpm build`) so catalog verification runs as part of
-the build. Source checks do not prove that an installed application was
-rebuilt, that a release artifact was installed, or that live provider
+Before a renderer or desktop release, the user runs the repository's release
+build path (`pnpm build:renderer` or `pnpm build`) so catalog verification runs
+as part of the build. Source checks do not prove that an installed application
+was rebuilt, that a release artifact was installed, or that live provider
 requests work; report those boundaries explicitly.
 
 ## Live Audit Tooling

@@ -269,6 +269,51 @@ fn assert_unverified(
 
 #[test]
 #[serial_test::serial]
+fn unchanged_child_missing_copied_parent_prefix_skips_tail_and_recovers_same_stamp_rewrite(
+) -> Result<(), AppError> {
+    let dir = tempdir().unwrap();
+    let db = Database::memory()?;
+    let parent = rollout(dir.path(), PARENT);
+    let child = rollout(dir.path(), CHILD);
+    let history = parent_history(true);
+    write_parent_records(&parent, &history);
+    let mut records = complete_child(&history, true);
+    records.push(record(
+        LIVE_TIME,
+        "response_item",
+        json!({"text": "x".repeat(256 * 1024)}),
+    ));
+    records[1]["payload"]["id"] = json!(PARENT_TURN);
+    write_child_records(&child, &records);
+    let metadata = fs::metadata(&child).unwrap();
+    let modified = metadata.modified().unwrap();
+    assert_unverified(&db, &child, &sync(&db, &child, &parent)?)?;
+    let parses = CODEX_SNAPSHOT_PARSE_COUNT.with(std::cell::Cell::get);
+    fork_proof::RECHECKED_CHILD_BYTES.with(|bytes| bytes.set(0));
+    for _ in 0..2 {
+        assert_unverified(&db, &child, &sync(&db, &child, &parent)?)?;
+    }
+    CODEX_SNAPSHOT_PARSE_COUNT.with(|count| assert_eq!(count.get(), parses));
+    fork_proof::RECHECKED_CHILD_BYTES.with(|bytes| assert!((1..16_384).contains(&bytes.get())));
+
+    records[1]["payload"]["id"] = json!(PARENT);
+    write_child_records(&child, &records);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&child)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let corrected = fs::metadata(&child).unwrap();
+    assert_eq!(corrected.len(), metadata.len());
+    assert_eq!(corrected.modified().unwrap(), modified);
+    assert_eq!(sync(&db, &child, &parent)?.imported, 1);
+    assert_eq!(rows(&db)?, vec![expected_live(2, 60)]);
+    Ok(())
+}
+
+#[test]
+#[serial_test::serial]
 fn copied_root_idle_parent_imports_only_live_last_or_total_delta() -> Result<(), AppError> {
     for with_last in [true, false] {
         clear_codex_replay_caches();
@@ -279,7 +324,13 @@ fn copied_root_idle_parent_imports_only_live_last_or_total_delta() -> Result<(),
         let history = parent_history(with_last);
         write_parent_records(&parent, &history);
         write_child_records(&child, &complete_child(&history, with_last));
+        let parses_before = CODEX_SNAPSHOT_PARSE_COUNT.with(std::cell::Cell::get);
         let result = sync(&db, &child, &parent)?;
+        assert_eq!(
+            CODEX_SNAPSHOT_PARSE_COUNT.with(std::cell::Cell::get) - parses_before,
+            1,
+            "a copied fork without a continuation baseline only needs one full parse"
+        );
         assert!(
             !result.deferred,
             "an exact copied parent prefix does not need a later parent timestamp"

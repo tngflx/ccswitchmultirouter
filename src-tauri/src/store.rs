@@ -8,7 +8,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
 };
@@ -25,6 +25,7 @@ pub struct AppState {
     protocol_probe_released: Arc<tokio::sync::Notify>,
     protocol_probe_receipts: Arc<Mutex<HashMap<String, ProtocolProbeReceipt>>>,
     codex_provider_set_probe_receipts: Arc<Mutex<CodexProviderSetProbeReceiptState>>,
+    codex_provider_set_commit: Arc<Mutex<()>>,
     codex_startup_reconciliation_pending: Arc<AtomicBool>,
 }
 
@@ -39,6 +40,7 @@ impl Clone for AppState {
             protocol_probe_released: self.protocol_probe_released.clone(),
             protocol_probe_receipts: self.protocol_probe_receipts.clone(),
             codex_provider_set_probe_receipts: self.codex_provider_set_probe_receipts.clone(),
+            codex_provider_set_commit: self.codex_provider_set_commit.clone(),
             codex_startup_reconciliation_pending: self.codex_startup_reconciliation_pending.clone(),
         }
     }
@@ -246,11 +248,20 @@ impl AppState {
             codex_provider_set_probe_receipts: Arc::new(Mutex::new(
                 CodexProviderSetProbeReceiptState::default(),
             )),
+            codex_provider_set_commit: Arc::new(Mutex::new(())),
             // Tests, CLI helpers and command-only AppState instances do not run the
             // Desktop startup recovery pipeline. The real app explicitly opens the
             // gate before exposing its renderer.
             codex_startup_reconciliation_pending: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Keep provider-set validation, database writes and live updates ordered
+    /// across blocking workers sharing the managed state.
+    pub(crate) fn lock_codex_provider_set_commit(&self) -> MutexGuard<'_, ()> {
+        self.codex_provider_set_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Prevent renderer consistency checks from observing the transient state

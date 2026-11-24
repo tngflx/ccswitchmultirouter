@@ -196,6 +196,9 @@ export const handlers = [
   http.post(`${TAURI_ENDPOINT}/get_pending_recovery_outcomes`, () =>
     success([]),
   ),
+  http.post(`${TAURI_ENDPOINT}/get_codex_usage_limit_resume_count`, () =>
+    success({ count: 0, complete: true }),
+  ),
   http.post(`${TAURI_ENDPOINT}/get_orchestration_settings`, () =>
     success({
       enabled: false,
@@ -565,7 +568,8 @@ export const handlers = [
       next.streamRetryMaxAttempts = patch.streamRetryMaxAttempts;
     }
     if ("streamRetryUnlimitedReconnects" in patch) {
-      next.streamRetryUnlimitedReconnects = patch.streamRetryUnlimitedReconnects;
+      next.streamRetryUnlimitedReconnects =
+        patch.streamRetryUnlimitedReconnects;
     }
     if (patch.quotaCollaboration) {
       next.quotaCollaboration = {

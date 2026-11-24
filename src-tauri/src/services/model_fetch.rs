@@ -1155,6 +1155,13 @@ fn collect_declared_model_metadata_fields(
     for (key, value) in object {
         use crate::reasoning_capabilities::provider_metadata::looks_like_canonical_reasoning;
         let reasoning_field = reasoning_metadata_field(key);
+        // OpenRouter can include a compact duplicate with `reasoning: null`
+        // alongside a richer descriptor in another inventory. A null container
+        // means that this row has no reasoning metadata, while explicit false
+        // declarations remain authoritative below.
+        if value.is_null() && reasoning_field == Some("reasoning") {
+            continue;
+        }
         if (reasoning_field == Some("reasoning")
             && (!value.is_object() || looks_like_canonical_reasoning(value)))
             || (reasoning_field == Some("supports_reasoning") && value.as_bool() == Some(false))
@@ -1223,7 +1230,8 @@ fn merge_missing_model_metadata(
         // fields. Typed capabilities and explicit scalar controls are atomic.
         if matches!(key.as_str(), "reasoning" | "effort") {
             use crate::reasoning_capabilities::provider_metadata::looks_like_canonical_reasoning;
-            match (target.get_mut(key), value) {
+            // A null container has the same merge precedence as an absent one.
+            match (target.get_mut(key).filter(|value| !value.is_null()), value) {
                 (Some(existing), serde_json::Value::Object(descriptor_reasoning))
                     if existing.is_object()
                         && !looks_like_canonical_reasoning(existing)
@@ -6095,6 +6103,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_models_response_replaces_compact_null_reasoning_with_rich_descriptor() {
+        let models = parse_provider_models_response(
+            r#"{
+                "data": [{
+                    "id": "provider/null-reasoning",
+                    "reasoning": null,
+                    "supported_parameters": ["reasoning", "reasoning_effort"]
+                }],
+                "models": [{
+                    "id": "provider/null-reasoning",
+                    "reasoning": {
+                        "mandatory": false,
+                        "supported_efforts": ["high", "medium"],
+                        "default_effort": "medium"
+                    }
+                }]
+            }"#,
+            &[],
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/models",
+        )
+        .expect("merge rich descriptor over compact null reasoning");
+
+        let reasoning = models[0]
+            .reasoning
+            .as_ref()
+            .expect("rich reasoning declaration");
+        assert_eq!(reasoning["controlKind"], "graded");
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["high", "medium"])
+        );
+        assert_eq!(reasoning["defaultEffort"], "medium");
+    }
+
+    #[test]
     fn parse_models_response_preserves_openrouter_null_effort_declaration_from_rich_descriptors() {
         let models = parse_provider_models_response(
             r#"{
@@ -6190,6 +6234,83 @@ mod tests {
             let reasoning = models[0].reasoning.as_ref().unwrap();
             assert_eq!(reasoning["supportStatus"], "confirmed_unsupported");
         }
+    }
+
+    #[test]
+    fn parse_models_response_enriches_rich_reasoning_after_compact_null_container() {
+        let body = serde_json::json!({
+            "data": [{
+                "id": "example/model",
+                "supported_parameters": ["reasoning"],
+                "reasoning": null
+            }],
+            "models": [{
+                "id": "example/model",
+                "reasoning": {
+                    "mandatory": false,
+                    "supported_efforts": ["high", "medium"],
+                    "default_effort": "high"
+                }
+            }]
+        });
+        let models = parse_provider_models_response(
+            &body.to_string(),
+            &[],
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/models",
+        )
+        .expect("merge rich reasoning after null compact metadata");
+
+        let reasoning = models[0]
+            .reasoning
+            .as_ref()
+            .expect("merged reasoning declaration");
+        assert_eq!(reasoning["controlKind"], "graded");
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["high", "medium"])
+        );
+        assert_eq!(reasoning["defaultEffort"], "high");
+    }
+
+    #[test]
+    fn parse_models_response_keeps_compact_efforts_authoritative_when_reasoning_is_null() {
+        let body = serde_json::json!({
+            "data": [{
+                "id": "example/model",
+                "supportedReasoningEfforts": ["low", "high"],
+                "supported_parameters": ["reasoning", "reasoning_effort"],
+                "reasoning": null
+            }],
+            "models": [{
+                "id": "example/model",
+                "reasoning": {
+                    "mandatory": true,
+                    "supported_efforts": ["medium", "high"],
+                    "default_effort": "high"
+                }
+            }]
+        });
+        let models = parse_provider_models_response(
+            &body.to_string(),
+            &[],
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/models",
+        )
+        .expect("merge rich reasoning without overriding compact effort list");
+
+        let reasoning = models[0]
+            .reasoning
+            .as_ref()
+            .expect("merged reasoning declaration");
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            serde_json::json!(["low", "high"])
+        );
+        assert_eq!(reasoning["defaultEffort"], "high");
+        assert_eq!(reasoning["disableAllowed"], false);
+        assert_eq!(reasoning["upstream"]["parameter"], "reasoning.effort");
+        assert_eq!(reasoning["controlKind"], "graded");
     }
 
     #[test]

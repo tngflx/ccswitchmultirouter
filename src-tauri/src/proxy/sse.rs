@@ -14,6 +14,8 @@ pub(crate) struct BoundedSseFrames {
     tail: u32,
     discarding: bool,
     limit: usize,
+    #[cfg(test)]
+    scanned_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,6 +154,8 @@ impl BoundedSseFrames {
             tail: 0,
             discarding: false,
             limit,
+            #[cfg(test)]
+            scanned_bytes: 0,
         }
     }
 
@@ -161,6 +165,10 @@ impl BoundedSseFrames {
         let bytes = *input;
         let mut start = 0;
         for (index, &byte) in bytes.iter().enumerate() {
+            #[cfg(test)]
+            {
+                self.scanned_bytes += 1;
+            }
             self.tail = (self.tail << 8) | u32::from(byte);
             let end_of_frame = self.tail & 0xffff == 0x0a0a || self.tail == 0x0d0a0d0a;
             if self.discarding {
@@ -203,8 +211,8 @@ impl BoundedSseFrames {
 
 #[inline]
 pub(crate) fn strip_sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
-    line.strip_prefix(&format!("{field}: "))
-        .or_else(|| line.strip_prefix(&format!("{field}:")))
+    let value = line.strip_prefix(field)?.strip_prefix(':')?;
+    Some(value.strip_prefix(' ').unwrap_or(value))
 }
 
 #[inline]
@@ -373,6 +381,34 @@ mod tests {
     }
 
     #[test]
+    fn bounded_sse_frames_scan_each_wire_byte_once_across_fragment_sizes() {
+        for size in [32, 64 * 1024] {
+            let oversized = "x".repeat(size + 20);
+            let accepted = format!("data: {}\r\n\r\n", "y".repeat(size / 2));
+            let wire = format!("{oversized}\r\n\r\n{accepted}");
+            for chunk_size in [1, 63, 8192] {
+                let mut reader = BoundedSseFrames::new(size + 10);
+                let mut rejected = 0;
+                let mut frames = Vec::new();
+                for chunk in wire.as_bytes().chunks(chunk_size) {
+                    let mut input = chunk;
+                    while let Some(frame) = reader.read(&mut input) {
+                        match frame {
+                            SseFrame::Oversized => rejected += 1,
+                            SseFrame::Complete(bytes) => frames.push(bytes),
+                        }
+                    }
+                    assert!(input.is_empty());
+                }
+                assert_eq!(reader.scanned_bytes, wire.len());
+                assert_eq!(rejected, 1);
+                assert_eq!(frames, [bytes::Bytes::from(accepted.clone())]);
+                assert!(reader.pending.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn strip_sse_field_accepts_optional_space() {
         assert_eq!(
             strip_sse_field("data: {\"ok\":true}", "data"),
@@ -391,6 +427,10 @@ mod tests {
             Some("message_start")
         );
         assert_eq!(strip_sse_field("id:1", "data"), None);
+        assert_eq!(strip_sse_field("data-id:1", "data"), None);
+        assert_eq!(strip_sse_field("data", "data"), None);
+        assert_eq!(strip_sse_field("data:", "data"), Some(""));
+        assert_eq!(strip_sse_field("data:  fixture", "data"), Some(" fixture"));
     }
 
     #[test]

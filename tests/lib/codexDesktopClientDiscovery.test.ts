@@ -19,6 +19,7 @@ type Scope = {
   watch: () => void;
   readonly queryClient: QueryClient;
 };
+type ScopeBinding = { node: object };
 type State = {
   appServerStatusAtoms?: object[];
   appServerStatusBindings?: { atom: object; managerToken: object }[];
@@ -30,6 +31,7 @@ type State = {
   scopedAppServerScopesScannedAt?: number | null;
   scopedAppServerScopeScanComplete?: boolean;
   scopedAppServerScopeHintScanComplete?: boolean;
+  scopedAppServerScopeHintScan?: { status: string; reason?: string };
   scopedAppServerRootIdentities?: object[];
   pendingReactNodes?: Set<object>;
   reactMutationGeneration?: number;
@@ -98,7 +100,7 @@ const createHarness = (
     "yieldReactDiscovery",
     "installationIsCurrent",
     "rememberCodexUserTurnAction",
-    `${source}\nreturn { patchAppServerModuleClients, patchCodexScopedAppServerClients, refreshCodexScopedAppServerClients, codexAppServerClientHasCurrentOwner, codexDeclaredDependencyScope, codexScopeQueryClient, codexQueryObserverPrototype, codexRendererScopeRootsMatchCurrent, codexRendererScopeCandidates, codexRendererScopeSnapshotIsCurrent, codexCurrentAppServerScopeHints, codexRendererMountedNodes };`,
+    `${source}\nreturn { patchAppServerModuleClients, patchCodexScopedAppServerClients, refreshCodexScopedAppServerClients, codexAppServerClientHasCurrentOwner, codexDeclaredDependencyScope, codexScopeQueryClient, codexQueryObserverPrototype, codexRendererScopeRootsMatchCurrent, codexRendererScopeCandidates, codexRendererScopeSnapshotIsCurrent, codexCurrentAppServerScopeHints, codexRendererMountedNodes, codexRendererScopePathIsCurrent };`,
   )(
     state,
     window,
@@ -126,8 +128,15 @@ const createHarness = (
     codexRendererScopeRootsMatchCurrent: () => boolean;
     codexRendererScopeCandidates: () => Promise<Scope[]>;
     codexRendererScopeSnapshotIsCurrent: () => boolean;
-    codexCurrentAppServerScopeHints: (completeInventory?: boolean) => Scope[];
+    codexCurrentAppServerScopeHints: (
+      completeInventory?: boolean,
+      scopeBindings?: Map<Scope, ScopeBinding>,
+    ) => Scope[];
     codexRendererMountedNodes: (targets: Set<unknown>) => Set<unknown>;
+    codexRendererScopePathIsCurrent: (
+      scope: Scope,
+      binding?: ScopeBinding,
+    ) => boolean;
   };
   return {
     state,
@@ -440,14 +449,18 @@ describe("Codex Desktop declared client discovery", () => {
     }
   });
 
-  it("keeps the inventory incomplete when a Fiber value queue omits an owner", async () => {
+  it("finds a previously unseen same-brand owner beyond the broad Fiber value cap", async () => {
     const client = new QueryClient();
+    const secondClient = new QueryClient();
     const brand = {};
-    const retained = createScope(client);
-    const omitted = Object.assign(createScope(client), { scope: brand });
-    const values: Record<string, unknown> = Object.fromEntries(
-      Array.from({ length: 2048 }, (_, index) => [`unrelated${index}`, {}]),
-    );
+    const retained = Object.assign(createScope(client), { scope: brand });
+    const omitted = Object.assign(createScope(secondClient), { scope: brand });
+    const values: Record<string, unknown> = {
+      retained,
+      ...Object.fromEntries(
+        Array.from({ length: 2048 }, (_, index) => [`unrelated${index}`, {}]),
+      ),
+    };
     values.owner = omitted;
     const root = { memoizedState: values };
     const harness = createHarness(
@@ -458,8 +471,17 @@ describe("Codex Desktop declared client discovery", () => {
       { __codexRoot: { _internalRoot: { current: root } } },
     );
     try {
-      expect(harness.api.codexCurrentAppServerScopeHints(true)).toEqual([]);
-      expect(harness.state.scopedAppServerScopeHintScanComplete).toBe(false);
+      expect(harness.api.codexCurrentAppServerScopeHints()).toEqual([retained]);
+      const bindings = new Map<Scope, ScopeBinding>();
+      expect(
+        harness.api.codexCurrentAppServerScopeHints(true, bindings),
+      ).toEqual([retained, omitted]);
+      expect(harness.state.scopedAppServerScopeHintScanComplete).toBe(true);
+      const binding = bindings.get(omitted);
+      expect(binding?.node).toBe(omitted.node);
+      expect(
+        harness.api.codexRendererScopePathIsCurrent(omitted, binding),
+      ).toBe(true);
       expect(
         harness.api.codexRendererMountedNodes(new Set([omitted.node])),
       ).toEqual(new Set());
@@ -476,22 +498,61 @@ describe("Codex Desktop declared client discovery", () => {
         reason: "value_limit",
       });
       expect(harness.api.codexRendererScopeSnapshotIsCurrent()).toBe(false);
+      delete values.owner;
+      expect(
+        harness.api.codexRendererScopePathIsCurrent(omitted, binding),
+      ).toBe(false);
+    } finally {
+      client.clear();
+      secondClient.clear();
+    }
+  });
+
+  it("charges a shared value once across Fibers and retains its shallowest path", () => {
+    const client = new QueryClient();
+    const brand = {};
+    const scope = Object.assign(createScope(client), { scope: brand });
+    const shared = { scope };
+    const outer = { shared };
+    const child = { memoizedState: shared };
+    const root = { memoizedState: outer, child, sibling: child };
+    const harness = createHarness(
+      { appServerStatusAtoms: [{ scope: brand }] },
+      { __codexRoot: { _internalRoot: { current: root } } },
+      { objectScanLimit: 3, fieldScanLimit: 2 },
+    );
+    try {
+      const bindings = new Map<Scope, ScopeBinding>();
+      expect(
+        harness.api.codexCurrentAppServerScopeHints(true, bindings),
+      ).toEqual([scope]);
+      expect(harness.state.scopedAppServerScopeHintScanComplete).toBe(true);
+      root.memoizedState = { shared: { scope } };
+      expect(
+        harness.api.codexRendererScopePathIsCurrent(scope, bindings.get(scope)),
+      ).toBe(true);
     } finally {
       client.clear();
     }
   });
 
   it.each(["object", "field"] as const)(
-    "keeps the inventory incomplete when its %s snapshot budget is exhausted",
+    "keeps both inventories incomplete when their %s work budget is exhausted",
     async (budget) => {
       const root = { memoizedState: { holder: { current: {} } } };
       const harness = createHarness(
-        {},
+        { appServerStatusAtoms: [{ scope: {} }] },
         {
           __codexRoot: { _internalRoot: { current: root } },
         },
         budget === "object" ? { objectScanLimit: 1 } : { fieldScanLimit: 1 },
       );
+      expect(harness.api.codexCurrentAppServerScopeHints(true)).toEqual([]);
+      expect(harness.state.scopedAppServerScopeHintScanComplete).toBe(false);
+      expect(harness.state.scopedAppServerScopeHintScan).toMatchObject({
+        status: "capped",
+        reason: budget === "object" ? "object_limit" : "field_limit",
+      });
       await harness.api.codexRendererScopeCandidates();
       expect(harness.state.scopedAppServerScopeScanComplete).toBe(false);
       expect(harness.state.scopedAppServerScopeScan).toMatchObject({

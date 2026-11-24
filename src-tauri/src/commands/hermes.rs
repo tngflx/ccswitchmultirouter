@@ -1,9 +1,8 @@
 use std::time::Duration;
-use tauri::{AppHandle, State};
+use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::hermes_config;
-use crate::store::AppState;
 
 /// Error string returned when `open_hermes_web_ui` cannot reach the Hermes
 /// FastAPI server. Kept in sync with the `HERMES_WEB_OFFLINE_ERROR` constant
@@ -19,9 +18,12 @@ const HERMES_WEB_OFFLINE_ERROR: &str = "hermes_web_offline";
 /// Hermes uses additive mode — users may already have providers
 /// configured in config.yaml.
 #[tauri::command]
-pub fn import_hermes_providers_from_live(state: State<'_, AppState>) -> Result<usize, String> {
-    crate::services::provider::import_hermes_providers_from_live(state.inner())
-        .map_err(|e| e.to_string())
+pub async fn import_hermes_providers_from_live(app: AppHandle) -> Result<usize, String> {
+    super::run_app_state_blocking(&app, |state| {
+        crate::services::provider::import_hermes_providers_from_live(state)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Get provider names in the Hermes live config.
@@ -37,10 +39,13 @@ pub async fn get_hermes_live_provider_ids() -> Result<Vec<String>, String> {
 
 /// Get a single Hermes provider fragment from live config.
 #[tauri::command]
-pub fn get_hermes_live_provider(
+pub async fn get_hermes_live_provider(
     #[allow(non_snake_case)] providerId: String,
 ) -> Result<Option<serde_json::Value>, String> {
-    hermes_config::get_provider(&providerId).map_err(|e| e.to_string())
+    super::run_command_blocking(move || {
+        hermes_config::get_provider(&providerId).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 // ============================================================================
@@ -57,10 +62,33 @@ pub async fn get_hermes_model_config() -> Result<Option<hermes_config::HermesMod
 
 #[cfg(test)]
 mod read_dispatch_tests {
-    use super::{get_hermes_live_provider_ids, get_hermes_model_config};
+    use super::{
+        get_hermes_live_provider, get_hermes_live_provider_ids, get_hermes_memory,
+        get_hermes_memory_limits, get_hermes_model_config, import_hermes_providers_from_live,
+        set_hermes_memory, set_hermes_memory_enabled,
+    };
     use std::future::Future;
+    use tauri::AppHandle;
 
     fn assert_async_command<T, F>(_: impl FnOnce() -> F)
+    where
+        F: Future<Output = Result<T, String>> + Send,
+    {
+    }
+
+    fn assert_async_command_with_arg<A, T, F>(_: impl FnOnce(A) -> F)
+    where
+        F: Future<Output = Result<T, String>> + Send,
+    {
+    }
+
+    fn assert_async_command_with_two_args<A, B, T, F>(_: impl FnOnce(A, B) -> F)
+    where
+        F: Future<Output = Result<T, String>> + Send,
+    {
+    }
+
+    fn assert_async_app_command<T, F>(_: impl FnOnce(AppHandle) -> F)
     where
         F: Future<Output = Result<T, String>> + Send,
     {
@@ -70,6 +98,16 @@ mod read_dispatch_tests {
     fn provider_page_reads_use_async_dispatch() {
         assert_async_command(get_hermes_live_provider_ids);
         assert_async_command(get_hermes_model_config);
+        assert_async_command_with_arg(get_hermes_live_provider);
+        assert_async_command_with_arg(get_hermes_memory);
+        assert_async_command(get_hermes_memory_limits);
+        assert_async_app_command(import_hermes_providers_from_live);
+    }
+
+    #[test]
+    fn setters_use_async_dispatch() {
+        assert_async_command_with_two_args(set_hermes_memory);
+        assert_async_command_with_two_args(set_hermes_memory_enabled);
     }
 }
 
@@ -78,26 +116,37 @@ mod read_dispatch_tests {
 // ============================================================================
 
 #[tauri::command]
-pub fn get_hermes_memory(kind: hermes_config::MemoryKind) -> Result<String, String> {
-    hermes_config::read_memory(kind).map_err(|e| e.to_string())
+pub async fn get_hermes_memory(kind: hermes_config::MemoryKind) -> Result<String, String> {
+    super::run_command_blocking(move || hermes_config::read_memory(kind).map_err(|e| e.to_string()))
+        .await
 }
 
 #[tauri::command]
-pub fn set_hermes_memory(kind: hermes_config::MemoryKind, content: String) -> Result<(), String> {
-    hermes_config::write_memory(kind, &content).map_err(|e| e.to_string())
+pub async fn set_hermes_memory(
+    kind: hermes_config::MemoryKind,
+    content: String,
+) -> Result<(), String> {
+    super::run_command_blocking(move || {
+        hermes_config::write_memory(kind, &content).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn get_hermes_memory_limits() -> Result<hermes_config::HermesMemoryLimits, String> {
-    hermes_config::read_memory_limits().map_err(|e| e.to_string())
+pub async fn get_hermes_memory_limits() -> Result<hermes_config::HermesMemoryLimits, String> {
+    super::run_command_blocking(|| hermes_config::read_memory_limits().map_err(|e| e.to_string()))
+        .await
 }
 
 #[tauri::command]
-pub fn set_hermes_memory_enabled(
+pub async fn set_hermes_memory_enabled(
     kind: hermes_config::MemoryKind,
     enabled: bool,
 ) -> Result<hermes_config::HermesWriteOutcome, String> {
-    hermes_config::set_memory_enabled(kind, enabled).map_err(|e| e.to_string())
+    super::run_command_blocking(move || {
+        hermes_config::set_memory_enabled(kind, enabled).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 // ============================================================================

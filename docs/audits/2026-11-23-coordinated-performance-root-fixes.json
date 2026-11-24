@@ -1,0 +1,174 @@
+{
+  "schemaVersion": 1,
+  "recordedAtUtc": "2026-11-23T12:47:43.348Z",
+  "clientTimezone": "Asia/Singapore",
+  "checkout": "H:/repos/ccswitchmulti-refork",
+  "branch": "main",
+  "coordination": {
+    "threadId": "01a2034c-87bc-75b0-be2f-39c4c5425b8b",
+    "title": "Add bulk session resume button",
+    "ownership": "Other chat owns observer/guardian/Auto Resume; this chat owns forwarder priming, session usage retention, and performance regression runner."
+  },
+  "lifecycle": {
+    "appBuild": false,
+    "appRunOrRestart": false,
+    "appReplacementOrInstallation": false,
+    "alternativeOutputOrTarget": false,
+    "approvalGateAdded": false,
+    "sourceArtifactsOutsideCheckout": false
+  },
+  "fixes": [
+    {
+      "file": "src-tauri/src/proxy/forwarder.rs",
+      "issue": "Fragmented Claude openai_responses priming repeatedly parsed growing JSON, rescanned partial SSE, and summed retained chunks.",
+      "red": {
+        "test": "responses_stream_priming_fragmented_work_is_linear",
+        "result": "failed before fix with old-loop reproduction using existing production parsing helpers",
+        "wireBytes": 68,
+        "scannedBytes": 2278
+      },
+      "fix": "Incremental byte framing, complete-candidate JSON/SSE parsing, running replay byte counter, one semantic envelope parse, exact raw replay retained.",
+      "workRegressions": [
+        "responses_stream_priming_fragmented_work_is_linear",
+        "responses_stream_priming_many_lifecycle_frames_are_inspected_once",
+        "responses_stream_priming_wrapper_work_is_linear"
+      ],
+      "scopeLimitation": "Claude openai_responses path; not attribution of historical native Codex CPU."
+    },
+    {
+      "file": "src-tauri/src/services/session_usage_codex.rs",
+      "issue": "Disposable parent timeline map retained every encountered full token-event vector until reset/root change.",
+      "red": {
+        "test": "parent_timeline_cache_retention_bounds_real_lookup_work",
+        "result": "failed on unchanged pre-fix production at 257 retained real-file parents"
+      },
+      "fix": "Bounded canonical-map FIFO admission; exact raw digest on every hit; physical failures and vanished paths evict; oversized histories return complete validated results without retention.",
+      "budget": {
+        "entries": 256,
+        "perEntryEventCapacity": 4096,
+        "totalEventCapacity": 32768,
+        "perEntryEstimatedBytes": 1048576,
+        "totalEstimatedBytes": 8388608
+      },
+      "scopeLimitation": "Conservative retained parent-cache estimate, not total RSS, pending-map limit, transient parsing, outstanding returned Arcs, or O(1) I/O."
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --manifest-path src-tauri/Cargo.toml --lib --jobs 2 -- responses_stream_priming_ parent_timeline_cache_ oversized_parent_timeline --test-threads=2 --color=never",
+      "passed": 12,
+      "failed": 0
+    },
+    {
+      "command": "pnpm performance:verify",
+      "passed": 31,
+      "failed": 0,
+      "inventory": "fail-closed explicit work regressions",
+      "finalEvidence": "docs/audits/2026-11-23-coordinated-final-source-checks.json"
+    },
+    {
+      "command": "cargo test --manifest-path src-tauri/Cargo.toml --lib --jobs 2 -- proxy::forwarder:: services::session_usage_codex codex_state_db::tests proxy::codex_subagent_reasoning:: codex_multirouter:: codex_guardian:: --test-threads=2 --color=never",
+      "passed": 647,
+      "failed": 0,
+      "ignored": 1,
+      "ignoredReason": "existing manual real-corpus test"
+    },
+    {
+      "command": "pnpm performance:test",
+      "passed": 37,
+      "failed": 0
+    },
+    {
+      "command": "pnpm typecheck",
+      "result": "passed"
+    },
+    {
+      "command": "pnpm catalog:verify",
+      "passed": 895,
+      "files": 18,
+      "readerGuards": 23,
+      "discoveryGuards": 6,
+      "failed": 0
+    },
+    {
+      "command": "pnpm scripts:check",
+      "result": "passed"
+    },
+    {
+      "command": "pnpm format:check",
+      "result": "passed"
+    },
+    {
+      "command": "cargo fmt --check --manifest-path src-tauri/Cargo.toml",
+      "result": "passed"
+    },
+    {
+      "command": "cargo clippy --manifest-path src-tauri/Cargo.toml --jobs 2 -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed",
+      "note": "only Git line-ending normalization notices"
+    }
+  ],
+  "reasoningPolicy": {
+    "unifiedMaintainedGptMatrix": "passed in required performance suite and broad Rust scope",
+    "parent": "exact Ultra ownership -> max",
+    "child": "saved codebase policy, including high and medium coverage",
+    "transports": [
+      "Responses",
+      "Chat conversion",
+      "compaction"
+    ],
+    "liveRequestsVerifiedThisTurn": false
+  },
+  "observerCombinedCheck": {
+    "priorRedEvidence": "docs/audits/2026-11-23-coordinated-source-regression-snapshot.json",
+    "followupEvidence": "docs/audits/2026-11-23-coordinated-source-regression-snapshot-followup.json",
+    "finalEvidence": "docs/audits/2026-11-23-coordinated-source-regression-snapshot-final.json",
+    "priorFailed": 3,
+    "finalPassed": 384,
+    "finalFailed": 0,
+    "observerCases": 45,
+    "finalSourcesStable": true,
+    "action": "Owning chat finished multi-client and partial/conflicting-idle safeguards. Final five-file source run passes with stable hashes; no parent writes to owned observer files."
+  },
+  "sourceSha256": {
+    "src-tauri/src/proxy/forwarder.rs": "e273899dfb71990bafb50322d69e579467c14aec9d71b8f9af3d9f826c5120e7",
+    "src-tauri/src/services/session_usage_codex.rs": "cc2ea350fd0782973f68d970c555ad89cad2e45250296e7717bd246c43938929",
+    "scripts/verify-resource-performance.mjs": "8b97d22a9615c56286b1f5019412a4a24bb673ae0ec66d517537cafaf68fcc4e",
+    "scripts/verify-resource-performance.node-test.mjs": "2a410c2bbde1f4e9f44a60fccc8bc1f10a7dc52addd18263d3da59f9544eecc0"
+  },
+  "liveAudit": {
+    "status": "unavailable configured scoped resource-monitor entrypoint",
+    "appOrUiDriven": false,
+    "directProviderProbe": false,
+    "newCpuOrMemoryMeasurement": false,
+    "historicalResourceEvidenceReusedAsCurrent": false
+  },
+  "wholeCheckoutFinalSignoff": false,
+  "rebuildRequested": false,
+  "updatedAtUtc": "2026-11-23T13:30:09.080Z",
+  "currentMandatoryPerformanceInventory": 31,
+  "latestMandatoryPerformanceVerification": "passed31/31 on final coordinated source snapshot",
+  "otherChatCompletedVerification": {
+    "reportedFrontendAndIntegrationPassed": 465,
+    "reportedRustPassed": 504,
+    "performancePassed": 31,
+    "strictClippyPassed": true,
+    "note": "Reported by completed owning chat; overlapping tests are not additive to this chat counts."
+  },
+  "finalIntegratedSourceChecks": {
+    "evidence": "docs/audits/2026-11-23-coordinated-final-source-checks.json",
+    "scopedSourceChecksPassed": true,
+    "sourcesStableDuringChecks": true,
+    "sourcesStillMatchFinalHashes": true,
+    "currentMismatches": [],
+    "latestBroadRustPassed": 647,
+    "latestBroadRustIgnored": 1,
+    "latestBroadRustFailed": 0
+  },
+  "scopedSourceFixesReady": true,
+  "wholeCheckoutAllPerformanceIssuesEliminated": false
+}

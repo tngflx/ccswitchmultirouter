@@ -673,8 +673,14 @@ pub async fn get_codex_guardian_status(
 }
 
 #[tauri::command]
-pub async fn unlock_codex_model_picker() -> Result<CodexModelPickerUnlockResult, String> {
-    crate::codex_desktop::unlock_codex_model_picker().await
+pub async fn unlock_codex_model_picker(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<CodexModelPickerUnlockResult, String> {
+    let result = crate::codex_desktop::unlock_codex_model_picker().await?;
+    if result.injected {
+        state.proxy_service.retain_codex_recovery_observer().await;
+    }
+    Ok(result)
 }
 
 /// Relaunch Codex after an explicit provider switch using the takeover state
@@ -3159,11 +3165,16 @@ pub async fn switch_proxy_provider(
 ) -> Result<(), String> {
     // Codex's built-in official provider can use the client's native OpenAI
     // login through takeover. Other official providers remain blocked.
-    let provider = state
-        .db
-        .get_provider_by_id(&provider_id, &app_type)
-        .map_err(|e| format!("读取供应商失败: {e}"))?
-        .ok_or_else(|| format!("供应商不存在: {provider_id}"))?;
+    let provider_id_for_read = provider_id.clone();
+    let app_type_for_read = app_type.clone();
+    let provider = crate::commands::run_state_blocking(&state, move |state| {
+        state
+            .db
+            .get_provider_by_id(&provider_id_for_read, &app_type_for_read)
+            .map_err(|e| format!("读取供应商失败: {e}"))?
+            .ok_or_else(|| format!("供应商不存在: {provider_id_for_read}"))
+    })
+    .await?;
     let app = crate::app_config::AppType::from_str(&app_type)
         .map_err(|e| format!("无效的应用类型: {e}"))?;
     if provider.category.as_deref() == Some("official")
@@ -3231,17 +3242,33 @@ pub async fn reset_circuit_breaker(
     };
 
     if app_enabled && auto_failover_enabled && state.proxy_service.is_running().await {
-        // 获取当前供应商 ID
-        let current_id = db
-            .get_current_provider(&app_type)
-            .map_err(|e| e.to_string())?;
+        let app_type_for_recovery = app_type.clone();
+        let provider_id_for_recovery = provider_id.clone();
+        let (current_id, queue, provider_name) =
+            crate::commands::run_state_blocking(&state, move |state| {
+                let current_id = state
+                    .db
+                    .get_current_provider(&app_type_for_recovery)
+                    .map_err(|e| e.to_string())?;
+                let queue = state
+                    .db
+                    .get_failover_queue(&app_type_for_recovery)
+                    .map_err(|e| e.to_string())?;
+                let provider_name = state
+                    .db
+                    .get_all_providers(&app_type_for_recovery)
+                    .ok()
+                    .and_then(|providers| {
+                        providers
+                            .get(&provider_id_for_recovery)
+                            .map(|provider| provider.name.clone())
+                    })
+                    .unwrap_or_else(|| provider_id_for_recovery.clone());
+                Ok((current_id, queue, provider_name))
+            })
+            .await?;
 
         if let Some(current_id) = current_id {
-            // 获取故障转移队列
-            let queue = db
-                .get_failover_queue(&app_type)
-                .map_err(|e| e.to_string())?;
-
             // 找到恢复的供应商和当前供应商在队列中的位置（使用 sort_index）
             let restored_order = queue
                 .iter()
@@ -3260,16 +3287,9 @@ pub async fn reset_circuit_breaker(
                         "[Recovery] 供应商 {provider_id} 已恢复且优先级更高 (P{restored} vs P{current})，自动切换"
                     );
 
-                    // 获取供应商名称用于日志和事件
-                    let provider_name = db
-                        .get_all_providers(&app_type)
-                        .ok()
-                        .and_then(|providers| providers.get(&provider_id).map(|p| p.name.clone()))
-                        .unwrap_or_else(|| provider_id.clone());
-
                     // 创建故障转移切换管理器并执行切换
                     let switch_manager =
-                        crate::proxy::failover_switch::FailoverSwitchManager::new(db.clone());
+                        crate::proxy::failover_switch::FailoverSwitchManager::new(state.db.clone());
                     if let Err(e) = switch_manager
                         .try_switch(Some(&app_handle), &app_type, &provider_id, &provider_name)
                         .await

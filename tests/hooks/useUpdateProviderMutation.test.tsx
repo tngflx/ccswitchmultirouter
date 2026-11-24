@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { act, renderHook } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { AppId } from "@/lib/api";
 import { useUpdateProviderMutation } from "@/lib/query/mutations";
 import { usageKeys } from "@/lib/query/usage";
 import type { Provider } from "@/types";
@@ -94,12 +95,12 @@ describe("useUpdateProviderMutation", () => {
   it("invalidates the updated provider usage query", async () => {
     const { wrapper, invalidateSpy } = createWrapper();
     const provider = createProvider({ id: "provider-b" });
-    const { result } = renderHook(() => useUpdateProviderMutation("codex"), {
+    const { result } = renderHook(useUpdateProviderMutation, {
       wrapper,
     });
 
     await act(async () => {
-      await result.current.mutateAsync({ provider });
+      await result.current.mutateAsync({ appId: "codex", provider });
     });
 
     expect(apiMocks.update).toHaveBeenCalledWith(provider, "codex", undefined);
@@ -114,6 +115,51 @@ describe("useUpdateProviderMutation", () => {
     });
   });
 
+  it("completes a pending update for the originating app after switching apps", async () => {
+    const { wrapper, invalidateSpy } = createWrapper();
+    const provider = createProvider();
+    let resolveWrite!: (success: boolean) => void;
+    apiMocks.update.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        resolveWrite = resolve;
+      }),
+    );
+    const { result, rerender } = renderHook(
+      ({ appId }: { appId: AppId }) => {
+        const mutation = useUpdateProviderMutation();
+        return (provider: Provider) =>
+          mutation.mutateAsync({ appId, provider });
+      },
+      { wrapper, initialProps: { appId: "codex" } },
+    );
+    let update!: ReturnType<typeof result.current>;
+
+    await act(async () => {
+      update = result.current(provider);
+    });
+    expect(apiMocks.update).toHaveBeenCalledWith(provider, "codex", undefined);
+    expect(invalidateSpy).not.toHaveBeenCalled();
+
+    rerender({ appId: "claude" });
+    await act(async () => {
+      resolveWrite(true);
+      await update;
+    });
+
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["providers", "codex"],
+    });
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: usageKeys.script(provider.id, "codex"),
+    });
+    expect(invalidateSpy).not.toHaveBeenCalledWith({
+      queryKey: ["providers", "claude"],
+    });
+    expect(
+      apiMocks.inspectActiveCodexMultiRouterProjection,
+    ).toHaveBeenCalledTimes(1);
+  });
+
   it("submits one Codex Provider mutation without rewriting MultiRouter plans in the frontend", async () => {
     const { wrapper } = createWrapper();
     const provider = createProvider({
@@ -122,12 +168,12 @@ describe("useUpdateProviderMutation", () => {
         modelCatalog: { models: [{ model: "new-model" }] },
       },
     });
-    const { result } = renderHook(() => useUpdateProviderMutation("codex"), {
+    const { result } = renderHook(useUpdateProviderMutation, {
       wrapper,
     });
 
     await act(async () => {
-      await result.current.mutateAsync({ provider });
+      await result.current.mutateAsync({ appId: "codex", provider });
     });
 
     expect(apiMocks.getAll).not.toHaveBeenCalled();
@@ -143,12 +189,15 @@ describe("useUpdateProviderMutation", () => {
       lastErrorMessage: "live files differ",
     });
     const { wrapper } = createWrapper();
-    const { result } = renderHook(() => useUpdateProviderMutation("codex"), {
+    const { result } = renderHook(useUpdateProviderMutation, {
       wrapper,
     });
 
     await act(async () => {
-      await result.current.mutateAsync({ provider: createProvider() });
+      await result.current.mutateAsync({
+        appId: "codex",
+        provider: createProvider(),
+      });
     });
 
     expect(
@@ -163,12 +212,13 @@ describe("useUpdateProviderMutation", () => {
   it("also invalidates the previous usage query when provider id changes", async () => {
     const { wrapper, invalidateSpy } = createWrapper();
     const provider = createProvider({ id: "provider-new" });
-    const { result } = renderHook(() => useUpdateProviderMutation("openclaw"), {
+    const { result } = renderHook(useUpdateProviderMutation, {
       wrapper,
     });
 
     await act(async () => {
       await result.current.mutateAsync({
+        appId: "openclaw",
         provider,
         originalId: "provider-old",
       });

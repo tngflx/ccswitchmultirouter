@@ -5,8 +5,9 @@
 //! asks Codex Desktop to start a new turn containing the literal `continue`.
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -15,12 +16,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::providers::codex_terminal::{
-    classify_native_responses_terminal, terminal_error_code, terminal_error_code_from_body,
-    NativeResponsesEvidence, NativeResponsesTerminalDisposition,
+    classify_native_responses_terminal, is_retryable_usage_limit_payload, terminal_error_code,
+    terminal_error_code_from_body, NativeResponsesEvidence, NativeResponsesTerminalDisposition,
 };
 use super::sse::strip_sse_field;
 
 const RECOVERY_STATE_TTL: Duration = Duration::from_secs(15 * 60);
+// Permit a short gap between native snapshots without presenting an old
+// confirmation indefinitely if the renderer stops answering.
+const NATIVE_USAGE_LIMIT_CONFIRMATION_TTL: Duration = Duration::from_secs(30);
 const DESKTOP_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const DESKTOP_READY_DELAY: Duration = Duration::from_millis(500);
 #[cfg(not(test))]
@@ -161,6 +165,29 @@ impl ContinuationTransaction {
                     | OwnerContinuationStatus::Uncertain
             )
     }
+
+    fn blocks_new_continuation(
+        &self,
+        action_epoch: &str,
+        usage_limit: Option<&UsageLimitCandidate>,
+    ) -> bool {
+        if self.status == OwnerContinuationStatus::Committing {
+            return true;
+        }
+        if usage_limit.is_some_and(|candidate| candidate.turn.turn_id == self.base_turn_id) {
+            return self.status != OwnerContinuationStatus::Refused;
+        }
+        // Native turns can advance without a proxy request changing the epoch.
+        // Preserve previous mutation receipts and any current reservation.
+        self.blocks_same_epoch(action_epoch)
+            && (self.status == OwnerContinuationStatus::Reserved
+                || usage_limit.is_none_or(|candidate| {
+                    candidate
+                        .native_evidence
+                        .confirmed_at_ms(Instant::now())
+                        .is_none()
+                }))
+    }
 }
 
 static NATIVE_CONTINUATION_PROCESS_EPOCH: OnceLock<String> = OnceLock::new();
@@ -173,7 +200,7 @@ fn native_continuation_process_epoch() -> &'static str {
     NATIVE_CONTINUATION_PROCESS_EPOCH.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
-fn valid_continuation_identifier(value: &str) -> bool {
+pub(crate) fn valid_continuation_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
         && value.trim() == value
@@ -184,6 +211,8 @@ fn valid_continuation_identifier(value: &str) -> bool {
 pub(crate) struct TurnRecoveryContext {
     pub(crate) session_id: String,
     pub(crate) desktop_thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) desktop_turn_id: Option<String>,
     pub(crate) recovery_id: String,
     pub(crate) observed_at_ms: i64,
     pub(crate) model: String,
@@ -193,6 +222,119 @@ pub(crate) struct TurnRecoveryContext {
     pub(crate) provider_fingerprint: String,
     pub(crate) desktop_eligible: bool,
     pub(crate) max_recoveries: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ObservedUsageLimitTurn {
+    thread_id: String,
+    turn_id: String,
+    model: Option<String>,
+    observed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProxyUsageLimitTurn {
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) observed_at_ms: i64,
+}
+
+impl ProxyUsageLimitTurn {
+    pub(crate) fn is_valid(&self) -> bool {
+        valid_continuation_identifier(&self.thread_id)
+            && valid_continuation_identifier(&self.turn_id)
+            && self.observed_at_ms > 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeUsageLimitEvidence {
+    Absent,
+    Confirmed {
+        observed_at_ms: i64,
+        confirmed_at: Instant,
+    },
+    Conflicting,
+    Displaced,
+}
+
+impl NativeUsageLimitEvidence {
+    fn confirmed_at_ms(self, now: Instant) -> Option<i64> {
+        match self {
+            Self::Confirmed {
+                observed_at_ms,
+                confirmed_at,
+            } if now.saturating_duration_since(confirmed_at)
+                <= NATIVE_USAGE_LIMIT_CONFIRMATION_TTL =>
+            {
+                Some(observed_at_ms)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UsageLimitCandidate {
+    turn: ObservedUsageLimitTurn,
+    proxy_observed_at: Option<Instant>,
+    native_evidence: NativeUsageLimitEvidence,
+}
+
+impl UsageLimitCandidate {
+    fn has_current_proxy_observation(&self, now: Instant) -> bool {
+        self.proxy_observed_at
+            .is_some_and(|observed| now.saturating_duration_since(observed) <= RECOVERY_STATE_TTL)
+    }
+
+    fn has_current_observation(&self, now: Instant) -> bool {
+        self.native_evidence.confirmed_at_ms(now).is_some()
+            || self.has_current_proxy_observation(now)
+    }
+
+    fn has_current_evidence(&self, now: Instant) -> bool {
+        !matches!(
+            self.native_evidence,
+            NativeUsageLimitEvidence::Conflicting | NativeUsageLimitEvidence::Displaced
+        ) && self.has_current_observation(now)
+    }
+
+    fn continuation_observation(&self) -> (i64, bool) {
+        let native_observed_at_ms = self.native_evidence.confirmed_at_ms(Instant::now());
+        (
+            native_observed_at_ms.unwrap_or(self.turn.observed_at_ms),
+            native_observed_at_ms.is_some(),
+        )
+    }
+
+    fn operation_id(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(self.turn.thread_id.as_bytes());
+        digest.update([0]);
+        digest.update(self.turn.turn_id.as_bytes());
+        format!("usage-limit-{}", hex::encode(digest.finalize()))
+    }
+}
+
+fn usage_limit_candidate_is_current(
+    state: &RecoveryState,
+    candidate: &UsageLimitCandidate,
+) -> bool {
+    let now = Instant::now();
+    state.usage_limit.as_ref().is_some_and(|current| {
+        current.turn == candidate.turn
+            && current.proxy_observed_at == candidate.proxy_observed_at
+            && candidate
+                .native_evidence
+                .confirmed_at_ms(now)
+                .is_none_or(|expected| {
+                    current.native_evidence.confirmed_at_ms(now) == Some(expected)
+                })
+            && current.has_current_evidence(now)
+    })
 }
 
 #[derive(Debug)]
@@ -206,6 +348,9 @@ struct RecoveryState {
     reservation_epoch: Option<String>,
     reservation_intent: Option<ContinuationIntent>,
     commit_charged: bool,
+    // Eligibility is live evidence from this CC Switch process. Only
+    // continuation transaction receipts are restored across a restart.
+    usage_limit: Option<UsageLimitCandidate>,
     // Retained native mutation evidence lives in this same canonical ledger;
     // it has no independent sender, retry loop, or timeout retirement.
     continuations: HashMap<String, ContinuationTransaction>,
@@ -238,15 +383,36 @@ impl Default for RecoveryState {
             reservation_epoch: None,
             reservation_intent: None,
             commit_charged: false,
+            usage_limit: None,
             continuations: HashMap::new(),
         }
     }
 }
 
-static RECOVERY_STATES: OnceLock<Mutex<HashMap<String, RecoveryState>>> = OnceLock::new();
+#[derive(Default)]
+struct RecoveryStates {
+    threads: HashMap<String, RecoveryState>,
+    native_usage_limit_snapshot_completed_at: Option<Instant>,
+}
 
-fn recovery_states() -> &'static Mutex<HashMap<String, RecoveryState>> {
-    RECOVERY_STATES.get_or_init(|| Mutex::new(HashMap::new()))
+impl Deref for RecoveryStates {
+    type Target = HashMap<String, RecoveryState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.threads
+    }
+}
+
+impl DerefMut for RecoveryStates {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.threads
+    }
+}
+
+static RECOVERY_STATES: OnceLock<Mutex<RecoveryStates>> = OnceLock::new();
+
+fn recovery_states() -> &'static Mutex<RecoveryStates> {
+    RECOVERY_STATES.get_or_init(|| Mutex::new(RecoveryStates::default()))
 }
 
 fn reset_automatic_state(state: &mut RecoveryState, reset_budget: bool) {
@@ -279,6 +445,7 @@ fn has_owner_transaction_for_current_epoch(state: &RecoveryState) -> bool {
 
 fn advance_action_epoch(state: &mut RecoveryState) {
     state.action_epoch = uuid::Uuid::new_v4().to_string();
+    state.usage_limit = None;
     // A later user action invalidates uncommitted owner preparation. A commit
     // intent/outcome is retained; observing input does not establish provenance.
     for operation in state.continuations.values_mut() {
@@ -296,6 +463,7 @@ fn owner_epoch_capacity_allows(
     let is_empty = |state: &RecoveryState| {
         state.phase == RecoveryPhase::Idle
             && state.tracked.is_none()
+            && state.usage_limit.is_none()
             && state.continuations.is_empty()
     };
     // Failed arbitrary thread reads must not accumulate epoch-only entries.
@@ -351,6 +519,15 @@ pub(crate) fn reserve_owner_continuation(
     base_turn_id: &str,
     operation_id: &str,
 ) -> Result<OwnerContinuationReservation, OwnerContinuationError> {
+    reserve_continuation(epoch, base_turn_id, operation_id, None)
+}
+
+fn reserve_continuation(
+    epoch: &OwnerContinuationEpoch,
+    base_turn_id: &str,
+    operation_id: &str,
+    usage_limit: Option<&UsageLimitCandidate>,
+) -> Result<OwnerContinuationReservation, OwnerContinuationError> {
     ensure_owner_ledger_loaded();
     if !RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst) {
         return Err(OwnerContinuationError::StorageUnavailable);
@@ -381,6 +558,9 @@ pub(crate) fn reserve_owner_continuation(
     if state.action_epoch != epoch.action_epoch {
         return Err(OwnerContinuationError::StaleEpoch);
     }
+    if usage_limit.is_some_and(|candidate| !usage_limit_candidate_is_current(state, candidate)) {
+        return Err(OwnerContinuationError::StaleEpoch);
+    }
     // Old-base mutation evidence is not erased by a new action, TTL, or policy
     // change. Repeated clicks for the same exact base attach rather than send.
     if let Some(existing) = state.continuations.values().find(|operation| {
@@ -400,10 +580,11 @@ pub(crate) fn reserve_owner_continuation(
         RecoveryPhase::ActiveRequest
             | RecoveryPhase::ToolStepComplete
             | RecoveryPhase::CommittingRecovery
-    ) || state.continuations.values().any(|operation| {
-        operation.status == OwnerContinuationStatus::Committing
-            || operation.blocks_same_epoch(&state.action_epoch)
-    }) {
+    ) || state
+        .continuations
+        .values()
+        .any(|operation| operation.blocks_new_continuation(&state.action_epoch, usage_limit))
+    {
         return Err(OwnerContinuationError::Busy);
     }
     if state.continuations.len() >= MAX_OWNER_OPERATIONS_PER_THREAD {
@@ -502,6 +683,14 @@ fn authorize_owner_continuation_commit_with(
     operation: &OwnerContinuationOperation,
     persist: impl FnOnce(&HashMap<String, RecoveryState>) -> bool,
 ) -> bool {
+    authorize_continuation_commit(operation, None, persist)
+}
+
+fn authorize_continuation_commit(
+    operation: &OwnerContinuationOperation,
+    usage_limit: Option<&UsageLimitCandidate>,
+    persist: impl FnOnce(&HashMap<String, RecoveryState>) -> bool,
+) -> bool {
     if !RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst) {
         return false;
     }
@@ -514,6 +703,7 @@ fn authorize_owner_continuation_commit_with(
     if !owner_operation_matches(state, operation)
         || state.action_epoch != operation.epoch.action_epoch
         || state.continuations[&operation.operation_id].status != OwnerContinuationStatus::Reserved
+        || usage_limit.is_some_and(|candidate| !usage_limit_candidate_is_current(state, candidate))
         || matches!(
             state.phase,
             RecoveryPhase::ActiveRequest | RecoveryPhase::CommittingRecovery
@@ -645,6 +835,10 @@ fn reserve_recovery(context: &TurnRecoveryContext) -> Option<u32> {
     let mut states = recovery_states().lock().ok()?;
     states.retain(|_, state| {
         !state.continuations.is_empty()
+            || state
+                .usage_limit
+                .as_ref()
+                .is_some_and(|candidate| candidate.has_current_observation(now))
             || now.duration_since(state.updated_at) <= RECOVERY_STATE_TTL
     });
     let state = states.entry(context.desktop_thread_id.clone()).or_default();
@@ -731,8 +925,13 @@ pub(crate) fn mark_observed_turn_completed(context: &TurnRecoveryContext) {
         });
         if owned {
             let state = states.get_mut(&context.desktop_thread_id).unwrap();
+            if state.usage_limit.as_ref().is_some_and(|candidate| {
+                context.desktop_turn_id.as_deref() == Some(candidate.turn.turn_id.as_str())
+            }) {
+                state.usage_limit = None;
+            }
             reset_automatic_state(state, true);
-            if state.continuations.is_empty() {
+            if state.continuations.is_empty() && state.usage_limit.is_none() {
                 states.remove(&context.desktop_thread_id);
             }
             persist_states(&states);
@@ -936,6 +1135,9 @@ fn finish_reserved_recovery(context: &TurnRecoveryContext, submitted: bool) -> u
         return state.submitted;
     }
     let committed_submission = submitted && state.phase == RecoveryPhase::CommittingRecovery;
+    if committed_submission {
+        state.usage_limit = None;
+    }
     // A positive no-mutation finish can retire its precommit charge. Ambiguous
     // results use submitted=true and must retain it.
     if !submitted && state.commit_charged {
@@ -982,7 +1184,7 @@ fn cancel_reserved_recovery(context: &TurnRecoveryContext) {
         state.updated_at = Instant::now();
     } else {
         reset_automatic_state(state, false);
-        if state.continuations.is_empty() {
+        if state.continuations.is_empty() && state.usage_limit.is_none() {
             states.remove(&context.desktop_thread_id);
         }
     }
@@ -1292,7 +1494,11 @@ fn ledger_from_states(states: &HashMap<String, RecoveryState>) -> RecoveryLedger
                 .then(|| PersistedTurn {
                     context: context.clone(),
                     submitted: state.submitted,
-                    phase: state.phase,
+                    phase: if state.phase == RecoveryPhase::Idle && state.usage_limit.is_some() {
+                        RecoveryPhase::AwaitingContinuation
+                    } else {
+                        state.phase
+                    },
                     commit_charged: state.commit_charged,
                 })
             })
@@ -1566,6 +1772,517 @@ pub(crate) fn forward_error_is_recoverable(error: &super::error::ProxyError) -> 
         // ResponsePending is an unknown still-running upstream operation;
         // neither a replay nor a new turn may duplicate it.
         _ => false,
+    }
+}
+
+pub(crate) fn handle_recovery_forward_error(
+    context: TurnRecoveryContext,
+    error: &super::error::ProxyError,
+    reason: &'static str,
+) {
+    if forward_error_is_recoverable(error) {
+        if matches!(
+            error,
+            super::error::ProxyError::UpstreamError { body: Some(body), .. }
+                if super::providers::streaming_retry::is_retryable_usage_limit_body(body)
+        ) {
+            record_proxy_usage_limit(&context);
+        }
+        schedule_turn_recovery(context, reason);
+    } else {
+        mark_observed_turn_completed(&context);
+    }
+}
+
+fn record_proxy_usage_limit(context: &TurnRecoveryContext) {
+    let Some(turn_id) = context.desktop_turn_id.as_ref() else {
+        return;
+    };
+    let turn = ObservedUsageLimitTurn {
+        thread_id: context.desktop_thread_id.clone(),
+        turn_id: turn_id.clone(),
+        model: Some(context.desktop_model.clone()),
+        observed_at_ms: context.observed_at_ms,
+    };
+    if !context.desktop_eligible || !turn.is_valid() {
+        return;
+    }
+    let Ok(mut states) = recovery_states().lock() else {
+        return;
+    };
+    let Some(state) = states.get_mut(&turn.thread_id) else {
+        return;
+    };
+    if state.phase != RecoveryPhase::ActiveRequest
+        || state.tracked_epoch.as_deref() != Some(state.action_epoch.as_str())
+        || state.tracked.as_ref().is_none_or(|tracked| {
+            tracked.recovery_id != context.recovery_id
+                || tracked.desktop_turn_id != context.desktop_turn_id
+        })
+    {
+        return;
+    }
+    // The running request reached a terminal failure. Its Drop must retain
+    // the click candidate independently of the automatic retry budget.
+    state.phase = RecoveryPhase::Idle;
+    let now = Instant::now();
+    state.usage_limit = Some(UsageLimitCandidate {
+        turn,
+        proxy_observed_at: Some(now),
+        native_evidence: NativeUsageLimitEvidence::Absent,
+    });
+    state.updated_at = now;
+    persist_states(&states);
+}
+
+impl ObservedUsageLimitTurn {
+    pub(crate) fn is_valid(&self) -> bool {
+        valid_continuation_identifier(&self.thread_id)
+            && valid_continuation_identifier(&self.turn_id)
+            && self.model.as_deref().is_none_or(|model| {
+                valid_continuation_identifier(model) && !model.eq_ignore_ascii_case("unknown")
+            })
+            && self.observed_at_ms > 0
+    }
+}
+
+pub(crate) fn proxy_usage_limit_turns() -> Vec<ProxyUsageLimitTurn> {
+    ensure_owner_ledger_loaded();
+    recovery_states()
+        .lock()
+        .map(|states| states.proxy_usage_limit_turns())
+        .unwrap_or_default()
+}
+
+pub(crate) fn replace_native_usage_limit_candidates(
+    snapshot: crate::codex_desktop::NativeUsageLimitSnapshot,
+) {
+    ensure_owner_ledger_loaded();
+    let Ok(mut states) = recovery_states().lock() else {
+        return;
+    };
+    states.apply_native_usage_limit_snapshot(snapshot);
+}
+
+pub(crate) fn clear_native_usage_limit_candidates() {
+    ensure_owner_ledger_loaded();
+    let Ok(mut states) = recovery_states().lock() else {
+        return;
+    };
+    states.clear_native_usage_limit_snapshot();
+}
+
+impl RecoveryStates {
+    fn proxy_usage_limit_turns(&self) -> Vec<ProxyUsageLimitTurn> {
+        let now = Instant::now();
+        self.threads
+            .values()
+            .filter_map(|state| state.usage_limit.as_ref())
+            .filter(|candidate| candidate.has_current_proxy_observation(now))
+            .map(|candidate| ProxyUsageLimitTurn {
+                thread_id: candidate.turn.thread_id.clone(),
+                turn_id: candidate.turn.turn_id.clone(),
+                observed_at_ms: candidate.turn.observed_at_ms,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn replace_native_usage_limit_snapshot(
+        &mut self,
+        turns: Vec<ObservedUsageLimitTurn>,
+        conflicting_thread_ids: Vec<String>,
+        complete: bool,
+    ) {
+        self.apply_native_usage_limit_snapshot(crate::codex_desktop::NativeUsageLimitSnapshot {
+            candidates: turns,
+            conflicting_thread_ids,
+            complete,
+            ..Default::default()
+        });
+    }
+
+    fn apply_native_usage_limit_snapshot(
+        &mut self,
+        snapshot: crate::codex_desktop::NativeUsageLimitSnapshot,
+    ) {
+        self.native_usage_limit_snapshot_completed_at = snapshot.complete.then(Instant::now);
+        merge_native_usage_limit_candidates(
+            &mut self.threads,
+            snapshot.candidates,
+            snapshot.conflicting_thread_ids,
+            snapshot.stale_proxy_turns,
+            snapshot.complete,
+        );
+    }
+
+    fn clear_native_usage_limit_snapshot(&mut self) {
+        merge_native_usage_limit_candidates(
+            &mut self.threads,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        self.native_usage_limit_snapshot_completed_at = None;
+    }
+
+    fn usage_limit_resume_count(&self) -> UsageLimitResumeCount {
+        UsageLimitResumeCount {
+            count: self
+                .threads
+                .values()
+                .filter_map(eligible_usage_limit_candidate)
+                .count(),
+            complete: self
+                .native_usage_limit_snapshot_completed_at
+                .is_some_and(|completed_at| {
+                    completed_at.elapsed() <= NATIVE_USAGE_LIMIT_CONFIRMATION_TTL
+                }),
+        }
+    }
+}
+
+fn merge_native_usage_limit_candidates(
+    states: &mut HashMap<String, RecoveryState>,
+    turns: Vec<ObservedUsageLimitTurn>,
+    conflicting_thread_ids: Vec<String>,
+    stale_proxy_turns: Vec<ProxyUsageLimitTurn>,
+    complete: bool,
+) {
+    let mut observed: HashMap<String, Option<ObservedUsageLimitTurn>> = HashMap::new();
+    for turn in turns.into_iter().filter(ObservedUsageLimitTurn::is_valid) {
+        observed
+            .entry(turn.thread_id.clone())
+            .and_modify(|previous| {
+                // Renderer windows can overlap. Conflicting turn/model
+                // bindings cannot pick an arbitrary winner for this thread.
+                match previous {
+                    Some(old) if old.turn_id == turn.turn_id => match (&old.model, &turn.model) {
+                        (None, Some(_)) => *old = turn.clone(),
+                        (Some(_), None) => {}
+                        (left, right) if left == right => {
+                            old.observed_at_ms = old.observed_at_ms.min(turn.observed_at_ms);
+                        }
+                        _ => *previous = None,
+                    },
+                    _ => *previous = None,
+                }
+            })
+            .or_insert(Some(turn));
+    }
+    for thread_id in conflicting_thread_ids {
+        // A reported conflict takes precedence over a positive observation
+        // from another renderer during the same scan.
+        observed.insert(thread_id, None);
+    }
+    let now = Instant::now();
+    for stale in stale_proxy_turns {
+        let Some(candidate) = states
+            .get_mut(&stale.thread_id)
+            .and_then(|state| state.usage_limit.as_mut())
+            .filter(|candidate| {
+                candidate.has_current_proxy_observation(now)
+                    && candidate.turn.turn_id == stale.turn_id
+                    && candidate.turn.observed_at_ms == stale.observed_at_ms
+            })
+        else {
+            continue;
+        };
+        candidate.native_evidence = NativeUsageLimitEvidence::Displaced;
+    }
+    let reconcile_candidate =
+        |state: &mut RecoveryState, observation: Option<&Option<ObservedUsageLimitTurn>>| {
+            let Some(candidate) = state.usage_limit.as_mut() else {
+                return true;
+            };
+            let observed_turn = observation.and_then(Option::as_ref);
+            if candidate.native_evidence == NativeUsageLimitEvidence::Displaced
+                && !observed_turn.is_some_and(|turn| {
+                    turn.turn_id != candidate.turn.turn_id
+                        && turn.observed_at_ms > candidate.turn.observed_at_ms
+                })
+                && (observed_turn.is_some() || candidate.has_current_proxy_observation(now))
+            {
+                // A renderer still reporting the displaced turn cannot make it
+                // eligible again. A proven newer failed turn can replace it.
+                return true;
+            }
+            candidate.native_evidence = match observation {
+                Some(Some(turn))
+                    if turn.turn_id == candidate.turn.turn_id
+                        && (turn.model == candidate.turn.model
+                            || (turn.model.is_none() && candidate.proxy_observed_at.is_some())) =>
+                {
+                    NativeUsageLimitEvidence::Confirmed {
+                        observed_at_ms: turn.observed_at_ms,
+                        confirmed_at: now,
+                    }
+                }
+                Some(native)
+                    if candidate.proxy_observed_at.is_some()
+                        && native
+                            .as_ref()
+                            .is_none_or(|turn| turn.turn_id == candidate.turn.turn_id) =>
+                {
+                    // Keep the proxy's binding while the renderer disagrees, so a
+                    // later poll cannot reinsert the conflicting turn as native only.
+                    NativeUsageLimitEvidence::Conflicting
+                }
+                _ if candidate.native_evidence == NativeUsageLimitEvidence::Conflicting
+                    && !observation.and_then(Option::as_ref).is_some_and(|turn| {
+                        turn.observed_at_ms > candidate.turn.observed_at_ms
+                    }) =>
+                {
+                    // Missing evidence cannot restore a vetoed proxy failure.
+                    // Keep the veto until a positive binding or proxy expiry.
+                    NativeUsageLimitEvidence::Conflicting
+                }
+                _ => NativeUsageLimitEvidence::Absent,
+            };
+            if candidate.has_current_observation(now) {
+                return true;
+            }
+            state.usage_limit = None;
+            state.phase != RecoveryPhase::Idle
+                || state.tracked.is_some()
+                || !state.continuations.is_empty()
+        };
+    if complete {
+        states.retain(|thread_id, state| reconcile_candidate(state, observed.get(thread_id)));
+    } else {
+        // Only an observed thread has enough evidence to change its binding
+        // when the renderer could not enumerate every thread.
+        for (thread_id, observation) in &observed {
+            if states
+                .get_mut(thread_id)
+                .is_some_and(|state| !reconcile_candidate(state, Some(observation)))
+            {
+                states.remove(thread_id);
+            }
+        }
+    }
+    for (thread_id, turn) in observed
+        .into_iter()
+        .filter_map(|(id, turn)| Some((id, turn?)))
+    {
+        let state = states.entry(thread_id).or_default();
+        if state.usage_limit.as_ref().is_some_and(|candidate| {
+            candidate.native_evidence != NativeUsageLimitEvidence::Absent
+                || candidate.turn.observed_at_ms >= turn.observed_at_ms
+        }) || matches!(
+            state.phase,
+            RecoveryPhase::ActiveRequest | RecoveryPhase::ToolStepComplete
+        ) || state.tracked.as_ref().is_some_and(|tracked| {
+            tracked.observed_at_ms > turn.observed_at_ms
+                || (state.phase == RecoveryPhase::AwaitingContinuation
+                    && tracked.desktop_turn_id.as_deref() == Some(turn.turn_id.as_str()))
+        }) {
+            continue;
+        }
+        state.usage_limit = Some(UsageLimitCandidate {
+            native_evidence: NativeUsageLimitEvidence::Confirmed {
+                observed_at_ms: turn.observed_at_ms,
+                confirmed_at: now,
+            },
+            turn,
+            proxy_observed_at: None,
+        });
+    }
+}
+
+fn eligible_usage_limit_candidate(state: &RecoveryState) -> Option<&UsageLimitCandidate> {
+    let candidate = state.usage_limit.as_ref()?;
+    if !candidate.has_current_evidence(Instant::now())
+        || matches!(
+            state.phase,
+            RecoveryPhase::ActiveRequest
+                | RecoveryPhase::ToolStepComplete
+                | RecoveryPhase::CommittingRecovery
+        )
+        || state.continuations.len() >= MAX_OWNER_OPERATIONS_PER_THREAD
+        || state.continuations.contains_key(&candidate.operation_id())
+        || state.continuations.values().any(|operation| {
+            operation.blocks_new_continuation(&state.action_epoch, Some(candidate))
+        })
+    {
+        return None;
+    }
+    Some(candidate)
+}
+
+fn usage_limit_resume_states() -> Result<MutexGuard<'static, RecoveryStates>, String> {
+    ensure_owner_ledger_loaded();
+    if !RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst) {
+        return Err("Codex continuation evidence storage is unavailable".into());
+    }
+    recovery_states()
+        .lock()
+        .map_err(|_| "Codex continuation evidence storage is unavailable".into())
+}
+
+fn usage_limit_resume_snapshot(
+) -> Result<Vec<(OwnerContinuationEpoch, UsageLimitCandidate)>, String> {
+    Ok(usage_limit_resume_states()?
+        .iter()
+        .filter_map(|(thread_id, state)| {
+            let candidate = eligible_usage_limit_candidate(state)?;
+            Some((
+                OwnerContinuationEpoch {
+                    thread_id: thread_id.clone(),
+                    process_epoch: native_continuation_process_epoch().to_owned(),
+                    action_epoch: state.action_epoch.clone(),
+                },
+                candidate.clone(),
+            ))
+        })
+        .collect())
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct UsageLimitResumeCount {
+    count: usize,
+    complete: bool,
+}
+
+pub(crate) fn codex_usage_limit_resume_count() -> Result<UsageLimitResumeCount, String> {
+    Ok(usage_limit_resume_states()?.usage_limit_resume_count())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UsageLimitResumeOutcome {
+    Submitted,
+    Deferred,
+    Skipped,
+    Uncertain,
+}
+
+#[derive(Default, Serialize)]
+pub struct UsageLimitResumeReport {
+    submitted: usize,
+    deferred: usize,
+    skipped: usize,
+    uncertain: usize,
+}
+
+pub(crate) async fn resume_usage_limited_turns() -> Result<UsageLimitResumeReport, String> {
+    static BATCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _batch = BATCH
+        .try_lock()
+        .map_err(|_| "Codex Auto Resume is already running")?;
+    let candidates = usage_limit_resume_snapshot()?;
+    let mut outcomes = futures::stream::iter(candidates)
+        .map(|(epoch, candidate)| resume_usage_limited_turn(epoch, candidate))
+        .buffer_unordered(4);
+    let mut report = UsageLimitResumeReport::default();
+    while let Some(outcome) = outcomes.next().await {
+        match outcome {
+            UsageLimitResumeOutcome::Submitted => report.submitted += 1,
+            UsageLimitResumeOutcome::Deferred => report.deferred += 1,
+            UsageLimitResumeOutcome::Skipped => report.skipped += 1,
+            UsageLimitResumeOutcome::Uncertain => report.uncertain += 1,
+        }
+    }
+    Ok(report)
+}
+
+async fn resume_usage_limited_turn(
+    epoch: OwnerContinuationEpoch,
+    candidate: UsageLimitCandidate,
+) -> UsageLimitResumeOutcome {
+    let turn = &candidate.turn;
+    let operation = match reserve_continuation(
+        &epoch,
+        &turn.turn_id,
+        &candidate.operation_id(),
+        Some(&candidate),
+    ) {
+        Ok(OwnerContinuationReservation::Reserved(operation)) => operation,
+        Err(OwnerContinuationError::Busy) => return UsageLimitResumeOutcome::Deferred,
+        _ => return UsageLimitResumeOutcome::Skipped,
+    };
+    let renderer_operation_id = uuid::Uuid::new_v4().to_string();
+    let (observed_at_ms, require_native_observation) = candidate.continuation_observation();
+    let result = tokio::time::timeout(
+        DESKTOP_READY_TIMEOUT,
+        crate::codex_desktop::submit_codex_usage_limit_continuation(
+            &turn.thread_id,
+            &renderer_operation_id,
+            turn.model.as_deref(),
+            observed_at_ms,
+            &turn.turn_id,
+            require_native_observation,
+            |final_commit| {
+                if final_commit {
+                    authorize_continuation_commit(&operation, Some(&candidate), persist_states)
+                } else {
+                    owner_continuation_is_reserved(&operation)
+                }
+            },
+        ),
+    )
+    .await;
+    finish_usage_limit_resume(&operation, &candidate, result.ok().and_then(Result::ok))
+}
+
+fn finish_usage_limit_resume(
+    operation: &OwnerContinuationOperation,
+    candidate: &UsageLimitCandidate,
+    result: Option<crate::codex_desktop::CodexContinuationResult>,
+) -> UsageLimitResumeOutcome {
+    let (outcome, deferred) = match result {
+        Some(result) if result.submitted => (
+            result
+                .turn_id
+                .map_or(OwnerContinuationOutcome::Uncertain, |turn_id| {
+                    OwnerContinuationOutcome::Submitted { turn_id }
+                }),
+            false,
+        ),
+        Some(result) if result.mutation_attempted => (OwnerContinuationOutcome::Uncertain, false),
+        Some(result) => (
+            OwnerContinuationOutcome::Refused,
+            result.usage_limit_deferred,
+        ),
+        // The journal distinguishes read-only preparation from an authorized
+        // send when the transport stops yielding a result.
+        None => (OwnerContinuationOutcome::Uncertain, true),
+    };
+    let receipt = finish_owner_continuation(operation, outcome);
+    match receipt.status {
+        OwnerContinuationStatus::Submitted => UsageLimitResumeOutcome::Submitted,
+        OwnerContinuationStatus::Committing | OwnerContinuationStatus::Uncertain => {
+            UsageLimitResumeOutcome::Uncertain
+        }
+        OwnerContinuationStatus::Refused => {
+            let Ok(mut states) = recovery_states().lock() else {
+                return UsageLimitResumeOutcome::Skipped;
+            };
+            let Some(state) = states.get_mut(&operation.epoch.thread_id) else {
+                return UsageLimitResumeOutcome::Skipped;
+            };
+            let current = state.action_epoch == operation.epoch.action_epoch
+                && usage_limit_candidate_is_current(state, candidate);
+            if deferred {
+                if owner_operation_matches(state, operation)
+                    && state.continuations[&operation.operation_id].status
+                        == OwnerContinuationStatus::Refused
+                {
+                    state.continuations.remove(&operation.operation_id);
+                    persist_states(&states);
+                }
+                return if current {
+                    UsageLimitResumeOutcome::Deferred
+                } else {
+                    UsageLimitResumeOutcome::Skipped
+                };
+            }
+            if current {
+                state.usage_limit = None;
+            }
+            UsageLimitResumeOutcome::Skipped
+        }
+        OwnerContinuationStatus::Reserved => UsageLimitResumeOutcome::Uncertain,
     }
 }
 
@@ -2093,6 +2810,10 @@ fn apply_recovery_decision(context: &TurnRecoveryContext, decision: RecoveryDeci
         }
         RecoveryDecision::ToolStepComplete => mark_observed_tool_step_completed(context),
         RecoveryDecision::Recover(reason) => schedule_turn_recovery(context.clone(), reason),
+        RecoveryDecision::UsageLimit(reason) => {
+            record_proxy_usage_limit(context);
+            schedule_turn_recovery(context.clone(), reason);
+        }
     }
 }
 
@@ -2101,6 +2822,7 @@ enum RecoveryDecision {
     Complete,
     ToolStepComplete,
     Recover(&'static str),
+    UsageLimit(&'static str),
     Ignore,
 }
 
@@ -2110,27 +2832,21 @@ fn recovery_decision(
     payload: &Value,
     evidence: NativeResponsesEvidence,
 ) -> RecoveryDecision {
-    match disposition {
+    let reason = match disposition {
         NativeResponsesTerminalDisposition::Completed if evidence.valid_tool_calls > 0 => {
-            RecoveryDecision::ToolStepComplete
+            return RecoveryDecision::ToolStepComplete;
         }
-        NativeResponsesTerminalDisposition::Completed => RecoveryDecision::Complete,
-        NativeResponsesTerminalDisposition::Incomplete
-            if terminal_is_recoverable(event_name, payload) =>
-        {
-            RecoveryDecision::Recover("response_incomplete")
-        }
-        NativeResponsesTerminalDisposition::Failed
-            if terminal_is_recoverable(event_name, payload) =>
-        {
-            RecoveryDecision::Recover("response_failed")
-        }
-        NativeResponsesTerminalDisposition::ProtocolError { .. }
-            if terminal_is_recoverable(event_name, payload) =>
-        {
-            RecoveryDecision::Recover("protocol_error")
-        }
-        _ => RecoveryDecision::Ignore,
+        NativeResponsesTerminalDisposition::Completed => return RecoveryDecision::Complete,
+        NativeResponsesTerminalDisposition::Incomplete => "response_incomplete",
+        NativeResponsesTerminalDisposition::Failed => "response_failed",
+        NativeResponsesTerminalDisposition::ProtocolError { .. } => "protocol_error",
+    };
+    if !terminal_is_recoverable(event_name, payload) {
+        RecoveryDecision::Ignore
+    } else if is_retryable_usage_limit_payload(payload) {
+        RecoveryDecision::UsageLimit(reason)
+    } else {
+        RecoveryDecision::Recover(reason)
     }
 }
 
@@ -2173,6 +2889,7 @@ mod tests {
         TurnRecoveryContext {
             session_id: session_id.to_string(),
             desktop_thread_id: session_id.to_string(),
+            desktop_turn_id: None,
             recovery_id: format!("recovery-{session_id}"),
             observed_at_ms: chrono::Utc::now().timestamp_millis(),
             model: "gpt-test".to_string(),
@@ -2182,6 +2899,1030 @@ mod tests {
             provider_fingerprint: "fingerprint-test".to_string(),
             desktop_eligible: true,
             max_recoveries: budget,
+        }
+    }
+
+    fn exact_usage_limit_context(session_id: &str, budget: u32) -> TurnRecoveryContext {
+        let mut turn = context(session_id, budget);
+        turn.desktop_turn_id = Some(format!("{session_id}-turn"));
+        turn
+    }
+
+    fn temporary_usage_limit_error() -> Value {
+        serde_json::json!({
+            "type": "usage_limit_reached",
+            "message": "You've hit your usage limit. Try again later."
+        })
+    }
+
+    #[tokio::test]
+    async fn bulk_resume_snapshot_selects_exact_temporary_failures_from_http_and_sse() {
+        use super::super::error::ProxyError;
+
+        let http = exact_usage_limit_context("bulk-resume-http", 0);
+        let sse = exact_usage_limit_context("bulk-resume-sse", 0);
+        let pending = exact_usage_limit_context("bulk-resume-pending", 0);
+        let cancelled = exact_usage_limit_context("bulk-resume-cancelled", 0);
+        let hard_limit = exact_usage_limit_context("bulk-resume-quota", 0);
+        let no_turn_id = context("bulk-resume-no-exact-turn", 0);
+        let mut external = exact_usage_limit_context("bulk-resume-external", 0);
+        external.desktop_eligible = false;
+        let temporary = ProxyError::UpstreamError {
+            status: 429,
+            body: Some(serde_json::json!({"error": temporary_usage_limit_error()}).to_string()),
+        };
+        for turn in [&http, &no_turn_id, &external] {
+            let tracking = track_turn(turn);
+            handle_recovery_forward_error(turn.clone(), &temporary, "upstream_request_failed");
+            drop(tracking);
+        }
+
+        let frame = serde_json::json!({
+            "type": "response.failed",
+            "response": {"status": "failed", "error": temporary_usage_limit_error()}
+        });
+        let terminal = Bytes::from(format!("event: response.failed\ndata: {frame}\n\n"));
+        let events = futures::stream::iter([Ok::<_, std::io::Error>(terminal.clone())]);
+        let output = observe_responses_turn_stream(events, sse.clone())
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(output[0].as_ref().unwrap(), &terminal);
+
+        let pending_tracking = track_turn(&pending);
+        let cancelled_tracking = track_turn(&cancelled);
+        drop(cancelled_tracking);
+        handle_recovery_forward_error(cancelled.clone(), &temporary, "late_error");
+        let quota_tracking = track_turn(&hard_limit);
+        handle_recovery_forward_error(
+            hard_limit.clone(),
+            &ProxyError::UpstreamError {
+                status: 429,
+                body: Some(
+                    serde_json::json!({"error": {"type": "insufficient_quota", "message": "Quota exhausted"}})
+                        .to_string(),
+                ),
+            },
+            "upstream_request_failed",
+        );
+        drop(quota_tracking);
+
+        let candidates = usage_limit_resume_snapshot().unwrap();
+        for turn in [&http, &sse] {
+            let candidate = &candidates
+                .iter()
+                .find(|(epoch, _)| epoch.thread_id == turn.desktop_thread_id)
+                .unwrap()
+                .1;
+            assert_eq!(Some(&candidate.turn.turn_id), turn.desktop_turn_id.as_ref());
+        }
+        for turn in [&pending, &cancelled, &hard_limit, &no_turn_id, &external] {
+            assert!(candidates
+                .iter()
+                .all(|(epoch, _)| epoch.thread_id != turn.desktop_thread_id));
+        }
+        drop(pending_tracking);
+        for turn in [&http, &sse] {
+            mark_turn_completed(&turn.desktop_thread_id);
+        }
+    }
+
+    #[test]
+    fn usage_limit_candidate_preserves_the_existing_automatic_budget_and_fences_old_clicks() {
+        let context = exact_usage_limit_context("bulk-resume-aggressive", 1);
+        let tracking = track_turn(&context);
+        apply_recovery_decision(&context, RecoveryDecision::UsageLimit("response_failed"));
+        drop(tracking);
+        assert!(recovery_is_active(&context));
+        let (epoch, candidate) = usage_limit_resume_snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|(epoch, _)| epoch.thread_id == context.desktop_thread_id)
+            .unwrap();
+        let OwnerContinuationReservation::Reserved(operation) = reserve_continuation(
+            &epoch,
+            &candidate.turn.turn_id,
+            &candidate.operation_id(),
+            Some(&candidate),
+        )
+        .unwrap() else {
+            panic!("the explicit click should reserve the exact turn");
+        };
+        assert!(!recovery_is_active(&context));
+        begin_turn(&context.desktop_thread_id, false);
+        assert!(!authorize_continuation_commit(
+            &operation,
+            Some(&candidate),
+            persist_states,
+        ));
+        assert_eq!(
+            finish_usage_limit_resume(&operation, &candidate, None),
+            UsageLimitResumeOutcome::Skipped,
+        );
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    fn bulk_resume_can_retry_after_native_confirmation_temporarily_conflicts() {
+        let context = exact_usage_limit_context("bulk-resume-confirmation-conflict", 0);
+        let tracking = track_turn(&context);
+        record_proxy_usage_limit(&context);
+        drop(tracking);
+        let (epoch, candidate) = usage_limit_resume_snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|(epoch, _)| epoch.thread_id == context.desktop_thread_id)
+            .unwrap();
+        let OwnerContinuationReservation::Reserved(operation) = reserve_continuation(
+            &epoch,
+            &candidate.turn.turn_id,
+            &candidate.operation_id(),
+            Some(&candidate),
+        )
+        .unwrap() else {
+            panic!("the first click should reserve");
+        };
+        recovery_states()
+            .lock()
+            .unwrap()
+            .replace_native_usage_limit_snapshot(Vec::new(), vec![epoch.thread_id.clone()], false);
+        assert!(!authorize_continuation_commit(
+            &operation,
+            Some(&candidate),
+            persist_states,
+        ));
+        assert_eq!(
+            finish_usage_limit_resume(
+                &operation,
+                &candidate,
+                Some(crate::codex_desktop::CodexContinuationResult {
+                    submitted: false,
+                    mutation_attempted: false,
+                    usage_limit_deferred: true,
+                    turn_id: None,
+                    debug_port: None,
+                    target_id: None,
+                    message: String::new(),
+                }),
+            ),
+            UsageLimitResumeOutcome::Skipped,
+        );
+        recovery_states()
+            .lock()
+            .unwrap()
+            .replace_native_usage_limit_snapshot(vec![candidate.turn.clone()], Vec::new(), false);
+        let (_, confirmed) = usage_limit_resume_snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|(observed, _)| observed.thread_id == epoch.thread_id)
+            .expect("fresh confirmation should make the turn eligible again");
+        assert!(matches!(
+            reserve_continuation(
+                &epoch,
+                &confirmed.turn.turn_id,
+                &confirmed.operation_id(),
+                Some(&confirmed),
+            ),
+            Ok(OwnerContinuationReservation::Reserved(_))
+        ));
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    fn bulk_resume_retries_preparation_after_timeout_and_fences_a_possible_send() {
+        let context = exact_usage_limit_context("bulk-resume-timeout", 0);
+        let tracking = track_turn(&context);
+        record_proxy_usage_limit(&context);
+        drop(tracking);
+        let (epoch, candidate) = usage_limit_resume_snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|(epoch, _)| epoch.thread_id == context.desktop_thread_id)
+            .unwrap();
+        let reserve = || {
+            reserve_continuation(
+                &epoch,
+                &candidate.turn.turn_id,
+                &candidate.operation_id(),
+                Some(&candidate),
+            )
+            .unwrap()
+        };
+        let OwnerContinuationReservation::Reserved(operation) = reserve() else {
+            panic!("the first click should reserve");
+        };
+        assert!(matches!(
+            reserve(),
+            OwnerContinuationReservation::AttachOnly(_)
+        ));
+        assert_eq!(
+            finish_usage_limit_resume(&operation, &candidate, None),
+            UsageLimitResumeOutcome::Deferred,
+        );
+        let OwnerContinuationReservation::Reserved(retry) = reserve() else {
+            panic!("an uncommitted timeout should leave the turn available");
+        };
+        assert!(authorize_continuation_commit(
+            &retry,
+            Some(&candidate),
+            persist_states
+        ));
+        assert_eq!(
+            finish_usage_limit_resume(&retry, &candidate, None),
+            UsageLimitResumeOutcome::Uncertain,
+        );
+        let OwnerContinuationReservation::AttachOnly(receipt) = reserve() else {
+            panic!("an unconfirmed send must retain its receipt");
+        };
+        assert_eq!(receipt.status, OwnerContinuationStatus::Uncertain);
+        assert!(usage_limit_resume_snapshot()
+            .unwrap()
+            .iter()
+            .all(|(observed, _)| observed.thread_id != epoch.thread_id));
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    fn native_snapshots_merge_matching_turns_and_require_current_evidence() {
+        let turn = ObservedUsageLimitTurn {
+            thread_id: "bulk-resume-overlapping-views".into(),
+            turn_id: "matching-turn".into(),
+            model: Some("gpt-test".into()),
+            observed_at_ms: 100,
+        };
+        let mut duplicate = turn.clone();
+        duplicate.observed_at_ms += 1;
+        let mut states = HashMap::new();
+        merge_native_usage_limit_candidates(
+            &mut states,
+            vec![duplicate, turn.clone()],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let state = &states[&turn.thread_id];
+        assert_eq!(eligible_usage_limit_candidate(state).unwrap().turn, turn);
+
+        let mut conflict = turn.clone();
+        conflict.turn_id = "conflicting-turn".into();
+        merge_native_usage_limit_candidates(
+            &mut states,
+            vec![turn.clone(), conflict],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        assert!(!states.contains_key(&turn.thread_id));
+
+        let proxy = UsageLimitCandidate {
+            turn: turn.clone(),
+            proxy_observed_at: Some(Instant::now() - RECOVERY_STATE_TTL - Duration::from_secs(1)),
+            native_evidence: NativeUsageLimitEvidence::Absent,
+        };
+        let mut state = RecoveryState {
+            usage_limit: Some(proxy),
+            ..Default::default()
+        };
+        assert!(eligible_usage_limit_candidate(&state).is_none());
+        state.updated_at = Instant::now();
+        states.insert(turn.thread_id.clone(), state);
+        merge_native_usage_limit_candidates(
+            &mut states,
+            vec![turn.clone()],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        assert!(eligible_usage_limit_candidate(&states[&turn.thread_id]).is_some());
+        merge_native_usage_limit_candidates(&mut states, Vec::new(), Vec::new(), Vec::new(), true);
+        assert!(!states.contains_key(&turn.thread_id));
+    }
+
+    #[test]
+    fn incomplete_native_snapshot_replaces_a_superseded_turn() {
+        let turn = ObservedUsageLimitTurn {
+            thread_id: "native-superseded-thread".into(),
+            turn_id: "first-turn".into(),
+            model: Some("gpt-test".into()),
+            observed_at_ms: 100,
+        };
+        let newer = ObservedUsageLimitTurn {
+            turn_id: "newer-turn".into(),
+            observed_at_ms: 200,
+            ..turn.clone()
+        };
+        let mut states = RecoveryStates::default();
+        states.replace_native_usage_limit_snapshot(vec![turn.clone()], Vec::new(), true);
+        let previous = eligible_usage_limit_candidate(&states[&turn.thread_id])
+            .unwrap()
+            .clone();
+
+        states.replace_native_usage_limit_snapshot(vec![newer.clone()], Vec::new(), false);
+
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount {
+                count: 1,
+                complete: false,
+            }
+        );
+        let state = &states[&turn.thread_id];
+        assert_eq!(eligible_usage_limit_candidate(state).unwrap().turn, newer);
+        assert!(!usage_limit_candidate_is_current(state, &previous));
+    }
+
+    #[test]
+    fn incomplete_native_snapshot_blocks_conflicting_observed_bindings() {
+        let native = ObservedUsageLimitTurn {
+            thread_id: "native-ambiguous-thread".into(),
+            turn_id: "native-turn".into(),
+            model: Some("gpt-test".into()),
+            observed_at_ms: 100,
+        };
+        let proxy = ObservedUsageLimitTurn {
+            thread_id: "proxy-conflicting-thread".into(),
+            ..native.clone()
+        };
+        let native_conflict = ObservedUsageLimitTurn {
+            turn_id: "different-turn".into(),
+            ..native.clone()
+        };
+        let proxy_conflict = ObservedUsageLimitTurn {
+            model: Some("different-model".into()),
+            ..proxy.clone()
+        };
+        let mut states = RecoveryStates::default();
+        states.replace_native_usage_limit_snapshot(vec![native.clone()], Vec::new(), true);
+        states
+            .entry(proxy.thread_id.clone())
+            .or_default()
+            .usage_limit = Some(UsageLimitCandidate {
+            turn: proxy.clone(),
+            proxy_observed_at: Some(Instant::now()),
+            native_evidence: NativeUsageLimitEvidence::Absent,
+        });
+
+        states.replace_native_usage_limit_snapshot(
+            vec![native.clone(), native_conflict, proxy_conflict],
+            Vec::new(),
+            false,
+        );
+
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount::default()
+        );
+        assert!(!states.contains_key(&native.thread_id));
+        let proxy_candidate = states[&proxy.thread_id].usage_limit.as_ref().unwrap();
+        assert_eq!(proxy_candidate.turn, proxy);
+        assert_eq!(
+            proxy_candidate.native_evidence,
+            NativeUsageLimitEvidence::Conflicting
+        );
+    }
+
+    #[test]
+    fn incomplete_native_snapshot_applies_explicit_conflicts_to_reported_threads() {
+        let native = ObservedUsageLimitTurn {
+            thread_id: "native-explicit-conflict".into(),
+            turn_id: "failed-turn".into(),
+            model: Some("gpt-test".into()),
+            observed_at_ms: 100,
+        };
+        let proxy = ObservedUsageLimitTurn {
+            thread_id: "proxy-explicit-conflict".into(),
+            ..native.clone()
+        };
+        let unrelated = ObservedUsageLimitTurn {
+            thread_id: "native-unrelated-thread".into(),
+            ..native.clone()
+        };
+        let mut states = RecoveryStates::default();
+        states.replace_native_usage_limit_snapshot(
+            vec![native.clone(), unrelated.clone()],
+            Vec::new(),
+            true,
+        );
+        let proxy_candidate = UsageLimitCandidate {
+            turn: proxy.clone(),
+            proxy_observed_at: Some(Instant::now()),
+            native_evidence: NativeUsageLimitEvidence::Absent,
+        };
+        states
+            .entry(proxy.thread_id.clone())
+            .or_default()
+            .usage_limit = Some(proxy_candidate.clone());
+        assert_eq!(states.usage_limit_resume_count().count, 3);
+
+        states.replace_native_usage_limit_snapshot(
+            vec![native.clone()],
+            vec![native.thread_id.clone(), proxy.thread_id.clone()],
+            false,
+        );
+
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount {
+                count: 1,
+                complete: false,
+            }
+        );
+        assert!(!states.contains_key(&native.thread_id));
+        let proxy_state = &states[&proxy.thread_id];
+        assert!(!usage_limit_candidate_is_current(
+            proxy_state,
+            &proxy_candidate
+        ));
+        let blocked_proxy = proxy_state.usage_limit.as_ref().unwrap();
+        assert_eq!(blocked_proxy.turn, proxy);
+        assert_eq!(
+            blocked_proxy.proxy_observed_at,
+            proxy_candidate.proxy_observed_at
+        );
+        assert_eq!(
+            blocked_proxy.native_evidence,
+            NativeUsageLimitEvidence::Conflicting
+        );
+        assert!(eligible_usage_limit_candidate(&states[&unrelated.thread_id]).is_some());
+    }
+
+    #[test]
+    fn native_usage_limit_snapshots_accept_null_models_and_preserve_known_bindings() {
+        let native: ObservedUsageLimitTurn = serde_json::from_value(serde_json::json!({
+            "threadId": "native-null-model-thread",
+            "turnId": "native-null-model-turn",
+            "model": null,
+            "observedAtMs": 100
+        }))
+        .unwrap();
+        let known = ObservedUsageLimitTurn {
+            model: Some("gpt-test".into()),
+            observed_at_ms: 200,
+            ..native.clone()
+        };
+        let mut states = RecoveryStates::default();
+        let thread_id = native.thread_id.clone();
+        states.replace_native_usage_limit_snapshot(
+            vec![native.clone(), native.clone()],
+            Vec::new(),
+            true,
+        );
+        assert_eq!(states.usage_limit_resume_count().count, 1);
+        assert_eq!(
+            eligible_usage_limit_candidate(&states[&thread_id])
+                .unwrap()
+                .turn,
+            native
+        );
+
+        for turns in [
+            vec![native.clone(), known.clone()],
+            vec![known.clone(), native.clone()],
+        ] {
+            states.replace_native_usage_limit_snapshot(turns, Vec::new(), true);
+            assert_eq!(states.usage_limit_resume_count().count, 1);
+            assert_eq!(
+                eligible_usage_limit_candidate(&states[&thread_id])
+                    .unwrap()
+                    .turn,
+                known
+            );
+            states.replace_native_usage_limit_snapshot(vec![native.clone()], Vec::new(), true);
+            assert_eq!(
+                eligible_usage_limit_candidate(&states[&thread_id])
+                    .unwrap()
+                    .turn,
+                native
+            );
+        }
+
+        let conflict = ObservedUsageLimitTurn {
+            model: Some("other-model".into()),
+            ..known.clone()
+        };
+        states.replace_native_usage_limit_snapshot(
+            vec![known.clone(), native.clone(), conflict, native.clone()],
+            Vec::new(),
+            true,
+        );
+        assert_eq!(states.usage_limit_resume_count().count, 0);
+
+        // The proxy binding keeps its model even when only the native source
+        // can still confirm the failed turn.
+        let state = states.entry(thread_id.clone()).or_default();
+        state.usage_limit = Some(UsageLimitCandidate {
+            turn: known.clone(),
+            proxy_observed_at: Some(Instant::now() - RECOVERY_STATE_TTL - Duration::from_secs(1)),
+            native_evidence: NativeUsageLimitEvidence::Absent,
+        });
+        states.replace_native_usage_limit_snapshot(vec![native.clone()], Vec::new(), true);
+        assert_eq!(states.usage_limit_resume_count().count, 1);
+        let candidate = eligible_usage_limit_candidate(&states[&thread_id]).unwrap();
+        assert_eq!(candidate.turn, known);
+        assert!(candidate.proxy_observed_at.is_some());
+        assert_eq!(
+            candidate.continuation_observation(),
+            (native.observed_at_ms, true)
+        );
+        let pending = candidate.clone();
+
+        let reobserved = ObservedUsageLimitTurn {
+            observed_at_ms: native.observed_at_ms + 1,
+            ..native
+        };
+        states.replace_native_usage_limit_snapshot(vec![reobserved.clone()], Vec::new(), true);
+        let state = &states[&thread_id];
+        let candidate = eligible_usage_limit_candidate(state).unwrap();
+        assert_eq!(
+            candidate.continuation_observation(),
+            (reobserved.observed_at_ms, true)
+        );
+        assert!(!usage_limit_candidate_is_current(state, &pending));
+    }
+
+    #[test]
+    fn conflicting_native_models_block_proxy_resume_until_bindings_agree() {
+        let turn = ObservedUsageLimitTurn {
+            thread_id: "proxy-native-conflict".into(),
+            turn_id: "same-turn".into(),
+            model: Some("proxy-model".into()),
+            observed_at_ms: 100,
+        };
+        let conflicting = ObservedUsageLimitTurn {
+            model: Some("other-model".into()),
+            observed_at_ms: 200,
+            ..turn.clone()
+        };
+        let mut states = RecoveryStates::default();
+        let proxy = UsageLimitCandidate {
+            turn: turn.clone(),
+            proxy_observed_at: Some(Instant::now()),
+            native_evidence: NativeUsageLimitEvidence::Absent,
+        };
+        states
+            .entry(turn.thread_id.clone())
+            .or_default()
+            .usage_limit = Some(proxy.clone());
+        assert_eq!(states.usage_limit_resume_count().count, 1);
+        assert_eq!(
+            proxy.continuation_observation(),
+            (turn.observed_at_ms, false)
+        );
+
+        // A separate window may agree while another reports a conflicting
+        // model. Neither a conflicting row nor conflicting windows can resume.
+        for rows in [
+            vec![conflicting.clone()],
+            vec![turn.clone(), conflicting.clone()],
+            vec![conflicting],
+        ] {
+            states.replace_native_usage_limit_snapshot(rows, Vec::new(), true);
+            assert_eq!(states.usage_limit_resume_count().count, 0);
+            assert!(!usage_limit_candidate_is_current(
+                &states[&turn.thread_id],
+                &proxy
+            ));
+        }
+
+        states.replace_native_usage_limit_snapshot(vec![turn.clone()], Vec::new(), true);
+        let candidate = eligible_usage_limit_candidate(&states[&turn.thread_id]).unwrap();
+        assert_eq!(candidate.turn, turn);
+        assert_eq!(
+            candidate.continuation_observation(),
+            (turn.observed_at_ms, true)
+        );
+    }
+
+    #[test]
+    fn usage_limit_count_preserves_completeness_when_candidates_change() {
+        let mut states = RecoveryStates::default();
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount::default()
+        );
+        states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), true);
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount {
+                count: 0,
+                complete: true
+            }
+        );
+
+        let turn = ObservedUsageLimitTurn {
+            thread_id: "native-count-thread".into(),
+            turn_id: "native-count-turn".into(),
+            model: Some("gpt-test".into()),
+            observed_at_ms: 100,
+        };
+        states.replace_native_usage_limit_snapshot(
+            vec![turn.clone(), turn.clone()],
+            Vec::new(),
+            true,
+        );
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount {
+                count: 1,
+                complete: true
+            }
+        );
+
+        let thread_id = turn.thread_id.clone();
+        let confirmed_observation = eligible_usage_limit_candidate(&states[&thread_id])
+            .unwrap()
+            .continuation_observation();
+        states.replace_native_usage_limit_snapshot(vec![turn.clone()], Vec::new(), false);
+        assert_eq!(
+            serde_json::to_value(states.usage_limit_resume_count()).unwrap(),
+            serde_json::json!({ "count": 1, "complete": false })
+        );
+        assert_eq!(
+            eligible_usage_limit_candidate(&states[&thread_id])
+                .unwrap()
+                .continuation_observation(),
+            confirmed_observation
+        );
+
+        states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), false);
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount {
+                count: 1,
+                complete: false
+            }
+        );
+        assert!(states.threads.contains_key(&thread_id));
+        assert_eq!(
+            eligible_usage_limit_candidate(&states[&thread_id])
+                .unwrap()
+                .continuation_observation(),
+            confirmed_observation
+        );
+
+        // A new action invalidates the last confirmed candidate between scans.
+        states.replace_native_usage_limit_snapshot(vec![turn], Vec::new(), false);
+        advance_action_epoch(states.get_mut(&thread_id).unwrap());
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount::default()
+        );
+
+        states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), true);
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount {
+                count: 0,
+                complete: true
+            }
+        );
+    }
+
+    #[test]
+    fn usage_limit_count_keeps_eligible_proxy_evidence_when_native_observation_is_unavailable() {
+        let turn = ObservedUsageLimitTurn {
+            thread_id: "proxy-count-thread".into(),
+            turn_id: "proxy-count-turn".into(),
+            model: Some("gpt-test".into()),
+            observed_at_ms: 200,
+        };
+        let mut states = RecoveryStates::default();
+        let state = states.entry(turn.thread_id.clone()).or_default();
+        state.usage_limit = Some(UsageLimitCandidate {
+            turn: turn.clone(),
+            proxy_observed_at: Some(Instant::now()),
+            native_evidence: NativeUsageLimitEvidence::Absent,
+        });
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount {
+                count: 1,
+                complete: false
+            }
+        );
+
+        states.replace_native_usage_limit_snapshot(vec![turn.clone()], Vec::new(), true);
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount {
+                count: 1,
+                complete: true
+            }
+        );
+
+        states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), false);
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount {
+                count: 1,
+                complete: false
+            }
+        );
+
+        let state = states.get_mut(&turn.thread_id).unwrap();
+        state.usage_limit.as_mut().unwrap().native_evidence = NativeUsageLimitEvidence::Confirmed {
+            observed_at_ms: turn.observed_at_ms,
+            confirmed_at: Instant::now()
+                - NATIVE_USAGE_LIMIT_CONFIRMATION_TTL
+                - Duration::from_secs(1),
+        };
+        let candidate = eligible_usage_limit_candidate(state).unwrap();
+        assert_eq!(
+            candidate.continuation_observation(),
+            (turn.observed_at_ms, false)
+        );
+
+        advance_action_epoch(states.get_mut(&turn.thread_id).unwrap());
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount::default()
+        );
+    }
+
+    #[test]
+    fn usage_limit_count_does_not_revive_vetoed_proxy_turn_on_quiet_scans() {
+        let turn = ObservedUsageLimitTurn {
+            thread_id: "vetoed-proxy-thread".into(),
+            turn_id: "failed-proxy-turn".into(),
+            model: Some("gpt-test".into()),
+            observed_at_ms: 200,
+        };
+        let mut states = RecoveryStates::default();
+        let candidate = UsageLimitCandidate {
+            turn: turn.clone(),
+            proxy_observed_at: Some(Instant::now()),
+            native_evidence: NativeUsageLimitEvidence::Absent,
+        };
+        states
+            .entry(turn.thread_id.clone())
+            .or_default()
+            .usage_limit = Some(candidate.clone());
+        states.replace_native_usage_limit_snapshot(vec![turn.clone()], Vec::new(), true);
+        assert_eq!(states.usage_limit_resume_count().count, 1);
+
+        states.replace_native_usage_limit_snapshot(Vec::new(), vec![turn.thread_id.clone()], false);
+        assert_eq!(states.usage_limit_resume_count().count, 0);
+
+        states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), true);
+        assert_eq!(states.usage_limit_resume_count().count, 0);
+        assert!(!usage_limit_candidate_is_current(
+            &states[&turn.thread_id],
+            &candidate
+        ));
+
+        states.clear_native_usage_limit_snapshot();
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount::default()
+        );
+
+        states.replace_native_usage_limit_snapshot(vec![turn.clone()], Vec::new(), true);
+        assert_eq!(states.usage_limit_resume_count().count, 1);
+        assert!(usage_limit_candidate_is_current(
+            &states[&turn.thread_id],
+            &candidate
+        ));
+    }
+
+    #[test]
+    fn usage_limit_count_vetoes_only_the_exact_proxy_observation() {
+        let turn = ObservedUsageLimitTurn {
+            thread_id: "proxy-observation-thread".into(),
+            turn_id: "proxy-observation-turn".into(),
+            model: None,
+            observed_at_ms: 200,
+        };
+        let mut states = RecoveryStates::default();
+        let proxy = UsageLimitCandidate {
+            turn: turn.clone(),
+            proxy_observed_at: Some(Instant::now()),
+            native_evidence: NativeUsageLimitEvidence::Absent,
+        };
+        states
+            .entry(turn.thread_id.clone())
+            .or_default()
+            .usage_limit = Some(proxy.clone());
+        let mut unrelated = proxy.clone();
+        unrelated.turn.thread_id = "unrelated-proxy-thread".into();
+        let unrelated_state = states.entry(unrelated.turn.thread_id.clone()).or_default();
+        unrelated_state.usage_limit = Some(unrelated);
+        let mut watched = states.proxy_usage_limit_turns();
+        watched.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
+        assert_eq!(watched.len(), 2);
+        let observed = watched.remove(0);
+        assert_eq!(observed.thread_id, turn.thread_id);
+
+        for stale in [
+            ProxyUsageLimitTurn {
+                turn_id: "older-turn".into(),
+                ..observed.clone()
+            },
+            ProxyUsageLimitTurn {
+                observed_at_ms: 100,
+                ..observed.clone()
+            },
+        ] {
+            states.apply_native_usage_limit_snapshot(
+                crate::codex_desktop::NativeUsageLimitSnapshot {
+                    stale_proxy_turns: vec![stale],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(states.usage_limit_resume_count().count, 2);
+        }
+
+        states.apply_native_usage_limit_snapshot(crate::codex_desktop::NativeUsageLimitSnapshot {
+            candidates: vec![turn.clone()],
+            stale_proxy_turns: vec![observed],
+            complete: true,
+            ..Default::default()
+        });
+        assert_eq!(states.usage_limit_resume_count().count, 1);
+        assert!(!usage_limit_candidate_is_current(
+            &states[&turn.thread_id],
+            &proxy
+        ));
+
+        states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), true);
+        assert_eq!(states.usage_limit_resume_count().count, 1);
+        for complete in [false, true] {
+            // The window that disproved this failure can disappear while an
+            // older renderer continues to report it.
+            states.replace_native_usage_limit_snapshot(vec![turn.clone()], Vec::new(), complete);
+            assert_eq!(states.usage_limit_resume_count().count, 1);
+            assert!(!usage_limit_candidate_is_current(
+                &states[&turn.thread_id],
+                &proxy
+            ));
+        }
+        let replacement = ObservedUsageLimitTurn {
+            turn_id: "replacement-failed-turn".into(),
+            observed_at_ms: 300,
+            ..turn
+        };
+        states.replace_native_usage_limit_snapshot(vec![replacement.clone()], Vec::new(), true);
+        assert_eq!(states.usage_limit_resume_count().count, 2);
+        assert_eq!(
+            eligible_usage_limit_candidate(&states[&replacement.thread_id])
+                .unwrap()
+                .turn,
+            replacement
+        );
+    }
+
+    #[test]
+    fn stale_native_confirmations_do_not_keep_the_count_actionable() {
+        let turn = ObservedUsageLimitTurn {
+            thread_id: "native-stale-thread".into(),
+            turn_id: "native-stale-turn".into(),
+            model: None,
+            observed_at_ms: 300,
+        };
+        let mut states = RecoveryStates::default();
+        states.replace_native_usage_limit_snapshot(vec![turn.clone()], Vec::new(), true);
+
+        let stale_at =
+            Instant::now() - NATIVE_USAGE_LIMIT_CONFIRMATION_TTL - Duration::from_secs(1);
+        states.native_usage_limit_snapshot_completed_at = Some(stale_at);
+        let candidate = states
+            .get_mut(&turn.thread_id)
+            .unwrap()
+            .usage_limit
+            .as_mut()
+            .unwrap();
+        candidate.native_evidence = NativeUsageLimitEvidence::Confirmed {
+            observed_at_ms: turn.observed_at_ms,
+            confirmed_at: stale_at,
+        };
+        let previous_confirmation = candidate.clone();
+
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount::default()
+        );
+        assert!(!usage_limit_candidate_is_current(
+            &states[&turn.thread_id],
+            &previous_confirmation
+        ));
+
+        states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), false);
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount::default()
+        );
+
+        states.replace_native_usage_limit_snapshot(vec![turn.clone()], Vec::new(), false);
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount {
+                count: 1,
+                complete: false
+            }
+        );
+        assert!(usage_limit_candidate_is_current(
+            &states[&turn.thread_id],
+            &previous_confirmation
+        ));
+    }
+
+    #[test]
+    fn clearing_native_usage_limit_snapshot_removes_native_only_rows() {
+        let turn = ObservedUsageLimitTurn {
+            thread_id: "native-clear-thread".into(),
+            turn_id: "native-clear-turn".into(),
+            model: Some("gpt-test".into()),
+            observed_at_ms: 300,
+        };
+        let mut states = RecoveryStates::default();
+        states.replace_native_usage_limit_snapshot(vec![turn], Vec::new(), true);
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount {
+                count: 1,
+                complete: true
+            }
+        );
+
+        states.clear_native_usage_limit_snapshot();
+        assert_eq!(
+            states.usage_limit_resume_count(),
+            UsageLimitResumeCount::default()
+        );
+        assert!(states.threads.is_empty());
+    }
+
+    #[test]
+    fn distinct_native_failure_can_resume_in_the_same_proxy_epoch() {
+        for outcome in [
+            OwnerContinuationOutcome::Submitted {
+                turn_id: "next-turn".into(),
+            },
+            OwnerContinuationOutcome::Uncertain,
+        ] {
+            let (epoch, prior) = owner_test_operation("repeat-native-usage-limit");
+            let candidate = UsageLimitCandidate {
+                turn: ObservedUsageLimitTurn {
+                    thread_id: epoch.thread_id.clone(),
+                    turn_id: "next-turn".into(),
+                    model: Some("gpt-test".into()),
+                    observed_at_ms: 100,
+                },
+                proxy_observed_at: None,
+                native_evidence: NativeUsageLimitEvidence::Confirmed {
+                    observed_at_ms: 100,
+                    confirmed_at: Instant::now(),
+                },
+            };
+            let set_candidate = |candidate: &UsageLimitCandidate| {
+                recovery_states()
+                    .lock()
+                    .unwrap()
+                    .get_mut(&epoch.thread_id)
+                    .unwrap()
+                    .usage_limit = Some(candidate.clone());
+            };
+            let is_eligible = || {
+                eligible_usage_limit_candidate(&recovery_states().lock().unwrap()[&epoch.thread_id])
+                    .is_some()
+            };
+            set_candidate(&candidate);
+            assert!(
+                !is_eligible(),
+                "an in-flight reservation blocks another send"
+            );
+            assert!(authorize_owner_continuation_commit(&prior));
+            assert!(!is_eligible(), "an in-flight commit blocks another send");
+            let prior_receipt = finish_owner_continuation(&prior, outcome);
+
+            let mut same_turn = candidate.clone();
+            same_turn.turn.turn_id = "base-turn".into();
+            set_candidate(&same_turn);
+            assert!(
+                !is_eligible(),
+                "the original failed turn cannot be replayed"
+            );
+            let OwnerContinuationReservation::AttachOnly(receipt) = reserve_continuation(
+                &epoch,
+                &same_turn.turn.turn_id,
+                &same_turn.operation_id(),
+                Some(&same_turn),
+            )
+            .unwrap() else {
+                panic!("the original failed turn must keep its receipt");
+            };
+            assert_eq!(receipt.operation_id, prior_receipt.operation_id);
+
+            set_candidate(&candidate);
+            assert!(is_eligible(), "a different observed failed turn can resume");
+            assert!(matches!(
+                reserve_continuation(
+                    &epoch,
+                    &candidate.turn.turn_id,
+                    &candidate.operation_id(),
+                    Some(&candidate),
+                ),
+                Ok(OwnerContinuationReservation::Reserved(_))
+            ));
+            cleanup_owner_test(&epoch);
         }
     }
 
@@ -2940,6 +4681,8 @@ mod tests {
                 std::future::ready(Ok(crate::codex_desktop::CodexContinuationResult {
                     submitted: true,
                     mutation_attempted: true,
+                    usage_limit_deferred: false,
+                    turn_id: None,
                     debug_port: Some(9229),
                     target_id: None,
                     message: String::new(),
@@ -3479,6 +5222,8 @@ mod tests {
                 std::future::ready(Ok(crate::codex_desktop::CodexContinuationResult {
                     submitted: false,
                     mutation_attempted: false,
+                    usage_limit_deferred: false,
+                    turn_id: None,
                     debug_port: None,
                     target_id: None,
                     message: "Codex Desktop request client was not found".into(),
@@ -3533,6 +5278,8 @@ mod tests {
                         Ok(crate::codex_desktop::CodexContinuationResult {
                             submitted: false,
                             mutation_attempted: false,
+                            usage_limit_deferred: false,
+                            turn_id: None,
                             debug_port: None,
                             target_id: None,
                             message: "Codex Desktop request client was not found".into(),
@@ -3719,6 +5466,8 @@ mod tests {
                 std::future::ready(Ok(crate::codex_desktop::CodexContinuationResult {
                     submitted: false,
                     mutation_attempted: false,
+                    usage_limit_deferred: false,
+                    turn_id: None,
                     debug_port: None,
                     target_id: None,
                     message: "renderer positively refused before mutation".into(),
@@ -3790,6 +5539,8 @@ mod tests {
                 std::future::ready(Ok(crate::codex_desktop::CodexContinuationResult {
                     submitted: true,
                     mutation_attempted: true,
+                    usage_limit_deferred: false,
+                    turn_id: None,
                     debug_port: None,
                     target_id: None,
                     message: "simulated successful continuation".into(),
@@ -3826,6 +5577,8 @@ mod tests {
                 std::future::ready(Ok(crate::codex_desktop::CodexContinuationResult {
                     submitted: true,
                     mutation_attempted: true,
+                    usage_limit_deferred: false,
+                    turn_id: None,
                     debug_port: None,
                     target_id: None,
                     message: "simulated submission".into(),
@@ -3877,6 +5630,8 @@ mod tests {
                     std::future::ready(Ok(crate::codex_desktop::CodexContinuationResult {
                         submitted: false,
                         mutation_attempted: false,
+                        usage_limit_deferred: false,
+                        turn_id: None,
                         debug_port: None,
                         target_id: None,
                         message: "simulated Desktop readiness wait".into(),
@@ -4419,7 +6174,7 @@ mod tests {
                 &payload,
                 evidence,
             ),
-            RecoveryDecision::Recover("response_failed")
+            RecoveryDecision::UsageLimit("response_failed")
         );
         assert!(forward_error_is_recoverable(&ProxyError::UpstreamError {
             status: 429,

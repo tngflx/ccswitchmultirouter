@@ -1598,25 +1598,33 @@ pub fn set_current_provider(app_type: &AppType, id: Option<&str>) -> Result<(), 
 ///
 /// 这确保了返回的 ID 一定是有效的（在数据库中存在）。
 /// 多设备云同步场景下，配置导入后本地 ID 可能失效，此函数会自动修复。
+fn validate_local_current_provider(
+    db: &crate::database::Database,
+    app_type: &AppType,
+    local_id: &str,
+) -> Result<bool, AppError> {
+    // 1. 验证本地 settings 中的 ID 是否存在，不加载完整供应商目录。
+    if db.provider_exists(local_id, app_type.as_str())? {
+        return Ok(true);
+    }
+
+    log::warn!(
+        "本地 settings 中的供应商 {} ({}) 在数据库中不存在，将清理并 fallback 到数据库",
+        local_id,
+        app_type.as_str()
+    );
+    Ok(false)
+}
+
 pub fn get_effective_current_provider(
     db: &crate::database::Database,
     app_type: &AppType,
 ) -> Result<Option<String>, AppError> {
-    // 1. 从本地 settings 读取
-    if let Some(local_id) = get_current_provider(app_type) {
-        // 2. 验证该 ID 在数据库中存在
-        let providers = db.get_all_providers(app_type.as_str())?;
-        if providers.contains_key(&local_id) {
-            // 存在，直接返回
+    let local_id = get_current_provider(app_type);
+    if let Some(local_id) = local_id {
+        if validate_local_current_provider(db, app_type, &local_id)? {
             return Ok(Some(local_id));
         }
-
-        // 3. 不存在，清理本地 settings
-        log::warn!(
-            "本地 settings 中的供应商 {} ({}) 在数据库中不存在，将清理并 fallback 到数据库",
-            local_id,
-            app_type.as_str()
-        );
         let _ = set_current_provider(app_type, None);
     }
 
@@ -1797,6 +1805,8 @@ where
 mod tests {
     use super::*;
     use crate::app_config::AppType;
+    use crate::database::Database;
+    use crate::provider::Provider;
 
     #[test]
     fn tool_auto_update_is_opt_in_and_preserves_legacy_codex_preference() {
@@ -1820,6 +1830,44 @@ mod tests {
             serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
         assert!(round_trip.tool_auto_update_enabled("gemini"));
         assert!(!round_trip.tool_auto_update_enabled("codex"));
+    }
+
+    #[test]
+    fn effective_current_provider_resolves_existing_and_missing_local_ids() {
+        let db = Database::memory().expect("memory database");
+        let local = Provider::with_id(
+            "local-provider".to_string(),
+            "Local provider".to_string(),
+            serde_json::json!({"auth": {}, "config": ""}),
+            None,
+        );
+        let fallback = Provider::with_id(
+            "fallback-provider".to_string(),
+            "Fallback provider".to_string(),
+            serde_json::json!({"auth": {}, "config": ""}),
+            None,
+        );
+        db.save_provider("codex", &local)
+            .expect("save local provider");
+        db.save_provider("codex", &fallback)
+            .expect("save fallback provider");
+        db.set_current_provider("codex", &fallback.id)
+            .expect("set database fallback provider");
+
+        assert!(
+            validate_local_current_provider(&db, &AppType::Codex, &local.id)
+                .expect("validate existing local provider")
+        );
+
+        assert!(
+            !validate_local_current_provider(&db, &AppType::Codex, "missing-provider")
+                .expect("validate missing local provider")
+        );
+        assert_eq!(
+            db.get_current_provider("codex")
+                .expect("read database fallback provider"),
+            Some(fallback.id)
+        );
     }
 
     #[test]

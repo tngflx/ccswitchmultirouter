@@ -25,22 +25,24 @@ struct TurnMetadata<'a> {
 }
 
 impl<'a> TurnMetadata<'a> {
-    fn read(headers: &'a HeaderMap, body: &'a Value) -> Option<Self> {
+    fn read(
+        headers: &'a HeaderMap,
+        body: &'a Value,
+        allowed_request_kinds: &[&str],
+    ) -> Result<Self, ()> {
         const TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
-        let header_turn = header_text(headers, TURN_METADATA_HEADER)
-            .ok()?
+        let header_turn = header_text(headers, TURN_METADATA_HEADER)?
             .map(parse_turn_metadata)
-            .transpose()
-            .ok()?;
+            .transpose()?;
         let client_metadata = body.get("client_metadata");
         if client_metadata.is_some_and(|value| !value.is_object()) {
-            return None;
+            return Err(());
         }
         let client_turn = match client_metadata.and_then(|value| value.get(TURN_METADATA_HEADER)) {
-            Some(Value::String(raw)) => Some(Cow::Owned(parse_turn_metadata(raw).ok()?)),
+            Some(Value::String(raw)) => Some(Cow::Owned(parse_turn_metadata(raw)?)),
             Some(value @ Value::Object(_)) => Some(Cow::Borrowed(value)),
             None => None,
-            _ => return None,
+            _ => return Err(()),
         };
         let metadata = Self {
             headers,
@@ -48,10 +50,13 @@ impl<'a> TurnMetadata<'a> {
             client_metadata,
             client_turn,
         };
-        match metadata.identifier("request_kind", None) {
-            Ok(None | Some("turn")) => Some(metadata),
-            _ => None,
+        if metadata
+            .identifier("request_kind", None)?
+            .is_some_and(|kind| !allowed_request_kinds.contains(&kind))
+        {
+            return Err(());
         }
+        Ok(metadata)
     }
 
     fn identifier(&self, key: &str, header_key: Option<&str>) -> Result<Option<&str>, ()> {
@@ -84,6 +89,14 @@ impl<'a> TurnMetadata<'a> {
         }
         Ok(resolved)
     }
+
+    fn desktop_turn(&self) -> Option<(&str, &str)> {
+        let thread = self.identifier("thread_id", Some("thread-id")).ok()??;
+        let turn = self.identifier("turn_id", None).ok()??;
+        uuid::Uuid::parse_str(thread).ok()?;
+        uuid::Uuid::parse_str(turn).ok()?;
+        Some((thread, turn))
+    }
 }
 
 fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, ()> {
@@ -107,12 +120,22 @@ fn parse_turn_metadata(raw: &str) -> Result<Value, ()> {
     value.is_object().then_some(value).ok_or(())
 }
 
-fn is_generation_endpoint(endpoint: &str) -> bool {
-    let path = endpoint.split('?').next().unwrap_or(endpoint);
-    matches!(
-        path,
-        "/responses" | "/v1/responses" | "/chat/completions" | "/v1/chat/completions"
-    )
+fn is_responses_reasoning_path(path: &str) -> bool {
+    matches!(path, "/responses" | "/v1/responses")
+        || super::providers::is_codex_remote_compact_endpoint(path)
+}
+
+pub(super) fn desktop_recovery_metadata(
+    headers: &HeaderMap,
+    body: &Value,
+) -> Result<Option<(String, String)>, ()> {
+    if is_subagent_request(headers, body) {
+        return Err(());
+    }
+    let metadata = TurnMetadata::read(headers, body, &["turn"])?;
+    Ok(metadata
+        .desktop_turn()
+        .map(|(thread, turn)| (thread.to_owned(), turn.to_owned())))
 }
 
 /// Desktop records the selected Ultra tier before serializing it as xhigh.
@@ -142,19 +165,15 @@ fn desktop_ultra_candidate(
     endpoint: &str,
 ) -> Option<(String, String, String)> {
     let path = endpoint.split('?').next().unwrap_or(endpoint);
-    if !matches!(path, "/responses" | "/v1/responses")
+    if !is_responses_reasoning_path(path)
         || !super::handlers::is_verified_codex_desktop_request(headers)
         || is_subagent_request(headers, incoming)
         || diagnostic_effort(incoming) != "xhigh"
     {
         return None;
     }
-    let metadata = TurnMetadata::read(headers, incoming)?;
-    let thread = metadata.identifier("thread_id", Some("thread-id")).ok()??;
-    let turn = metadata.identifier("turn_id", None).ok()??;
-    if uuid::Uuid::parse_str(thread).is_err() || uuid::Uuid::parse_str(turn).is_err() {
-        return None;
-    }
+    let metadata = TurnMetadata::read(headers, incoming, &["turn", "compaction"]).ok()?;
+    let (thread, turn) = metadata.desktop_turn()?;
     let model = incoming.get("model")?.as_str()?;
     let normalized =
         super::providers::transform_codex_chat::normalized_codex_reasoning_request(incoming)
@@ -247,7 +266,7 @@ pub(super) fn apply_subagent_reasoning_effort(
 ) -> Option<CodexReasoningEffort> {
     let path = endpoint.split('?').next().unwrap_or(endpoint);
     let native_chat = matches!(path, "/chat/completions" | "/v1/chat/completions");
-    if !is_generation_endpoint(endpoint)
+    if !(native_chat || is_responses_reasoning_path(path))
         || settings
             .pointer("/codexRouting/enabled")
             .and_then(Value::as_bool)
@@ -419,11 +438,85 @@ mod tests {
             desktop_ultra_candidate(&provider, &headers, &conflicting, "/v1/responses").is_none()
         );
         assert!(
-            desktop_ultra_candidate(&provider, &headers, &incoming, "/v1/responses/compact")
+            desktop_ultra_candidate(&provider, &headers, &incoming, "/v1/chat/completions")
                 .is_none()
         );
         headers.remove("originator");
         assert!(desktop_ultra_candidate(&provider, &headers, &incoming, "/v1/responses").is_none());
+    }
+
+    #[test]
+    fn desktop_compaction_restores_only_recorded_parent_ultra_and_cannot_authorize_continuation() {
+        let provider = Provider::with_id(
+            "sublyx".into(),
+            "Sublyx".into(),
+            json!({"base_url": "https://api.sublyx.org/v1"}),
+            None,
+        );
+        let thread = "019c0000-0000-7000-8000-000000000001";
+        let turn = "019c0000-0000-7000-8000-000000000002";
+        let model = "gpt-6.2-sol";
+        let mut headers = desktop_parent_headers();
+        headers.remove("x-codex-turn-metadata");
+        let incoming = json!({
+            "model": model,
+            "reasoning": {"effort": "xhigh"},
+            "client_metadata": {"thread_id": thread, "turn_id": turn, "request_kind": "compaction"}
+        });
+        assert!(desktop_recovery_metadata(&headers, &incoming).is_err());
+        for endpoint in [
+            "/responses/compact",
+            "/v1/responses/compact?transport=http",
+            "/responses",
+            "/v1/responses",
+        ] {
+            let candidate =
+                |body: &Value| desktop_ultra_candidate(&provider, &headers, body, endpoint);
+            assert_eq!(
+                candidate(&incoming),
+                Some((thread.to_owned(), turn.to_owned(), model.to_owned()))
+            );
+            for (recorded, expected) in [
+                (Some(CodexReasoningEffort::Ultra), "max"),
+                (Some(CodexReasoningEffort::XHigh), "xhigh"),
+                (None, "xhigh"),
+            ] {
+                let mut prepared = incoming.clone();
+                apply_recorded_ultra_effort(&mut prepared, recorded);
+                super::super::providers::prepare_codex_native_responses_model(
+                    &provider,
+                    &mut prepared,
+                )
+                .expect("prepare the compact request for Sublyx");
+                assert_eq!(prepared["reasoning"]["effort"], expected, "{endpoint}");
+            }
+            let mut missing_turn = incoming.clone();
+            missing_turn["client_metadata"]
+                .as_object_mut()
+                .unwrap()
+                .remove("turn_id");
+            assert!(candidate(&missing_turn).is_none());
+
+            let mut conflicting = incoming.clone();
+            conflicting["client_metadata"]["x-codex-turn-metadata"] = json!({"turn_id": thread});
+            assert!(candidate(&conflicting).is_none());
+
+            let mut unsupported = incoming.clone();
+            unsupported["model"] = json!("gpt-unknown");
+            assert!(candidate(&unsupported).is_none());
+
+            let mut child = incoming.clone();
+            child["client_metadata"]["x-openai-subagent"] = json!("collab_spawn");
+            assert!(candidate(&child).is_none());
+            assert!(apply_subagent_reasoning_effort(
+                &settings("high"),
+                &provider,
+                &headers,
+                &mut child,
+                endpoint
+            ));
+            assert_eq!(child["reasoning"]["effort"], "high");
+        }
     }
 
     #[test]
@@ -631,8 +724,42 @@ mod tests {
         body["client_metadata"]["x-codex-turn-metadata"] = json!("malformed");
         assert!(candidate(&headers, &body).is_none());
         body["client_metadata"]["x-codex-turn-metadata"] =
-            json!({"thread_id": thread, "turn_id": turn, "request_kind": "compaction"});
+            json!({"thread_id": thread, "turn_id": turn, "request_kind": "unknown"});
         assert!(candidate(&headers, &body).is_none());
+    }
+
+    #[test]
+    fn desktop_recovery_metadata_requires_one_consistent_parent_turn() {
+        let thread = "019c0000-0000-7000-8000-000000000001";
+        let turn = "019c0000-0000-7000-8000-000000000002";
+        let mut headers = desktop_parent_headers();
+        let body = json!({
+            "client_metadata": {
+                "thread_id": thread,
+                "x-codex-turn-metadata": {"thread_id": thread, "turn_id": turn, "request_kind": "turn"}
+            }
+        });
+        assert_eq!(
+            desktop_recovery_metadata(&headers, &body),
+            Ok(Some((thread.to_owned(), turn.to_owned())))
+        );
+
+        headers.insert("thread-id", HeaderValue::from_static(thread));
+        assert_eq!(
+            desktop_recovery_metadata(&headers, &body),
+            Ok(Some((thread.to_owned(), turn.to_owned())))
+        );
+        headers.insert("thread-id", HeaderValue::from_static("other-thread"));
+        assert_eq!(desktop_recovery_metadata(&headers, &body), Ok(None));
+
+        headers.remove("thread-id");
+        let mut child = body.clone();
+        child["client_metadata"]["x-openai-subagent"] = json!("collab_spawn");
+        assert!(desktop_recovery_metadata(&headers, &child).is_err());
+
+        let mut disagreeing = body;
+        disagreeing["client_metadata"]["x-codex-turn-metadata"]["turn_id"] = json!(thread);
+        assert_eq!(desktop_recovery_metadata(&headers, &disagreeing), Ok(None));
     }
 
     #[test]
@@ -871,6 +998,84 @@ mod tests {
     }
 
     #[test]
+    fn sublyx_maintained_gpt_parent_ultra_and_subagents_follow_saved_policy_across_transports() {
+        use crate::proxy::providers::{
+            prepare_codex_native_responses_model, resolve_codex_chat_reasoning_config,
+            transform_codex_chat::responses_to_chat_completions_with_reasoning,
+        };
+
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+            "gpt-6-sol",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+        ] {
+            let provider = Provider::with_id(
+                "sublyx".into(),
+                "Sublyx".into(),
+                json!({
+                    "baseUrl": "https://api.sublyx.org/v1",
+                    "modelCatalog": {"models": [{"model": model}]}
+                }),
+                None,
+            );
+            for (child, incoming, policy, expected) in [
+                (false, "ultra", "high", "max"),
+                (true, "ultra", "high", "high"),
+                (true, "max", "high", "high"),
+                (true, "ultra", "medium", "medium"),
+            ] {
+                let headers = if child {
+                    child_headers()
+                } else {
+                    desktop_parent_headers()
+                };
+                for (endpoint, convert_to_chat) in [
+                    ("/v1/responses", false),
+                    ("/v1/responses", true),
+                    ("/responses/compact", false),
+                    ("/v1/responses/compact", false),
+                ] {
+                    let mut wire = request();
+                    wire["model"] = json!(model);
+                    wire["reasoning"]["effort"] = json!(incoming);
+                    let overridden = apply_subagent_reasoning_effort(
+                        &settings(policy),
+                        &provider,
+                        &headers,
+                        &mut wire,
+                        endpoint,
+                    );
+                    assert_eq!(
+                        overridden, child,
+                        "{endpoint}, {model}, {incoming}, policy {policy}"
+                    );
+                    if convert_to_chat {
+                        let config = resolve_codex_chat_reasoning_config(&provider, &wire)
+                            .expect("Sublyx Chat reasoning configuration");
+                        wire = responses_to_chat_completions_with_reasoning(wire, Some(&config))
+                            .expect("Sublyx Chat preparation");
+                    } else {
+                        prepare_codex_native_responses_model(&provider, &mut wire)
+                            .expect("Sublyx native preparation");
+                    }
+                    assert_eq!(
+                        wire["reasoning"]["effort"], expected,
+                        "{endpoint}, convert_to_chat={convert_to_chat}, {model}, child={child}, {incoming}, policy {policy}"
+                    );
+                    assert!(wire.get("reasoning_effort").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn subagent_reasoning_effort_prepares_saved_effort_for_marked_sublyx_children() {
         let base_url = "https://api.sublyx.org/v1";
         let wire_model = "gpt-6.2-sol";
@@ -1058,11 +1263,11 @@ mod tests {
     }
 
     #[test]
-    fn subagent_reasoning_effort_leaves_nongeneration_endpoints_unchanged() {
+    fn subagent_reasoning_effort_leaves_unrelated_endpoints_unchanged() {
         for endpoint in [
             "/alpha/search",
-            "/responses/compact",
-            "/v1/responses/compact",
+            "/responses/compact/status",
+            "/v1/responses/compact-extra",
             "/v1/images/generations",
         ] {
             let mut body = request();

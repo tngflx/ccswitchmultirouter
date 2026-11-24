@@ -265,6 +265,12 @@ struct Observer {
     encoding: Option<String>,
     sse: bool,
     buffer: String,
+    #[cfg(test)]
+    delimiter_search_bytes: usize,
+    #[cfg(test)]
+    classification_json_parse_calls: usize,
+    #[cfg(test)]
+    classification_json_parse_bytes: usize,
     remainder: Vec<u8>,
     body: Vec<u8>,
     total: usize,
@@ -302,6 +308,12 @@ impl Observer {
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.contains("text/event-stream")),
             buffer: String::new(),
+            #[cfg(test)]
+            delimiter_search_bytes: 0,
+            #[cfg(test)]
+            classification_json_parse_calls: 0,
+            #[cfg(test)]
+            classification_json_parse_bytes: 0,
             remainder: Vec::new(),
             body: Vec::new(),
             total: 0,
@@ -325,9 +337,28 @@ impl Observer {
                 .extend_from_slice(&bytes[..remaining.min(bytes.len())]);
             return events;
         }
+        let mut buffer = std::mem::take(&mut self.buffer);
         for chunk in bytes.chunks(8192) {
-            super::sse::append_utf8_safe(&mut self.buffer, &mut self.remainder, chunk);
-            while let Some(block) = super::sse::take_sse_block(&mut self.buffer) {
+            let previous_len = buffer.len();
+            super::sse::append_utf8_safe(&mut buffer, &mut self.remainder, chunk);
+            let appended = &buffer[previous_len..];
+            #[cfg(test)]
+            {
+                self.delimiter_search_bytes += appended.len();
+            }
+            let mut frame_start = 0;
+            // Only a newly appended LF can finish a block. Check its suffix
+            // against the retained text so split delimiters still match.
+            for (offset, _) in appended.match_indices('\n') {
+                let end = previous_len + offset + 1;
+                let frame = &buffer[frame_start..end];
+                let Some(block) = frame
+                    .strip_suffix("\n\n")
+                    .or_else(|| frame.strip_suffix("\r\n\r\n"))
+                else {
+                    continue;
+                };
+                frame_start = end;
                 if self.skipping {
                     self.skipping = false;
                     // The event name is bounded metadata, not a parsed response.
@@ -391,10 +422,12 @@ impl Observer {
                     _ => {}
                 }
             }
-            if self.skipping || self.buffer.len() > BODY_LIMIT {
+            if frame_start > 0 {
+                buffer.drain(..frame_start);
+            }
+            if self.skipping || buffer.len() > BODY_LIMIT {
                 if !self.skipping {
-                    self.skipped_terminal_event = self
-                        .buffer
+                    self.skipped_terminal_event = buffer
                         .lines()
                         .find_map(|line| super::sse::strip_sse_field(line, "event"))
                         .is_some_and(|event| {
@@ -417,15 +450,27 @@ impl Observer {
                 // LF/CRLF boundary cannot swallow the following real error.
                 let delimiter_prefix = ["\r\n\r", "\r\n", "\n", "\r"]
                     .into_iter()
-                    .find(|prefix| self.buffer.ends_with(*prefix))
-                    .unwrap_or("")
-                    .to_string();
-                self.buffer.clear();
-                self.buffer.push_str(&delimiter_prefix);
+                    .find(|prefix| buffer.ends_with(*prefix))
+                    .unwrap_or("");
+                buffer.clear();
+                buffer.push_str(delimiter_prefix);
                 self.remainder.clear();
             }
         }
+        self.buffer = buffer;
         events
+    }
+
+    // Classification shares one parsed body between JSON validity and semantic
+    // error checks. These counters intentionally exclude diagnostic redaction,
+    // which runs only when an error record actually needs to be emitted.
+    fn parse_classification_json(&mut self, text: &str) -> Result<Value, serde_json::Error> {
+        #[cfg(test)]
+        {
+            self.classification_json_parse_calls += 1;
+            self.classification_json_parse_bytes += text.len();
+        }
+        serde_json::from_str(text)
     }
 
     fn finish(&mut self, transport_error: Option<&str>) -> Vec<Value> {
@@ -478,11 +523,19 @@ impl Observer {
             .get("content-type")
             .and_then(Value::as_str)
             .unwrap_or("");
+        let is_html = content_type.contains("text/html");
+        let is_json = content_type.contains("application/json") || content_type.contains("+json");
+        let mut parsed_body = None;
         let unexpected_body = (200..300).contains(&self.status)
             && self.total == self.body.len()
-            && (content_type.contains("text/html")
-                || (content_type.contains("application/json") || content_type.contains("+json"))
-                    && text.is_some_and(|text| serde_json::from_str::<Value>(text).is_err()));
+            && (is_html
+                || is_json
+                    && text.is_some_and(|text| {
+                        let parsed = self.parse_classification_json(text);
+                        let invalid = parsed.is_err();
+                        parsed_body = Some(parsed);
+                        invalid
+                    }));
         if self.sse && (200..300).contains(&self.status) && self.encoding.is_some() {
             if let Some(decoded) = decoded.as_deref() {
                 let mut headers = http::HeaderMap::new();
@@ -504,10 +557,14 @@ impl Observer {
         }
         if unexpected_body
             || !(200..300).contains(&self.status)
-            || text
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-                .and_then(|payload| selected_error(&payload))
-                .is_some()
+            || text.is_some_and(|text| {
+                parsed_body
+                    .get_or_insert_with(|| self.parse_classification_json(text))
+                    .as_ref()
+                    .ok()
+                    .and_then(selected_error)
+                    .is_some()
+            })
         {
             use sha2::{Digest, Sha256};
             events.push(self.evidence(if unexpected_body { "unexpected_response_body" } else { "upstream_http_error" }, json!({"body_excerpt":text.map(safe_excerpt),"captured_prefix_sha256":hex::encode(Sha256::digest(&self.body)),"captured_bytes":self.body.len(),"truncated":self.total>self.body.len(),"complete":transport_error.is_none(),"decode_available":text.is_some()})));
@@ -657,6 +714,76 @@ mod tests {
     }
 
     #[test]
+    fn journal_success_json_classification_parses_body_once() {
+        for size in [32, BODY_LIMIT - 128] {
+            let body = json!({"id":"fixture-success","output_text":"x".repeat(size)}).to_string();
+            for content_type in ["application/json", "application/problem+json", "text/plain"] {
+                for compressed in [false, true] {
+                    let wire = if compressed {
+                        let mut encoded = flate2::write::GzEncoder::new(
+                            Vec::new(),
+                            flate2::Compression::default(),
+                        );
+                        encoded.write_all(body.as_bytes()).unwrap();
+                        encoded.finish().unwrap()
+                    } else {
+                        body.as_bytes().to_vec()
+                    };
+                    for chunk_size in [1, 97, BODY_LIMIT] {
+                        let mut observer = observer(200, content_type);
+                        observer.encoding = compressed.then(|| "gzip".to_string());
+                        for chunk in wire.chunks(chunk_size) {
+                            assert!(observer.feed(chunk).is_empty());
+                            assert_eq!(observer.classification_json_parse_calls, 0);
+                        }
+                        assert!(observer.finish(None).is_empty());
+                        assert_eq!(observer.classification_json_parse_calls, 1);
+                        assert_eq!(observer.classification_json_parse_bytes, body.len());
+                        assert!(observer.body.len() <= BODY_LIMIT);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn journal_reused_json_classification_preserves_errors_and_redaction() {
+        for (content_type, body, expected_kind) in [
+            (
+                "application/json",
+                r#"{"error":{"message":"fixture capacity","password":"fixture-secret"},"request":{"input":"fixture-private"}}"#,
+                "upstream_http_error",
+            ),
+            (
+                "application/problem+json",
+                r#"{"error":{"message":"fixture capacity","password":"fixture-secret"},"request":{"input":"fixture-private"}}"#,
+                "upstream_http_error",
+            ),
+            (
+                "application/json",
+                r#"{"password":"fixture-secret","input":"fixture-private","broken":}"#,
+                "unexpected_response_body",
+            ),
+        ] {
+            let mut observer = observer(200, content_type);
+            assert!(observer.feed(body.as_bytes()).is_empty());
+            let events = observer.finish(None);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["kind"], expected_kind);
+            assert_eq!(observer.classification_json_parse_calls, 1);
+            assert_eq!(observer.classification_json_parse_bytes, body.len());
+            let serialized = events[0].to_string();
+            assert!(!serialized.contains("fixture-secret"));
+            assert!(!serialized.contains("fixture-private"));
+            if expected_kind == "upstream_http_error" {
+                assert!(serialized.contains("fixture capacity"));
+            } else {
+                assert!(serialized.contains("malformed or truncated JSON omitted"));
+            }
+        }
+    }
+
+    #[test]
     fn journal_inspects_bounded_gzip_errors_and_unexpected_html() {
         let mut encoded = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoded
@@ -775,6 +902,48 @@ mod tests {
         );
         assert_eq!(records.last().unwrap()["kind"], "upstream_sse_error");
         assert!(observer.finish(None).is_empty());
+    }
+
+    #[test]
+    fn journal_scan_work_is_independent_of_fragment_count() {
+        for size in [512, BODY_LIMIT - 128] {
+            let wire = format!(
+                "data: {{\"delta\":\"{}café\"}}\r\n\r\nevent: response.completed\ndata: {{\"type\":\"response.completed\"}}\n\n",
+                "x".repeat(size)
+            );
+            for chunk_size in [1, 97, 8192] {
+                let mut observer = observer(200, "text/event-stream");
+                for chunk in wire.as_bytes().chunks(chunk_size) {
+                    assert!(observer.feed(chunk).is_empty());
+                }
+                assert_eq!(observer.delimiter_search_bytes, wire.len());
+                assert!(observer.finish(None).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn journal_searches_each_fragment_once_and_recovers_after_an_oversized_frame() {
+        let mut observer = observer(200, "text/event-stream");
+        let oversized = format!("data: {{\"delta\":\"{}\"}}", "x".repeat(1024 * 1024));
+        let mut records = Vec::new();
+        for fragment in oversized.as_bytes().chunks(64) {
+            records.extend(observer.feed(fragment));
+        }
+        let tail = "\r\n\r\nevent: error\ndata: {\"error\":{\"message\":\"café\",\"password\":\"fixture-secret\"}}\n\n";
+        for fragment in tail.as_bytes().chunks(1) {
+            records.extend(observer.feed(fragment));
+        }
+        records.extend(observer.finish(None));
+        assert_eq!(
+            observer.delimiter_search_bytes,
+            oversized.len() + tail.len()
+        );
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["kind"], "sse_inspection_limit");
+        assert_eq!(records[1]["kind"], "upstream_sse_error");
+        assert!(records[1].to_string().contains("café"));
+        assert!(!records[1].to_string().contains("fixture-secret"));
     }
 
     #[test]

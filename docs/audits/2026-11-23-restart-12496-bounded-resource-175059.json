@@ -1,0 +1,320 @@
+{
+  "SchemaVersion": 1,
+  "CapturedAtSingapore": "2026-11-23T17:50:59.3034879+08:00",
+  "Application": {
+    "Pid": 12496,
+    "Path": "H:\\repos\\ccswitchmulti-refork\\src-tauri\\target\\debug\\cc-switch.exe",
+    "StartedUtc": "2026-11-23T09:40:15.4166541Z",
+    "BinaryModifiedUtc": "2026-11-23T09:40:15.1531583Z"
+  },
+  "Method": {
+    "Scope": "Only named backend process; no process-tree or UI scan",
+    "ConfiguredMonitorAvailable": false,
+    "IntervalSeconds": 2,
+    "CpuBasis": "100% one logical core; machine percent divides by logical processor count",
+    "AgentTestsOrBuildsDuringSample": false,
+    "Limitations": [
+      "No native stacks or parser timing attribution",
+      "Does not measure renderer descendants",
+      "Active workload not controlled; not a matched before/after benchmark"
+    ]
+  },
+  "Summary": {
+    "DurationSeconds": 60.3557984,
+    "CpuSeconds": 75.453125,
+    "LogicalProcessors": 16,
+    "AverageCpuOneCorePercent": 125.01387936241765,
+    "AverageCpuMachinePercent": 7.813367460151103,
+    "PeakIntervalCpuOneCorePercent": 405.90004715857367,
+    "PeakIntervalCpuMachinePercent": 25.368752947410854,
+    "WorkingSetStartBytes": 300560384,
+    "WorkingSetEndBytes": 315363328,
+    "WorkingSetMinBytes": 282439680,
+    "WorkingSetPeakBytes": 315363328,
+    "PrivateStartBytes": 246198272,
+    "PrivateEndBytes": 262774784,
+    "PrivateMinBytes": 226426880,
+    "PrivatePeakBytes": 262774784
+  },
+  "Samples": [
+    {
+      "AtUtc": "2026-11-23T09:49:58.9249323+00:00",
+      "ElapsedSeconds": 0.0049069,
+      "CpuSeconds": 1019.734375,
+      "WorkingSetBytes": 300560384,
+      "PrivateBytes": 246198272,
+      "ThreadCount": 30,
+      "HandleCount": 766
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:00.9585792+00:00",
+      "ElapsedSeconds": 2.0365061,
+      "CpuSeconds": 1023.703125,
+      "WorkingSetBytes": 310157312,
+      "PrivateBytes": 256307200,
+      "ThreadCount": 30,
+      "HandleCount": 766
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:02.9751266+00:00",
+      "ElapsedSeconds": 4.0530375,
+      "CpuSeconds": 1027.625,
+      "WorkingSetBytes": 295989248,
+      "PrivateBytes": 239579136,
+      "ThreadCount": 30,
+      "HandleCount": 766
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:04.9842874+00:00",
+      "ElapsedSeconds": 6.0622082,
+      "CpuSeconds": 1027.703125,
+      "WorkingSetBytes": 298639360,
+      "PrivateBytes": 243163136,
+      "ThreadCount": 30,
+      "HandleCount": 765
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:06.9997695+00:00",
+      "ElapsedSeconds": 8.0776836,
+      "CpuSeconds": 1028.125,
+      "WorkingSetBytes": 299032576,
+      "PrivateBytes": 243982336,
+      "ThreadCount": 30,
+      "HandleCount": 765
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:09.0099108+00:00",
+      "ElapsedSeconds": 10.0878231,
+      "CpuSeconds": 1034.390625,
+      "WorkingSetBytes": 301838336,
+      "PrivateBytes": 246824960,
+      "ThreadCount": 30,
+      "HandleCount": 766
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:11.0137556+00:00",
+      "ElapsedSeconds": 12.0916707,
+      "CpuSeconds": 1039.546875,
+      "WorkingSetBytes": 300261376,
+      "PrivateBytes": 244928512,
+      "ThreadCount": 30,
+      "HandleCount": 765
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:13.0255425+00:00",
+      "ElapsedSeconds": 14.1034512,
+      "CpuSeconds": 1044.859375,
+      "WorkingSetBytes": 303235072,
+      "PrivateBytes": 247799808,
+      "ThreadCount": 28,
+      "HandleCount": 763
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:15.0417251+00:00",
+      "ElapsedSeconds": 16.1196372,
+      "CpuSeconds": 1047.828125,
+      "WorkingSetBytes": 303910912,
+      "PrivateBytes": 248639488,
+      "ThreadCount": 28,
+      "HandleCount": 760
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:17.0574446+00:00",
+      "ElapsedSeconds": 18.1353514,
+      "CpuSeconds": 1047.890625,
+      "WorkingSetBytes": 303996928,
+      "PrivateBytes": 248745984,
+      "ThreadCount": 31,
+      "HandleCount": 760
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:19.0606045+00:00",
+      "ElapsedSeconds": 20.1385143,
+      "CpuSeconds": 1048.4375,
+      "WorkingSetBytes": 304062464,
+      "PrivateBytes": 249118720,
+      "ThreadCount": 31,
+      "HandleCount": 760
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:21.0725391+00:00",
+      "ElapsedSeconds": 22.1504464,
+      "CpuSeconds": 1053.140625,
+      "WorkingSetBytes": 304181248,
+      "PrivateBytes": 249274368,
+      "ThreadCount": 31,
+      "HandleCount": 760
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:23.0915348+00:00",
+      "ElapsedSeconds": 24.169442,
+      "CpuSeconds": 1057.203125,
+      "WorkingSetBytes": 282439680,
+      "PrivateBytes": 226426880,
+      "ThreadCount": 31,
+      "HandleCount": 760
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:25.1071707+00:00",
+      "ElapsedSeconds": 26.1850757,
+      "CpuSeconds": 1059.78125,
+      "WorkingSetBytes": 285634560,
+      "PrivateBytes": 229527552,
+      "ThreadCount": 33,
+      "HandleCount": 765
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:27.1241721+00:00",
+      "ElapsedSeconds": 28.202084,
+      "CpuSeconds": 1064.390625,
+      "WorkingSetBytes": 287072256,
+      "PrivateBytes": 232157184,
+      "ThreadCount": 33,
+      "HandleCount": 763
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:29.1316242+00:00",
+      "ElapsedSeconds": 30.2095321,
+      "CpuSeconds": 1068.109375,
+      "WorkingSetBytes": 289755136,
+      "PrivateBytes": 235585536,
+      "ThreadCount": 33,
+      "HandleCount": 763
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:31.1450376+00:00",
+      "ElapsedSeconds": 32.2229421,
+      "CpuSeconds": 1068.1875,
+      "WorkingSetBytes": 289910784,
+      "PrivateBytes": 235728896,
+      "ThreadCount": 33,
+      "HandleCount": 763
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:33.1532552+00:00",
+      "ElapsedSeconds": 34.2311663,
+      "CpuSeconds": 1068.25,
+      "WorkingSetBytes": 290070528,
+      "PrivateBytes": 235859968,
+      "ThreadCount": 33,
+      "HandleCount": 763
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:35.1676396+00:00",
+      "ElapsedSeconds": 36.2455442,
+      "CpuSeconds": 1068.96875,
+      "WorkingSetBytes": 291225600,
+      "PrivateBytes": 236797952,
+      "ThreadCount": 33,
+      "HandleCount": 763
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:37.1728506+00:00",
+      "ElapsedSeconds": 38.2507537,
+      "CpuSeconds": 1069.6875,
+      "WorkingSetBytes": 291819520,
+      "PrivateBytes": 237322240,
+      "ThreadCount": 33,
+      "HandleCount": 763
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:39.1838580+00:00",
+      "ElapsedSeconds": 40.261762,
+      "CpuSeconds": 1070.3125,
+      "WorkingSetBytes": 292810752,
+      "PrivateBytes": 238612480,
+      "ThreadCount": 33,
+      "HandleCount": 763
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:41.1926394+00:00",
+      "ElapsedSeconds": 42.2705421,
+      "CpuSeconds": 1070.328125,
+      "WorkingSetBytes": 293007360,
+      "PrivateBytes": 238841856,
+      "ThreadCount": 33,
+      "HandleCount": 763
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:43.2106176+00:00",
+      "ElapsedSeconds": 44.2885197,
+      "CpuSeconds": 1071.703125,
+      "WorkingSetBytes": 298291200,
+      "PrivateBytes": 245854208,
+      "ThreadCount": 31,
+      "HandleCount": 756
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:45.2242240+00:00",
+      "ElapsedSeconds": 46.3021276,
+      "CpuSeconds": 1072.875,
+      "WorkingSetBytes": 301473792,
+      "PrivateBytes": 249864192,
+      "ThreadCount": 31,
+      "HandleCount": 756
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:47.2439006+00:00",
+      "ElapsedSeconds": 48.3218034,
+      "CpuSeconds": 1074.171875,
+      "WorkingSetBytes": 304439296,
+      "PrivateBytes": 253263872,
+      "ThreadCount": 31,
+      "HandleCount": 756
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:49.2482525+00:00",
+      "ElapsedSeconds": 50.3261554,
+      "CpuSeconds": 1075.390625,
+      "WorkingSetBytes": 304467968,
+      "PrivateBytes": 253296640,
+      "ThreadCount": 31,
+      "HandleCount": 756
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:51.2532203+00:00",
+      "ElapsedSeconds": 52.3311227,
+      "CpuSeconds": 1078.109375,
+      "WorkingSetBytes": 304541696,
+      "PrivateBytes": 253296640,
+      "ThreadCount": 31,
+      "HandleCount": 756
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:53.2602728+00:00",
+      "ElapsedSeconds": 54.3381772,
+      "CpuSeconds": 1082.0625,
+      "WorkingSetBytes": 304865280,
+      "PrivateBytes": 253562880,
+      "ThreadCount": 31,
+      "HandleCount": 756
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:55.2658462+00:00",
+      "ElapsedSeconds": 56.343751,
+      "CpuSeconds": 1090.203125,
+      "WorkingSetBytes": 307916800,
+      "PrivateBytes": 256618496,
+      "ThreadCount": 33,
+      "HandleCount": 761
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:57.2718682+00:00",
+      "ElapsedSeconds": 58.3497728,
+      "CpuSeconds": 1092.8125,
+      "WorkingSetBytes": 308338688,
+      "PrivateBytes": 256643072,
+      "ThreadCount": 33,
+      "HandleCount": 761
+    },
+    {
+      "AtUtc": "2026-11-23T09:50:59.2827999+00:00",
+      "ElapsedSeconds": 60.3607053,
+      "CpuSeconds": 1095.1875,
+      "WorkingSetBytes": 315363328,
+      "PrivateBytes": 262774784,
+      "ThreadCount": 33,
+      "HandleCount": 761
+    }
+  ]
+}

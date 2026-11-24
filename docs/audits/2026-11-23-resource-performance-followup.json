@@ -1,0 +1,275 @@
+{
+  "schemaVersion": 1,
+  "capturedAtUtc": "2026-11-22T17:05:39.311Z",
+  "timezone": "Asia/Singapore",
+  "checkout": "H:\\repos\\ccswitchmulti-refork",
+  "branch": "main",
+  "scope": "User-authorized read-only app/process resource sampling, bounded configured log inspection, source fixes and regression checks. No desktop build, app restart/install, live-provider mutation or UI/CDP automation.",
+  "resourceEvidence": {
+    "sampleFile": "H:\\repos\\ccswitchmulti-refork\\docs\\audits\\2026-11-23-resource-sample-45584-161000.json",
+    "windowLogFile": "H:\\repos\\ccswitchmulti-refork\\docs\\audits\\2026-11-23-resource-window-log-summary.json",
+    "summary": {
+      "durationSeconds": 180.071,
+      "sampleCount": 84,
+      "logicalProcessors": 16,
+      "rootAverageCpuOneCorePercent": 106.32090953012978,
+      "rootPeakCpuOneCorePercent": 404.7514954116761,
+      "treeAverageCpuOneCorePercent": 107.3621654791721,
+      "treeAverageCpuMachinePercent": 6.710135342448257,
+      "treePeakCpuOneCorePercent": 408.56990574574854,
+      "treeP95CpuOneCorePercent": 287.8985115440872,
+      "rootPrivateStartBytes": 145657856,
+      "rootPrivateEndBytes": 162324480,
+      "rootPrivatePeakBytes": 190185472,
+      "treePrivateStartBytes": 623734784,
+      "treePrivateEndBytes": 641802240,
+      "treePrivatePeakBytes": 669167616,
+      "rootWorkingSetEndBytes": 213102592,
+      "treeWorkingSetEndBytes": 730513408
+    },
+    "laterSameProcessMemorySnapshot": {
+      "capturedAtUtc": "2026-11-22T16:56:40.7887326Z",
+      "rootPrivateMiB": 206.27734375,
+      "rootWorkingSetMiB": 218.77734375,
+      "knownTreePrivateMiB": 614.05078125,
+      "knownTreeWorkingSetMiB": 476.6953125,
+      "knownProcessCount": 7,
+      "allKnownProcessStartTimesMatched": true,
+      "scope": "Known sampled processes only; not a refreshed descendant inventory or another test-free CPU sample; summed working sets can double-count shared pages; snapshots do not establish leak-free behavior"
+    },
+    "workload": {
+      "actualUpstreamSends": 45,
+      "clientRequestBytes": 38994867,
+      "scanCompletions": 3,
+      "filesPerScan": 1255,
+      "deferredFilesPerScan": 117,
+      "repeatedDeferWarnings": 0,
+      "capacitySseErrorsInSample": 0,
+      "recoveryEventsInSample": 0
+    },
+    "comparison": {
+      "preFixComparableCpuRamBaselineAvailable": false,
+      "quantifiedCpuOrRamImprovementPercent": null,
+      "liveImpactOfAdditionalSourceFixesVerified": false,
+      "leakFreeBehaviorEstablished": false,
+      "hangFreeBehaviorEstablished": false
+    }
+  },
+  "liveReasoningEvidence": {
+    "matchedCount": 45,
+    "parentCount": 18,
+    "markedChildCount": 27,
+    "observedMismatches": 0,
+    "groups": [
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "kind": "turn",
+        "isSubagent": "true",
+        "overrideApplied": "true",
+        "requested": "max",
+        "restoredDesktop": "not_recorded",
+        "forwarded": "high",
+        "count": 22
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "kind": "turn",
+        "isSubagent": "false",
+        "overrideApplied": "false",
+        "requested": "xhigh",
+        "restoredDesktop": "ultra",
+        "forwarded": "max",
+        "count": 9
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "kind": "turn",
+        "isSubagent": "false",
+        "overrideApplied": "false",
+        "requested": "max",
+        "restoredDesktop": "not_recorded",
+        "forwarded": "max",
+        "count": 9
+      },
+      {
+        "model": "gpt-6.2-astra",
+        "kind": "turn",
+        "isSubagent": "true",
+        "overrideApplied": "true",
+        "requested": "xhigh",
+        "restoredDesktop": "not_recorded",
+        "forwarded": "high",
+        "count": 4
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "kind": "compaction",
+        "isSubagent": "true",
+        "overrideApplied": "true",
+        "requested": "xhigh",
+        "restoredDesktop": "not_recorded",
+        "forwarded": "high",
+        "count": 1
+      }
+    ]
+  },
+  "finalHealth": {
+    "healthy": true,
+    "listenerOwner": 45584,
+    "port": 15721,
+    "pid": 45584,
+    "version": "3.20.4-3",
+    "processStartUtc": "2026-11-22T15:29:45.8961942Z",
+    "executablePath": "H:\\repos\\ccswitchmulti-refork\\src-tauri\\target\\debug\\cc-switch.exe",
+    "processIdentityMatchesSample": true,
+    "binaryModifiedAtUtc": "2026-11-22T15:29:45.632Z",
+    "binaryUnchangedFromManualRebuild": true,
+    "guardianLoopStarted": false
+  },
+  "sourceFixes": [
+    {
+      "area": "provider materialization",
+      "files": [
+        "src-tauri/src/proxy/forwarder.rs",
+        "src-tauri/src/proxy/providers/codex.rs",
+        "src-tauri/src/proxy/providers/mod.rs"
+      ],
+      "change": "Removed two discarded full request/history clones. Canonical model-only borrowed resolver is shared with mutating mapping; native narrower precedence remains intact.",
+      "regression": "Existing performance-selected provider_attempt_body_borrows_history_and_isolates_bedrock_on_failover now also exercises actual materialization with 1KiB/1MiB histories and 2/8 direct+target candidates. Separate semantic precedence matrix added.",
+      "proofBoundary": "Model-only API cannot access history; counters measure resolver calls and model input bytes, not global Value::clone allocations."
+    },
+    {
+      "area": "automatic recovery",
+      "files": [
+        "src-tauri/src/resources/codex_desktop/continuation.js",
+        "tests/lib/codexDesktopContinuation.test.ts",
+        "src-tauri/src/codex_desktop.rs"
+      ],
+      "change": "Common metadata-only thread/read plus one unloaded latest-turn page replaces full transcript polling. Retains terminal error, exact identity/model/freshness, user-stop/permanent/active refusal and mutation guards. Rust embedded JS mocks explicitly migrated to the bounded RPC contract.",
+      "compatibilityBoundary": "Unavailable bounded pagination refuses recovery without mutation; no full-history fallback. Genuine active/nonterminal thread recovery remains refused."
+    },
+    {
+      "area": "reasoning policy",
+      "files": [
+        "src-tauri/src/proxy/codex_subagent_reasoning.rs"
+      ],
+      "change": "Verified Desktop parent compaction restores exact recorded Ultra to max; genuine XHigh or missing proof stays xhigh. Marked child policy covers both native compact aliases and generation paths, using current saved policy rather than hardcoded High.",
+      "regression": {
+        "maintainedSublyxGptFamilies": 10,
+        "wireCases": 160,
+        "transports": 4,
+        "includesSavedHighAndMedium": true,
+        "continuationCompactionAuthorizationStillRejected": true
+      },
+      "liveBoundary": "Live sample covered three model routes, not all ten families. Additional compaction source fixes have not been installed by this task."
+    },
+    {
+      "area": "stream diagnostics",
+      "files": [
+        "src-tauri/src/proxy/providers/streaming_retry.rs",
+        "src-tauri/src/proxy/handlers.rs",
+        "src-tauri/src/proxy/forwarder.rs"
+      ],
+      "change": "Use existing request health trace for stream errors/retry decisions/fixed-enum final observed outcome. Retry decision uses same unlimited-aware budget predicate as execution. No extra payload parsing or whole-history storage.",
+      "outcomeBoundary": "Proxy-observed terminal/cancellation/unknown is not client delivery acknowledgement. Earlier three capacity retries remain historically unproven; upstream capacity limits are not eliminated.",
+      "newRegressions": 7
+    }
+  ],
+  "verification": {
+    "frontendFull": {
+      "command": "pnpm test:unit --silent --reporter=dot",
+      "status": "passed",
+      "files": 311,
+      "tests": 4602,
+      "completionReceiptVerified": true
+    },
+    "frontendWorkspaceIsolation": {
+      "status": "passed",
+      "tests": 286,
+      "timeoutUnchanged": true
+    },
+    "focusedRecoveryAndStreams": {
+      "status": "passed",
+      "tests": 37
+    },
+    "rustLibraryFull": {
+      "command": "cargo test --manifest-path src-tauri/Cargo.toml --lib --jobs 2 -- --test-threads=2 --quiet",
+      "status": "passed",
+      "passed": 5844,
+      "failed": 0,
+      "existingIgnored": 12,
+      "observedLibTestWarnings": 6
+    },
+    "multirouter": {
+      "status": "passed",
+      "tests": 196
+    },
+    "deterministicPerformance": {
+      "command": "pnpm performance:verify",
+      "status": "passed",
+      "selectedRegressions": 20
+    },
+    "performanceRunner": {
+      "command": "pnpm performance:test",
+      "status": "passed",
+      "tests": 27
+    },
+    "catalog": {
+      "command": "pnpm catalog:verify",
+      "status": "passed",
+      "frontendTests": 893,
+      "nodeGuardAndConfigTests": 29
+    },
+    "typecheck": {
+      "command": "pnpm typecheck",
+      "status": "passed"
+    },
+    "scriptsPolicy": {
+      "command": "pnpm scripts:check",
+      "status": "passed"
+    },
+    "formatting": {
+      "command": "pnpm format:check",
+      "status": "passed"
+    },
+    "rustFormatting": {
+      "command": "cargo fmt --check --manifest-path src-tauri/Cargo.toml",
+      "status": "passed"
+    },
+    "strictClippy": {
+      "command": "cargo clippy --manifest-path src-tauri/Cargo.toml --jobs 2 -- -D warnings",
+      "status": "passed"
+    },
+    "whitespace": {
+      "command": "git diff --check",
+      "status": "passed",
+      "nonFailingExistingLineEndingWarnings": true
+    },
+    "earlierFailuresResolved": [
+      "One full frontend run timed out one unchanged five-second UI test; isolated file and complete rerun passed without a timeout increase.",
+      "Eight backend embedded JS fixtures were explicitly migrated from full-history reads to the bounded RPC contract.",
+      "Three new stream fixtures were corrected to include valid terminal evidence and genuine scripted retry order; production validation/call-count/duration assertions retained.",
+      "A no-Crypto user-stop fixture now precisely asserts persistence-uncertain refusal plus observed-stop/persistence-failed evidence; no safety guard removed."
+    ]
+  },
+  "actions": {
+    "desktopBuildInvoked": false,
+    "applicationLaunched": false,
+    "applicationRestarted": false,
+    "installedApplicationReplaced": false,
+    "liveProviderMutated": false,
+    "uiOrCdpAutomation": false,
+    "alternateBuildTargetOrOutputSelected": false,
+    "sourceTestsCompiledInExistingConfiguredTarget": true,
+    "branchOrWorktreeCreated": false,
+    "commitOrPushPerformed": false,
+    "sourceAndAuditReportsSavedInsideCheckout": true
+  },
+  "limitations": [
+    "No pre-fix matched resource sample, so no numerical before/after CPU or RAM improvement claim.",
+    "Initial CPU sample was collected before this task started regression tests; later memory snapshot is not a new controlled CPU sample.",
+    "The running manually rebuilt binary is unchanged; additional source fixes require a user-owned build to obtain new live evidence.",
+    "Twelve existing ignored Rust tests remain ignored; six ordinary lib-test warnings were observed. Strict Clippy on the required default targets passed.",
+    "Live upstream SSE completion was not established by HTTP 200 statuses alone."
+  ]
+}

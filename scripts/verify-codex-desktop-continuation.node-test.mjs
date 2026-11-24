@@ -1462,8 +1462,15 @@ test("the actual log watcher accepts newly appended same-second installation rec
   };
   const record = (time, hash) =>
     `${timestamp(time)}[INFO] Codex picker catalog payload installed: runtime_fingerprint=sha256-${hash.repeat(64)}\n`;
+  const malformedRecord = (time) =>
+    `${timestamp(time)}[INFO] Codex picker catalog payload installed: runtime_fingerprint=sha256-not-a-fingerprint\n`;
   try {
-    await writeFile(logPath, record(second - 10_000, "1"));
+    await writeFile(
+      logPath,
+      record(second - 1_000, "2") +
+        malformedRecord(second - 1_000) +
+        record(second - 10_000, "1"),
+    );
     const initial = await stat(logPath);
     const context = vm.createContext({
       stat,
@@ -1474,6 +1481,7 @@ test("the actual log watcher accepts newly appended same-second installation rec
       logOffset: initial.size,
       logFileIdentity: `${initial.dev}:${initial.ino}`,
       logFragment: "",
+      logInitialScanPending: true,
       expectedFingerprint: undefined,
       startedAt: second + 900,
       binaryIdentity: { modifiedAt: second - 2_000 },
@@ -1484,8 +1492,8 @@ test("the actual log watcher accepts newly appended same-second installation rec
     await context.refresh();
     assert.equal(
       context.expectedFingerprint,
-      undefined,
-      "A prior installation must not establish current runtime identity",
+      `sha256-${"2".repeat(64)}`,
+      "A valid pre-existing installation after binary replacement establishes runtime identity",
     );
     await writeFile(logPath, record(second, "2"), { flag: "a" });
     await context.refresh();
@@ -1495,12 +1503,18 @@ test("the actual log watcher accepts newly appended same-second installation rec
       "Appended records have only second precision and remain fresh in the start second",
     );
     await rename(logPath, path.join(directory, "cc-switch.old.log"));
-    await writeFile(logPath, record(second, "3"));
+    await writeFile(
+      logPath,
+      Buffer.concat([
+        Buffer.alloc(128 * 1024, "x"),
+        Buffer.from(`\n${record(second, "3")}`),
+      ]),
+    );
     await context.refresh();
     assert.equal(
       context.expectedFingerprint,
       `sha256-${"3".repeat(64)}`,
-      "A rotated log must be read from its own beginning",
+      "A rotated log must be scanned through its bounded tail",
     );
   } finally {
     assert.ok(directory.startsWith(prefix) && directory !== os.tmpdir());
@@ -1756,13 +1770,53 @@ const pickerInspectionProgram = async (context) => {
   );
 };
 
-const pickerInspectionContext = (state, extra = {}) =>
-  vm.createContext({
+const pickerInspectionContext = (
+  state,
+  extra = {},
+  { markDiagnosticsReadOnly = true } = {},
+) => {
+  const reader = Object.getOwnPropertyDescriptor(
+    state ?? {},
+    "readCodexModelPickerDiagnostics",
+  )?.value;
+  if (markDiagnosticsReadOnly && typeof reader === "function")
+    Object.defineProperty(reader, "readOnly", { value: true });
+  return vm.createContext({
     patchKey: "fixture-runtime",
     expectedFingerprint: fingerprint,
     window: { "fixture-runtime": state },
     ...extra,
   });
+};
+
+test("picker inspection leaves older diagnostics callbacks untouched", async () => {
+  let reads = 0;
+  const context = pickerInspectionContext(
+    {
+      rendererRuntimeFingerprint: fingerprint,
+      payload: { catalogAvailable: true },
+      readCodexModelPickerDiagnostics: () => {
+        reads += 1;
+        return { status: "ready" };
+      },
+    },
+    {},
+    { markDiagnosticsReadOnly: false },
+  );
+  const result = vm.runInContext(
+    await pickerInspectionProgram(context),
+    context,
+  );
+  assert.equal(reads, 0);
+  assert.equal(result.fingerprintMatches, true);
+  assert.equal(result.catalog.available, true);
+  assert.equal(result.pickerDiagnostics.available, false);
+  assert.ok(
+    result.modelObservations.unavailableReasons.includes(
+      "read_only_diagnostics_unavailable",
+    ),
+  );
+});
 
 test("picker inspection reports a stale runtime without requiring or invoking continuation APIs", async () => {
   let reads = 0;
@@ -1808,9 +1862,54 @@ test("picker inspection reports a stale runtime without requiring or invoking co
   assert.equal(result.fingerprintMatches, false);
   assert.equal(result.renderedMenuVerified, false);
   assert.equal(result.modelObservations.queryRowsVerified, false);
+  assert.ok(
+    result.modelObservations.unavailableReasons.includes("runtime_not_current"),
+  );
   assert.deepEqual(JSON.parse(JSON.stringify(result.catalog.models)), [
     { model: "openai/gpt-test:free", declaredEfforts: ["high", "max"] },
     { model: "gpt-test-sublyx", declaredEfforts: ["max", "ultra"] },
+  ]);
+});
+
+test("picker inspection distinguishes a missing expected fingerprint from a mismatch", async () => {
+  const context = pickerInspectionContext(
+    {
+      rendererRuntimeFingerprint: fingerprint,
+      payload: {
+        catalogAvailable: true,
+        modelNames: ["fixture-model"],
+        models: [
+          { model: "fixture-model", supported_reasoning_levels: ["max"] },
+        ],
+      },
+      readCodexModelPickerDiagnostics: () => ({
+        status: "ready",
+        modelObservations: {
+          queryRowsVerified: true,
+          unavailable: false,
+          rows: [
+            {
+              model: "fixture-model",
+              expectedEfforts: ["max"],
+              observedEfforts: ["max"],
+              nativeVisibleEfforts: ["max"],
+              missingEfforts: [],
+            },
+          ],
+        },
+      }),
+    },
+    { expectedFingerprint: undefined },
+  );
+  const result = vm.runInContext(
+    await pickerInspectionProgram(context),
+    context,
+  );
+  assert.equal(result.runtimeStatus, "expected_fingerprint_unavailable");
+  assert.equal(result.fingerprintMatches, false);
+  assert.equal(result.modelObservations.queryRowsVerified, false);
+  assert.deepEqual(Array.from(result.modelObservations.unavailableReasons), [
+    "expected_fingerprint_unavailable",
   ]);
 });
 
@@ -1850,6 +1949,7 @@ test("picker inspection whitelists diagnostics and model observations without re
       return {
         status: "ready",
         selectedMaxModelCount: 1,
+        booleanControlNotObservedModelCount: 2,
         unreadableObserverCount: -4,
         private: secret,
         modelObservations: {
@@ -1901,6 +2001,7 @@ test("picker inspection whitelists diagnostics and model observations without re
     true,
   );
   assert.equal(result.pickerDiagnostics.unreadableObserverCount, undefined);
+  assert.equal(result.pickerDiagnostics.booleanControlNotObservedModelCount, 2);
   assert.equal(result.nativeVisibility.scopeCandidateCount, 1);
 });
 
@@ -2291,6 +2392,40 @@ test("picker inspection preserves bounded canonical owner diagnostics without ce
   }
 });
 
+test("picker inspection preserves canonical hint scan telemetry through the overflow sentinel", async () => {
+  for (const [hintCount, hintScanStatus, hintScanReason] of [
+    [0, "unknown", null],
+    [0, "scanning", null],
+    [64, "complete", null],
+    [96, "complete", null],
+    [18, "capped", "value_limit"],
+    [65, "capped", "scope_limit"],
+    [2049, "capped", "scope_limit"],
+    [18, "capped", "read_failed"],
+    [18, "capped", "fiber_limit"],
+    [18, "capped", "object_limit"],
+    [18, "capped", "field_limit"],
+  ]) {
+    const counts = { hintCount, hintScanStatus, hintScanReason };
+    const context = pickerInspectionContext({
+      rendererRuntimeFingerprint: fingerprint,
+      nativeReasoningVisibilityReconciliation: {
+        status: "unverified",
+        canonicalOwnerCounts: counts,
+      },
+    });
+    const result = vm.runInContext(
+      await pickerInspectionProgram(context),
+      context,
+    );
+    const actualCounts =
+      result.nativeVisibility.reconciliation.canonicalOwnerCounts;
+    assert.deepEqual(JSON.parse(JSON.stringify(actualCounts)), counts);
+    assert.equal(result.nativeVisibility.ownershipStatus, "unverified");
+    assert.equal(result.renderedMenuVerified, false);
+  }
+});
+
 test("picker inspection filters malformed canonical diagnostics without getter reads or secrets", async () => {
   const secret = "private-canonical-owner-fixture";
   let reads = 0;
@@ -2301,12 +2436,13 @@ test("picker inspection filters malformed canonical diagnostics without getter r
     pendingNodeCount: 30001,
     private: secret,
   };
-  Object.defineProperty(counts, "hintCount", {
-    get() {
-      reads += 1;
-      throw new Error(secret);
-    },
-  });
+  for (const key of ["hintCount", "hintScanStatus", "hintScanReason"])
+    Object.defineProperty(counts, key, {
+      get() {
+        reads += 1;
+        throw new Error(secret);
+      },
+    });
   const failures = {
     canonical_owner_unavailable: 2,
     canonical_owner_unverified: secret,
@@ -2314,6 +2450,7 @@ test("picker inspection filters malformed canonical diagnostics without getter r
   };
   for (const invalidCounts of [
     counts,
+    { hintCount: 2050, hintScanStatus: secret, hintScanReason: secret },
     Object.create({ uniqueBrandCount: 1 }),
     [],
     null,
@@ -3472,6 +3609,7 @@ const runPickerTargetsFixture = async (
     sampleIntervalMs = 1000,
     nativeFailure,
     nativeFailureAt = 1,
+    fingerprintAvailableAtMs = 0,
   } = {},
 ) => {
   const source = await readMonitorSource();
@@ -3490,6 +3628,7 @@ const runPickerTargetsFixture = async (
       byUrl.set(target.webSocketDebuggerUrl, definitions[index]);
   });
   let now = Date.now();
+  const startedAt = now;
   let nativeChecks = 0;
   let binaryChecks = 0;
   const sleeps = [];
@@ -3499,6 +3638,9 @@ const runPickerTargetsFixture = async (
     evaluated = [];
   const program = await pickerInspectionProgram(
     pickerInspectionContext(undefined),
+  );
+  const programWithoutFingerprint = await pickerInspectionProgram(
+    pickerInspectionContext(undefined, { expectedFingerprint: undefined }),
   );
   const forbidden = () => {
     throw new Error(
@@ -3510,7 +3652,7 @@ const runPickerTargetsFixture = async (
     createHash: (await import("node:crypto")).createHash,
     options: new Map(),
     stat: forbidden,
-    startedAt: now,
+    startedAt,
     Date: { now: () => now },
     waitMs,
     port: 9229,
@@ -3523,7 +3665,10 @@ const runPickerTargetsFixture = async (
         throw new Error(nativeFailure);
     },
     sourceRuntimeBootstrapped: false,
-    refreshFingerprint: async () => {},
+    refreshFingerprint: async () => {
+      if (now - startedAt >= fingerprintAvailableAtMs)
+        context.expectedFingerprint = fingerprint;
+    },
     readNativeIdentity: () => ({
       host: "127.0.0.1",
       owners: [
@@ -3535,7 +3680,8 @@ const runPickerTargetsFixture = async (
         },
       ],
     }),
-    expectedFingerprint: fingerprint,
+    expectedFingerprint:
+      fingerprintAvailableAtMs === 0 ? fingerprint : undefined,
     inspectPicker: true,
     pickerSampleCount: sampleCount,
     pickerSampleIntervalMs: sampleIntervalMs,
@@ -3553,7 +3699,7 @@ const runPickerTargetsFixture = async (
       }
       return {
         evaluate: async (expression) => {
-          assert.equal(expression, program);
+          assert.equal(expression, context.pickerInspectionExpression());
           evaluated.push(url);
           const index = readCounts.get(url) || 0;
           readCounts.set(url, index + 1);
@@ -3571,7 +3717,8 @@ const runPickerTargetsFixture = async (
         close: () => closed.push(url),
       };
     },
-    pickerInspectionExpression: () => program,
+    pickerInspectionExpression: () =>
+      context.expectedFingerprint ? program : programWithoutFingerprint,
     readinessExpression: forbidden,
     createServer: forbidden,
     mkdtemp: forbidden,
@@ -3583,6 +3730,8 @@ const runPickerTargetsFixture = async (
     fail: (reason) => new Error(reason),
     connection: null,
     nativeIdentity: null,
+    sameIdentity: (left, right) =>
+      JSON.stringify(left) === JSON.stringify(right),
     readinessBlocker: undefined,
     readinessDiagnostics: undefined,
     pickerInspection: undefined,
@@ -3614,6 +3763,60 @@ const nativeTargetId = (value) => value.toString(16).padStart(32, "0");
 const installedPickerState = (value = fingerprint) => ({
   rendererRuntimeFingerprint: value,
   payload: { catalogAvailable: true, modelNames: [], models: [] },
+});
+
+test("picker inspection waits for a later log fingerprint before reporting the current renderer", async () => {
+  const definitions = [
+    { id: nativeTargetId(1), state: installedPickerState() },
+  ];
+  for (const sampleCount of [1, 3]) {
+    const fixture = await runPickerTargetsFixture(definitions, {
+      waitMs: 2000,
+      sampleCount,
+      sampleIntervalMs: 250,
+      fingerprintAvailableAtMs: 250,
+    });
+    assert.equal(fixture.failure, undefined);
+    assert.equal(fixture.result.pickerInspection.runtimeStatus, "current");
+    assert.equal(
+      fixture.result.pickerInspection.expectedRuntimeFingerprint,
+      fingerprint,
+    );
+    assert.equal(fixture.connected.length, 2);
+    assert.equal(fixture.closed.length, 2);
+    if (sampleCount > 1) {
+      assert.equal(fixture.collection.sampling.complete, true);
+      assert.equal(fixture.collection.sampling.samples.length, sampleCount);
+      assert.ok(
+        fixture.collection.sampling.samples.every(
+          ({ inspection }) => inspection.runtimeStatus === "current",
+        ),
+      );
+    }
+  }
+});
+
+test("picker inspection retains the early snapshot when the log fingerprint is absent at the deadline", async () => {
+  const fixture = await runPickerTargetsFixture(
+    [{ id: nativeTargetId(1), state: installedPickerState() }],
+    { waitMs: 750, fingerprintAvailableAtMs: Infinity },
+  );
+  assert.equal(fixture.failure, undefined);
+  assert.equal(
+    fixture.result.pickerInspection.runtimeStatus,
+    "expected_fingerprint_unavailable",
+  );
+  assert.equal(
+    fixture.result.pickerInspection.installedRuntimeFingerprint,
+    fingerprint,
+  );
+  assert.equal(
+    fixture.result.pickerInspection.expectedRuntimeFingerprint,
+    null,
+  );
+  assert.deepEqual(fixture.sleeps, [500, 250]);
+  assert.equal(fixture.evaluated.length, 1);
+  assert.equal(fixture.closed.length, 1);
 });
 
 test("picker target sweep does not mistake the first absent renderer for every renderer and selects the best current snapshot deterministically", async () => {

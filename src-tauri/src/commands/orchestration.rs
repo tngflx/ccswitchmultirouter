@@ -1,7 +1,7 @@
 use crate::orchestration::{Run, Settings};
 use crate::store::AppState;
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -12,11 +12,14 @@ pub struct OrchestrationSaveResult {
 }
 
 #[tauri::command]
-pub fn get_orchestration_settings(state: State<'_, AppState>) -> Result<Settings, String> {
-    state
-        .db
-        .get_orchestration_settings()
-        .map_err(|error| error.to_string())
+pub async fn get_orchestration_settings(app: AppHandle) -> Result<Settings, String> {
+    super::run_app_state_blocking(&app, |state| {
+        state
+            .db
+            .get_orchestration_settings()
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -111,6 +114,18 @@ pub fn cancel_orchestration_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+
+    #[test]
+    fn orchestration_settings_read_uses_async_dispatch() {
+        fn assert_async_command<F>(_: impl FnOnce(AppHandle) -> F)
+        where
+            F: Future<Output = Result<Settings, String>> + Send,
+        {
+        }
+
+        assert_async_command(get_orchestration_settings);
+    }
 
     #[test]
     fn publication_failure_preserves_saved_settings_and_redacts_details() {

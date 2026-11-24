@@ -67,6 +67,7 @@ const createHarness = (client = createClient()) => {
   };
   const api = new Function(
     "state",
+    "recoveryOnly",
     "document",
     "window",
     "patchRequestClient",
@@ -78,6 +79,7 @@ const createHarness = (client = createClient()) => {
     `${resource("client_discovery.js")}\n${renderer.slice(reactStart, reactEnd)}\n${continuation}\nreturn { patchReactAppServerClients, patchAppServerModuleClients, patchCodexScopedAppServerClients, current: codexContinuationClientIsCurrent, snapshotCurrent: codexRendererScopeSnapshotIsCurrent };`,
   )(
     state,
+    false,
     { getElementById: () => root, body: null, documentElement: null },
     {},
     patchRequestClient,

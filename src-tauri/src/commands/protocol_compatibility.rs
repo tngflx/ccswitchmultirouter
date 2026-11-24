@@ -429,31 +429,37 @@ fn classify_codex_provider_set_projection_commit(
 }
 
 #[tauri::command]
-pub fn prepare_codex_provider_set_batch(
-    state: State<'_, AppState>,
+pub async fn prepare_codex_provider_set_batch(
+    app_handle: AppHandle,
     request: PrepareCodexProviderSetBatchRequest,
 ) -> Result<CodexProviderSetBatchPreview, String> {
-    prepare_codex_provider_set_batch_internal(state.inner(), request, Utc::now().timestamp())
-        .map(|(_, preview)| preview)
+    crate::commands::run_app_state_blocking(&app_handle, move |state| {
+        prepare_codex_provider_set_batch_internal(state, request, Utc::now().timestamp())
+            .map(|(_, preview)| preview)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn commit_codex_provider_set_batch(
-    state: State<'_, AppState>,
+pub async fn commit_codex_provider_set_batch(
+    app_handle: AppHandle,
     request: CommitCodexProviderSetBatchRequest,
 ) -> Result<CodexProviderSetBatchCommitOutcome, String> {
-    commit_codex_provider_set_batch_internal_with_publisher(
-        state.inner(),
-        request,
-        Utc::now().timestamp(),
-        |artifact| {
-            crate::codex_config::publish_codex_multirouter_projection_for_database(
-                state.db.as_ref(),
-                artifact,
-            )
-            .map_err(|error| error.to_string())
-        },
-    )
+    crate::commands::run_app_state_blocking(&app_handle, move |state| {
+        commit_codex_provider_set_batch_internal_with_publisher(
+            state,
+            request,
+            Utc::now().timestamp(),
+            |artifact| {
+                crate::codex_config::publish_codex_multirouter_projection_for_database(
+                    state.db.as_ref(),
+                    artifact,
+                )
+                .map_err(|error| error.to_string())
+            },
+        )
+    })
+    .await
 }
 
 fn prepare_codex_provider_set_batch_internal(
@@ -544,6 +550,7 @@ where
         &crate::codex_multirouter::projection::CodexRoutingProjectionArtifact,
     ) -> Result<crate::codex_multirouter::projection::ProjectionReadBack, String>,
 {
+    let _commit = state.lock_codex_provider_set_commit();
     let receipt_ids = request
         .sources
         .iter()
@@ -647,30 +654,64 @@ where
 }
 
 #[tauri::command]
-pub fn prepare_codex_provider_set(
-    state: State<'_, AppState>,
+pub async fn prepare_codex_provider_set(
+    app_handle: AppHandle,
     request: PrepareCodexProviderSetRequest,
 ) -> Result<CodexProviderSetPreview, String> {
-    prepare_codex_provider_set_internal(state.inner(), request, chrono::Utc::now().timestamp())
+    crate::commands::run_app_state_blocking(&app_handle, move |state| {
+        prepare_codex_provider_set_internal(state, request, chrono::Utc::now().timestamp())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn commit_codex_provider_set(
-    state: State<'_, AppState>,
+pub async fn commit_codex_provider_set(
+    app_handle: AppHandle,
     request: CommitCodexProviderSetRequest,
 ) -> Result<CodexProviderSetCommitOutcome, String> {
+    crate::commands::run_app_state_blocking(&app_handle, move |state| {
+        commit_codex_provider_set_with_publisher_and_sync(
+            state,
+            request,
+            |artifact| {
+                crate::codex_config::publish_codex_multirouter_projection_for_database(
+                    state.db.as_ref(),
+                    artifact,
+                )
+                .map_err(|error| error.to_string())
+            },
+            |outcome| sync_current_provider_after_codex_provider_set_commit(state, outcome),
+        )
+    })
+    .await
+}
+
+fn commit_codex_provider_set_with_publisher_and_sync<F>(
+    state: &AppState,
+    request: CommitCodexProviderSetRequest,
+    publish: F,
+    sync: impl FnOnce(&mut CodexProviderSetCommitOutcome) -> Result<(), String>,
+) -> Result<CodexProviderSetCommitOutcome, String>
+where
+    F: FnMut(
+        &crate::codex_multirouter::projection::CodexRoutingProjectionArtifact,
+    ) -> Result<crate::codex_multirouter::projection::ProjectionReadBack, String>,
+{
+    let _commit = state.lock_codex_provider_set_commit();
     let mut outcome = commit_codex_provider_set_internal_with_publisher(
-        state.inner(),
+        state,
         request,
-        chrono::Utc::now().timestamp(),
-        |artifact| {
-            crate::codex_config::publish_codex_multirouter_projection_for_database(
-                state.db.as_ref(),
-                artifact,
-            )
-            .map_err(|error| error.to_string())
-        },
+        Utc::now().timestamp(),
+        publish,
     )?;
+    sync(&mut outcome)?;
+    Ok(outcome)
+}
+
+fn sync_current_provider_after_codex_provider_set_commit(
+    state: &AppState,
+    outcome: &mut CodexProviderSetCommitOutcome,
+) -> Result<(), String> {
     let source_is_current = state
         .db
         .get_current_provider(AppType::Codex.as_str())
@@ -683,7 +724,7 @@ pub fn commit_codex_provider_set(
             Some(outcome.preview.source_provider_id.as_str()),
         );
         let live_result = if matches!(outcome.preview.plan, CodexProviderSetPlan::Single { .. }) {
-            ProviderService::sync_current_provider_for_app(state.inner(), AppType::Codex)
+            ProviderService::sync_current_provider_for_app(state, AppType::Codex)
         } else {
             Ok(())
         };
@@ -693,7 +734,7 @@ pub fn commit_codex_provider_set(
                 Some("codex_provider_set_live_projection_failed".to_string());
         }
     }
-    Ok(outcome)
+    Ok(())
 }
 
 pub(crate) fn prepare_codex_provider_set_internal(
@@ -2132,45 +2173,148 @@ fn target_for_candidate(
 }
 
 #[tauri::command]
-pub fn get_codex_protocol_compatibility(
-    state: State<'_, AppState>,
+pub async fn get_codex_protocol_compatibility(
+    app_handle: AppHandle,
     target: ProbeTargetKey,
 ) -> Result<ReasoningCompatibilityInspection, String> {
-    inspect_reasoning_compatibility(state.inner(), target)
+    crate::commands::run_app_state_blocking(&app_handle, move |state| {
+        inspect_reasoning_compatibility(state, target)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn list_codex_protocol_probe_observations(
-    state: State<'_, AppState>,
+pub async fn list_codex_protocol_probe_observations(
+    app_handle: AppHandle,
     provider_id: String,
 ) -> Result<Vec<ProtocolCompatibilityRecord>, String> {
-    let provider_id = required("providerId", &provider_id)?;
-    ProviderService::list_codex_protocol_probe_observations(state.inner(), provider_id)
-        .map_err(|error| error.to_string())
+    crate::commands::run_app_state_blocking(&app_handle, move |state| {
+        let provider_id = required("providerId", &provider_id)?;
+        ProviderService::list_codex_protocol_probe_observations(state, provider_id)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn plan_codex_reasoning_override(
-    state: State<'_, AppState>,
+pub async fn plan_codex_reasoning_override(
+    app_handle: AppHandle,
     request: PlanReasoningOverrideRequest,
 ) -> Result<ReasoningOverridePlan, String> {
-    plan_reasoning_override(state.inner(), request)
+    crate::commands::run_app_state_blocking(&app_handle, move |state| {
+        plan_reasoning_override(state, request)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn apply_codex_reasoning_override(
-    state: State<'_, AppState>,
+pub async fn apply_codex_reasoning_override(
+    app_handle: AppHandle,
     request: ApplyReasoningOverrideRequest,
 ) -> Result<ReasoningCompatibilityInspection, String> {
-    apply_reasoning_override(state.inner(), request)
+    crate::commands::run_app_state_blocking(&app_handle, move |state| {
+        apply_reasoning_override(state, request)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn clear_codex_reasoning_override(
-    state: State<'_, AppState>,
+pub async fn clear_codex_reasoning_override(
+    app_handle: AppHandle,
     request: ClearReasoningOverrideRequest,
 ) -> Result<ReasoningCompatibilityInspection, String> {
-    clear_reasoning_override(state.inner(), request)
+    crate::commands::run_app_state_blocking(&app_handle, move |state| {
+        clear_reasoning_override(state, request)
+    })
+    .await
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use std::future::Future;
+
+    macro_rules! assert_async_app_command {
+        ($name:ident, $command:path, $request:ty, $output:ty) => {
+            #[allow(dead_code)]
+            fn $name(
+                app_handle: AppHandle,
+                request: $request,
+            ) -> impl Future<Output = Result<$output, String>> + Send {
+                $command(app_handle, request)
+            }
+        };
+    }
+
+    assert_async_app_command!(
+        prepare_codex_provider_set_batch_is_async,
+        prepare_codex_provider_set_batch,
+        PrepareCodexProviderSetBatchRequest,
+        CodexProviderSetBatchPreview
+    );
+    assert_async_app_command!(
+        commit_codex_provider_set_batch_is_async,
+        commit_codex_provider_set_batch,
+        CommitCodexProviderSetBatchRequest,
+        CodexProviderSetBatchCommitOutcome
+    );
+    assert_async_app_command!(
+        prepare_codex_provider_set_is_async,
+        prepare_codex_provider_set,
+        PrepareCodexProviderSetRequest,
+        CodexProviderSetPreview
+    );
+    assert_async_app_command!(
+        commit_codex_provider_set_is_async,
+        commit_codex_provider_set,
+        CommitCodexProviderSetRequest,
+        CodexProviderSetCommitOutcome
+    );
+    assert_async_app_command!(
+        get_codex_protocol_compatibility_is_async,
+        get_codex_protocol_compatibility,
+        ProbeTargetKey,
+        ReasoningCompatibilityInspection
+    );
+    assert_async_app_command!(
+        list_codex_protocol_probe_observations_is_async,
+        list_codex_protocol_probe_observations,
+        String,
+        Vec<ProtocolCompatibilityRecord>
+    );
+    assert_async_app_command!(
+        plan_codex_reasoning_override_is_async,
+        plan_codex_reasoning_override,
+        PlanReasoningOverrideRequest,
+        ReasoningOverridePlan
+    );
+    assert_async_app_command!(
+        apply_codex_reasoning_override_is_async,
+        apply_codex_reasoning_override,
+        ApplyReasoningOverrideRequest,
+        ReasoningCompatibilityInspection
+    );
+    assert_async_app_command!(
+        clear_codex_reasoning_override_is_async,
+        clear_codex_reasoning_override,
+        ClearReasoningOverrideRequest,
+        ReasoningCompatibilityInspection
+    );
+
+    #[test]
+    fn provider_page_protocol_commands_use_async_blocking_dispatch() {
+        let _ = (
+            prepare_codex_provider_set_batch_is_async,
+            commit_codex_provider_set_batch_is_async,
+            prepare_codex_provider_set_is_async,
+            commit_codex_provider_set_is_async,
+            get_codex_protocol_compatibility_is_async,
+            list_codex_protocol_probe_observations_is_async,
+            plan_codex_reasoning_override_is_async,
+            apply_codex_reasoning_override_is_async,
+            clear_codex_reasoning_override_is_async,
+        );
+    }
 }
 
 pub(crate) fn inspect_reasoning_compatibility(
@@ -4601,6 +4745,108 @@ mod tests {
             db.get_all_providers("codex").unwrap().is_empty(),
             "selection is still a draft until explicit commit"
         );
+    }
+
+    #[test]
+    fn single_provider_set_commit_waits_for_batch_commit_to_finish() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let state = AppState::new(Arc::new(Database::memory().expect("memory database")));
+        let now = chrono::Utc::now().timestamp();
+        let mut source = ordinary_provider();
+        source.category = Some("official".to_string());
+        let router = router_provider(&source.id);
+        let sources = vec![CodexProviderSetBatchSourceRequest {
+            provider: source,
+            receipt_ids: Vec::new(),
+        }];
+        let (_, batch_preview) = prepare_codex_provider_set_batch_internal(
+            &state,
+            PrepareCodexProviderSetBatchRequest {
+                sources: sources.clone(),
+                router: router.clone(),
+            },
+            now,
+        )
+        .expect("prepare batch");
+        let (publishing, batch_is_publishing) = mpsc::channel();
+        let (finish_batch, batch_may_finish) = mpsc::channel();
+        let (single_started, single_is_running) = mpsc::channel();
+        let (single_finished, single_outcome) = mpsc::channel();
+
+        thread::scope(|scope| {
+            let batch_state = state.clone();
+            let batch = scope.spawn(move || {
+                commit_codex_provider_set_batch_internal_with_publisher(
+                    &batch_state,
+                    CommitCodexProviderSetBatchRequest {
+                        sources,
+                        router,
+                        digest: batch_preview.digest,
+                        intent: CodexProviderSetCommitIntent::AcceptAuto,
+                    },
+                    now,
+                    |artifact| {
+                        publishing.send(()).expect("notify batch publication");
+                        batch_may_finish
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("release batch publisher");
+                        Ok(
+                            crate::codex_multirouter::projection::ProjectionReadBack::verified(
+                                artifact.dependency_fingerprint.clone(),
+                            ),
+                        )
+                    },
+                )
+            });
+            batch_is_publishing
+                .recv_timeout(Duration::from_secs(5))
+                .expect("batch reached publisher");
+
+            let mut provider = ordinary_provider();
+            provider.id = "provider-b".to_string();
+            provider.meta.as_mut().unwrap().codex_protocol_mode = Some(CodexProtocolMode::Manual);
+            let preview = prepare_codex_provider_set_internal(
+                &state,
+                PrepareCodexProviderSetRequest {
+                    provider: provider.clone(),
+                    receipt_ids: Vec::new(),
+                },
+                now,
+            )
+            .expect("prepare single provider set");
+            let single_state = state.clone();
+            scope.spawn(move || {
+                single_started.send(()).expect("notify single commit start");
+                let outcome = super::commit_codex_provider_set_with_publisher_and_sync(
+                    &single_state,
+                    CommitCodexProviderSetRequest {
+                        provider,
+                        receipt_ids: Vec::new(),
+                        digest: preview.digest,
+                        intent: CodexProviderSetCommitIntent::ConfirmManual,
+                    },
+                    |_| panic!("independent single provider has no router projection"),
+                    |_| Ok(()),
+                );
+                single_finished.send(outcome).expect("report single commit");
+            });
+            single_is_running
+                .recv_timeout(Duration::from_secs(5))
+                .expect("single commit started");
+            let overlapping = single_outcome.recv_timeout(Duration::from_millis(250));
+            finish_batch.send(()).expect("release batch");
+
+            batch.join().expect("join batch").expect("commit batch");
+            assert!(
+                matches!(overlapping, Err(mpsc::RecvTimeoutError::Timeout)),
+                "single commit finished while batch was publishing"
+            );
+            single_outcome
+                .recv_timeout(Duration::from_secs(5))
+                .expect("single resumed after batch")
+                .expect("commit single provider set");
+        });
     }
 
     #[test]

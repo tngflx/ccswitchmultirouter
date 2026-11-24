@@ -941,6 +941,7 @@ pub fn sublyx_reasoning_capability_for_model(model: &str) -> Option<CodexModelRe
         "gpt-6-luna",
         "gpt-6.1-sol",
         "gpt-6.1-terra",
+        "gpt-6.2-astra",
         "gpt-6.2-sol",
     ]
     .iter()
@@ -1920,6 +1921,7 @@ mod tests {
             "gpt-6-luna",
             "gpt-6.1-sol",
             "gpt-6.1-terra",
+            "gpt-6.2-astra",
             "gpt-6.2-sol",
         ] {
             for wire_model in [model.to_string(), format!("{model}-sublyx")] {
@@ -1968,6 +1970,8 @@ mod tests {
             ("gpt-5.4", "high", "high"),
             ("gpt-6.1-sol", "max", "max"),
             ("gpt-6.1-sol", "high", "high"),
+            ("gpt-6.2-astra", "max", "max"),
+            ("gpt-6.2-astra", "high", "high"),
             ("gpt-6.2-sol", "max", "max"),
             ("gpt-6.2-sol", "high", "high"),
         ] {
@@ -2004,7 +2008,7 @@ mod tests {
                 .any(|effort| effort == "max");
             assert_eq!(
                 accepts_native_max,
-                matches!(model, "gpt-6.1-sol" | "gpt-6.2-sol"),
+                matches!(model, "gpt-6.1-sol" | "gpt-6.2-astra" | "gpt-6.2-sol"),
                 "{model}"
             );
             assert_eq!(
@@ -2012,11 +2016,13 @@ mod tests {
                     .codex_ultra_orchestration
                     .as_ref()
                     .and_then(|ultra| ultra.provider_effort.as_deref()),
-                Some(if matches!(model, "gpt-6.1-sol" | "gpt-6.2-sol") {
-                    "max"
-                } else {
-                    "xhigh"
-                }),
+                Some(
+                    if matches!(model, "gpt-6.1-sol" | "gpt-6.2-astra" | "gpt-6.2-sol") {
+                        "max"
+                    } else {
+                        "xhigh"
+                    }
+                ),
                 "{model}: Ultra follows the maintained native target",
             );
         }
@@ -2381,6 +2387,8 @@ mod tests {
         for (model, saved_max_mapping) in [
             ("gpt-6.1-sol", Some("xhigh")),
             ("gpt-6.1-sol", Some("max")),
+            ("gpt-6.2-astra", Some("xhigh")),
+            ("gpt-6.2-astra", Some("max")),
             ("gpt-6.2-sol", None),
         ] {
             let mut saved = sublyx_reasoning_capability_for_model(model).unwrap();

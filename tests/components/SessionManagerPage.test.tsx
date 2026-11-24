@@ -259,6 +259,20 @@ describe("SessionManagerPage", () => {
     setSessionFixtures(sessions, messages);
   });
 
+  it("provides the backup and restore action in Codex Session Manager", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(
+      screen.getByRole("button", { name: "sessionManager.backup.title" }),
+    );
+
+    expect(
+      await within(screen.getByRole("dialog")).findByRole("checkbox", {
+        name: /Alpha Session/,
+      }),
+    ).toBeVisible();
+  });
+
   it("surfaces a relative Pi sessionDir instead of presenting an empty scan as authoritative", async () => {
     const discovery = vi.spyOn(piApi, "getSessionDiscovery").mockResolvedValue({
       status: "requires_project_context",

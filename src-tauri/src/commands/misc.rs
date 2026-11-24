@@ -276,7 +276,7 @@ pub async fn run_tool_lifecycle_action(
 }
 
 fn automatic_update_available(current: &ToolVersion) -> bool {
-    if current.installed_but_broken || current.error.is_some() || current.env_type == "wsl" {
+    if current.installed_but_broken || current.error.is_some() {
         return false;
     }
     let (Some(version), Some(latest)) = (
@@ -290,14 +290,43 @@ fn automatic_update_available(current: &ToolVersion) -> bool {
         && compare_semver(version, latest) == Some(std::cmp::Ordering::Less)
 }
 
+#[cfg(test)]
 fn tool_process_matches(tool: &str, executable: &str, command_line: &str) -> bool {
+    tool_process_matches_for_target(tool, executable, command_line, false)
+}
+
+fn tool_process_matches_for_target(
+    tool: &str,
+    executable: &str,
+    command_line: &str,
+    codex_windows_app_target: bool,
+) -> bool {
     let executable = executable.replace('\\', "/").to_ascii_lowercase();
+    let command = command_line.replace('\\', "/").to_ascii_lowercase();
+
+    // The Windows Codex Desktop application includes its own `codex.exe`
+    // runtime and launches a `ChatGPT.exe` shell. Neither process is the
+    // user-installed Codex CLI that this lifecycle updater manages. The
+    // bundled runtime can otherwise make a healthy npm installation look
+    // busy on every startup.
+    if tool == "codex"
+        && (is_codex_windows_app_path_str(&executable)
+            || is_codex_windows_app_path_str(&command)
+            || (codex_windows_app_target
+                && executable
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.trim_end_matches(".exe") == "chatgpt")))
+    {
+        return codex_windows_app_target;
+    }
+
     let name = executable
         .rsplit('/')
         .next()
         .unwrap_or("")
         .trim_end_matches(".exe");
-    if name == tool || (tool == "codex" && matches!(name, "chatgpt" | "codex.appimage")) {
+    if name == tool || (tool == "codex" && name == "codex.appimage") {
         return true;
     }
     if !matches!(
@@ -308,10 +337,13 @@ fn tool_process_matches(tool: &str, executable: &str, command_line: &str) -> boo
         return false;
     }
     if command_line.trim().is_empty() {
-        // A runtime with an unreadable command may be hosting this CLI.
-        return true;
+        // A runtime with an unavailable command line is not enough evidence
+        // that it hosts this tool. Windows WMI commonly leaves CommandLine
+        // null for unrelated or access-restricted processes. Treating every
+        // such runtime as a match makes one background node/python process
+        // disable automatic updates for all tools indefinitely.
+        return false;
     }
-    let command = command_line.replace('\\', "/").to_ascii_lowercase();
     let package_marker = match tool {
         "claude" => "@anthropic-ai/claude-code",
         "codex" => "@openai/codex",
@@ -331,7 +363,7 @@ fn tool_process_matches(tool: &str, executable: &str, command_line: &str) -> boo
         })
 }
 
-fn tool_process_is_running(tool: &str) -> Result<bool, String> {
+fn tool_process_is_running(tool: &str, codex_windows_app_target: bool) -> Result<bool, String> {
     #[cfg(not(target_os = "windows"))]
     use std::process::Command;
     use std::process::Stdio;
@@ -340,7 +372,7 @@ fn tool_process_is_running(tool: &str) -> Result<bool, String> {
         let mut command = crate::powershell::command();
         command.args([
             "-NoProfile", "-NonInteractive", "-Command",
-            "$ErrorActionPreference='Stop'; ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | Select-Object Name,CommandLine)",
+            "$ErrorActionPreference='Stop'; ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | Select-Object Name,CommandLine,ExecutablePath)",
         ]);
         command.creation_flags(CREATE_NO_WINDOW);
         command
@@ -371,14 +403,16 @@ fn tool_process_is_running(tool: &str) -> Result<bool, String> {
         struct Process {
             name: String,
             command_line: Option<String>,
+            executable_path: Option<String>,
         }
         let processes: Vec<Process> = serde_json::from_str(text.trim())
             .map_err(|error| format!("Cannot read running CLIs: {error}"))?;
         Ok(processes.iter().any(|process| {
-            tool_process_matches(
+            tool_process_matches_for_target(
                 tool,
-                &process.name,
+                process.executable_path.as_deref().unwrap_or(&process.name),
                 process.command_line.as_deref().unwrap_or(""),
+                codex_windows_app_target,
             )
         }))
     }
@@ -387,7 +421,7 @@ fn tool_process_is_running(tool: &str) -> Result<bool, String> {
         Ok(text.lines().any(|line| {
             let line = line.trim();
             let (name, args) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-            tool_process_matches(tool, name, args)
+            tool_process_matches_for_target(tool, name, args, codex_windows_app_target)
         }))
     }
 }
@@ -405,6 +439,7 @@ pub(crate) async fn auto_update_tool_if_needed(
     }
     let latest = current.latest_version.unwrap();
     let expected_latest = latest.clone();
+    let is_wsl = current.env_type == "wsl";
     let updated = TOOL_LIFECYCLE
         .run(vec![tool], move |_| {
             // Re-check policy, version, and installation after waiting for manual
@@ -414,11 +449,29 @@ pub(crate) async fn auto_update_tool_if_needed(
             }
             let installs = enumerate_tool_installations(tool);
             let (command, needs_confirmation, anchored) = plan_command_for(tool, &installs);
-            if !automatic_update_target_is_safe(&installs, needs_confirmation, anchored, &latest) {
+            let target_is_safe = if is_wsl {
+                // WSL installations are outside the Windows enumeration. The
+                // generated command is anchored to the configured distro.
+                anchored && !command.trim().is_empty()
+            } else {
+                automatic_update_target_is_safe(&installs, needs_confirmation, anchored, &latest)
+            };
+            if !target_is_safe {
                 log::info!("Skipping automatic {tool} update: installation needs manual review");
                 return Ok(false);
             }
-            if tool_process_is_running(tool)? {
+            #[cfg(target_os = "windows")]
+            let codex_windows_app_target = tool == "codex"
+                && default_install(&installs).is_some_and(|install| {
+                    install.source == "codex-app"
+                        || is_codex_windows_app_install(
+                            &install.path,
+                            &install.real.to_string_lossy(),
+                        )
+                });
+            #[cfg(not(target_os = "windows"))]
+            let codex_windows_app_target = false;
+            if tool_process_is_running(tool, codex_windows_app_target)? {
                 log::info!("Skipping automatic {tool} update: CLI is running");
                 return Ok(false);
             }
@@ -451,15 +504,35 @@ pub(crate) async fn auto_update_tool_if_needed(
 
 fn automatic_update_target_is_safe(
     installs: &[ToolInstallation],
-    needs_confirmation: bool,
+    _needs_confirmation: bool,
     anchored: bool,
     latest: &str,
 ) -> bool {
-    installs.len() == 1
-        && !needs_confirmation
-        && anchored
-        && installs[0].runnable
-        && installs[0].version.as_deref().is_some_and(|version| {
+    if !anchored {
+        return false;
+    }
+
+    // Multiple installations are safe for startup updates when the command
+    // resolver has one unambiguous PATH default. The manual UI still asks for
+    // confirmation because it presents all installations to the user. Startup
+    // policy updates only that same PATH-selected target and leaves secondary
+    // distributions, such as the Codex Desktop/MSIX runtime, untouched.
+    if installs.len() > 1
+        && installs
+            .iter()
+            .filter(|install| install.is_path_default)
+            .count()
+            != 1
+    {
+        return false;
+    }
+
+    let Some(target) = default_install(installs) else {
+        return false;
+    };
+
+    target.runnable
+        && target.version.as_deref().is_some_and(|version| {
             compare_semver(version, latest) == Some(std::cmp::Ordering::Less)
         })
 }
@@ -2354,10 +2427,10 @@ fn infer_install_source(path: &Path) -> &'static str {
     // 与 Windows `%LOCALAPPDATA%\pnpm` / `%PNPM_HOME%` 都命中 `/pnpm/`。
     } else if s.contains("/pnpm/") {
         "pnpm"
-    } else if s.contains("/scoop/") {
-        "scoop"
     } else if is_codex_windows_app_path_str(&s) {
         "codex-app"
+    } else if s.contains("/scoop/") {
+        "scoop"
     } else if s.contains("/library/python")
         || s.contains("/scripts/")
         || s.contains("/site-packages/")
@@ -2375,10 +2448,22 @@ fn infer_install_source(path: &Path) -> &'static str {
 /// Node/npm 混用，容易出现启动崩溃或安装卡住。
 fn is_codex_windows_app_path_str(normalized_lower: &str) -> bool {
     normalized_lower.contains("/appdata/local/openai/codex/")
+        || normalized_lower.contains("/appdata/local/programs/openai/codex/")
+        || normalized_lower.contains("/appdata/local/programs/codex/")
         || normalized_lower.contains("/windowsapps/openai.codex_")
+        || normalized_lower.contains("/windowsapps/openai.codex.preview_")
         || normalized_lower.contains("/msix/openai.codex_")
+        || normalized_lower.contains("/msix/openai.codex.preview_")
         || normalized_lower.contains("/microsoft/windowsapps/codex.exe")
         || normalized_lower.ends_with("/microsoft/windowsapps/codex")
+        || normalized_lower.contains("/program files/openai/codex/")
+        || normalized_lower.contains("/program files/codex/")
+        || normalized_lower.contains("/program files (x86)/openai/codex/")
+        // Scoop can expose both the Codex Desktop shell and a CLI binary.
+        // The desktop shell lives at the app root as `Codex.exe`, while the
+        // CLI is normally under `bin/` and must keep Scoop/npm update logic.
+        || (normalized_lower.contains("/scoop/apps/codex/")
+            && !normalized_lower.contains("/bin/"))
 }
 
 #[cfg(target_os = "windows")]
@@ -2806,6 +2891,41 @@ fn sibling_bin_with_ext(
     None
 }
 
+/// Find a Windows command in an explicit PATH string without invoking a shell.
+///
+/// npm-installed CLI shims normally live in `%APPDATA%\\npm`, while `npm.cmd`
+/// lives in the Node installation directory. Looking only beside the shim
+/// therefore makes a valid global installation appear unanchorable. Keep the
+/// lookup deterministic and use the same PATH snapshot that version probing
+/// uses so the generated command targets the environment the user selected.
+#[cfg(target_os = "windows")]
+fn windows_command_from_path(command: &str, path: &str) -> Option<String> {
+    for raw_dir in path.split(';') {
+        let dir = raw_dir.trim().trim_matches('"');
+        if dir.is_empty() {
+            continue;
+        }
+        let dir = Path::new(dir);
+        for extension in ["cmd", "exe"] {
+            let candidate = dir.join(format!("{command}.{extension}"));
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+        let candidate = dir.join(command);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn npm_command_for_bin_path(bin_path: &str, effective_path: &str) -> Option<String> {
+    sibling_bin_with_ext(bin_path, "npm", &["cmd", "exe"])
+        .or_else(|| windows_command_from_path("npm", effective_path))
+}
+
 /// 返回 `<bin_path 同目录>/<exe>` 的绝对路径。bin_path 是命令行命中的入口
 /// (如 `/opt/homebrew/bin/gemini`、`~/.volta/bin/codex`),`exe` 是与之共处一个
 /// bin 目录的另一个可执行(`brew` / `volta` / `bun` / `npm`)——这些包管理器
@@ -3090,7 +3210,11 @@ fn anchored_command_from_paths(tool: &str, bin_path: &str, real_target: &str) ->
 }
 
 #[cfg(target_os = "windows")]
-fn package_manager_anchored_command_from_paths(tool: &str, bin_path: &str) -> Option<String> {
+fn package_manager_anchored_command_from_paths(
+    tool: &str,
+    bin_path: &str,
+    effective_path: &str,
+) -> Option<String> {
     let pkg = npm_package_for(tool)?;
 
     match infer_install_source(Path::new(bin_path)) {
@@ -3109,9 +3233,11 @@ fn package_manager_anchored_command_from_paths(tool: &str, bin_path: &str) -> Op
             ))
         }
         // 兜底 = npm 类:Scoop / Chocolatey / winget / nvm-windows / MS Store nodejs /
-        // system / 任何识别不到专属来源的 → sibling npm.cmd。
+        // system / 任何识别不到专属来源的 → same-directory npm.cmd when present,
+        // otherwise the npm command from the effective PATH. Windows npm shims
+        // normally live in `%APPDATA%\\npm`, while `npm.cmd` lives beside Node.
         _ => {
-            let npm = sibling_bin_with_ext(bin_path, "npm", &["cmd", "exe"])?;
+            let npm = npm_command_for_bin_path(bin_path, effective_path)?;
             Some(format!(
                 "{} i -g {pkg}@latest",
                 win_quote_path_for_batch(&npm)
@@ -3143,11 +3269,27 @@ fn package_manager_anchored_command_from_paths(tool: &str, bin_path: &str) -> Op
 /// ② 支持官方自升级且 Windows 可安全静默执行的工具 → `<bin_path> update/upgrade || call <包管理器 fallback>`。
 /// ③ 其余 npm 工具 → sibling `npm.cmd`/`.exe` i -g <pkg>@latest。
 ///
-/// 包管理器 fallback 的 sibling 探测都通过 `sibling_bin_with_ext`(碰 fs):该处无候选
-/// 扩展名存在时,支持官方自升级的工具仍返回 `<bin_path> update/upgrade`,其余工具
-/// 才返 None 让上游兜回静态命令、`anchored=false`。
+/// Package-manager fallback first probes the sibling executable because that is
+/// how Volta/pnpm layouts are identified. The npm fallback also searches the
+/// effective Windows PATH so a normal Node installation can be resolved when
+/// its global shims are stored in a separate directory.
 #[cfg(target_os = "windows")]
 fn anchored_command_from_paths(tool: &str, bin_path: &str, real_target: &str) -> Option<String> {
+    anchored_command_from_paths_with_effective_path(
+        tool,
+        bin_path,
+        real_target,
+        &effective_path_string(),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn anchored_command_from_paths_with_effective_path(
+    tool: &str,
+    bin_path: &str,
+    real_target: &str,
+    effective_path: &str,
+) -> Option<String> {
     if tool == "hermes" {
         return anchored_official_update_command(tool, bin_path);
     }
@@ -3159,7 +3301,8 @@ fn anchored_command_from_paths(tool: &str, bin_path: &str, real_target: &str) ->
             anchored_official_update_command(tool, bin_path)?,
         ));
     }
-    let package_command = package_manager_anchored_command_from_paths(tool, bin_path);
+    let package_command =
+        package_manager_anchored_command_from_paths(tool, bin_path, effective_path);
     if prefers_official_update(tool, LifecycleCommandShell::WindowsBatch) {
         let update = anchored_official_update_command(tool, bin_path)?;
         return Some(match package_command {
@@ -3630,16 +3773,27 @@ fn run_wsl_tool_command(
 fn installs_anchored_command(tool: &str, installs: &[ToolInstallation]) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        // Codex Windows App/MSIX 可能同时暴露 AppData launcher 和 WindowsApps alias。
-        // 一旦 default_install 因多入口歧义返回 None,不要掉回 `codex update || npm ...`;
-        // 只要安装列表里出现 App/MSIX 痕迹,就走 Store 包更新通道。
-        if tool == "codex"
-            && installs.iter().any(|i| {
-                i.source == "codex-app"
-                    || is_codex_windows_app_install(&i.path, &i.real.to_string_lossy())
-            })
-        {
-            return Some(codex_windows_app_update_command());
+        // The Codex Windows App/MSIX can be present alongside an npm CLI. Use
+        // the installation that PATH actually selects when one is known. The
+        // Store path remains the conservative fallback for an ambiguous list
+        // that contains an App/MSIX installation.
+        if tool == "codex" {
+            let default = default_install(installs);
+            let default_is_codex_app = default.is_some_and(|install| {
+                install.source == "codex-app"
+                    || is_codex_windows_app_install(&install.path, &install.real.to_string_lossy())
+            });
+            let ambiguous_codex_app = default.is_none()
+                && installs.iter().any(|install| {
+                    install.source == "codex-app"
+                        || is_codex_windows_app_install(
+                            &install.path,
+                            &install.real.to_string_lossy(),
+                        )
+                });
+            if default_is_codex_app || ambiguous_codex_app {
+                return Some(codex_windows_app_update_command());
+            }
         }
     }
     let inst = default_install(installs)?;
@@ -3720,10 +3874,9 @@ fn install_command_for(tool: &str) -> String {
 
 /// 计算某工具的升级命令与"是否需确认"。全平台共用一份:
 /// - **Windows + WSL 工具**(override 是 `\\wsl$\<distro>\...` UNC 路径)的升级规划
-///   始终走 POSIX 静态命令、不锚定:锚定命令是 Windows 主机绝对路径,跨 `wsl.exe`
-///   边界进入 distro 文件系统后完全无效;且 `enumerate_tool_installations` 不参与
-///   WSL 文件系统、锚定无锚点。这一类显式短路到 `(unix_static, false, false)`,
-///   前端不会弹确认。
+///   走配置发行版对应的 POSIX 命令。Windows 主机绝对路径无法跨 `wsl.exe`
+///   边界进入 distro 文件系统，因此不使用 Windows 安装枚举来生成锚点；配置的
+///   distro 本身就是可执行目标，返回 `(wsl_command, false, true)`，前端不会弹确认。
 ///   **必须用 `wsl_tool_action_shell_command`(unix 版)而非 `static_fallback_command`**
 ///   ——后者读 `tool_action_shell_command`,Windows target 给 hermes 返回 PowerShell
 ///   installer,跨 wsl.exe 后不适用;`build_tool_action_line` 的 WSL 分支也用同一 wrapper,
@@ -3737,7 +3890,7 @@ fn plan_command_for(tool: &str, installs: &[ToolInstallation]) -> (String, bool,
         if wsl_distro_for_tool(tool).is_some() {
             let cmd = wsl_tool_action_shell_command(tool, ToolLifecycleAction::Update)
                 .unwrap_or_default();
-            return (cmd, false, false);
+            return (cmd, false, true);
         }
     }
     match installs_anchored_command(tool, installs) {
@@ -4916,11 +5069,11 @@ mod tests {
         assert!(!automatic_update_available(&current));
         current.latest_version = Some("0.161.0".to_string());
         current.env_type = "wsl".to_string();
-        assert!(!automatic_update_available(&current));
+        assert!(automatic_update_available(&current));
     }
 
     #[test]
-    fn automatic_updates_require_one_unambiguous_anchored_installation() {
+    fn automatic_updates_require_a_unique_path_default_or_single_installation() {
         let install = || ToolInstallation {
             path: "/tools/codex".to_string(),
             version: Some("0.160.0".to_string()),
@@ -4948,8 +5101,26 @@ mod tests {
             true,
             "0.161.0"
         ));
+        let mut secondary = install();
+        secondary.path = "/secondary/codex".to_string();
+        secondary.real = PathBuf::from("/secondary/codex");
+        secondary.is_path_default = false;
+        assert!(automatic_update_target_is_safe(
+            &[install(), secondary],
+            true,
+            true,
+            "0.161.0"
+        ));
+        let mut no_default_a = install();
+        no_default_a.path = "/secondary/a/codex".to_string();
+        no_default_a.real = PathBuf::from("/secondary/a/codex");
+        no_default_a.is_path_default = false;
+        let mut no_default_b = install();
+        no_default_b.path = "/secondary/b/codex".to_string();
+        no_default_b.real = PathBuf::from("/secondary/b/codex");
+        no_default_b.is_path_default = false;
         assert!(!automatic_update_target_is_safe(
-            &[install()],
+            &[no_default_a, no_default_b],
             true,
             true,
             "0.161.0"
@@ -4996,7 +5167,45 @@ mod tests {
                 "node /projects/unrelated/index.js"
             ));
         }
-        assert!(tool_process_matches("codex", "ChatGPT.exe", ""));
+        assert!(!tool_process_matches("codex", "ChatGPT.exe", ""));
+        assert!(tool_process_matches(
+            "codex",
+            r"C:\Users\me\AppData\Roaming\npm\codex.exe",
+            ""
+        ));
+        assert!(!tool_process_matches(
+            "codex",
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__2p2nqsd0c76g0\app\resources\codex.exe",
+            ""
+        ));
+        assert!(!tool_process_matches(
+            "codex",
+            r"C:\Program Files\WindowsApps\OpenAI.Codex.Preview_1.0.0.0_x64__2p2nqsd0c76g0\app\resources\codex.exe",
+            ""
+        ));
+        assert!(!tool_process_matches(
+            "codex",
+            r"C:\Users\me\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe",
+            ""
+        ));
+        assert!(tool_process_matches_for_target(
+            "codex",
+            "ChatGPT.exe",
+            "",
+            true
+        ));
+        assert!(tool_process_matches_for_target(
+            "codex",
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__2p2nqsd0c76g0\app\resources\codex.exe",
+            "",
+            true
+        ));
+        assert!(tool_process_matches_for_target(
+            "codex",
+            r"C:\Program Files\WindowsApps\OpenAI.Codex.Preview_1.0.0.0_x64__2p2nqsd0c76g0\app\resources\codex.exe",
+            "",
+            true
+        ));
         assert!(tool_process_matches(
             "gemini",
             "node.exe",
@@ -5013,7 +5222,7 @@ mod tests {
             "python -m hermes_cli.main"
         ));
         for runtime in ["nodejs.exe", "deno.exe", "pythonw.exe", "python3.12"] {
-            assert!(tool_process_matches("codex", runtime, ""));
+            assert!(!tool_process_matches("codex", runtime, ""));
         }
         assert!(!tool_process_matches("codex", "notepad.exe", ""));
     }
@@ -5697,6 +5906,28 @@ mod tests {
         }
 
         #[test]
+        fn codex_windows_standalone_app_uses_ms_store_upgrade() {
+            let bin_path = r"C:\Users\me\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe";
+            let cmd = anchored_command_from_paths("codex", bin_path, bin_path);
+            assert_eq!(
+                cmd.as_deref(),
+                Some(codex_windows_app_update_command().as_str())
+            );
+            assert!(!cmd.unwrap().contains("@openai/codex"));
+        }
+
+        #[test]
+        fn codex_windows_preview_app_uses_ms_store_upgrade() {
+            let bin_path = r"C:\Program Files\WindowsApps\OpenAI.Codex.Preview_1.0.0.0_x64__2p2nqsd0c76g0\app\resources\codex.exe";
+            let cmd = anchored_command_from_paths("codex", bin_path, bin_path);
+            assert_eq!(
+                cmd.as_deref(),
+                Some(codex_windows_app_update_command().as_str())
+            );
+            assert!(!cmd.unwrap().contains("@openai/codex"));
+        }
+
+        #[test]
         fn ambiguous_codex_app_install_uses_ms_store_upgrade() {
             // 多个 Codex 入口并存且没有明确 PATH 默认项时,default_install 会返回 None。
             // 只要其中一个入口属于 Codex App/MSIX,仍必须走 Store 更新,不能退到静态 npm 链。
@@ -5731,6 +5962,48 @@ mod tests {
                 !cmd.unwrap().contains("@openai/codex"),
                 "ambiguous Codex App installs must not fall back to npm"
             );
+        }
+
+        #[test]
+        fn npm_path_default_wins_over_secondary_codex_app_install() {
+            // A Codex App runtime can remain visible in PATH-related discovery
+            // while the npm CLI is the command users actually invoke. The npm
+            // installation must determine the anchored update command.
+            let (_app_dir, _app_sub, app_path) = setup_sibling("codex-app", "codex.exe", &[]);
+            let (_npm_dir, npm_sub, npm_path) = setup_sibling("node", "codex.cmd", &["npm.cmd"]);
+            let installs = vec![
+                ToolInstallation {
+                    path: app_path.clone(),
+                    version: Some("0.171.0-alpha.13".to_string()),
+                    runnable: true,
+                    error: None,
+                    source: "codex-app".to_string(),
+                    is_path_default: false,
+                    real: std::path::PathBuf::from(app_path),
+                },
+                ToolInstallation {
+                    path: npm_path.clone(),
+                    version: Some("0.169.0".to_string()),
+                    runnable: true,
+                    error: None,
+                    source: "system".to_string(),
+                    is_path_default: true,
+                    real: std::path::PathBuf::from(&npm_path),
+                },
+            ];
+
+            assert!(automatic_update_target_is_safe(
+                &installs, true, true, "0.171.0"
+            ));
+            let cmd = installs_anchored_command("codex", &installs)
+                .expect("the PATH-default npm install should be anchored");
+            let npm_full = format!("{}\\npm.cmd", npm_sub.to_string_lossy());
+            let expected = format!(
+                "{} i -g @openai/codex@latest",
+                expect_quoted_path(&npm_full)
+            );
+            assert_eq!(cmd, expected);
+            assert!(!cmd.contains("winget.exe"));
         }
 
         #[test]
@@ -5789,7 +6062,8 @@ mod tests {
             // Codex 的 self-update 在 npm/optional dependency 损坏时会假成功，不能作为
             // 无 sibling 包管理器时的锚定命令。返回 None 后由上层静态 npm fallback 处理。
             let (_dir, _sub, bin_path) = setup_sibling("", "codex.cmd", &[]);
-            let cmd = anchored_command_from_paths("codex", &bin_path, &bin_path);
+            let cmd =
+                anchored_command_from_paths_with_effective_path("codex", &bin_path, &bin_path, "");
             assert!(cmd.is_none());
         }
 
@@ -5799,7 +6073,8 @@ mod tests {
             // 只是没有包管理器 fallback。用 claude —— codex 自 5092fe51 起一律走 npm 锚定,
             // 已不再有官方 self-update 分支,故改用仍在 prefers_official_update 的 claude 覆盖此路径。
             let (_dir, _sub, bin_path) = setup_sibling("", "claude.cmd", &[]);
-            let cmd = anchored_command_from_paths("claude", &bin_path, &bin_path);
+            let cmd =
+                anchored_command_from_paths_with_effective_path("claude", &bin_path, &bin_path, "");
             let expected = format!("{} update", expect_quoted_path(&bin_path));
             assert_eq!(cmd.as_deref(), Some(expected.as_str()));
         }
@@ -6041,6 +6316,25 @@ mod tests {
         }
 
         #[test]
+        fn npm_command_falls_back_to_path_when_shim_directory_has_no_npm() {
+            let codex_dir = tempfile::tempdir().unwrap();
+            let node_dir = tempfile::tempdir().unwrap();
+            let codex = codex_dir.path().join("codex.cmd");
+            let npm = node_dir.path().join("npm.cmd");
+            std::fs::write(&codex, "").unwrap();
+            std::fs::write(&npm, "").unwrap();
+
+            let path = format!(
+                "{};{}",
+                codex_dir.path().display(),
+                node_dir.path().display()
+            );
+            let found = npm_command_for_bin_path(&codex.to_string_lossy(), &path)
+                .expect("npm should be resolved from PATH");
+            assert_eq!(found, npm.to_string_lossy());
+        }
+
+        #[test]
         fn sibling_bin_volta_prefers_exe() {
             // Volta 是 Rust 写的 native binary,扩展名顺序应是 [exe, cmd]——若只有 .exe
             // 存在(常见情形),探到的就是它。
@@ -6233,7 +6527,34 @@ mod tests {
             );
             assert_eq!(
                 infer_install_source(Path::new(
+                    "C:\\Users\\me\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe"
+                )),
+                "codex-app"
+            );
+            assert_eq!(
+                infer_install_source(Path::new(
                     "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.608.1337.0_x64__2p2nqsd0c76g0\\app\\resources\\codex.exe"
+                )),
+                "codex-app"
+            );
+            for path in [
+                "C:\\Program Files\\WindowsApps\\OpenAI.Codex.Preview_26.608.1337.0_x64__2p2nqsd0c76g0\\app\\resources\\codex.exe",
+                "C:\\Users\\me\\AppData\\Local\\Programs\\Codex\\bin\\codex.exe",
+                "C:\\Program Files\\OpenAI\\Codex\\bin\\codex.exe",
+                "C:\\Program Files\\Codex\\bin\\codex.exe",
+                "C:\\Program Files (x86)\\OpenAI\\Codex\\bin\\codex.exe",
+            ] {
+                assert_eq!(infer_install_source(Path::new(path)), "codex-app", "{path}");
+            }
+            assert_eq!(
+                infer_install_source(Path::new(
+                    "C:\\Users\\me\\scoop\\apps\\codex\\current\\bin\\codex.exe"
+                )),
+                "scoop"
+            );
+            assert_eq!(
+                infer_install_source(Path::new(
+                    "C:\\Users\\me\\scoop\\apps\\codex\\current\\Codex.exe"
                 )),
                 "codex-app"
             );
@@ -7470,12 +7791,20 @@ mod tests {
             .await
             .expect("Codex install diagnostics");
         assert_eq!(reports.len(), 1);
+        println!(
+            "Codex install report: {}",
+            serde_json::to_string(&reports[0]).unwrap()
+        );
         assert!(
             reports[0]
                 .installs
                 .iter()
                 .any(|install| install.is_path_default && install.runnable),
             "PATH default must be reported as runnable"
+        );
+        assert!(
+            reports[0].anchored,
+            "PATH-default Codex installation must have an anchored update command"
         );
     }
 

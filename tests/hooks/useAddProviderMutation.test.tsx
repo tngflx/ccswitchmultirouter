@@ -86,12 +86,13 @@ beforeEach(() => {
 describe("useAddProviderMutation", () => {
   it("uses Pi's explicit provider key and keeps native enablement opt-in", async () => {
     const { wrapper } = createWrapper();
-    const { result } = renderHook(() => useAddProviderMutation("pi"), {
+    const { result } = renderHook(useAddProviderMutation, {
       wrapper,
     });
 
     const provider = await act(async () =>
       result.current.mutateAsync({
+        appId: "pi",
         name: "Pi custom",
         providerKey: "pi-custom",
         settingsConfig: { baseUrl: "https://example.invalid" },
@@ -110,13 +111,11 @@ describe("useAddProviderMutation", () => {
 
   it("duplicates Claude Desktop official providers with a fresh id", async () => {
     const { wrapper } = createWrapper();
-    const { result } = renderHook(
-      () => useAddProviderMutation("claude-desktop"),
-      { wrapper },
-    );
+    const { result } = renderHook(useAddProviderMutation, { wrapper });
 
     const duplicatedProvider = await act(async () =>
       result.current.mutateAsync({
+        appId: "claude-desktop",
         name: "Claude Desktop Official copy",
         settingsConfig: { env: {} },
         category: "official",
@@ -153,13 +152,11 @@ describe("useAddProviderMutation", () => {
       "claude-desktop-official": seedProvider,
     });
     const { wrapper } = createWrapper();
-    const { result } = renderHook(
-      () => useAddProviderMutation("claude-desktop"),
-      { wrapper },
-    );
+    const { result } = renderHook(useAddProviderMutation, { wrapper });
 
     const persistedProvider = await act(async () =>
       result.current.mutateAsync({
+        appId: "claude-desktop",
         name: "Renamed by form",
         settingsConfig: { env: { ignored: true } },
         websiteUrl: "https://example.invalid",
@@ -188,12 +185,13 @@ describe("useAddProviderMutation", () => {
       "codex-official": seedProvider,
     });
     const { wrapper } = createWrapper();
-    const { result } = renderHook(() => useAddProviderMutation("codex"), {
+    const { result } = renderHook(useAddProviderMutation, {
       wrapper,
     });
 
     const persistedProvider = await act(async () =>
       result.current.mutateAsync({
+        appId: "codex",
         name: "OpenAI Official",
         settingsConfig: { auth: {}, config: "" },
         category: "official",
@@ -214,12 +212,13 @@ describe("useAddProviderMutation", () => {
       lastErrorCode: "projection_readback_failed",
     });
     const { wrapper } = createWrapper();
-    const { result } = renderHook(() => useAddProviderMutation("codex"), {
+    const { result } = renderHook(useAddProviderMutation, {
       wrapper,
     });
 
     await act(async () => {
       await result.current.mutateAsync({
+        appId: "codex",
         name: "Third-party Codex",
         settingsConfig: {},
       });

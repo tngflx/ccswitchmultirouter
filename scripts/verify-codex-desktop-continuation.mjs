@@ -278,6 +278,7 @@ let logFileIdentity = initialLogInfo
   : null;
 let logOffset = initialLogInfo?.size || 0;
 let logFragment = "";
+let logInitialScanPending = Boolean(initialLogInfo);
 const fail = (code) => new Error(code);
 // Never serialize raw renderer exceptions: server messages can contain paths,
 // prompts, credentials, or reflected provider input. Keep only fixed classes.
@@ -1183,21 +1184,36 @@ const refreshFingerprint = async () => {
   const info = await stat(logPath).catch(() => null);
   if (!info) return;
   const fileIdentity = `${info.dev}:${info.ino}`;
-  if (info.size < logOffset || fileIdentity !== logFileIdentity) {
+  const logReset = info.size < logOffset || fileIdentity !== logFileIdentity;
+  const initialScan =
+    logInitialScanPending && !logReset && fileIdentity === logFileIdentity;
+  const tailScan = initialScan || logReset;
+  if (logReset) {
     logOffset = 0;
     logFragment = "";
+    logInitialScanPending = false;
   }
   logFileIdentity = fileIdentity;
-  const bytes = Math.min(128 * 1024, info.size - logOffset);
+  const readOffset = tailScan ? Math.max(0, info.size - 128 * 1024) : logOffset;
+  const bytes = Math.min(128 * 1024, info.size - readOffset);
+  if (initialScan) logInitialScanPending = false;
   if (!bytes) return;
   const file = await open(logPath, "r");
   const buffer = Buffer.alloc(bytes);
   try {
-    const read = await file.read(buffer, 0, bytes, logOffset);
-    logOffset += read.bytesRead;
-    const lines = (
-      logFragment + buffer.subarray(0, read.bytesRead).toString("utf8")
-    ).split(/\r?\n/);
+    const read = await file.read(buffer, 0, bytes, readOffset);
+    logOffset = readOffset + read.bytesRead;
+    let chunk = buffer.subarray(0, read.bytesRead).toString("utf8");
+    if (tailScan && readOffset > 0) {
+      const firstLineBreak = chunk.search(/\r?\n/);
+      chunk =
+        firstLineBreak < 0
+          ? ""
+          : chunk.slice(
+              firstLineBreak + (chunk[firstLineBreak] === "\r" ? 2 : 1),
+            );
+    }
+    const lines = (logFragment + chunk).split(/\r?\n/);
     logFragment = lines.pop().slice(-64 * 1024);
     for (const line of lines) {
       if (!line.includes("Codex picker catalog payload installed:")) continue;
@@ -1210,14 +1226,13 @@ const refreshFingerprint = async () => {
       const atMs = timestamp
         ? new Date(`${timestamp[1]}T${timestamp[2]}`).getTime()
         : NaN;
-      if (
-        fingerprint &&
-        atMs >=
-          Math.floor(
-            Math.max(startedAt, binaryIdentity?.modifiedAt || 0) / 1000,
-          ) *
-            1000
-      )
+      const freshnessFloor =
+        Math.floor(
+          (initialScan
+            ? binaryIdentity?.modifiedAt || 0
+            : Math.max(startedAt, binaryIdentity?.modifiedAt || 0)) / 1000,
+        ) * 1000;
+      if (fingerprint && atMs >= freshnessFloor)
         expectedFingerprint = fingerprint;
     }
   } finally {
@@ -1839,9 +1854,11 @@ const pickerInspectionExpression = () => `(() => {
   if (powerTruncations.size) nativePowerSelections.truncationReasons = [...powerTruncations].slice(0,5);
   let rawDiagnostics;
   let diagnosticsAvailable = false;
+  const read = own(state,'readCodexModelPickerDiagnostics');
+  // Older renderers can reconcile mounted controls while reporting diagnostics.
+  const hasReadOnlyDiagnostics = typeof read === 'function' && own(read,'readOnly') === true;
   try {
-    const read = own(state,'readCodexModelPickerDiagnostics');
-    if (typeof read === 'function') {
+    if (hasReadOnlyDiagnostics) {
       rawDiagnostics = read.call(state,{includeModelObservations:true});
       diagnosticsAvailable = !!rawDiagnostics && typeof rawDiagnostics === 'object';
     }
@@ -1849,7 +1866,7 @@ const pickerInspectionExpression = () => `(() => {
   const statusNames = new Set(['ready','pending','error','mismatch','unverified','not_required']);
   const rawStatus = own(rawDiagnostics,'status');
   const pickerDiagnostics = {available:diagnosticsAvailable,status:statusNames.has(rawStatus) ? rawStatus : 'unverified'};
-  for (const key of ['pickerObserverCount','successObserverCount','errorObserverCount','pendingObserverCount','unsupportedObserverCount','unreadableObserverCount','nativeVisibilityUnverifiedObserverCount','booleanControlUnverifiedModelCount','booleanControlReadyModelCount','effortMismatchCount','flagMismatchCount','missingMaxModelCount','missingUltraModelCount','selectedMaxModelCount','selectedUltraModelCount']) {
+  for (const key of ['pickerObserverCount','successObserverCount','errorObserverCount','pendingObserverCount','unsupportedObserverCount','unreadableObserverCount','nativeVisibilityUnverifiedObserverCount','booleanControlUnverifiedModelCount','booleanControlReadyModelCount','booleanControlNotObservedModelCount','effortMismatchCount','flagMismatchCount','missingMaxModelCount','missingUltraModelCount','selectedMaxModelCount','selectedUltraModelCount']) {
     const value = count(own(rawDiagnostics,key));
     if (value !== undefined) pickerDiagnostics[key] = value;
   }
@@ -1870,9 +1887,10 @@ const pickerInspectionExpression = () => `(() => {
   const queryRowsVerified = fingerprintMatches && own(payload,'catalogAvailable') === true && own(rawObservations,'queryRowsVerified') === true && own(rawObservations,'unavailable') === false && !truncated && !invalidObservation && observedRows.length > 0;
   const allowedReasons = new Set(['catalog_unavailable','native_owner_unverified','native_visibility_unverified','picker_query_pending','picker_query_error','unreadable_picker_evidence','unsupported_picker_selection','invalid_model_observation','no_verified_query_rows','row_limit']);
   const unavailableReasons = items(own(rawObservations,'unavailableReasons'),16).filter((reason) => allowedReasons.has(reason));
-  if (!rawObservations) unavailableReasons.push('snapshot_unavailable');
+  if (!hasReadOnlyDiagnostics) unavailableReasons.push('read_only_diagnostics_unavailable');
+  else if (!rawObservations) unavailableReasons.push('snapshot_unavailable');
   if (own(payload,'catalogAvailable') !== true) unavailableReasons.push('catalog_unavailable');
-  if (!fingerprintMatches) unavailableReasons.push('runtime_not_current');
+  if (!fingerprintMatches) unavailableReasons.push(runtimeStatus === 'expected_fingerprint_unavailable' ? runtimeStatus : 'runtime_not_current');
   if (!observedRows.length) unavailableReasons.push('no_verified_query_rows');
   if (invalidObservation) unavailableReasons.push('invalid_model_observations');
   if (truncated) unavailableReasons.push('observation_limit');
@@ -1920,9 +1938,16 @@ const pickerInspectionExpression = () => `(() => {
   const ownerScopeCount = Number.isSafeInteger(rawOwnerScopeCount) && rawOwnerScopeCount >= 0 && rawOwnerScopeCount <= 2048 ? rawOwnerScopeCount : undefined;
   const rawCanonicalOwnerCounts = own(reconciliation,'canonicalOwnerCounts');
   const canonicalOwnerCounts = rawCanonicalOwnerCounts && typeof rawCanonicalOwnerCounts === 'object' && !Array.isArray(rawCanonicalOwnerCounts) ? {} : undefined;
-  if (canonicalOwnerCounts) for (const [key, maximum] of [['appServerStatusAtomCount',17],['uniqueBrandCount',16],['hintCount',17],['pendingNodeCount',30000]]) {
-    const value = own(rawCanonicalOwnerCounts,key);
-    if (Number.isSafeInteger(value) && value >= 0 && value <= maximum) canonicalOwnerCounts[key] = value;
+  if (canonicalOwnerCounts) {
+    // The owner scan can report one additional hint to signal overflow.
+    for (const [key, maximum] of [['appServerStatusAtomCount',17],['uniqueBrandCount',16],['hintCount',2049],['pendingNodeCount',30000]]) {
+      const value = own(rawCanonicalOwnerCounts,key);
+      if (Number.isSafeInteger(value) && value >= 0 && value <= maximum) canonicalOwnerCounts[key] = value;
+    }
+    const hintScanStatus = own(rawCanonicalOwnerCounts,'hintScanStatus');
+    if (['unknown','scanning','complete','capped'].includes(hintScanStatus)) canonicalOwnerCounts.hintScanStatus = hintScanStatus;
+    const hintScanReason = own(rawCanonicalOwnerCounts,'hintScanReason');
+    if (hintScanReason === null || ['value_limit','scope_limit','read_failed','fiber_limit','object_limit','field_limit'].includes(hintScanReason)) canonicalOwnerCounts.hintScanReason = hintScanReason;
   }
   const canonicalOwnerReasons = new Set(['unavailable','atoms_unverified','pending_nodes','roots_unavailable','hints_read_failed','snapshot_changed','hints_ambiguous','hints_incomplete','hint_count_mismatch','scope_unmounted','scope_cache_unverified']);
   const rawCanonicalOwnerRefusalReason = own(reconciliation,'canonicalOwnerRefusalReason');
@@ -2675,6 +2700,11 @@ const inspectPickerTargets = async (
             throw fail("inspection_deadline");
           await sleep(sampleIntervalMs);
         }
+        // The outer sweep reranks all targets when log authority arrives.
+        if (!expectedFingerprint) {
+          await refreshFingerprint();
+          if (expectedFingerprint) break;
+        }
         const inspection = await inspect(candidate);
         sampling.samples.push({
           index,
@@ -2777,6 +2807,7 @@ const run = async () => {
       const targets = await readTargets();
       if (inspectPicker && targets.length > 0) {
         stage = "picker_inspection";
+        const inspectionFingerprint = expectedFingerprint;
         pickerTargetInspections = await inspectPickerTargets(
           targets,
           readinessDeadline,
@@ -2790,6 +2821,18 @@ const run = async () => {
             target.targetRef === pickerTargetInspections.selectedTargetRef,
         )?.inspection;
         if (!pickerInspection) throw fail("picker_inspection_unavailable");
+        if (!inspectionFingerprint && Date.now() < readinessDeadline) {
+          // Preserve the first snapshot if the log never supplies an expected
+          // fingerprint. A late record requires a new sweep under that authority.
+          while (!expectedFingerprint && Date.now() < readinessDeadline) {
+            await refreshFingerprint();
+            if (!expectedFingerprint && Date.now() < readinessDeadline)
+              await sleep(Math.min(500, readinessDeadline - Date.now()));
+          }
+          if (expectedFingerprint && Date.now() < readinessDeadline) continue;
+          await checkBinary();
+          checkNativeIdentity();
+        }
         break;
       }
       for (const target of targets) {

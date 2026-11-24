@@ -162,6 +162,22 @@ pub async fn set_tool_auto_update(
     .await
 }
 
+/// Run one opt-in CLI auto-update immediately after its policy is enabled.
+///
+/// Startup still performs the same check for policies that were already saved.
+/// Keeping this as a separate command lets the settings write return promptly
+/// while reusing the guarded updater instead of the broader manual update path.
+#[tauri::command]
+pub async fn run_tool_auto_update(app: AppHandle, tool: String) -> Result<bool, String> {
+    let tool = super::misc::VALID_TOOLS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == tool)
+        .ok_or_else(|| format!("Unsupported tool: {tool}"))?;
+
+    super::misc::auto_update_tool_if_needed(&app, tool).await
+}
+
 /// 保存设置
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]

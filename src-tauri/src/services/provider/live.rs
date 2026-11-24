@@ -3,6 +3,7 @@
 //! Handles reading and writing live configuration files for Claude, Codex, and Gemini.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
 
 use serde_json::{json, Value};
 use toml_edit::{DocumentMut, Item, TableLike};
@@ -20,6 +21,12 @@ use super::gemini_auth::{
     detect_gemini_auth_type, ensure_google_oauth_security_flag, GeminiAuthType,
 };
 use super::{block_on_tauri_runtime, normalize_claude_models_in_value};
+
+// Startup and command workers must serialize each app's live read, inventory
+// snapshot, and writes so concurrent imports reconcile against current rows.
+static OPENCODE_IMPORT_LOCK: Mutex<()> = Mutex::new(());
+static OPENCLAW_IMPORT_LOCK: Mutex<()> = Mutex::new(());
+static HERMES_IMPORT_LOCK: Mutex<()> = Mutex::new(());
 
 /// ChatGPT Codex catalogs gpt-5.6 at a 372K context window with a ~353K
 /// effective budget (openai/codex#31860), far below the 1.05M API spec.
@@ -2282,6 +2289,9 @@ pub(crate) fn remove_opencode_provider_from_live(provider_id: &str) -> Result<()
 pub fn import_opencode_providers_from_live(state: &AppState) -> Result<usize, AppError> {
     use crate::opencode_config;
 
+    let _import = OPENCODE_IMPORT_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let providers = opencode_config::get_typed_providers()?;
     if providers.is_empty() {
         return Ok(0);
@@ -2357,6 +2367,9 @@ pub fn import_opencode_providers_from_live(state: &AppState) -> Result<usize, Ap
 pub fn import_openclaw_providers_from_live(state: &AppState) -> Result<usize, AppError> {
     use crate::openclaw_config;
 
+    let _import = OPENCLAW_IMPORT_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let providers = openclaw_config::get_typed_providers()?;
     if providers.is_empty() {
         return Ok(0);
@@ -2365,6 +2378,8 @@ pub fn import_openclaw_providers_from_live(state: &AppState) -> Result<usize, Ap
     let mut imported = 0;
     let mut updated = 0;
     let existing_ids = state.db.get_provider_ids("openclaw")?;
+    #[cfg(test)]
+    tests::run_openclaw_import_snapshot_hook();
 
     for (id, config) in providers {
         // Validate: skip entries with empty id or no models
@@ -2482,6 +2497,9 @@ pub fn import_openclaw_providers_from_live(state: &AppState) -> Result<usize, Ap
 pub fn import_hermes_providers_from_live(state: &AppState) -> Result<usize, AppError> {
     use crate::hermes_config;
 
+    let _import = HERMES_IMPORT_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let providers = hermes_config::get_providers()?;
     if providers.is_empty() {
         return Ok(0);
@@ -2585,7 +2603,82 @@ mod tests {
     use super::*;
     use serde_json::json;
     use serial_test::serial;
-    use std::{env, fs, sync::Arc};
+    use std::{cell::RefCell, env, fs, sync::Arc};
+
+    type ImportSnapshotHook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static OPENCLAW_IMPORT_SNAPSHOT_HOOK: RefCell<Option<ImportSnapshotHook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn run_openclaw_import_snapshot_hook() {
+        if let Some(hook) = OPENCLAW_IMPORT_SNAPSHOT_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn concurrent_openclaw_live_import_reconciles_each_provider_once() {
+        use std::{sync::mpsc, thread};
+
+        let _home = TempHome::new();
+        let settings = json!({
+            "api": "openai-completions",
+            "baseUrl": "https://api.example.com/v1",
+            "models": [{"id": "test-model", "name": "Test Model"}]
+        });
+        crate::openclaw_config::set_provider("new", settings.clone()).unwrap();
+        crate::openclaw_config::set_provider("existing", settings).unwrap();
+        let state = AppState::new(Arc::new(Database::memory().unwrap()));
+        let mut original = Provider::with_id("existing".into(), "Existing".into(), json!({}), None);
+        original.notes = Some("user notes".into());
+        state.db.save_provider("openclaw", &original).unwrap();
+
+        thread::scope(|scope| {
+            let state = &state;
+            let (snapshot_tx, snapshot_rx) = mpsc::channel();
+            let (continue_tx, continue_rx) = mpsc::channel();
+            let first = scope.spawn(move || {
+                OPENCLAW_IMPORT_SNAPSHOT_HOOK.set(Some(Box::new(move || {
+                    snapshot_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                })));
+                import_openclaw_providers_from_live(state).unwrap()
+            });
+            snapshot_rx.recv().unwrap();
+
+            let (attempt_tx, attempt_rx) = mpsc::channel();
+            let second = scope.spawn(move || {
+                let first_holds_lock = matches!(
+                    OPENCLAW_IMPORT_LOCK.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                );
+                attempt_tx.send(first_holds_lock).unwrap();
+                import_openclaw_providers_from_live(state).unwrap()
+            });
+            let first_holds_lock = attempt_rx.recv().unwrap();
+            continue_tx.send(()).unwrap();
+            assert!(
+                first_holds_lock,
+                "first import must hold the lock after reading provider IDs"
+            );
+            assert_eq!(first.join().unwrap(), 2);
+            assert_eq!(second.join().unwrap(), 0);
+        });
+
+        assert_eq!(state.db.get_provider_ids("openclaw").unwrap().len(), 2);
+        let saved = state
+            .db
+            .get_provider_by_id("existing", "openclaw")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.notes, original.notes);
+        assert_eq!(
+            saved.settings_config["baseUrl"],
+            "https://api.example.com/v1"
+        );
+    }
 
     #[test]
     fn legacy_te_descriptor_is_rejected_before_generic_openclaw_live_write() {

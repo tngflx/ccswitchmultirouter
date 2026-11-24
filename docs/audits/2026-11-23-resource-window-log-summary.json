@@ -1,0 +1,220 @@
+{
+  "sampleStartUtc": "2026-11-22T16:06:59.1556767+00:00",
+  "sampleEndUtc": "2026-11-22T16:10:00.9169388+00:00",
+  "scope": "Bounded 4MiB per named configured app log; sample interval only; aggregate fields, no bodies or identifiers",
+  "logs": [
+    {
+      "name": "cc-switch.log",
+      "tailBytes": 4194304,
+      "matchingLines": 48,
+      "requestPrepared": 0,
+      "upstreamSends": 0,
+      "upstreamStatus200": 0,
+      "sseFailures": 0,
+      "capacityRetryDecisions": 0,
+      "recoveryEvents": 0,
+      "syncCompletions": 3,
+      "deferWarnings": 0,
+      "errorLevelLines": 0
+    },
+    {
+      "name": "codex-router.log",
+      "tailBytes": 4194304,
+      "matchingLines": 447,
+      "requestPrepared": 45,
+      "upstreamSends": 45,
+      "upstreamStatus200": 44,
+      "sseFailures": 0,
+      "capacityRetryDecisions": 0,
+      "recoveryEvents": 0,
+      "syncCompletions": 0,
+      "deferWarnings": 0,
+      "errorLevelLines": 0
+    }
+  ],
+  "syncEvents": [
+    {
+      "atSingapore": "2026-11-23T00:07:39.000+08:00",
+      "counts": [
+        7,
+        6,
+        117,
+        1255
+      ]
+    },
+    {
+      "atSingapore": "2026-11-23T00:08:44.000+08:00",
+      "counts": [
+        11,
+        5,
+        117,
+        1255
+      ]
+    },
+    {
+      "atSingapore": "2026-11-23T00:09:49.000+08:00",
+      "counts": [
+        10,
+        6,
+        117,
+        1255
+      ]
+    }
+  ],
+  "reasoningAggregates": {
+    "gpt-6.1-sol-sublyx|max|?|high|?": 22,
+    "gpt-6.2-sol|xhigh|ultra|max|?": 9,
+    "gpt-6.1-sol-sublyx|max|?|max|?": 9,
+    "gpt-6.2-astra|xhigh|?|high|?": 4,
+    "gpt-6.1-sol-sublyx|xhigh|?|high|?": 1
+  },
+  "bins": [
+    {
+      "offsetSeconds": 0,
+      "reasoning": 5,
+      "upstreamSends": 5,
+      "syncCompletions": 0
+    },
+    {
+      "offsetSeconds": 15,
+      "reasoning": 1,
+      "upstreamSends": 1,
+      "syncCompletions": 0
+    },
+    {
+      "offsetSeconds": 30,
+      "reasoning": 4,
+      "upstreamSends": 4,
+      "syncCompletions": 1
+    },
+    {
+      "offsetSeconds": 45,
+      "reasoning": 3,
+      "upstreamSends": 3,
+      "syncCompletions": 0
+    },
+    {
+      "offsetSeconds": 60,
+      "reasoning": 6,
+      "upstreamSends": 6,
+      "syncCompletions": 0
+    },
+    {
+      "offsetSeconds": 75,
+      "reasoning": 3,
+      "upstreamSends": 3,
+      "syncCompletions": 0
+    },
+    {
+      "offsetSeconds": 90,
+      "reasoning": 5,
+      "upstreamSends": 5,
+      "syncCompletions": 1
+    },
+    {
+      "offsetSeconds": 105,
+      "reasoning": 5,
+      "upstreamSends": 5,
+      "syncCompletions": 0
+    },
+    {
+      "offsetSeconds": 120,
+      "reasoning": 3,
+      "upstreamSends": 3,
+      "syncCompletions": 0
+    },
+    {
+      "offsetSeconds": 135,
+      "reasoning": 4,
+      "upstreamSends": 4,
+      "syncCompletions": 0
+    },
+    {
+      "offsetSeconds": 150,
+      "reasoning": 5,
+      "upstreamSends": 5,
+      "syncCompletions": 0
+    },
+    {
+      "offsetSeconds": 165,
+      "reasoning": 1,
+      "upstreamSends": 1,
+      "syncCompletions": 1
+    }
+  ],
+  "matchedActualUpstreamReasoning": {
+    "matchedCount": 45,
+    "parentCount": 18,
+    "markedChildCount": 27,
+    "observedMismatches": 0,
+    "groups": [
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "kind": "turn",
+        "isSubagent": "true",
+        "overrideApplied": "true",
+        "requested": "max",
+        "restoredDesktop": "not_recorded",
+        "forwarded": "high",
+        "count": 22
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "kind": "turn",
+        "isSubagent": "false",
+        "overrideApplied": "false",
+        "requested": "xhigh",
+        "restoredDesktop": "ultra",
+        "forwarded": "max",
+        "count": 9
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "kind": "turn",
+        "isSubagent": "false",
+        "overrideApplied": "false",
+        "requested": "max",
+        "restoredDesktop": "not_recorded",
+        "forwarded": "max",
+        "count": 9
+      },
+      {
+        "model": "gpt-6.2-astra",
+        "kind": "turn",
+        "isSubagent": "true",
+        "overrideApplied": "true",
+        "requested": "xhigh",
+        "restoredDesktop": "not_recorded",
+        "forwarded": "high",
+        "count": 4
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "kind": "compaction",
+        "isSubagent": "true",
+        "overrideApplied": "true",
+        "requested": "xhigh",
+        "restoredDesktop": "not_recorded",
+        "forwarded": "high",
+        "count": 1
+      }
+    ]
+  },
+  "requestBodyAccounting": {
+    "records": 45,
+    "totalClientBytes": 38994867,
+    "maxClientBytes": 1517299,
+    "totalUpstreamWireBytes": 38887286,
+    "maxUpstreamWireBytes": 1512841
+  },
+  "laterSameProcessMemorySnapshot": {
+    "capturedAtUtc": "2026-11-22T16:56:40.7887326Z",
+    "rootPrivateMiB": 206.27734375,
+    "rootWorkingSetMiB": 218.77734375,
+    "knownTreePrivateMiB": 614.05078125,
+    "knownTreeWorkingSetMiB": 476.6953125,
+    "knownProcessCount": 7,
+    "allKnownProcessStartTimesMatched": true,
+    "scope": "Known sampled processes only; not a refreshed descendant inventory or another test-free CPU sample; summed working sets can double-count shared pages; snapshots do not establish leak-free behavior"
+  }
+}

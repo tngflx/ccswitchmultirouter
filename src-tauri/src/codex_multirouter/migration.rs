@@ -7,6 +7,7 @@ use super::schema::{
 use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
+use crate::proxy::providers::codex_reasoning::reasoning_capability_from_model_entry;
 use crate::proxy::providers::codex_route_auth_source;
 use rusqlite::params;
 use serde::Serialize;
@@ -844,7 +845,27 @@ fn apply_model_capabilities(
         .get("supportsReasoning")
         .and_then(Value::as_bool)
     {
-        model["reasoning"] = json!({"supported": supports_reasoning});
+        // Legacy route capabilities only carry a coarse support flag. Keep a
+        // valid canonical model capability authoritative so migration cannot
+        // erase provider-native effort tiers, defaults, or wire mappings.
+        if reasoning_capability_from_model_entry(model).is_none() {
+            let (support_status, control_kind) = if supports_reasoning {
+                ("confirmed_supported", "unknown")
+            } else {
+                ("confirmed_unsupported", "none")
+            };
+            // The old flag reports support without a current wire contract.
+            // Preserve its provenance so provider evidence can supply controls.
+            model["reasoning"] = json!({
+                "schemaVersion": 2,
+                "supportStatus": support_status,
+                "controlKind": control_kind,
+                "supportedEfforts": [],
+                "disableAllowed": false,
+                "upstream": {"format": "none", "parameter": "reasoning"},
+                "source": "legacy"
+            });
+        }
     }
     if let Some(cache) = capabilities.get("codexCache") {
         model["codexCache"] = cache.clone();
@@ -1309,8 +1330,80 @@ mod tests {
             .expect("target exists");
         let model = &saved.settings_config["modelCatalog"]["models"][0];
         assert_eq!(model["inputModalities"], json!(["text", "image"]));
-        assert_eq!(model["reasoning"]["supported"], true);
+        let reasoning = reasoning_capability_from_model_entry(model)
+            .expect("migrated reasoning is readable by the canonical parser");
+        use crate::proxy::providers::codex_reasoning::{
+            ReasoningControlKind, ReasoningSupportStatus,
+        };
+        assert_eq!(reasoning.schema_version, Some(2));
+        assert_eq!(reasoning.supported, None);
+        assert_eq!(
+            reasoning.effective_support_status(),
+            ReasoningSupportStatus::ConfirmedSupported
+        );
+        assert_eq!(
+            reasoning.effective_control_kind(),
+            ReasoningControlKind::Unknown
+        );
+        assert!(reasoning.supported_efforts.is_empty());
+        assert!(!reasoning.disable_allowed);
+        assert_eq!(reasoning.upstream.format, "none");
+        assert_eq!(reasoning.source.as_deref(), Some("legacy"));
         assert_eq!(model["codexCache"]["enabled"], true);
+    }
+
+    #[test]
+    fn route_capabilities_preserve_existing_canonical_reasoning_efforts() {
+        let db = Database::memory().expect("memory db");
+        let mut provider = target();
+        provider.settings_config["modelCatalog"]["models"][0]["reasoning"] = json!({
+            "schemaVersion": 2,
+            "supportStatus": "confirmed_supported",
+            "controlKind": "graded",
+            "supportedEfforts": ["low", "medium", "high", "max"],
+            "defaultEffort": "medium",
+            "disableAllowed": false,
+            "upstream": {
+                "format": "reasoning_object",
+                "parameter": "reasoning.effort",
+                "effortMap": {
+                    "low": "low",
+                    "medium": "medium",
+                    "high": "high",
+                    "max": "max"
+                }
+            },
+            "source": "detection"
+        });
+        db.save_provider("codex", &provider).expect("save target");
+
+        let mut route = legacy_route(json!({
+            "apiFormat": "openai_responses",
+            "apiFormatSource": "provider",
+            "auth": {"source": "provider_config"}
+        }));
+        route["capabilities"] = json!({"supportsReasoning": true});
+        db.save_provider("codex", &legacy_router(route))
+            .expect("save router");
+
+        let revision = codex_multirouter_revision(&db, "router").expect("revision");
+        let preview =
+            preview_codex_multirouter_migration(&db, "router", &revision).expect("preview");
+        apply_codex_multirouter_migration(&db, "router", &revision, &preview.plan_token)
+            .expect("apply");
+
+        let saved = db
+            .get_provider_by_id("qwen", "codex")
+            .expect("read target")
+            .expect("target exists");
+        let reasoning = &saved.settings_config["modelCatalog"]["models"][0]["reasoning"];
+        assert_eq!(
+            reasoning["supportedEfforts"],
+            json!(["low", "medium", "high", "max"])
+        );
+        assert_eq!(reasoning["controlKind"], "graded");
+        assert_eq!(reasoning["defaultEffort"], "medium");
+        assert_eq!(reasoning["upstream"]["parameter"], "reasoning.effort");
     }
 
     #[test]

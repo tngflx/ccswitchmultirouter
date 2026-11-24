@@ -1,19 +1,30 @@
+use futures::future::join_all;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{watch, Mutex};
 
 use crate::codex_desktop::{
-    candidate_debug_ports, deactivate_codex_model_picker, detect_running_codex_main_process_async,
-    inspect_codex_renderer_compatibility, list_cdp_targets,
-    load_cc_switch_model_catalog_projection_outcome, pick_codex_page_targets_async,
-    try_inject_on_candidate_ports, CodexModelCatalogLoadOutcome, CodexModelCatalogProjection,
-    CodexModelPickerDiagnosticsCounts, CodexModelPickerReadiness,
-    CodexRendererCompatibilityObservation, DEFAULT_CODEX_DEBUG_PORT,
+    candidate_debug_ports, collect_native_usage_limit_candidates, deactivate_codex_model_picker,
+    detect_running_codex_main_process_async, inspect_codex_renderer_compatibility,
+    list_cdp_targets, load_cc_switch_model_catalog_projection_outcome,
+    pick_codex_page_targets_async, try_inject_on_candidate_ports, CdpTarget,
+    CodexModelCatalogLoadOutcome, CodexModelCatalogProjection, CodexModelPickerDiagnosticsCounts,
+    CodexModelPickerReadiness, CodexRendererCompatibilityObservation, NativeUsageLimitSnapshot,
+    DEFAULT_CODEX_DEBUG_PORT,
+};
+use crate::proxy::codex_turn_recovery::{
+    clear_native_usage_limit_candidates, proxy_usage_limit_turns,
+    replace_native_usage_limit_candidates,
 };
 
 const GUARDIAN_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 const GUARDIAN_IDLE_MAX_INTERVAL: Duration = Duration::from_secs(12);
+// Native usage-limit scans enumerate every loaded thread. Keep renderer and
+// picker verification at the normal cadence, but bound this heavier observer
+// to one scan per three guardian cycles unless its source set changes.
+const NATIVE_USAGE_SCAN_INTERVAL: Duration = Duration::from_secs(9);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GuardianCycleState {
@@ -67,11 +78,96 @@ struct GuardianInner {
     injected_catalog_fingerprint: Option<String>,
     inject_generation: u64,
     last_picker_readiness_signature: Option<String>,
+    native_usage_scan: NativeUsageScanCadence,
+}
+
+#[derive(Default)]
+struct NativeUsageScanCadence {
+    next_due_at: Option<Instant>,
+    source_signature: Vec<String>,
+    expedited_incomplete: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NativeUsageScan {
+    Skip,
+    Scan,
+    Clear,
+}
+
+impl NativeUsageScanCadence {
+    fn next_scan(&mut self, sources: &[&str], force: bool, now: Instant) -> NativeUsageScan {
+        if sources.is_empty() {
+            if self.source_signature.is_empty() {
+                return NativeUsageScan::Skip;
+            }
+            // Losing every verified destination invalidates its native proof.
+            // A failed read from a still verified destination remains partial.
+            self.reset();
+            return NativeUsageScan::Clear;
+        }
+        if force {
+            self.expedite();
+        }
+        if self.should_scan(sources, now) {
+            NativeUsageScan::Scan
+        } else {
+            NativeUsageScan::Skip
+        }
+    }
+
+    fn should_scan(&mut self, sources: &[&str], now: Instant) -> bool {
+        let mut signature = sources
+            .iter()
+            .map(|source| (*source).to_string())
+            .collect::<Vec<_>>();
+        signature.sort_unstable();
+        let source_changed = self.source_signature != signature;
+        let due = self
+            .next_due_at
+            .is_none_or(|next_due_at| now >= next_due_at);
+        if source_changed || due {
+            if source_changed {
+                self.expedited_incomplete = false;
+            }
+            self.source_signature = signature;
+            self.next_due_at = Some(now + NATIVE_USAGE_SCAN_INTERVAL);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn expedite(&mut self) {
+        self.next_due_at = None;
+        self.expedited_incomplete = false;
+    }
+
+    fn finish_scan(&mut self, complete: bool) {
+        if complete {
+            self.expedited_incomplete = false;
+        } else if !self.expedited_incomplete {
+            self.expedited_incomplete = true;
+            self.next_due_at = None;
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerManagement {
+    Observe,
+    Manage,
+    ReleaseRestoredPicker,
 }
 
 /// 守护的外部句柄；丢弃后守护自动停止。
 pub(crate) struct GuardianHandle {
     shutdown_tx: watch::Sender<bool>,
+    picker_management: watch::Sender<PickerManagement>,
     pub(crate) status: Arc<Mutex<CodexGuardianStatus>>,
 }
 
@@ -80,44 +176,78 @@ pub(crate) struct GuardianHandle {
 /// 守护不会静默终止正在工作的 Codex。
 /// 在检测到新 renderer target、目录变化或 renderer 重载时幂等重新注入；
 /// 若 CDP 不可用则记录原因并等待。
-pub(crate) fn start_codex_guardian() -> GuardianHandle {
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let status = Arc::new(Mutex::new(CodexGuardianStatus {
-        active: true,
-        codex_running: false,
-        cdp_available: false,
-        injected_target_count: 0,
-        injected: false,
-        picker_ready_target_count: 0,
-        picker_status: CodexModelPickerReadiness::Unverified,
-        picker_diagnostics: None,
-        picker_verification_issues: Vec::new(),
-        last_event: "守护已启动".into(),
-        message: "守护已启动，等待 Codex Desktop...".into(),
-    }));
-
+pub(crate) fn start_codex_guardian(manage_model_picker: bool) -> GuardianHandle {
+    let (handle, shutdown_rx) = GuardianHandle::new(manage_model_picker);
     let inner = Arc::new(Mutex::new(GuardianInner {
         injected_target_ids: Vec::new(),
         injected_catalog_fingerprint: None,
         inject_generation: 0,
         last_picker_readiness_signature: None,
+        native_usage_scan: NativeUsageScanCadence::default(),
     }));
 
-    let s = status.clone();
-    let i = inner.clone();
-    tokio::spawn(async move {
-        guardian_loop(s, i, shutdown_rx).await;
+    let status = handle.status.clone();
+    let management = handle.picker_management.clone();
+    tauri::async_runtime::spawn(async move {
+        guardian_loop(status, inner, shutdown_rx, management).await;
     });
 
-    GuardianHandle {
-        shutdown_tx,
-        status,
-    }
+    handle
 }
 
 impl GuardianHandle {
+    fn new(manage_model_picker: bool) -> (Self, watch::Receiver<bool>) {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let status = Arc::new(Mutex::new(CodexGuardianStatus {
+            active: true,
+            codex_running: false,
+            cdp_available: false,
+            injected_target_count: 0,
+            injected: false,
+            picker_ready_target_count: 0,
+            picker_status: CodexModelPickerReadiness::Unverified,
+            picker_diagnostics: None,
+            picker_verification_issues: Vec::new(),
+            last_event: "守护已启动".into(),
+            message: "守护已启动，等待 Codex Desktop...".into(),
+        }));
+        (
+            Self {
+                shutdown_tx,
+                picker_management: watch::Sender::new(if manage_model_picker {
+                    PickerManagement::Manage
+                } else {
+                    PickerManagement::Observe
+                }),
+                status,
+            },
+            shutdown_rx,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(manage_model_picker: bool) -> Self {
+        Self::new(manage_model_picker).0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manages_model_picker(&self) -> bool {
+        *self.picker_management.borrow() == PickerManagement::Manage
+    }
+
+    pub(crate) fn set_model_picker_management(&self, enabled: bool) {
+        self.picker_management.send_modify(|mode| {
+            if enabled {
+                *mode = PickerManagement::Manage;
+            } else if *mode == PickerManagement::Manage {
+                *mode = PickerManagement::ReleaseRestoredPicker;
+            }
+        });
+    }
+
     pub(crate) fn stop(self) {
         let _ = self.shutdown_tx.send(true);
+        clear_native_usage_limit_candidates();
     }
 }
 
@@ -125,6 +255,7 @@ async fn guardian_loop(
     status: Arc<Mutex<CodexGuardianStatus>>,
     inner: Arc<Mutex<GuardianInner>>,
     mut shutdown: watch::Receiver<bool>,
+    picker_management: watch::Sender<PickerManagement>,
 ) {
     let mut cadence = GuardianCadence::default();
     loop {
@@ -140,7 +271,8 @@ async fn guardian_loop(
             return;
         }
 
-        let delay = cadence.after_cycle(run_guardian_cycle(&status, &inner).await);
+        let delay = cadence
+            .after_cycle(run_guardian_cycle(&status, &inner, &shutdown, &picker_management).await);
 
         tokio::select! {
             _ = tokio::time::sleep(delay) => {},
@@ -159,13 +291,120 @@ async fn guardian_loop(
     }
 }
 
+struct GuardianTargetDestinations<'a> {
+    picker: Vec<(String, String)>,
+    native_usage: Vec<&'a str>,
+}
+
+fn collect_guardian_target_destinations(
+    verified_pages: &[CdpTarget],
+) -> GuardianTargetDestinations<'_> {
+    let mut picker = Vec::new();
+    let mut native_usage = Vec::new();
+    let mut seen_picker_ids = HashSet::new();
+    let mut seen_websocket_urls = HashSet::new();
+    for page in verified_pages {
+        let Some(websocket_url) = page.web_socket_debugger_url.as_deref() else {
+            continue;
+        };
+        if seen_picker_ids.insert(page.id.as_str()) {
+            picker.push((page.id.clone(), websocket_url.to_string()));
+        }
+        // Different verified listeners can report the same target ID. Observe
+        // each distinct WebSocket destination once, even across debug ports.
+        if seen_websocket_urls.insert(websocket_url) {
+            native_usage.push(websocket_url);
+        }
+    }
+    GuardianTargetDestinations {
+        picker,
+        native_usage,
+    }
+}
+
+fn publish_native_usage_limit_candidates(
+    shutdown: &watch::Receiver<bool>,
+    snapshot: Option<NativeUsageLimitSnapshot>,
+) {
+    // Hold the watch read lock through publication so stop can clear the
+    // snapshot without an in-flight cycle republishing it afterward.
+    let stopped = shutdown.borrow();
+    if !*stopped {
+        match snapshot {
+            Some(snapshot) => replace_native_usage_limit_candidates(snapshot),
+            None => clear_native_usage_limit_candidates(),
+        }
+    }
+}
+
+async fn scan_native_usage_limit_sources(
+    inner: &Arc<Mutex<GuardianInner>>,
+    shutdown: &watch::Receiver<bool>,
+    sources: &[&str],
+    force: bool,
+) {
+    let scan = inner
+        .lock()
+        .await
+        .native_usage_scan
+        .next_scan(sources, force, Instant::now());
+    match scan {
+        NativeUsageScan::Skip => return,
+        NativeUsageScan::Clear => {
+            publish_native_usage_limit_candidates(shutdown, None);
+            return;
+        }
+        NativeUsageScan::Scan => {}
+    }
+
+    let proxy_turns_json = serde_json::to_string(&proxy_usage_limit_turns())
+        .expect("serializing proxy usage limit turn identifiers and timestamps cannot fail");
+    let authorize = |_| !*shutdown.borrow();
+    let snapshots = join_all(sources.iter().copied().map(|source| {
+        collect_native_usage_limit_candidates(source, &proxy_turns_json, &authorize)
+    }))
+    .await;
+    let mut combined = NativeUsageLimitSnapshot {
+        complete: !snapshots.is_empty(),
+        ..Default::default()
+    };
+    for snapshot in snapshots {
+        combined.complete &= snapshot.complete;
+        combined.candidates.extend(snapshot.candidates);
+        combined
+            .conflicting_thread_ids
+            .extend(snapshot.conflicting_thread_ids);
+        combined
+            .stale_proxy_turns
+            .extend(snapshot.stale_proxy_turns);
+    }
+    let complete = combined.complete;
+    publish_native_usage_limit_candidates(shutdown, Some(combined));
+
+    // A pre-install bridge probe can return an incomplete snapshot while
+    // installing the renderer observer. Give an incomplete scan one expedited
+    // retry. Consecutive partial scans return to the normal sampling cadence.
+    inner.lock().await.native_usage_scan.finish_scan(complete);
+}
+
+fn finish_restored_picker_release(picker_management: &watch::Sender<PickerManagement>) {
+    picker_management.send_modify(|mode| {
+        if *mode == PickerManagement::ReleaseRestoredPicker {
+            *mode = PickerManagement::Observe;
+        }
+    });
+}
+
 async fn run_guardian_cycle(
     status: &Arc<Mutex<CodexGuardianStatus>>,
     inner: &Arc<Mutex<GuardianInner>>,
+    shutdown: &watch::Receiver<bool>,
+    picker_management: &watch::Sender<PickerManagement>,
 ) -> GuardianCycleState {
     // 1. 检查 Codex 主进程是否在运行。
     let running = detect_running_codex_main_process_async().await;
     if running.is_none() {
+        clear_native_usage_limit_candidates();
         let mut s = status.lock().await;
         s.codex_running = false;
         s.cdp_available = false;
@@ -182,12 +421,13 @@ async fn run_guardian_cycle(
         guard.injected_target_ids.clear();
         guard.injected_catalog_fingerprint = None;
         guard.last_picker_readiness_signature = None;
+        guard.native_usage_scan.reset();
         return GuardianCycleState::DesktopMissing;
     }
 
     // 2. 保留 websocket 地址，以便同一 target 重载后核验 renderer 状态。
     let ports = candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT);
-    let mut current_targets: Vec<(String, String)> = Vec::new();
+    let mut verified_pages = Vec::new();
     let mut target_ports = Vec::new();
     let mut cdp_available = false;
 
@@ -197,19 +437,23 @@ async fn run_guardian_cycle(
                 Ok(pages) => {
                     cdp_available = true;
                     target_ports.push(*port);
-                    for t in &pages {
-                        if let Some(websocket_url) = t.web_socket_debugger_url.as_deref() {
-                            if !current_targets.iter().any(|(id, _)| id == &t.id) {
-                                current_targets.push((t.id.clone(), websocket_url.to_string()));
-                            }
-                        }
-                    }
+                    verified_pages.extend(pages);
                 }
                 Err(_) => continue,
             },
             Err(_) => continue,
         }
     }
+
+    // The continuation runtime also serves native providers. Its candidates
+    // are independent of the model picker catalog's availability or ownership.
+    // This observer enumerates every loaded thread, so it has its own bounded
+    // cadence; renderer/picker checks below still run on every guardian cycle.
+    let GuardianTargetDestinations {
+        picker: current_targets,
+        native_usage: native_usage_sources,
+    } = collect_guardian_target_destinations(&verified_pages);
+    scan_native_usage_limit_sources(inner, shutdown, &native_usage_sources, false).await;
 
     if !cdp_available {
         let mut s = status.lock().await;
@@ -227,26 +471,62 @@ async fn run_guardian_cycle(
         guard.injected_target_ids.clear();
         guard.injected_catalog_fingerprint = None;
         guard.last_picker_readiness_signature = None;
+        guard.native_usage_scan.reset();
         return GuardianCycleState::VerifiedRendererUnavailable;
     }
 
-    // 3. 同时比较 target 和目录。renderer 补丁持有模型目录状态，因此 Provider
-    // 目录变化时，即使 target ID 不变也必须重新注入。
-    let catalog = match load_cc_switch_model_catalog_projection_outcome() {
-        Ok(CodexModelCatalogLoadOutcome::Managed(catalog)) => catalog,
-        Ok(CodexModelCatalogLoadOutcome::Unmanaged { model_provider }) => {
-            release_unmanaged_picker(&current_targets, model_provider.as_deref(), status, inner)
+    // A retained observer reconciles the restored picker configuration before
+    // ending picker management after takeover.
+    let management = *picker_management.borrow();
+    let catalog = match (management != PickerManagement::Observe)
+        .then(load_cc_switch_model_catalog_projection_outcome)
+    {
+        Some(Ok(CodexModelCatalogLoadOutcome::Managed(catalog))) => Some(catalog),
+        Some(Ok(CodexModelCatalogLoadOutcome::Unmanaged { model_provider })) => {
+            if *picker_management.borrow() != PickerManagement::Observe && !*shutdown.borrow() {
+                let released = release_unmanaged_picker(
+                    &current_targets,
+                    model_provider.as_deref(),
+                    status,
+                    inner,
+                )
                 .await;
+                if released && management == PickerManagement::ReleaseRestoredPicker {
+                    finish_restored_picker_release(picker_management);
+                }
+            }
             return GuardianCycleState::WatchingRenderer;
         }
-        Err(error) => {
+        Some(Err(error)) => {
             let mut s = status.lock().await;
             if report_catalog_load_failure(&mut s, &error.to_string()) {
                 log::warn!("Codex 守护: 模型目录加载失败: {error}");
             }
             return GuardianCycleState::WatchingRenderer;
         }
+        None => None,
     };
+    let Some(catalog) = catalog else {
+        let mut guard = inner.lock().await;
+        guard.injected_target_ids.clear();
+        guard.injected_catalog_fingerprint = None;
+        guard.last_picker_readiness_signature = None;
+        drop(guard);
+        let mut s = status.lock().await;
+        s.codex_running = true;
+        s.cdp_available = true;
+        s.injected = false;
+        s.injected_target_count = 0;
+        s.picker_ready_target_count = 0;
+        s.picker_status = CodexModelPickerReadiness::NotRequired;
+        s.picker_diagnostics = None;
+        s.picker_verification_issues.clear();
+        s.last_event = "已核验 Codex 恢复观察目标".into();
+        s.message = "正在观察 Codex Desktop 中断的会话。".into();
+        return GuardianCycleState::WatchingRenderer;
+    };
+    // 3. 同时比较 target 和目录。renderer 补丁持有模型目录状态，因此 Provider
+    // 目录变化时，即使 target ID 不变也必须重新注入。
     let catalog_fingerprint = catalog.fingerprint();
     let mut guard = inner.lock().await;
     guard.injected_target_ids.retain(|id| {
@@ -290,10 +570,21 @@ async fn run_guardian_cycle(
         apply_renderer_observation(s, &observations);
         s.last_event = "CDP renderer 安装状态与模型选择器就绪状态已核验".into();
         s.message = renderer_observation_message(&observations);
+        if management == PickerManagement::ReleaseRestoredPicker {
+            finish_restored_picker_release(picker_management);
+        }
         return GuardianCycleState::WatchingRenderer;
     }
 
     // 4. 有新 target、目录变化或 renderer 状态丢失时尝试注入。
+    // The renderer can reload without changing its target ID or websocket URL.
+    // Expedite the heavier observer after reinjection so the fresh compatibility
+    // layer is sampled immediately instead of waiting for the normal 9-second
+    // native scan interval.
+    {
+        let mut guard = inner.lock().await;
+        guard.native_usage_scan.expedite();
+    }
     let gen = {
         let mut guard = inner.lock().await;
         guard.inject_generation += 1;
@@ -326,6 +617,9 @@ async fn run_guardian_cycle(
 
     let mut injection = None;
     for port in target_ports {
+        if *picker_management.borrow() != management || *shutdown.borrow() {
+            return GuardianCycleState::WatchingRenderer;
+        }
         if let Some(result) = try_inject_on_candidate_ports(&catalog, &[port]).await {
             if result.injected || injection.is_none() {
                 injection = Some(result);
@@ -349,6 +643,7 @@ async fn run_guardian_cycle(
         s.cdp_available = true;
         apply_renderer_observation(&mut s, &observations);
     }
+    let injection_succeeded = injection.as_ref().is_some_and(|result| result.injected);
     match injection {
         Some(result) if result.injected => {
             let mut s = status.lock().await;
@@ -386,6 +681,9 @@ async fn run_guardian_cycle(
             log::warn!("Codex 守护: 注入失败，未找到可注入的 target");
         }
     }
+    if injection_succeeded && injected_target_count > 0 {
+        scan_native_usage_limit_sources(inner, shutdown, &native_usage_sources, true).await;
+    }
     GuardianCycleState::WatchingRenderer
 }
 
@@ -410,7 +708,7 @@ async fn release_unmanaged_picker(
     model_provider: Option<&str>,
     status: &Arc<Mutex<CodexGuardianStatus>>,
     inner: &Arc<Mutex<GuardianInner>>,
-) {
+) -> bool {
     let mut failed = 0;
     for (_, websocket_url) in targets {
         match deactivate_codex_model_picker(websocket_url, model_provider).await {
@@ -450,6 +748,7 @@ async fn release_unmanaged_picker(
             "当前 Codex 配置不由 CCSM 托管；{failed} 个 renderer 的模型菜单兼容层尚未释放，将在下次检查时重试。"
         );
     }
+    failed == 0
 }
 
 /// Readiness is a projection of this cycle's live diagnostics, not another
@@ -557,6 +856,7 @@ fn summarize_renderer_observations(
     let mut statuses = Vec::new();
     let mut aggregate_diagnostics = CodexModelPickerDiagnosticsCounts::default();
     let mut has_diagnostics = false;
+    let mut verified_empty_targets = 0;
     for (id, observation) in observations {
         if observation.current {
             summary.installed_target_ids.push(id);
@@ -631,6 +931,19 @@ fn summarize_renderer_observations(
         if picker_status == CodexModelPickerReadiness::Ready {
             summary.picker_ready_target_count += 1;
         }
+        // The probe checks the same managed catalog on every target and only
+        // emits NotRequired for an available catalog with no model names.
+        if picker_status == CodexModelPickerReadiness::NotRequired
+            && target_issues.is_empty()
+            && observation
+                .picker_diagnostics
+                .as_ref()
+                .is_some_and(|diagnostics| {
+                    *diagnostics == CodexModelPickerDiagnosticsCounts::default()
+                })
+        {
+            verified_empty_targets += 1;
+        }
         statuses.push(picker_status);
     }
     if has_diagnostics {
@@ -660,6 +973,7 @@ fn summarize_renderer_observations(
             } else if statuses
                 .iter()
                 .all(|status| *status == CodexModelPickerReadiness::NotRequired)
+                || summary.picker_ready_target_count + verified_empty_targets == statuses.len()
             {
                 CodexModelPickerReadiness::NotRequired
             } else {
@@ -761,6 +1075,125 @@ mod tests {
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     #[test]
+    fn native_usage_sources_keep_shared_target_ids_and_dedupe_websocket_aliases() {
+        let first = "ws://127.0.0.1:9229/devtools/page/1";
+        let second = "ws://127.0.0.1:9229/devtools/page/2";
+        let third = "ws://127.0.0.1:9230/devtools/page/1";
+        let page = |id: &str, websocket_url: &str| CdpTarget {
+            id: id.to_string(),
+            target_type: "page".to_string(),
+            title: "Codex".to_string(),
+            url: "app://-/index.html".to_string(),
+            web_socket_debugger_url: Some(websocket_url.to_string()),
+            source_endpoint: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+        };
+        let verified_pages = [
+            page("shared-id", first),
+            page("first-alias", first),
+            page("second-page", second),
+            page("shared-id", third),
+            page("shared-id", third),
+        ];
+
+        let destinations = collect_guardian_target_destinations(&verified_pages);
+        assert_eq!(destinations.native_usage, [first, second, third]);
+        assert_eq!(
+            destinations.picker,
+            [
+                ("shared-id".to_string(), first.to_string()),
+                ("first-alias".to_string(), first.to_string()),
+                ("second-page".to_string(), second.to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn native_usage_scan_cadence_skips_unchanged_sources_until_due() {
+        let start = Instant::now();
+        let mut cadence = NativeUsageScanCadence::default();
+        let sources = ["ws://127.0.0.1:9229/devtools/page/1"];
+
+        assert!(cadence.should_scan(&sources, start));
+        assert!(!cadence.should_scan(
+            &sources,
+            start + NATIVE_USAGE_SCAN_INTERVAL - Duration::from_millis(1),
+        ));
+        assert!(cadence.should_scan(&sources, start + NATIVE_USAGE_SCAN_INTERVAL));
+        // A renderer installation resets the cadence so the first current
+        // runtime is sampled in the same guardian cycle.
+        cadence.reset();
+        assert!(cadence.should_scan(&sources, start + Duration::from_secs(1)));
+        assert!(!cadence.should_scan(&sources, start + Duration::from_secs(2)));
+
+        let changed = ["ws://127.0.0.1:9229/devtools/page/2"];
+        assert!(cadence.should_scan(&changed, start + Duration::from_secs(10)));
+        assert!(!cadence.should_scan(
+            &changed,
+            start + Duration::from_secs(10) + Duration::from_secs(1),
+        ));
+
+        assert!(cadence.should_scan(&[], start + Duration::from_secs(11)));
+        assert!(!cadence.should_scan(&[], start + Duration::from_secs(12)));
+        cadence.reset();
+        assert!(cadence.should_scan(&[], start + Duration::from_secs(13)));
+    }
+
+    #[test]
+    fn usage_limit_scan_clears_once_when_the_last_verified_source_disappears() {
+        let now = Instant::now();
+        let sources = ["ws://127.0.0.1:9229/devtools/page/1"];
+        let mut cadence = NativeUsageScanCadence::default();
+        assert_eq!(
+            cadence.next_scan(&sources, false, now),
+            NativeUsageScan::Scan
+        );
+        cadence.finish_scan(false);
+        cadence.expedite();
+        assert_eq!(cadence.next_scan(&[], false, now), NativeUsageScan::Clear);
+        assert_eq!(cadence.next_scan(&[], false, now), NativeUsageScan::Skip);
+        assert_eq!(
+            cadence.next_scan(&sources, false, now),
+            NativeUsageScan::Scan
+        );
+    }
+
+    #[test]
+    fn incomplete_native_usage_scan_is_due_again_immediately() {
+        let start = Instant::now();
+        let mut cadence = NativeUsageScanCadence::default();
+        let sources = ["ws://127.0.0.1:9229/devtools/page/1"];
+
+        assert!(cadence.should_scan(&sources, start));
+        assert!(!cadence.should_scan(&sources, start + Duration::from_secs(1)));
+
+        cadence.finish_scan(false);
+
+        assert!(cadence.should_scan(&sources, start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn repeated_incomplete_usage_scans_keep_the_normal_work_bound() {
+        let mut cadence = NativeUsageScanCadence::default();
+        let sources = ["ws://127.0.0.1:9229/devtools/page/1"];
+        let start = Instant::now();
+        let mut scans = 0;
+        for cycle in 0..=12 {
+            let now = start + GUARDIAN_CHECK_INTERVAL * cycle;
+            if cadence.should_scan(&sources, now) {
+                scans += 1;
+                cadence.finish_scan(false);
+            }
+        }
+        assert_eq!(scans, 5);
+
+        let changed = ["ws://127.0.0.1:9229/devtools/page/2"];
+        let now = start + GUARDIAN_CHECK_INTERVAL * 13;
+        assert!(cadence.should_scan(&changed, now));
+        cadence.finish_scan(false);
+        assert!(cadence.should_scan(&changed, now + GUARDIAN_CHECK_INTERVAL));
+    }
+
+    #[test]
     fn guardian_backs_off_repeated_idle_native_probes_and_recovers_full_cadence() {
         use GuardianCycleState::*;
 
@@ -823,6 +1256,7 @@ mod tests {
             injected_catalog_fingerprint: Some("previous-catalog".to_string()),
             inject_generation: 7,
             last_picker_readiness_signature: Some("previous-readiness".to_string()),
+            native_usage_scan: NativeUsageScanCadence::default(),
         }));
         let status = Arc::new(Mutex::new(CodexGuardianStatus {
             active: true,
@@ -979,6 +1413,55 @@ mod tests {
         )]);
         assert_eq!(empty.picker_status, CodexModelPickerReadiness::NotRequired);
         assert_eq!(empty.picker_ready_target_count, 0);
+    }
+
+    #[test]
+    fn guardian_aggregate_accepts_authoritative_empty_catalog() {
+        let mut without_observer =
+            observed_target("empty", true, CodexModelPickerReadiness::NotRequired, false);
+        without_observer.1.picker_diagnostics = Some(CodexModelPickerDiagnosticsCounts::default());
+        let ready = observed_target("ready", true, CodexModelPickerReadiness::Ready, true);
+        let summarize = |other| summarize_renderer_observations(vec![ready.clone(), other]);
+        let summary = summarize(without_observer.clone());
+
+        assert_eq!(
+            summary.picker_status,
+            CodexModelPickerReadiness::NotRequired
+        );
+        assert_eq!(summary.installed_target_ids, ["ready", "empty"]);
+        assert_eq!(summary.picker_ready_target_count, 1);
+        assert!(summary.picker_verification_issues.is_empty());
+        assert_eq!(
+            summary.picker_diagnostics.unwrap().success_observer_count,
+            1
+        );
+
+        let mut pending_observer = without_observer.clone();
+        pending_observer.1.picker_diagnostics = Some(CodexModelPickerDiagnosticsCounts {
+            picker_observer_count: 1,
+            pending_observer_count: 1,
+            ..Default::default()
+        });
+        let pending = summarize(pending_observer);
+        assert_eq!(pending.picker_status, CodexModelPickerReadiness::Unverified);
+        assert_eq!(pending.picker_verification_issues, ["observer_pending"]);
+
+        let mut unavailable = without_observer.clone();
+        unavailable.1.picker_diagnostics = None;
+        assert_eq!(
+            summarize(unavailable).picker_status,
+            CodexModelPickerReadiness::Unverified
+        );
+
+        let mismatched = summarize_renderer_observations(vec![
+            ready,
+            without_observer,
+            observed_target("mismatch", true, CodexModelPickerReadiness::Mismatch, true),
+        ]);
+        assert_eq!(
+            mismatched.picker_status,
+            CodexModelPickerReadiness::Mismatch
+        );
     }
 
     #[test]
@@ -1147,6 +1630,7 @@ mod tests {
             injected_catalog_fingerprint: None,
             inject_generation: 0,
             last_picker_readiness_signature: None,
+            native_usage_scan: NativeUsageScanCadence::default(),
         };
         let mut observation = summarize_renderer_observations(vec![observed_target(
             "a",

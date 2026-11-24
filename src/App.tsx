@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useRef } from "react";
+import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
@@ -24,6 +24,7 @@ import {
   FolderOpen,
   KeyRound,
   Shield,
+  ShieldCheck,
   Cpu,
   LayoutDashboard,
   Network,
@@ -36,8 +37,10 @@ import { confirmDialog } from "@/lib/dialog";
 import type { Provider, VisibleApps } from "@/types";
 import type { EnvConflict } from "@/types/env";
 import {
+  currentProviderQueryOptions,
   proxyKeys,
   useCodexEditorProvidersQuery,
+  useCurrentProviderQuery,
   useProvidersQuery,
   useSettingsQuery,
 } from "@/lib/query";
@@ -103,7 +106,10 @@ import { ProxyToggle } from "@/components/proxy/ProxyToggle";
 import { RoutingActivationBrand } from "@/components/proxy/RoutingActivationBrand";
 import { ClaudeDesktopRouteToggle } from "@/components/proxy/ClaudeDesktopRouteToggle";
 import { FailoverToggle } from "@/components/proxy/FailoverToggle";
-import { StreamRetryHeaderToggle } from "@/components/proxy/StreamRetryHeaderToggle";
+import {
+  CodexUsageLimitResumeButton,
+  StreamRetryHeaderToggle,
+} from "@/components/proxy/StreamRetryHeaderToggle";
 import UsageScriptModal from "@/components/UsageScriptModal";
 import UnifiedMcpPanel from "@/components/mcp/UnifiedMcpPanel";
 import PromptPanel, {
@@ -183,6 +189,7 @@ interface SyncStatusUpdatedPayload {
 
 const DEFAULT_DRAG_BAR_HEIGHT = isWindows() || isLinux() ? 0 : 28; // px
 const HEADER_HEIGHT = 64; // px
+const CODEX_USAGE_RESUME_ROW_HEIGHT = 40; // px
 const WIZARD_CHILD_PANEL_Z_INDEX_CLASS = "z-[140]";
 
 const STORAGE_KEY = "cc-switch-last-app";
@@ -443,7 +450,11 @@ function App() {
   const useAppWindowControls =
     isLinux() && (settingsData?.useAppWindowControls ?? false);
   const dragBarHeight = useAppWindowControls ? 32 : DEFAULT_DRAG_BAR_HEIGHT;
-  const contentTopOffset = dragBarHeight + HEADER_HEIGHT;
+  const showCodexRecoveryRibbon = currentView === "providers";
+  const headerHeight =
+    HEADER_HEIGHT +
+    (showCodexRecoveryRibbon ? CODEX_USAGE_RESUME_ROW_HEIGHT : 0);
+  const contentTopOffset = dragBarHeight + headerHeight;
   const visibleApps: VisibleApps = {
     ...DEFAULT_VISIBLE_APPS,
     ...settingsData?.visibleApps,
@@ -568,10 +579,22 @@ function App() {
   } = useProvidersQuery(activeApp, {
     isProxyRunning: currentAppUsesProxy && isProxyRunning,
   });
+  const {
+    data: currentProviderId,
+    error: currentProviderError,
+    refetch: refetchCurrentProvider,
+  } = useCurrentProviderQuery(activeApp, {
+    isProxyRunning: currentAppUsesProxy && isProxyRunning,
+  });
+  const refetchProviderReads = useCallback(
+    () => Promise.all([refetch(), refetchCurrentProvider()]),
+    [refetch, refetchCurrentProvider],
+  );
   const providers = useMemo(() => data?.providers ?? {}, [data]);
-  const providerLoadError = providersQueryError
-    ? extractErrorMessage(providersQueryError)
-    : (data?.currentProviderError ?? null);
+  const providerReadError = providersQueryError ?? currentProviderError;
+  const providerLoadError = providerReadError
+    ? extractErrorMessage(providerReadError)
+    : null;
   const providerLoadErrorMessage = providerLoadError
     ? t("provider.loadFailed", {
         defaultValue:
@@ -618,7 +641,6 @@ function App() {
     () => codexWizardProviders.filter(isRoutingPlan),
     [codexWizardProviders],
   );
-  const currentProviderId = data?.currentProviderId ?? "";
   const isOpenClawView =
     activeApp === "openclaw" &&
     (currentView === "providers" ||
@@ -698,7 +720,9 @@ function App() {
         const off = await providersApi.onSwitched(
           (event: ProviderSwitchEvent) => {
             const refreshes: Promise<unknown>[] = [];
-            if (event.appType === activeApp) refreshes.push(refetch());
+            if (event.appType === activeApp) {
+              refreshes.push(refetchProviderReads());
+            }
             if (event.appType === "pi") {
               refreshes.push(invalidatePiProviderCaches(queryClient));
             }
@@ -720,7 +744,7 @@ function App() {
       active = false;
       unsubscribe?.();
     };
-  }, [activeApp, queryClient, refetch]);
+  }, [activeApp, queryClient, refetchProviderReads]);
 
   useTauriEvent("universal-provider-synced", async () => {
     await queryClient.invalidateQueries({ queryKey: ["providers"] });
@@ -1088,8 +1112,21 @@ function App() {
   const switchAwayFromCurrentCodexRouterBeforeDelete = async (
     provider: Provider,
   ) => {
-    if (activeApp !== "codex" || !isRoutingPlan(provider)) return;
-    if (provider.id !== currentProviderId) return;
+    if (activeApp !== "codex" || !isRoutingPlan(provider)) return true;
+    let currentId = currentProviderId;
+    if (currentId === undefined || currentProviderError) {
+      try {
+        currentId = await queryClient.fetchQuery({
+          ...currentProviderQueryOptions(activeApp),
+          staleTime: 0,
+        });
+      } catch (error) {
+        toast.error(extractErrorMessage(error));
+        return false;
+      }
+    }
+    if (currentId === undefined) return false;
+    if (provider.id !== currentId) return true;
 
     const fallbackProvider = Object.values(providers)
       .filter((candidate) => candidate.id !== provider.id)
@@ -1113,6 +1150,7 @@ function App() {
       `Switched to ${fallbackProvider.name}; deleting the current MultiRouter.`,
       { closeButton: true },
     );
+    return true;
   };
 
   const handleConfirmAction = async () => {
@@ -1163,7 +1201,9 @@ function App() {
         { closeButton: true },
       );
     } else {
-      await switchAwayFromCurrentCodexRouterBeforeDelete(provider);
+      if (!(await switchAwayFromCurrentCodexRouterBeforeDelete(provider))) {
+        return;
+      }
       await deleteProvider(provider.id);
     }
     setConfirmAction(null);
@@ -1327,7 +1367,7 @@ function App() {
       });
     } catch (error) {
       console.error("[App] Failed to refresh providers after import", error);
-      await refetch();
+      await refetchProviderReads();
     }
     try {
       await providersApi.updateTrayMenu();
@@ -1578,7 +1618,7 @@ function App() {
             <CodexRouterWorkspacePage
               providers={codexWizardProviders}
               providerLoadError={providerLoadErrorMessage}
-              onRetryProviderLoad={() => void refetch()}
+              onRetryProviderLoad={() => void refetchProviderReads()}
               proxyStatus={proxyStatus}
               isProxyRunning={isProxyRunning}
               isCodexTakeoverActive={Boolean(takeoverStatus?.codex)}
@@ -1695,7 +1735,7 @@ function App() {
                           variant="outline"
                           size="sm"
                           className="shrink-0 gap-2"
-                          onClick={() => void refetch()}
+                          onClick={() => void refetchProviderReads()}
                           title={t("common.retry", { defaultValue: "Retry" })}
                         >
                           <RefreshCw className="h-4 w-4" />
@@ -1710,7 +1750,7 @@ function App() {
                     )}
                     <ProviderList
                       providers={providers}
-                      currentProviderId={currentProviderId}
+                      currentProviderId={currentProviderId ?? ""}
                       appId={activeApp}
                       isLoading={isLoading || providerActionLoading}
                       isProxyRunning={currentAppUsesProxy && isProxyRunning}
@@ -1877,17 +1917,25 @@ function App() {
           {
             ...DRAG_REGION_STYLE,
             top: dragBarHeight,
-            height: HEADER_HEIGHT,
+            height: headerHeight,
           } as any
         }
       >
         <div
-          className="flex h-full items-center justify-between gap-2 px-6"
+          className="flex shrink-0 items-center justify-between gap-2 px-6"
+          role="toolbar"
+          aria-label={t("common.applicationToolbar", {
+            defaultValue: "Application toolbar",
+          })}
           {...DRAG_REGION_ATTR}
-          style={{ ...DRAG_REGION_STYLE } as any}
+          style={{ ...DRAG_REGION_STYLE, height: HEADER_HEIGHT } as any}
         >
           <div
             className="flex items-center gap-1"
+            role="group"
+            aria-label={t("common.navigation", {
+              defaultValue: "Navigation",
+            })}
             style={{ WebkitAppRegion: "no-drag" } as any}
           >
             {currentView !== "providers" ? (
@@ -1986,11 +2034,21 @@ function App() {
             )}
           </div>
 
-          <div className="flex flex-1 min-w-0 items-center justify-end gap-1.5">
+          <div
+            className="flex flex-1 min-w-0 items-center justify-end gap-1.5"
+            role="group"
+            aria-label={t("common.workspaceControls", {
+              defaultValue: "Workspace controls",
+            })}
+          >
             {currentView === "providers" &&
               (activeApp === "claude-desktop" || proxyAppId) && (
                 <div
                   className="flex shrink-0 items-center gap-1.5"
+                  role="group"
+                  aria-label={t("common.routingControls", {
+                    defaultValue: "Routing controls",
+                  })}
                   style={{ WebkitAppRegion: "no-drag" } as any}
                 >
                   {activeApp === "claude-desktop" ? (
@@ -2018,12 +2076,22 @@ function App() {
               (settingsData?.showProfileSwitcher ?? true) && (
                 <div
                   className="flex shrink-0 items-center"
+                  role="group"
+                  aria-label={t("common.profile", {
+                    defaultValue: "Profile",
+                  })}
                   style={{ WebkitAppRegion: "no-drag" } as any}
                 >
                   <ProfileSwitcher activeApp={activeApp} />
                 </div>
               )}
-            <div className="flex min-w-0 flex-1 items-center justify-end overflow-hidden py-4">
+            <div
+              className="flex min-w-0 flex-1 items-center justify-end overflow-hidden py-4"
+              role="group"
+              aria-label={t("common.applications", {
+                defaultValue: "Applications",
+              })}
+            >
               {currentView === "providers" && (
                 <AppSwitcher
                   activeApp={activeApp}
@@ -2032,7 +2100,13 @@ function App() {
                 />
               )}
             </div>
-            <div className="flex shrink-0 items-center py-4 pr-2">
+            <div
+              className="flex shrink-0 items-center py-4 pr-2"
+              role="group"
+              aria-label={t("common.actions", {
+                defaultValue: "Actions",
+              })}
+            >
               <div
                 className="flex shrink-0 items-center gap-1.5"
                 style={{ WebkitAppRegion: "no-drag" } as any}
@@ -2417,6 +2491,55 @@ function App() {
                 )}
               </div>
             </div>
+          </div>
+        </div>
+        <div
+          data-testid="codex-usage-limit-resume-row"
+          hidden={!showCodexRecoveryRibbon}
+          className={cn(
+            "shrink-0 items-center gap-3 border-t border-border/60 bg-muted/20 px-6 shadow-[inset_0_1px_0_hsl(var(--primary)/0.06)]",
+            showCodexRecoveryRibbon && "flex",
+          )}
+          role="region"
+          aria-label={t("streamRetry.usageLimitResume.title", {
+            defaultValue: "Codex session recovery",
+          })}
+          {...DRAG_REGION_ATTR}
+          style={
+            {
+              ...DRAG_REGION_STYLE,
+              height: CODEX_USAGE_RESUME_ROW_HEIGHT,
+            } as any
+          }
+        >
+          <div
+            className="flex min-w-0 flex-1 items-center gap-2"
+            style={{ WebkitAppRegion: "no-drag" } as any}
+          >
+            <div
+              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary"
+              aria-hidden="true"
+            >
+              <ShieldCheck className="h-3.5 w-3.5" />
+            </div>
+            <div className="hidden min-w-0 flex-col leading-tight sm:flex">
+              <span className="truncate text-xs font-medium text-foreground">
+                {t("streamRetry.usageLimitResume.title", {
+                  defaultValue: "Codex session recovery",
+                })}
+              </span>
+              <span className="truncate text-[10px] text-muted-foreground">
+                {t("streamRetry.usageLimitResume.subtitle", {
+                  defaultValue: "Verified usage-limit sessions",
+                })}
+              </span>
+            </div>
+          </div>
+          <div
+            className="flex shrink-0 items-center"
+            style={{ WebkitAppRegion: "no-drag" } as any}
+          >
+            <CodexUsageLimitResumeButton visible={showCodexRecoveryRibbon} />
           </div>
         </div>
       </header>

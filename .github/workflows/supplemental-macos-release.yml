@@ -114,7 +114,7 @@ jobs:
         timeout-minutes: 60
         run: |
           set -euxo pipefail
-          pnpm tauri build --confirm-build --target universal-apple-darwin
+          pnpm tauri build --target universal-apple-darwin
 
       - name: Stage macOS release assets
         shell: bash

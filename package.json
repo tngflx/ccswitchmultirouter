@@ -12,7 +12,7 @@
     "build": "node scripts/local-build-pipeline.mjs",
     "watchdog:legacy:inspect": "node scripts/install-ccswitchmulti-watchdog.mjs --uninstall --dry-run",
     "watchdog:uninstall": "node scripts/install-ccswitchmulti-watchdog.mjs --uninstall",
-    "tauri": "node scripts/tauri-command.mjs",
+    "tauri": "tauri",
     "dev:renderer": "vite",
     "build:renderer": "node scripts/build-renderer.mjs",
     "remote:assets": "node scripts/build-owner-remote-assets.mjs",
@@ -46,10 +46,12 @@
     "release:hook:install:sync": "node scripts/install-local-release-hook.mjs --synchronous",
     "test:unit": "node scripts/run-unit-tests.mjs",
     "test:dev-recovery": "node --test --test-concurrency=1 scripts/dev-tauri-delayed.node-test.mjs scripts/dev-recovery-output.node-test.mjs scripts/dev-recovery-output.integration.node-test.mjs scripts/dev-watchdog-ancestor.integration.node-test.mjs scripts/dev-watchdog-policy.node-test.mjs scripts/prune-cargo-target.node-test.mjs scripts/windows-json-query.node-test.mjs scripts/dev-session-launch.node-test.mjs scripts/dev-app-exit.node-test.mjs scripts/dev-session-takeover.integration.node-test.mjs scripts/dev-watchdog-handoff.integration.node-test.mjs scripts/dev-live-owner-handoff.integration.node-test.mjs",
-    "test:lifecycle": "node --test scripts/build-approval.node-test.mjs scripts/ccswitchmulti-guardian-core.node-test.mjs scripts/watch-ccswitchmulti.node-test.mjs scripts/install-ccswitchmulti-watchdog.node-test.mjs scripts/local-build-pipeline.node-test.mjs scripts/cleanup-cargo-targets.node-test.mjs scripts/local-release-pipeline.node-test.mjs scripts/install-local-release-hook.node-test.mjs scripts/export-latest-ccswitchmulti.node-test.mjs scripts/codex-error-capture.node-test.mjs scripts/codex-oauth-diagnostics.node-test.mjs scripts/lifecycle-entrypoints.node-test.mjs scripts/no-powershell-scripts.node-test.mjs scripts/powershell-bundle-boundary.node-test.mjs scripts/release-output-root.node-test.mjs",
+    "test:lifecycle": "node --test scripts/ccswitchmulti-guardian-core.node-test.mjs scripts/watch-ccswitchmulti.node-test.mjs scripts/install-ccswitchmulti-watchdog.node-test.mjs scripts/local-build-pipeline.node-test.mjs scripts/cleanup-cargo-targets.node-test.mjs scripts/local-release-pipeline.node-test.mjs scripts/install-local-release-hook.node-test.mjs scripts/export-latest-ccswitchmulti.node-test.mjs scripts/codex-error-capture.node-test.mjs scripts/codex-oauth-diagnostics.node-test.mjs scripts/lifecycle-entrypoints.node-test.mjs scripts/no-powershell-scripts.node-test.mjs scripts/powershell-bundle-boundary.node-test.mjs scripts/release-output-root.node-test.mjs scripts/verify-resource-performance.node-test.mjs",
     "test:runner": "node --test scripts/run-unit-tests.node-test.mjs",
     "test:unit:watch": "vitest watch",
-    "scripts:check": "node scripts/no-powershell-scripts.mjs"
+    "scripts:check": "node scripts/no-powershell-scripts.mjs",
+    "performance:verify": "node scripts/verify-resource-performance.mjs",
+    "performance:test": "node --test scripts/verify-resource-performance.node-test.mjs"
   },
   "keywords": [],
   "author": "Jason Young",

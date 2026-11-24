@@ -59,7 +59,13 @@ const createReader = (state: State) =>
     "window",
     "document",
     `${discovery}\n${native}\nreturn typeof readCodexNativeReasoningVisibility === "function"
-      ? readCodexNativeReasoningVisibility
+      ? (cache, efforts) => readCodexNativeReasoningVisibility(
+          cache,
+          efforts,
+          state.nativeReasoningVisibilityRequired === true
+            ? codexCurrentNativeReasoningOwnerProof()
+            : null,
+        )
       : () => ({ status: "not_required", missingEfforts: [] });`,
   )(state, fixtureWindow, fixtureDocument) as (
     cache: object,
@@ -512,6 +518,63 @@ describe("Codex Desktop managed native graded-effort reconciliation", () => {
     expect(state.nativeReasoningVisibilityPowerPatches?.size).toBe(0);
   });
 
+  it("exposes a declared graded None only for the model that supports it", () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const enabled = new Set(["medium", "high"]);
+    const { scope } = createScope(cache, enabled);
+    const state = createState(atom, scope);
+    state.payload!.modelNames = ["fixture", "required-thinking"];
+    state.payload!.models = [
+      {
+        model: "fixture",
+        supported_reasoning_levels: ["none", "medium", "high"],
+        reasoning: { controlKind: "graded", disableAllowed: true },
+      },
+      {
+        model: "required-thinking",
+        supported_reasoning_levels: ["medium", "high"],
+        reasoning: { controlKind: "graded", disableAllowed: false },
+      },
+    ];
+    const triggers = state.payload!.modelNames.map((model) => {
+      const powerSelections = ["medium", "high"].map((reasoningEffort) => ({
+        id: `${model}:${reasoningEffort}`,
+        model,
+        reasoningEffort,
+      }));
+      const props = {
+        selectedLabelCandidate: powerSelections[0],
+        onSelectPower: vi.fn(),
+        powerSelections,
+        triggerConfig: {},
+      };
+      return { props, button: { isConnected: true } };
+    });
+    state.nativeReasoningVisibilityFiberPath = (button) =>
+      triggers
+        .filter((trigger) => trigger.button === button)
+        .map(({ props }) => ({ memoizedProps: props }));
+    const reconcile = createReconciler(state, {
+      getElementById: () => null,
+      querySelectorAll: () =>
+        triggers.map(({ button }) => ({ closest: () => button })),
+    });
+
+    expect(reconcile(["none", "medium", "high"])).toMatchObject({
+      status: "known",
+      patchedScopes: 1,
+    });
+    expect(scope.get(atom).has("none")).toBe(true);
+    expect(enabled.has("none")).toBe(false);
+    expect(
+      triggers[0].props.powerSelections.map((row) => row.reasoningEffort),
+    ).toEqual(["none", "medium", "high"]);
+    expect(
+      triggers[1].props.powerSelections.map((row) => row.reasoningEffort),
+    ).toEqual(["medium", "high"]);
+  });
+
   it("wraps only the exact current managed scope and restores it on release", () => {
     const cache = createManagedCache();
     const atom = createAtom();
@@ -768,9 +831,7 @@ const createCurrentCacheReader = (state: State) =>
     "state",
     "window",
     "document",
-    `${discovery}\n${native}\nreturn typeof codexCurrentNativeReasoningQueryCaches === "function"
-      ? codexCurrentNativeReasoningQueryCaches
-      : () => null;`,
+    `${discovery}\n${native}\nreturn () => codexCurrentNativeReasoningOwnerProof()?.caches ?? null;`,
   )(state, fixtureWindow, fixtureDocument) as () => Set<object> | null;
 
 const createScannedReconciler = (
@@ -797,7 +858,7 @@ ${native}
 return {
       scan: codexRendererScopeCandidates,
       snapshotCurrent: codexRendererScopeSnapshotIsCurrent,
-      caches: codexCurrentNativeReasoningQueryCaches,
+      caches: () => codexCurrentNativeReasoningOwnerProof()?.caches ?? null,
       reconcile: reconcileCodexNativeReasoningVisibility,
     };`,
   )(
@@ -814,6 +875,26 @@ return {
   };
 
 describe("Codex Desktop retained native ownership provenance", () => {
+  it("validates complete scope snapshots once per reconciliation phase", async () => {
+    const atom = createAtom();
+    const { scope } = createScope(createManagedCache(), new Set(["high"]));
+    const state = createState(atom, scope);
+    const ownKeys = vi.fn(Reflect.ownKeys);
+    const api = createScannedReconciler(state, {
+      memoizedState: new Proxy({ owner: scope }, { ownKeys }),
+    });
+
+    await api.scan();
+    expect(api.snapshotCurrent()).toBe(true);
+    ownKeys.mockClear();
+
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "known",
+      patchedScopes: 1,
+    });
+    expect(ownKeys).toHaveBeenCalledTimes(2);
+  });
+
   it("uses an exact current atom owner when broad discovery is capped", () => {
     const cache = createManagedCache();
     const atom = createAtom();
@@ -837,7 +918,7 @@ describe("Codex Desktop retained native ownership provenance", () => {
     expect(canonical.scope.get(atom).has("max")).toBe(true);
   });
 
-  it("keeps a branded owner usable when unrelated Fiber values hit the queue cap", () => {
+  it("completes the branded owner proof beyond the per-Fiber discovery cap", () => {
     const cache = createManagedCache();
     const atom = createAtom();
     const canonical = createScope(cache, new Set(["high"]));
@@ -856,14 +937,107 @@ describe("Codex Desktop retained native ownership provenance", () => {
       canonicalOwnerRefusalReason: null,
       canonicalOwnerCounts: {
         hintCount: 1,
-        hintScanStatus: "capped",
-        hintScanReason: "value_limit",
+        hintScanStatus: "complete",
+        hintScanReason: null,
       },
     });
     expect(canonical.scope.get(atom).has("max")).toBe(true);
   });
 
-  it("still rejects a visible conflicting cache when the hint walk is capped", () => {
+  it("accepts a current branded owner when the retained candidate object is stale", () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const brand = {};
+    atom.scope = brand;
+    const retained = createScope(cache, new Set(["high"])).scope;
+    const current = createScope(cache, new Set(["high"])).scope;
+    (retained as Record<string, unknown>).scope = brand;
+    (current as Record<string, unknown>).scope = brand;
+    const state = createState(atom, retained);
+    state.appServerStatusAtoms = [atom];
+    state.scopedAppServerScopeScanComplete = false;
+    const api = createScannedReconciler(state, {
+      memoizedState: {
+        current,
+        unrelated: Object.fromEntries(
+          Array.from({ length: 2048 }, (_, index) => [`value${index}`, {}]),
+        ),
+      },
+    });
+
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "known",
+      patchedScopes: 1,
+      canonicalOwnerRefusalReason: null,
+    });
+    expect(current.get(atom).has("max")).toBe(true);
+    expect(retained.get).not.toHaveBeenCalled();
+  });
+
+  it("ignores stale same-brand candidates retained from earlier scans", () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const brand = {};
+    atom.scope = brand;
+    const stale = createScope(cache, new Set(["high"])).scope;
+    const retained = createScope(cache, new Set(["high"])).scope;
+    const current = createScope(cache, new Set(["high"])).scope;
+    for (const scope of [stale, retained, current])
+      (scope as Record<string, unknown>).scope = brand;
+    const state = createState(atom, stale, retained);
+    state.appServerStatusAtoms = [atom];
+    state.scopedAppServerScopeScanComplete = false;
+    const api = createScannedReconciler(state, {
+      memoizedState: {
+        current,
+        unrelated: Object.fromEntries(
+          Array.from({ length: 2048 }, (_, index) => [`value${index}`, {}]),
+        ),
+      },
+    });
+
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "known",
+      patchedScopes: 1,
+      canonicalOwnerRefusalReason: null,
+    });
+    expect(current.get(atom).has("max")).toBe(true);
+    expect(stale.get).not.toHaveBeenCalled();
+    expect(retained.get).not.toHaveBeenCalled();
+  });
+
+  it("ignores retained candidates from unrelated dependency brands", () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const canonical = createScope(cache, new Set(["high"])).scope;
+    const unrelated = createScope(
+      createManagedCache(),
+      new Set(["high"]),
+    ).scope;
+    (canonical as Record<string, unknown>).scope = atom.scope;
+    (unrelated as Record<string, unknown>).scope = {};
+    const state = createState(atom, unrelated);
+    state.appServerStatusAtoms = [atom];
+    state.scopedAppServerScopeScanComplete = false;
+    const api = createScannedReconciler(state, {
+      memoizedState: {
+        current: canonical,
+        unrelated: Object.fromEntries(
+          Array.from({ length: 2048 }, (_, index) => [`value${index}`, {}]),
+        ),
+      },
+    });
+
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "known",
+      patchedScopes: 1,
+      canonicalOwnerRefusalReason: null,
+    });
+    expect(canonical.get(atom).has("max")).toBe(true);
+    expect(unrelated.get).not.toHaveBeenCalled();
+  });
+
+  it("rejects conflicting caches found before the per-Fiber discovery cap", () => {
     const atom = createAtom();
     const first = createScope(createManagedCache(), new Set(["high"]));
     const second = createScope(createManagedCache(), new Set(["high"]));
@@ -886,8 +1060,8 @@ describe("Codex Desktop retained native ownership provenance", () => {
       canonicalOwnerRefusalReason: "hints_ambiguous",
       canonicalOwnerCounts: {
         hintCount: 2,
-        hintScanStatus: "capped",
-        hintScanReason: "value_limit",
+        hintScanStatus: "complete",
+        hintScanReason: null,
       },
       ownerFailureCounts: { canonical_owner_unverified: 1 },
     });
@@ -895,31 +1069,66 @@ describe("Codex Desktop retained native ownership provenance", () => {
     expect(second.scope.get).not.toHaveBeenCalled();
   });
 
-  it("keeps the canonical proof complete across the observed mounted scope multiplicity", () => {
-    const cache = createManagedCache();
+  it("refuses a previously unseen conflicting scope beyond the old per-Fiber cap", () => {
     const atom = createAtom();
-    const brand = atom.scope;
-    const scopes = Array.from({ length: 17 }, () => {
-      const candidate = createScope(cache, new Set(["high"])).scope;
-      (candidate as Record<string, unknown>).scope = brand;
-      return candidate;
-    });
-    const state = createState(atom, scopes[0]);
+    const first = createScope(createManagedCache(), new Set(["high"]));
+    const unseen = createScope(createManagedCache(), new Set(["high"]));
+    for (const { scope } of [first, unseen])
+      (scope as Record<string, unknown>).scope = atom.scope;
+    const values: Record<string, unknown> = { first: first.scope };
+    for (let index = 0; index < 2048; index += 1)
+      values[`unrelated${index}`] = {};
+    values.unseen = unseen.scope;
+    const state = createState(atom, first.scope);
     state.appServerStatusAtoms = [atom];
     state.scopedAppServerScopeScanComplete = false;
-    const values = Object.fromEntries(
-      scopes.map((scope, index) => [`scope${index}`, scope]),
-    );
     const api = createScannedReconciler(state, { memoizedState: values });
 
     expect(api.reconcile(["max"])).toMatchObject({
-      status: "known",
-      patchedScopes: 17,
-      canonicalOwnerRefusalReason: null,
-      canonicalOwnerCounts: { hintCount: 17 },
+      status: "unverified",
+      patchedScopes: 0,
+      canonicalOwnerRefusalReason: "hints_ambiguous",
+      canonicalOwnerCounts: { hintCount: 2, hintScanStatus: "complete" },
     });
-    expect(scopes.every((scope) => scope.get(atom).has("max"))).toBe(true);
+    expect(first.scope.get).not.toHaveBeenCalled();
+    expect(unseen.scope.get).not.toHaveBeenCalled();
   });
+
+  it.each([64, 96])(
+    "verifies all %i mounted scopes sharing one managed cache",
+    (scopeCount) => {
+      const cache = createManagedCache();
+      const getAll = vi.spyOn(cache, "getAll");
+      const atom = createAtom();
+      const brand = atom.scope;
+      const scopes = Array.from({ length: scopeCount }, () => {
+        const candidate = createScope(cache, new Set(["high"])).scope;
+        (candidate as Record<string, unknown>).scope = brand;
+        return candidate;
+      });
+      const state = createState(atom, scopes[0]);
+      state.appServerStatusAtoms = [atom];
+      state.scopedAppServerScopeScanComplete = false;
+      const values = Object.fromEntries(
+        scopes.map((scope, index) => [`scope${index}`, scope]),
+      );
+      const ownKeys = vi.fn(Reflect.ownKeys);
+      const api = createScannedReconciler(state, {
+        memoizedState: new Proxy(values, { ownKeys }),
+      });
+
+      expect(api.reconcile(["max"])).toMatchObject({
+        status: "known",
+        patchedScopes: scopeCount,
+        canonicalOwnerRefusalReason: null,
+        canonicalOwnerCounts: { hintCount: scopeCount },
+      });
+      expect(getAll.mock.calls.length).toBeLessThanOrEqual(2);
+      const reconciliationScans = ownKeys.mock.calls.length;
+      expect(scopes.every((scope) => scope.get(atom).has("max"))).toBe(true);
+      expect(ownKeys).toHaveBeenCalledTimes(reconciliationScans);
+    },
+  );
 
   it.each([false, true])(
     "checks all branded owners and exact mounting behind scalar fields (conflicting cache: %s)",
@@ -1001,6 +1210,149 @@ describe("Codex Desktop retained native ownership provenance", () => {
     });
     expect(replacement.get).not.toHaveBeenCalled();
     expect(canonical.scope.get(atom)).toBe(enabled);
+  });
+
+  it("recovers from a scope replacement after a fresh capped discovery proves its binding", async () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const baseline = new Set(["high"]);
+    const first = createScope(cache, baseline).scope;
+    const replacement = createScope(cache, baseline).scope;
+    replacement.node = first.node;
+    for (const scope of [first, replacement])
+      (scope as Record<string, unknown>).scope = atom.scope;
+    const state = createState(atom, first);
+    state.appServerStatusAtoms = [atom];
+    const ref = {
+      current: first,
+      unrelated: Object.fromEntries(
+        Array.from({ length: 2048 }, (_, index) => [`value${index}`, {}]),
+      ),
+    };
+    const api = createScannedReconciler(state, { memoizedState: ref });
+    expect((await api.scan()).includes(first)).toBe(true);
+    expect(api.snapshotCurrent()).toBe(false);
+    expect(api.reconcile(["max"]).status).toBe("known");
+    expect(first.get(atom).has("max")).toBe(true);
+
+    ref.current = replacement;
+    expect(api.reconcile(["max"]).status).toBe("unverified");
+    expect(first.get(atom)).toBe(baseline);
+    expect(api.caches()).toBeNull();
+    expect(replacement.get).not.toHaveBeenCalled();
+
+    expect((await api.scan()).includes(replacement)).toBe(true);
+    expect(api.snapshotCurrent()).toBe(false);
+    expect(api.caches()).toBeNull();
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "known",
+      patchedScopes: 1,
+      canonicalOwnerCounts: {
+        hintScanStatus: "complete",
+        hintScanReason: null,
+      },
+    });
+    expect(api.caches()).toEqual(new Set([cache]));
+    expect(replacement.get(atom).has("max")).toBe(true);
+    expect(first.get(atom)).toBe(baseline);
+
+    const unscanned = createScope(cache, baseline).scope;
+    unscanned.node = first.node;
+    (unscanned as Record<string, unknown>).scope = atom.scope;
+    ref.current = unscanned;
+    expect(api.reconcile(["max"]).status).toBe("unverified");
+    expect(replacement.get(atom)).toBe(baseline);
+    expect(unscanned.get).not.toHaveBeenCalled();
+  });
+
+  it("rebinds a published owner found only by the complete canonical scan", async () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const baseline = new Set(["high"]);
+    const first = createScope(cache, baseline).scope;
+    const replacement = createScope(cache, baseline).scope;
+    replacement.node = first.node;
+    for (const scope of [first, replacement])
+      (scope as Record<string, unknown>).scope = atom.scope;
+    const state = createState(atom, first);
+    state.appServerStatusAtoms = [atom];
+    const mounted: Record<string, unknown> = {
+      current: first,
+      ...Object.fromEntries(
+        Array.from({ length: 2048 }, (_, index) => [`value${index}`, {}]),
+      ),
+      replacement: null,
+    };
+    const api = createScannedReconciler(state, { memoizedState: mounted });
+    expect((await api.scan()).includes(first)).toBe(true);
+    expect(api.snapshotCurrent()).toBe(false);
+    expect(api.reconcile(["max"]).status).toBe("known");
+    expect(first.get(atom).has("max")).toBe(true);
+
+    mounted.current = null;
+    mounted.replacement = replacement;
+    expect(api.reconcile(["max"]).status).toBe("unverified");
+    expect(first.get(atom)).toBe(baseline);
+    expect(replacement.get).not.toHaveBeenCalled();
+
+    expect((await api.scan()).includes(replacement)).toBe(false);
+    expect(api.snapshotCurrent()).toBe(false);
+    expect(api.caches()).toBeNull();
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "known",
+      patchedScopes: 1,
+      canonicalOwnerCounts: {
+        hintScanStatus: "complete",
+        hintScanReason: null,
+      },
+    });
+    expect(api.caches()).toEqual(new Set([cache]));
+    expect(replacement.get(atom).has("max")).toBe(true);
+    expect(first.get(atom)).toBe(baseline);
+  });
+
+  it("recovers a replacement in a later Fiber after an earlier Fiber exhausts its value budget", async () => {
+    const cache = createManagedCache();
+    const atom = createAtom();
+    const baseline = new Set(["high"]);
+    const first = createScope(cache, baseline).scope;
+    const replacement = createScope(cache, baseline).scope;
+    replacement.node = first.node;
+    for (const scope of [first, replacement])
+      (scope as Record<string, unknown>).scope = atom.scope;
+    const state = createState(atom, first);
+    state.appServerStatusAtoms = [atom];
+    const ref = { current: first };
+    const earlierFiber = {
+      memoizedState: {},
+      sibling: { memoizedState: ref },
+    };
+    const api = createScannedReconciler(state, { child: earlierFiber });
+    expect((await api.scan()).includes(first)).toBe(true);
+    expect(api.snapshotCurrent()).toBe(true);
+    expect(api.reconcile(["max"]).status).toBe("known");
+
+    earlierFiber.memoizedState = Object.fromEntries(
+      Array.from({ length: 2048 }, (_, index) => [`value${index}`, {}]),
+    );
+    ref.current = replacement;
+    expect(api.reconcile(["max"]).status).toBe("unverified");
+    expect(first.get(atom)).toBe(baseline);
+    expect(replacement.get).not.toHaveBeenCalled();
+
+    expect((await api.scan()).includes(replacement)).toBe(true);
+    expect(state.scopedAppServerScopeScanComplete).toBe(false);
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "known",
+      patchedScopes: 1,
+      canonicalOwnerCounts: {
+        hintScanStatus: "complete",
+        hintScanReason: null,
+      },
+    });
+    expect(api.caches()).toEqual(new Set([cache]));
+    expect(replacement.get(atom).has("max")).toBe(true);
+    expect(first.get(atom)).toBe(baseline);
   });
 
   it.each([
@@ -1259,20 +1611,51 @@ describe("Codex Desktop retained native ownership provenance", () => {
     expect(canonical.scope.get).not.toHaveBeenCalled();
   });
 
-  it("does not certify atom-owner uniqueness when the Fiber value bound omits a duplicate", () => {
+  it("patches all same-cache owners found beyond the per-Fiber discovery cap", () => {
     const cache = createManagedCache();
     const atom = createAtom();
     const brand = {};
     atom.scope = brand;
     const first = createScope(cache, new Set(["high"]));
-    const omitted = createScope(cache, new Set(["high"]));
+    const second = createScope(cache, new Set(["high"]));
     (first.scope as Record<string, unknown>).scope = brand;
-    (omitted.scope as Record<string, unknown>).scope = brand;
+    (second.scope as Record<string, unknown>).scope = brand;
     const values: Record<string, unknown> = { first: first.scope };
     for (let index = 0; index < 2048; index += 1)
       values[`unrelated${index}`] = {};
-    values.duplicate = omitted.scope;
-    const state = createState(atom, first.scope, omitted.scope);
+    values.second = second.scope;
+    const state = createState(atom, first.scope, second.scope);
+    state.appServerStatusAtoms = [atom];
+    state.scopedAppServerScopeScanComplete = false;
+    const api = createScannedReconciler(state, { memoizedState: values });
+
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "known",
+      patchedScopes: 2,
+      canonicalOwnerRefusalReason: null,
+      canonicalOwnerCounts: {
+        appServerStatusAtomCount: 1,
+        uniqueBrandCount: 1,
+        hintCount: 2,
+        pendingNodeCount: 0,
+      },
+      ownerFailureCounts: { canonical_owner_unverified: 0 },
+    });
+    expect(first.scope.get(atom).has("max")).toBe(true);
+    expect(second.scope.get(atom).has("max")).toBe(true);
+  });
+
+  it("refuses conflicting owners even when the retained inventory contains only one of them", () => {
+    const atom = createAtom();
+    const visible = createScope(createManagedCache(), new Set(["high"]));
+    const omitted = createScope(createManagedCache(), new Set(["high"]));
+    (visible.scope as Record<string, unknown>).scope = atom.scope;
+    (omitted.scope as Record<string, unknown>).scope = atom.scope;
+    const values: Record<string, unknown> = { visible: visible.scope };
+    for (let index = 0; index < 2048; index += 1)
+      values[`unrelated${index}`] = {};
+    values.omitted = omitted.scope;
+    const state = createState(atom, omitted.scope);
     state.appServerStatusAtoms = [atom];
     state.scopedAppServerScopeScanComplete = false;
     const api = createScannedReconciler(state, { memoizedState: values });
@@ -1280,16 +1663,10 @@ describe("Codex Desktop retained native ownership provenance", () => {
     expect(api.reconcile(["max"])).toMatchObject({
       status: "unverified",
       patchedScopes: 0,
-      canonicalOwnerRefusalReason: "hints_incomplete",
-      canonicalOwnerCounts: {
-        appServerStatusAtomCount: 1,
-        uniqueBrandCount: 1,
-        hintCount: 1,
-        pendingNodeCount: 0,
-      },
-      ownerFailureCounts: { canonical_owner_unverified: 1 },
+      canonicalOwnerRefusalReason: "hints_ambiguous",
+      canonicalOwnerCounts: { hintCount: 2, hintScanStatus: "complete" },
     });
-    expect(first.scope.get).not.toHaveBeenCalled();
+    expect(visible.scope.get).not.toHaveBeenCalled();
     expect(omitted.scope.get).not.toHaveBeenCalled();
   });
 
@@ -1323,6 +1700,44 @@ describe("Codex Desktop retained native ownership provenance", () => {
     expect(readDescriptors).toHaveBeenCalled();
     expect(first.scope.get).not.toHaveBeenCalled();
     expect(hidden.scope.get).not.toHaveBeenCalled();
+  });
+
+  it("does not let a value cap hide unreadable ownership evidence", () => {
+    const atom = createAtom();
+    const cache = createManagedCache();
+    const visible = createScope(cache, new Set(["high"])).scope;
+    const hidden = createScope(createManagedCache(), new Set(["high"])).scope;
+    for (const scope of [visible, hidden])
+      (scope as Record<string, unknown>).scope = atom.scope;
+    const unreadable = new Proxy(
+      { hidden },
+      {
+        ownKeys() {
+          throw new Error("unreadable_fixture");
+        },
+      },
+    );
+    const state = createState(atom, visible);
+    state.appServerStatusAtoms = [atom];
+    state.scopedAppServerScopeScanComplete = false;
+    const api = createScannedReconciler(state, {
+      memoizedState: {
+        visible,
+        unreadable,
+        unrelated: Object.fromEntries(
+          Array.from({ length: 2048 }, (_, index) => [`value${index}`, {}]),
+        ),
+      },
+    });
+
+    expect(api.reconcile(["max"])).toMatchObject({
+      status: "unverified",
+      patchedScopes: 0,
+      canonicalOwnerRefusalReason: "hints_incomplete",
+      canonicalOwnerCounts: { hintScanReason: "read_failed" },
+    });
+    expect(visible.get).not.toHaveBeenCalled();
+    expect(hidden.get).not.toHaveBeenCalled();
   });
 
   it("exposes declared Max to the mounted picker when several branded scopes own the managed cache", () => {

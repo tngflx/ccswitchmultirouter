@@ -5,11 +5,15 @@
 //! Diagnostics contain only byte counts, item kinds, structural findings, and
 //! redacted routing identifiers.
 
+use super::forwarder::FinalizedRequestPayload;
 use crate::settings::{RequestHealthConfig, RequestHealthReviewMode, RequestOptimizationMode};
-use serde::Serialize;
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Write};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -270,24 +274,59 @@ pub fn snapshot(config: RequestHealthConfig) -> RequestHealthSnapshot {
     }
 }
 
-pub(crate) fn inspect_and_optimize(
+#[cfg(test)]
+thread_local! {
+    pub(super) static REQUEST_JSON_SERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DIAGNOSTIC_SIZE_MEASUREMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static REQUEST_JSON_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static DIAGNOSTIC_MEASUREMENT_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn serialize_request_json(body: &Value) -> serde_json::Result<Vec<u8>> {
+    #[cfg(test)]
+    REQUEST_JSON_SERIALIZATIONS.with(|count| count.set(count.get() + 1));
+    let serialized = serde_json::to_vec(body)?;
+    #[cfg(test)]
+    REQUEST_JSON_BYTES.with(|count| count.set(count.get() + serialized.len()));
+    Ok(serialized)
+}
+
+pub(super) fn prepare_request_json(
+    method: &http::Method,
     body: &mut Value,
     config: &RequestHealthConfig,
     context: RequestHealthContext<'_>,
-) -> Option<RequestHealthDiagnostic> {
-    if !crate::settings::request_health_diagnostics_active(config) {
-        return None;
+) -> serde_json::Result<(Option<RequestHealthDiagnostic>, Vec<u8>)> {
+    if matches!(method, &http::Method::GET | &http::Method::HEAD) {
+        return Ok((None, Vec::new()));
     }
+    match inspect_and_serialize(body, config, context)? {
+        Some((diagnostic, serialized)) => Ok((Some(diagnostic), serialized)),
+        None => Ok((None, serialize_request_json(body)?)),
+    }
+}
 
-    let original_bytes = serialized_len(body);
-    let mut analysis = Analysis::default();
-    analyze_conversation_items(body, &mut analysis);
+pub(crate) fn inspect_and_serialize(
+    body: &mut Value,
+    config: &RequestHealthConfig,
+    context: RequestHealthContext<'_>,
+) -> serde_json::Result<Option<(RequestHealthDiagnostic, Vec<u8>)>> {
+    if !crate::settings::request_health_diagnostics_active(config) {
+        return Ok(None);
+    }
 
     let optimization_applied = config.optimization_mode == RequestOptimizationMode::Safe;
-    if optimization_applied {
-        remove_safe_transport_metadata(body);
-    }
-    let optimized_bytes = serialized_len(body);
+    let removed = if optimization_applied {
+        remove_safe_transport_metadata(body)?
+    } else {
+        RemovedTransportMetadata::default()
+    };
+    let (serialized_body, measurements) = serialize_measured_request_json(body, &removed)?;
+    let mut analysis = Analysis::default();
+    analyze_conversation_items(body, &measurements, &mut analysis);
+    let bytes_removed = removed.bytes;
+    let optimized_bytes = serialized_body.len();
+    let original_bytes = optimized_bytes + bytes_removed;
     let threshold_bytes = config.large_request_threshold_bytes.max(64 * 1024) as usize;
     let threshold_exceeded = optimized_bytes >= threshold_bytes;
     let estimated_input_tokens = optimized_bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN);
@@ -408,7 +447,7 @@ pub(crate) fn inspect_and_optimize(
         client_request_bytes: context.client_request_bytes,
         original_bytes,
         optimized_bytes,
-        bytes_removed: original_bytes.saturating_sub(optimized_bytes),
+        bytes_removed,
         threshold_bytes,
         threshold_exceeded,
         estimated_input_tokens,
@@ -462,7 +501,7 @@ pub(crate) fn inspect_and_optimize(
     }
     store.push_back(diagnostic.clone());
     refresh_session_review_risk(&mut store, context.session_id);
-    Some(diagnostic)
+    Ok(Some((diagnostic, serialized_body)))
 }
 
 /// Attach authoritative upstream usage to the matching finalized request. A
@@ -810,14 +849,13 @@ fn register_pending_review(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn review_before_upstream(
+pub(super) async fn review_before_upstream(
     _inspected_config: &RequestHealthConfig,
     trace_id: &str,
     session_id: &str,
     session_client_provided: bool,
     model: &str,
-    transformed_json: &[u8],
-    wire_body: &[u8],
+    payload: &FinalizedRequestPayload,
     dispatch_scope: &str,
     compaction_request: bool,
 ) -> Result<PreflightReviewOutcome, String> {
@@ -827,8 +865,7 @@ pub(crate) async fn review_before_upstream(
         session_id,
         session_client_provided,
         model,
-        transformed_json,
-        wire_body,
+        payload,
         dispatch_scope,
         compaction_request,
     )
@@ -842,15 +879,14 @@ async fn review_before_upstream_with_config(
     session_id: &str,
     session_client_provided: bool,
     model: &str,
-    transformed_json: &[u8],
-    wire_body: &[u8],
+    payload: &FinalizedRequestPayload,
     dispatch_scope: &str,
     compaction_request: bool,
 ) -> Result<PreflightReviewOutcome, String> {
     // The handoff summary is an intentional second turn over the same large
     // source context. Re-running it through the oversized-request gate would
     // recursively block the handoff that is supposed to recover the session.
-    if is_active_manual_summary_request(session_id, transformed_json) {
+    if is_active_manual_summary_request(session_id, payload.transformed_json()) {
         return Ok(PreflightReviewOutcome::NotRequired);
     }
 
@@ -861,7 +897,7 @@ async fn review_before_upstream_with_config(
         || session_id.is_empty()
         || !session_client_provided
         || compaction_request
-        || transformed_json.is_empty()
+        || payload.transformed_json().is_empty()
     {
         return Ok(PreflightReviewOutcome::NotRequired);
     }
@@ -872,13 +908,13 @@ async fn review_before_upstream_with_config(
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (model, wire_body, dispatch_scope);
+        let _ = (model, dispatch_scope);
         return Ok(PreflightReviewOutcome::NotRequired);
     }
 
     #[cfg(target_os = "windows")]
     {
-        let body_hash = wire_body_hash(wire_body);
+        let body_hash = payload.wire_hash();
         let dispatch_hash = wire_body_hash(dispatch_scope.as_bytes());
         let token = uuid::Uuid::new_v4().simple().to_string();
         let (sender, receiver) = oneshot::channel();
@@ -888,7 +924,7 @@ async fn review_before_upstream_with_config(
             PendingReview {
                 trace_id: trace_id.to_string(),
                 session_id: session_id.to_string(),
-                body_hash: body_hash.clone(),
+                body_hash: body_hash.to_owned(),
                 dispatch_hash: dispatch_hash.clone(),
                 sender,
             },
@@ -897,7 +933,7 @@ async fn review_before_upstream_with_config(
                 let Some(risk) = review_finding(current_config, trace_id, session_id) else {
                     return Ok(Some(PreflightReviewOutcome::NotRequired));
                 };
-                if payload_was_approved(trace_id, session_id, &body_hash, &dispatch_hash) {
+                if payload_was_approved(trace_id, session_id, body_hash, &dispatch_hash) {
                     return Ok(Some(PreflightReviewOutcome::ContinueOnce));
                 }
                 let diagnostic = diagnostics_store()
@@ -910,9 +946,9 @@ async fn review_before_upstream_with_config(
 
                 show_windows_review_notification(
                     &token,
-                    &body_hash,
+                    body_hash,
                     model,
-                    wire_body.len(),
+                    payload.wire_len(),
                     &risk,
                     current_config.review_timeout_seconds,
                     current_config.summarize_and_restart_enabled,
@@ -929,7 +965,7 @@ async fn review_before_upstream_with_config(
         };
         let _guard = PendingReviewGuard {
             token: token.clone(),
-            body_hash: body_hash.clone(),
+            body_hash: body_hash.to_owned(),
         };
 
         let timeout_seconds = u64::from(config.review_timeout_seconds)
@@ -1319,11 +1355,251 @@ fn truncate_for_notification(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn serialized_len(value: &Value) -> usize {
-    serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
+#[derive(Clone, Copy, Default)]
+struct ItemMeasurement {
+    bytes: usize,
+    media_bytes: usize,
 }
 
-fn analyze_conversation_items(body: &Value, analysis: &mut Analysis) {
+#[derive(Default)]
+struct RemovedTransportMetadata {
+    bytes: usize,
+    items: HashMap<&'static str, HashMap<usize, ItemMeasurement>>,
+}
+
+struct CountingWriter<'a, W> {
+    inner: W,
+    position: &'a Cell<usize>,
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.position.set(self.position.get() + written);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Measure image objects while emitting their JSON, including the original
+/// contribution of metadata removed from the containing conversation item.
+struct MeasuredJsonValue<'a> {
+    value: &'a Value,
+    position: &'a Cell<usize>,
+    media_bytes: &'a Cell<usize>,
+    removed: ItemMeasurement,
+}
+
+impl Serialize for MeasuredJsonValue<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let start = self.position.get();
+        let media_before = self.media_bytes.get();
+        match self.value {
+            Value::Object(fields) => {
+                let image_object = fields
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| matches!(kind, "image" | "input_image" | "image_url"))
+                    || fields
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.starts_with("image/"));
+                let mut map = serializer.serialize_map(Some(fields.len()))?;
+                for (key, value) in fields {
+                    map.serialize_entry(
+                        key,
+                        &Self {
+                            value,
+                            position: self.position,
+                            media_bytes: self.media_bytes,
+                            removed: ItemMeasurement::default(),
+                        },
+                    )?;
+                }
+                let result = map.end()?;
+                let nested_media = self.media_bytes.get() - media_before + self.removed.media_bytes;
+                let original_media = if image_object && nested_media == 0 {
+                    self.position.get() - start + self.removed.bytes
+                } else {
+                    nested_media
+                };
+                self.media_bytes.set(media_before + original_media);
+                Ok(result)
+            }
+            Value::Array(items) => {
+                let mut sequence = serializer.serialize_seq(Some(items.len()))?;
+                for value in items {
+                    sequence.serialize_element(&Self {
+                        value,
+                        position: self.position,
+                        media_bytes: self.media_bytes,
+                        removed: ItemMeasurement::default(),
+                    })?;
+                }
+                sequence.end()
+            }
+            Value::String(text) => {
+                let result = text.serialize(serializer)?;
+                if text.starts_with("data:image/") && text.contains(";base64,") {
+                    self.media_bytes.set(self.media_bytes.get() + text.len());
+                }
+                Ok(result)
+            }
+            value => value.serialize(serializer),
+        }
+    }
+}
+
+struct MeasuredConversationItem<'a> {
+    value: &'a Value,
+    removed: ItemMeasurement,
+    position: &'a Cell<usize>,
+    measurements: &'a RefCell<Vec<ItemMeasurement>>,
+}
+
+impl Serialize for MeasuredConversationItem<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let start = self.position.get();
+        let media_bytes = Cell::new(0);
+        let result = MeasuredJsonValue {
+            value: self.value,
+            position: self.position,
+            media_bytes: &media_bytes,
+            removed: self.removed,
+        }
+        .serialize(serializer)?;
+        self.measurements.borrow_mut().push(ItemMeasurement {
+            bytes: self.position.get() - start + self.removed.bytes,
+            media_bytes: media_bytes.get(),
+        });
+        Ok(result)
+    }
+}
+
+struct MeasuredConversationItems<'a> {
+    items: &'a [Value],
+    removed: Option<&'a HashMap<usize, ItemMeasurement>>,
+    position: &'a Cell<usize>,
+    measurements: &'a RefCell<Vec<ItemMeasurement>>,
+}
+
+impl Serialize for MeasuredConversationItems<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.items.len()))?;
+        for (index, value) in self.items.iter().enumerate() {
+            let removed = self
+                .removed
+                .and_then(|items| items.get(&index))
+                .copied()
+                .unwrap_or_default();
+            sequence.serialize_element(&MeasuredConversationItem {
+                value,
+                removed,
+                position: self.position,
+                measurements: self.measurements,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+struct MeasuredRequestJson<'a> {
+    body: &'a Value,
+    removed: &'a RemovedTransportMetadata,
+    position: &'a Cell<usize>,
+    measurements: &'a RefCell<Vec<ItemMeasurement>>,
+}
+
+impl Serialize for MeasuredRequestJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Some(fields) = self.body.as_object() else {
+            return self.body.serialize(serializer);
+        };
+        let collection = ["input", "messages", "contents"]
+            .into_iter()
+            .find(|key| fields.get(*key).is_some_and(Value::is_array));
+        let mut map = serializer.serialize_map(Some(fields.len()))?;
+        for (key, value) in fields {
+            if Some(key.as_str()) == collection {
+                if let Some(items) = value.as_array() {
+                    map.serialize_entry(
+                        key,
+                        &MeasuredConversationItems {
+                            items,
+                            removed: self.removed.items.get(key.as_str()),
+                            position: self.position,
+                            measurements: self.measurements,
+                        },
+                    )?;
+                }
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+}
+
+fn serialize_measured_request_json(
+    body: &Value,
+    removed: &RemovedTransportMetadata,
+) -> serde_json::Result<(Vec<u8>, Vec<ItemMeasurement>)> {
+    #[cfg(test)]
+    REQUEST_JSON_SERIALIZATIONS.with(|count| count.set(count.get() + 1));
+    let position = Cell::new(0);
+    let measurements = RefCell::new(Vec::new());
+    let mut writer = CountingWriter {
+        inner: Vec::new(),
+        position: &position,
+    };
+    serde_json::to_writer(
+        &mut writer,
+        &MeasuredRequestJson {
+            body,
+            removed,
+            position: &position,
+            measurements: &measurements,
+        },
+    )?;
+    #[cfg(test)]
+    REQUEST_JSON_BYTES.with(|count| count.set(count.get() + position.get()));
+    Ok((writer.inner, measurements.into_inner()))
+}
+
+fn measure_removed_metadata(value: &Value) -> serde_json::Result<ItemMeasurement> {
+    #[cfg(test)]
+    DIAGNOSTIC_SIZE_MEASUREMENTS.with(|count| count.set(count.get() + 1));
+    let position = Cell::new(0);
+    let media_bytes = Cell::new(0);
+    let mut writer = CountingWriter {
+        inner: io::sink(),
+        position: &position,
+    };
+    serde_json::to_writer(
+        &mut writer,
+        &MeasuredJsonValue {
+            value,
+            position: &position,
+            media_bytes: &media_bytes,
+            removed: ItemMeasurement::default(),
+        },
+    )?;
+    #[cfg(test)]
+    DIAGNOSTIC_MEASUREMENT_BYTES.with(|count| count.set(count.get() + position.get()));
+    Ok(ItemMeasurement {
+        bytes: position.get(),
+        media_bytes: media_bytes.get(),
+    })
+}
+
+fn analyze_conversation_items(
+    body: &Value,
+    measurements: &[ItemMeasurement],
+    analysis: &mut Analysis,
+) {
     let Some(object) = body.as_object() else {
         return;
     };
@@ -1334,11 +1610,11 @@ fn analyze_conversation_items(body: &Value, analysis: &mut Analysis) {
         return;
     };
 
-    for item in items {
-        let bytes = serialized_len(item);
+    for (item, measurement) in items.iter().zip(measurements) {
+        let bytes = measurement.bytes;
         let category = item_category(item);
         analysis.item_count += 1;
-        let media_bytes = image_payload_bytes(item);
+        let media_bytes = measurement.media_bytes;
         if media_bytes > 0 {
             analysis.media_items += 1;
             analysis.media_bytes += media_bytes;
@@ -1366,32 +1642,6 @@ fn analyze_conversation_items(body: &Value, analysis: &mut Analysis) {
                 analysis.outputs.push(call_id.to_string());
             }
         }
-    }
-}
-
-fn image_payload_bytes(value: &Value) -> usize {
-    match value {
-        Value::Object(map) => {
-            let image_object = map
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|t| matches!(t, "image" | "input_image" | "image_url"))
-                || map
-                    .get("mimeType")
-                    .and_then(Value::as_str)
-                    .is_some_and(|m| m.starts_with("image/"));
-            let nested = map.values().map(image_payload_bytes).sum::<usize>();
-            if image_object && nested == 0 {
-                serialized_len(value)
-            } else {
-                nested
-            }
-        }
-        Value::Array(items) => items.iter().map(image_payload_bytes).sum(),
-        Value::String(text) if text.starts_with("data:image/") && text.contains(";base64,") => {
-            text.len()
-        }
-        _ => 0,
     }
 }
 
@@ -1474,12 +1724,16 @@ fn is_output_type(item_type: &str) -> bool {
     )
 }
 
-fn remove_safe_transport_metadata(body: &mut Value) {
+fn remove_safe_transport_metadata(
+    body: &mut Value,
+) -> serde_json::Result<RemovedTransportMetadata> {
+    const METADATA_FIELD: &str = "internal_chat_message_metadata_passthrough";
+    let mut removed = RemovedTransportMetadata::default();
     for key in ["input", "messages", "contents"] {
         let Some(items) = body.get_mut(key).and_then(Value::as_array_mut) else {
             continue;
         };
-        for item in items {
+        for (index, item) in items.iter_mut().enumerate() {
             let Some(object) = item.as_object_mut() else {
                 continue;
             };
@@ -1501,10 +1755,28 @@ fn remove_safe_transport_metadata(body: &mut Value) {
                 _ => false,
             };
             if is_transport_envelope {
-                object.remove("internal_chat_message_metadata_passthrough");
+                if let Some(metadata) = object.remove(METADATA_FIELD) {
+                    // The compact JSON entry contains the literal ASCII field
+                    // name, two quotes, a colon, and a comma if a field remains.
+                    let measurement = measure_removed_metadata(&metadata)?;
+                    let measurement = ItemMeasurement {
+                        bytes: METADATA_FIELD.len()
+                            + 3
+                            + usize::from(!object.is_empty())
+                            + measurement.bytes,
+                        media_bytes: measurement.media_bytes,
+                    };
+                    removed.bytes += measurement.bytes;
+                    removed
+                        .items
+                        .entry(key)
+                        .or_default()
+                        .insert(index, measurement);
+                }
             }
         }
     }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -1525,6 +1797,213 @@ mod tests {
             client_request_bytes: 0,
             compaction_request: false,
             session_client_provided: true,
+        }
+    }
+
+    fn inspect_and_optimize(
+        body: &mut Value,
+        config: &RequestHealthConfig,
+        context: RequestHealthContext<'_>,
+    ) -> Option<RequestHealthDiagnostic> {
+        inspect_and_serialize(body, config, context)
+            .expect("serialize inspected request")
+            .map(|(diagnostic, _)| diagnostic)
+    }
+
+    #[test]
+    fn disabled_diagnostics_skip_serialization_item_analysis_and_optimization() {
+        let original = json!({"input": [{
+            "type": "message", "role": "user", "content": "x".repeat(1024 * 1024),
+            "internal_chat_message_metadata_passthrough": {"fixture": true}
+        }]});
+        let mut body = original.clone();
+        let config = RequestHealthConfig {
+            enabled: false,
+            optimization_mode: RequestOptimizationMode::Safe,
+            ..RequestHealthConfig::default()
+        };
+        REQUEST_JSON_SERIALIZATIONS.with(|count| count.set(0));
+        DIAGNOSTIC_SIZE_MEASUREMENTS.with(|count| count.set(0));
+        assert!(inspect_and_serialize(&mut body, &config, context())
+            .unwrap()
+            .is_none());
+        REQUEST_JSON_SERIALIZATIONS.with(|count| assert_eq!(count.get(), 0));
+        DIAGNOSTIC_SIZE_MEASUREMENTS.with(|count| assert_eq!(count.get(), 0));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn diagnostic_sizes_share_the_emitted_json_traversal() {
+        fn reference_media_bytes(value: &Value) -> usize {
+            match value {
+                Value::Object(fields) => {
+                    let nested = fields.values().map(reference_media_bytes).sum::<usize>();
+                    let image = fields
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| matches!(kind, "image" | "input_image" | "image_url"))
+                        || fields
+                            .get("mimeType")
+                            .and_then(Value::as_str)
+                            .is_some_and(|kind| kind.starts_with("image/"));
+                    if image && nested == 0 {
+                        serde_json::to_vec(value).unwrap().len()
+                    } else {
+                        nested
+                    }
+                }
+                Value::Array(items) => items.iter().map(reference_media_bytes).sum(),
+                Value::String(text)
+                    if text.starts_with("data:image/") && text.contains(";base64,") =>
+                {
+                    text.len()
+                }
+                _ => 0,
+            }
+        }
+
+        for collection in ["input", "messages", "contents"] {
+            for history_bytes in [1024, 1024 * 1024] {
+                let items = json!([
+                    {"type": "message", "role": "user", "mimeType": "image/png",
+                        "content": "escaped \"\n café ".repeat(history_bytes / 16),
+                        "internal_chat_message_metadata_passthrough": {
+                            "fixture": "data:image/png;base64,fixture", "text": "m".repeat(history_bytes)
+                        }
+                    },
+                    {"type": "image_url", "image_url": {"url": "https://fixture.invalid/image\n\""}},
+                    {"type": "message", "role": "assistant", "mimeType": "image/png",
+                        "internal_chat_message_metadata_passthrough": {"fixture": true}},
+                    {"type": "message", "role": "user", "content": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,fixture"},
+                        {"type": "input_text", "text": "fixture"}]},
+                    null,
+                    42
+                ]);
+                let item_list = items.as_array().unwrap();
+                let expected_sizes = item_list
+                    .iter()
+                    .map(|item| serde_json::to_vec(item).unwrap().len())
+                    .collect::<Vec<_>>();
+                let expected_media = item_list
+                    .iter()
+                    .map(reference_media_bytes)
+                    .collect::<Vec<_>>();
+                let mut expected_breakdown = HashMap::<String, (usize, usize)>::new();
+                for (item, bytes) in item_list.iter().zip(&expected_sizes) {
+                    let entry = expected_breakdown.entry(item_category(item)).or_default();
+                    entry.0 += 1;
+                    entry.1 += bytes;
+                }
+                let mut original = json!({"model":"fixture-model", "tools": [{"type":"function", "name":"fixture", "description":"t".repeat(history_bytes)}]});
+                original[collection] = items;
+                let original_bytes = serde_json::to_vec(&original).unwrap().len();
+                for mode in [
+                    RequestOptimizationMode::Off,
+                    RequestOptimizationMode::Diagnose,
+                    RequestOptimizationMode::Safe,
+                ] {
+                    let mut body = original.clone();
+                    let expected_metadata_bytes = if mode == RequestOptimizationMode::Safe {
+                        original[collection]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|item| {
+                                item.get("internal_chat_message_metadata_passthrough")
+                            })
+                            .map(|metadata| serde_json::to_vec(metadata).unwrap().len())
+                            .sum()
+                    } else {
+                        0
+                    };
+                    REQUEST_JSON_SERIALIZATIONS.with(|count| count.set(0));
+                    REQUEST_JSON_BYTES.with(|count| count.set(0));
+                    DIAGNOSTIC_MEASUREMENT_BYTES.with(|count| count.set(0));
+                    let (diagnostic, bytes) = prepare_request_json(
+                        &http::Method::POST,
+                        &mut body,
+                        &RequestHealthConfig {
+                            optimization_mode: mode,
+                            ..RequestHealthConfig::default()
+                        },
+                        context(),
+                    )
+                    .unwrap();
+                    let diagnostic = diagnostic.unwrap();
+                    assert_eq!(bytes, serde_json::to_vec(&body).unwrap());
+                    assert_eq!(diagnostic.original_bytes, original_bytes);
+                    assert_eq!(diagnostic.optimized_bytes, bytes.len());
+                    assert_eq!(diagnostic.item_count, expected_sizes.len());
+                    assert_eq!(
+                        diagnostic.largest_item_bytes,
+                        *expected_sizes.iter().max().unwrap()
+                    );
+                    assert_eq!(diagnostic.media_bytes, expected_media.iter().sum::<usize>());
+                    assert_eq!(
+                        diagnostic.media_items,
+                        expected_media.iter().filter(|bytes| **bytes > 0).count()
+                    );
+                    let actual_breakdown = diagnostic
+                        .breakdown
+                        .into_iter()
+                        .map(|row| (row.category, (row.item_count, row.bytes)))
+                        .collect::<HashMap<_, _>>();
+                    assert_eq!(actual_breakdown, expected_breakdown);
+                    REQUEST_JSON_SERIALIZATIONS.with(|count| assert_eq!(count.get(), 1));
+                    REQUEST_JSON_BYTES.with(|count| assert_eq!(count.get(), bytes.len()));
+                    DIAGNOSTIC_MEASUREMENT_BYTES
+                        .with(|count| assert_eq!(count.get(), expected_metadata_bytes));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostics_measure_the_exact_forwarded_json() {
+        let original = json!({
+            "input": [{
+                "type": "message",
+                "content": "x".repeat(128 * 1024),
+                "internal_chat_message_metadata_passthrough": {
+                    "fixture": ["\n\"\u{e9}", null, true, 1.25]
+                }
+            }]
+        });
+        let original_bytes = serde_json::to_vec(&original).unwrap().len();
+        let item_bytes = serde_json::to_vec(&original["input"][0]).unwrap().len();
+        let mut optimized = original.clone();
+        optimized["input"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("internal_chat_message_metadata_passthrough");
+
+        for (mode, expected) in [
+            (RequestOptimizationMode::Safe, &optimized),
+            (RequestOptimizationMode::Diagnose, &original),
+        ] {
+            let mut body = original.clone();
+            let config = RequestHealthConfig {
+                optimization_mode: mode,
+                ..RequestHealthConfig::default()
+            };
+            let (diagnostic, serialized) = inspect_and_serialize(
+                &mut body,
+                &config,
+                RequestHealthContext {
+                    trace_id: Some("exact-request-size"),
+                    session_id: "exact-request-size",
+                    ..context()
+                },
+            )
+            .unwrap()
+            .expect("request diagnostics");
+            assert_eq!(&body, expected);
+            assert_eq!(serialized, serde_json::to_vec(expected).unwrap());
+            assert_eq!(diagnostic.original_bytes, original_bytes);
+            assert_eq!(diagnostic.optimized_bytes, serialized.len());
+            assert_eq!(diagnostic.bytes_removed, original_bytes - serialized.len());
+            assert_eq!(diagnostic.largest_item_bytes, item_bytes);
         }
     }
 
@@ -1988,7 +2467,7 @@ mod tests {
                 "internal_chat_message_metadata_passthrough".to_string(),
                 json!({"transport":true}),
             );
-            remove_safe_transport_metadata(&mut body);
+            remove_safe_transport_metadata(&mut body).unwrap();
             assert_eq!(body, expected);
         }
     }
@@ -2605,6 +3084,16 @@ mod tests {
         assert!(begin_summary_handoff(session_id).is_some());
     }
 
+    fn review_payload(json: &[u8], compress: bool) -> FinalizedRequestPayload {
+        FinalizedRequestPayload::from_transformed_json(
+            json.len(),
+            json.to_vec(),
+            &mut http::HeaderMap::new(),
+            compress,
+        )
+        .expect("finalize review payload")
+    }
+
     #[tokio::test]
     async fn active_summary_handoff_rejects_a_codex_retry_before_risk_recalculation() {
         let session_id = "summary-handoff-preflight-session";
@@ -2615,8 +3104,7 @@ mod tests {
             session_id,
             true,
             "gpt-test",
-            br#"{"input":"same oversized payload"}"#,
-            br#"{"input":"same oversized payload"}"#,
+            &review_payload(br#"{"input":"same oversized payload"}"#, false),
             "provider|POST|https://example.test/responses",
             false,
         )
@@ -2647,8 +3135,7 @@ mod tests {
             session_id,
             true,
             "gpt-test",
-            &body,
-            b"compressed-or-otherwise-encoded-wire-body",
+            &review_payload(&body, true),
             "provider|POST|https://example.test/responses",
             false,
         )
@@ -2686,8 +3173,7 @@ mod tests {
             "notifications-disabled-session",
             true,
             "gpt-test",
-            br#"{"input":"oversized request"}"#,
-            br#"{"input":"oversized request"}"#,
+            &review_payload(br#"{"input":"oversized request"}"#, false),
             "provider|POST|https://example.test/responses",
             false,
         )

@@ -33,10 +33,11 @@ const terminalErrorCases = JSON.parse(
 type Job = {
   status: string;
   threadId?: string;
-  expectedModel?: string;
+  expectedModel?: string | null;
   observedAtMs?: number;
   submitted?: boolean;
   mutationAttempted?: boolean;
+  usageLimitDeferred?: boolean;
   reason?: string;
 };
 type ContinuationState = {
@@ -50,6 +51,22 @@ type ContinuationState = {
     model: string,
     observedAt: number,
   ) => unknown;
+  startCodexUsageLimitContinuation: (
+    thread: string,
+    recovery: string,
+    model: string | null,
+    observedAt: number,
+    turn: string,
+    requireNativeObservation?: boolean,
+  ) => unknown;
+  getCodexNativeUsageLimitCandidate?: (
+    thread: string,
+    turn: string,
+  ) => {
+    model: string | null;
+    modelProvider: string;
+    observedAtMs: number;
+  } | null;
   startCodexOwnerContinuation: (
     viewReference: string,
     operation: string,
@@ -105,7 +122,7 @@ const createHarness = (
   }));
   const failedThread: {
     id: string;
-    model: string;
+    model: string | null;
     modelProvider?: string;
     status?: unknown;
     turns: Array<{
@@ -158,7 +175,7 @@ const createHarness = (
           .reverse()
           .map((turn) => {
             const metadata = { items: [], itemsView: "notLoaded" };
-            for (const key of ["id", "status", "model"]) {
+            for (const key of ["id", "status", "model", "error"]) {
               const descriptor = Object.getOwnPropertyDescriptor(turn, key);
               if (descriptor) Object.defineProperty(metadata, key, descriptor);
             }
@@ -282,6 +299,7 @@ const createHarness = (
   return {
     state,
     api,
+    storage,
     startTurn,
     failedThread,
     seedMarkers: (markers: object) =>
@@ -2084,6 +2102,240 @@ describe("owner canonical user-action evidence", () => {
       clock.mockRestore();
     }
   });
+
+  it.each([1, 128])(
+    "parses unchanged persisted action evidence once across repeated reads of %i threads",
+    (threadCount) => {
+      const { api, storage } = createHarness();
+      const storageKey = "ccswitch-codex-user-turn-actions-v1";
+      const revision = "a".repeat(32);
+      const threadIds = Array.from(
+        { length: threadCount },
+        (_, index) => `thread-${index}`,
+      );
+      const document = {
+        schemaVersion: 2,
+        revision,
+        actions: Object.fromEntries(
+          threadIds.map((id, index) => [
+            id,
+            {
+              method: "turn/start",
+              atMs: 1_000_000,
+              actionId: (index + 1).toString(16).padStart(32, "0"),
+            },
+          ]),
+        ),
+      };
+      const unchanged = JSON.stringify(document);
+      storage.set(storageKey, unchanged);
+      const storageReads = vi.spyOn(storage, "get");
+      const parse = vi.spyOn(JSON, "parse");
+      try {
+        const threadId = threadIds[0];
+        const first = api.captureCodexOwnerUserActionEvidence(threadId);
+        expect(first).toMatchObject({
+          documentRevision: revision,
+          persistedMethod: "turn/start",
+        });
+        for (let poll = 0; poll < 3; poll += 1) {
+          for (const id of threadIds) {
+            expect(api.captureCodexOwnerUserActionEvidence(id)).toMatchObject({
+              documentRevision: revision,
+              persistedMethod: "turn/start",
+            });
+          }
+        }
+        expect(
+          storageReads.mock.calls.filter(([key]) => key === storageKey),
+        ).toHaveLength(threadCount * 3 + 1);
+        expect(
+          parse.mock.calls.filter(([raw]) => raw === unchanged),
+        ).toHaveLength(1);
+
+        document.actions[threadId].method = "turn/interrupt";
+        const changed = JSON.stringify(document);
+        storage.set(storageKey, changed);
+        expect(api.codexOwnerUserActionEvidenceIsCurrent(threadId, first)).toBe(
+          false,
+        );
+        expect(api.captureCodexOwnerUserActionEvidence(threadId)).toMatchObject(
+          {
+            documentRevision: revision,
+            persistedMethod: "turn/interrupt",
+          },
+        );
+        expect(
+          parse.mock.calls.filter(([raw]) => raw === changed),
+        ).toHaveLength(1);
+
+        document.actions[threadId].method = "invalid-method";
+        storage.set(storageKey, JSON.stringify(document));
+        expect(api.captureCodexOwnerUserActionEvidence(threadId)).toBeNull();
+        storage.delete(storageKey);
+        expect(api.captureCodexOwnerUserActionEvidence(threadId)).toBeNull();
+
+        storage.set(storageKey, unchanged);
+        expect(api.captureCodexOwnerUserActionEvidence(threadId)).toEqual(
+          first,
+        );
+        expect(
+          parse.mock.calls.filter(([raw]) => raw === unchanged),
+        ).toHaveLength(2);
+      } finally {
+        parse.mockRestore();
+        storageReads.mockRestore();
+      }
+    },
+  );
+});
+
+describe("automatic recovery bounded source contract", () => {
+  it("uses only metadata and one unloaded latest turn through preparation and commit", async () => {
+    const harness = createHarness();
+    harness.start();
+    await flushJobs();
+    expect(harness.job().status).toBe("prepared");
+    harness.state.commitCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.startTurn).toHaveBeenCalledTimes(1);
+    const reads = harness.requestCalls.filter(
+      ([method]) => method !== "turn/start",
+    );
+    expect(reads).toHaveLength(6);
+    for (const [method, params] of reads) {
+      expect(params).toEqual(
+        method === "thread/read"
+          ? { threadId: "exact-thread", includeTurns: false }
+          : {
+              threadId: "exact-thread",
+              cursor: null,
+              limit: 1,
+              sortDirection: "desc",
+              itemsView: "notLoaded",
+            },
+      );
+    }
+  });
+
+  it("refuses unavailable pagination without loading the automatic recovery transcript", async () => {
+    const harness = createHarness(false, undefined, "failed", {
+      boundedHistoryUnavailable: true,
+    });
+    harness.start();
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.requestCalls).toEqual([
+      ["thread/read", { threadId: "exact-thread", includeTurns: false }],
+      [
+        "thread/turns/list",
+        {
+          threadId: "exact-thread",
+          cursor: null,
+          limit: 1,
+          sortDirection: "desc",
+          itemsView: "notLoaded",
+        },
+      ],
+    ]);
+  });
+
+  it("reprepares the same recovery id after active work reaches a recoverable terminal state", async () => {
+    const harness = createHarness(false, undefined, "inProgress");
+    const observedAt = Date.now() - 1000;
+    const start = () =>
+      harness.state.startCodexContinuation(
+        "exact-thread",
+        "recovery-id",
+        "request-model",
+        observedAt,
+      );
+    harness.failedThread.status = { type: "active" };
+    start();
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+      reason: "The interrupted Codex thread is still active",
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    harness.failedThread.status = { type: "idle" };
+    harness.failedThread.turns[0].status = "failed";
+    start();
+    await flushJobs();
+    expect(harness.job().status).toBe("prepared");
+    expect(harness.readCount()).toBe(3);
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    harness.state.commitCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.startTurn).toHaveBeenCalledTimes(1);
+    expect(harness.job().submitted).toBe(true);
+    expect(
+      harness.requestCalls
+        .filter(([method]) => method === "thread/read")
+        .every(
+          ([, params]) =>
+            (params as { includeTurns: boolean }).includeTurns === false,
+        ),
+    ).toBe(true);
+  });
+
+  it.each([
+    { status: "failed", error: { message: "The user cancelled the turn" } },
+    {
+      status: "failed",
+      error: { code: "authentication_error", message: "Authentication failed" },
+    },
+    {
+      status: "failed",
+      error: {
+        code: "response_pending",
+        message: "The upstream operation is still pending",
+      },
+    },
+    { status: "interrupted", error: {} },
+    { status: "completed", error: {} },
+    { status: "unknown", error: {} },
+  ])(
+    "preserves refusal for bounded terminal metadata $status $error",
+    async ({ status, error }) => {
+      const harness = createHarness(false, error, status);
+      harness.start();
+      await flushJobs();
+      expect(harness.job()).toMatchObject({
+        status: "completed",
+        submitted: false,
+        mutationAttempted: false,
+      });
+      harness.state.commitCodexContinuation("recovery-id");
+      await flushJobs();
+      expect(harness.startTurn).not.toHaveBeenCalled();
+      expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+    },
+  );
+
+  it("refuses accessor-backed bounded terminal errors without evaluating them", async () => {
+    const harness = createHarness();
+    const readError = vi.fn(() => ({ message: "untrusted accessor" }));
+    Object.defineProperty(harness.failedThread.turns[0], "error", {
+      get: readError,
+    });
+    harness.start();
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+    });
+    expect(readError).not.toHaveBeenCalled();
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
 });
 
 describe("owner continuation bounded source contract", () => {
@@ -2207,6 +2459,409 @@ it.each([
     expect(harness.startTurn).not.toHaveBeenCalled();
   },
 );
+
+describe("Codex usage-limit continuation", () => {
+  const usageError = {
+    message: "You've hit your usage limit. Try again later.",
+    codexErrorInfo: "usageLimitExceeded",
+  };
+  const planUsageError = {
+    message:
+      "You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at 7:45 PM.",
+    codexErrorInfo: "usageLimitExceeded",
+    additionalDetails: null,
+  };
+  const prepareUsageLimit = (
+    harness: ReturnType<typeof createHarness>,
+    requireNativeObservation = false,
+    model: string | null = "request-model",
+    observedAtMs = Date.now() - 1_000,
+  ) =>
+    harness.state.startCodexUsageLimitContinuation(
+      "exact-thread",
+      "recovery-id",
+      model,
+      observedAtMs,
+      "failed-turn",
+      requireNativeObservation,
+    );
+  const nativeObservation = (model: string | null = "request-model") => ({
+    model,
+    modelProvider: "request-provider",
+    observedAtMs: Date.now() - 1_000,
+  });
+
+  it.each([usageError, planUsageError])(
+    "submits literal continue only after confirming the exact usage-limited turn: %j",
+    async (error) => {
+      const harness = createHarness(false, error);
+      harness.failedThread.status = { type: "systemError" };
+      prepareUsageLimit(harness);
+      await flushJobs();
+      expect(harness.job().status).toBe("prepared");
+      expect(
+        harness.state.commitCodexContinuation("recovery-id"),
+      ).toMatchObject({
+        started: false,
+      });
+      harness.state.confirmCodexContinuation("recovery-id");
+      await flushJobs();
+      expect(harness.job().status).toBe("confirmed");
+      harness.state.commitCodexContinuation("recovery-id");
+      await flushJobs();
+      expect(harness.startTurn).toHaveBeenCalledTimes(1);
+      expect(harness.startTurn).toHaveBeenCalledWith({
+        threadId: "exact-thread",
+        input: [{ type: "text", text: "continue" }],
+      });
+    },
+  );
+
+  it("keeps the automatic continuation policy for plan limits with a credit suggestion", () => {
+    const harness = createHarness();
+    expect(
+      harness.api.codexContinuationTerminalErrorCode("", {
+        error: planUsageError,
+      }),
+    ).toBe("insufficient_quota");
+  });
+
+  it.each([
+    ["a different turn", { id: "newer-turn" }],
+    ["a completed turn", { status: "completed" }],
+    [
+      "an unrelated error",
+      { error: { message: "Our servers are overloaded" } },
+    ],
+    [
+      "a hard limit",
+      {
+        error: {
+          message: "You've hit your daily usage limit. Please try again later.",
+        },
+      },
+    ],
+    [
+      "a quota failure with the same Codex error code",
+      {
+        error: {
+          ...usageError,
+          message: "Quota exceeded. Check your plan and billing details.",
+        },
+      },
+    ],
+    [
+      "a limit with no retry wording",
+      { error: { ...usageError, message: "You've hit your usage limit." } },
+    ],
+    [
+      "a plan limit with explicit retry denial",
+      { error: { ...planUsageError, retryable: false } },
+    ],
+    [
+      "a plan limit reporting hard quota in its details",
+      { error: { ...planUsageError, additionalDetails: "Quota exhausted." } },
+    ],
+  ])("skips %s", async (_label, changedTurn) => {
+    const harness = createHarness(false, usageError);
+    harness.failedThread.status = { type: "idle" };
+    Object.assign(harness.failedThread.turns[0], changedTurn);
+    prepareUsageLimit(harness);
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      mutationAttempted: false,
+    });
+    expect(harness.job().usageLimitDeferred).not.toBe(true);
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { status: { type: "active" } },
+    { status: { type: "idle" }, pendingOperations: ["pending"] },
+  ])("defers a thread with active or pending work", async (thread) => {
+    const harness = createHarness(false, usageError);
+    Object.assign(harness.failedThread, thread);
+    prepareUsageLimit(harness);
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      mutationAttempted: false,
+      usageLimitDeferred: true,
+    });
+    expect(harness.job()).not.toHaveProperty(
+      "usageLimitInitialReadUnavailable",
+    );
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it("reports an unavailable initial read so another renderer can verify the interruption", async () => {
+    const harness = createHarness(false, usageError, "failed", {
+      readError: new Error("Codex thread/read timed out"),
+    });
+    const observation = nativeObservation();
+    harness.state.getCodexNativeUsageLimitCandidate = () => observation;
+    expect(
+      prepareUsageLimit(
+        harness,
+        true,
+        observation.model,
+        observation.observedAtMs,
+      ),
+    ).toMatchObject({ started: true });
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+      usageLimitDeferred: true,
+      usageLimitInitialReadUnavailable: true,
+    });
+    expect(harness.requestCalls).toEqual([
+      ["thread/read", { threadId: "exact-thread", includeTurns: false }],
+    ]);
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it("revalidates the usage limit before releasing the confirmed sender", async () => {
+    const harness = createHarness(false, usageError);
+    harness.failedThread.status = { type: "idle" };
+    prepareUsageLimit(harness);
+    await flushJobs();
+    expect(harness.job().status).toBe("prepared");
+    harness.failedThread.turns[0].error = { message: "Connection closed" };
+    harness.state.confirmCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      mutationAttempted: false,
+    });
+    expect(harness.job().usageLimitDeferred).not.toBe(true);
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "resumes a verified native thread with no model field only while its provider is current (changed: %s)",
+    async (providerChanged) => {
+      const harness = createHarness(false, usageError);
+      const observation = nativeObservation(null);
+      Object.assign(harness.failedThread, {
+        status: { type: "idle" },
+        model: null,
+        modelProvider: observation.modelProvider,
+      });
+      harness.state.getCodexNativeUsageLimitCandidate = () => observation;
+      expect(prepareUsageLimit(harness, false, null)).toMatchObject({
+        started: false,
+      });
+      expect(
+        prepareUsageLimit(harness, true, null, observation.observedAtMs),
+      ).toMatchObject({ started: true });
+      await flushJobs();
+      expect(harness.job().status).toBe("prepared");
+      if (providerChanged)
+        harness.failedThread.modelProvider = "other-provider";
+      harness.state.confirmCodexContinuation("recovery-id");
+      await flushJobs();
+      harness.state.commitCodexContinuation("recovery-id");
+      await flushJobs();
+      expect(harness.job()).toMatchObject({
+        status: "completed",
+        submitted: !providerChanged,
+        mutationAttempted: !providerChanged,
+      });
+      if (providerChanged) {
+        expect(harness.startTurn).not.toHaveBeenCalled();
+      } else {
+        expect(harness.startTurn).toHaveBeenCalledTimes(1);
+        expect(harness.startTurn).toHaveBeenCalledWith({
+          threadId: "exact-thread",
+          input: [{ type: "text", text: "continue" }],
+        });
+      }
+    },
+  );
+
+  it.each([
+    {
+      evidence: "native and proxy evidence for the same turn",
+      requireNative: true,
+      freshModel: null,
+      submitted: true,
+    },
+    {
+      evidence: "proxy evidence alone",
+      requireNative: false,
+      freshModel: null,
+      submitted: false,
+    },
+    {
+      evidence: "native and proxy evidence with a conflicting model on reread",
+      requireNative: true,
+      freshModel: "other-model",
+      submitted: false,
+    },
+  ])(
+    "checks an omitted model with $evidence",
+    async ({ requireNative, freshModel, submitted }) => {
+      const harness = createHarness(false, usageError);
+      const observation = nativeObservation(null);
+      Object.assign(harness.failedThread, {
+        status: { type: "idle" },
+        model: null,
+        modelProvider: observation.modelProvider,
+      });
+      harness.state.getCodexNativeUsageLimitCandidate = () => observation;
+      expect(
+        prepareUsageLimit(
+          harness,
+          requireNative,
+          "request-model",
+          observation.observedAtMs,
+        ),
+      ).toMatchObject({ started: true });
+      await flushJobs();
+      harness.failedThread.model = freshModel;
+      harness.state.confirmCodexContinuation("recovery-id");
+      await flushJobs();
+      harness.state.commitCodexContinuation("recovery-id");
+      await flushJobs();
+      expect(harness.job()).toMatchObject({
+        status: "completed",
+        submitted,
+        mutationAttempted: submitted,
+      });
+      expect(harness.startTurn).toHaveBeenCalledTimes(submitted ? 1 : 0);
+      if (submitted)
+        expect(harness.startTurn).toHaveBeenCalledWith({
+          threadId: "exact-thread",
+          input: [{ type: "text", text: "continue" }],
+        });
+    },
+  );
+
+  it("does not substitute a fresh native observation for the one selected by the backend", async () => {
+    const harness = createHarness(false, usageError);
+    const observation = nativeObservation();
+    harness.failedThread.status = { type: "idle" };
+    harness.failedThread.modelProvider = observation.modelProvider;
+    harness.state.getCodexNativeUsageLimitCandidate = () => observation;
+
+    expect(
+      prepareUsageLimit(
+        harness,
+        true,
+        "request-model",
+        observation.observedAtMs - 1,
+      ),
+    ).toMatchObject({ started: false });
+    await flushJobs();
+    expect(harness.readCount()).toBe(0);
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it("requires current native evidence on the renderer that observed the interruption", async () => {
+    const harness = createHarness(false, usageError);
+    harness.failedThread.status = { type: "idle" };
+    expect(prepareUsageLimit(harness, true)).toMatchObject({ started: false });
+    expect(harness.readCount()).toBe(0);
+
+    let current = true;
+    const observation = nativeObservation();
+    harness.failedThread.modelProvider = observation.modelProvider;
+    const verifyObservation = vi.fn(() => (current ? observation : null));
+    harness.state.getCodexNativeUsageLimitCandidate = verifyObservation;
+    expect(
+      prepareUsageLimit(
+        harness,
+        true,
+        observation.model,
+        observation.observedAtMs,
+      ),
+    ).toMatchObject({ started: true });
+    await flushJobs();
+    harness.state.confirmCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.job().status).toBe("confirmed");
+
+    current = false;
+    harness.state.commitCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(verifyObservation).toHaveBeenLastCalledWith(
+      "exact-thread",
+      "failed-turn",
+      harness.state.appServerClients[0],
+    );
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      mutationAttempted: false,
+      usageLimitDeferred: true,
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+  });
+
+  it("can resume an exact native interruption after observation recovers during confirmation", async () => {
+    const harness = createHarness(false, usageError, "failed", {
+      pauseCommitRead: true,
+    });
+    harness.failedThread.status = { type: "idle" };
+    let current = true;
+    const observation = nativeObservation();
+    harness.failedThread.modelProvider = observation.modelProvider;
+    harness.state.getCodexNativeUsageLimitCandidate = () =>
+      current ? observation : null;
+    expect(
+      prepareUsageLimit(
+        harness,
+        true,
+        observation.model,
+        observation.observedAtMs,
+      ),
+    ).toMatchObject({ started: true });
+    await flushJobs();
+    harness.state.confirmCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.job().status).toBe("confirming");
+
+    current = false;
+    harness.releaseCommitRead();
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: false,
+      mutationAttempted: false,
+      usageLimitDeferred: true,
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+    expect(harness.api.readCodexContinuationMarkers()).toEqual({});
+
+    current = true;
+    expect(
+      harness.state.startCodexUsageLimitContinuation(
+        "exact-thread",
+        "retry-recovery-id",
+        "request-model",
+        observation.observedAtMs,
+        "failed-turn",
+        true,
+      ),
+    ).toMatchObject({ started: true });
+    await flushJobs();
+    harness.state.confirmCodexContinuation("retry-recovery-id");
+    await flushJobs();
+    harness.state.commitCodexContinuation("retry-recovery-id");
+    await flushJobs();
+    expect(harness.startTurn).toHaveBeenCalledTimes(1);
+    expect(
+      harness.state.readCodexContinuationJob("retry-recovery-id"),
+    ).toMatchObject({
+      status: "completed",
+      submitted: true,
+      mutationAttempted: true,
+    });
+  });
+});
 
 describe("explicit automatic Codex continuation confirmation", () => {
   it("finishes the final read before exposing an immediate guarded sender", async () => {

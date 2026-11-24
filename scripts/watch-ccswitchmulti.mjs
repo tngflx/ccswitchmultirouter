@@ -13,7 +13,6 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { DEV_RECOVERY_POLICY } from "./dev-watchdog-policy.mjs";
-import { BUILD_APPROVAL_FLAG } from "./build-approval.mjs";
 import { inspectCanonicalDevWatchdog } from "./dev-watchdog-identity.mjs";
 import { spawnDevRecoveryProcess } from "./dev-recovery-output.mjs";
 import {
@@ -30,7 +29,6 @@ const booleanOptions = new Set([
   "RestartOnCleanExit",
   "NoRestart",
   "DevelopmentMode",
-  "ConfirmBuild",
   "PlanOnly",
 ]);
 const numberOptions = new Set([
@@ -178,9 +176,6 @@ export function parseGuardianArgs(argv, { environment = process.env } = {}) {
     RestartOnCleanExit: false,
     NoRestart: false,
     DevelopmentMode: false,
-    // A persisted dev-session argument is never approval for a later
-    // recovery. The current guardian invocation must carry this flag.
-    ConfirmBuild: false,
     PlanOnly: false,
     MaxCycles: 0,
   };
@@ -644,13 +639,9 @@ ConvertTo-Json -InputObject $items -Compress`,
       }
     },
     startDevSession: async (devPlan) => {
-      if (
-        plan.DevelopmentMode !== true ||
-        plan.NoRestart === true ||
-        plan.ConfirmBuild !== true
-      )
+      if (plan.DevelopmentMode !== true || plan.NoRestart === true)
         throw new Error(
-          "Native launch requires current explicit development recovery approval with --confirm-build and without --no-restart.",
+          "Native launch requires explicit development recovery without --no-restart.",
         );
       assertHeld();
       const { child } = await spawnDevRecoveryProcess(
@@ -661,7 +652,6 @@ ConvertTo-Json -InputObject $items -Compress`,
             devPlan.ScriptPath,
             DEV_RECOVERY_POLICY.recoveryLaunchFlag,
             String(safePid(devPlan.SupervisorPid)),
-            ...(plan.ConfirmBuild === true ? [BUILD_APPROVAL_FLAG] : []),
             ...devPlan.Args,
           ],
           options: {
@@ -697,12 +687,6 @@ export async function guardianRecoveryPolicy({ plan, runtime, core }) {
     return runtime.writeEvent("info", "production-recovery-owned-by-rust", {
       Port: plan.Port,
     });
-  if (plan.ConfirmBuild !== true)
-    return runtime.writeEvent(
-      "warning",
-      "dev-session-recovery-requires-current-approval",
-      null,
-    );
   core ??= await import("./ccswitchmulti-guardian-core.mjs");
   runtime.assertHeld?.();
   const { writeEvent } = runtime;
@@ -743,10 +727,6 @@ export async function runGuardian(
   if (!legacyProductionGuardianAllowed(plan))
     throw new Error(
       "Production recovery is owned by the built-in Rust watchdog. Use --no-restart for read-only diagnostics or --development-mode for a recorded dev session.",
-    );
-  if (plan.DevelopmentMode === true && plan.ConfirmBuild !== true)
-    throw new Error(
-      "Development recovery requires current explicit approval. Re-run with --confirm-build.",
     );
   core ??= await import("./ccswitchmulti-guardian-core.mjs");
   mkdirSync(path.dirname(plan.LockPath), { recursive: true });
@@ -841,7 +821,7 @@ export function legacyProductionGuardianAllowed(plan) {
 export async function guardianMain(argv = process.argv.slice(2)) {
   if (argv.length === 1 && ["--help", "-Help", "-h"].includes(argv[0])) {
     process.stdout.write(
-      "Usage: node scripts/watch-ccswitchmulti.mjs [--installed-executable PATH] [--config-path PATH] [--port PORT] [--no-restart | --development-mode --confirm-build] [--plan-only]\nProduction diagnostics require --no-restart; release recovery is owned by the built-in Rust watchdog. Development recovery requires --development-mode, --confirm-build, and a valid recorded dev session, and never falls back to the installed app. PowerShell-style named options remain accepted.\n",
+      "Usage: node scripts/watch-ccswitchmulti.mjs [--installed-executable PATH] [--config-path PATH] [--port PORT] [--no-restart | --development-mode] [--plan-only]\nProduction diagnostics require --no-restart; release recovery is owned by the built-in Rust watchdog. Development recovery requires --development-mode and a valid recorded dev session, and never falls back to the installed app. PowerShell-style named options remain accepted.\n",
     );
     return;
   }
@@ -863,12 +843,6 @@ export async function guardianMain(argv = process.argv.slice(2)) {
   if (!legacyProductionGuardianAllowed(plan)) {
     process.stdout.write(
       "Production recovery is owned by the built-in Rust watchdog. Use Settings > Connections > Crash recovery; this JavaScript guardian supports --no-restart diagnostics or explicit --development-mode only.\n",
-    );
-    return;
-  }
-  if (plan.DevelopmentMode === true && plan.ConfirmBuild !== true) {
-    process.stdout.write(
-      "Development recovery requires current explicit approval. Re-run with --confirm-build.\n",
     );
     return;
   }

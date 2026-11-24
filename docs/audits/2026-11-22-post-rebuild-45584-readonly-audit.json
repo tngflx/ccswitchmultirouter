@@ -1,0 +1,157 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-11-22T15:45:29.468Z",
+  "timezone": "Asia/Singapore",
+  "scope": "Post-rebuild runtime identity, existing monitor health probe, and bounded app/router log tails; no CPU or RAM sampling.",
+  "application": {
+    "pid": 45584,
+    "version": "3.20.4-3",
+    "startedAtSingapore": "2026-11-22 23:29:46.488",
+    "executablePath": "H:\\repos\\ccswitchmulti-refork\\src-tauri\\target\\debug\\cc-switch.exe",
+    "binaryModifiedAtUtc": "2026-11-22T15:29:45.632Z",
+    "runningIdentityPreviouslyMatched": true,
+    "binaryNewerThanAuditedResourceFixSources": true,
+    "sourceBuildIdentityCryptographicallyVerified": false
+  },
+  "health": {
+    "interface": "scripts/watch-ccswitchmulti.mjs createGuardianRuntime.inspectRuntime",
+    "port": 15721,
+    "healthy": true,
+    "listenerOwner": 45584,
+    "listenerMatchesMarker": true,
+    "guardianLoopStarted": false
+  },
+  "logAudit": {
+    "files": [
+      "cc-switch.log",
+      "codex-router.log"
+    ],
+    "maxTailBytesPerFile": 4194304,
+    "includeOnlySinceStartup": true,
+    "credentialsPromptsBodiesAndSessionIdentifiersOmitted": true,
+    "provider": "Sublyx",
+    "matchedOutboundWindowThroughSingapore": "2026-11-22 23:39:11",
+    "matchedUpstreamSends": 178,
+    "observedModelRoutes": [
+      "gpt-6.2-sol",
+      "gpt-6.1-sol-sublyx"
+    ],
+    "generation": {
+      "parents": [
+        {
+          "model": "gpt-6.2-sol",
+          "requested": "xhigh",
+          "forwarded": "max",
+          "count": 35
+        },
+        {
+          "model": "gpt-6.1-sol-sublyx",
+          "requested": "max",
+          "forwarded": "max",
+          "count": 9
+        }
+      ],
+      "markedSubagents": [
+        {
+          "model": "gpt-6.2-sol",
+          "requested": "xhigh",
+          "forwarded": "high",
+          "count": 123
+        },
+        {
+          "model": "gpt-6.1-sol-sublyx",
+          "requested": "max",
+          "forwarded": "high",
+          "count": 10
+        }
+      ],
+      "observedPolicyMismatches": 0
+    },
+    "markedSubagentCompaction": {
+      "model": "gpt-6.2-sol",
+      "requested": "xhigh",
+      "forwarded": "high",
+      "count": 1
+    },
+    "followupWindowThroughSingapore": "2026-11-22 23:43:01",
+    "explicitUltraRestoration": {
+      "model": "gpt-6.2-sol",
+      "generationRequests": 43,
+      "requested": "xhigh",
+      "restoredDesktopEffort": "ultra",
+      "forwarded": "max",
+      "separateRestorationSourceFieldAvailable": false
+    },
+    "parentCompactionExceptionToGenerationCoverage": {
+      "count": 1,
+      "model": "gpt-6.2-sol",
+      "requested": "xhigh",
+      "forwarded": "xhigh",
+      "restoredUltraFieldPresent": false,
+      "conclusion": "Selected semantic Ultra was not established for this compact request; excluded from generation-policy pass claims."
+    },
+    "importer": {
+      "windowThroughSingapore": "2026-11-22 23:39:46",
+      "completedScans": 9,
+      "filesPerScan": 1255,
+      "deferredFilesPerScan": 117,
+      "warmCompletionIntervalsSeconds": [
+        65,
+        65,
+        65,
+        69,
+        65,
+        65,
+        66,
+        67
+      ],
+      "meanWarmCompletionIntervalSeconds": 65.875,
+      "initialPassDeferWarnings": 117,
+      "initialReasons": {
+        "missingCopiedParentPrefix": 111,
+        "missingHistoryBase": 3,
+        "other": 3
+      },
+      "subsequentDeferWarnings": 0,
+      "importedUsageRecords": 15,
+      "cpuOrParseByteCountEstablishedByTheseLogs": false
+    },
+    "upstreamHttpStatusesInMatchedWindow": {
+      "observed": 171,
+      "status200": 171,
+      "notYetObserved": 7,
+      "streamSuccessProvenByHttp200": false
+    },
+    "observedIssues": {
+      "gatewayConcurrencySseErrors": 3,
+      "gatewayCapacityRetriesStarted": 3,
+      "gatewayRetryFinalOutcomes": "unknown: no per-request trace on SSE error and no explicit stream-completion markers in permitted log tails",
+      "recoveryScheduledEvents": 8,
+      "recoveryScheduledReason": "app_crash_interrupted_turn",
+      "recoveryScheduledAtSingapore": "2026-11-22 23:29:52",
+      "recoverySubmitFailedEvents": 8,
+      "recoverySubmitFailedAtSingapore": "2026-11-22 23:35:52",
+      "recoveryFailureReason": "desktop_ready_deadline",
+      "recoveryReadinessBlocker": "thread_not_terminal",
+      "appErrorRecords": 1,
+      "appErrorClassification": "continue submission refused: thread_not_terminal"
+    }
+  },
+  "resourceAudit": {
+    "status": "unavailable under configured-monitor-only restriction",
+    "configuredCpuMemoryMetricsFound": false,
+    "localAutomationConfigurationFound": false,
+    "adHocCpuMemorySamplerUsed": false,
+    "liveCpuReductionVerified": false,
+    "liveMemoryStabilityVerified": false,
+    "hangFreeClaimEstablished": false
+  },
+  "actions": {
+    "applicationBuild": false,
+    "applicationRestart": false,
+    "providerMutation": false,
+    "uiOrCdpAutomation": false,
+    "sourceEdits": false,
+    "diagnosticReportCreatedInCheckout": true
+  }
+}

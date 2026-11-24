@@ -126,6 +126,7 @@ pub fn resolve_reasoning_effort(body: &Value) -> Option<&'static str> {
                         | "gpt-6-astra"
                         | "gpt-6-sol"
                         | "gpt-6-luna"
+                        | "gpt-6.2-astra"
                         | "gpt-6.2-sol"
                 ) =>
             {
@@ -1799,9 +1800,11 @@ mod tests {
         for model in [
             "gpt-6-sol",
             "gpt-6-luna",
+            "gpt-6.2-astra",
             "gpt-6.2-sol",
             "GPT-6-SOL",
             "GPT-6-LUNA",
+            "GPT-6.2-ASTRA",
             "GPT-6.2-SOL",
         ] {
             let body = json!({"model": model, "output_config": {"effort": "max"}});
@@ -1818,6 +1821,7 @@ mod tests {
             "gpt-6-other",
             "gpt-6-sol-custom",
             "gpt-6-luna-custom",
+            "gpt-6.2-astra-custom",
             "",
         ] {
             let body = json!({"model": model, "output_config": {"effort": "max"}});

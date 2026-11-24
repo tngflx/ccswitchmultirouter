@@ -22,7 +22,8 @@ vi.mock("@tauri-apps/api/core", () => ({
     const text = await response.text();
     if (!text) return undefined;
     try {
-      return JSON.parse(text);
+      const parsed = JSON.parse(text);
+      return parsed;
     } catch {
       return text;
     }

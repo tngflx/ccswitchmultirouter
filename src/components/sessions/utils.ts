@@ -69,6 +69,13 @@ const extractCodexPromptFromIdeContext = (content: string) => {
 export const getSessionKey = (session: SessionMeta) =>
   `${session.providerId}:${session.sessionId}:${session.sourcePath ?? ""}`;
 
+export const isArchivedCodexSession = (session: SessionMeta) =>
+  session.providerId === "codex" &&
+  session.sourcePath
+    ?.replace(/\\/g, "/")
+    .split("/")
+    .some((segment) => segment.toLowerCase() === "archived_sessions");
+
 export const getSessionDirectoryGroupKey = (
   providerId: string,
   projectDir?: string | null,

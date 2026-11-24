@@ -4,6 +4,11 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import {
+  assertUnlinkedDirectories,
+  requireBuildCommandSuccess,
+  runBuildCommand,
+} from "./release-build-config.mjs";
+import {
   parseWindowsJsonQueryOutput,
   runWindowsJsonQuery,
   windowsJsonQueryCommand,
@@ -12,7 +17,7 @@ import {
 // Debug Cargo artifacts accumulate multiple test/linkage generations. Keep the
 // normal target bounded near the size users expect; cleanup remains guarded by
 // process ownership and never runs while the development binary is active.
-const DEFAULT_MAX_GB = 5;
+const DEFAULT_MAX_GB = 6;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
 const TAURI_DIR = path.join(REPO_ROOT, "src-tauri");
@@ -334,10 +339,81 @@ export function maintainCargoTarget({
   }
 
   log(
-    `[cargo-clean] Target is ${formatGb(sizeBytes)} GB; running guarded cargo clean before development starts.`,
+    `[cargo-clean] Target is ${formatGb(sizeBytes)} GB. Running guarded cargo clean.`,
   );
   clean();
   return decision;
+}
+
+export function maintainDevCargoTarget({
+  environment = process.env,
+  run = runBuildCommand,
+  verifyPath = assertUnlinkedDirectories,
+  measure = directorySizeBytes,
+  getProcesses = process.platform === "win32"
+    ? windowsCargoProcesses
+    : unixCargoProcesses,
+  log = console.log,
+} = {}) {
+  const options = parseCleanupOptions([], environment);
+  if (options.maxGb === 0) return "disabled";
+
+  const debugDirectory = path.join(EXPECTED_TARGET, "debug");
+  verifyPath(debugDirectory);
+  const sizeBytes = measure(debugDirectory);
+  if (sizeBytes <= options.maxGb * 1024 ** 3) return "keep";
+
+  const cargo = (args, stdio = "pipe") =>
+    run("cargo", args, {
+      cwd: TAURI_DIR,
+      env: environment,
+      encoding: "utf8",
+      windowsHide: true,
+      stdio,
+    });
+  const result = requireBuildCommandSuccess(
+    cargo(["metadata", "--locked", "--offline", "--no-deps", "--format-version", "1"]),
+    "cargo metadata",
+  );
+  const { target_directory, build_directory } = JSON.parse(result.stdout);
+  if (
+    normalized(target_directory) !== normalized(EXPECTED_TARGET) ||
+    (build_directory !== undefined &&
+      normalized(build_directory) !== normalized(EXPECTED_TARGET))
+  ) {
+    throw new Error("Cargo development cache is outside the canonical target.");
+  }
+
+  return maintainCargoTarget({
+    actualTarget: EXPECTED_TARGET,
+    options,
+    measureSize: () => sizeBytes,
+    // A manually started Cargo invocation can use a relative manifest or rely
+    // on its current directory. Process arguments alone cannot rule it out.
+    getOwners: () =>
+      getProcesses().filter((candidate) =>
+        /^(?:cargo|rustc)(?:\.exe)?$/i.test(candidate.Name) ||
+        processOwnsCargoTarget(candidate),
+      ),
+    clean: () => {
+      verifyPath(debugDirectory);
+      requireBuildCommandSuccess(
+        cargo(
+          [
+            "clean",
+            "--profile", "dev",
+            "--locked",
+            "--offline",
+            "--target-dir", EXPECTED_TARGET,
+            "--config", `build.build-dir=${JSON.stringify(EXPECTED_TARGET)}`,
+          ],
+          "inherit",
+        ),
+        "cargo clean --profile dev",
+      );
+    },
+    log,
+  });
 }
 
 function run() {

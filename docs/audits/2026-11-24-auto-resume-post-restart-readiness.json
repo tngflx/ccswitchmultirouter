@@ -1,0 +1,35 @@
+{
+  "verified": false,
+  "scenario": "overload",
+  "desktopCdpVerified": false,
+  "stage": "readiness",
+  "failure": "desktop_bridge_not_ready",
+  "initialRequests": 0,
+  "continuedRequests": 0,
+  "readinessBlocker": "renderer_runtime_fingerprint_mismatch",
+  "readinessDiagnostics": {
+    "installedRuntimeFingerprint": "sha256-027e4adf972263fe3892d05ffcce5f7807acffcce39c23eb2cb0f512ece38f28",
+    "expectedRuntimeFingerprint": "sha256-78fe09a9b7a982de46cb8cdc1307017f7c14b9fc1867b1d258f3ecf04e103f7a",
+    "runtimeGeneration": 2,
+    "appServerPatchInstalled": true,
+    "appServerClientCount": 1,
+    "eligibleGuardedRequestClientCount": 1,
+    "scopedScopeCount": 1,
+    "scopedRegistryCount": 0,
+    "scopedClientCount": 1,
+    "scopedQueryClientCount": 1,
+    "scopedAppServerScopeScanComplete": false,
+    "pendingReactNodeCount": 8,
+    "webpackRuntimeCount": 1,
+    "webpackModuleCount": 10577,
+    "webpackCandidateCount": 32768,
+    "webpackDiscoveryTruncated": true,
+    "failureCount": 1,
+    "failureKinds": [
+      "asset_not_found"
+    ]
+  },
+  "temporaryDurableTestThread": false,
+  "existingThreadsTouched": false,
+  "verifiedAtUtc": "2026-11-23T17:54:09.051Z"
+}

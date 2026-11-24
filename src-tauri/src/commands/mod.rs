@@ -34,6 +34,7 @@ pub mod skill;
 mod stream_check;
 mod subscription;
 mod sync_support;
+mod tailscale;
 mod te_provider;
 mod xai_oauth;
 
@@ -77,6 +78,7 @@ pub use settings::*;
 pub use skill::*;
 pub use stream_check::*;
 pub use subscription::*;
+pub use tailscale::*;
 pub use te_provider::*;
 pub use xai_oauth::*;
 

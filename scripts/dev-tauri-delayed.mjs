@@ -42,6 +42,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import { maintainDevCargoTarget } from "./prune-cargo-target.mjs";
 import {
   createDevReconnectTracker,
   createDevWatchdogOutputReader,
@@ -56,26 +57,20 @@ import {
   parseWindowsJsonQueryOutput,
   runWindowsJsonQuery,
 } from "./windows-json-query.mjs";
-import { hasBuildApproval } from "./build-approval.mjs";
 export {
   windowsJsonQueryCommand,
   parseWindowsJsonQueryOutput,
   runWindowsJsonQuery,
 } from "./windows-json-query.mjs";
 
-// Backend rebuilds and crash recovery are manual operations. A prior
-// --confirm-build launch must never authorize a later unattended compile.
-export const AUTOMATIC_DEV_REBUILD_ENABLED = false;
-export const AUTOMATIC_DEV_RECOVERY_ENABLED = false;
+// A four-hour quiet period keeps the running Tauri binary stable during normal
+// development while still rebuilding automatically after sustained backend
+// editing. Use --delay 0 when an immediate backend rebuild is intentional.
 const DEFAULT_DELAY_MS = 14_400_000;
 const DEFAULT_FRONTEND_PORT = 3000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
 const TAURI_DIR = path.join(REPO_ROOT, "src-tauri");
-const CARGO_TARGET_MAINTENANCE_SCRIPT = path.join(
-  SCRIPT_DIR,
-  "prune-cargo-target.mjs",
-);
 const WATCH_EVENT_BATCH_MS = 100;
 const CHILD_EXIT_TIMEOUT_MS = 10_000;
 const DEV_CHILD_STDIO_DRAIN_TIMEOUT_MS = 250;
@@ -124,7 +119,7 @@ export function parseDelayMs(args, environment = process.env) {
       index += 1;
       continue;
     }
-    if (argument === "--no-rebuild" || argument === "--confirm-build") {
+    if (argument === "--no-rebuild") {
       continue;
     }
     if (argument !== "--help" && argument !== "-h") {
@@ -202,24 +197,6 @@ export function parseNoRebuild(args, environment = process.env) {
   throw new Error(
     `Invalid TAURI_DEV_NO_REBUILD value "${rawValue}". Use 1/true or 0/false.`,
   );
-}
-
-export function parseRebuildApproval(args) {
-  const flagCount = args.filter(
-    (argument) => argument === "--confirm-build",
-  ).length;
-  if (flagCount > 1) {
-    throw new Error("The --confirm-build flag may only be specified once.");
-  }
-  return hasBuildApproval(args, {});
-}
-
-export function requireDevBuildApproval(args) {
-  if (!parseRebuildApproval(args)) {
-    throw new Error(
-      "Development sessions require explicit --confirm-build approval. Re-run with --confirm-build.",
-    );
-  }
 }
 
 export function parsePort(environment = process.env) {
@@ -509,16 +486,22 @@ export function createQuietPeriodScheduler(delayMs, callback) {
 
 export function createChangeEventBatcher(batchMs, callback) {
   const changedPaths = new Set();
-  const scheduler = createQuietPeriodScheduler(batchMs, () => {
+  const deliverChanges = () => {
+    if (changedPaths.size === 0) return false;
     const paths = [...changedPaths];
     changedPaths.clear();
-    callback(paths);
-  });
+    return callback(paths);
+  };
+  const scheduler = createQuietPeriodScheduler(batchMs, deliverChanges);
 
   return {
     add(changedPath) {
       changedPaths.add(changedPath);
       scheduler.schedule();
+    },
+    flush() {
+      scheduler.cancel();
+      return deliverChanges();
     },
     cancel() {
       changedPaths.clear();
@@ -547,16 +530,24 @@ export function createExpectedExitRegistry() {
   };
 }
 
-export function createBackendRebuildGate(delayMs, callback) {
+export function createBackendRebuildGate(
+  delayMs,
+  callback,
+  flushPendingChanges = () => false,
+) {
   let phase = "building";
   let changedDuringBuild = false;
   let quietPeriodElapsedDuringBuild = false;
+  const rebuildIfQuiet = () => {
+    // An edit still in the watcher batch can reschedule or cancel this rebuild.
+    if (!flushPendingChanges()) callback();
+  };
   const scheduler = createQuietPeriodScheduler(delayMs, () => {
     if (phase === "building") {
       quietPeriodElapsedDuringBuild = true;
       return;
     }
-    callback();
+    rebuildIfQuiet();
   });
 
   const settleBuild = (nextPhase) => {
@@ -570,7 +561,7 @@ export function createBackendRebuildGate(delayMs, callback) {
     changedDuringBuild = false;
     if (quietPeriodElapsedDuringBuild) {
       quietPeriodElapsedDuringBuild = false;
-      callback();
+      rebuildIfQuiet();
     }
     return true;
   };
@@ -1721,35 +1712,6 @@ function queryCargoTargetDirectory() {
   return metadata.target_directory;
 }
 
-export function runCargoTargetMaintenance({
-  executable = process.execPath,
-  scriptPath = CARGO_TARGET_MAINTENANCE_SCRIPT,
-  cwd = REPO_ROOT,
-  environment = process.env,
-  run = spawnSync,
-} = {}) {
-  const result = run(executable, [scriptPath], {
-    cwd,
-    env: environment,
-    encoding: "utf8",
-    windowsHide: true,
-  });
-  if (result.stdout) {
-    process.stdout.write(result.stdout);
-  }
-  if (result.stderr) {
-    process.stderr.write(result.stderr);
-  }
-  if (result.error) {
-    throw result.error;
-  }
-  if (result.status !== 0) {
-    throw new Error(
-      `Cargo target maintenance exited with status ${result.status}.`,
-    );
-  }
-}
-
 export function reportDevSupervisorDecision(
   decision,
   outcome,
@@ -1769,10 +1731,6 @@ export async function superviseDevSessions({
   spawnSession,
   cleanSession,
   readEnabled = readDevWatchdogEnabled,
-  // Imported callers must opt into restart behavior explicitly. The production
-  // entrypoint passes the hard-disabled policy constant, and omission must
-  // never turn a helper call into an unattended respawn loop.
-  allowAutomaticRestart = false,
   isStopping = () => false,
   waitToRestart = () =>
     new Promise((resolve) => setTimeout(resolve, DEV_AUTO_RESTART_DELAY_MS)),
@@ -1802,7 +1760,7 @@ export async function superviseDevSessions({
     const decision = devWorkerRestartDecision({
       ...outcome,
       expectedExit: isStopping(),
-      watchdogEnabled: allowAutomaticRestart && readEnabled(),
+      watchdogEnabled: readEnabled(),
       nowMs: decisionAtMs,
       restartTimesMs,
     });
@@ -1831,9 +1789,7 @@ export async function superviseDevSessions({
     // Persist before waiting so launcher recovery cannot reset this budget.
     onRestart();
     await waitToRestart();
-    if (!allowAutomaticRestart || !readEnabled()) {
-      return outcome.exitCode ?? 1;
-    }
+    if (!readEnabled()) return outcome.exitCode ?? 1;
   }
   return 0;
 }
@@ -1866,30 +1822,6 @@ function devSessionPath() {
   return settingsPath
     ? path.join(path.dirname(settingsPath), "logs", "dev-session.json")
     : null;
-}
-
-export function requireDetachedDevWatchdogApproval(
-  supervisorPid,
-  {
-    markerPath = devSessionPath(),
-    readSession = () => JSON.parse(readFileSync(markerPath, "utf8")),
-  } = {},
-) {
-  let session;
-  try {
-    session = markerPath ? readSession() : undefined;
-  } catch {
-    session = undefined;
-  }
-  if (
-    session?.supervisorPid !== supervisorPid ||
-    !Array.isArray(session?.args)
-  ) {
-    throw new Error(
-      "Development sessions require explicit --confirm-build approval before watchdog recovery.",
-    );
-  }
-  requireDevBuildApproval(session.args);
 }
 
 export function devSessionEnvironment(environment) {
@@ -2352,7 +2284,6 @@ export async function handoffDetachedDevSupervisor({
   supervisorPid,
   markerPath,
   session,
-  allowAutomaticRestart = false,
   now = Date.now,
   readEnabled = readDevWatchdogEnabled,
   persistSession = (nextSession) =>
@@ -2392,12 +2323,6 @@ export async function handoffDetachedDevSupervisor({
   repoRoot = REPO_ROOT,
   environment = process.env,
 }) {
-  if (!allowAutomaticRestart) {
-    return {
-      restarted: false,
-      decision: { restart: false, reason: "disabled" },
-    };
-  }
   // This snapshot is the version observed by the detached watcher. It is not
   // authority to overwrite a marker that an explicit/newer launcher published.
   const observedSession = structuredClone(session);
@@ -2553,7 +2478,6 @@ export async function handoffDetachedDevSupervisor({
 export async function runDetachedDevWatchdog(
   supervisorPid,
   {
-    allowAutomaticRestart = false,
     markerPath = devSessionPath(),
     readSession = () => JSON.parse(readFileSync(markerPath, "utf8")),
     wait = (milliseconds) =>
@@ -2566,9 +2490,6 @@ export async function runDetachedDevWatchdog(
     now = Date.now,
   } = {},
 ) {
-  if (!allowAutomaticRestart) {
-    return { watched: false, reason: "disabled" };
-  }
   if (!markerPath) return;
   const diagnosticTimes = new Map();
   const writeDiagnostic = (event, detail) => {
@@ -2631,7 +2552,6 @@ export async function runDetachedDevWatchdog(
         supervisorPid,
         markerPath,
         session,
-        allowAutomaticRestart,
         readSession,
         queryProcesses,
       });
@@ -2773,7 +2693,6 @@ export function persistIndependentWatchdog({
 
 async function runDevSupervisor(launchArgs) {
   const launch = parseDevSupervisorLaunchArgs(launchArgs);
-  requireDevBuildApproval(launch.args);
   const { args } = launch;
   // Validate the requested settings before retiring a working development session.
   parseDelayMs(args);
@@ -2968,7 +2887,7 @@ async function runDevSupervisor(launchArgs) {
     const handoffTimer = setInterval(() => {
       if (!stopping) handoff.request();
     }, 250);
-    if (markerPath && AUTOMATIC_DEV_RECOVERY_ENABLED) {
+    if (markerPath) {
       const outputPath = devRecoveryLogPath(markerPath);
       console.log(
         `[dev watchdog] Launcher recovery output: ${outputPath}. Follow it with Get-Content -LiteralPath '${outputPath.replaceAll("'", "''")}' -Tail 60 -Wait.`,
@@ -3035,15 +2954,10 @@ async function runDevSupervisor(launchArgs) {
           "[dev watchdog] Could not start launcher recovery; see dev-watchdog.jsonl.",
         );
       }
-    } else if (markerPath) {
-      console.log(
-        "[dev watchdog] Automatic recovery is disabled. Start a new approved development session after a crash.",
-      );
     }
     let completed = false;
     try {
       const code = await superviseDevSessions({
-        allowAutomaticRestart: AUTOMATIC_DEV_RECOVERY_ENABLED,
         spawnSession() {
           roots = new Map();
           const command = devWorkerCommand(args);
@@ -3194,33 +3108,35 @@ async function runDevWorker(args) {
     });
   }
   if (args.includes("--help") || args.includes("-h")) {
-    console.log(`Usage: pnpm dev:delayed -- [--delay milliseconds] [--confirm-build] [--no-rebuild]
+    console.log(`Usage: pnpm dev:delayed -- [--delay milliseconds] [--no-rebuild]
 
-Runs the complete Vite + Cargo/Tauri development session. Explicit approval
-is required before the session can acquire its launch lock or start any process.
+Runs Vite with immediate frontend HMR and rebuilds the Tauri backend only after
+backend files have remained unchanged for the configured quiet period.
 
 Options:
-  -d, --delay <ms>  Retained for compatibility; backend rebuilds remain manual
-  --confirm-build   Explicitly authorize this complete development session
-  --no-rebuild      Retained for compatibility; backend rebuilds remain disabled
+  -d, --delay <ms>  Quiet period before a backend rebuild (default: 14400000 / 4 hours)
+  --no-rebuild      Disable source-edit rebuilds (watchdog crash recovery still applies)
 
 Watchdog:
-  Automatic crash recovery is disabled. A crash stops the session and requires
-  a new explicit --confirm-build launch.
+  watchdogEnabled recovers crashes and sustained reconnect loops immediately,
+  without the source-edit delay (maximum 5 automatic restarts / 30 minutes).
+  A worker crash is restarted by the supervisor in the launching terminal.
+  If the supervisor itself disappears, a detached watchdog relaunches the
+  complete pnpm dev session independently and writes output to dev-recovery.log.
+  Ctrl+C, a clean/manual quit, a disabled watchdog, or the restart limit does
+  not trigger another launch.
 
 Environment:
   TAURI_DEV_REBUILD_DELAY_MS  Same setting as --delay; CLI option takes priority
   TAURI_DEV_NO_REBUILD         Same setting as --no-rebuild (1/true or 0/false)
+  CCSM_CARGO_TARGET_MAX_GB     Debug cache cleanup threshold in GiB (default: 6, 0 disables)
 
 Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     return;
   }
 
-  requireDevBuildApproval(args);
   const delayMs = parseDelayMs(args);
-  parseNoRebuild(args);
-  parseRebuildApproval(args);
-  const noRebuild = !AUTOMATIC_DEV_REBUILD_ENABLED;
+  const noRebuild = parseNoRebuild(args);
   const frontendPort = parsePort();
   assertNormalCargoTargetDirectory(path.join(TAURI_DIR, "target"));
   assertNormalCargoTargetDirectory(queryCargoTargetDirectory(), {});
@@ -3229,7 +3145,6 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
       `Port ${frontendPort} is already in use. Stop the existing dev session before running pnpm dev:delayed.`,
     );
   }
-  runCargoTargetMaintenance();
   // Drain parent-disconnect/shutdown events after synchronous Cargo preflight.
   await new Promise((resolve) => setImmediate(resolve));
   if (
@@ -3243,7 +3158,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
   }
 
   console.log(
-    "[dev] Frontend HMR is immediate; backend rebuilds and crash recovery require a new explicit --confirm-build launch.",
+    `[dev] Frontend HMR is immediate; backend ${noRebuild ? "rebuilds are disabled (--no-rebuild)" : `rebuilds after ${delayMs}ms without changes`}.`,
   );
 
   const vite = startProcess(process.execPath, [
@@ -3290,9 +3205,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
   const changeBatcher = createChangeEventBatcher(
     WATCH_EVENT_BATCH_MS,
     (changedPaths) => {
-      if (shuttingDown || changedPaths.length === 0) {
-        return;
-      }
+      if (shuttingDown) return false;
       let contentStateChanged = false;
       for (const changedPath of changedPaths) {
         if (
@@ -3305,7 +3218,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
         }
       }
       if (!contentStateChanged) {
-        return;
+        return false;
       }
 
       const dirtyPaths = backendContentTracker.dirtyPaths();
@@ -3316,7 +3229,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
         );
         lastBackendEditAt = new Date().toISOString();
         lastBackendEditPaths = [];
-        return;
+        return true;
       }
       lastBackendEditAt = new Date().toISOString();
       lastBackendEditPaths = dirtyPaths;
@@ -3329,9 +3242,10 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
         logBackendEvent(
           `Backend rebuild suppressed; latest detected edit is ${lastBackendEditAt}.`,
         );
-        return;
+      } else {
+        reportScheduledRebuild(dirtyPaths, rebuildGate.scheduleChange());
       }
-      reportScheduledRebuild(dirtyPaths, rebuildGate.scheduleChange());
+      return true;
     },
   );
 
@@ -3403,6 +3317,11 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
   };
 
   const startTauri = () => {
+    try {
+      maintainDevCargoTarget();
+    } catch (error) {
+      console.warn(`[cargo-clean] Development cache maintenance skipped: ${error.message}`);
+    }
     let outputTail = "";
     let appStarted = false;
     const sessionStartedAt = Date.now();
@@ -3503,8 +3422,6 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     };
     const recovery = createDevWorkerRecovery({
       isCurrent: () => !shuttingDown && !restartInProgress && tauri === child,
-      readEnabled: () =>
-        AUTOMATIC_DEV_RECOVERY_ENABLED && readDevWatchdogEnabled(),
       readMarkerPresent: () =>
         readDevRunMarkerPresent(
           process.env,
@@ -3598,7 +3515,7 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
           uncleanExit,
           // The outer supervisor reads the persisted toggle at the restart
           // boundary. Here we only classify the worker's exit as clean/crashed.
-          watchdogEnabled: AUTOMATIC_DEV_RECOVERY_ENABLED,
+          watchdogEnabled: true,
         });
         if (outcome.reason === "clean-exit" || outcome.reason === "signal") {
           void shutdown(0);
@@ -3614,12 +3531,6 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
   };
 
   const restartTauri = async (reason = "backend-edit") => {
-    if (!AUTOMATIC_DEV_REBUILD_ENABLED) {
-      logBackendEvent(
-        `Backend rebuild blocked (${reason}); start a new session with explicit --confirm-build approval.`,
-      );
-      return;
-    }
     if (restartInProgress || shuttingDown) {
       return;
     }
@@ -3671,9 +3582,13 @@ Use "pnpm dev:immediate" for the same verified lifecycle with no quiet delay.`);
     }
   };
 
-  const rebuildGate = createBackendRebuildGate(delayMs, () => {
-    void restartTauri();
-  });
+  const rebuildGate = createBackendRebuildGate(
+    delayMs,
+    () => {
+      void restartTauri();
+    },
+    changeBatcher.flush,
+  );
 
   const shutdown = (exitCode = 0) => {
     if (shutdownPromise) {
@@ -3814,22 +3729,13 @@ if (isMainModule) {
   const cliArgs = normalizeCliArgs(process.argv.slice(2));
   const isWorker = cliArgs[0] === DEV_WORKER_FLAG;
   const isDetachedWatchdog = cliArgs[0] === DEV_WATCHDOG_FLAG;
-  let task;
-  if (isDetachedWatchdog) {
-    requireDetachedDevWatchdogApproval(Number(cliArgs[1]));
-    if (!AUTOMATIC_DEV_RECOVERY_ENABLED) {
-      throw new Error(
-        "Automatic development recovery is disabled. Start a new session with explicit --confirm-build approval.",
-      );
-    }
-    task = runDetachedDevWatchdog(Number(cliArgs[1]));
-  } else if (isWorker) {
-    task = runDevWorker(cliArgs.slice(1));
-  } else if (cliArgs.includes("--help") || cliArgs.includes("-h")) {
-    task = runDevWorker(cliArgs);
-  } else {
-    task = runDevSupervisor(cliArgs);
-  }
+  const task = isDetachedWatchdog
+    ? runDetachedDevWatchdog(Number(cliArgs[1]))
+    : isWorker
+      ? runDevWorker(cliArgs.slice(1))
+      : cliArgs.includes("--help") || cliArgs.includes("-h")
+        ? runDevWorker(cliArgs)
+        : runDevSupervisor(cliArgs);
   task.catch((error) => {
     console.error(`[dev] ${error.message}`);
     process.exitCode = 1;

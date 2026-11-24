@@ -11011,7 +11011,9 @@ wire_api = "responses"
     }
 
     #[test]
+    #[serial_test::serial]
     fn router_catalog_marks_deepseek_alias_as_raw_reasoning() {
+        let _home = TestHomeGuard::new();
         let settings = json!({
             "modelCatalog": {
                 "models": [{
@@ -19121,7 +19123,9 @@ base_url = "http://127.0.0.1:15721/v1"
     }
 
     #[test]
+    #[serial_test::serial]
     fn codex_model_catalog_projects_declared_glm_reasoning_capability() {
+        let _home = TestHomeGuard::new();
         let settings = json!({
             "modelCatalog": { "models": [{
                 "model": "glm-5.2",
@@ -19241,7 +19245,9 @@ base_url = "http://127.0.0.1:15721/v1"
     }
 
     #[test]
+    #[serial_test::serial]
     fn unknown_third_party_model_does_not_inherit_template_reasoning() {
+        let _home = TestHomeGuard::new();
         let settings = json!({
             "modelCatalog": { "models": [{ "model": "private-model" }] }
         });

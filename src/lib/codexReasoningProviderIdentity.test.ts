@@ -656,6 +656,7 @@ base_url = "https://gateway.example/v1"`,
 
   describe.each([
     ["gpt-6.1-sol", ["low", "medium", "high", "xhigh", "max"]],
+    ["gpt-6.2-astra", ["low", "medium", "high", "xhigh", "max"]],
     ["gpt-6.2-sol", ["low", "medium", "high", "xhigh", "max"]],
     ["gpt-6-future", ["low", "medium", "high", "xhigh"]],
   ] as const)("Sublyx native evidence for %s", (model, maintainedEfforts) => {
@@ -1241,6 +1242,7 @@ base_url = "https://gateway.example/v1"`,
     "gpt-6-luna",
     "gpt-6.1-sol",
     "gpt-6.1-terra",
+    "gpt-6.2-astra",
   ])(
     "keeps native Max selectable for the maintained/audited row %s",
     (model) => {

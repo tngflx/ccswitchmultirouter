@@ -1,3 +1,4 @@
+pub(crate) mod codex_backup;
 pub mod providers;
 pub mod terminal;
 

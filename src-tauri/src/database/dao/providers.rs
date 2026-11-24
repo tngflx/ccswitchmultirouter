@@ -443,6 +443,22 @@ impl Database {
         }
     }
 
+    /// Check provider existence without loading or parsing its full catalog row.
+    pub fn provider_exists(&self, id: &str, app_type: &str) -> Result<bool, AppError> {
+        let conn = lock_conn!(self.conn);
+        let result = conn.query_row(
+            "SELECT 1 FROM providers WHERE id = ?1 AND app_type = ?2 LIMIT 1",
+            params![id, app_type],
+            |_| Ok(()),
+        );
+
+        match result {
+            Ok(()) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(error) => Err(AppError::Database(error.to_string())),
+        }
+    }
+
     pub fn get_provider_by_id(
         &self,
         id: &str,

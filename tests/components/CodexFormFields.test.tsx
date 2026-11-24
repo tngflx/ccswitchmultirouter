@@ -325,6 +325,15 @@ async function waitForReasoningResolution() {
   });
 }
 
+async function applyModelSyncReview() {
+  const review = await screen.findByRole("dialog", {
+    name: "Review model sync",
+  });
+  fireEvent.click(
+    within(review).getByRole("button", { name: "Apply to draft" }),
+  );
+}
+
 function renderRoutingHarness(
   initialRouting?: CodexRoutingConfig,
   options: { shouldShowSpeedTest?: boolean } = {},
@@ -1197,6 +1206,7 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
         expect.objectContaining({
@@ -1219,14 +1229,21 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
   });
 
-  it("makes a successful empty catalog sync non-routable", async () => {
+  it("preserves catalog inclusion when the provider returns an empty list", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([]);
     const { latestCatalog } = renderCatalogHarness([{ model: "removed" }]);
     await waitForReasoningResolution();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
-    await waitFor(() => expect(latestCatalog()[0].enabled).toBe(false));
-    expect(screen.getByText("No included models")).toBeVisible();
+    const review = await screen.findByRole("dialog", {
+      name: "Review model sync",
+    });
+    expect(
+      within(review).queryByRole("button", { name: "Apply to draft" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(within(review).getByRole("button", { name: "Close" }));
+    expect(latestCatalog()).toEqual([{ model: "removed" }]);
+    expect(screen.queryByText("No included models")).not.toBeInTheDocument();
     await waitForReasoningResolution();
   });
 
@@ -1240,6 +1257,9 @@ describe("CodexFormFields local model routing", () => {
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "Sync models" })).toBeEnabled(),
     );
+    expect(
+      screen.queryByRole("dialog", { name: "Review model sync" }),
+    ).not.toBeInTheDocument();
     expect(latestCatalog()).toEqual([{ model: "kept" }]);
     await waitForReasoningResolution();
   });
@@ -1247,6 +1267,7 @@ describe("CodexFormFields local model routing", () => {
   it("preserves independent key-group inventory on a primary-key sync", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValueOnce([
       { id: "primary", ownedBy: null },
+      { id: "fresh", ownedBy: null },
     ]);
     const { latestCatalog } = renderCatalogHarness(
       [{ model: "primary" }, { model: "other-key-model" }],
@@ -1259,13 +1280,32 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    const review = await screen.findByRole("dialog", {
+      name: "Review model sync",
+    });
+    expect(
+      within(review).queryByRole("radio", { name: "Disable missing models" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(review).queryByRole("radio", { name: "Replace catalog" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(
+      within(review).getByRole("button", { name: "Apply to draft" }),
+    );
     await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledOnce());
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "Sync models" })).toBeEnabled(),
     );
-    expect(latestCatalog().every((model) => model.enabled !== false)).toBe(
-      true,
-    );
+    expect(latestCatalog()).toEqual([
+      expect.objectContaining({ model: "primary" }),
+      expect.objectContaining({ model: "other-key-model" }),
+      expect.objectContaining({ model: "fresh", enabled: false }),
+    ]);
+    expect(
+      latestCatalog()
+        .filter((model) => model.enabled !== false)
+        .map((model) => model.model),
+    ).toEqual(["primary", "other-key-model"]);
     expect(
       screen.queryByRole("button", { name: /Enable only synced models/ }),
     ).not.toBeInTheDocument();
@@ -1284,6 +1324,7 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
     await waitFor(() => expect(latestCatalog()).toHaveLength(3));
     expect(latestCatalog()).toEqual([
       expect.objectContaining({ model: "primary" }),
@@ -1297,8 +1338,7 @@ describe("CodexFormFields local model routing", () => {
       }),
     ).not.toBeInTheDocument();
 
-    // Sync owns inventory, not permission to include newly discovered models.
-    // The supported canonical table requires an explicit user selection.
+    // The catalog table can include newly discovered models after review.
     fireEvent.click(screen.getByRole("checkbox", { name: "Select primary" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Select fresh" }));
     fireEvent.click(screen.getByRole("button", { name: "Include selected" }));
@@ -1414,6 +1454,7 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
     await waitFor(() => expect(latestCatalog()).toHaveLength(5));
     expect(latestCatalog()[0].enabled).toBe(true);
     expect(
@@ -1486,6 +1527,7 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
     await waitFor(() => expect(latestCatalog()).toHaveLength(2));
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "Sync models" })).toBeEnabled(),
@@ -1516,6 +1558,7 @@ describe("CodexFormFields local model routing", () => {
       ]);
       await repeatedSync.promise;
     });
+    await applyModelSyncReview();
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
         expect.objectContaining({
@@ -1556,6 +1599,7 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
         expect.objectContaining({ model: "favorite", enabled: true }),
@@ -1596,11 +1640,10 @@ describe("CodexFormFields local model routing", () => {
     );
     expect(latestCatalog()).toEqual(beforeFailure);
 
-    // A later successful, complete refresh is authoritative about remote
-    // availability, but it retains every row for editing. Restore explicit
-    // custom/missing inclusions through the canonical table, not a second
-    // Readiness replacement operation with a stale saved snapshot.
+    // The default review option disables absent rows and keeps them editable.
+    // Restore custom and missing inclusions through the catalog table.
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
     await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(3));
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -1648,6 +1691,7 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
     await waitFor(() => expect(latestCatalog()).toHaveLength(1));
     expect(latestCatalog()[0].enabled).toBe(false);
     expect(
@@ -1659,6 +1703,7 @@ describe("CodexFormFields local model routing", () => {
       expect(screen.getByRole("button", { name: "Sync models" })).toBeEnabled(),
     );
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
     await waitFor(() => expect(fetchModelsForConfig).toHaveBeenCalledTimes(2));
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -1684,6 +1729,7 @@ describe("CodexFormFields local model routing", () => {
       { defaultModel: "", shouldShowSpeedTest: true },
     );
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
     await waitFor(() => expect(latestCatalog()).toHaveLength(2));
     expect(latestCatalog().every((model) => model.enabled === false)).toBe(
       true,
@@ -2705,6 +2751,7 @@ describe("CodexFormFields local model routing", () => {
     } = renderAutoSplitHarness();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
 
     await waitFor(() => {
       expect(latestCatalog()).toHaveLength(2);
@@ -3612,6 +3659,7 @@ describe("CodexFormFields local model routing", () => {
     });
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
 
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -3652,6 +3700,7 @@ describe("CodexFormFields local model routing", () => {
     ]);
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
 
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -3759,6 +3808,7 @@ describe("CodexFormFields local model routing", () => {
     ]);
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
 
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -3787,6 +3837,7 @@ describe("CodexFormFields local model routing", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
 
     await waitFor(() => {
       expect(fetchModelsForConfig).toHaveBeenCalledWith(
@@ -3840,6 +3891,7 @@ describe("CodexFormFields local model routing", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
+    await applyModelSyncReview();
 
     await waitFor(() => {
       expect(fetchModelsForConfig).toHaveBeenCalledWith(

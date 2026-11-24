@@ -62,8 +62,8 @@ async function setup(language: string) {
   );
   const hook = renderHook(
     () => ({
-      add: useAddProviderMutation("openclaw"),
-      update: useUpdateProviderMutation("openclaw"),
+      add: useAddProviderMutation(),
+      update: useUpdateProviderMutation(),
     }),
     { wrapper },
   );
@@ -80,6 +80,7 @@ describe("TE saved-but-not-published localized outcomes", () => {
       const { id, ...addInput } = provider;
       const added = await act(() =>
         result.current.add.mutateAsync({
+          appId: "openclaw",
           ...addInput,
           providerKey: id,
           teDescriptor: descriptor,
@@ -102,6 +103,7 @@ describe("TE saved-but-not-published localized outcomes", () => {
       );
       const updated = await act(() =>
         result.current.update.mutateAsync({
+          appId: "openclaw",
           provider,
           teDescriptor: descriptor,
           originalId: "previous-source",
@@ -139,6 +141,7 @@ describe("TE saved-but-not-published localized outcomes", () => {
       const { id, ...addInput } = provider;
       await act(() =>
         result.current.add.mutateAsync({
+          appId: "openclaw",
           ...addInput,
           providerKey: id,
           teDescriptor: descriptor,
@@ -150,6 +153,7 @@ describe("TE saved-but-not-published localized outcomes", () => {
       );
       await act(() =>
         result.current.update.mutateAsync({
+          appId: "openclaw",
           provider,
           teDescriptor: descriptor,
         }),

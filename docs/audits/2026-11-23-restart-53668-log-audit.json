@@ -1,0 +1,638 @@
+{
+  "schemaVersion": 1,
+  "capturedAtUtc": "2026-11-22T18:55:52.250Z",
+  "timezone": "Asia/Singapore",
+  "application": {
+    "pid": 53668,
+    "markerStart": "2026-11-23 02:45:54.795",
+    "executablePath": "H:\\repos\\ccswitchmulti-refork\\src-tauri\\target\\debug\\cc-switch.exe",
+    "binaryModifiedAtUtc": "2026-11-22T18:45:53.864Z"
+  },
+  "measurement": {
+    "sampleFile": "H:/repos/ccswitchmulti-refork/docs/audits/2026-11-23-resource-sample-53668-restart-185007.json",
+    "summary": {
+      "durationSeconds": 177.15341400000003,
+      "sampleCount": 65,
+      "logicalProcessors": 16,
+      "rootAverageCpuOneCorePercent": 81.28547835945176,
+      "rootAverageCpuMachinePercent": 5.080342397465735,
+      "rootPeakCpuOneCorePercent": 502.04402661399286,
+      "treeAverageCpuOneCorePercent": 81.28547835945176,
+      "treeAverageCpuMachinePercent": 5.080342397465735,
+      "treePeakCpuMachinePercent": 31.377751663374553,
+      "rootPrivateStartBytes": 112119808,
+      "rootPrivateEndBytes": 182857728,
+      "rootPrivatePeakBytes": 182857728,
+      "treePrivateStartBytes": 564789248,
+      "treePrivateEndBytes": 592883712,
+      "treePrivatePeakBytes": 617848832,
+      "aggregateCorrection": "Recomputed from serialized per-process CPU deltas and memory values; PowerShell Measure-Object over dynamic objects did not populate maxima/tree sums reliably."
+    }
+  },
+  "logs": [
+    {
+      "file": "cc-switch.log",
+      "size": 9307649,
+      "bytesRead": 4194304
+    },
+    {
+      "file": "codex-router.log",
+      "size": 3395574,
+      "bytesRead": 3395574
+    }
+  ],
+  "scope": "Read-only named app/router tails, bounded to startup and CPU sample; prompts/bodies/credentials/session/trace identifiers omitted",
+  "sinceStartup": {
+    "startUtc": "2026-11-22T18:45:54.795Z",
+    "endUtc": "2026-11-22T18:55:51.717Z",
+    "events": [
+      {
+        "event": "request_classified",
+        "count": 102
+      },
+      {
+        "event": "route_resolved",
+        "count": 101
+      },
+      {
+        "event": "request_prepared",
+        "count": 101
+      },
+      {
+        "event": "auth_prepared",
+        "count": 101
+      },
+      {
+        "event": "request_health",
+        "count": 101
+      },
+      {
+        "event": "request_body_accounting",
+        "count": 101
+      },
+      {
+        "event": "upstream_send",
+        "count": 101
+      },
+      {
+        "event": "request_health_review_approved",
+        "count": 100
+      },
+      {
+        "event": "upstream_status",
+        "count": 96
+      },
+      {
+        "event": "response_ready",
+        "count": 96
+      },
+      {
+        "event": "stream_outcome",
+        "count": 94
+      }
+    ],
+    "sends": 101,
+    "requestBytes": 73425232,
+    "wireBytes": 73425232,
+    "streamOutcomes": [
+      {
+        "outcome": "completed",
+        "attempt": "0",
+        "count": 93
+      },
+      {
+        "outcome": "cancelled",
+        "attempt": "0",
+        "count": 1
+      }
+    ],
+    "sseErrors": [],
+    "retryDecisions": [],
+    "recoveries": [],
+    "reasoning": [
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": "ultra",
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 68
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 16
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 10
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 6
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "compaction",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": "ultra",
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 1
+      }
+    ],
+    "sync": [
+      {
+        "t": "2026-11-22T18:46:43.000Z",
+        "imported": 0,
+        "skipped": 8,
+        "deferred": 118,
+        "scanned": 1208
+      },
+      {
+        "t": "2026-11-22T18:47:48.000Z",
+        "imported": 1,
+        "skipped": 4,
+        "deferred": 117,
+        "scanned": 1170
+      },
+      {
+        "t": "2026-11-22T18:48:53.000Z",
+        "imported": 0,
+        "skipped": 5,
+        "deferred": 117,
+        "scanned": 1170
+      },
+      {
+        "t": "2026-11-22T18:49:55.000Z",
+        "imported": 1,
+        "skipped": 5,
+        "deferred": 117,
+        "scanned": 1170
+      },
+      {
+        "t": "2026-11-22T18:51:00.000Z",
+        "imported": 2,
+        "skipped": 8,
+        "deferred": 117,
+        "scanned": 1170
+      },
+      {
+        "t": "2026-11-22T18:52:09.000Z",
+        "imported": 1,
+        "skipped": 9,
+        "deferred": 117,
+        "scanned": 1170
+      },
+      {
+        "t": "2026-11-22T18:53:17.000Z",
+        "imported": 3,
+        "skipped": 6,
+        "deferred": 117,
+        "scanned": 1170
+      },
+      {
+        "t": "2026-11-22T18:54:20.000Z",
+        "imported": 2,
+        "skipped": 6,
+        "deferred": 117,
+        "scanned": 1170
+      },
+      {
+        "t": "2026-11-22T18:55:25.000Z",
+        "imported": 2,
+        "skipped": 6,
+        "deferred": 117,
+        "scanned": 1170
+      }
+    ]
+  },
+  "cpuWindow": {
+    "startUtc": "2026-11-22T18:50:09.547Z",
+    "endUtc": "2026-11-22T18:53:06.700Z",
+    "events": [
+      {
+        "event": "request_classified",
+        "count": 38
+      },
+      {
+        "event": "route_resolved",
+        "count": 38
+      },
+      {
+        "event": "request_prepared",
+        "count": 38
+      },
+      {
+        "event": "auth_prepared",
+        "count": 38
+      },
+      {
+        "event": "request_health",
+        "count": 38
+      },
+      {
+        "event": "request_body_accounting",
+        "count": 38
+      },
+      {
+        "event": "request_health_review_approved",
+        "count": 38
+      },
+      {
+        "event": "upstream_send",
+        "count": 38
+      },
+      {
+        "event": "stream_outcome",
+        "count": 34
+      },
+      {
+        "event": "upstream_status",
+        "count": 33
+      },
+      {
+        "event": "response_ready",
+        "count": 33
+      }
+    ],
+    "sends": 38,
+    "requestBytes": 29343689,
+    "wireBytes": 29343689,
+    "streamOutcomes": [
+      {
+        "outcome": "completed",
+        "attempt": "0",
+        "count": 33
+      },
+      {
+        "outcome": "cancelled",
+        "attempt": "0",
+        "count": 1
+      }
+    ],
+    "sseErrors": [],
+    "retryDecisions": [],
+    "recoveries": [],
+    "reasoning": [
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": "ultra",
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 27
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 5
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 3
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 3
+      }
+    ],
+    "sync": [
+      {
+        "t": "2026-11-22T18:51:00.000Z",
+        "imported": 2,
+        "skipped": 8,
+        "deferred": 117,
+        "scanned": 1170
+      },
+      {
+        "t": "2026-11-22T18:52:09.000Z",
+        "imported": 1,
+        "skipped": 9,
+        "deferred": 117,
+        "scanned": 1170
+      }
+    ]
+  },
+  "timeline10s": [
+    {
+      "startUtc": "2026-11-22T18:50:09.547Z",
+      "endUtc": "2026-11-22T18:50:19.547Z",
+      "cpuMachinePercent": 8.630095021964658,
+      "sends": 1,
+      "wireBytes": 1406693,
+      "streamOutcomes": 2,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:50:19.547Z",
+      "endUtc": "2026-11-22T18:50:29.547Z",
+      "cpuMachinePercent": 9.883852514482719,
+      "sends": 5,
+      "wireBytes": 3526143,
+      "streamOutcomes": 4,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:50:29.547Z",
+      "endUtc": "2026-11-22T18:50:39.547Z",
+      "cpuMachinePercent": 5.860567948880283,
+      "sends": 4,
+      "wireBytes": 3191940,
+      "streamOutcomes": 4,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:50:39.547Z",
+      "endUtc": "2026-11-22T18:50:49.547Z",
+      "cpuMachinePercent": 0.3012392418012216,
+      "sends": 1,
+      "wireBytes": 1232676,
+      "streamOutcomes": 0,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:50:49.547Z",
+      "endUtc": "2026-11-22T18:50:59.547Z",
+      "cpuMachinePercent": 2.5095628118836095,
+      "sends": 1,
+      "wireBytes": 572599,
+      "streamOutcomes": 1,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:50:59.547Z",
+      "endUtc": "2026-11-22T18:51:09.547Z",
+      "cpuMachinePercent": 0.3140336028801577,
+      "sends": 0,
+      "wireBytes": 0,
+      "streamOutcomes": 0,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 1
+    },
+    {
+      "startUtc": "2026-11-22T18:51:09.547Z",
+      "endUtc": "2026-11-22T18:51:19.547Z",
+      "cpuMachinePercent": 8.73417368230396,
+      "sends": 0,
+      "wireBytes": 0,
+      "streamOutcomes": 0,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:51:19.547Z",
+      "endUtc": "2026-11-22T18:51:29.547Z",
+      "cpuMachinePercent": 4.490087568008111,
+      "sends": 2,
+      "wireBytes": 1740116,
+      "streamOutcomes": 3,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:51:29.547Z",
+      "endUtc": "2026-11-22T18:51:39.547Z",
+      "cpuMachinePercent": 8.70370813400028,
+      "sends": 3,
+      "wireBytes": 1630384,
+      "streamOutcomes": 5,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:51:39.547Z",
+      "endUtc": "2026-11-22T18:51:49.547Z",
+      "cpuMachinePercent": 4.946275370827119,
+      "sends": 5,
+      "wireBytes": 3599223,
+      "streamOutcomes": 3,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:51:49.547Z",
+      "endUtc": "2026-11-22T18:51:59.547Z",
+      "cpuMachinePercent": 1.5077310394878207,
+      "sends": 2,
+      "wireBytes": 2013654,
+      "streamOutcomes": 0,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:51:59.547Z",
+      "endUtc": "2026-11-22T18:52:09.547Z",
+      "cpuMachinePercent": 1.6899500339795446,
+      "sends": 0,
+      "wireBytes": 0,
+      "streamOutcomes": 0,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 1
+    },
+    {
+      "startUtc": "2026-11-22T18:52:09.547Z",
+      "endUtc": "2026-11-22T18:52:19.547Z",
+      "cpuMachinePercent": 6.203818953606355,
+      "sends": 0,
+      "wireBytes": 0,
+      "streamOutcomes": 0,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:52:19.547Z",
+      "endUtc": "2026-11-22T18:52:29.547Z",
+      "cpuMachinePercent": 6.86453475909178,
+      "sends": 3,
+      "wireBytes": 2481514,
+      "streamOutcomes": 2,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:52:29.547Z",
+      "endUtc": "2026-11-22T18:52:39.547Z",
+      "cpuMachinePercent": 13.701349173815878,
+      "sends": 2,
+      "wireBytes": 1125869,
+      "streamOutcomes": 5,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:52:39.547Z",
+      "endUtc": "2026-11-22T18:52:49.547Z",
+      "cpuMachinePercent": 5.032414557224685,
+      "sends": 8,
+      "wireBytes": 6255958,
+      "streamOutcomes": 5,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:52:49.547Z",
+      "endUtc": "2026-11-22T18:52:59.547Z",
+      "cpuMachinePercent": 0.6250254806300829,
+      "sends": 1,
+      "wireBytes": 566920,
+      "streamOutcomes": 0,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    },
+    {
+      "startUtc": "2026-11-22T18:52:59.547Z",
+      "endUtc": "2026-11-22T18:53:06.700Z",
+      "cpuMachinePercent": 0,
+      "sends": 0,
+      "wireBytes": 0,
+      "streamOutcomes": 0,
+      "sseErrors": 0,
+      "retries": 0,
+      "sync": 0
+    }
+  ],
+  "limitations": [
+    "No native CPU stack attribution or parser timings.",
+    "Tail bounded to4MiB per file.",
+    "Short-lived descendants can be missed between10-second tree refreshes.",
+    "Stream outcomes are proxy-observed terminal outcomes, not client acknowledgements."
+  ],
+  "comparisonWithPriorAudit": {
+    "currentPid": 53668,
+    "previousPid": 24180,
+    "currentWindow": {
+      "durationSeconds": 177.15341400000003,
+      "rootAverageMachinePercent": 5.080342397465735,
+      "sends": 38,
+      "wireBytes": 29343689,
+      "coreSeconds": 144,
+      "coreSecondsPerSend": 3.789473684210526
+    },
+    "previousWindow": {
+      "durationSeconds": 180.1976814,
+      "rootAverageMachinePercent": 9.884977354653133,
+      "sends": 74,
+      "wireBytes": 37660058,
+      "coreSeconds": 285,
+      "coreSecondsPerSend": 3.8513513513513513
+    },
+    "interpretation": "Current total CPU is lower than prior sample, but request rate/workload differs. Per-send core-seconds are similar (~3.79 vs ~3.85); this is not a controlled before/after performance proof."
+  },
+  "sourceAudit": {
+    "guardian": "One serialized guardian loop; live renderer cadence roughly3s plus cycle duration; native usage candidates collected unconditionally per renderer target via join_all.",
+    "loadedThreadObserver": "Each renderer scans all loaded threads/pages with up to8 concurrent workers; per-renderer source single-flight only, no cross-renderer deduplication.",
+    "nativeDiscovery": "Fresh listener/ownership checks are intentionally repeated for TOCTOU; probes are offloaded and bounded, no busy-spin. Safe optimization boundary is batching/reusing inventory within identity snapshot or deduplicating identical renderer sources while preserving fresh authorization.",
+    "cpuAttribution": "Source proves recurring work multipliers but not live dominance. The fresh PID sample is process-level only, not stack-level.",
+    "deferredWarningCount": 118,
+    "deferredReasonCategories": {
+      "missingCopiedParentPrefix": 112,
+      "missingExplicitContinuationBase": 3,
+      "missingParentRollout": 3
+    }
+  },
+  "liveReverification": {
+    "markerPid": 53668,
+    "markerStart": "2026-11-23 02:45:54.795",
+    "listenerOwner": 53668,
+    "health": "healthy",
+    "guardianLoopStarted": false,
+    "binaryModifiedAtUtc": "2026-11-22T18:45:53.8636909Z",
+    "sourceEditsPrecedeBinary": [
+      "src-tauri/src/services/session_usage_codex.rs",
+      "src-tauri/src/proxy/forwarder.rs",
+      "src-tauri/src/proxy/hyper_client.rs",
+      "src-tauri/src/proxy/error_journal.rs",
+      "src-tauri/src/proxy/providers/streaming_retry.rs"
+    ],
+    "sourceBuildIdentityCryptographicallyVerified": false
+  },
+  "finalStatus": {
+    "postRestartResourceSampleComplete": true,
+    "postRestartLogAuditComplete": true,
+    "reasoningContractObserved": true,
+    "remainingUnproven": "Exact function-level CPU attribution and live improvement from source fixes."
+  },
+  "finalIdentityCheck": {
+    "capturedAtUtc": "2026-11-22T19:02:32.287Z",
+    "pid": 53668,
+    "markerAndNativeProcessIdentityMatch": true,
+    "listenerOwner": 53668,
+    "health": "healthy",
+    "guardianLoopStarted": false,
+    "currentPrivateMiB": 145.26,
+    "currentWorkingSetMiB": 208.55
+  },
+  "auditConclusion": {
+    "restartedRuntimeObserved": true,
+    "backendCpuAverageMachinePercent": 5.08,
+    "backendCpuPeakMachinePercent": 31.38,
+    "requestAndImportWorkStillPresent": true,
+    "majorNewDuplicateOwnerFound": false,
+    "reasoningContractMatchesObservedTraffic": true,
+    "remainingCPUAttribution": "not stack-level proven; loaded-thread observer and repeated native discovery remain source-proven recurring work multipliers.",
+    "beforeAfterCaveat": "Compared with PID24180 prior sample, total CPU was lower (5.08% vs9.88%), but per-send core-seconds were similar (3.79 vs3.85) and workloads differed, so this does not prove a fix percentage.",
+    "sourceFixesInRunningBinary": "Binary timestamp is after the listed source edits and user restarted it, but source-to-binary identity was not cryptographically verified."
+  }
+}

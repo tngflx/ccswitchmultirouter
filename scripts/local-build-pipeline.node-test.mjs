@@ -19,11 +19,9 @@ import {
   assertLocalProductionOutputRoot,
   buildHistoryRepairSidecar,
   invokeLocalProductionBuild,
-  main,
   parseLocalBuildOptions,
   resolveLocalProductionOutputRoot,
 } from "./local-build-pipeline.mjs";
-import { createBuildApprovalScope } from "./build-approval.mjs";
 import {
   assertLocalTauriCliVersion,
   cleanupLocalReleaseCargoTarget,
@@ -134,20 +132,16 @@ function controlledRunner(
   return { run, calls };
 }
 
-function approved(t, environment = {}) {
-  const scope = createBuildApprovalScope(environment);
-  t.after(() => scope.cleanup());
-  return { environment: scope.environment, log() {}, warn() {} };
-}
+const quiet = { log() {}, warn() {} };
 
 test("JS build accepts current and former output-directory spelling and rejects incomplete arguments", () => {
   assert.deepEqual(
     parseLocalBuildOptions(["-OutputDir", "D:\\builds\\candidate"]),
-    { outputDir: "D:\\builds\\candidate", confirmBuild: false, help: false },
+    { outputDir: "D:\\builds\\candidate", help: false },
   );
   assert.deepEqual(
     parseLocalBuildOptions(["--output-dir", "output/candidate"]),
-    { outputDir: "output/candidate", confirmBuild: false, help: false },
+    { outputDir: "output/candidate", help: false },
   );
   assert.equal(parseLocalBuildOptions(["--help"]).help, true);
   assert.throws(
@@ -158,42 +152,6 @@ test("JS build accepts current and former output-directory spelling and rejects 
     () => parseLocalBuildOptions(["--execute"]),
     /Unknown local build option/,
   );
-});
-
-test("local production entrypoint refuses before any platform or build work", (t) => {
-  const { root } = fixture(t);
-  assert.throws(
-    () => main([], { repoRoot: root, platform: "win32" }),
-    /explicit user approval/,
-  );
-  assert.equal(existsSync(path.join(root, ".tmp")), false);
-});
-
-test("exported production build helpers refuse without current approval before spawning", (t) => {
-  const { root, output } = fixture(t);
-  const target = path.join(root, ".tmp", "sidecar-target");
-  let calls = 0;
-  assert.throws(
-    () =>
-      buildHistoryRepairSidecar(root, target, {
-        run() {
-          calls += 1;
-        },
-      }),
-    /explicit user approval/,
-  );
-  assert.throws(
-    () =>
-      invokeLocalProductionBuild(root, output, {
-        approvalArgs: ["--confirm-build"],
-        run() {
-          calls += 1;
-        },
-      }),
-    /explicit user approval/,
-  );
-  assert.equal(calls, 0);
-  assert.equal(existsSync(path.join(root, ".tmp")), false);
 });
 
 test("production output defaults and relative overrides resolve against the repository", (t) => {
@@ -210,9 +168,8 @@ test("history repair sidecar build uses the isolated target and canonical featur
   const target = mkdtempSync(path.join(os.tmpdir(), "ccsm-sidecar-target-"));
   t.after(() => rmSync(target, { recursive: true, force: true }));
   const calls = [];
-  const approval = approved(t, { CARGO_TARGET_DIR: "caller-owned-target" });
   const sidecar = buildHistoryRepairSidecar(root, target, {
-    environment: approval.environment,
+    environment: { CARGO_TARGET_DIR: "caller-owned-target" },
     run(executable, args, options) {
       calls.push({ executable, args, options });
       mkdirSync(path.join(target, "release"), { recursive: true });
@@ -242,10 +199,7 @@ test("history repair sidecar build uses the isolated target and canonical featur
       ],
       options: {
         cwd: root,
-        env: {
-          ...approval.environment,
-          CARGO_TARGET_DIR: target,
-        },
+        env: { CARGO_TARGET_DIR: target },
         stdio: "inherit",
       },
     },
@@ -256,11 +210,9 @@ test("history repair sidecar build fails closed when Cargo omits the helper", (t
   const { root } = fixture(t);
   const target = mkdtempSync(path.join(os.tmpdir(), "ccsm-sidecar-target-"));
   t.after(() => rmSync(target, { recursive: true, force: true }));
-  const approval = approved(t);
   assert.throws(
     () =>
       buildHistoryRepairSidecar(root, target, {
-        environment: approval.environment,
         run: () => ({ status: 0 }),
       }),
     /codex-history-repairer sidecar was not produced/,
@@ -276,15 +228,8 @@ test("successful isolated build preserves binaries/resources after cleanup and l
   };
   let target;
   let config;
-  let approvalScope;
   const { run, calls } = controlledRunner((build) => {
     ({ target, config } = build);
-    approvalScope = build.options.env.CCSWITCH_BUILD_APPROVAL_SCOPE;
-    assert.ok(approvalScope);
-    assert.equal(
-      JSON.parse(readFileSync(approvalScope, "utf8")).token,
-      build.options.env.CCSWITCH_BUILD_APPROVED,
-    );
     assert.equal(environment.CARGO_TARGET_DIR, "caller-owned-target");
     assert.equal(
       JSON.parse(readFileSync(config, "utf8")).bundle.createUpdaterArtifacts,
@@ -299,10 +244,7 @@ test("successful isolated build preserves binaries/resources after cleanup and l
     writeArtifacts(target);
   });
   assert.equal(
-    invokeLocalProductionBuild(root, output, {
-      run,
-      ...approved(t, environment),
-    }),
+    invokeLocalProductionBuild(root, output, { run, environment, ...quiet }),
     output,
   );
   assert.equal(
@@ -323,7 +265,6 @@ test("successful isolated build preserves binaries/resources after cleanup and l
   assert.equal(existsSync(path.join(output, "old-installer.exe")), false);
   assert.equal(existsSync(target), false);
   assert.equal(existsSync(config), false);
-  assert.equal(existsSync(approvalScope), true);
   assert.equal(environment.CARGO_TARGET_DIR, "caller-owned-target");
   assert.equal(calls.length, 4);
   assert.equal(calls[1].executable, "cargo");
@@ -346,7 +287,7 @@ test("failed native build leaves previous output intact and cleans only its own 
     return { status: 7 };
   });
   assert.throws(
-    () => invokeLocalProductionBuild(root, output, { run, ...approved(t) }),
+    () => invokeLocalProductionBuild(root, output, { run, ...quiet }),
     /tauri build failed with exit code 7/,
   );
   assert.equal(
@@ -373,7 +314,6 @@ test("a thrown build error keeps the original error while cleanup failures becom
     () =>
       invokeLocalProductionBuild(root, output, {
         run,
-        ...approved(t),
         log() {},
         warn: (message) => warnings.push(message),
       }),
@@ -401,7 +341,6 @@ test("locked config cleanup cannot skip Cargo cleanup or replace the primary bui
     () =>
       invokeLocalProductionBuild(root, output, {
         run,
-        ...approved(t),
         createConfig: () => ({
           path: config.path,
           remove() {
@@ -425,7 +364,7 @@ test("missing installer blocks export even when Tauri reports success", (t) => {
     writeArtifacts(target, { installer: false }),
   );
   assert.throws(
-    () => invokeLocalProductionBuild(root, output, { run, ...approved(t) }),
+    () => invokeLocalProductionBuild(root, output, { run, ...quiet }),
     /did not produce an NSIS installer/,
   );
   assert.equal(
@@ -440,7 +379,7 @@ test("missing executable blocks export before an existing output is touched", (t
   previousOutput(root, output);
   const { run } = controlledRunner(() => {});
   assert.throws(
-    () => invokeLocalProductionBuild(root, output, { run, ...approved(t) }),
+    () => invokeLocalProductionBuild(root, output, { run, ...quiet }),
     /did not produce the raw executable/,
   );
   assert.equal(
@@ -457,7 +396,7 @@ test("copy failure leaves previous output intact and removes the unique staging 
     () =>
       invokeLocalProductionBuild(root, output, {
         run,
-        ...approved(t),
+        ...quiet,
         exportOptions: {
           copy(source, destination, options) {
             if (path.basename(source) === "bundle")
@@ -483,7 +422,7 @@ test("failed staging promotion restores previous output and removes staging", (t
     () =>
       invokeLocalProductionBuild(root, output, {
         run,
-        ...approved(t),
+        ...quiet,
         exportOptions: {
           promote(stage, release, context) {
             assert.equal(context.repoRoot, root);
@@ -520,7 +459,7 @@ test("locked staging cleanup preserves the primary export error and the previous
     () =>
       invokeLocalProductionBuild(root, output, {
         run,
-        ...approved(t),
+        ...quiet,
         exportOptions: {
           copy() {
             throw new Error("primary fixture copy failure");
@@ -554,7 +493,7 @@ test("failed export never deletes through a staging junction while preserving it
     () =>
       invokeLocalProductionBuild(root, output, {
         run,
-        ...approved(t),
+        ...quiet,
         exportOptions: {
           copy(_source, destination) {
             const stage = path.dirname(destination);
@@ -603,7 +542,7 @@ test("unsafe source, scratch, repository ancestor and filesystem-root outputs ar
           run() {
             called = true;
           },
-          ...approved(t),
+          ...quiet,
         }),
       /release output/,
     );
@@ -647,7 +586,7 @@ test("LOCAL-BUILD metadata alone cannot authorize replacing unrelated contents",
           called = true;
           throw new Error("build must not start");
         },
-        ...approved(t),
+        ...quiet,
       }),
     /not owned|no verified ownership/,
   );
@@ -668,11 +607,12 @@ test("active caller Cargo target cannot be replaced before a build starts", (t) 
   assert.throws(
     () =>
       invokeLocalProductionBuild(root, output, {
-        ...approved(t, { CARGO_TARGET_DIR: output }),
+        environment: { CARGO_TARGET_DIR: output },
         run() {
           called = true;
           throw new Error("build must not start");
         },
+        ...quiet,
       }),
     /active Cargo target directory/,
   );
@@ -684,7 +624,7 @@ test("verified canonical inventory authorizes the next output replacement", (t) 
   const { root, output } = fixture(t);
   previousOutput(root, output);
   const { run } = controlledRunner();
-  invokeLocalProductionBuild(root, output, { run, ...approved(t) });
+  invokeLocalProductionBuild(root, output, { run, ...quiet });
   assert.equal(
     readFileSync(path.join(output, "cc-switch.exe"), "utf8"),
     "production executable",
@@ -757,7 +697,7 @@ test("stale installed or reported Tauri versions block native compilation", (t) 
         run() {
           called = true;
         },
-        ...approved(t),
+        ...quiet,
       }),
     /package version mismatch/,
   );
@@ -814,7 +754,7 @@ console.error('successful fixture build progress');`;
       windowsHide: true,
     });
   };
-  invokeLocalProductionBuild(root, output, { run, ...approved(t) });
+  invokeLocalProductionBuild(root, output, { run, ...quiet });
   assert.equal(
     readFileSync(path.join(output, "cc-switch.exe"), "utf8"),
     "fixture executable",

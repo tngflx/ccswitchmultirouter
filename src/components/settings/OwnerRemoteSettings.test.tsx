@@ -12,6 +12,7 @@ import {
   useOwnerRemoteController,
 } from "./OwnerRemoteSettings";
 import { ownerRemoteApi, type OwnerRemoteStatus } from "@/lib/api/ownerRemote";
+import { tailscaleApi, type TailscaleStatus } from "@/lib/api/tailscale";
 import en from "@/i18n/locales/en.json";
 import zh from "@/i18n/locales/zh.json";
 import zhTW from "@/i18n/locales/zh-TW.json";
@@ -28,6 +29,13 @@ vi.mock("@/lib/api/ownerRemote", () => ({
     createInvite: vi.fn(),
   },
 }));
+vi.mock("@/lib/api/tailscale", () => ({
+  tailscaleApi: {
+    getStatus: vi.fn(),
+    connect: vi.fn(),
+    verifyOwnerRemote: vi.fn(),
+  },
+}));
 
 const stopped: OwnerRemoteStatus = {
   enabled: false,
@@ -40,6 +48,18 @@ const running: OwnerRemoteStatus = {
   enabled: true,
   running: true,
   httpsOrigin: "https://owner.test",
+};
+const tailscaleMissing: TailscaleStatus = {
+  state: "missing",
+  reachable: false,
+};
+const tailscaleReady: TailscaleStatus = {
+  state: "ready",
+  reachable: false,
+};
+const tailscaleReachable: TailscaleStatus = {
+  state: "reachable",
+  reachable: true,
 };
 
 function deferred<T>() {
@@ -57,14 +77,17 @@ const toggle = () =>
 const originInput = () => screen.getByLabelText("settings.ownerRemote.origin");
 const inviteButton = () =>
   screen.getByRole("button", { name: "settings.ownerRemote.invite" });
+const connectButton = () =>
+  screen.getByRole("button", { name: "settings.ownerRemote.tailscaleConnect" });
 
 function OwnerRemoteHarness({ active = true }: { active?: boolean }) {
   const controller = useOwnerRemoteController(active);
   return active ? <OwnerRemoteSettings controller={controller} /> : null;
 }
 
-async function mount(status = stopped) {
+async function mount(status = stopped, tailscale = tailscaleMissing) {
   vi.mocked(ownerRemoteApi.getStatus).mockResolvedValue(status);
+  vi.mocked(tailscaleApi.getStatus).mockResolvedValue(tailscale);
   const view = render(<OwnerRemoteHarness />);
   await waitFor(() => expect(originInput()).not.toBeDisabled());
   return view;
@@ -100,6 +123,135 @@ describe("OwnerRemoteSettings", () => {
     ).toBeVisible();
     expect(screen.getByText("settings.ownerRemote.security")).toBeVisible();
     expect(screen.getByText("settings.ownerRemote.boundary")).toBeVisible();
+  });
+
+  it("reads Tailscale status without connecting or verifying on mount", async () => {
+    await mount(stopped, tailscaleMissing);
+    expect(tailscaleApi.getStatus).toHaveBeenCalledTimes(1);
+    expect(connectButton()).toBeEnabled();
+    expect(tailscaleApi.connect).not.toHaveBeenCalled();
+    expect(tailscaleApi.verifyOwnerRemote).not.toHaveBeenCalled();
+  });
+
+  it("connects once and refreshes listener state and enrollment actions from native status", async () => {
+    await mount();
+    const connection = deferred<TailscaleStatus>();
+    vi.mocked(tailscaleApi.connect).mockReturnValue(connection.promise);
+    vi.mocked(ownerRemoteApi.getStatus).mockResolvedValue(running);
+    const button = connectButton();
+    act(() => {
+      fireEvent.click(button);
+      fireEvent.click(button);
+    });
+    expect(tailscaleApi.connect).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByText("settings.ownerRemote.tailscaleActionConnect"),
+    ).toBeVisible();
+    expect(inviteButton()).toBeDisabled();
+    await act(async () => connection.resolve(tailscaleReachable));
+    expect(ownerRemoteApi.getStatus).toHaveBeenCalledTimes(2);
+    expect(ownerRemoteApi.start).not.toHaveBeenCalled();
+    expect(toggle()).toBeChecked();
+    expect(inviteButton()).toBeEnabled();
+    expect(
+      screen.getByText("settings.ownerRemote.tailscaleReachable"),
+    ).toBeVisible();
+    expect(
+      screen.getByText("settings.ownerRemote.tailscaleEnrollDevice"),
+    ).toBeVisible();
+  });
+
+  it("verifies only by request and clears proof when the listener stops", async () => {
+    await mount(running, tailscaleReady);
+    vi.mocked(tailscaleApi.verifyOwnerRemote).mockResolvedValue(
+      tailscaleReachable,
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "settings.ownerRemote.tailscaleVerify",
+      }),
+    );
+    expect(
+      await screen.findByText("settings.ownerRemote.tailscaleReachable"),
+    ).toBeVisible();
+    expect(tailscaleApi.verifyOwnerRemote).toHaveBeenCalledTimes(1);
+    const stopping = deferred<OwnerRemoteStatus>();
+    vi.mocked(ownerRemoteApi.stop).mockReturnValue(stopping.promise);
+    fireEvent.click(toggle());
+    expect(toggle()).toBeChecked();
+    expect(
+      screen.queryByText("settings.ownerRemote.tailscaleReachable"),
+    ).toBeNull();
+    await act(async () => stopping.resolve(stopped));
+    await waitFor(() => expect(toggle()).not.toBeChecked());
+    expect(
+      screen.queryByText("settings.ownerRemote.tailscaleReachable"),
+    ).toBeNull();
+    expect(
+      screen.queryByText("settings.ownerRemote.tailscaleEnrollDevice"),
+    ).toBeNull();
+    expect(inviteButton()).toBeDisabled();
+  });
+
+  it("clears verified status when the listener stops externally and then restarts", async () => {
+    await mount(running, tailscaleReachable);
+    const refresh = screen.getByRole("button", {
+      name: "settings.ownerRemote.refreshStatus",
+    });
+    expect(
+      screen.getByText("settings.ownerRemote.tailscaleReachable"),
+    ).toBeVisible();
+
+    vi.mocked(ownerRemoteApi.getStatus).mockResolvedValue(stopped);
+    fireEvent.click(refresh);
+    await waitFor(() => expect(toggle()).not.toBeChecked());
+
+    vi.mocked(ownerRemoteApi.getStatus).mockResolvedValue(running);
+    fireEvent.click(refresh);
+    await waitFor(() => expect(toggle()).toBeChecked());
+    expect(
+      screen.queryByText("settings.ownerRemote.tailscaleReachable"),
+    ).toBeNull();
+    expect(
+      screen.queryByText("settings.ownerRemote.tailscaleEnrollDevice"),
+    ).toBeNull();
+  });
+
+  it("clears verified status when a Tailscale refresh observes a disconnect", async () => {
+    await mount(running, tailscaleReachable);
+    const checking = deferred<TailscaleStatus>();
+    vi.mocked(tailscaleApi.getStatus).mockReturnValue(checking.promise);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "settings.ownerRemote.tailscaleRefresh",
+      }),
+    );
+    expect(
+      screen.queryByText("settings.ownerRemote.tailscaleEnrollDevice"),
+    ).toBeNull();
+    await act(async () =>
+      checking.resolve({ state: "needsLogin", reachable: false }),
+    );
+    expect(
+      screen.getByText("settings.ownerRemote.tailscaleNeedsLogin"),
+    ).toBeVisible();
+    expect(
+      screen.queryByText("settings.ownerRemote.tailscaleReachable"),
+    ).toBeNull();
+    expect(connectButton()).toBeEnabled();
+  });
+
+  it("reports the native Tailscale sign-in timeout", async () => {
+    await mount();
+    vi.mocked(tailscaleApi.connect).mockResolvedValue({
+      state: "needsLogin",
+      reachable: false,
+      error: "tailscale_login_timeout",
+    });
+    fireEvent.click(connectButton());
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "settings.ownerRemote.tailscaleLoginTimeout",
+    );
   });
 
   it("shows ordered Tailscale-first setup without installing or changing access", async () => {
@@ -210,6 +362,12 @@ describe("OwnerRemoteSettings", () => {
         "cloudflareNoSecrets",
         "openWebsite",
         "listenerOnly",
+        "tailscaleConnect",
+        "tailscaleActionConnect",
+        "tailscaleNeedsApproval",
+        "tailscaleReady",
+        "tailscaleReachable",
+        "tailscaleEnrollDevice",
       ];
       const copy = messages.settings.ownerRemote as Record<string, unknown>;
       for (const key of keys) {

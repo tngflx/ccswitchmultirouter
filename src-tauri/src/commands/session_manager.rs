@@ -1,6 +1,8 @@
 #![allow(non_snake_case)]
 
 use crate::session_manager;
+use crate::session_manager::codex_backup;
+use std::path::Path;
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +56,32 @@ pub async fn list_sessions() -> Result<Vec<session_manager::SessionMeta>, String
         .await
         .map_err(|e| format!("Failed to scan sessions: {e}"))?;
     Ok(sessions)
+}
+
+#[tauri::command]
+pub async fn export_codex_session_backup(
+    target_path: String,
+    items: Vec<codex_backup::BackupItem>,
+) -> Result<codex_backup::ExportOutcome, String> {
+    super::run_command_blocking(move || codex_backup::export(Path::new(&target_path), &items)).await
+}
+
+#[tauri::command]
+pub async fn inspect_codex_session_backup(
+    source_path: String,
+) -> Result<codex_backup::BackupPreview, String> {
+    super::run_command_blocking(move || codex_backup::inspect(Path::new(&source_path))).await
+}
+
+#[tauri::command]
+pub async fn import_codex_session_backup(
+    source_path: String,
+    manifest_hash: String,
+) -> Result<codex_backup::ImportOutcome, String> {
+    super::run_command_blocking(move || {
+        codex_backup::import(Path::new(&source_path), &manifest_hash)
+    })
+    .await
 }
 
 #[tauri::command]

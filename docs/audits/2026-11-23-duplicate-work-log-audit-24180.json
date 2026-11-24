@@ -1,0 +1,1112 @@
+{
+  "schemaVersion": 1,
+  "capturedAtUtc": "2026-11-22T17:47:35.254Z",
+  "timezone": "Asia/Singapore",
+  "pid": 24180,
+  "monitor": {
+    "interface": "createGuardianRuntime.inspectRuntime",
+    "healthy": true,
+    "listenerMatchesMarker": true,
+    "guardianLoopStarted": false
+  },
+  "sampleFile": "docs/audits/2026-11-23-resource-sample-24180-173251.json",
+  "sourceFiles": [
+    {
+      "name": "cc-switch.log",
+      "fileBytes": 9099706,
+      "bytesRead": 4194304,
+      "firstUtc": "2026-11-22T17:16:28.000Z",
+      "lastUtc": "2026-11-22T17:47:13.000Z"
+    },
+    {
+      "name": "codex-router.log",
+      "fileBytes": 15385804,
+      "bytesRead": 4194304,
+      "firstUtc": "2026-11-22T17:16:34.205Z",
+      "lastUtc": "2026-11-22T17:47:23.544Z"
+    }
+  ],
+  "scope": "Read-only named app/router log tails, max4MiB each; prompts/bodies/credentials/session and trace identifiers omitted",
+  "sinceStartup": {
+    "startUtc": "2026-11-22T17:16:14.076Z",
+    "endUtc": "2026-11-22T17:47:23.544Z",
+    "events": [
+      {
+        "event": "route_resolved",
+        "count": 593
+      },
+      {
+        "event": "request_prepared",
+        "count": 593
+      },
+      {
+        "event": "auth_prepared",
+        "count": 593
+      },
+      {
+        "event": "request_health",
+        "count": 593
+      },
+      {
+        "event": "request_body_accounting",
+        "count": 593
+      },
+      {
+        "event": "upstream_send",
+        "count": 593
+      },
+      {
+        "event": "request_classified",
+        "count": 588
+      },
+      {
+        "event": "upstream_status",
+        "count": 584
+      },
+      {
+        "event": "response_ready",
+        "count": 584
+      },
+      {
+        "event": "request_health_review_approved",
+        "count": 581
+      },
+      {
+        "event": "stream_outcome",
+        "count": 577
+      },
+      {
+        "event": "upstream_sse_error",
+        "count": 25
+      },
+      {
+        "event": "capacity_retry_decision",
+        "count": 25
+      },
+      {
+        "event": "turn_recovery",
+        "count": 8
+      }
+    ],
+    "actualSends": 593,
+    "clientBytes": 290910659,
+    "wireBytes": 290519659,
+    "reasoning": [
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 381
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": "ultra",
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 103
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 56
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 26
+      },
+      {
+        "model": "gpt-6.2-astra",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 15
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "unset",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "unset",
+        "subagent_reasoning_override_applied": "false",
+        "count": 5
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "compaction",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 3
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "compaction",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": "ultra",
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 2
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "compaction",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 1
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "compaction",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 1
+      }
+    ],
+    "outcomes": [
+      {
+        "outcome": "completed",
+        "attempt": "0",
+        "count": 508
+      },
+      {
+        "outcome": "cancelled",
+        "attempt": "0",
+        "count": 44
+      },
+      {
+        "outcome": "cancelled",
+        "attempt": "1",
+        "count": 25
+      }
+    ],
+    "capacity": [
+      {
+        "event": "upstream_sse_error",
+        "sse_event": "response.failed",
+        "decision": null,
+        "reason": null,
+        "attempt": "0",
+        "code": null,
+        "count": 25
+      },
+      {
+        "event": "capacity_retry_decision",
+        "sse_event": null,
+        "decision": null,
+        "reason": "retry_started",
+        "attempt": "0",
+        "code": null,
+        "count": 25
+      }
+    ],
+    "recovery": [
+      {
+        "stage": null,
+        "outcome": null,
+        "reason": "app_crash_interrupted_turn",
+        "count": 4
+      },
+      {
+        "stage": null,
+        "outcome": null,
+        "reason": "turn_activity_changed",
+        "count": 4
+      }
+    ],
+    "syncCompletions": [
+      {
+        "timestampUtc": "2026-11-22T17:17:12.000Z",
+        "imported": 0,
+        "skipped": 18,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:18:17.000Z",
+        "imported": 0,
+        "skipped": 14,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:19:22.000Z",
+        "imported": 0,
+        "skipped": 11,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:20:27.000Z",
+        "imported": 0,
+        "skipped": 7,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:21:32.000Z",
+        "imported": 0,
+        "skipped": 14,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:22:39.000Z",
+        "imported": 0,
+        "skipped": 15,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:23:45.000Z",
+        "imported": 0,
+        "skipped": 13,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:24:50.000Z",
+        "imported": 0,
+        "skipped": 17,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:25:55.000Z",
+        "imported": 0,
+        "skipped": 16,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:27:00.000Z",
+        "imported": 0,
+        "skipped": 11,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:28:05.000Z",
+        "imported": 1,
+        "skipped": 9,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:29:10.000Z",
+        "imported": 0,
+        "skipped": 7,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:30:15.000Z",
+        "imported": 5,
+        "skipped": 11,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:31:19.000Z",
+        "imported": 13,
+        "skipped": 11,
+        "deferred": 118,
+        "scanned": 1261
+      },
+      {
+        "timestampUtc": "2026-11-22T17:32:25.000Z",
+        "imported": 12,
+        "skipped": 26,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:33:30.000Z",
+        "imported": 10,
+        "skipped": 13,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:34:34.000Z",
+        "imported": 6,
+        "skipped": 11,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:35:42.000Z",
+        "imported": 3,
+        "skipped": 20,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:36:47.000Z",
+        "imported": 4,
+        "skipped": 17,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:37:53.000Z",
+        "imported": 7,
+        "skipped": 16,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:38:58.000Z",
+        "imported": 7,
+        "skipped": 10,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:40:03.000Z",
+        "imported": 1,
+        "skipped": 11,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:41:08.000Z",
+        "imported": 1,
+        "skipped": 14,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:42:13.000Z",
+        "imported": 0,
+        "skipped": 13,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:43:19.000Z",
+        "imported": 0,
+        "skipped": 11,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:44:24.000Z",
+        "imported": 0,
+        "skipped": 12,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:45:29.000Z",
+        "imported": 1,
+        "skipped": 14,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:46:35.000Z",
+        "imported": 3,
+        "skipped": 11,
+        "deferred": 118,
+        "scanned": 1264
+      }
+    ]
+  },
+  "cpuWindow": {
+    "startUtc": "2026-11-22T17:32:52.204Z",
+    "endUtc": "2026-11-22T17:35:52.401Z",
+    "events": [
+      {
+        "event": "upstream_status",
+        "count": 79
+      },
+      {
+        "event": "response_ready",
+        "count": 79
+      },
+      {
+        "event": "route_resolved",
+        "count": 74
+      },
+      {
+        "event": "request_prepared",
+        "count": 74
+      },
+      {
+        "event": "auth_prepared",
+        "count": 74
+      },
+      {
+        "event": "request_health",
+        "count": 74
+      },
+      {
+        "event": "request_body_accounting",
+        "count": 74
+      },
+      {
+        "event": "upstream_send",
+        "count": 74
+      },
+      {
+        "event": "request_classified",
+        "count": 73
+      },
+      {
+        "event": "request_health_review_approved",
+        "count": 71
+      },
+      {
+        "event": "stream_outcome",
+        "count": 70
+      },
+      {
+        "event": "upstream_sse_error",
+        "count": 6
+      },
+      {
+        "event": "capacity_retry_decision",
+        "count": 6
+      }
+    ],
+    "actualSends": 74,
+    "clientBytes": 37722914,
+    "wireBytes": 37660058,
+    "reasoning": [
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 40
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 12
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": "ultra",
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 12
+      },
+      {
+        "model": "gpt-6.2-astra",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 4
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 3
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "unset",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "unset",
+        "subagent_reasoning_override_applied": "false",
+        "count": 1
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "compaction",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 1
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "compaction",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 1
+      }
+    ],
+    "outcomes": [
+      {
+        "outcome": "completed",
+        "attempt": "0",
+        "count": 65
+      },
+      {
+        "outcome": "cancelled",
+        "attempt": "1",
+        "count": 3
+      },
+      {
+        "outcome": "cancelled",
+        "attempt": "0",
+        "count": 2
+      }
+    ],
+    "capacity": [
+      {
+        "event": "upstream_sse_error",
+        "sse_event": "response.failed",
+        "decision": null,
+        "reason": null,
+        "attempt": "0",
+        "code": null,
+        "count": 6
+      },
+      {
+        "event": "capacity_retry_decision",
+        "sse_event": null,
+        "decision": null,
+        "reason": "retry_started",
+        "attempt": "0",
+        "code": null,
+        "count": 6
+      }
+    ],
+    "recovery": [],
+    "syncCompletions": [
+      {
+        "timestampUtc": "2026-11-22T17:33:30.000Z",
+        "imported": 10,
+        "skipped": 13,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:34:34.000Z",
+        "imported": 6,
+        "skipped": 11,
+        "deferred": 118,
+        "scanned": 1264
+      },
+      {
+        "timestampUtc": "2026-11-22T17:35:42.000Z",
+        "imported": 3,
+        "skipped": 20,
+        "deferred": 118,
+        "scanned": 1264
+      }
+    ],
+    "capacityErrorClasses": [
+      {
+        "errorType": "gateway_concurrency_limit",
+        "messageClass": "upstream_error",
+        "attempt": "0",
+        "count": 6
+      }
+    ]
+  },
+  "cpuTimeline10Seconds": [
+    {
+      "startUtc": "2026-11-22T17:32:52.204Z",
+      "endUtc": "2026-11-22T17:33:02.204Z",
+      "rootCpuMachineMeanPercent": 5.998042302682518,
+      "sends": 3,
+      "requestBytes": 2338332,
+      "streamOutcomes": 2,
+      "capacityErrors": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:33:02.204Z",
+      "endUtc": "2026-11-22T17:33:12.204Z",
+      "rootCpuMachineMeanPercent": 4.307663059578686,
+      "sends": 2,
+      "requestBytes": 676937,
+      "streamOutcomes": 2,
+      "capacityErrors": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:33:12.204Z",
+      "endUtc": "2026-11-22T17:33:22.204Z",
+      "rootCpuMachineMeanPercent": 6.67789925389814,
+      "sends": 3,
+      "requestBytes": 722063,
+      "streamOutcomes": 3,
+      "capacityErrors": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:33:22.204Z",
+      "endUtc": "2026-11-22T17:33:32.204Z",
+      "rootCpuMachineMeanPercent": 9.009591602226514,
+      "sends": 3,
+      "requestBytes": 2564640,
+      "streamOutcomes": 3,
+      "capacityErrors": 0,
+      "syncCompletions": 1
+    },
+    {
+      "startUtc": "2026-11-22T17:33:32.204Z",
+      "endUtc": "2026-11-22T17:33:42.204Z",
+      "rootCpuMachineMeanPercent": 20.224435840932454,
+      "sends": 4,
+      "requestBytes": 1242411,
+      "streamOutcomes": 4,
+      "capacityErrors": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:33:42.204Z",
+      "endUtc": "2026-11-22T17:33:52.204Z",
+      "rootCpuMachineMeanPercent": 14.005139906859895,
+      "sends": 10,
+      "requestBytes": 3347825,
+      "streamOutcomes": 10,
+      "capacityErrors": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:33:52.204Z",
+      "endUtc": "2026-11-22T17:34:02.204Z",
+      "rootCpuMachineMeanPercent": 3.794692940670032,
+      "sends": 5,
+      "requestBytes": 3709047,
+      "streamOutcomes": 3,
+      "capacityErrors": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:34:02.204Z",
+      "endUtc": "2026-11-22T17:34:12.204Z",
+      "rootCpuMachineMeanPercent": 9.497387180995778,
+      "sends": 4,
+      "requestBytes": 1473884,
+      "streamOutcomes": 5,
+      "capacityErrors": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:34:12.204Z",
+      "endUtc": "2026-11-22T17:34:22.204Z",
+      "rootCpuMachineMeanPercent": 6.154606232967469,
+      "sends": 1,
+      "requestBytes": 1861169,
+      "streamOutcomes": 0,
+      "capacityErrors": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:34:22.204Z",
+      "endUtc": "2026-11-22T17:34:32.204Z",
+      "rootCpuMachineMeanPercent": 5.916837385696729,
+      "sends": 0,
+      "requestBytes": 0,
+      "streamOutcomes": 0,
+      "capacityErrors": 3,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:34:32.204Z",
+      "endUtc": "2026-11-22T17:34:42.204Z",
+      "rootCpuMachineMeanPercent": 20.87158982633727,
+      "sends": 7,
+      "requestBytes": 2445287,
+      "streamOutcomes": 8,
+      "capacityErrors": 0,
+      "syncCompletions": 1
+    },
+    {
+      "startUtc": "2026-11-22T17:34:42.204Z",
+      "endUtc": "2026-11-22T17:34:52.204Z",
+      "rootCpuMachineMeanPercent": 13.616573065396258,
+      "sends": 8,
+      "requestBytes": 2906538,
+      "streamOutcomes": 8,
+      "capacityErrors": 1,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:34:52.204Z",
+      "endUtc": "2026-11-22T17:35:02.204Z",
+      "rootCpuMachineMeanPercent": 4.925490241535667,
+      "sends": 7,
+      "requestBytes": 4594403,
+      "streamOutcomes": 4,
+      "capacityErrors": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:35:02.204Z",
+      "endUtc": "2026-11-22T17:35:12.204Z",
+      "rootCpuMachineMeanPercent": 8.750312219549294,
+      "sends": 2,
+      "requestBytes": 1232762,
+      "streamOutcomes": 2,
+      "capacityErrors": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:35:12.204Z",
+      "endUtc": "2026-11-22T17:35:22.204Z",
+      "rootCpuMachineMeanPercent": 1.7309627986790408,
+      "sends": 1,
+      "requestBytes": 1811036,
+      "streamOutcomes": 1,
+      "capacityErrors": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:35:22.204Z",
+      "endUtc": "2026-11-22T17:35:32.204Z",
+      "rootCpuMachineMeanPercent": 2.89512978514947,
+      "sends": 0,
+      "requestBytes": 0,
+      "streamOutcomes": 0,
+      "capacityErrors": 2,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:35:32.204Z",
+      "endUtc": "2026-11-22T17:35:42.204Z",
+      "rootCpuMachineMeanPercent": 20.405484298641007,
+      "sends": 8,
+      "requestBytes": 3601904,
+      "streamOutcomes": 8,
+      "capacityErrors": 0,
+      "syncCompletions": 1
+    },
+    {
+      "startUtc": "2026-11-22T17:35:42.204Z",
+      "endUtc": "2026-11-22T17:35:52.204Z",
+      "rootCpuMachineMeanPercent": 19.041128797093677,
+      "sends": 5,
+      "requestBytes": 2364644,
+      "streamOutcomes": 7,
+      "capacityErrors": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-22T17:35:52.204Z",
+      "endUtc": "2026-11-22T17:35:52.401Z",
+      "rootCpuMachineMeanPercent": 15.32556076472047,
+      "sends": 1,
+      "requestBytes": 767176,
+      "streamOutcomes": 0,
+      "capacityErrors": 0,
+      "syncCompletions": 0
+    }
+  ],
+  "limitations": [
+    "Logs correlate activity but do not sample native CPU stacks or per-parser CPU time.",
+    "Stream outcomes describe proxy-observed/selected outcome, not client delivery acknowledgement.",
+    "Bounded tail excludes any earlier lines outside the last4MiB.",
+    "App log also appears in dev-recovery.log because stdout/stderr is captured; this alone is not evidence of duplicate app execution.",
+    "Short-lived PowerShell children between process tree refreshes may not have attributable CPU deltas.",
+    "No native CPU stack profile or per-parser timings were available from these logs; CPU dominance is not proven.",
+    "Source fixes are not live until the user elects to rebuild/restart; no desktop build or binary replacement was performed.",
+    "A no-recovery-log window alone does not prove absence of all maintenance work."
+  ],
+  "parsing": "First event= field is the primary router event. A repeated event= field in SSE diagnostics is recorded only as sse_event; it does not replace the primary event.",
+  "deferredWarnings": {
+    "scope": "Fixed source-derived reason categories only; no paths/session IDs/error text",
+    "sinceStartupThroughAuditWindow": {
+      "missingCopiedParentPrefix": 112,
+      "missingExplicitContinuationBase": 3,
+      "missingParentRollout": 3
+    },
+    "inCpuWindow": {}
+  },
+  "resourceMeasurement": {
+    "sampleFile": "H:/repos/ccswitchmulti-refork/docs/audits/2026-11-23-resource-sample-24180-173251.json",
+    "startedAtSingapore": "2026-11-23 01:32:52",
+    "finishedAtSingapore": "2026-11-23 01:35:52",
+    "summary": {
+      "durationSeconds": 180.1976814,
+      "sampleCount": 86,
+      "logicalProcessors": 16,
+      "rootAverageCpuOneCorePercent": 158.15963767445012,
+      "rootAverageCpuMachinePercent": 9.884977354653133,
+      "rootPeakCpuOneCorePercent": 639.799925704464,
+      "treeAverageCpuOneCorePercent": 158.15963767445004,
+      "treeAverageCpuMachinePercent": 9.884977354653127,
+      "treePeakCpuMachinePercent": 39.987495356529,
+      "rootPrivateStartBytes": 229642240,
+      "rootPrivateEndBytes": 207360000,
+      "rootPrivatePeakBytes": 237666304,
+      "treePrivateStartBytes": 680914944,
+      "treePrivateEndBytes": 658415616,
+      "treePrivatePeakBytes": 688128000
+    },
+    "controls": [
+      "No regression tests or source compilation during resource baseline.",
+      "Only target PID and scoped descendant discovery; target path/start identity verified throughout.",
+      "Configured monitor health-only inspectRuntime; no guardian loop started.",
+      "Read-only source agents were active during sampling; their normal model/proxy traffic can be part of the measured workload. This was not an idle or controlled load benchmark."
+    ],
+    "comparison": "Prior PID45584 sample used a different process and workload (45 sends vs74); no controlled improvement/regression percentage claimed."
+  },
+  "sourceFindings": [
+    {
+      "status": "fixed_in_source",
+      "path": "H:/repos/ccswitchmulti-refork/src-tauri/src/services/session_usage_codex.rs",
+      "line": 1187,
+      "finding": "Every no-checkpoint/deferred file previously triggered a filename-fallback checkpoint-table scan before its warm rejection fast path. Archived cursors also repeated filename scans.",
+      "fix": "Per-collection compact derived path/order indices, at most2 suffix keys per stored path; exact primary-key payload reads only for selected hits. DB remains canonical, commit-only refresh, exact malformed authority and moved/rename/rollback semantics preserved.",
+      "regressions": [
+        "checkpoint_and_archived_lookup_snapshot_is_bounded",
+        "lookup_snapshot_preserves_exact_moved_and_committed_write_authority",
+        "renamed_rollout_uses_committed_checkpoint_in_the_same_pass",
+        "stored_codex_filename_keys_preserve_both_separator_suffixes",
+        "cold_and_unchanged_rollout_work_is_bounded_by_required_bytes"
+      ],
+      "platformBoundary": "Unix-only literal-backslash production fallback/removal test added but cannot execute on this Windows host."
+    },
+    {
+      "status": "fixed_in_source",
+      "paths": [
+        "H:/repos/ccswitchmulti-refork/src-tauri/src/proxy/forwarder.rs",
+        "H:/repos/ccswitchmulti-refork/src-tauri/src/proxy/hyper_client.rs"
+      ],
+      "lines": [
+        266,
+        470
+      ],
+      "finding": "Every initial send/retry/reconnect copied finalized immutable wire bytes into Vec; raw case-preserving transport copied full body again while combining head and body.",
+      "fix": "Shared Bytes through reqwest/Hyper; raw transport writes small generated head plus original borrowed body. TCP_NODELAY before direct/proxy TLS or tunneling prevents split-write Nagle delay. Partial writes and ResponsePending safety retained.",
+      "regressions": [
+        "finalized_payload_accounts_for_transform_wire_and_identical_replays",
+        "finalized_request_shares_uncompressed_bytes_and_hashes_each_wire_variant_once",
+        "raw_transport_writes_the_original_body_allocation_after_the_exact_header_bytes",
+        "raw_tcp_connector_enables_nodelay_before_tls_or_tunneling",
+        "raw_transport_completes_short_writes_and_classifies_interrupted_body_as_pending"
+      ],
+      "workClaim": "Allocation identity tests establish this specific payload-copy removal, not global zero-allocation or a measured CPU saving."
+    },
+    {
+      "status": "fixed_in_source",
+      "path": "H:/repos/ccswitchmulti-refork/src-tauri/src/proxy/error_journal.rs",
+      "line": 528,
+      "finding": "Complete successful non-SSE JSON was strictly parsed for validity, then parsed again for semantic error classification.",
+      "fix": "Lazy local Result reuse; exactly one classification parse. Compression, truncation, SSE handling and diagnostic redaction unchanged.",
+      "regressions": [
+        "journal_success_json_classification_parses_body_once",
+        "journal_reused_json_classification_preserves_errors_and_redaction"
+      ],
+      "liveRelevance": "This is a non-streaming optimization, not evidence that this path caused the sampled streaming CPU spikes."
+    },
+    {
+      "status": "fixed_in_source_not_a_cpu_fix",
+      "path": "H:/repos/ccswitchmulti-refork/src-tauri/src/proxy/providers/streaming_retry.rs",
+      "line": 1473,
+      "finding": "Router event=upstream_sse_error was followed by another event=response.failed field. Last-key-wins parsers misclassified errors.",
+      "fix": "SSE detail is now sse_event in native and Chat diagnostics, leaving primary router event unique. Current audit parser explicitly preserves the first primary event for old logs.",
+      "regressions": [
+        "upstream_sse_error_diagnostics_native_preserves_primary_event",
+        "upstream_sse_error_diagnostics_chat_preserves_primary_event"
+      ]
+    }
+  ],
+  "remainingCosts": [
+    {
+      "status": "not_proven_current_cpu_dominance",
+      "path": "H:/repos/ccswitchmulti-refork/src-tauri/src/codex_guardian.rs",
+      "finding": "One serialized guardian still repeatedly discovers and revalidates endpoints; loaded-thread usage observer rescans per renderer. Native ownership rechecks are intentional security boundaries, not removable duplicates."
+    },
+    {
+      "status": "not_changed_to_avoid_protocol_drift",
+      "path": "H:/repos/ccswitchmulti-refork/src-tauri/src/proxy/providers/codex_reasoning_mapping.rs",
+      "finding": "Journal/retry/mapping/recovery can each inspect SSE for distinct responsibilities. Mapping also normalizes framing for otherwise unmapped events. A raw named-event skip would change framing and malformed/conflicting-field behavior."
+    },
+    {
+      "status": "fresh_proof_required_no_unsafe_cache",
+      "path": "H:/repos/ccswitchmulti-refork/src-tauri/src/codex_state_db.rs",
+      "finding": "Exact current turn/model reasoning proof still scans rollout bytes backward. Missing proof may scan entire file; do not introduce TTL-only proof caches or downgrade parent reasoning."
+    },
+    {
+      "status": "conditional_no_new_recovery_events_in_cpu_window",
+      "path": "H:/repos/ccswitchmulti-refork/src-tauri/src/proxy/codex_turn_recovery.rs",
+      "finding": "Recovery backoff and active-request heartbeats serialize and durably persist the ledger; waiting threads amplify maintenance writes. No mandatory pre-mutation durable authorization removed."
+    }
+  ],
+  "reasoningPreservation": {
+    "liveCpuWindow": {
+      "maintainedModelsObserved": [
+        "gpt-6.2-sol",
+        "gpt-6.1-sol-sublyx",
+        "gpt-6.2-astra"
+      ],
+      "markedChildrenForwardedHigh": 58,
+      "parentsWithMaxEffort": 15,
+      "parentRequestsWithUnsetEffortExcludedFromUltraClaims": 1,
+      "verifiedUltraRestorations": 12,
+      "observedCoveredPolicyMismatches": 0
+    },
+    "sourceContract": [
+      "Exact verified Desktop Ultra -> max.",
+      "Genuine XHigh stays xhigh; absent proof must not promote it.",
+      "Marked children follow current saved policy, including High and Medium scenarios."
+    ],
+    "regression": "sublyx_maintained_gpt_parent_ultra_and_subagents_follow_saved_policy_across_transports covers160 wire cases across10 maintained GPT families and4 transports."
+  },
+  "sourceFingerprintsAtVerificationStart": {
+    "H:/repos/ccswitchmulti-refork/src-tauri/src/services/session_usage_codex.rs": "0ff87301305b7d9f2bb1ff44c367f9a2496ad1b7a89a4014be33dbbcd3917522",
+    "H:/repos/ccswitchmulti-refork/src-tauri/src/proxy/forwarder.rs": "84e2634ff29b6315b91b4349c7dfdbe2b46f99507153dfb2622fb852ccbc4cd2",
+    "H:/repos/ccswitchmulti-refork/src-tauri/src/proxy/hyper_client.rs": "72c17466b4b5aa7f1d0656c981cca74460ebff545230f0decd3a4e9a2f06a350",
+    "H:/repos/ccswitchmulti-refork/src-tauri/src/proxy/error_journal.rs": "9ecd2aef0223f6be39aab757ee9bb8e8b0ce44110e6c530420c1ca21308789d3",
+    "H:/repos/ccswitchmulti-refork/src-tauri/src/proxy/providers/streaming_retry.rs": "cb4b4f7be76d530b28fd8b6ef66f96522d22b21f1ec4028d5ed4320b307413d8"
+  },
+  "verification": {
+    "frontend": {
+      "typecheck": "passed",
+      "catalog": {
+        "status": "passed",
+        "frontendTests": 893,
+        "nodeGuardAndConfigurationTests": 29
+      },
+      "format": "passed",
+      "scriptPolicy": "passed",
+      "performanceRunnerNodeTests": {
+        "passed": 27
+      }
+    },
+    "rust": {
+      "status": "passed_for_final_source",
+      "fullLibrary": {
+        "passed": 5855,
+        "failed": 0,
+        "ignored": 12,
+        "total": 5867,
+        "durationSeconds": 165.78
+      },
+      "multirouter": {
+        "passed": 196,
+        "failed": 0
+      },
+      "deterministicPerformanceGate": {
+        "passed": 20
+      },
+      "rustfmt": "passed",
+      "strictClippy": "passed with -D warnings",
+      "ordinaryLibTestWarnings": 6,
+      "warningBoundary": "Existing cfg(test)/fixture warnings remain in ordinary Cargo test; required default-target strict Clippy passed. No guard disabled.",
+      "sourceFingerprintsUnchangedAcrossFinalChecks": true,
+      "commands": [
+        "cargo fmt --check --manifest-path src-tauri/Cargo.toml",
+        "cargo test --manifest-path src-tauri/Cargo.toml --lib --jobs 2 -- --test-threads=2 --format=terse",
+        "cargo test --manifest-path src-tauri/Cargo.toml --lib --jobs 2 codex_multirouter:: -- --test-threads=2 --format=terse",
+        "pnpm performance:verify",
+        "cargo clippy --manifest-path src-tauri/Cargo.toml --jobs 2 -- -D warnings"
+      ]
+    },
+    "diffCheck": "passed"
+  },
+  "operationalBoundary": {
+    "checkout": "H:/repos/ccswitchmulti-refork/",
+    "branch": "main",
+    "desktopBuildPerformed": false,
+    "appRestartOrInstallPerformed": false,
+    "providersMutated": false,
+    "uiAutomationPerformed": false,
+    "alternateTargetOrOutputDirectoryCreated": false,
+    "buildApprovalMechanismAdded": false,
+    "desktopExecutableModifiedAtUtc": "2026-11-22T17:16:12.9712316Z",
+    "testsUseExistingConfiguredCargoTarget": true,
+    "allEvidenceSavedInsideCheckout": true,
+    "latestSourceFixesPresentInRunningBinary": false
+  },
+  "finalReadOnlyHealth": {
+    "capturedAtUtc": "2026-11-22T18:29:15.379Z",
+    "interface": "createGuardianRuntime.inspectRuntime",
+    "healthy": true,
+    "listenerOwner": 24180,
+    "listenerMatchesMeasuredPid": true,
+    "guardianLoopStarted": false,
+    "desktopBinaryModifiedAtUtc": "2026-11-22T17:16:12.971Z",
+    "scope": "Identity/health only after tests; not a second test-free resource sample or live proof of new source fixes"
+  },
+  "sourceAuditUpdatedAtUtc": "2026-11-22T18:35:14.075Z",
+  "conclusion": {
+    "auditStatus": "source_fixes_verified_live_improvement_unverified",
+    "significantBackendCpuMeasured": true,
+    "sourceProvenRedundantWorkFound": true,
+    "competingPerpetualOwnersFound": false,
+    "competingOwnersBoundary": "No evidence found in the inspected collector/guardian/renderer scheduling paths; not an exhaustive absence proof.",
+    "dominantNativeCpuFunctionIdentified": false,
+    "allResourceIssuesProvenResolved": false,
+    "newSourceCpuSavingMeasured": false,
+    "summary": "Active request/stream work and periodic importing overlap the measured CPU peaks. Three concrete redundant-work sites and one diagnostic-key ambiguity were corrected; no safeguards or reasoning policy lowered."
+  },
+  "nativeDiscoveryFollowup": {
+    "scope": "Read-only source audit; no live discovery chain invoked for this follow-up",
+    "busySpinFound": false,
+    "waitBehavior": "Timeout parent try_wait sleeps20ms; pipe readers block on read_to_end; channel wait uses recv_timeout; timeout kills and reaps child.",
+    "processQuery": "External PowerShell filtered CIM query for Codex/codex/ChatGPT; no Rust whole-machine native inventory found in inspected chain.",
+    "workAmplification": "Each listener identity validation starts2 sequential PowerShell children: process identity query and listener query. Main-process detection adds1 child. Distinct recovery tasks may overlap discovery; no shared query single-flight found.",
+    "scenarioNotLiveCount": {
+      "assumptions": "4 absent candidate ports, both loopback address families attempted;1 live IPv4 port, pre/post-discovery ownership checks",
+      "powerShellStartsPerGuardianCycle": 21
+    },
+    "attributionBoundary": "This establishes startup/pipe/thread churn and explains short-lived pwsh descendants, not measured dominance of backend CPU. Mandatory fresh ownership rechecks must not simply be removed.",
+    "sources": [
+      {
+        "path": "H:/repos/ccswitchmulti-refork/src-tauri/src/commands/proxy.rs",
+        "lines": "1347-1433"
+      },
+      {
+        "path": "H:/repos/ccswitchmulti-refork/src-tauri/src/codex_desktop.rs",
+        "lines": "1306-1314,2939-2968,3908-3964"
+      }
+    ]
+  }
+}

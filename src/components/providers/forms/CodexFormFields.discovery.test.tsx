@@ -1,5 +1,12 @@
 import type { ComponentProps, ReactNode } from "react";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import type { CodexCatalogModel } from "@/types";
@@ -80,6 +87,12 @@ function readiness(): ReadinessProps {
 
 function catalogModelIds(): string[] {
   return readiness().models.map((model) => model.model);
+}
+
+async function findModelSyncReview() {
+  return within(
+    await screen.findByRole("dialog", { name: "Review model sync" }),
+  );
 }
 
 function availableDefaultModels(): FetchedModel[] {
@@ -214,11 +227,13 @@ describe("Codex form discovery request ownership", () => {
     // Its free flag is discovery-only dropdown metadata, so it proves whether
     // the old fetch cache survives without confusing it with catalog rows.
     vi.mocked(fetchModelsForConfig).mockResolvedValue([
-      { id: "wire-old", ownedBy: null, isFree: true },
+      { id: "wire-old", ownedBy: null, isFree: true, contextWindow: 12_345 },
     ]);
     const props = formProps({ onModelChange: vi.fn() });
     const { rerender } = render(<CodexFormFields {...props} />);
     act(() => readiness().onSyncModels());
+    const review = await findModelSyncReview();
+    fireEvent.click(review.getByRole("button", { name: "Apply to draft" }));
     await waitFor(() =>
       expect(availableDefaultModels()).toContainEqual(
         expect.objectContaining({ id: "wire-old", isFree: true }),
@@ -259,6 +274,9 @@ describe("Codex form discovery request ownership", () => {
     act(() => readiness().onSyncModels());
     await waitFor(() => expect(readiness().isSyncingModels).toBe(false));
     expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("dialog", { name: "Review model sync" }),
+    ).toBeNull();
     warning.mockRestore();
   });
 });
@@ -387,7 +405,20 @@ describe("Codex form discovery lifecycle", () => {
 
     await act(async () => newer.resolve(response));
     expect(readiness().isSyncingModels).toBe(false);
+    const review = await findModelSyncReview();
+    expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
+    expect(catalogModelIds()).toEqual(["wire-old"]);
+    expect(
+      review.getByRole("radio", { name: /disable missing models/i }),
+    ).toBeChecked();
+    expect(
+      review.getByRole("checkbox", { name: /include new models/i }),
+    ).not.toBeChecked();
+    fireEvent.click(review.getByRole("button", { name: "Apply to draft" }));
     expect(catalogModelIds()).toEqual(["wire-old", "wire-new"]);
+    expect(
+      readiness().models.find((model) => model.model === "wire-old"),
+    ).toMatchObject({ enabled: false });
     expect(
       readiness().models.find((model) => model.model === "wire-new"),
     ).toMatchObject({ enabled: false });
@@ -407,6 +438,9 @@ describe("Codex form discovery lifecycle", () => {
     rerender(<CodexFormFields {...props} apiKeyGroups={[]} />);
 
     await act(async () => pending.resolve(response));
+    expect(
+      screen.queryByRole("dialog", { name: "Review model sync" }),
+    ).toBeNull();
     expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
     expect(catalogModelIds()).toEqual(["wire-old"]);
     expect(readiness().models).toEqual(
@@ -414,6 +448,348 @@ describe("Codex form discovery lifecycle", () => {
         expect.objectContaining({ model: "wire-old", enabled: true }),
       ]),
     );
+  });
+});
+
+describe("Codex API-key model sync review", () => {
+  beforeEach(() => vi.resetAllMocks());
+
+  it("previews new and missing rows before replacing the catalog", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([
+      { id: "wire-current", ownedBy: null },
+      ...response,
+    ]);
+    const props = formProps({
+      codexModel: "wire-old",
+      onModelChange: vi.fn(),
+      protocolOverrides: {
+        "wire-old": "openai_responses",
+        "my-current": "openai_chat",
+      },
+      onProtocolOverridesChange: vi.fn(),
+      catalogModels: [
+        { model: "wire-old", enabled: true },
+        {
+          model: "my-current",
+          upstreamModel: "wire-current",
+          displayName: "Current custom name",
+          enabled: false,
+        },
+      ],
+    });
+    render(<CodexFormFields {...props} />);
+    act(() => readiness().onSyncModels());
+    const review = await findModelSyncReview();
+    expect(review.getByText("wire-new")).toBeInTheDocument();
+    expect(review.getByText("wire-old")).toBeInTheDocument();
+    expect(review.queryByText("my-current")).toBeNull();
+    expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
+    expect(props.onModelChange).not.toHaveBeenCalled();
+    expect(props.onProtocolOverridesChange).not.toHaveBeenCalled();
+
+    fireEvent.click(review.getByRole("radio", { name: /replace catalog/i }));
+    fireEvent.click(
+      review.getByRole("checkbox", { name: /include new models/i }),
+    );
+    fireEvent.click(review.getByRole("button", { name: "Apply to draft" }));
+
+    expect(catalogModelIds()).toEqual(["my-current", "wire-new"]);
+    expect(props.onCatalogModelsChange).toHaveBeenCalledOnce();
+    expect(props.onCatalogModelsChange).toHaveBeenCalledWith([
+      expect.objectContaining({
+        model: "my-current",
+        upstreamModel: "wire-current",
+        displayName: "Current custom name",
+        enabled: false,
+      }),
+      expect.objectContaining({ model: "wire-new", enabled: true }),
+    ]);
+    expect(props.onModelChange).toHaveBeenCalledOnce();
+    expect(props.onModelChange).toHaveBeenCalledWith("wire-new");
+    expect(props.onProtocolOverridesChange).toHaveBeenCalledOnce();
+    expect(props.onProtocolOverridesChange).toHaveBeenCalledWith({
+      "my-current": "openai_chat",
+    });
+    expect(availableDefaultModels()).toEqual([
+      { id: "wire-new", ownedBy: null },
+    ]);
+  });
+
+  it("can keep missing rows included while adding new models", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue(response);
+    const props = formProps({
+      catalogModels: [{ model: "wire-old", enabled: true }],
+    });
+    render(<CodexFormFields {...props} />);
+    act(() => readiness().onSyncModels());
+    const review = await findModelSyncReview();
+    fireEvent.click(
+      review.getByRole("radio", { name: /keep missing models/i }),
+    );
+    fireEvent.click(review.getByRole("button", { name: "Apply to draft" }));
+
+    expect(props.onCatalogModelsChange).toHaveBeenCalledOnce();
+    expect(props.onCatalogModelsChange).toHaveBeenCalledWith([
+      expect.objectContaining({ model: "wire-old", enabled: true }),
+      expect.objectContaining({ model: "wire-new", enabled: false }),
+    ]);
+  });
+
+  it("keeps Apply enabled for replacement when every missing model is already excluded", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([
+      { id: "wire-current", ownedBy: null },
+    ]);
+    const currentModel = {
+      model: "wire-current",
+      displayName: "Current custom name",
+      enabled: true,
+    };
+    const props = formProps({
+      codexModel: currentModel.model,
+      onModelChange: vi.fn(),
+      catalogModels: [
+        { model: "wire-old-a", enabled: false },
+        currentModel,
+        { model: "wire-old-b", enabled: false },
+      ],
+    });
+    render(<CodexFormFields {...props} />);
+    act(() => readiness().onSyncModels());
+    const review = await findModelSyncReview();
+
+    expect(catalogModelIds()).toEqual([
+      "wire-old-a",
+      "wire-current",
+      "wire-old-b",
+    ]);
+    expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
+    expect(props.onModelChange).not.toHaveBeenCalled();
+    expect(
+      review.getByText("All missing models are already excluded."),
+    ).toBeInTheDocument();
+    expect(review.getByText("wire-old-a")).toBeInTheDocument();
+    expect(review.getByText("wire-old-b")).toBeInTheDocument();
+    const replace = review.getByRole("radio", { name: /replace catalog/i });
+    expect(replace).toBeChecked();
+    const apply = review.getByRole("button", {
+      name: "Apply to draft",
+    });
+    expect(apply).toBeEnabled();
+
+    const disable = review.getByRole("radio", {
+      name: /disable missing models/i,
+    });
+    const keep = review.getByRole("radio", { name: /keep missing models/i });
+    expect(disable).toBeDisabled();
+    expect(keep).toBeDisabled();
+    fireEvent.click(disable);
+    fireEvent.click(keep);
+    expect(replace).toBeChecked();
+    expect(apply).toBeEnabled();
+    expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
+
+    fireEvent.click(apply);
+
+    expect(catalogModelIds()).toEqual(["wire-current"]);
+    expect(props.onCatalogModelsChange).toHaveBeenCalledOnce();
+    expect(props.onCatalogModelsChange).toHaveBeenCalledWith([
+      expect.objectContaining(currentModel),
+    ]);
+    expect(props.onModelChange).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      choice: /keep missing models/i,
+      initiallyIncluded: true,
+      expectedIncluded: true,
+      replacesAlias: false,
+      changesCatalog: false,
+    },
+    {
+      choice: /disable missing models/i,
+      initiallyIncluded: true,
+      expectedIncluded: false,
+      replacesAlias: false,
+      changesCatalog: true,
+    },
+    {
+      choice: /replace catalog/i,
+      initiallyIncluded: true,
+      expectedIncluded: true,
+      replacesAlias: true,
+      changesCatalog: true,
+    },
+    {
+      choice: /replace catalog/i,
+      initiallyIncluded: false,
+      expectedIncluded: true,
+      replacesAlias: true,
+      changesCatalog: true,
+    },
+  ])(
+    "handles a new upstream ID that matches an existing public alias ($choice, included: $initiallyIncluded)",
+    async ({
+      choice,
+      initiallyIncluded,
+      expectedIncluded,
+      replacesAlias,
+      changesCatalog,
+    }) => {
+      vi.mocked(fetchModelsForConfig).mockResolvedValue(response);
+      const props = formProps({
+        catalogModels: [
+          {
+            model: "wire-new",
+            upstreamModel: "wire-old",
+            enabled: initiallyIncluded,
+          },
+        ],
+        protocolOverrides: { "wire-new": "openai_chat" },
+        onProtocolOverridesChange: vi.fn(),
+      });
+      render(<CodexFormFields {...props} />);
+      act(() => readiness().onSyncModels());
+      const review = await findModelSyncReview();
+      if (!initiallyIncluded) {
+        expect(
+          review.getByRole("radio", { name: /keep missing models/i }),
+        ).toBeInTheDocument();
+        expect(
+          review.getByRole("radio", { name: /disable missing models/i }),
+        ).toBeInTheDocument();
+      }
+      const option = review.getByRole("radio", { name: choice });
+      if (changesCatalog) {
+        fireEvent.click(option);
+      } else {
+        expect(option).toBeDisabled();
+      }
+      const includeNew = review.queryByRole("checkbox", {
+        name: /include new models/i,
+      });
+      if (replacesAlias) {
+        expect(includeNew).toBeInTheDocument();
+        fireEvent.click(includeNew!);
+      } else {
+        expect(includeNew).toBeNull();
+      }
+      const apply = review.getByRole("button", { name: "Apply to draft" });
+      if (changesCatalog) {
+        fireEvent.click(apply);
+      } else {
+        expect(apply).toBeEnabled();
+        const conflicts = review.getByRole("list", {
+          name: /model IDs already in use/i,
+        });
+        expect(within(conflicts).getByText("wire-new")).toBeInTheDocument();
+        fireEvent.click(review.getByRole("button", { name: "Cancel" }));
+        expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
+      }
+
+      if (replacesAlias) {
+        expect(props.onCatalogModelsChange).toHaveBeenCalledOnce();
+        expect(props.onCatalogModelsChange).toHaveBeenCalledWith([
+          expect.objectContaining({
+            model: "wire-new",
+            enabled: expectedIncluded,
+          }),
+        ]);
+        expect(readiness().models[0]?.upstreamModel).not.toBe("wire-old");
+        expect(props.onProtocolOverridesChange).toHaveBeenCalledOnce();
+        expect(props.onProtocolOverridesChange).toHaveBeenCalledWith({});
+      } else {
+        expect(readiness().models).toEqual([
+          expect.objectContaining({
+            model: "wire-new",
+            upstreamModel: "wire-old",
+            enabled: expectedIncluded,
+          }),
+        ]);
+        expect(props.onProtocolOverridesChange).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("preserves models outside the main key's directory when using key groups", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue(response);
+    const props = formProps({
+      apiKeyGroups: [{ id: "group-a", apiKeys: ["redacted-group-credential"] }],
+      catalogModels: [{ model: "wire-old", enabled: true }],
+    });
+    render(<CodexFormFields {...props} />);
+    act(() => readiness().onSyncModels());
+    const review = await findModelSyncReview();
+    expect(
+      review.queryByRole("radio", { name: /disable missing models/i }),
+    ).toBeNull();
+    expect(
+      review.queryByRole("radio", { name: /replace catalog/i }),
+    ).toBeNull();
+    fireEvent.click(review.getByRole("button", { name: "Apply to draft" }));
+
+    expect(props.onCatalogModelsChange).toHaveBeenCalledOnce();
+    expect(props.onCatalogModelsChange).toHaveBeenCalledWith([
+      expect.objectContaining({ model: "wire-old", enabled: true }),
+      expect.objectContaining({ model: "wire-new", enabled: false }),
+    ]);
+  });
+
+  it("offers no missing-model actions after an empty response", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([]);
+    const props = formProps({
+      catalogModels: [{ model: "wire-old", enabled: true }],
+    });
+    render(<CodexFormFields {...props} />);
+    act(() => readiness().onSyncModels());
+    const review = await findModelSyncReview();
+    expect(
+      review.getByText(/provider returned no models/i),
+    ).toBeInTheDocument();
+    expect(review.queryByRole("radio")).toBeNull();
+    expect(review.queryByRole("button", { name: "Apply to draft" })).toBeNull();
+    fireEvent.click(review.getByText("Close", { selector: "button" }));
+
+    expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
+    expect(readiness().models).toEqual([
+      expect.objectContaining({ model: "wire-old", enabled: true }),
+    ]);
+  });
+
+  it("leaves the draft unchanged when a user cancels replacement", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue(response);
+    const props = formProps();
+    render(<CodexFormFields {...props} />);
+    act(() => readiness().onSyncModels());
+    const review = await findModelSyncReview();
+    fireEvent.click(review.getByRole("radio", { name: /replace catalog/i }));
+    fireEvent.click(review.getByRole("button", { name: "Cancel" }));
+
+    expect(
+      screen.queryByRole("dialog", { name: "Review model sync" }),
+    ).toBeNull();
+    expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
+    expect(catalogModelIds()).toEqual(["wire-old"]);
+  });
+
+  it("clears pending choices when credentials change and never revives them", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue(response);
+    const props = formProps();
+    const { rerender } = render(<CodexFormFields {...props} />);
+    act(() => readiness().onSyncModels());
+    const review = await findModelSyncReview();
+    fireEvent.click(review.getByRole("radio", { name: /replace catalog/i }));
+
+    rerender(<CodexFormFields {...props} codexApiKey="redacted-other-key" />);
+    expect(
+      screen.queryByRole("dialog", { name: "Review model sync" }),
+    ).toBeNull();
+    rerender(<CodexFormFields {...props} />);
+    expect(
+      screen.queryByRole("dialog", { name: "Review model sync" }),
+    ).toBeNull();
+    expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
+    expect(catalogModelIds()).toEqual(["wire-old"]);
   });
 });
 

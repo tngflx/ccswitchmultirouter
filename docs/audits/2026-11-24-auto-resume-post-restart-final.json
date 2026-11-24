@@ -1,0 +1,140 @@
+{
+  "verified": true,
+  "scenario": "overload",
+  "scope": "actual_codex_desktop_cdp_existing_production_runtime",
+  "desktopCdpVerified": true,
+  "automaticNativeSchedulingVerified": false,
+  "runtimeFingerprint": "sha256-78fe09a9b7a982de46cb8cdc1307017f7c14b9fc1867b1d258f3ecf04e103f7a",
+  "creationReadinessDiagnostics": {
+    "installedRuntimeFingerprint": "sha256-78fe09a9b7a982de46cb8cdc1307017f7c14b9fc1867b1d258f3ecf04e103f7a",
+    "expectedRuntimeFingerprint": "sha256-78fe09a9b7a982de46cb8cdc1307017f7c14b9fc1867b1d258f3ecf04e103f7a",
+    "runtimeGeneration": 2,
+    "appServerPatchInstalled": true,
+    "appServerClientCount": 1,
+    "eligibleGuardedRequestClientCount": 1,
+    "scopedScopeCount": 1,
+    "scopedRegistryCount": 0,
+    "scopedClientCount": 1,
+    "scopedQueryClientCount": 1,
+    "scopedAppServerScopeScanComplete": false,
+    "pendingReactNodeCount": 0,
+    "webpackRuntimeCount": 1,
+    "webpackModuleCount": 10727,
+    "webpackCandidateCount": 32768,
+    "webpackDiscoveryTruncated": true,
+    "failureCount": 1,
+    "failureKinds": [
+      "asset_not_found"
+    ]
+  },
+  "nativeOwnerVerified": true,
+  "nativeHost": "127.0.0.1",
+  "nativeOwnerPids": [
+    10264
+  ],
+  "temporaryDurableTestThread": true,
+  "perThreadLocalFixtureProviderConfirmed": true,
+  "initialFailedTurnObserved": true,
+  "sseOverloadFailedTurnObserved": true,
+  "productionGuardsPrepared": true,
+  "appServerAcceptedContinue": true,
+  "upstreamReceivedLiteralContinue": true,
+  "continuedTurnCompleted": true,
+  "exactlyOneContinuation": true,
+  "continuationDiagnostics": {
+    "prepareAck": {
+      "present": true,
+      "status": "unknown",
+      "started": true,
+      "submitted": null,
+      "mutationAttempted": null,
+      "threadMatches": null,
+      "jobMatches": true,
+      "turnIdPresent": false,
+      "reasonCode": "none",
+      "runtimeGeneration": 2
+    },
+    "latestJob": {
+      "present": true,
+      "status": "completed",
+      "started": null,
+      "submitted": true,
+      "mutationAttempted": true,
+      "threadMatches": true,
+      "jobMatches": null,
+      "turnIdPresent": true,
+      "reasonCode": "submitted",
+      "runtimeGeneration": 2
+    },
+    "preparedJob": {
+      "present": true,
+      "status": "prepared",
+      "started": null,
+      "submitted": false,
+      "mutationAttempted": false,
+      "threadMatches": true,
+      "jobMatches": null,
+      "turnIdPresent": false,
+      "reasonCode": "none",
+      "runtimeGeneration": 2
+    },
+    "preparedReadinessGeneration": 2,
+    "confirmAck": {
+      "present": true,
+      "status": "unknown",
+      "started": true,
+      "submitted": null,
+      "mutationAttempted": null,
+      "threadMatches": null,
+      "jobMatches": true,
+      "turnIdPresent": false,
+      "reasonCode": "none",
+      "runtimeGeneration": 2
+    },
+    "confirmedJob": {
+      "present": true,
+      "status": "confirmed",
+      "started": null,
+      "submitted": false,
+      "mutationAttempted": false,
+      "threadMatches": true,
+      "jobMatches": null,
+      "turnIdPresent": false,
+      "reasonCode": "none",
+      "runtimeGeneration": 2
+    },
+    "commitAck": {
+      "present": true,
+      "status": "unknown",
+      "started": true,
+      "submitted": null,
+      "mutationAttempted": null,
+      "threadMatches": null,
+      "jobMatches": true,
+      "turnIdPresent": false,
+      "reasonCode": "none",
+      "runtimeGeneration": 2
+    },
+    "completedJob": {
+      "present": true,
+      "status": "completed",
+      "started": null,
+      "submitted": true,
+      "mutationAttempted": true,
+      "threadMatches": true,
+      "jobMatches": null,
+      "turnIdPresent": true,
+      "reasonCode": "submitted",
+      "runtimeGeneration": 2
+    }
+  },
+  "existingThreadsTouched": false,
+  "initialRequests": 1,
+  "continuedRequests": 1,
+  "cleanupDiagnostics": {
+    "archived": true,
+    "reason": "archived"
+  },
+  "cleanupArchived": true,
+  "verifiedAtUtc": "2026-11-23T19:48:26.968Z"
+}

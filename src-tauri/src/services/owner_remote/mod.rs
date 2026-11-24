@@ -45,7 +45,7 @@ use tokio::{
 };
 
 const CONTROL_PORT: u16 = 15723;
-const CONTROL_ADDRESS: &str = "127.0.0.1:15723";
+pub(crate) const CONTROL_ADDRESS: &str = "127.0.0.1:15723";
 const CONFIG_FILE: &str = "control.json";
 const AUTH_FILE: &str = "owner-remote-auth.sqlite";
 const CONFIG_VERSION: u8 = 1;

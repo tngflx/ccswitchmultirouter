@@ -514,9 +514,11 @@ describe("native Boolean reasoning presentation", () => {
       model,
     });
     render(React.createElement(NativeHarness, { row }));
+    expect(screen.queryByRole("switch")).not.toBeInTheDocument();
     expect(api.readNativeBooleanReasoningControlState(model).status).toBe(
-      "not_observed",
+      "unverified",
     );
+    expect(screen.queryByRole("switch")).not.toBeInTheDocument();
     sync(api);
     expect(api.readNativeBooleanReasoningControlState(model)).toEqual({
       status: "ready",
@@ -531,8 +533,14 @@ describe("native Boolean reasoning presentation", () => {
     sync(api);
     act(() => api.restoreNativeBooleanReasoningControls());
     expect(api.readNativeBooleanReasoningControlState(model).status).toBe(
-      "not_observed",
+      "unverified",
     );
+    api.lifecycle.current = false;
+    expect(api.readNativeBooleanReasoningControlState(model)).toEqual({
+      status: "runtime_unverified",
+      model,
+    });
+    api.lifecycle.current = true;
     api.state.payload.catalogReleased = true;
     expect(api.readNativeBooleanReasoningControlState(model).status).toBe(
       "not_active",
@@ -706,7 +714,7 @@ describe("native Boolean reasoning presentation", () => {
     );
   });
 
-  it("reconciles a valid Fiber binding after an invalid observation without a DOM mutation", () => {
+  it("reads Boolean proof without reconciling a Fiber-only change", () => {
     const row = booleanRow();
     const filtered = {
       ...row,
@@ -730,6 +738,14 @@ describe("native Boolean reasoning presentation", () => {
     });
     view.rerender(React.createElement(NativeHarness, { row }));
     expect(mutations.takeRecords()).toEqual([]);
+    expect(api.readNativeBooleanReasoningControlState(row.model)).toEqual({
+      status: "unverified",
+      model: row.model,
+    });
+    expect(mutations.takeRecords()).toEqual([]);
+    expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+    sync(api);
+    expect(screen.getByRole("switch")).toBeInTheDocument();
     expect(api.readNativeBooleanReasoningControlState(row.model)).toEqual({
       status: "ready",
       model: row.model,

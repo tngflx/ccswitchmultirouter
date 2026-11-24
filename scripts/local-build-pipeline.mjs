@@ -20,24 +20,16 @@ import {
   requireBuildCommandSuccess,
   runBuildCommand,
 } from "./release-build-config.mjs";
-import {
-  createBuildApprovalScope,
-  requireBuildApproval,
-} from "./build-approval.mjs";
 
 const SCRIPT_REPO = fileURLToPath(new URL("../", import.meta.url));
 const CURRENT_OWNER = "local-build-pipeline.mjs";
 
 export function parseLocalBuildOptions(args) {
-  const options = { outputDir: "", confirmBuild: false, help: false };
+  const options = { outputDir: "", help: false };
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (["--help", "-h", "-?"].includes(argument)) {
       options.help = true;
-      continue;
-    }
-    if (argument === "--confirm-build") {
-      options.confirmBuild = true;
       continue;
     }
     if (["--output-dir", "-OutputDir"].includes(argument)) {
@@ -158,12 +150,6 @@ export function buildHistoryRepairSidecar(
     environment = process.env,
   } = {},
 ) {
-  requireBuildApproval({
-    args: [],
-    environment,
-    operation: "the history repair sidecar build",
-    allowEnvironmentApproval: true,
-  });
   const repo = path.resolve(repoRoot);
   const target = path.resolve(cargoTargetDir);
   const manifest = path.join(repo, "src-tauri", "Cargo.toml");
@@ -208,12 +194,6 @@ export function invokeLocalProductionBuild(
     createConfig = createTauriBuildConfig,
   } = {},
 ) {
-  requireBuildApproval({
-    args: [],
-    environment,
-    operation: "the local production build",
-    allowEnvironmentApproval: true,
-  });
   const repo = path.resolve(repoRoot);
   const buildEnvironment = environment;
   let target;
@@ -283,33 +263,21 @@ export function main(
   const parsed = parseLocalBuildOptions(args);
   if (parsed.help) {
     console.log(
-      "Usage: node scripts/local-build-pipeline.mjs --confirm-build [--output-dir PATH]\nBuilds and exports the Windows NSIS application without installing or publishing.\nThe existing -OutputDir PATH spelling is also supported.",
+      "Usage: node scripts/local-build-pipeline.mjs [--output-dir PATH]\nBuilds and exports the Windows NSIS application without installing or publishing.\nThe existing -OutputDir PATH spelling is also supported.",
     );
     return;
   }
-  requireBuildApproval({
-    args,
-    operation: "the local production build",
-  });
   if (platform !== "win32")
     throw new Error("Local NSIS production builds require Windows.");
-  const approval = createBuildApprovalScope(options.environment);
-  try {
-    const output = invokeLocalProductionBuild(
-      repoRoot,
-      resolveLocalProductionOutputRoot(repoRoot, parsed.outputDir),
-      {
-        ...options,
-        environment: approval.environment,
-      },
-    );
-    console.log(`Local production artifacts exported to: ${output}`);
-    console.log(`Raw executable: ${path.join(output, "cc-switch.exe")}`);
-    console.log(`Installer bundles: ${path.join(output, "bundle", "nsis")}`);
-    return output;
-  } finally {
-    approval.cleanup();
-  }
+  const output = invokeLocalProductionBuild(
+    repoRoot,
+    resolveLocalProductionOutputRoot(repoRoot, parsed.outputDir),
+    options,
+  );
+  console.log(`Local production artifacts exported to: ${output}`);
+  console.log(`Raw executable: ${path.join(output, "cc-switch.exe")}`);
+  console.log(`Installer bundles: ${path.join(output, "bundle", "nsis")}`);
+  return output;
 }
 
 if (

@@ -112,6 +112,7 @@ export const loadCodexRendererSourceRuntime = async () => {
     catalogReleased,
     suppressed,
     fingerprint,
+    recoveryOnly = false,
   ) => {
     let result = renderer;
     fragments.forEach(([slot], index) => {
@@ -135,6 +136,7 @@ export const loadCodexRendererSourceRuntime = async () => {
     });
     return result
       .replaceAll("__CCSWITCH_CATALOG_RELEASED__", String(catalogReleased))
+      .replaceAll("__CCSWITCH_RECOVERY_ONLY__", String(recoveryOnly))
       .replaceAll(
         "__CCSWITCH_PATCH_KEY__",
         JSON.stringify("__ccSwitchCodexAppCompatibilityV9"),
@@ -154,8 +156,14 @@ export const loadCodexRendererSourceRuntime = async () => {
   const fingerprint = `sha256-${createHash("sha256").update("ccswitch-codex-renderer-runtime-fingerprint-v2\0").update(template).digest("hex")}`;
   return {
     fingerprint,
-    assemble: (catalogPayload, catalogReleased, suppressed) =>
-      assemble(catalogPayload, catalogReleased, suppressed, fingerprint),
+    assemble: (catalogPayload, catalogReleased, suppressed, recoveryOnly) =>
+      assemble(
+        catalogPayload,
+        catalogReleased,
+        suppressed,
+        fingerprint,
+        recoveryOnly,
+      ),
     template,
   };
 };

@@ -1,5 +1,9 @@
 import { useEffect, useReducer, useRef } from "react";
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import {
+  queryOptions,
+  useQuery,
+  type UseQueryResult,
+} from "@tanstack/react-query";
 import {
   providersApi,
   settingsApi,
@@ -42,12 +46,44 @@ const sortProviders = (
 
 export interface ProvidersQueryData {
   providers: Record<string, Provider>;
-  currentProviderId: string;
-  currentProviderError?: string;
 }
 
 export interface UseProvidersQueryOptions {
   isProxyRunning?: boolean; // 代理服务是否运行中
+}
+
+/** Keep a stalled native provider read from holding the provider view forever. */
+export const PROVIDER_QUERY_TIMEOUT_MS = 15_000;
+
+function withTimeout<T>(
+  operation: () => Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      settled = true;
+      reject(new Error(message));
+    }, timeoutMs);
+
+    Promise.resolve()
+      .then(operation)
+      .then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+  });
 }
 
 /** Load one provider snapshot without converting backend failures into emptiness. */
@@ -57,21 +93,20 @@ export async function fetchProvidersQueryData(
   // Provider inventory is authoritative UI state. Let getAll failures reject
   // so React Query keeps any previous snapshot and exposes an error instead
   // of turning a backend/projection failure into `{}`.
-  const providers = await providersApi.getAll(appId);
-  let currentProviderId = "";
-  let currentProviderError: string | undefined;
-  try {
-    currentProviderId = await providersApi.getCurrent(appId);
-  } catch (error) {
-    console.error("获取当前供应商失败:", error);
-    currentProviderError = extractErrorMessage(error);
-  }
+  const providers = await withTimeout(
+    () => providersApi.getAll(appId),
+    PROVIDER_QUERY_TIMEOUT_MS,
+    `Loading ${appId} providers timed out after ${PROVIDER_QUERY_TIMEOUT_MS}ms`,
+  );
+  return { providers: sortProviders(providers) };
+}
 
-  return {
-    providers: sortProviders(providers),
-    currentProviderId,
-    ...(currentProviderError ? { currentProviderError } : {}),
-  };
+export function fetchCurrentProviderId(appId: AppId): Promise<string> {
+  return withTimeout(
+    () => providersApi.getCurrent(appId),
+    PROVIDER_QUERY_TIMEOUT_MS,
+    `Loading ${appId} current provider timed out after ${PROVIDER_QUERY_TIMEOUT_MS}ms`,
+  );
 }
 
 export const useProvidersQuery = (
@@ -85,9 +120,28 @@ export const useProvidersQuery = (
     // 当代理服务运行时，每 10 秒刷新一次供应商列表
     // 这样可以自动反映后端熔断器自动禁用代理目标的变更
     refetchInterval: isProxyRunning ? 10000 : false,
+    retry: false,
     queryFn: () => fetchProvidersQueryData(appId),
   });
 };
+
+export function currentProviderQueryOptions(appId: AppId) {
+  return queryOptions({
+    queryKey: ["providers", appId, "current"],
+    retry: false,
+    queryFn: () => fetchCurrentProviderId(appId),
+  });
+}
+
+export function useCurrentProviderQuery(
+  appId: AppId,
+  { isProxyRunning = false }: UseProvidersQueryOptions = {},
+) {
+  return useQuery({
+    ...currentProviderQueryOptions(appId),
+    refetchInterval: isProxyRunning ? 10000 : false,
+  });
+}
 
 /** Restoring split protocol sources is for editing, not displaying runtime providers. */
 export function useCodexEditorProvidersQuery(enabled: boolean) {

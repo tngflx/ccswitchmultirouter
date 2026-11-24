@@ -154,8 +154,8 @@ pub async fn preset_registry_apply_update(source_id: String) -> Result<Value, St
 /// 供前端一次性加载后做同步查询（模型上下文推断）；文件缺失或损坏返回 `None`，
 /// 前端回退到内置硬编码预设。
 #[tauri::command]
-pub fn preset_catalog_get() -> Option<PresetTableBundle> {
-    preset_catalog_service::load_default_bundle()
+pub async fn preset_catalog_get() -> Result<Option<PresetTableBundle>, String> {
+    super::run_command_blocking(|| Ok(preset_catalog_service::load_default_bundle())).await
 }
 
 /// 解析单个模型的能力条目：共享 deployment 覆盖 > plan/policy 覆盖 > 基线。
@@ -178,4 +178,21 @@ pub fn preset_catalog_resolve(
         plan.as_deref(),
         deployment.as_deref(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{preset_catalog_get, PresetTableBundle};
+    use std::future::Future;
+
+    #[test]
+    fn preset_catalog_read_uses_async_dispatch() {
+        fn assert_async_command<F>(_: impl FnOnce() -> F)
+        where
+            F: Future<Output = Result<Option<PresetTableBundle>, String>> + Send,
+        {
+        }
+
+        assert_async_command(preset_catalog_get);
+    }
 }

@@ -61,6 +61,7 @@ import { extractErrorMessage } from "@/utils/errorUtils";
 import { isMac } from "@/lib/platform";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { CodexHistoryRepairPanel } from "./CodexHistoryRepairPanel";
+import { CodexSessionBackupDialog } from "./CodexSessionBackupDialog";
 import { SessionItem } from "./SessionItem";
 import { SessionMessageItem } from "./SessionMessageItem";
 import { SessionTocDialog, SessionTocSidebar } from "./SessionToc";
@@ -75,6 +76,7 @@ import {
   getSessionDirectoryGroupKey,
   getSessionKey,
   groupSessionsByProviderAndDirectory,
+  isArchivedCodexSession,
   type SessionDirectoryGroup,
   type SessionProviderGroup,
   shouldHideCodexMessageFromToc,
@@ -84,13 +86,6 @@ const SESSION_LIST_VIEW_MODE_STORAGE_KEY =
   "cc-switch.sessionManager.listViewMode";
 const SESSION_GROUP_EXPANSION_STORAGE_KEY =
   "cc-switch.sessionManager.groupExpansionState";
-
-const isArchivedCodexSession = (session: SessionMeta) =>
-  session.providerId === "codex" &&
-  session.sourcePath
-    ?.replace(/\\/g, "/")
-    .split("/")
-    .includes("archived_sessions");
 
 type ProviderFilter =
   | "all"
@@ -1325,21 +1320,21 @@ export function SessionManagerPage({
                       </div>
                     </div>
                     {isCodexManager && (
-                      <div className="grid grid-cols-2 gap-1 rounded-md border bg-muted/30 p-1">
+                      <div className="grid grid-cols-3 gap-1 rounded-md border bg-muted/30 p-1">
                         <Button
                           type="button"
                           size="sm"
                           variant={
                             showCodexHistoryRepair ? "secondary" : "ghost"
                           }
-                          className="h-8 justify-start gap-2 px-2.5 text-xs"
+                          className="h-auto min-h-12 flex-col gap-1 whitespace-normal px-1 py-1 text-center text-xs leading-tight"
                           onClick={() => {
                             setShowCodexHistoryRepair(true);
                             setShowCodexHistoryRepairGuide(false);
                           }}
                         >
                           <FileClock className="size-3.5" />
-                          <span className="truncate">History repair</span>
+                          <span>History repair</span>
                         </Button>
                         <Button
                           type="button"
@@ -1347,15 +1342,20 @@ export function SessionManagerPage({
                           variant={
                             showCodexHistoryRepair ? "ghost" : "secondary"
                           }
-                          className="h-8 justify-start gap-2 px-2.5 text-xs"
+                          className="h-auto min-h-12 flex-col gap-1 whitespace-normal px-1 py-1 text-center text-xs leading-tight"
                           onClick={() => {
                             setShowCodexHistoryRepair(false);
                             setShowCodexHistoryRepairGuide(false);
                           }}
                         >
                           <MessageSquare className="size-3.5" />
-                          <span className="truncate">Session browser</span>
+                          <span>Session browser</span>
                         </Button>
+                        <CodexSessionBackupDialog
+                          sessions={sessions}
+                          isLoading={isLoading}
+                          onRestore={() => void refetch()}
+                        />
                       </div>
                     )}
                     {selectionMode && (

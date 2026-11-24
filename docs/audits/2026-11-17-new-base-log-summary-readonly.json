@@ -1,0 +1,67 @@
+{
+  "observedAtUtc": "2026-11-17T15:13:49.706Z",
+  "scope": "bounded_existing_configured_ccswitch_log_tails",
+  "noRawBodiesPathsSessionsOrCredentials": true,
+  "noProviderProbePerformed": true,
+  "noRuntimeMutationPerformed": true,
+  "journal": {
+    "boundedBytes": 524288,
+    "records": 958,
+    "from": "2026-11-17T14:30:56.261962700+00:00",
+    "to": "2026-11-17T15:13:48.399743800+00:00",
+    "counts": {
+      "sse_inspection_limit:200": 922,
+      "response_consumption_stopped:200": 35,
+      "upstream_http_error:429": 1
+    }
+  },
+  "router": {
+    "boundedBytes": 1048576,
+    "lineCount": 2628,
+    "events": {
+      "upstream_send": 265,
+      "request_classified": 263,
+      "route_resolved": 264,
+      "upstream_status": 254,
+      "response_ready": 254,
+      "request_prepared": 264,
+      "auth_prepared": 264,
+      "request_health": 264,
+      "request_body_accounting": 264,
+      "request_health_review_approved": 262,
+      "web_search_history_declared": 2,
+      "turn_recovery": 8
+    },
+    "prepared": 264,
+    "children": 181,
+    "overrideApplied": 181,
+    "upstreamEfforts": {
+      "high": 181,
+      "max": 81,
+      "medium": 2
+    },
+    "httpStatusEventCounts": {
+      "200": 508
+    }
+  },
+  "app": {
+    "boundedBytes": 524288,
+    "lineCount": 2078,
+    "levels": {
+      "WARN": 1435,
+      "INFO": 643
+    },
+    "categories": {
+      "usage_fork_prefix_mismatch": 710,
+      "usage_fork_prefix_missing": 62,
+      "guardian_readiness_change": 8,
+      "upstream_rate_limit": 1
+    },
+    "latestUsageSync": {
+      "imported": 4,
+      "skipped": 0,
+      "deferred": 674,
+      "scanned": 703
+    }
+  }
+}

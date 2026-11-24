@@ -8,10 +8,11 @@
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
 use super::{
+    codex_subagent_reasoning::desktop_recovery_metadata,
     codex_turn_recovery::{
-        begin_turn, forward_error_is_recoverable, mark_observed_turn_completed,
-        observe_responses_turn_json, observe_responses_turn_stream, provider_fingerprint,
-        schedule_turn_recovery, track_turn, TurnRecoveryContext,
+        begin_turn, forward_error_is_recoverable, handle_recovery_forward_error,
+        mark_observed_turn_completed, observe_responses_turn_json, observe_responses_turn_stream,
+        provider_fingerprint, schedule_turn_recovery, track_turn, TurnRecoveryContext,
     },
     content_encoding::{
         decompress_body, get_content_encoding, is_supported_content_encoding, CodexInboundEncoding,
@@ -722,6 +723,22 @@ fn desktop_recovery_thread_id(headers: &HeaderMap) -> Option<String> {
         .or_else(|| headers.get("session_id").and_then(nonempty))
 }
 
+fn desktop_recovery_identity(
+    headers: &HeaderMap,
+    body: &Value,
+) -> Option<(String, Option<String>)> {
+    if !is_verified_codex_desktop_request(headers) {
+        return None;
+    }
+    let metadata = desktop_recovery_metadata(headers, body).ok()?;
+    if let Some(thread_id) = desktop_recovery_thread_id(headers) {
+        let turn_id = metadata.and_then(|(thread, turn)| (thread == thread_id).then_some(turn));
+        Some((thread_id, turn_id))
+    } else {
+        metadata.map(|(thread, turn)| (thread, Some(turn)))
+    }
+}
+
 /// Observe the exact Responses SSE form returned to Codex Desktop. The stream
 /// may have passed through a provider adapter first, so recovery belongs here
 /// at the final client-facing boundary rather than in an upstream converter.
@@ -885,11 +902,7 @@ fn finalize_aggressive_recovery(
             Ok(response)
         }
         Err(error) => {
-            if forward_error_is_recoverable(&error) {
-                schedule_turn_recovery(context, "response_processing_failed");
-            } else {
-                mark_observed_turn_completed(&context);
-            }
+            handle_recovery_forward_error(context, &error, "response_processing_failed");
             Err(error)
         }
     }
@@ -1405,6 +1418,7 @@ async fn handle_claude_transform(
                         None,
                         None,
                         Some(StreamLogContext {
+                            request_trace: ctx.request_health_trace.clone(),
                             session_id: ctx.session_id.clone(),
                             model: ctx
                                 .outbound_model
@@ -1422,6 +1436,7 @@ async fn handle_claude_transform(
                         hosted_web_search_name.clone(),
                         hosted_web_search_max_uses,
                         Some(StreamLogContext {
+                            request_trace: ctx.request_health_trace.clone(),
                             session_id: ctx.session_id.clone(),
                             model: ctx
                                 .outbound_model
@@ -1923,6 +1938,7 @@ pub async fn handle_chat_completions(
             Box::pin(response.bytes_stream()),
             stream_reconnect,
             Some(StreamLogContext {
+                request_trace: ctx.request_health_trace.clone(),
                 session_id: ctx.session_id.clone(),
                 model: ctx
                     .outbound_model
@@ -3483,6 +3499,7 @@ async fn handle_codex_responses_to_chat_transform(
             Box::pin(response.bytes_stream()),
             stream_reconnect,
             Some(StreamLogContext {
+                request_trace: ctx.request_health_trace.clone(),
                 session_id: ctx.session_id.clone(),
                 model: ctx
                     .outbound_model
@@ -3697,6 +3714,31 @@ fn rebuilt_codex_responses_stream(
     super::hyper_client::ProxyResponse::streamed(status, headers, stream)
 }
 
+#[cfg(test)]
+thread_local! {
+    static MESSAGES_HISTORY_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn codex_messages_history_request(
+    provider: &crate::provider::Provider,
+    endpoint: &str,
+    original_request: &[u8],
+) -> Result<Option<Value>, ProxyError> {
+    if !super::providers::should_convert_codex_responses_to_messages(provider, endpoint) {
+        return Ok(None);
+    }
+    // Only the winning Messages route records request input. These decoded
+    // bytes precede any role overrides or per-provider request transforms.
+    #[cfg(test)]
+    MESSAGES_HISTORY_PARSES.with(|count| count.set(count.get() + 1));
+    let mut request: Value = serde_json::from_slice(original_request)
+        .map_err(|e| ProxyError::Internal(format!("Failed to read request history input: {e}")))?;
+    if let Some(fields) = request.as_object_mut() {
+        fields.retain(|key, _| key == "input");
+    }
+    Ok(Some(request))
+}
+
 pub async fn handle_grokbuild_responses(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
@@ -3745,12 +3787,6 @@ async fn handle_responses_for_app(
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
     let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
-    let request_body_for_history = body.clone();
-    let desktop_recovery_eligible =
-        app_type == AppType::Codex && is_verified_codex_desktop_request(&headers);
-    let desktop_thread_id = desktop_recovery_eligible
-        .then(|| desktop_recovery_thread_id(&headers))
-        .flatten();
     let desktop_reasoning = app_type == AppType::Codex
         && super::providers::is_codex_desktop_reasoning_client(
             &headers,
@@ -3764,34 +3800,36 @@ async fn handle_responses_for_app(
     let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let is_codex_v2_compaction =
         super::forwarder::codex_request_is_v2_compaction(&app_type, &endpoint, &body, &headers);
-    let recovery_thread_id = (is_stream && !is_codex_v2_compaction)
-        .then(|| desktop_thread_id.clone())
+    let recovery_identity = (app_type == AppType::Codex && is_stream && !is_codex_v2_compaction)
+        .then(|| desktop_recovery_identity(&headers, &body))
         .flatten();
-    if let Some(thread_id) = recovery_thread_id.as_ref() {
+    if let Some((thread_id, _)) = recovery_identity.as_ref() {
         begin_recovery_request(thread_id, &body);
     }
-    let mut recovery_context = recovery_thread_id.and_then(|desktop_thread_id| {
-        let durable_provider_id = crate::settings::get_current_provider(&AppType::Codex)?;
-        let durable_provider = state
-            .db
-            .get_provider_by_id(&durable_provider_id, "codex")
-            .ok()
-            .flatten()?;
-        let request_model = request_model_from_body(&body);
-        Some(TurnRecoveryContext {
-            session_id: crate::proxy::extract_session_id(&headers, &body, "codex").session_id,
-            desktop_thread_id,
-            recovery_id: uuid::Uuid::new_v4().to_string(),
-            observed_at_ms: chrono::Utc::now().timestamp_millis(),
-            model: request_model.clone(),
-            desktop_model: request_model,
-            provider_id: durable_provider_id.clone(),
-            durable_provider_id,
-            provider_fingerprint: provider_fingerprint(&durable_provider),
-            desktop_eligible: true,
-            max_recoveries: crate::settings::get_settings().stream_recovery_budget(),
-        })
-    });
+    let mut recovery_context =
+        recovery_identity.and_then(|(desktop_thread_id, desktop_turn_id)| {
+            let durable_provider_id = crate::settings::get_current_provider(&AppType::Codex)?;
+            let durable_provider = state
+                .db
+                .get_provider_by_id(&durable_provider_id, "codex")
+                .ok()
+                .flatten()?;
+            let request_model = request_model_from_body(&body);
+            Some(TurnRecoveryContext {
+                session_id: crate::proxy::extract_session_id(&headers, &body, "codex").session_id,
+                desktop_thread_id,
+                desktop_turn_id,
+                recovery_id: uuid::Uuid::new_v4().to_string(),
+                observed_at_ms: chrono::Utc::now().timestamp_millis(),
+                model: request_model.clone(),
+                desktop_model: request_model,
+                provider_id: durable_provider_id.clone(),
+                durable_provider_id,
+                provider_fingerprint: provider_fingerprint(&durable_provider),
+                desktop_eligible: true,
+                max_recoveries: crate::settings::get_settings().stream_recovery_budget(),
+            })
+        });
     let recovery_tracking = recovery_context.as_ref().map(track_turn);
 
     let is_external_openai_client =
@@ -3912,11 +3950,7 @@ async fn handle_responses_for_app(
         Ok(ctx) => ctx,
         Err(error) => {
             if let Some(context) = recovery_context {
-                if forward_error_is_recoverable(&error) {
-                    schedule_turn_recovery(context, "provider_selection_failed");
-                } else {
-                    mark_observed_turn_completed(&context);
-                }
+                handle_recovery_forward_error(context, &error, "provider_selection_failed");
             }
             return Err(error);
         }
@@ -3951,11 +3985,7 @@ async fn handle_responses_for_app(
             log_forward_error(&state, &ctx, is_stream, &err.error);
             if let Some(mut context) = recovery_context {
                 context.provider_id = ctx.provider.id.clone();
-                if forward_error_is_recoverable(&err.error) {
-                    schedule_turn_recovery(context, "upstream_request_failed");
-                } else {
-                    mark_observed_turn_completed(&context);
-                }
+                handle_recovery_forward_error(context, &err.error, "upstream_request_failed");
             }
             return build_codex_proxy_error_response(&ctx, &endpoint, &err.error);
         }
@@ -3999,7 +4029,9 @@ async fn handle_responses_for_app(
             .await;
         }
 
-        if super::providers::should_convert_codex_responses_to_messages(&ctx.provider, &endpoint) {
+        if let Some(request_body_for_history) =
+            codex_messages_history_request(&ctx.provider, &endpoint, &body_bytes)?
+        {
             let rebuilt = if is_stream || response.is_sse() {
                 let status = response.status();
                 let response_headers = response.headers().clone();
@@ -4007,6 +4039,7 @@ async fn handle_responses_for_app(
                     Box::pin(response.bytes_stream()),
                     stream_reconnect,
                     Some(StreamLogContext {
+                        request_trace: ctx.request_health_trace.clone(),
                         session_id: ctx.session_id.clone(),
                         model: ctx
                             .outbound_model
@@ -4103,6 +4136,7 @@ async fn handle_responses_for_app(
                 Box::pin(response.bytes_stream()),
                 stream_reconnect,
                 Some(StreamLogContext {
+                    request_trace: ctx.request_health_trace.clone(),
                     session_id: ctx.session_id.clone(),
                     model: ctx
                         .outbound_model
@@ -4280,7 +4314,6 @@ async fn handle_responses_compact_for_app(
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
-    let request_body_for_history = body.clone();
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
@@ -4338,7 +4371,9 @@ async fn handle_responses_compact_for_app(
         .await;
     }
 
-    if super::providers::should_convert_codex_responses_to_messages(&ctx.provider, &endpoint) {
+    if let Some(request_body_for_history) =
+        codex_messages_history_request(&ctx.provider, &endpoint, &body_bytes)?
+    {
         let rebuilt = if is_stream || response.is_sse() {
             let status = response.status();
             let response_headers = response.headers().clone();
@@ -4346,6 +4381,7 @@ async fn handle_responses_compact_for_app(
                 Box::pin(response.bytes_stream()),
                 stream_reconnect,
                 Some(StreamLogContext {
+                    request_trace: ctx.request_health_trace.clone(),
                     session_id: ctx.session_id.clone(),
                     model: ctx
                         .outbound_model
@@ -4481,6 +4517,7 @@ async fn handle_codex_xai_native_responses_rewrite(
             Box::pin(response.bytes_stream()),
             stream_reconnect,
             Some(StreamLogContext {
+                request_trace: ctx.request_health_trace.clone(),
                 session_id: ctx.session_id.clone(),
                 model: ctx
                     .outbound_model
@@ -4954,6 +4991,7 @@ async fn handle_codex_chat_to_responses_transform(
 
     if (is_stream || response.is_sse()) && !hosted_tool_loop_response {
         let log_context = StreamLogContext {
+            request_trace: ctx.request_health_trace.clone(),
             session_id: ctx.session_id.clone(),
             model: upstream_model.to_string(),
             provider_id: ctx.provider.id.clone(),
@@ -5184,6 +5222,7 @@ async fn handle_codex_anthropic_to_responses_transform(
     // envelopes and gateways that ignore stream:true can be converted faithfully.
     if response.is_sse() || (is_stream && !response.is_json()) {
         let log_context = StreamLogContext {
+            request_trace: ctx.request_health_trace.clone(),
             session_id: ctx.session_id.clone(),
             model: ctx
                 .outbound_model
@@ -7024,6 +7063,109 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::RwLock;
 
+    #[test]
+    fn desktop_recovery_identity_uses_only_matching_turn_metadata() {
+        let thread = "019c0000-0000-7000-8000-000000000001";
+        let turn = "019c0000-0000-7000-8000-000000000002";
+        let other_thread = "019c0000-0000-7000-8000-000000000003";
+        let body = json!({"client_metadata": {
+            "x-codex-turn-metadata": {"thread_id": thread, "turn_id": turn, "request_kind": "turn"}
+        }});
+        let mut headers = HeaderMap::new();
+        headers.insert("originator", HeaderValue::from_static("Codex Desktop"));
+        assert_eq!(
+            super::desktop_recovery_identity(&headers, &body),
+            Some((thread.to_owned(), Some(turn.to_owned())))
+        );
+
+        headers.insert("session-id", HeaderValue::from_static(thread));
+        assert_eq!(
+            super::desktop_recovery_identity(&headers, &body),
+            Some((thread.to_owned(), Some(turn.to_owned())))
+        );
+        headers.insert("session-id", HeaderValue::from_static(other_thread));
+        assert_eq!(
+            super::desktop_recovery_identity(&headers, &body),
+            Some((other_thread.to_owned(), None))
+        );
+
+        mark_external_openai_headers(&mut headers);
+        assert!(super::desktop_recovery_identity(&headers, &body).is_none());
+    }
+
+    #[test]
+    fn desktop_recovery_legacy_thread_fallback_excludes_child_and_non_turn_requests() {
+        let thread = "019c0000-0000-7000-8000-000000000001";
+        let mut headers = HeaderMap::new();
+        headers.insert("originator", HeaderValue::from_static("Codex Desktop"));
+        headers.insert("thread-id", HeaderValue::from_static(thread));
+        let legacy = json!({"input": "Continue this work"});
+        assert_eq!(
+            super::desktop_recovery_identity(&headers, &legacy),
+            Some((thread.to_owned(), None))
+        );
+
+        headers.insert(
+            "x-openai-subagent",
+            HeaderValue::from_static("collab_spawn"),
+        );
+        assert!(super::desktop_recovery_identity(&headers, &legacy).is_none());
+        headers.remove("x-openai-subagent");
+
+        let child = json!({"client_metadata": {"x-openai-subagent": "collab_spawn"}});
+        assert!(super::desktop_recovery_identity(&headers, &child).is_none());
+
+        let background = json!({"client_metadata": {
+            "x-codex-turn-metadata": {"request_kind": "background"}
+        }});
+        assert!(super::desktop_recovery_identity(&headers, &background).is_none());
+        headers.insert(
+            "x-codex-turn-metadata",
+            HeaderValue::from_static(r#"{"request_kind":"compaction"}"#),
+        );
+        assert!(super::desktop_recovery_identity(&headers, &legacy).is_none());
+    }
+
+    #[test]
+    fn only_winning_messages_provider_reads_original_responses_history_input() {
+        let provider = |format: &str| {
+            Provider::with_id(
+                format.to_string(),
+                format.to_string(),
+                json!({ "apiFormat": format }),
+                None,
+            )
+        };
+        let native = provider("openai_responses");
+        let messages = provider("openai_messages");
+        let original = br#"{"model":"role-selected-by-client","input":[{"role":"user","content":"original input"}],"tools":[{"type":"web_search"}]}"#;
+        for endpoint in ["/v1/responses", "/responses/compact"] {
+            super::MESSAGES_HISTORY_PARSES.with(|count| count.set(0));
+            // The native path has no reason to even deserialize the snapshot.
+            assert!(
+                super::codex_messages_history_request(&native, endpoint, b"unread")
+                    .unwrap()
+                    .is_none()
+            );
+            for _ in 0..3 {
+                assert!(
+                    super::codex_messages_history_request(&native, endpoint, original)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            super::MESSAGES_HISTORY_PARSES.with(|count| assert_eq!(count.get(), 0));
+            let captured = super::codex_messages_history_request(&messages, endpoint, original)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                captured,
+                json!({"input":[{"role":"user","content":"original input"}]})
+            );
+            super::MESSAGES_HISTORY_PARSES.with(|count| assert_eq!(count.get(), 1));
+        }
+    }
+
     fn parse_responses_sse_events(text: &str) -> Vec<(String, Value)> {
         text.split("\n\n")
             .filter(|block| !block.trim().is_empty())
@@ -8492,6 +8634,7 @@ data: [DONE]\n\n";
         super::TurnRecoveryContext {
             session_id: thread_id.clone(),
             desktop_thread_id: thread_id,
+            desktop_turn_id: None,
             recovery_id: uuid::Uuid::new_v4().to_string(),
             observed_at_ms: chrono::Utc::now().timestamp_millis(),
             model: "test-model".to_string(),

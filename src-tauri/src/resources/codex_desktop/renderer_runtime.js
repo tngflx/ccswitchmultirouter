@@ -3,21 +3,46 @@
   if (__CCSWITCH_CATALOG_RELEASED__) incomingPayload.catalogReleased = true;
   const patchKey = __CCSWITCH_PATCH_KEY__;
   const state = window[patchKey] || {};
+  const rendererRuntimeFingerprint = __CCSWITCH_RENDERER_RUNTIME_FINGERPRINT__;
+  const observeRecovery = __CCSWITCH_RECOVERY_ONLY__;
+  if (
+    observeRecovery &&
+    state.rendererRuntimeFingerprint === rendererRuntimeFingerprint &&
+    typeof state.collectCodexNativeUsageLimitCandidates === "function"
+  )
+    return {
+      status: "ok",
+      patchKey,
+      recoveryOnly: state.recoveryOnly === true,
+    };
+
+  const installedFullRuntime =
+    typeof state.rendererRuntimeFingerprint === "string" &&
+    state.recoveryOnly !== true;
+  // Upgrade an older full installation with its existing catalog and mode.
+  const recoveryOnly = observeRecovery && !installedFullRuntime;
+  const previousPayload = state.payload;
+  const requestedPayload =
+    observeRecovery && installedFullRuntime && previousPayload
+      ? previousPayload
+      : incomingPayload;
+  state.recoveryOnly = recoveryOnly;
   // Canonical status tokens are only candidates across runtime replacement;
   // the new code resolves their current mounted scope before rebinding.
   const previousAppServerStatusAtoms = state.appServerStatusAtoms || [];
   const previousAppServerStatusBindings = state.appServerStatusBindings || [];
   // DOM controls and event closures belong to this exact installation.
-  state.nativeBooleanReasoningRestore?.();
+  if (!recoveryOnly) state.nativeBooleanReasoningRestore?.();
   /*__CCSWITCH_CATALOG_PAYLOAD_SELECTION_CORE__*/
-  const previousPayload = state.payload;
   /*__CCSWITCH_MODEL_PICKER_RELEASE_CORE__*/
-  if (incomingPayload?.catalogReleased === true)
-    releaseCodexModelPicker(incomingPayload.modelProvider);
-  else cancelCodexModelPickerReleaseRefresh();
-  const payload = selectCatalogPayload(state.payload, incomingPayload);
+  if (!recoveryOnly) {
+    if (requestedPayload?.catalogReleased === true)
+      releaseCodexModelPicker(requestedPayload.modelProvider);
+    else cancelCodexModelPickerReleaseRefresh();
+  }
+  const payload = selectCatalogPayload(state.payload, requestedPayload);
   const preservePreviousCatalog =
-    payload !== incomingPayload && payload?.catalogAvailable === true;
+    payload !== requestedPayload && payload?.catalogAvailable === true;
   const installationGeneration = (state.runtimeGeneration || 0) + 1;
   state.runtimeGeneration = installationGeneration;
   // Continuation commit closures capture installationIsCurrent. Any new
@@ -52,7 +77,7 @@
   state.reactRootObserver = null;
   if (state.interval) clearInterval(state.interval);
   state.interval = null;
-  state.catalogReleased = incomingPayload?.catalogReleased === true;
+  state.catalogReleased = requestedPayload?.catalogReleased === true;
   if (
     previousPayload?.catalogAvailable === true &&
     !state.modelPickerStatsigOverrides
@@ -61,7 +86,6 @@
   // This is a content fingerprint of the embedded renderer resources. The
   // runtime closure captures those functions; a changed fingerprint tears
   // down an older interval and rebinds every owned hook automatically.
-  const rendererRuntimeFingerprint = __CCSWITCH_RENDERER_RUNTIME_FINGERPRINT__;
   let reasoningQueryCachesToRebind = [];
   /*__CCSWITCH_QUERY_CACHE_LIFECYCLE_CORE__*/
   const cleanupMessagePatch = () => {
@@ -92,8 +116,9 @@
       state.reactRootObserver?.disconnect();
     } catch {}
     cleanupMessagePatch();
-    reasoningQueryCachesToRebind =
-      prepareCodexModelReasoningQueryCachesForReinjection();
+    if (!recoveryOnly)
+      reasoningQueryCachesToRebind =
+        prepareCodexModelReasoningQueryCachesForReinjection();
     state.interval = null;
     state.reactRootObserver = null;
     // Older discovery admitted dynamic RPC stubs before patching failed. Drop
@@ -197,6 +222,7 @@
   /*__CCSWITCH_SUMMARY_HANDOFF_CORE__*/
   /*__CCSWITCH_CODEX_CONTINUATION_CORE__*/
   /*__CCSWITCH_OWNER_REMOTE_VIEW_CORE__*/
+  /*__CCSWITCH_NATIVE_USAGE_LIMIT_OBSERVER_CORE__*/
   const patchStatsigConfig = (name, config, repairLegacyPollution = false) => {
     const prepared = prepareStatsigDynamicConfig(
       name,
@@ -441,6 +467,7 @@
     state.scopedAppServerRegistryClasses = candidates.registries || [];
     state.appServerStatusAtoms = candidates.appServerStatusAtoms || [];
     state.appServerStatusBindings = candidates.appServerStatusBindings || [];
+    if (recoveryOnly) return candidates.scopes;
     for (const prototype of candidates.queryObserverPrototypes) {
       try {
         patchCodexModelReasoningQueryObserverPrototype(prototype);
@@ -677,6 +704,10 @@
     if (!installationIsCurrent()) return false;
     const sendRequest = codexDeclaredMethod(client, "sendRequest");
     if (!sendRequest || !isLocalAppServerTarget(client, null)) return false;
+    const requestHook = codexContinuationOwnData(
+      sendRequest,
+      "__ccSwitchRequestHook",
+    );
     const retainVerifiedClient = () => {
       state.appServerClients = Array.isArray(state.appServerClients)
         ? state.appServerClients
@@ -687,6 +718,8 @@
     };
     if (
       !appServerRequestClientNeedsPatch(client) &&
+      codexContinuationOwnData(requestHook, "observeTurnStart") ===
+        captureCodexNativeUsageLimitTurnStart &&
       codexVerifiedAppServerOriginalRequest(
         client,
         appServerRequestPatchVersion,
@@ -708,10 +741,19 @@
         options,
       ) {
         rememberCodexUserTurnAction(method, params);
-        const normalizedParams = normalizeAppServerRequestParams(
+        const normalizedParams = recoveryOnly
+          ? params
+          : normalizeAppServerRequestParams(method, params);
+        const acknowledgeTurnStart = captureCodexNativeUsageLimitTurnStart(
+          client,
           method,
-          params,
+          normalizedParams,
         );
+        if (recoveryOnly) {
+          const result = await original(method, params, options);
+          acknowledgeTurnStart?.(result);
+          return result;
+        }
         const actualMethod = appServerMethod(method, params);
         const modelListScope = captureModelListScope(
           actualMethod,
@@ -720,6 +762,7 @@
         );
         try {
           const result = await original(method, normalizedParams, options);
+          acknowledgeTurnStart?.(result);
           return patchAppServerResult(
             actualMethod,
             result,
@@ -737,6 +780,7 @@
           state.guardianV2FallbackCount =
             (state.guardianV2FallbackCount || 0) + 1;
           const result = await original(method, fallbackParams, options);
+          acknowledgeTurnStart?.(result);
           return patchAppServerResult(
             actualMethod,
             result,
@@ -751,6 +795,7 @@
           client,
           original,
           version: appServerRequestPatchVersion,
+          observeTurnStart: captureCodexNativeUsageLimitTurnStart,
         }),
       });
       client.__ccSwitchOriginalSendRequest = original;
@@ -926,6 +971,20 @@
   };
   const monotonicNow = () =>
     typeof performance?.now === "function" ? performance.now() : Date.now();
+  let initialUsageLimitScanPending =
+    typeof observeRecovery === "boolean" ? observeRecovery : false;
+  const scanInitialUsageLimitIfReady = () => {
+    // The next guardian poll may arrive after a turn already in progress has
+    // failed. Start observing when discovery publishes a current local owner.
+    if (
+      !initialUsageLimitScanPending ||
+      !installationIsCurrent() ||
+      codexContinuationLocalClients().length === 0
+    )
+      return;
+    initialUsageLimitScanPending = false;
+    void state.collectCodexNativeUsageLimitCandidates().catch(recordFailure);
+  };
   const patchReactAppServerClients = async (startingNodes, patchedCaches) => {
     if (!installationIsCurrent()) return 0;
     if (state.reactDiscoveryPromise) return await state.reactDiscoveryPromise;
@@ -1030,34 +1089,36 @@
               key: "requestClient",
             });
             patched += 1;
-            if (
-              state.historyManagerCandidates.size >= 8 &&
-              !state.historyManagerCandidates.has(value)
-            )
-              state.historyManagerCandidates.clear();
-            state.historyManagerCandidates.add(value);
-            if (
-              !state.historyQueryRefreshPromise &&
-              !state.historyQueryRefreshCompleted &&
-              typeof value?.threadStore?.refreshRecentConversations ===
-                "function"
-            ) {
-              state.historyQueryRefreshPromise = Promise.resolve()
-                .then(() =>
-                  value.threadStore.refreshRecentConversations({
-                    mode: "expanded",
-                  }),
-                )
-                .then(() => {
-                  state.historyQueryRefreshCompleted = true;
-                })
-                .catch((error) => {
-                  state.historyQueryRefreshPromise = null;
-                  state.historyQueryRefreshCompleted = false;
-                  recordFailure(error);
-                });
+            if (!recoveryOnly) {
+              if (
+                state.historyManagerCandidates.size >= 8 &&
+                !state.historyManagerCandidates.has(value)
+              )
+                state.historyManagerCandidates.clear();
+              state.historyManagerCandidates.add(value);
+              if (
+                !state.historyQueryRefreshPromise &&
+                !state.historyQueryRefreshCompleted &&
+                typeof value?.threadStore?.refreshRecentConversations ===
+                  "function"
+              ) {
+                state.historyQueryRefreshPromise = Promise.resolve()
+                  .then(() =>
+                    value.threadStore.refreshRecentConversations({
+                      mode: "expanded",
+                    }),
+                  )
+                  .then(() => {
+                    state.historyQueryRefreshCompleted = true;
+                  })
+                  .catch((error) => {
+                    state.historyQueryRefreshPromise = null;
+                    state.historyQueryRefreshCompleted = false;
+                    recordFailure(error);
+                  });
+              }
+              scheduleHistoryLineageHydration(value);
             }
-            scheduleHistoryLineageHydration(value);
           }
 
           if (depth >= 14) continue;
@@ -1113,6 +1174,7 @@
       state.appServerClients = (state.appServerClients || []).filter((client) =>
         codexAppServerClientHasCurrentOwner(client),
       );
+      scanInitialUsageLimitIfReady();
       state.reactRequestClientPatched =
         state.reactRequestClientPatched || patched > 0;
       state.historyQueryPatch = {
@@ -1201,6 +1263,7 @@
         state.scopedAppServerRegistryClasses || [],
         patchedCaches,
       );
+      scanInitialUsageLimitIfReady();
     }
     let patched = modulePatched;
     if (modulePatched > 0) state.appServerPatchInstalled = true;
@@ -1229,9 +1292,11 @@
           // New initialized status atoms can bind the exact current manager
           // immediately, without gating the canonical tree scan on this import.
           refreshMountedAppServerScopeHints(patchedCaches);
-          const known =
-            Array.isArray(state.nativeReasoningVisibilityAtoms) &&
-            state.nativeReasoningVisibilityAtoms.length === 1;
+          scanInitialUsageLimitIfReady();
+          const known = recoveryOnly
+            ? codexContinuationLocalClients().length > 0
+            : Array.isArray(state.nativeReasoningVisibilityAtoms) &&
+              state.nativeReasoningVisibilityAtoms.length === 1;
           state.webpackPickerDiscoveryRetryAt =
             Date.now() + (known ? 30000 : 5000);
         })
@@ -1272,12 +1337,14 @@
             state.scopedAppServerRegistryClasses || [],
             patchedCaches,
           );
+          scanInitialUsageLimitIfReady();
           const discover = async (module) => {
             if (!installationIsCurrent()) return 0;
             const result = await patchCodexScopedAppServerClients(
               module,
               patchedCaches,
             );
+            scanInitialUsageLimitIfReady();
             return state.scopedAppServerDiscovery?.clientCount || result || 0;
           };
           try {
@@ -1296,6 +1363,16 @@
               scopedPatched = await discover(initial);
             } catch {}
           }
+          if (recoveryOnly && scopedPatched === 0) {
+            try {
+              const module = await loadAppModule("app-server-manager-signals-");
+              scopedPatched = patchAppServerModuleClients(
+                module,
+                patchedCaches,
+              );
+              scanInitialUsageLimitIfReady();
+            } catch {}
+          }
           return scopedPatched;
         };
         try {
@@ -1311,11 +1388,12 @@
           // installation/heartbeat alive while it binds the picker caches.
           modulePatched = state.scopedAppServerDiscovery?.clientCount || 0;
         } catch {}
-        if (modulePatched === 0) {
+        if (!recoveryOnly && modulePatched === 0) {
           try {
             const module = await loadAppModule("app-server-manager-signals-");
             if (!installationIsCurrent()) return;
             modulePatched = patchAppServerModuleClients(module, patchedCaches);
+            scanInitialUsageLimitIfReady();
           } catch {}
         }
         if (!installationIsCurrent()) return;
@@ -1361,7 +1439,7 @@
     // without accepting stale roots or turning a cache into RPC authorization.
     // Pending DOM nodes remain owned by the throttled React work above.
     if (
-      state.nativeReasoningVisibilityRequired === true &&
+      (recoveryOnly || state.nativeReasoningVisibilityRequired === true) &&
       !state.pendingReactNodes.size &&
       !codexRendererScopeSnapshotIsCurrent() &&
       (!state.nativeReasoningScopeRetryAt ||
@@ -1381,6 +1459,8 @@
         recordFailure(error);
       }
     }
+    scanInitialUsageLimitIfReady();
+    if (recoveryOnly) return;
     // History refresh is optional and may wait on a renderer-owned request that
     // never settles during startup. It must not gate model-list patching or the
     // heartbeat interval; its promise already records completion/failure above.
@@ -1550,9 +1630,9 @@
     if (state.runtimeGeneration !== installationGeneration) return;
     if (state.runPromise) return await state.runPromise;
     const job = (async () => {
-      installMessagePatch();
+      if (!recoveryOnly) installMessagePatch();
       await installAppServerPatch();
-      if (!installationIsCurrent()) return;
+      if (recoveryOnly || !installationIsCurrent()) return;
       void triggerLocalThreadCatalogSync();
       if (!state.catalogReleased) patchStatsig();
       patchReactState();
@@ -1565,11 +1645,13 @@
       if (state.runPromise === job) state.runPromise = null;
     }
   };
-  await run();
+  if (recoveryOnly) void run().catch(recordFailure);
+  else await run();
   if (state.runtimeGeneration === installationGeneration && !state.interval)
     state.interval = setInterval(() => {
       if (!state.runPromise) void run().catch(recordFailure);
     }, 1500);
+  if (recoveryOnly) return { status: "ok", patchKey, recoveryOnly };
   // The native history catalog is optional. Return the renderer compatibility
   // result immediately and let the existing heartbeat publish the eventual
   // status once the RPC settles.

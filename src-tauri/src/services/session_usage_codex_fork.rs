@@ -13,6 +13,7 @@ use super::{
 };
 use crate::error::AppError;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -20,12 +21,73 @@ use std::path::Path;
 // A record can contain image/tool payloads. Bound only this additional proof
 // reader; oversized/unverifiable history remains deferred, never guessed live.
 const MAX_PROOF_RECORD_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const MAX_REJECTED_PREFIX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum CopiedForkProof {
     Unavailable,
     Verified { first_live_line: i64 },
     Deferred(String),
+    MissingParentPrefix(RejectedChildPrefix),
+}
+
+pub(super) const MISSING_PARENT_PREFIX: &str =
+    "fork own-settings 前缺少可验证的父 session_meta 复制前缀";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RejectedChildPrefix {
+    stamp: ParentFileStamp,
+    bytes: u64,
+    digest: [u8; 32],
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static RECHECKED_CHILD_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static HASHED_CHILD_PREFIX_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PROOF_RECORD_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(&Value)>>> = const { std::cell::RefCell::new(None) };
+}
+
+impl RejectedChildPrefix {
+    /// The caller supplies a digest of the exact bytes consumed by its
+    /// canonical parser, bounded to an immutable prefix of this snapshot.
+    pub(super) fn from_verified_prefix(
+        stamp: ParentFileStamp,
+        bytes: u64,
+        digest: [u8; 32],
+    ) -> Option<Self> {
+        (bytes > 0 && bytes <= MAX_REJECTED_PREFIX_BYTES && bytes <= stamp.size).then_some(Self {
+            stamp,
+            bytes,
+            digest,
+        })
+    }
+
+    pub(super) fn still_matches(&self, path: &Path) -> bool {
+        let Ok(file) = File::open(path) else {
+            return false;
+        };
+        if !ParentFileStamp::from_file(&file)
+            .is_some_and(|current| self.stamp.same_identity_and_not_shrunk(&current))
+        {
+            return false;
+        }
+        let mut prefix = file.take(self.bytes);
+        let mut digest = Sha256::new();
+        let mut buffer = [0; 8192];
+        while prefix.limit() > 0 {
+            match prefix.read(&mut buffer) {
+                Ok(0) | Err(_) => return false,
+                Ok(count) => {
+                    digest.update(&buffer[..count]);
+                    #[cfg(test)]
+                    RECHECKED_CHILD_BYTES.with(|bytes| bytes.set(bytes.get() + count as u64));
+                }
+            }
+        }
+        let result: [u8; 32] = digest.finalize().into();
+        result == self.digest && path_still_names(path, self.stamp)
+    }
 }
 
 #[derive(Debug)]
@@ -70,6 +132,13 @@ fn own_settings(record: &Value, child_id: uuid::Uuid) -> bool {
 /// Read one complete JSONL record without retaining a history/event cache.
 /// Error reasons deliberately exclude the untrusted record and parse error.
 fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, &'static str> {
+    read_record_with(reader, |_| {})
+}
+
+fn read_record_with(
+    reader: &mut impl BufRead,
+    observe: impl FnOnce(&[u8]),
+) -> Result<Option<Value>, &'static str> {
     let mut bytes = Vec::new();
     let count = Read::take(&mut *reader, MAX_PROOF_RECORD_BYTES + 1)
         .read_until(b'\n', &mut bytes)
@@ -97,6 +166,13 @@ fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, &'static str>
     {
         return Err("fork 复制前缀记录缺少有效的 type/payload/envelope");
     }
+    observe(&bytes);
+    #[cfg(test)]
+    PROOF_RECORD_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow_mut().as_mut() {
+            observer(&record);
+        }
+    });
     Ok(Some(record))
 }
 
@@ -107,19 +183,23 @@ fn token_usage_signature(record: &Value) -> Option<&Value> {
     .flatten()
 }
 
-/// Codex may replay, omit, or add non-accounting records while materializing a
-/// fork. Token usage records are the boundary where content must remain exact.
-/// Their cumulative totals must occur in the parent history in order. A
-/// rewritten total defers the proof instead of risking double-counting.
-fn token_usage_subsequence(child: &[Value], parent: &[Value]) -> bool {
-    let child_tokens = child.iter().filter_map(token_usage_signature);
-    let mut parent_tokens = parent.iter().filter_map(token_usage_signature);
-    for child_token in child_tokens {
-        if !parent_tokens.any(|parent_token| parent_token == child_token) {
-            return false;
+/// Retain only the next accounting signature while advancing the copied
+/// history. Non-accounting image/tool records can be large and are discarded
+/// immediately after their envelope has been validated.
+fn next_child_usage(
+    reader: &mut impl BufRead,
+    remaining: &mut u64,
+) -> Result<Option<Value>, &'static str> {
+    while *remaining > 0 {
+        let mut record = read_record(reader)?.ok_or("fork child 复制前缀在验证期间缩短")?;
+        *remaining -= 1;
+        if token_usage_signature(&record).is_some() {
+            return Ok(record
+                .pointer_mut("/payload/info/total_token_usage")
+                .map(Value::take));
         }
     }
-    true
+    Ok(None)
 }
 
 fn stamp_unchanged_or_grew(current: ParentFileStamp, expected: ParentFileStamp) -> bool {
@@ -133,15 +213,32 @@ fn path_still_names(path: &Path, expected: ParentFileStamp) -> bool {
         .is_some_and(|current| stamp_unchanged_or_grew(current, expected))
 }
 
+enum ChildInspection {
+    Unavailable,
+    Boundary(CandidateBoundary),
+    MissingParentPrefix(RejectedChildPrefix),
+}
+
 fn inspect_child(
     child: &mut File,
     complete_bytes: u64,
     child_id: uuid::Uuid,
     parent_id: uuid::Uuid,
-) -> Result<Option<CandidateBoundary>, &'static str> {
+    stamp: ParentFileStamp,
+) -> Result<ChildInspection, &'static str> {
     let mut reader = BufReader::new(child.take(complete_bytes));
-    let Some(root) = read_record(&mut reader)? else {
-        return Ok(None);
+    let mut digest = Sha256::new();
+    let mut bytes = 0;
+    let mut observe = |record: &[u8]| {
+        bytes += record.len() as u64;
+        if bytes <= MAX_REJECTED_PREFIX_BYTES {
+            digest.update(record);
+            #[cfg(test)]
+            HASHED_CHILD_PREFIX_BYTES.with(|count| count.set(count.get() + record.len() as u64));
+        }
+    };
+    let Some(root) = read_record_with(&mut reader, &mut observe)? else {
+        return Ok(ChildInspection::Unavailable);
     };
     if meta_id(&root) != Some(child_id) {
         return Err("fork 复制验证的首条 child session_meta 身份不一致");
@@ -183,7 +280,15 @@ fn inspect_child(
     let mut starts_with_parent_meta = false;
     let mut saw_copied_meta = false;
     let mut line = 1i64;
-    while let Some(record) = read_record(&mut reader)? {
+    loop {
+        // Once the first copied record names the parent, this particular
+        // rejection is impossible. Larger valid copies need no prefix hash.
+        let record = if starts_with_parent_meta {
+            read_record(&mut reader)?
+        } else {
+            read_record_with(&mut reader, &mut observe)?
+        };
+        let Some(record) = record else { break };
         line = line.checked_add(1).ok_or("fork 复制历史行数溢出")?;
         if copied_ordinal_end.is_some()
             && record.get("ordinal").and_then(Value::as_u64) != Some((line - 1) as u64)
@@ -202,7 +307,16 @@ fn inspect_child(
         }
         if own_settings(&record, child_id) {
             if copied_records == 0 || !starts_with_parent_meta {
-                return Err("fork own-settings 前缺少可验证的父 session_meta 复制前缀");
+                if bytes > MAX_REJECTED_PREFIX_BYTES {
+                    return Err(MISSING_PARENT_PREFIX);
+                }
+                let prefix = RejectedChildPrefix::from_verified_prefix(
+                    stamp,
+                    bytes,
+                    digest.finalize().into(),
+                )
+                .ok_or(MISSING_PARENT_PREFIX)?;
+                return Ok(ChildInspection::MissingParentPrefix(prefix));
             }
             if copied_ordinal_end.is_some_and(|ordinal| ordinal != (line - 1) as u64) {
                 return Err("fork own-settings 与声明的 own-start ordinal 不一致");
@@ -213,7 +327,7 @@ fn inspect_child(
                 // turn ID is not immutable authority for the original copy.
                 return Err("fork 复制历史缺少显式 ordinal 快照边界；不能按内容相等推断继承");
             }
-            return Ok(Some(CandidateBoundary {
+            return Ok(ChildInspection::Boundary(CandidateBoundary {
                 copied_records,
                 marker_line: line,
                 copied_ordinal_end,
@@ -240,7 +354,7 @@ fn inspect_child(
     if saw_copied_meta || copied_ordinal_end.is_some() || parent_ordinal_end.is_some() {
         return Err("fork 已发布复制历史，但 child 初始化边界尚未完成；下轮重试");
     }
-    Ok(None)
+    Ok(ChildInspection::Unavailable)
 }
 
 fn compare_parent(
@@ -263,33 +377,19 @@ fn compare_parent(
     }
     let mut child_reader = BufReader::new((&mut child).take(complete_bytes));
     read_record(&mut child_reader)?.ok_or("fork child 首条记录在验证期间消失")?;
-    let mut child_prefix = Vec::with_capacity(
-        usize::try_from(boundary.copied_records).map_err(|_| "fork child 复制前缀过大")?,
-    );
-    for _ in 0..boundary.copied_records {
-        child_prefix
-            .push(read_record(&mut child_reader)?.ok_or("fork child 复制前缀在验证期间缩短")?);
+    let first_copied = read_record(&mut child_reader)?
+        .filter(|_| boundary.copied_records > 0)
+        .ok_or("fork child 复制前缀在验证期间缩短")?;
+    if meta_id(&first_copied) != Some(parent_id) {
+        return Err("fork 复制前缀含无法与 parent 对齐的 token usage；下轮重试");
     }
-    let marker = read_record(&mut child_reader)?.ok_or("fork child own-settings 边界消失")?;
-    if !own_settings(&marker, child_id) {
-        return Err("fork child own-settings 身份在验证期间变化");
-    }
-    if boundary
-        .copied_ordinal_end
-        .is_some_and(|expected| marker.get("ordinal").and_then(Value::as_u64) != Some(expected))
-    {
-        return Err("fork child own-settings ordinal 在验证期间变化");
-    }
+    drop(first_copied);
+    let mut remaining_child_records = boundary.copied_records - 1;
     let mut parent_reader = BufReader::new(&mut parent);
-    let mut parent_records = Vec::new();
-    while let Some(record) = read_record(&mut parent_reader)? {
-        parent_records.push(record);
-    }
-    let parent_root = parent_records
-        .first()
-        .ok_or("fork 父 rollout 缺少 canonical session_meta")?;
+    let parent_root =
+        read_record(&mut parent_reader)?.ok_or("fork 父 rollout 缺少 canonical session_meta")?;
     let parent_string = parent_id.hyphenated().to_string();
-    if meta_id(parent_root) != Some(parent_id)
+    if meta_id(&parent_root) != Some(parent_id)
         || (thread_id_from_filename(parent_path).as_deref() != Some(parent_string.as_str())
             && leading_thread_id_from_filename(parent_path).as_deref()
                 != Some(parent_string.as_str()))
@@ -320,26 +420,55 @@ fn compare_parent(
         return Err("fork 父 rollout 含引用历史，不能推断为完整物理复制前缀");
     }
 
-    if child_prefix
-        .first()
-        .is_none_or(|record| meta_id(record) != Some(parent_id))
-        || !token_usage_subsequence(&child_prefix, &parent_records)
-    {
-        return Err("fork 复制前缀含无法与 parent 对齐的 token usage；下轮重试");
-    }
-    if let Some(expected) = boundary.parent_ordinal_end {
-        let expected = usize::try_from(expected).map_err(|_| "fork 父复制前缀 ordinal 边界过大")?;
-        if parent_records.len() < expected
-            || parent_records
-                .iter()
-                .take(expected)
-                .enumerate()
-                .any(|(offset, record)| {
-                    record.get("ordinal").and_then(Value::as_u64) != Some(offset as u64)
-                })
+    // The matching state contains one child signature and one parent record.
+    // Keep validating the parent tail even after every child token matched.
+    let mut pending_child_usage =
+        next_child_usage(&mut child_reader, &mut remaining_child_records)?;
+    let mut parent_count = 0u64;
+    let mut parent_record = Some(parent_root);
+    while let Some(record) = parent_record {
+        if boundary
+            .parent_ordinal_end
+            .is_some_and(|end| parent_count < end)
+            && record.get("ordinal").and_then(Value::as_u64) != Some(parent_count)
         {
             return Err("fork 父复制前缀 ordinal 不连续或缺失");
         }
+        parent_count = parent_count
+            .checked_add(1)
+            .ok_or("fork 父复制前缀 ordinal 边界过大")?;
+        if pending_child_usage
+            .as_ref()
+            .is_some_and(|child_usage| token_usage_signature(&record) == Some(child_usage))
+        {
+            pending_child_usage =
+                next_child_usage(&mut child_reader, &mut remaining_child_records)?;
+        }
+        parent_record = read_record(&mut parent_reader)?;
+    }
+    // Complete the child's validation even when a token could not be matched.
+    while remaining_child_records > 0 {
+        read_record(&mut child_reader)?.ok_or("fork child 复制前缀在验证期间缩短")?;
+        remaining_child_records -= 1;
+    }
+    let marker = read_record(&mut child_reader)?.ok_or("fork child own-settings 边界消失")?;
+    if !own_settings(&marker, child_id) {
+        return Err("fork child own-settings 身份在验证期间变化");
+    }
+    if boundary
+        .copied_ordinal_end
+        .is_some_and(|expected| marker.get("ordinal").and_then(Value::as_u64) != Some(expected))
+    {
+        return Err("fork child own-settings ordinal 在验证期间变化");
+    }
+    if pending_child_usage.is_some() {
+        return Err("fork 复制前缀含无法与 parent 对齐的 token usage；下轮重试");
+    }
+    if boundary
+        .parent_ordinal_end
+        .is_some_and(|end| parent_count < end)
+    {
+        return Err("fork 父复制前缀 ordinal 不连续或缺失");
     }
     drop(parent_reader);
     drop(child_reader);
@@ -396,14 +525,23 @@ pub(super) fn certify_copied_rollout(
     if complete_bytes > child_before.size {
         return Ok(deferred("fork child 尚未发布请求的完整记录边界"));
     }
-    let boundary = match inspect_child(&mut child, complete_bytes, child_id, parent_id) {
-        Ok(Some(boundary)) => boundary,
-        Ok(None) => {
+    let boundary = match inspect_child(
+        &mut child,
+        complete_bytes,
+        child_id,
+        parent_id,
+        child_before,
+    ) {
+        Ok(ChildInspection::Boundary(boundary)) => boundary,
+        Ok(inspection) => {
             if !ParentFileStamp::from_file(&child)
                 .is_some_and(|current| stamp_unchanged_or_grew(current, child_before))
                 || !path_still_names(child_path, child_before)
             {
                 return Ok(deferred("fork child 在复制前缀验证期间变化；下轮重试"));
+            }
+            if let ChildInspection::MissingParentPrefix(prefix) = inspection {
+                return Ok(CopiedForkProof::MissingParentPrefix(prefix));
             }
             return Ok(CopiedForkProof::Unavailable);
         }
@@ -563,6 +701,160 @@ mod tests {
             Some(expected),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn copied_parent_comparison_streams_one_child_token_ahead() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        for token_count in [3, 32] {
+            let mut parent = vec![meta(PARENT, None)];
+            for offset in 0..token_count {
+                let mut usage = token();
+                usage["payload"]["info"]["total_token_usage"]["input_tokens"] = json!(offset + 1);
+                parent.push(usage);
+                parent.push(json!({
+                    "type": "response_item", "timestamp": "2026-10-20T00:00:01Z",
+                    "payload": {"text": "x".repeat(64 * 1024)}
+                }));
+            }
+            let (_directory, child, index) = fixture(&parent, &parent);
+            rewrite(&child, |records| {
+                for record in records.iter_mut().skip(1).take(parent.len()) {
+                    record["timestamp"] = json!("2026-10-21T00:00:00Z");
+                }
+            });
+            // Child tokens must be consumed alongside parent tokens. Retaining
+            // either whole history before matching grows this gap with input.
+            let observed = Rc::new(RefCell::new((0usize, 0usize, 0usize, 0usize)));
+            let observer_state = observed.clone();
+            PROOF_RECORD_OBSERVER.with(|observer| {
+                *observer.borrow_mut() = Some(Box::new(move |record| {
+                    let mut state = observer_state.borrow_mut();
+                    state.3 += 1;
+                    if token_usage_signature(record).is_some() {
+                        if record["timestamp"] == "2026-10-21T00:00:00Z" {
+                            state.0 += 1;
+                        } else {
+                            state.1 += 1;
+                        }
+                        state.2 = state.2.max(state.0.saturating_sub(state.1));
+                    }
+                }));
+            });
+            let stamp = ParentFileStamp::from_file(&File::open(&child).unwrap()).unwrap();
+            let boundary = CandidateBoundary {
+                copied_records: parent.len() as u64,
+                marker_line: parent.len() as i64 + 2,
+                copied_ordinal_end: Some(parent.len() as u64 + 1),
+                parent_ordinal_end: Some(parent.len() as u64),
+            };
+            let result = compare_parent(
+                &child,
+                stamp.size,
+                stamp,
+                &index[PARENT][0],
+                uuid::Uuid::parse_str(CHILD).unwrap(),
+                uuid::Uuid::parse_str(PARENT).unwrap(),
+                &boundary,
+            );
+            PROOF_RECORD_OBSERVER.with(|observer| observer.borrow_mut().take());
+            result.unwrap();
+            let (children, parents, peak_ahead, records_read) = *observed.borrow();
+            assert_eq!(children, token_count);
+            assert_eq!(parents, token_count);
+            assert_eq!(peak_ahead, 1, "copied history must remain streaming");
+            assert_eq!(records_read, parent.len() * 2 + 2);
+        }
+    }
+
+    #[test]
+    fn streaming_token_match_preserves_order_and_duplicate_multiplicity() {
+        let usage = |input| {
+            let mut record = token();
+            record["payload"]["info"]["total_token_usage"]["input_tokens"] = json!(input);
+            record
+        };
+        for (parent_totals, child_totals, matches) in [
+            (vec![1, 2, 1], vec![1, 1], true),
+            (vec![1, 2, 3], vec![1, 3], true),
+            (vec![1, 2], vec![2, 1], false),
+            (vec![1, 2], vec![1, 1], false),
+        ] {
+            let mut parent = vec![meta(PARENT, None)];
+            parent.extend(parent_totals.into_iter().map(usage));
+            let mut copied = vec![meta(PARENT, None)];
+            copied.extend(child_totals.into_iter().map(usage));
+            let (_directory, child, index) = fixture(&parent, &copied);
+            assert_eq!(
+                matches!(proof(&child, &index), CopiedForkProof::Verified { .. }),
+                matches
+            );
+        }
+    }
+
+    #[test]
+    fn matched_child_usage_still_validates_the_remaining_parent_records() {
+        let parent = vec![meta(PARENT, None), token()];
+        let (_directory, child, index) = fixture(&parent, &parent);
+        let mut file = File::options()
+            .append(true)
+            .open(&index[PARENT][0])
+            .unwrap();
+        file.write_all(b"{invalid-json}\n").unwrap();
+        drop(file);
+        assert!(matches!(
+            proof(&child, &index),
+            CopiedForkProof::Deferred(_)
+        ));
+    }
+
+    #[test]
+    fn rejected_prefix_rechecks_bounded_bytes_across_appends_and_rejects_changed_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("prefix.jsonl");
+        let prefix = b"accepted root metadata\n";
+        let mut contents = prefix.to_vec();
+        contents.extend_from_slice(b"original tail\n");
+        fs::write(&path, &contents).unwrap();
+        let stamp = ParentFileStamp::from_file(&File::open(&path).unwrap()).unwrap();
+        let witness = RejectedChildPrefix::from_verified_prefix(
+            stamp,
+            prefix.len() as u64,
+            Sha256::digest(prefix).into(),
+        )
+        .unwrap();
+        RECHECKED_CHILD_BYTES.with(|bytes| bytes.set(0));
+        assert!(witness.still_matches(&path));
+        File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&vec![b'x'; 256 * 1024])
+            .unwrap();
+        assert!(witness.still_matches(&path));
+        RECHECKED_CHILD_BYTES.with(|bytes| assert_eq!(bytes.get(), prefix.len() as u64 * 2));
+
+        let mut changed = fs::read(&path).unwrap();
+        changed[0] = b'X';
+        fs::write(&path, &changed).unwrap();
+        assert!(!witness.still_matches(&path));
+        fs::write(&path, prefix).unwrap();
+        assert!(
+            !witness.still_matches(&path),
+            "a truncated generation must be reconsidered"
+        );
+        fs::rename(&path, directory.path().join("old-prefix.jsonl")).unwrap();
+        fs::write(&path, &contents).unwrap();
+        assert!(
+            !witness.still_matches(&path),
+            "native file identity must still match"
+        );
+        assert!(RejectedChildPrefix::from_verified_prefix(stamp, 0, [0; 32]).is_none());
+        assert!(
+            RejectedChildPrefix::from_verified_prefix(stamp, stamp.size + 1, [0; 32]).is_none()
+        );
     }
 
     #[test]
@@ -889,6 +1181,28 @@ mod tests {
             matches!(result, CopiedForkProof::Deferred(_)),
             "ambiguous copied metadata must not escape to legacy resolution: {result:?}"
         );
+    }
+
+    #[test]
+    fn legacy_fork_without_copy_keeps_optional_prefix_hash_bounded() {
+        let parent = vec![meta(PARENT, None)];
+        let (_dir, child, index) = fixture(&parent, &parent);
+        let mut records = vec![meta(CHILD, Some(PARENT))];
+        let block = json!({
+            "type": "response_item", "timestamp": "2026-10-20T00:00:01Z",
+            "payload": {"text": "x".repeat(256 * 1024)}
+        });
+        records.extend(vec![block; 8]);
+        write(&child, &records);
+        HASHED_CHILD_PREFIX_BYTES.with(|bytes| bytes.set(0));
+        assert_eq!(proof(&child, &index), CopiedForkProof::Unavailable);
+        HASHED_CHILD_PREFIX_BYTES.with(|bytes| {
+            assert!((1..=MAX_REJECTED_PREFIX_BYTES).contains(&bytes.get()));
+        });
+
+        records.push(marker());
+        write(&child, &records);
+        assert_eq!(proof(&child, &index), deferred(MISSING_PARENT_PREFIX));
     }
 
     #[test]

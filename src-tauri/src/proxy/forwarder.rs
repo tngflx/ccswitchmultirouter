@@ -53,10 +53,11 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http::{Extensions, StatusCode};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::Manager;
 use tokio::sync::{OwnedSemaphorePermit, RwLock};
@@ -221,30 +222,36 @@ fn client_request_body_bytes(extensions: &Extensions, body: &Value) -> usize {
 /// Owns one finalized upstream entity. Every ordinary send and replay clones
 /// these already-finalized bytes; no retry path reserializes request history.
 #[derive(Clone, Debug)]
-struct FinalizedRequestPayload {
+pub(super) struct FinalizedRequestPayload {
     client_json_bytes: usize,
-    transformed_json: Arc<[u8]>,
-    wire_body: Arc<[u8]>,
+    transformed_json: Bytes,
+    wire_body: Bytes,
+    wire_hash: Arc<OnceLock<String>>,
+    #[cfg(test)]
+    wire_hash_computations: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FinalizedRequestPayload {
-    fn from_transformed_json(
+    pub(super) fn from_transformed_json(
         client_json_bytes: usize,
         transformed_json: Vec<u8>,
         headers: &mut http::HeaderMap,
         zstd_enabled: bool,
     ) -> Result<Self, ProxyError> {
-        let transformed_json_copy = Arc::from(transformed_json.clone());
+        let transformed_json = Bytes::from(transformed_json);
         let wire_body =
-            encode_codex_official_upstream_body(headers, transformed_json, zstd_enabled)?;
+            encode_codex_official_upstream_body(headers, &transformed_json, zstd_enabled)?;
         Ok(Self {
             client_json_bytes,
-            transformed_json: transformed_json_copy,
-            wire_body: Arc::from(wire_body),
+            transformed_json,
+            wire_body,
+            wire_hash: Arc::default(),
+            #[cfg(test)]
+            wire_hash_computations: Arc::default(),
         })
     }
 
-    fn transformed_json(&self) -> &[u8] {
+    pub(super) fn transformed_json(&self) -> &[u8] {
         self.transformed_json.as_ref()
     }
 
@@ -256,16 +263,21 @@ impl FinalizedRequestPayload {
         self.wire_body.as_ref()
     }
 
-    fn replay_body(&self) -> Vec<u8> {
-        self.wire_body.to_vec()
+    fn replay_body(&self) -> Bytes {
+        self.wire_body.clone()
     }
 
-    fn wire_len(&self) -> usize {
+    pub(super) fn wire_len(&self) -> usize {
         self.wire_body.len()
     }
 
-    fn wire_hash(&self) -> String {
-        super::request_health::wire_body_hash(self.wire_body())
+    pub(super) fn wire_hash(&self) -> &str {
+        self.wire_hash.get_or_init(|| {
+            #[cfg(test)]
+            self.wire_hash_computations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::request_health::wire_body_hash(self.wire_body())
+        })
     }
 }
 
@@ -296,7 +308,7 @@ fn append_request_body_accounting_event(
                 "upstream_wire_request_bytes",
                 payload.wire_len().to_string(),
             ),
-            ("wire_body_hash", payload.wire_hash()),
+            ("wire_body_hash", payload.wire_hash().to_owned()),
         ],
     );
 }
@@ -789,10 +801,11 @@ impl RequestForwarder {
                 .get("model")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let mut mapped_body = body.clone();
-            let upstream_model =
-                super::providers::apply_codex_upstream_model(provider, &mut mapped_body)
-                    .unwrap_or_else(|| public_model.to_string());
+            let upstream_model = super::providers::resolve_codex_upstream_model(
+                provider,
+                body.get("model").and_then(Value::as_str),
+            )
+            .unwrap_or_else(|| public_model.to_string());
             super::providers::apply_detected_codex_transport_to_effective_provider(
                 &mut effective_provider,
                 public_model,
@@ -832,10 +845,11 @@ impl RequestForwarder {
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let mut mapped_body = body.clone();
-        let upstream_model =
-            super::providers::apply_codex_upstream_model(&effective_provider, &mut mapped_body)
-                .unwrap_or_else(|| public_model.to_string());
+        let upstream_model = super::providers::resolve_codex_upstream_model(
+            &effective_provider,
+            body.get("model").and_then(Value::as_str),
+        )
+        .unwrap_or_else(|| public_model.to_string());
         if validate_api_capability {
             super::providers::validate_codex_provider_api_capability(
                 &effective_provider,
@@ -1868,21 +1882,8 @@ impl RequestForwarder {
                 }
             };
 
-            // PRE-SEND 优化器：每个 provider 独立决定是否优化
-            // clone body 以避免 Bedrock 优化字段泄漏到非 Bedrock provider（failover 场景）
             let mut provider_body =
-                if self.optimizer_config.enabled && is_bedrock_provider(provider) {
-                    let mut b = body.clone();
-                    if self.optimizer_config.thinking_optimizer {
-                        super::thinking_optimizer::optimize(&mut b, &self.optimizer_config);
-                    }
-                    if self.optimizer_config.cache_injection {
-                        super::cache_injector::inject(&mut b, &self.optimizer_config);
-                    }
-                    b
-                } else {
-                    body.clone()
-                };
+                prepare_provider_attempt_body(&body, provider, &self.optimizer_config);
 
             attempted_providers += 1;
 
@@ -1999,7 +2000,7 @@ impl RequestForwarder {
                         &provider_body,
                         &e,
                     ) {
-                        let mut media_body = provider_body.clone();
+                        let mut media_body = provider_body.as_ref().clone();
                         let replaced_images =
                             super::media_sanitizer::replace_image_blocks_with_marker(
                                 &mut media_body,
@@ -2153,7 +2154,7 @@ impl RequestForwarder {
                             }
 
                             // 首次触发：整流请求体
-                            let rectified = rectify_anthropic_request(&mut provider_body);
+                            let rectified = rectify_anthropic_request(provider_body.to_mut());
 
                             // 整流未生效：继续尝试 budget 整流路径，避免误判后短路
                             if !rectified.applied {
@@ -2316,7 +2317,7 @@ impl RequestForwarder {
                                 });
                             }
 
-                            let budget_rectified = rectify_thinking_budget(&mut provider_body);
+                            let budget_rectified = rectify_thinking_budget(provider_body.to_mut());
                             if !budget_rectified.applied {
                                 log::warn!(
                                     "[{app_type_str}] [RECT-014] budget 整流器触发但无可整流内容，不做无意义重试"
@@ -4345,26 +4346,31 @@ impl RequestForwarder {
 
         let request_health_config = crate::settings::get_settings().request_health;
         let request_health_app_type = format!("{app_type:?}").to_ascii_lowercase();
-        let request_health_diagnostic = super::request_health::inspect_and_optimize(
-            &mut filtered_body,
-            &request_health_config,
-            super::request_health::RequestHealthContext {
-                trace_id: codex_trace_id.as_deref(),
-                session_id: &self.session_id,
-                app_type: &request_health_app_type,
-                provider_id: &provider.id,
-                provider_name: &provider.name,
-                model: outbound_model
-                    .as_deref()
-                    .unwrap_or(request_model_for_log.as_str()),
-                endpoint: &effective_endpoint,
-                wire_responses: url::Url::parse(&url)
-                    .is_ok_and(|url| url.path().ends_with("/responses")),
-                client_request_bytes,
-                compaction_request: codex_request_metadata.request_kind == "compaction",
-                session_client_provided: self.session_client_provided,
-            },
-        );
+        let serialize_request_error =
+            |error| ProxyError::Internal(format!("Failed to serialize request body: {error}"));
+        let (request_health_diagnostic, transformed_json) =
+            super::request_health::prepare_request_json(
+                method,
+                &mut filtered_body,
+                &request_health_config,
+                super::request_health::RequestHealthContext {
+                    trace_id: codex_trace_id.as_deref(),
+                    session_id: &self.session_id,
+                    app_type: &request_health_app_type,
+                    provider_id: &provider.id,
+                    provider_name: &provider.name,
+                    model: outbound_model
+                        .as_deref()
+                        .unwrap_or(request_model_for_log.as_str()),
+                    endpoint: &effective_endpoint,
+                    wire_responses: url::Url::parse(&url)
+                        .is_ok_and(|url| url.path().ends_with("/responses")),
+                    client_request_bytes,
+                    compaction_request: codex_request_metadata.request_kind == "compaction",
+                    session_client_provided: self.session_client_provided,
+                },
+            )
+            .map_err(serialize_request_error)?;
         if let (Some(trace_id), Some(diagnostic)) = (
             codex_trace_id.as_deref(),
             request_health_diagnostic.as_ref(),
@@ -4443,17 +4449,6 @@ impl RequestForwarder {
             );
         }
 
-        // GET/HEAD are idempotent/safe methods and must not carry the JSON body
-        // used for routing. For every other method, serialize exactly once after
-        // the final provider/request-health mutation.
-        let transformed_json = if matches!(method, &http::Method::GET | &http::Method::HEAD) {
-            Vec::new()
-        } else {
-            serde_json::to_vec(&filtered_body).map_err(|error| {
-                ProxyError::Internal(format!("Failed to serialize request body: {error}"))
-            })?
-        };
-
         let zstd_compress_codex_official_upstream = should_zstd_compress_codex_official_upstream(
             app_type,
             method,
@@ -4499,8 +4494,7 @@ impl RequestForwarder {
                 outbound_model
                     .as_deref()
                     .unwrap_or(request_model_for_log.as_str()),
-                payload.transformed_json(),
-                payload.wire_body(),
+                &payload,
                 &review_dispatch_scope,
                 codex_request_metadata.request_kind == "compaction",
             )
@@ -4514,7 +4508,7 @@ impl RequestForwarder {
                             ("trace", trace_id.to_string()),
                             ("session", self.session_id.clone()),
                             ("provider", provider.id.clone()),
-                            ("wire_body_hash", payload.wire_hash()),
+                            ("wire_body_hash", payload.wire_hash().to_owned()),
                             ("client_request_bytes", client_request_bytes.to_string()),
                             (
                                 "diagnostic_request_bytes",
@@ -4550,7 +4544,7 @@ impl RequestForwarder {
                             ("trace", trace_id.to_string()),
                             ("session", self.session_id.clone()),
                             ("provider", provider.id.clone()),
-                            ("wire_body_hash", payload.wire_hash()),
+                            ("wire_body_hash", payload.wire_hash().to_owned()),
                         ],
                     );
                 }
@@ -4635,7 +4629,7 @@ impl RequestForwarder {
                             ("trace", trace_id.to_string()),
                             ("session", self.session_id.clone()),
                             ("provider", provider.id.clone()),
-                            ("wire_body_hash", payload.wire_hash()),
+                            ("wire_body_hash", payload.wire_hash().to_owned()),
                         ],
                     );
                 }
@@ -4876,7 +4870,7 @@ impl RequestForwarder {
 
         // 发送请求。默认保留 Codex Responses-Lite 协商头；只有上游明确返回
         // Lite 不支持错误时，才在错误响应体读取后剥头重发一次。
-        let send_upstream_request = |headers: http::HeaderMap, body_bytes: Vec<u8>| {
+        let send_upstream_request = |headers: http::HeaderMap, body_bytes: Bytes| {
             let method = method.clone();
             let url = url.clone();
             let extensions = extensions.clone();
@@ -5019,7 +5013,13 @@ impl RequestForwarder {
                     super::providers::openai_compat::normalize_codex_responses_lite_fallback_request(
                         filtered_body.clone(),
                     );
-                super::request_health::inspect_and_optimize(
+                let serialize_fallback_error = |error| {
+                    ProxyError::Internal(format!(
+                        "Failed to serialize Responses-Lite fallback body: {error}"
+                    ))
+                };
+                let (_, retry_body_bytes) = super::request_health::prepare_request_json(
+                    method,
                     &mut retry_body,
                     &request_health_config,
                     super::request_health::RequestHealthContext {
@@ -5036,12 +5036,8 @@ impl RequestForwarder {
                         compaction_request: codex_request_metadata.request_kind == "compaction",
                         session_client_provided: self.session_client_provided,
                     },
-                );
-                let retry_body_bytes = serde_json::to_vec(&retry_body).map_err(|error| {
-                    ProxyError::Internal(format!(
-                        "Failed to serialize Responses-Lite fallback body: {error}"
-                    ))
-                })?;
+                )
+                .map_err(serialize_fallback_error)?;
                 let retry_payload = FinalizedRequestPayload::from_transformed_json(
                     client_request_bytes,
                     retry_body_bytes,
@@ -5264,7 +5260,7 @@ impl RequestForwarder {
                                 target_for_log,
                                 headers,
                                 extensions,
-                                body_bytes,
+                                body_bytes.into(),
                                 timeout,
                                 true,
                                 non_streaming_timeout,
@@ -5299,6 +5295,7 @@ impl RequestForwarder {
                                 Box::pin(response.bytes_stream()),
                                 Some(reconnector),
                                 Some(StreamLogContext {
+                                    request_trace: self.request_health_trace.clone(),
                                     session_id: self.session_id.clone(),
                                     model: request_model_for_log.clone(),
                                     provider_id: provider.id.clone(),
@@ -5366,7 +5363,7 @@ impl RequestForwarder {
                                         ],
                                     );
                                 }
-                                let send = send_upstream_request(headers, body_bytes);
+                                let send = send_upstream_request(headers, body_bytes.into());
                                 send.await
                             }
                         },
@@ -5804,7 +5801,7 @@ impl RequestForwarder {
         } else {
             "hyper"
         };
-        let body_bytes = request_body.to_vec();
+        let body_bytes = request_body;
         let request_bytes_len = body_bytes.len();
         let upstream_started_at = std::time::Instant::now();
 
@@ -6358,8 +6355,7 @@ impl RequestForwarder {
         let headers = response.headers().clone();
         let mut stream = Box::pin(response.bytes_stream());
         let mut replay_chunks: Vec<Bytes> = Vec::new();
-        let mut parse_buffer = String::new();
-        let mut utf8_remainder = Vec::new();
+        let mut inspection = ResponsesStreamStartInspection::default();
 
         loop {
             let next_result = async {
@@ -6390,46 +6386,31 @@ impl RequestForwarder {
             };
 
             let Some(chunk) = next else {
-                if let Some(outcome) = inspect_responses_json_document(&parse_buffer) {
+                if let Some(outcome) = inspection.finish() {
                     outcome?;
                     let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
                     return Ok(ProxyResponse::streamed(status, headers, replay));
-                }
-                if !parse_buffer.trim().is_empty() {
-                    if let Some(outcome) = inspect_responses_start_event(parse_buffer.trim()) {
-                        outcome?;
-                        let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
-                        return Ok(ProxyResponse::streamed(status, headers, replay));
-                    }
                 }
                 return Err(ProxyError::ForwardFailed(
                     "Responses stream ended before producing output or a terminal event"
                         .to_string(),
                 ));
             };
-            crate::proxy::sse::append_utf8_safe(&mut parse_buffer, &mut utf8_remainder, &chunk);
+            let outcome = inspection.push(&chunk);
+            // Replay original transport bytes, not the inspection projection.
+            #[cfg(test)]
+            {
+                inspection.replay_appends += 1;
+                inspection.replay_bytes += chunk.len();
+            }
             replay_chunks.push(chunk);
-
-            // Some compatible gateways ignore `stream:true` and return a complete
-            // Responses JSON document without a JSON content-type. Recognize that
-            // shape before looking for SSE delimiters; pretty-printed JSON may itself
-            // contain blank lines and must stay intact.
-            if let Some(outcome) = inspect_responses_json_document(&parse_buffer) {
+            if let Some(outcome) = outcome {
                 outcome?;
                 let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
                 return Ok(ProxyResponse::streamed(status, headers, replay));
             }
 
-            while let Some(block) = crate::proxy::sse::take_sse_block(&mut parse_buffer) {
-                if let Some(outcome) = inspect_responses_start_event(&block) {
-                    outcome?;
-                    let replay =
-                        futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
-                    return Ok(ProxyResponse::streamed(status, headers, replay));
-                }
-            }
-
-            if replay_chunks.iter().map(Bytes::len).sum::<usize>() >= MAX_PRIME_BYTES {
+            if inspection.received_bytes >= MAX_PRIME_BYTES {
                 log::warn!(
                     "[Claude/Responses] semantic stream priming exceeded {MAX_PRIME_BYTES} bytes; committing buffered stream"
                 );
@@ -6696,6 +6677,24 @@ fn is_bedrock_provider(provider: &Provider) -> bool {
         .and_then(|v| v.as_str())
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+/// Share the original history until a provider-specific optimizer or retry needs to edit it.
+fn prepare_provider_attempt_body<'a>(
+    body: &'a Value,
+    provider: &Provider,
+    config: &OptimizerConfig,
+) -> Cow<'a, Value> {
+    let mut attempt = Cow::Borrowed(body);
+    if config.enabled && is_bedrock_provider(provider) {
+        if config.thinking_optimizer {
+            super::thinking_optimizer::optimize(attempt.to_mut(), config);
+        }
+        if config.cache_injection {
+            super::cache_injector::inject(attempt.to_mut(), config);
+        }
+    }
+    attempt
 }
 
 fn build_retryable_failure_log(
@@ -7029,13 +7028,17 @@ fn codex_anthropic_error_envelope_message(body: &[u8]) -> Option<String> {
 
 fn responses_error_envelope_message(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
+    responses_error_envelope_value_message(&value)
+}
+
+fn responses_error_envelope_value_message(value: &Value) -> Option<String> {
     let status = value.get("status").and_then(Value::as_str);
     let has_error = value.get("error").is_some_and(|error| !error.is_null());
     if !matches!(status, Some("failed" | "cancelled")) && !has_error {
         return None;
     }
 
-    let error = value.get("error").unwrap_or(&value);
+    let error = value.get("error").unwrap_or(value);
     let error_type = error
         .get("type")
         .and_then(Value::as_str)
@@ -7066,6 +7069,213 @@ fn codex_anthropic_cache_config(config: &OptimizerConfig) -> OptimizerConfig {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ResponsesPrimingWork {
+    scanned_bytes: usize,
+    json_parse_bytes: usize,
+    json_parses: usize,
+    sse_json_parse_bytes: usize,
+    sse_json_parses: usize,
+    frame_bytes: usize,
+    replay_accounting_steps: usize,
+    replay_appends: usize,
+    replay_bytes: usize,
+    peak_pending_bytes: usize,
+    finished_inspectors: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESPONSES_PRIMING_WORK: std::cell::RefCell<ResponsesPrimingWork> =
+        std::cell::RefCell::new(ResponsesPrimingWork::default());
+}
+
+#[derive(Default)]
+enum ResponsesPrimingProtocol {
+    #[default]
+    Unknown,
+    Json,
+    Sse,
+}
+
+/// Inspect only newly received bytes. JSON is parsed after its outer container
+/// closes (or once at EOF); SSE is parsed once per complete frame. In particular,
+/// blank lines inside a pretty-printed JSON response are not SSE delimiters.
+#[derive(Default)]
+struct ResponsesStreamStartInspection {
+    protocol: ResponsesPrimingProtocol,
+    pending: Vec<u8>,
+    leading_utf8: Vec<u8>,
+    tail: u32,
+    json_depth: usize,
+    json_string: bool,
+    json_escape: bool,
+    json_closed: bool,
+    json_inspected: bool,
+    received_bytes: usize,
+    #[cfg(test)]
+    scanned_bytes: usize,
+    #[cfg(test)]
+    json_bytes: usize,
+    #[cfg(test)]
+    frame_bytes: usize,
+    #[cfg(test)]
+    replay_accounting_steps: usize,
+    #[cfg(test)]
+    peak_pending_bytes: usize,
+    #[cfg(test)]
+    replay_appends: usize,
+    #[cfg(test)]
+    replay_bytes: usize,
+}
+
+#[cfg(test)]
+impl Drop for ResponsesStreamStartInspection {
+    fn drop(&mut self) {
+        RESPONSES_PRIMING_WORK.with(|work| {
+            let mut work = work.borrow_mut();
+            work.scanned_bytes += self.scanned_bytes;
+            work.frame_bytes += self.frame_bytes;
+            work.replay_accounting_steps += self.replay_accounting_steps;
+            work.replay_appends += self.replay_appends;
+            work.replay_bytes += self.replay_bytes;
+            work.peak_pending_bytes = work.peak_pending_bytes.max(self.peak_pending_bytes);
+            work.finished_inspectors += 1;
+        });
+    }
+}
+
+impl ResponsesStreamStartInspection {
+    fn select_protocol(&mut self, byte: u8) {
+        if self.leading_utf8.is_empty() && byte.is_ascii() {
+            if !byte.is_ascii_whitespace() {
+                self.protocol = if matches!(byte, b'{' | b'[') {
+                    ResponsesPrimingProtocol::Json
+                } else {
+                    ResponsesPrimingProtocol::Sse
+                };
+            }
+            return;
+        }
+        // Match str::trim's leading Unicode whitespace without rescanning an
+        // arbitrarily long whitespace prefix or misclassifying split UTF-8.
+        self.leading_utf8.push(byte);
+        match std::str::from_utf8(&self.leading_utf8) {
+            Ok(text) => {
+                if !text.chars().all(char::is_whitespace) {
+                    self.protocol = ResponsesPrimingProtocol::Sse;
+                }
+                self.leading_utf8.clear();
+            }
+            Err(error) if error.error_len().is_none() && self.leading_utf8.len() < 4 => {}
+            Err(_) => self.protocol = ResponsesPrimingProtocol::Sse,
+        }
+    }
+
+    fn inspect_pending(&mut self, json: bool, eof: bool) -> Option<Result<(), ProxyError>> {
+        // Preserve the existing inspection-only UTF-8 policy, including a final
+        // incomplete code point. Original bytes are retained separately for replay.
+        let mut text = String::new();
+        let mut remainder = Vec::new();
+        crate::proxy::sse::append_utf8_safe(&mut text, &mut remainder, &self.pending);
+        if json {
+            self.json_inspected = true;
+            #[cfg(test)]
+            {
+                self.json_bytes += self.pending.len();
+            }
+            inspect_responses_json_document(&text)
+        } else {
+            #[cfg(test)]
+            {
+                self.frame_bytes += self.pending.len();
+            }
+            inspect_responses_start_event(if eof { text.trim() } else { &text })
+        }
+    }
+
+    fn push(&mut self, input: &[u8]) -> Option<Result<(), ProxyError>> {
+        self.received_bytes = self.received_bytes.saturating_add(input.len());
+        #[cfg(test)]
+        {
+            self.replay_accounting_steps += 1;
+        }
+        for &byte in input {
+            #[cfg(test)]
+            {
+                self.scanned_bytes += 1;
+            }
+            self.pending.push(byte);
+            #[cfg(test)]
+            {
+                self.peak_pending_bytes = self.peak_pending_bytes.max(self.pending.len());
+            }
+            self.tail = (self.tail << 8) | u32::from(byte);
+            if matches!(self.protocol, ResponsesPrimingProtocol::Unknown) {
+                self.select_protocol(byte);
+            }
+            match self.protocol {
+                ResponsesPrimingProtocol::Unknown => {}
+                ResponsesPrimingProtocol::Json => {
+                    if self.json_closed {
+                        continue;
+                    }
+                    if self.json_string {
+                        if self.json_escape {
+                            self.json_escape = false;
+                        } else if byte == b'\\' {
+                            self.json_escape = true;
+                        } else if byte == b'"' {
+                            self.json_string = false;
+                        }
+                    } else {
+                        match byte {
+                            b'"' => self.json_string = true,
+                            b'{' | b'[' => self.json_depth += 1,
+                            b'}' | b']' => {
+                                self.json_depth = self.json_depth.saturating_sub(1);
+                                self.json_closed = self.json_depth == 0;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ResponsesPrimingProtocol::Sse => {
+                    if self.tail & 0xffff == 0x0a0a || self.tail == 0x0d0a0d0a {
+                        let outcome = self.inspect_pending(false, false);
+                        // Clear only the completed frame: never drain/shift the
+                        // remainder of a large chunk for every lifecycle event.
+                        self.pending.clear();
+                        self.tail = 0;
+                        if outcome.is_some() {
+                            return outcome;
+                        }
+                    }
+                }
+            }
+        }
+        // Inspect the whole transport chunk, as before: trailing junk received
+        // alongside the root close must not turn an invalid document into success.
+        if self.json_closed && !self.json_inspected {
+            return self.inspect_pending(true, false);
+        }
+        None
+    }
+
+    fn finish(&mut self) -> Option<Result<(), ProxyError>> {
+        match self.protocol {
+            ResponsesPrimingProtocol::Json if !self.json_inspected => {
+                self.inspect_pending(true, true)
+            }
+            ResponsesPrimingProtocol::Sse if !self.pending.is_empty() => {
+                self.inspect_pending(false, true)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// A streaming request may receive a whole JSON document even when the gateway
 /// omits `application/json`. `None` means either "not JSON" or "not complete yet";
 /// a parsed document is safe to commit unless it is a semantic failure envelope.
@@ -7074,8 +7284,14 @@ fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError
     if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
         return None;
     }
-    let _: Value = serde_json::from_str(trimmed).ok()?;
-    if let Some(message) = responses_error_envelope_message(trimmed.as_bytes()) {
+    #[cfg(test)]
+    RESPONSES_PRIMING_WORK.with(|work| {
+        let mut work = work.borrow_mut();
+        work.json_parse_bytes += trimmed.len();
+        work.json_parses += 1;
+    });
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    if let Some(message) = responses_error_envelope_value_message(&value) {
         return Some(Err(ProxyError::TransformError(format!(
             "Responses upstream returned a 2xx failure: {message}"
         ))));
@@ -7099,7 +7315,14 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
     if data_lines.is_empty() {
         return None;
     }
-    let value: Value = match serde_json::from_str(&data_lines.join("\n")) {
+    let data = data_lines.join("\n");
+    #[cfg(test)]
+    RESPONSES_PRIMING_WORK.with(|work| {
+        let mut work = work.borrow_mut();
+        work.sse_json_parse_bytes += data.len();
+        work.sse_json_parses += 1;
+    });
+    let value: Value = match serde_json::from_str(&data) {
         Ok(value) => value,
         Err(_) => return None,
     };
@@ -8007,7 +8230,7 @@ async fn send_forwarder_upstream_request(
     target_for_log: String,
     headers: http::HeaderMap,
     extensions: Extensions,
-    body_bytes: Vec<u8>,
+    body_bytes: Bytes,
     timeout: std::time::Duration,
     request_is_streaming: bool,
     non_streaming_timeout: std::time::Duration,
@@ -8044,7 +8267,7 @@ async fn send_forwarder_upstream_request_inner(
     target_for_log: String,
     headers: http::HeaderMap,
     extensions: Extensions,
-    body_bytes: Vec<u8>,
+    body_bytes: Bytes,
     timeout: std::time::Duration,
     request_is_streaming: bool,
     non_streaming_timeout: std::time::Duration,
@@ -9028,14 +9251,14 @@ fn should_zstd_compress_codex_official_upstream(
 /// body and `content-encoding` always describes the bytes actually sent.
 fn encode_codex_official_upstream_body(
     headers: &mut http::HeaderMap,
-    body: Vec<u8>,
+    body: &Bytes,
     enabled: bool,
-) -> Result<Vec<u8>, ProxyError> {
+) -> Result<Bytes, ProxyError> {
     if !enabled || body.is_empty() {
-        return Ok(body);
+        return Ok(body.clone());
     }
 
-    let encoded = zstd::stream::encode_all(std::io::Cursor::new(body), 0).map_err(|error| {
+    let encoded = zstd::stream::encode_all(body.as_ref(), 0).map_err(|error| {
         ProxyError::Internal(format!("Failed to compress request body: {error}"))
     })?;
     headers.insert(
@@ -9044,7 +9267,7 @@ fn encode_codex_official_upstream_body(
     );
     headers.remove(http::header::CONTENT_LENGTH);
     headers.remove(http::header::TRANSFER_ENCODING);
-    Ok(encoded)
+    Ok(Bytes::from(encoded))
 }
 
 /// 生成 Codex Responses->Chat 出站请求的脱敏形态摘要。
@@ -9856,6 +10079,110 @@ mod tests {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+        }
+    }
+
+    #[test]
+    fn provider_attempt_body_borrows_history_and_isolates_bedrock_on_failover() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "replayed history ".repeat(8192)}]
+        });
+        let ordinary = test_provider_with_type(None);
+        let mut bedrock = test_provider_with_type(None);
+        bedrock.settings_config = json!({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}});
+        let config = OptimizerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let optimized = prepare_provider_attempt_body(&body, &bedrock, &config);
+        assert_eq!(optimized["thinking"]["type"], "adaptive");
+        assert!(body.get("thinking").is_none());
+
+        let mut failover = prepare_provider_attempt_body(&body, &ordinary, &config);
+        assert!(std::ptr::eq(failover.as_ref(), &body));
+        failover.to_mut()["model"] = json!("retry-model");
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+        assert_eq!(optimized["model"], "claude-sonnet-4-6");
+        assert_model_projection_materialization_work_bounds();
+    }
+
+    fn assert_model_projection_materialization_work_bounds() {
+        use super::super::providers::CODEX_MODEL_RESOLUTION_INPUT;
+
+        for history_bytes in [1024, 1024 * 1024] {
+            for candidate_count in [2, 8] {
+                let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+                let direct = Provider::with_id(
+                    "projection-direct".to_string(),
+                    "Projection Direct".to_string(),
+                    json!({"model":"wire-direct", "apiFormat":"openai_responses", "base_url":"https://fixture.invalid/v1"}),
+                    None,
+                );
+                let target = Provider::with_id(
+                    "projection-target".to_string(),
+                    "Projection Target".to_string(),
+                    json!({"model":"wire-target", "apiFormat":"openai_responses", "base_url":"https://target.fixture.invalid/v1"}),
+                    None,
+                );
+                forwarder
+                    .router
+                    .database()
+                    .save_provider("codex", &target)
+                    .unwrap();
+                let router = Provider::with_id(
+                    "projection-router".to_string(),
+                    "Projection Router".to_string(),
+                    json!({"codexRouting":{"enabled":true, "routes":[{
+                        "id":"projection-route", "enabled":true,
+                        "targetProviderId":"projection-target",
+                        "match":{"models":["public-model"]},
+                        "upstream":{"apiFormat":"openai_responses"}
+                    }]}}),
+                    None,
+                );
+                let body = json!({
+                    "model":"public-model",
+                    "input":[{"role":"user", "content":"x".repeat(history_bytes)}],
+                    "tools":[{"type":"function", "name":"fixture", "description":"t".repeat(history_bytes)}]
+                });
+                let input = body["input"][0]["content"].as_str().unwrap();
+                let input_ptr = input.as_ptr();
+                let routes = build_forward_attempt_providers_preserving_codex_router_context(
+                    &AppType::Codex,
+                    &[router],
+                    &body,
+                );
+                assert_eq!(routes.len(), 1);
+                let candidates = [direct, routes[0].clone()];
+                CODEX_MODEL_RESOLUTION_INPUT.with(|work| work.set((0, 0)));
+                for candidate in candidates.iter().cycle().take(candidate_count) {
+                    let effective = forwarder
+                        .materialize_codex_forward_attempt_provider(
+                            &AppType::Codex,
+                            candidate,
+                            &body,
+                            "/responses",
+                        )
+                        .unwrap();
+                    assert!(effective.settings_config.get("base_url").is_some());
+                }
+                // The resolver API borrows only a model string. These counters
+                // bound projection calls/identity bytes, not Value::clone calls.
+                CODEX_MODEL_RESOLUTION_INPUT.with(|work| {
+                    assert_eq!(
+                        work.get(),
+                        (candidate_count, candidate_count * "public-model".len())
+                    );
+                });
+                assert_eq!(body["model"], "public-model");
+                assert_eq!(
+                    body["input"][0]["content"].as_str().unwrap().as_ptr(),
+                    input_ptr
+                );
+                assert_eq!(input.len(), history_bytes);
+            }
         }
     }
 
@@ -13251,7 +13578,7 @@ mod tests {
 
         let encoded = encode_codex_official_upstream_body(
             &mut headers,
-            original.clone(),
+            &Bytes::from(original.clone()),
             /* enabled */ true,
         )
         .expect("encode official request");
@@ -13333,6 +13660,14 @@ mod tests {
         let transport_retry = payload.replay_body();
         let rejection_retry = payload.replay_body();
         let stream_reconnect = payload.replay_body();
+        for dispatch in [
+            &initial_send,
+            &transport_retry,
+            &rejection_retry,
+            &stream_reconnect,
+        ] {
+            assert_eq!(dispatch.as_ptr(), payload.wire_body().as_ptr());
+        }
         assert_eq!(transport_retry, initial_send);
         assert_eq!(rejection_retry, initial_send);
         assert_eq!(stream_reconnect, initial_send);
@@ -13343,13 +13678,221 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_and_forwarding_serialize_each_body_variant_once() {
+        use super::super::request_health::{
+            prepare_request_json, RequestHealthContext, DIAGNOSTIC_MEASUREMENT_BYTES,
+            REQUEST_JSON_BYTES, REQUEST_JSON_SERIALIZATIONS,
+        };
+        use crate::settings::{
+            RequestHealthConfig, RequestHealthReviewMode, RequestOptimizationMode,
+        };
+
+        for history_bytes in [1024, 1024 * 1024] {
+            for enabled in [false, true] {
+                for review_mode in [
+                    RequestHealthReviewMode::Off,
+                    RequestHealthReviewMode::FirstLargeRequest,
+                ] {
+                    for optimization_mode in [
+                        RequestOptimizationMode::Off,
+                        RequestOptimizationMode::Diagnose,
+                        RequestOptimizationMode::Safe,
+                    ] {
+                        let mut body = json!({
+                            "model": "fixture-model", "input": [{"type": "message", "role": "user",
+                                "content": "x".repeat(history_bytes),
+                                "internal_chat_message_metadata_passthrough": {"fixture": true}
+                            }]
+                        });
+                        let config = RequestHealthConfig {
+                            enabled,
+                            review_mode,
+                            optimization_mode,
+                            ..RequestHealthConfig::default()
+                        };
+                        let context = || RequestHealthContext {
+                            trace_id: Some("serialization-work-bounds"),
+                            session_id: "serialization-work-bounds",
+                            app_type: "codex",
+                            provider_id: "fixture-provider",
+                            provider_name: "Fixture Provider",
+                            model: "fixture-model",
+                            endpoint: "/responses",
+                            wire_responses: true,
+                            client_request_bytes: 0,
+                            compaction_request: false,
+                            session_client_provided: true,
+                        };
+                        REQUEST_JSON_SERIALIZATIONS.with(|count| count.set(0));
+                        REQUEST_JSON_BYTES.with(|count| count.set(0));
+                        DIAGNOSTIC_MEASUREMENT_BYTES.with(|count| count.set(0));
+                        let mut emitted_bytes = 0;
+                        let mut removed_metadata_bytes = 0;
+                        for variant in 1..=2 {
+                            if enabled && optimization_mode == RequestOptimizationMode::Safe {
+                                if let Some(metadata) = body["input"][0]
+                                    .get("internal_chat_message_metadata_passthrough")
+                                {
+                                    removed_metadata_bytes +=
+                                        serde_json::to_vec(metadata).unwrap().len();
+                                }
+                            }
+                            let (diagnostic, bytes) = prepare_request_json(
+                                &http::Method::POST,
+                                &mut body,
+                                &config,
+                                context(),
+                            )
+                            .unwrap();
+                            assert_eq!(diagnostic.is_some(), enabled);
+                            assert_eq!(bytes, serde_json::to_vec(&body).unwrap());
+                            emitted_bytes += bytes.len();
+                            REQUEST_JSON_BYTES.with(|count| assert_eq!(count.get(), emitted_bytes));
+                            DIAGNOSTIC_MEASUREMENT_BYTES
+                                .with(|count| assert_eq!(count.get(), removed_metadata_bytes));
+                            let mut headers = HeaderMap::new();
+                            let payload = FinalizedRequestPayload::from_transformed_json(
+                                bytes.len(),
+                                bytes,
+                                &mut headers,
+                                variant == 2,
+                            )
+                            .unwrap();
+                            for _ in 0..3 {
+                                assert_eq!(payload.clone().replay_body(), payload.wire_body());
+                            }
+                            REQUEST_JSON_SERIALIZATIONS
+                                .with(|count| assert_eq!(count.get(), variant));
+                            // A fallback is a separately finalized JSON variant.
+                            body["store"] = json!(false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bodyless_methods_skip_active_diagnostics_and_serialization() {
+        use super::super::request_health::{
+            prepare_request_json, RequestHealthContext, DIAGNOSTIC_MEASUREMENT_BYTES,
+            REQUEST_JSON_BYTES, REQUEST_JSON_SERIALIZATIONS,
+        };
+        for method in [http::Method::GET, http::Method::HEAD] {
+            let original = json!({"input": [{"type": "message", "content": "x".repeat(1024 * 1024),
+                "internal_chat_message_metadata_passthrough": {"fixture": true}
+            }]});
+            let mut body = original.clone();
+            REQUEST_JSON_SERIALIZATIONS.with(|count| count.set(0));
+            REQUEST_JSON_BYTES.with(|count| count.set(0));
+            DIAGNOSTIC_MEASUREMENT_BYTES.with(|count| count.set(0));
+            let (diagnostic, bytes) = prepare_request_json(
+                &method,
+                &mut body,
+                &crate::settings::RequestHealthConfig::default(),
+                RequestHealthContext {
+                    trace_id: Some("bodyless-serialization-work"),
+                    session_id: "bodyless-serialization-work",
+                    app_type: "codex",
+                    provider_id: "fixture-provider",
+                    provider_name: "Fixture Provider",
+                    model: "fixture-model",
+                    endpoint: "/responses",
+                    wire_responses: true,
+                    client_request_bytes: 0,
+                    compaction_request: false,
+                    session_client_provided: true,
+                },
+            )
+            .unwrap();
+            assert!(diagnostic.is_none());
+            assert!(bytes.is_empty());
+            assert_eq!(body, original);
+            REQUEST_JSON_SERIALIZATIONS.with(|count| assert_eq!(count.get(), 0));
+            REQUEST_JSON_BYTES.with(|count| assert_eq!(count.get(), 0));
+            DIAGNOSTIC_MEASUREMENT_BYTES.with(|count| assert_eq!(count.get(), 0));
+        }
+    }
+
+    #[test]
+    fn finalized_request_shares_uncompressed_bytes_and_hashes_each_wire_variant_once() {
+        use std::sync::atomic::Ordering;
+
+        let json = br#"{"input":"replayed history"}"#.to_vec();
+        let original_ptr = json.as_ptr();
+        let mut headers = HeaderMap::new();
+        let plain =
+            FinalizedRequestPayload::from_transformed_json(json.len(), json, &mut headers, false)
+                .unwrap();
+        let replay = plain.clone();
+        assert_eq!(plain.transformed_json().as_ptr(), original_ptr);
+        assert_eq!(plain.wire_body().as_ptr(), original_ptr);
+        assert_eq!(replay.wire_body().as_ptr(), original_ptr);
+        assert_eq!(plain.replay_body().as_ptr(), original_ptr);
+        assert_eq!(replay.replay_body().as_ptr(), original_ptr);
+        assert!(plain.wire_hash.get().is_none());
+        assert_eq!(plain.wire_hash_computations.load(Ordering::Relaxed), 0);
+        let digest = replay.wire_hash();
+        for _ in 0..4 {
+            assert_eq!(plain.clone().wire_hash().as_ptr(), digest.as_ptr());
+        }
+        assert_eq!(plain.wire_hash_computations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            digest,
+            super::super::request_health::wire_body_hash(plain.wire_body())
+        );
+
+        let compressed = FinalizedRequestPayload::from_transformed_json(
+            plain.client_json_bytes,
+            plain.transformed_json().to_vec(),
+            &mut headers,
+            true,
+        )
+        .unwrap();
+        assert!(compressed.wire_hash.get().is_none());
+        std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|_| {
+                    let payload = compressed.clone();
+                    scope.spawn(move || payload.wire_hash().to_owned())
+                })
+                .collect::<Vec<_>>();
+            for worker in workers {
+                assert_eq!(worker.join().unwrap(), compressed.wire_hash());
+            }
+        });
+        assert_eq!(compressed.wire_hash_computations.load(Ordering::Relaxed), 1);
+        assert_ne!(compressed.wire_hash(), digest);
+        assert_eq!(
+            zstd::stream::decode_all(compressed.wire_body()).unwrap(),
+            plain.transformed_json()
+        );
+        assert_eq!(
+            compressed.wire_hash(),
+            super::super::request_health::wire_body_hash(compressed.wire_body())
+        );
+
+        let fallback = FinalizedRequestPayload::from_transformed_json(
+            0,
+            br#"{"input":"fallback history"}"#.to_vec(),
+            &mut HeaderMap::new(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(fallback.wire_hash_computations.load(Ordering::Relaxed), 0);
+        assert_ne!(fallback.wire_hash(), digest);
+        assert_eq!(fallback.wire_hash_computations.load(Ordering::Relaxed), 1);
+        assert_eq!(plain.wire_hash_computations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn non_official_upstream_wire_body_remains_uncompressed() {
         let original = br#"{"model":"deepseek-v4-flash","input":[]}"#.to_vec();
         let mut headers = HeaderMap::new();
 
         let encoded = encode_codex_official_upstream_body(
             &mut headers,
-            original.clone(),
+            &Bytes::from(original.clone()),
             /* enabled */ false,
         )
         .expect("prepare third-party request");
@@ -15376,6 +15919,309 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_priming_fragmented_work_is_linear() {
+        for size in [32, 64 * 1024] {
+            let json = format!(
+                r#"{{"status":"completed","output":["{}"]}}"#,
+                "x".repeat(size)
+            );
+            let sse = format!(
+                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"{}\"}}\n\n",
+                "x".repeat(size),
+            );
+            for wire in [&json, &sse] {
+                for chunk_size in [1, 97, 8192] {
+                    for _poll in 0..3 {
+                        let mut inspector = ResponsesStreamStartInspection::default();
+                        let mut outcome = None;
+                        let mut chunks = 0;
+                        for chunk in wire.as_bytes().chunks(chunk_size) {
+                            chunks += 1;
+                            if let Some(result) = inspector.push(chunk) {
+                                outcome = Some(result);
+                                break;
+                            }
+                        }
+                        assert!(matches!(outcome, Some(Ok(()))));
+                        assert!(
+                            inspector.scanned_bytes <= wire.len(),
+                            "priming rescanned a growing prefix: {} > {}",
+                            inspector.scanned_bytes,
+                            wire.len(),
+                        );
+                        assert!(
+                            inspector.json_bytes <= wire.len(),
+                            "priming reparsed a growing JSON prefix: {} > {}",
+                            inspector.json_bytes,
+                            wire.len(),
+                        );
+                        assert!(
+                            inspector.frame_bytes <= wire.len(),
+                            "priming reinspected a complete frame",
+                        );
+                        assert_eq!(inspector.received_bytes, wire.len());
+                        assert!(inspector.peak_pending_bytes <= wire.len());
+                        assert!(
+                            inspector.replay_accounting_steps <= chunks,
+                            "priming recounted previously retained chunks: {} > {}",
+                            inspector.replay_accounting_steps,
+                            chunks,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn responses_stream_priming_wrapper_work_is_linear() {
+        let created_data = r#"{"type":"response.created"}"#;
+        let created = format!("event: response.created\r\ndata: {created_data}\r\n\r\n");
+        let delta_data = r#"{"type":"response.output_text.delta","delta":"hi"}"#;
+        let delta = format!("event: response.output_text.delta\ndata: {delta_data}\n\n");
+        for size in [32, 64 * 1024] {
+            let json = format!(
+                r#"{{"status":"completed","output":["{}"]}}"#,
+                "x".repeat(size)
+            );
+            let lifecycle_count = if size == 32 { 1 } else { 1024 };
+            let sse = format!("{}{delta}", created.repeat(lifecycle_count));
+            for (wire, is_json) in [(&json, true), (&sse, false)] {
+                for chunk_size in [1, 97, wire.len()] {
+                    for _attempt in 0..3 {
+                        RESPONSES_PRIMING_WORK.with(|work| {
+                            *work.borrow_mut() = ResponsesPrimingWork::default();
+                        });
+                        let chunks = wire
+                            .as_bytes()
+                            .chunks(chunk_size)
+                            .map(|bytes| Ok::<_, std::io::Error>(Bytes::copy_from_slice(bytes)))
+                            .collect::<Vec<_>>();
+                        let expected_appends = chunks.len();
+                        let response = ProxyResponse::streamed(
+                            StatusCode::OK,
+                            HeaderMap::new(),
+                            futures::stream::iter(chunks),
+                        );
+                        let prepared = test_forwarder(Duration::ZERO, Duration::ZERO)
+                            .validate_responses_stream_start(response)
+                            .await
+                            .expect("wrapper must inspect then replay the complete response");
+                        let work = RESPONSES_PRIMING_WORK.with(|work| *work.borrow());
+                        assert_eq!(work.finished_inspectors, 1, "{work:?}");
+                        assert_eq!(work.scanned_bytes, wire.len(), "{work:?}");
+                        assert_eq!(work.replay_accounting_steps, expected_appends, "{work:?}");
+                        assert_eq!(work.replay_appends, expected_appends, "{work:?}");
+                        assert_eq!(work.replay_bytes, wire.len(), "{work:?}");
+                        if is_json {
+                            assert_eq!(work.json_parses, 1, "{work:?}");
+                            assert_eq!(work.json_parse_bytes, wire.len(), "{work:?}");
+                            assert_eq!(work.sse_json_parses, 0, "{work:?}");
+                            assert_eq!(work.sse_json_parse_bytes, 0, "{work:?}");
+                            assert_eq!(work.frame_bytes, 0, "{work:?}");
+                            assert_eq!(work.peak_pending_bytes, wire.len(), "{work:?}");
+                        } else {
+                            assert_eq!(work.json_parses, 0, "{work:?}");
+                            assert_eq!(work.json_parse_bytes, 0, "{work:?}");
+                            assert_eq!(work.sse_json_parses, lifecycle_count + 1, "{work:?}");
+                            assert_eq!(
+                                work.sse_json_parse_bytes,
+                                lifecycle_count * created_data.len() + delta_data.len(),
+                                "{work:?}"
+                            );
+                            assert_eq!(work.frame_bytes, wire.len(), "{work:?}");
+                            assert_eq!(
+                                work.peak_pending_bytes,
+                                created.len().max(delta.len()),
+                                "{work:?}"
+                            );
+                        }
+                        assert_eq!(
+                            prepared
+                                .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
+                                .await
+                                .unwrap()
+                                .as_ref(),
+                            wire.as_bytes()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responses_stream_priming_many_lifecycle_frames_are_inspected_once() {
+        let created = "event: response.created\r\ndata: {\"type\":\"response.created\"}\r\n\r\n";
+        let delta = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
+        for count in [1, 1024] {
+            let wire = format!("{}{delta}", created.repeat(count));
+            for chunk_size in [1, 97, wire.len()] {
+                let mut inspector = ResponsesStreamStartInspection::default();
+                let mut outcome = None;
+                for chunk in wire.as_bytes().chunks(chunk_size) {
+                    if let Some(result) = inspector.push(chunk) {
+                        outcome = Some(result);
+                        break;
+                    }
+                }
+                assert!(matches!(outcome, Some(Ok(()))));
+                assert_eq!(inspector.scanned_bytes, wire.len());
+                assert_eq!(inspector.frame_bytes, wire.len());
+                assert_eq!(inspector.json_bytes, 0);
+                assert!(inspector.peak_pending_bytes <= created.len().max(delta.len()));
+                assert_eq!(inspector.received_bytes, wire.len());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_stream_priming_preserves_fragmented_json_sse_and_raw_replay() {
+        let json = json!({
+            "status": "completed",
+            "output": [{"text": "brace } [ quote \" slash \\ Unicode café 🦀"}],
+        });
+        let pretty_json = serde_json::to_string_pretty(&json)
+            .unwrap()
+            .replace("]\n", "]\n\n");
+        let delta = format!(
+            "event: response.output_text.delta\r\ndata: {}\r\n\r\n",
+            json!({"type": "response.output_text.delta", "delta": "café 🦀"}),
+        );
+        let lifecycle = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
+        let later_failure = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"after output\"}}}\n\n";
+        let sse = format!("{lifecycle}: heartbeat\n\n{delta}{later_failure}");
+        let unterminated = delta.trim_end().to_string();
+        for wire in [pretty_json, sse, unterminated, format!("\u{2003}{}", json)] {
+            for chunk_size in [1, 7, wire.len()] {
+                let chunks: Vec<_> = wire
+                    .as_bytes()
+                    .chunks(chunk_size)
+                    .map(|bytes| Ok::<_, std::io::Error>(Bytes::copy_from_slice(bytes)))
+                    .collect();
+                let response = ProxyResponse::streamed(
+                    StatusCode::OK,
+                    HeaderMap::new(),
+                    futures::stream::iter(chunks),
+                );
+                let prepared = test_forwarder(Duration::ZERO, Duration::ZERO)
+                    .validate_responses_stream_start(response)
+                    .await
+                    .expect("complete JSON or productive SSE must commit");
+                assert_eq!(
+                    prepared
+                        .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    wire.as_bytes(),
+                    "original fragmented bytes must be replayed unchanged",
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_stream_priming_semantic_failure_allows_a_fresh_attempt() {
+        let failures = [
+            "{\n\"status\":\"failed\",\n\n\"error\":{\"message\":\"fixture busy\"}}",
+            "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"fixture busy\"}}}\n\n",
+        ];
+        for wire in failures {
+            for chunk_size in [1, 97] {
+                let response = ProxyResponse::streamed(
+                    StatusCode::OK,
+                    HeaderMap::new(),
+                    futures::stream::iter(
+                        wire.as_bytes()
+                            .chunks(chunk_size)
+                            .map(|bytes| Ok::<_, std::io::Error>(Bytes::copy_from_slice(bytes)))
+                            .collect::<Vec<_>>(),
+                    ),
+                );
+                let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+                let error = forwarder.validate_responses_stream_start(response).await;
+                assert!(matches!(error,
+                    Err(ProxyError::TransformError(message)) if message.contains("fixture busy")
+                ));
+                let next_wire = b"{\"status\":\"completed\",\"output\":[]}";
+                let next = ProxyResponse::streamed(
+                    StatusCode::OK,
+                    HeaderMap::new(),
+                    futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+                        next_wire,
+                    ))]),
+                );
+                let prepared = forwarder
+                    .validate_responses_stream_start(next)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    prepared
+                        .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    next_wire
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_stream_priming_rejects_truncation_and_same_chunk_json_junk() {
+        for wire in [
+            "{\"status\":\"completed\",\"output\":[",
+            "{\"status\":\"completed\"} trailing junk",
+            "{\"output\":]}",
+            "event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+        ] {
+            // Keep JSON trailing junk in the same transport chunk: as before,
+            // bytes arriving only after a committed document cannot undo it.
+            let response = ProxyResponse::streamed(
+                StatusCode::OK,
+                HeaderMap::new(),
+                futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+                    wire.as_bytes(),
+                ))]),
+            );
+            assert!(matches!(
+                test_forwarder(Duration::ZERO, Duration::ZERO)
+                    .validate_responses_stream_start(response)
+                    .await,
+                Err(ProxyError::ForwardFailed(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_stream_priming_byte_cap_preserves_buffered_and_remaining_bytes() {
+        let wire = format!(":{}\n\ntrailing raw bytes", "x".repeat(256 * 1024));
+        let response = ProxyResponse::streamed(
+            StatusCode::OK,
+            HeaderMap::new(),
+            futures::stream::iter(
+                wire.as_bytes()
+                    .chunks(997)
+                    .map(|bytes| Ok::<_, std::io::Error>(Bytes::copy_from_slice(bytes)))
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        let prepared = test_forwarder(Duration::ZERO, Duration::ZERO)
+            .validate_responses_stream_start(response)
+            .await
+            .expect("priming cap must preserve passthrough");
+        assert_eq!(
+            prepared
+                .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
+                .await
+                .unwrap()
+                .as_ref(),
+            wire.as_bytes()
+        );
+    }
+
+    #[test]
     fn responses_stream_start_semantic_failure_is_retryable() {
         let created = concat!(
             "event: response.created\n",
@@ -16752,7 +17598,7 @@ mod tests {
                         http::HeaderMap::new(),
                         // No original-case extension selects hyper-util.
                         http::Extensions::new(),
-                        payload.to_vec(),
+                        Bytes::from_static(payload),
                         Duration::from_secs(5),
                         None,
                     )

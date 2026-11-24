@@ -1341,6 +1341,9 @@ pub fn run() {
             let startup_recovery_classification = startup_recovery.classification;
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<AppState>();
+                if startup_recovery_classification.allows_proxy_startup() {
+                    state.proxy_service.retain_codex_recovery_observer().await;
+                }
 
                 // 检查是否有 Live 备份（表示上次异常退出时可能处于接管状态）
                 let has_backups = match state.db.has_any_live_backup().await {
@@ -1563,6 +1566,9 @@ pub fn run() {
             commands::start_owner_remote,
             commands::stop_owner_remote,
             commands::create_owner_remote_invite,
+            commands::get_tailscale_status,
+            commands::connect_tailscale_owner_remote,
+            commands::verify_tailscale_owner_remote,
             commands::migrate_codex_official_auth_ownership,
             commands::get_codex_editor_providers,
             commands::get_current_provider,
@@ -1612,6 +1618,8 @@ pub fn run() {
             commands::get_watchdog_status,
             commands::get_pending_recovery_outcomes,
             commands::acknowledge_recovery_outcomes,
+            commands::get_codex_usage_limit_resume_count,
+            commands::resume_codex_usage_limited_turns,
             commands::get_migration_result,
             commands::get_skills_migration_result,
             commands::get_app_config_path,
@@ -1909,6 +1917,9 @@ pub fn run() {
             commands::save_stream_check_config,
             // Session manager
             commands::list_sessions,
+            commands::export_codex_session_backup,
+            commands::inspect_codex_session_backup,
+            commands::import_codex_session_backup,
             commands::get_pi_current_state,
             commands::get_pi_session_discovery,
             commands::get_session_messages,
@@ -1919,6 +1930,7 @@ pub fn run() {
             commands::get_tool_versions,
             commands::get_tool_auto_update_settings,
             commands::set_tool_auto_update,
+            commands::run_tool_auto_update,
             commands::run_tool_lifecycle_action,
             commands::get_tool_install_commands,
             commands::probe_tool_installations,
@@ -2800,6 +2812,22 @@ mod tests {
     }
 
     #[test]
+    fn primary_startup_keeps_the_codex_recovery_observer_running_without_takeover() {
+        let (_, startup) = include_str!("lib.rs")
+            .split_once("let startup_recovery_classification = startup_recovery.classification;")
+            .expect("find primary startup task");
+        let (before_proxy_restore, _) = startup
+            .split_once("restore_proxy_state_on_startup(&state).await")
+            .expect("find proxy restore within primary startup");
+
+        assert!(before_proxy_restore.contains(concat!(
+            "if startup_recovery_classification.allows_proxy_startup() {\n",
+            "                    state.proxy_service.retain_codex_recovery_observer().await;\n",
+            "                }"
+        )));
+    }
+
+    #[test]
     fn configured_listener_recovery_command_is_registered_for_frontend_invocation() {
         // Tauri command registration is runtime-only: the frontend can typecheck
         // successfully while invoke() still rejects an omitted command. Keep this
@@ -2841,5 +2869,26 @@ mod tests {
         assert!(handler.contains("commands::save_te_provider,"));
         assert!(!handler.contains("commands::upsert_te_provider_descriptor,"));
         assert!(!handler.contains("commands::delete_te_provider_descriptor,"));
+    }
+
+    #[test]
+    fn tailscale_commands_are_registered_for_frontend_invocation() {
+        let (_, handler) = include_str!("lib.rs")
+            .split_once(".invoke_handler(tauri::generate_handler![")
+            .expect("application has a Tauri invoke handler");
+        let (handler, _) = handler
+            .split_once("\n        ])")
+            .expect("Tauri invoke handler is closed");
+
+        for command in [
+            "get_tailscale_status",
+            "connect_tailscale_owner_remote",
+            "verify_tailscale_owner_remote",
+        ] {
+            assert!(
+                handler.contains(&format!("commands::{command},")),
+                "register {command} in the Tauri invoke handler"
+            );
+        }
     }
 }

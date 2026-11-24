@@ -1,0 +1,795 @@
+{
+  "schemaVersion": 1,
+  "capturedAtUtc": "2026-11-23T10:02:26.711Z",
+  "timezone": "Asia/Singapore",
+  "application": {
+    "Pid": 12496,
+    "Path": "H:\\repos\\ccswitchmulti-refork\\src-tauri\\target\\debug\\cc-switch.exe",
+    "StartedUtc": "2026-11-23T09:40:15.4166541Z",
+    "BinaryModifiedUtc": "2026-11-23T09:40:15.1531583Z"
+  },
+  "scope": "Read-only 4MiB tails of the two configured application logs; no UI/CDP automation or workspace-wide/process-tree scan",
+  "configuredMonitor": {
+    "available": false,
+    "evidence": [
+      "MCP resources and templates are empty",
+      "Configured CODEX_HOME automations directory absent",
+      "No live monitor entrypoint found in package.json or referenced existing audit artifacts"
+    ],
+    "boundary": "This bounded process/log check is not a completed configured-monitor or native CPU-stack audit"
+  },
+  "logReads": [
+    {
+      "file": "C:/Users/Felix/.cc-switch/logs/cc-switch.log",
+      "bytesRead": 4194304,
+      "fileSizeAtRead": 12111355,
+      "firstAndLastTimestamp": {
+        "file": "C:/Users/Felix/.cc-switch/logs/cc-switch.log",
+        "first": "2026-11-22][18:56:15",
+        "last": "2026-11-23][17:51:42"
+      }
+    },
+    {
+      "file": "C:/Users/Felix/.cc-switch/logs/codex-router.log",
+      "bytesRead": 4194304,
+      "fileSizeAtRead": 7523256,
+      "firstAndLastTimestamp": {
+        "file": "C:/Users/Felix/.cc-switch/logs/codex-router.log",
+        "first": "2026-11-23 17:11:28.187",
+        "last": "2026-11-23 17:51:42.971"
+      }
+    }
+  ],
+  "resourceEvidencePath": "H:/repos/ccswitchmulti-refork/docs/audits/2026-11-23-restart-12496-bounded-resource-175059.json",
+  "resourceSummary": {
+    "DurationSeconds": 60.3557984,
+    "CpuSeconds": 75.453125,
+    "LogicalProcessors": 16,
+    "AverageCpuOneCorePercent": 125.01387936241765,
+    "AverageCpuMachinePercent": 7.813367460151103,
+    "PeakIntervalCpuOneCorePercent": 405.90004715857367,
+    "PeakIntervalCpuMachinePercent": 25.368752947410854,
+    "WorkingSetStartBytes": 300560384,
+    "WorkingSetEndBytes": 315363328,
+    "WorkingSetMinBytes": 282439680,
+    "WorkingSetPeakBytes": 315363328,
+    "PrivateStartBytes": 246198272,
+    "PrivateEndBytes": 262774784,
+    "PrivateMinBytes": 226426880,
+    "PrivatePeakBytes": 262774784
+  },
+  "sinceRestart": {
+    "startUtc": "2026-11-23T09:40:15.416Z",
+    "endUtc": "2026-11-23T09:51:42.971Z",
+    "events": [
+      {
+        "event": "route_resolved",
+        "count": 341
+      },
+      {
+        "event": "request_prepared",
+        "count": 341
+      },
+      {
+        "event": "auth_prepared",
+        "count": 341
+      },
+      {
+        "event": "request_health",
+        "count": 341
+      },
+      {
+        "event": "request_body_accounting",
+        "count": 341
+      },
+      {
+        "event": "upstream_send",
+        "count": 341
+      },
+      {
+        "event": "upstream_status",
+        "count": 335
+      },
+      {
+        "event": "response_ready",
+        "count": 335
+      },
+      {
+        "event": "request_classified",
+        "count": 327
+      },
+      {
+        "event": "request_health_review_approved",
+        "count": 317
+      },
+      {
+        "event": "stream_outcome",
+        "count": 299
+      },
+      {
+        "event": "upstream_sse_error",
+        "count": 17
+      },
+      {
+        "event": "capacity_retry_decision",
+        "count": 17
+      },
+      {
+        "event": "turn_recovery",
+        "count": 12
+      }
+    ],
+    "bytes": {
+      "client_request_bytes": 149741154,
+      "post_transform_request_bytes": 149545484,
+      "upstream_wire_request_bytes": 149545484
+    },
+    "reasoning": [
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 217
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": "ultra",
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 84
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "unset",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "unset",
+        "subagent_reasoning_override_applied": "false",
+        "count": 14
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 10
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "compaction",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 8
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 6
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "compaction",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "xhigh",
+        "subagent_reasoning_override_applied": "false",
+        "count": 1
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "compaction",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 1
+      }
+    ],
+    "parentUltraOrMaxEvidence": {
+      "observed": 95,
+      "notForwardedAsMax": 0
+    },
+    "gptChildEvidence": {
+      "observed": 231,
+      "notForwardedAsHigh": 0
+    },
+    "streamOutcomes": [
+      {
+        "outcome": "completed",
+        "attempt": "0",
+        "count": 273
+      },
+      {
+        "outcome": "cancelled",
+        "attempt": "0",
+        "count": 16
+      },
+      {
+        "outcome": "cancelled",
+        "attempt": "1",
+        "count": 10
+      }
+    ],
+    "upstreamStatus": [
+      {
+        "status": "200",
+        "count": 335
+      }
+    ],
+    "errors": [
+      {
+        "event": "upstream_sse_error",
+        "attempt": "0",
+        "error_type": "gateway_concurrency_limit",
+        "message_class": "upstream_error",
+        "reason": null,
+        "stage": "native_responses",
+        "outcome": null,
+        "event_class": null,
+        "budget": null,
+        "count": 17
+      },
+      {
+        "event": "capacity_retry_decision",
+        "attempt": "0",
+        "error_type": null,
+        "message_class": null,
+        "reason": "retry_started",
+        "stage": "native_responses",
+        "outcome": null,
+        "event_class": "response_failed",
+        "budget": null,
+        "count": 17
+      },
+      {
+        "event": "turn_recovery",
+        "attempt": "1",
+        "error_type": null,
+        "message_class": null,
+        "reason": "app_crash_interrupted_turn",
+        "stage": null,
+        "outcome": null,
+        "event_class": null,
+        "budget": "3",
+        "count": 6
+      },
+      {
+        "event": "turn_recovery",
+        "attempt": "1",
+        "error_type": null,
+        "message_class": null,
+        "reason": "turn_activity_changed",
+        "stage": null,
+        "outcome": null,
+        "event_class": null,
+        "budget": "3",
+        "count": 6
+      }
+    ],
+    "prepareElapsedMs": {
+      "count": 341,
+      "median": 24,
+      "p95": 29,
+      "max": 69,
+      "notCpuTime": true
+    }
+  },
+  "duringResourceSample": {
+    "startUtc": "2026-11-23T09:49:58.924Z",
+    "endUtc": "2026-11-23T09:50:59.282Z",
+    "events": [
+      {
+        "event": "upstream_status",
+        "count": 23
+      },
+      {
+        "event": "response_ready",
+        "count": 23
+      },
+      {
+        "event": "stream_outcome",
+        "count": 23
+      },
+      {
+        "event": "request_classified",
+        "count": 22
+      },
+      {
+        "event": "route_resolved",
+        "count": 22
+      },
+      {
+        "event": "request_prepared",
+        "count": 22
+      },
+      {
+        "event": "auth_prepared",
+        "count": 22
+      },
+      {
+        "event": "request_health",
+        "count": 22
+      },
+      {
+        "event": "request_body_accounting",
+        "count": 22
+      },
+      {
+        "event": "request_health_review_approved",
+        "count": 22
+      },
+      {
+        "event": "upstream_send",
+        "count": 22
+      }
+    ],
+    "bytes": {
+      "client_request_bytes": 9880240,
+      "post_transform_request_bytes": 9868900,
+      "upstream_wire_request_bytes": 9868900
+    },
+    "reasoning": [
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 15
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": "ultra",
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 5
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "turn",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "max",
+        "subagent_reasoning_override_applied": "false",
+        "count": 1
+      },
+      {
+        "model": "gpt-6.1-sol-sublyx",
+        "codex_request_kind": "turn",
+        "is_subagent": "true",
+        "requested_reasoning_effort": "max",
+        "restored_desktop_reasoning_effort": null,
+        "upstream_reasoning_effort": "high",
+        "subagent_reasoning_override_applied": "true",
+        "count": 1
+      }
+    ],
+    "parentUltraOrMaxEvidence": {
+      "observed": 6,
+      "notForwardedAsMax": 0
+    },
+    "gptChildEvidence": {
+      "observed": 16,
+      "notForwardedAsHigh": 0
+    },
+    "streamOutcomes": [
+      {
+        "outcome": "completed",
+        "attempt": "0",
+        "count": 22
+      },
+      {
+        "outcome": "cancelled",
+        "attempt": "1",
+        "count": 1
+      }
+    ],
+    "upstreamStatus": [
+      {
+        "status": "200",
+        "count": 23
+      }
+    ],
+    "errors": [],
+    "prepareElapsedMs": {
+      "count": 22,
+      "median": 22,
+      "p95": 27,
+      "max": 30,
+      "notCpuTime": true
+    }
+  },
+  "nativeLogSummary": {
+    "eventsSinceRestart": 534,
+    "groups": [
+      {
+        "level": "INFO",
+        "tag": "INFO",
+        "count": 378
+      },
+      {
+        "level": "WARN",
+        "tag": "WARN",
+        "count": 156
+      }
+    ],
+    "sync": [
+      {
+        "atUtc": "2026-11-23T09:40:54.000Z",
+        "imported": 0,
+        "skipped": 16,
+        "deferred": 131,
+        "scanned": 1389
+      },
+      {
+        "atUtc": "2026-11-23T09:41:56.000Z",
+        "imported": 1,
+        "skipped": 22,
+        "deferred": 131,
+        "scanned": 1389
+      },
+      {
+        "atUtc": "2026-11-23T09:42:58.000Z",
+        "imported": 0,
+        "skipped": 32,
+        "deferred": 131,
+        "scanned": 1391
+      },
+      {
+        "atUtc": "2026-11-23T09:44:00.000Z",
+        "imported": 1,
+        "skipped": 17,
+        "deferred": 131,
+        "scanned": 1391
+      },
+      {
+        "atUtc": "2026-11-23T09:45:02.000Z",
+        "imported": 1,
+        "skipped": 22,
+        "deferred": 131,
+        "scanned": 1391
+      },
+      {
+        "atUtc": "2026-11-23T09:46:04.000Z",
+        "imported": 1,
+        "skipped": 28,
+        "deferred": 131,
+        "scanned": 1391
+      },
+      {
+        "atUtc": "2026-11-23T09:47:07.000Z",
+        "imported": 3,
+        "skipped": 23,
+        "deferred": 131,
+        "scanned": 1393
+      },
+      {
+        "atUtc": "2026-11-23T09:48:09.000Z",
+        "imported": 2,
+        "skipped": 23,
+        "deferred": 131,
+        "scanned": 1394
+      },
+      {
+        "atUtc": "2026-11-23T09:49:11.000Z",
+        "imported": 2,
+        "skipped": 29,
+        "deferred": 131,
+        "scanned": 1394
+      },
+      {
+        "atUtc": "2026-11-23T09:50:13.000Z",
+        "imported": 2,
+        "skipped": 25,
+        "deferred": 131,
+        "scanned": 1394
+      },
+      {
+        "atUtc": "2026-11-23T09:51:15.000Z",
+        "imported": 2,
+        "skipped": 19,
+        "deferred": 131,
+        "scanned": 1394
+      }
+    ],
+    "moduleCounts": [
+      {
+        "level": "INFO",
+        "module": "cc_switch_lib::proxy::forwarder",
+        "count": 341
+      },
+      {
+        "level": "WARN",
+        "module": "cc_switch_lib::services::session_usage_codex",
+        "count": 131
+      },
+      {
+        "level": "WARN",
+        "module": "cc_switch_lib::proxy::providers::streaming_retry",
+        "count": 17
+      },
+      {
+        "level": "INFO",
+        "module": "cc_switch_lib",
+        "count": 14
+      },
+      {
+        "level": "INFO",
+        "module": "cc_switch_lib::services::session_usage_codex",
+        "count": 11
+      },
+      {
+        "level": "INFO",
+        "module": "cc_switch_lib::services::proxy",
+        "count": 6
+      },
+      {
+        "level": "WARN",
+        "module": "cc_switch_lib",
+        "count": 3
+      },
+      {
+        "level": "INFO",
+        "module": "cc_switch_lib::database::dao::proxy",
+        "count": 2
+      },
+      {
+        "level": "WARN",
+        "module": "cc_switch_lib::services::proxy",
+        "count": 2
+      },
+      {
+        "level": "WARN",
+        "module": "cc_switch_lib::proxy::usage::logger",
+        "count": 2
+      },
+      {
+        "level": "INFO",
+        "module": "cc_switch_lib::database::schema",
+        "count": 1
+      },
+      {
+        "level": "INFO",
+        "module": "cc_switch_lib::app_store",
+        "count": 1
+      },
+      {
+        "level": "INFO",
+        "module": "cc_switch_lib::proxy::http_client",
+        "count": 1
+      },
+      {
+        "level": "INFO",
+        "module": "cc_switch_lib::proxy::server",
+        "count": 1
+      },
+      {
+        "level": "WARN",
+        "module": "cc_switch_lib::proxy::forwarder",
+        "count": 1
+      }
+    ],
+    "deferredWarningCount": 131,
+    "deferredWarningsRepeatedEveryCycle": false
+  },
+  "topCpuIntervals": [
+    {
+      "startUtc": "2026-11-23T09:50:53.2602728+00:00",
+      "endUtc": "2026-11-23T09:50:55.2658462+00:00",
+      "cpuOneCorePercent": 405.90004715857367,
+      "sends": 0,
+      "requestsPrepared": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-23T09:50:06.9997695+00:00",
+      "endUtc": "2026-11-23T09:50:09.0099108+00:00",
+      "cpuOneCorePercent": 311.70100383580353,
+      "sends": 0,
+      "requestsPrepared": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-23T09:50:11.0137556+00:00",
+      "endUtc": "2026-11-23T09:50:13.0255425+00:00",
+      "cpuOneCorePercent": 264.0695642491812,
+      "sends": 1,
+      "requestsPrepared": 1,
+      "syncCompletions": 1
+    },
+    {
+      "startUtc": "2026-11-23T09:50:09.0099108+00:00",
+      "endUtc": "2026-11-23T09:50:11.0137556+00:00",
+      "cpuOneCorePercent": 257.31747264612335,
+      "sends": 1,
+      "requestsPrepared": 1,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-23T09:50:19.0606045+00:00",
+      "endUtc": "2026-11-23T09:50:21.0725391+00:00",
+      "cpuOneCorePercent": 233.76161650783354,
+      "sends": 0,
+      "requestsPrepared": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-23T09:50:25.1071707+00:00",
+      "endUtc": "2026-11-23T09:50:27.1241721+00:00",
+      "cpuOneCorePercent": 228.5253362616306,
+      "sends": 0,
+      "requestsPrepared": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-23T09:50:21.0725391+00:00",
+      "endUtc": "2026-11-23T09:50:23.0915348+00:00",
+      "cpuOneCorePercent": 201.2139105206569,
+      "sends": 0,
+      "requestsPrepared": 0,
+      "syncCompletions": 0
+    },
+    {
+      "startUtc": "2026-11-23T09:50:51.2532203+00:00",
+      "endUtc": "2026-11-23T09:50:53.2602728+00:00",
+      "cpuOneCorePercent": 196.96151748744288,
+      "sends": 0,
+      "requestsPrepared": 0,
+      "syncCompletions": 0
+    }
+  ],
+  "reasoningCaveat": [
+    {
+      "atUtc": "2026-11-23T09:41:22.375Z",
+      "fields": {
+        "model": "gpt-6.2-sol",
+        "codex_request_kind": "compaction",
+        "is_subagent": "false",
+        "requested_reasoning_effort": "xhigh",
+        "upstream_reasoning_effort": "xhigh",
+        "restored_desktop_reasoning_effort": null
+      },
+      "sameSessionPrepared": [
+        {
+          "model": "gpt-6.2-sol",
+          "codex_request_kind": "turn",
+          "is_subagent": "false",
+          "requested_reasoning_effort": "xhigh",
+          "restored_desktop_reasoning_effort": "ultra",
+          "upstream_reasoning_effort": "max",
+          "count": 10
+        },
+        {
+          "model": "gpt-6.2-sol",
+          "codex_request_kind": "turn",
+          "is_subagent": "true",
+          "requested_reasoning_effort": "xhigh",
+          "restored_desktop_reasoning_effort": null,
+          "upstream_reasoning_effort": "high",
+          "count": 9
+        },
+        {
+          "model": "gpt-6.2-sol",
+          "codex_request_kind": "compaction",
+          "is_subagent": "false",
+          "requested_reasoning_effort": "xhigh",
+          "restored_desktop_reasoning_effort": null,
+          "upstream_reasoning_effort": "xhigh",
+          "count": 1
+        }
+      ],
+      "nearestSameSession": [
+        {
+          "atUtc": "2026-11-23T09:41:22.375Z",
+          "kind": "compaction",
+          "child": "false",
+          "requested": "xhigh",
+          "restored": null,
+          "upstream": "xhigh"
+        },
+        {
+          "atUtc": "2026-11-23T09:42:35.837Z",
+          "kind": "turn",
+          "child": "false",
+          "requested": "xhigh",
+          "restored": "ultra",
+          "upstream": "max"
+        },
+        {
+          "atUtc": "2026-11-23T09:45:01.364Z",
+          "kind": "turn",
+          "child": "false",
+          "requested": "xhigh",
+          "restored": "ultra",
+          "upstream": "max"
+        },
+        {
+          "atUtc": "2026-11-23T09:45:33.199Z",
+          "kind": "turn",
+          "child": "false",
+          "requested": "xhigh",
+          "restored": "ultra",
+          "upstream": "max"
+        },
+        {
+          "atUtc": "2026-11-23T09:46:16.389Z",
+          "kind": "turn",
+          "child": "true",
+          "requested": "xhigh",
+          "restored": null,
+          "upstream": "high"
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "Only backend PID sampled; renderer descendants not included",
+    "No native stacks, scan-byte timings, or process-function CPU attribution",
+    "Active uncontrolled workload; historical samples are not matched before/after benchmarks",
+    "Files scanned in sync summaries is discovery/accounting, not proof every file was fully parsed",
+    "A parent-labelled compaction without an exact Ultra restoration record cannot be certified as Ultra/max solely by shared logged session",
+    "Observed live models do not cover every maintained GPT model; wider model coverage remains source-test evidence",
+    "No prompt, request body, credential, URL, session, or trace identifiers persisted"
+  ],
+  "sourceChangesThisTurn": true,
+  "appBuildRestartInstallOrReplacementByAgent": false,
+  "reasoningCaveatReview": {
+    "status": "Unresolved evidence gap, not proven policy failure",
+    "sourceContract": "Exact recorded Ultra restores max; exact XHigh or missing proof must retain xhigh; is_subagent=false is absence of explicit child marker, not proof of parent ownership",
+    "sourceRegression": "desktop_compaction_restores_only_recorded_parent_ultra_and_cannot_authorize_continuation",
+    "prohibitedInference": "Do not infer Ultra from a shared session field or rewrite all xhigh to max",
+    "timingCaveat": "request_prepared.elapsed_ms starts after exact parent-effort restoration and is neither total preparation time nor CPU time"
+  },
+  "additionalSourceReview": {
+    "retryableOrdinaryChild": "Implemented bounded exact-content-validated parser derivative reuse. Current parent/index/checkpoint/recovery authority remains fresh; only actual child-local Unavailable layout proof can bypass that certifier inspection.",
+    "nativeCodexStreaming": "No new major growing-prefix replay defect found in reviewed native paths; observers have distinct duties",
+    "separateNonNativePath": "Claude openai_responses priming still has fragmented-input whole-prefix work; not attributed to this native Codex sample and not changed in this task",
+    "parentTimeline": "Exact raw digest required on cached timeline reuse; restored-mtime middle rewrites recover. No O(1) I/O claim; unchanged parents still hash once per lookup."
+  },
+  "resourceSamplePrecedesNewSourceFix": true,
+  "sourcePatchVerification": {
+    "broadRustPassed": 377,
+    "broadRustFailed": 0,
+    "existingManualCorpusIgnored": 1,
+    "deterministicPerformanceTests": 22,
+    "runnerNodeTests": 28,
+    "catalogTests": 895,
+    "strictClippyPassed": true,
+    "typecheckPassed": true
+  },
+  "finalBoundary": {
+    "newParserFixLiveMeasured": false,
+    "appRebuiltOrRestartedByAgent": false,
+    "backendSnapshotOnly": true,
+    "notAControlledBeforeAfterBenchmark": true,
+    "allEarlierHotspotsCertifiedSolved": false,
+    "observerSourceConcurrentWriter": "Observer tests passed39 on stable snapshot; subsequent typecheck/hash check detected changed observer sources, so no final whole-checkout/all-clear or rebuild request while ownership is unresolved."
+  }
+}

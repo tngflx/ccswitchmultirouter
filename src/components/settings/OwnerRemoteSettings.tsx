@@ -5,6 +5,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { ownerRemoteApi, type OwnerRemoteStatus } from "@/lib/api/ownerRemote";
+import {
+  tailscaleApi,
+  type TailscaleState,
+  type TailscaleStatus,
+} from "@/lib/api/tailscale";
 
 function normalizeHttpsOrigin(value: string): string | null {
   try {
@@ -25,7 +30,48 @@ function normalizeHttpsOrigin(value: string): string | null {
   }
 }
 
-type PendingAction = "status" | "start" | "stop" | "invite";
+type PendingAction =
+  | "status"
+  | "start"
+  | "stop"
+  | "invite"
+  | "tailscaleConnect"
+  | "tailscaleVerify";
+
+const tailscaleStateKeys: Record<TailscaleState, string> = {
+  missing: "settings.ownerRemote.tailscaleMissing",
+  needsLogin: "settings.ownerRemote.tailscaleNeedsLogin",
+  needsApproval: "settings.ownerRemote.tailscaleNeedsApproval",
+  serveMissing: "settings.ownerRemote.tailscaleServeMissing",
+  targetMismatch: "settings.ownerRemote.tailscaleTargetMismatch",
+  originMismatch: "settings.ownerRemote.tailscaleOriginMismatch",
+  ready: "settings.ownerRemote.tailscaleReady",
+  reachable: "settings.ownerRemote.tailscaleReachable",
+  unreachable: "settings.ownerRemote.tailscaleUnreachable",
+  error: "settings.ownerRemote.tailscaleError",
+};
+
+const tailscaleErrors: Record<string, string> = {
+  tailscale_install_failed: "tailscaleInstallFailed",
+  tailscale_install_unsupported: "tailscaleInstallUnsupported",
+  tailscale_winget_unavailable: "tailscaleWingetUnavailable",
+  tailscale_login_failed: "tailscaleLoginFailed",
+  tailscale_login_timeout: "tailscaleLoginTimeout",
+  tailscale_serve_failed: "tailscaleServeFailed",
+  tailscale_serve_conflict: "tailscaleTargetMismatch",
+  tailscale_funnel_enabled: "tailscaleFunnelEnabled",
+  tailscale_owner_remote_start_failed: "tailscaleListenerFailed",
+  tailscale_probe_failed: "tailscaleProbeFailed",
+  tailscale_command_failed: "tailscaleCommandFailed",
+  tailscale_setup_in_progress: "tailscaleSetupInProgress",
+};
+
+function tailscaleErrorKey(error: unknown): string {
+  return typeof error === "string" &&
+    Object.prototype.hasOwnProperty.call(tailscaleErrors, error)
+    ? tailscaleErrors[error]
+    : "tailscaleActionError";
+}
 
 /** Own native status and operations above the tab-mounted view. */
 export function useOwnerRemoteController(active: boolean) {
@@ -50,13 +96,35 @@ export function useOwnerRemoteController(active: boolean) {
   const activeRef = useRef(active);
   activeRef.current = active;
   const inviteViewVersion = useRef(0);
+  const [tailscaleStatus, setTailscaleStatus] =
+    useState<TailscaleStatus | null>(null);
+  const [tailscaleChecking, setTailscaleChecking] = useState(false);
+  const [tailscaleError, setTailscaleError] = useState<string | null>(null);
+  const tailscaleReadRevision = useRef(0);
+  const tailscaleReadInFlight = useRef(false);
+
+  const clearTailscaleVerification = useCallback(() => {
+    setTailscaleStatus((previous) =>
+      previous?.state === "reachable" || previous?.state === "unreachable"
+        ? { ...previous, state: "ready", reachable: false, error: null }
+        : previous,
+    );
+  }, []);
+
+  const invalidateTailscaleProof = useCallback(() => {
+    tailscaleReadRevision.current += 1;
+    tailscaleReadInFlight.current = false;
+    setTailscaleChecking(false);
+    setTailscaleError(null);
+    clearTailscaleVerification();
+  }, [clearTailscaleVerification]);
 
   const run = useCallback(
     async <T,>(
       actionName: PendingAction,
       action: () => Promise<T>,
       onSuccess: (result: T) => void,
-      onFailure?: () => void,
+      onFailure?: (error: unknown) => void,
     ) => {
       // Lock synchronously: two clicks in the same render must not start two
       // listeners or overlap a status read with a configuration mutation.
@@ -70,14 +138,24 @@ export function useOwnerRemoteController(active: boolean) {
       setPendingAction(actionName);
       setError(false);
       setInvite(null);
+      const tailscaleAction =
+        actionName === "tailscaleConnect" || actionName === "tailscaleVerify";
+      if (tailscaleAction || actionName === "start" || actionName === "stop") {
+        invalidateTailscaleProof();
+      }
       try {
         const result = await action();
         if (isCurrent()) onSuccess(result);
-      } catch {
+      } catch (failure) {
         // Never log or reflect native exceptions: enrollment can carry secrets.
         if (isCurrent()) {
-          setError(true);
-          if (actionName === "start" || actionName === "stop") {
+          if (!tailscaleAction) setError(true);
+          onFailure?.(failure);
+          if (
+            actionName === "start" ||
+            actionName === "stop" ||
+            actionName === "tailscaleConnect"
+          ) {
             // A rejected mutation is not a rollback: stop closes the listener
             // even when persisting opt-out fails. Keep the action lock until
             // native status has reconciled both intent and runtime readiness.
@@ -97,8 +175,6 @@ export function useOwnerRemoteController(active: boolean) {
                 if (isCurrent()) setStatusFailed(true);
               }
             }
-          } else {
-            onFailure?.();
           }
         }
       } finally {
@@ -113,7 +189,7 @@ export function useOwnerRemoteController(active: boolean) {
         }
       }
     },
-    [],
+    [invalidateTailscaleProof],
   );
 
   const refreshStatus = useCallback(() => {
@@ -129,11 +205,44 @@ export function useOwnerRemoteController(active: boolean) {
         setOrigin(next.httpsOrigin ?? "");
         setStatusFailed(false);
         setError(Boolean(next.error));
+        if (!next.running) clearTailscaleVerification();
       },
-      () => setStatusFailed(true),
+      () => {
+        setStatusFailed(true);
+        clearTailscaleVerification();
+      },
     );
-  }, [run]);
+  }, [clearTailscaleVerification, run]);
   refreshStatusRef.current = refreshStatus;
+
+  const refreshTailscale = useCallback(async () => {
+    if (
+      !mounted.current ||
+      tailscaleReadInFlight.current ||
+      (inFlight.current && !statusInFlight.current)
+    )
+      return;
+    tailscaleReadInFlight.current = true;
+    const revision = ++tailscaleReadRevision.current;
+    const isCurrent = () =>
+      mounted.current && revision === tailscaleReadRevision.current;
+    setTailscaleChecking(true);
+    setTailscaleError(null);
+    try {
+      const next = await tailscaleApi.getStatus();
+      if (isCurrent()) setTailscaleStatus(next);
+    } catch (failure) {
+      if (isCurrent()) {
+        setTailscaleStatus(null);
+        setTailscaleError(tailscaleErrorKey(failure));
+      }
+    } finally {
+      if (isCurrent()) {
+        tailscaleReadInFlight.current = false;
+        setTailscaleChecking(false);
+      }
+    }
+  }, []);
 
   // Only actual owner teardown invalidates mutations; hiding a tab does not.
   useEffect(() => {
@@ -144,6 +253,8 @@ export function useOwnerRemoteController(active: boolean) {
       inFlight.current = false;
       statusInFlight.current = false;
       refreshQueued.current = false;
+      tailscaleReadRevision.current += 1;
+      tailscaleReadInFlight.current = false;
     };
   }, []);
 
@@ -151,12 +262,13 @@ export function useOwnerRemoteController(active: boolean) {
     if (active) {
       // run() retains a pending mutation's lock instead of racing its IPC.
       void refreshStatus();
+      void refreshTailscale();
     } else {
       // Enrollment material is view-scoped, unlike status and mutations.
       inviteViewVersion.current += 1;
       setInvite(null);
     }
-  }, [active, refreshStatus]);
+  }, [active, refreshStatus, refreshTailscale]);
 
   useEffect(() => {
     if (!invite) return;
@@ -231,6 +343,37 @@ export function useOwnerRemoteController(active: boolean) {
     );
   };
 
+  const applyTailscaleStatus = (next: TailscaleStatus) => {
+    setTailscaleStatus(next);
+    if (next.error) setTailscaleError(tailscaleErrorKey(next.error));
+  };
+  const connectTailscale = () =>
+    void run(
+      "tailscaleConnect",
+      async () => {
+        const tailscale = await tailscaleApi.connect();
+        const owner = await ownerRemoteApi.getStatus().catch(() => null);
+        return { tailscale, owner };
+      },
+      ({ tailscale, owner }) => {
+        if (owner) {
+          applyStatus(owner);
+          if (owner.httpsOrigin) setOrigin(owner.httpsOrigin);
+        } else {
+          setStatusFailed(true);
+        }
+        applyTailscaleStatus(tailscale);
+      },
+      (failure) => setTailscaleError(tailscaleErrorKey(failure)),
+    );
+  const verifyTailscale = () =>
+    void run(
+      "tailscaleVerify",
+      () => tailscaleApi.verifyOwnerRemote(),
+      applyTailscaleStatus,
+      (failure) => setTailscaleError(tailscaleErrorKey(failure)),
+    );
+
   return {
     status,
     origin,
@@ -250,6 +393,12 @@ export function useOwnerRemoteController(active: boolean) {
     stop,
     changeOrigin,
     createInvite,
+    tailscaleStatus,
+    tailscaleChecking,
+    tailscaleError,
+    refreshTailscale,
+    connectTailscale,
+    verifyTailscale,
   };
 }
 
@@ -279,7 +428,42 @@ export function OwnerRemoteSettings({ controller }: OwnerRemoteSettingsProps) {
     stop,
     changeOrigin,
     createInvite,
+    tailscaleStatus,
+    tailscaleChecking,
+    tailscaleError,
+    refreshTailscale,
+    connectTailscale,
+    verifyTailscale,
   } = controller;
+
+  const tailscaleState = tailscaleStatus?.state;
+  const verified =
+    running &&
+    pendingAction !== "status" &&
+    !tailscaleChecking &&
+    tailscaleState === "reachable" &&
+    tailscaleStatus?.reachable;
+  const canVerify =
+    running &&
+    (tailscaleState === "ready" ||
+      tailscaleState === "reachable" ||
+      tailscaleState === "unreachable");
+  const tailscaleStateLabel = !tailscaleState
+    ? t("settings.ownerRemote.tailscaleNotChecked")
+    : tailscaleState === "reachable" && !verified
+      ? t("settings.ownerRemote.tailscaleReady")
+      : t(tailscaleStateKeys[tailscaleState]);
+  const tailscaleActionLabel =
+    pendingAction === "tailscaleConnect"
+      ? t("settings.ownerRemote.tailscaleActionConnect")
+      : pendingAction === "tailscaleVerify"
+        ? t("settings.ownerRemote.tailscaleActionVerify")
+        : tailscaleChecking
+          ? t("settings.ownerRemote.tailscaleActionStatus")
+          : null;
+  const tailscaleStatusError =
+    tailscaleError ??
+    (tailscaleStatus?.error ? tailscaleErrorKey(tailscaleStatus.error) : null);
 
   return (
     <section
@@ -348,6 +532,69 @@ export function OwnerRemoteSettings({ controller }: OwnerRemoteSettingsProps) {
               })}
         </Button>
       </div>
+      <section
+        className="space-y-2 border-t border-border/70 pt-3"
+        aria-labelledby="owner-remote-tailscale-title"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="space-y-1">
+            <h4
+              id="owner-remote-tailscale-title"
+              className="text-sm font-medium"
+            >
+              {t("settings.ownerRemote.tailscaleTitle", {
+                defaultValue: "Tailscale connection",
+              })}
+            </h4>
+            <p className="text-xs text-muted-foreground" aria-live="polite">
+              {tailscaleActionLabel ?? tailscaleStateLabel}
+            </p>
+          </div>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={busy || tailscaleChecking}
+            onClick={() => void refreshTailscale()}
+          >
+            {t("settings.ownerRemote.tailscaleRefresh", {
+              defaultValue: "Check Tailscale",
+            })}
+          </Button>
+        </div>
+        {tailscaleStatusError ? (
+          <p className="text-xs text-destructive" role="alert">
+            {t(`settings.ownerRemote.${tailscaleStatusError}`)}
+          </p>
+        ) : null}
+        <div className="flex flex-wrap gap-2">
+          {!verified ? (
+            <Button
+              size="sm"
+              disabled={busy || tailscaleChecking}
+              onClick={connectTailscale}
+            >
+              {t("settings.ownerRemote.tailscaleConnect")}
+            </Button>
+          ) : null}
+          {canVerify ? (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy || tailscaleChecking}
+              onClick={verifyTailscale}
+            >
+              {t("settings.ownerRemote.tailscaleVerify", {
+                defaultValue: "Verify connection",
+              })}
+            </Button>
+          ) : null}
+        </div>
+        {verified ? (
+          <p className="text-xs text-muted-foreground">
+            {t("settings.ownerRemote.tailscaleEnrollDevice")}
+          </p>
+        ) : null}
+      </section>
       {enabled && running ? (
         <p className="text-xs text-muted-foreground">
           {t("settings.ownerRemote.listenerOnly")}

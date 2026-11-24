@@ -1,0 +1,32 @@
+{
+  "capturedAtUtc": "2026-11-23T11:13:45.858Z",
+  "method": "Valid envelopes and explicit parent-readiness/Unavailable precondition; temporarily bypass child snapshot lookup and exact parent cache validation, run both regressions, restore final source in finally",
+  "sourceRestored": true,
+  "exitStatus": 101,
+  "expectedRegressionFailureObserved": true,
+  "failures": [
+    {
+      "test": "services::session_usage_codex::tests::retryable_child_snapshot_reuse_bounds_parsing_and_retained_records",
+      "expectedFailureObserved": true
+    },
+    {
+      "test": "services::session_usage_codex::tests::retryable_parent_timeline_checks_exact_bytes_without_reparsing_unchanged_history",
+      "expectedFailureObserved": true
+    }
+  ],
+  "previousAttempt": {
+    "capturedAtUtc": "2026-11-23T10:51:00.257Z",
+    "method": "Temporarily bypass only disposable retryable snapshot lookup, run exact deterministic regression, restore final source in finally",
+    "sourceRestored": true,
+    "exitStatus": 101,
+    "expectedRegressionFailureObserved": true
+  },
+  "green": {
+    "recordedAtUtc": "2026-11-23T11:34:32.962Z",
+    "broadRustPassed": 377,
+    "failed": 0,
+    "existingManualCorpusIgnored": 1,
+    "performanceRegressionsPassed": 22,
+    "fixtureCorrections": "New rows now have valid timestamp envelopes and explicit parent-readiness precondition; ledger columns asserted separately because input already includes cached subset. Production ownership guards and existing assertions not weakened."
+  }
+}

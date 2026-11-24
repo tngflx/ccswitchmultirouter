@@ -1,0 +1,6125 @@
+{
+  "schemaVersion": 1,
+  "scope": "User-authorized read-only PID-scoped CPU/RAM measurement, no concurrent tests/app builds or runtime mutation",
+  "startedAtUtc": "2026-11-22T17:32:52.2041826+00:00",
+  "finishedAtUtc": "2026-11-22T17:35:52.4018640+00:00",
+  "timezone": "Asia/Singapore",
+  "application": {
+    "pid": 24180,
+    "executablePath": "H:\\repos\\ccswitchmulti-refork\\src-tauri\\target\\debug\\cc-switch.exe",
+    "version": "3.20.4-3",
+    "markerStart": "2026-11-23 01:16:14.076",
+    "identityUnchanged": true
+  },
+  "method": {
+    "durationTargetSeconds": 180,
+    "intervalSeconds": 2,
+    "processTreeRefreshSeconds": 30,
+    "cpuBasis": "100 percent is one logical core; machine percentage divides by logical processor count",
+    "workingSetCaveat": "Summed working sets may double-count shared pages",
+    "membershipCaveat": "May miss short-lived descendants between scoped tree refreshes",
+    "aggregation": "CPU deltas and memory sums derived directly from serialized per-process fields; PowerShell dictionary Measure-Object aggregates were corrected before analysis"
+  },
+  "summary": {
+    "durationSeconds": 180.1976814,
+    "sampleCount": 86,
+    "logicalProcessors": 16,
+    "rootAverageCpuOneCorePercent": 158.15963767445012,
+    "rootAverageCpuMachinePercent": 9.884977354653133,
+    "rootPeakCpuOneCorePercent": 639.799925704464,
+    "treeAverageCpuOneCorePercent": 158.15963767445004,
+    "treeAverageCpuMachinePercent": 9.884977354653127,
+    "treePeakCpuMachinePercent": 39.987495356529,
+    "rootPrivateStartBytes": 229642240,
+    "rootPrivateEndBytes": 207360000,
+    "rootPrivatePeakBytes": 237666304,
+    "treePrivateStartBytes": 680914944,
+    "treePrivateEndBytes": 658415616,
+    "treePrivatePeakBytes": 688128000
+  },
+  "processIdentities": [
+    {
+      "pid": 53876,
+      "name": "pwsh",
+      "startedAtUtc": "2026-11-22T17:32:51.1278797Z"
+    },
+    {
+      "pid": 3184,
+      "name": "msedgewebview2",
+      "startedAtUtc": "2026-11-22T17:16:13.7728686Z"
+    },
+    {
+      "pid": 62912,
+      "name": "msedgewebview2",
+      "startedAtUtc": "2026-11-22T17:16:13.6388256Z"
+    },
+    {
+      "pid": 64444,
+      "name": "pwsh",
+      "startedAtUtc": "2026-11-22T17:33:21.7848704Z"
+    },
+    {
+      "pid": 60756,
+      "name": "pwsh",
+      "startedAtUtc": "2026-11-22T17:34:56.2417477Z"
+    },
+    {
+      "pid": 57144,
+      "name": "pwsh",
+      "startedAtUtc": "2026-11-22T17:35:27.7349825Z"
+    },
+    {
+      "pid": 66872,
+      "name": "msedgewebview2",
+      "startedAtUtc": "2026-11-22T17:16:13.8154638Z"
+    },
+    {
+      "pid": 66504,
+      "name": "msedgewebview2",
+      "startedAtUtc": "2026-11-22T17:16:13.7722015Z"
+    },
+    {
+      "pid": 12576,
+      "name": "pwsh",
+      "startedAtUtc": "2026-11-22T17:34:24.7378082Z"
+    },
+    {
+      "pid": 24180,
+      "name": "cc-switch",
+      "startedAtUtc": "2026-11-22T17:16:13.3948153Z"
+    },
+    {
+      "pid": 24336,
+      "name": "msedgewebview2",
+      "startedAtUtc": "2026-11-22T17:16:13.5955093Z"
+    },
+    {
+      "pid": 44280,
+      "name": "msedgewebview2",
+      "startedAtUtc": "2026-11-22T17:16:13.9010878Z"
+    }
+  ],
+  "failure": null,
+  "samples": [
+    {
+      "capturedAtUtc": "2026-11-22T17:32:54.2567596+00:00",
+      "elapsedSeconds": 2.052577,
+      "rootCpuOneCorePercent": 48.71924415015856,
+      "rootCpuMachinePercent": 3.04495275938491,
+      "treeCpuOneCorePercent": 48.71924415015856,
+      "treeCpuMachinePercent": 3.04495275938491,
+      "rootPrivateBytes": 229642240,
+      "rootWorkingSetBytes": 286527488,
+      "treePrivateBytes": 680914944,
+      "treeWorkingSetBytes": 930869248,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49618944,
+          "workingSetBytes": 156598272
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 1,
+          "cpuOneCorePercent": 48.71924415015856,
+          "privateBytes": 229642240,
+          "workingSetBytes": 286527488
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15896576,
+          "workingSetBytes": 50843648
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 244166656,
+          "workingSetBytes": 293969920
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129597440,
+          "workingSetBytes": 103976960
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:32:56.3223145+00:00",
+      "elapsedSeconds": 2.0655549,
+      "rootCpuOneCorePercent": 193.65256280527814,
+      "rootCpuMachinePercent": 12.103285175329884,
+      "treeCpuOneCorePercent": 193.65256280527814,
+      "treeCpuMachinePercent": 12.103285175329884,
+      "rootPrivateBytes": 228069376,
+      "rootWorkingSetBytes": 284835840,
+      "treePrivateBytes": 677367808,
+      "treeWorkingSetBytes": 927297536,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47644672,
+          "workingSetBytes": 154718208
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 4,
+          "cpuOneCorePercent": 193.65256280527814,
+          "privateBytes": 228069376,
+          "workingSetBytes": 284835840
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15896576,
+          "workingSetBytes": 50843648
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 244166656,
+          "workingSetBytes": 293969920
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129597440,
+          "workingSetBytes": 103976960
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:32:58.3767777+00:00",
+      "elapsedSeconds": 2.0544632,
+      "rootCpuOneCorePercent": 97.34903015055222,
+      "rootCpuMachinePercent": 6.084314384409514,
+      "treeCpuOneCorePercent": 97.34903015055222,
+      "treeCpuMachinePercent": 6.084314384409514,
+      "rootPrivateBytes": 226869248,
+      "rootWorkingSetBytes": 283918336,
+      "treePrivateBytes": 676421632,
+      "treeWorkingSetBytes": 926437376,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47636480,
+          "workingSetBytes": 154710016
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 97.34903015055222,
+          "privateBytes": 226869248,
+          "workingSetBytes": 283918336
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15896576,
+          "workingSetBytes": 50843648
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 244428800,
+          "workingSetBytes": 294035456
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129597440,
+          "workingSetBytes": 103976960
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:00.4260818+00:00",
+      "elapsedSeconds": 2.0493041,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 226783232,
+      "rootWorkingSetBytes": 283901952,
+      "treePrivateBytes": 676229120,
+      "treeWorkingSetBytes": 926363648,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47591424,
+          "workingSetBytes": 154689536
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 226783232,
+          "workingSetBytes": 283901952
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15896576,
+          "workingSetBytes": 50843648
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 244428800,
+          "workingSetBytes": 294035456
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129536000,
+          "workingSetBytes": 103940096
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:02.4805870+00:00",
+      "elapsedSeconds": 2.0545052,
+      "rootCpuOneCorePercent": 146.02056008424802,
+      "rootCpuMachinePercent": 9.126285005265501,
+      "treeCpuOneCorePercent": 146.02056008424802,
+      "treeCpuMachinePercent": 9.126285005265501,
+      "rootPrivateBytes": 232550400,
+      "rootWorkingSetBytes": 289951744,
+      "treePrivateBytes": 682074112,
+      "treeWorkingSetBytes": 932466688,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47607808,
+          "workingSetBytes": 154705920
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 3,
+          "cpuOneCorePercent": 146.02056008424802,
+          "privateBytes": 232550400,
+          "workingSetBytes": 289951744
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15896576,
+          "workingSetBytes": 50843648
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 244432896,
+          "workingSetBytes": 294039552
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:04.5389499+00:00",
+      "elapsedSeconds": 2.0583629,
+      "rootCpuOneCorePercent": 97.1645961943834,
+      "rootCpuMachinePercent": 6.072787262148963,
+      "treeCpuOneCorePercent": 97.1645961943834,
+      "treeCpuMachinePercent": 6.072787262148963,
+      "rootPrivateBytes": 232546304,
+      "rootWorkingSetBytes": 289988608,
+      "treePrivateBytes": 684036096,
+      "treeWorkingSetBytes": 934440960,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49573888,
+          "workingSetBytes": 156577792
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 97.1645961943834,
+          "privateBytes": 232546304,
+          "workingSetBytes": 289988608
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15896576,
+          "workingSetBytes": 50843648
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 244432896,
+          "workingSetBytes": 294105088
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:06.5847063+00:00",
+      "elapsedSeconds": 2.0457564,
+      "rootCpuOneCorePercent": 97.76335051426454,
+      "rootCpuMachinePercent": 6.110209407141534,
+      "treeCpuOneCorePercent": 97.76335051426454,
+      "treeCpuMachinePercent": 6.110209407141534,
+      "rootPrivateBytes": 232767488,
+      "rootWorkingSetBytes": 290156544,
+      "treePrivateBytes": 684257280,
+      "treeWorkingSetBytes": 934674432,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49573888,
+          "workingSetBytes": 156577792
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 97.76335051426454,
+          "privateBytes": 232767488,
+          "workingSetBytes": 290156544
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15896576,
+          "workingSetBytes": 50843648
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 244432896,
+          "workingSetBytes": 294170624
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:08.6230794+00:00",
+      "elapsedSeconds": 2.0383731,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 232767488,
+      "rootWorkingSetBytes": 290197504,
+      "treePrivateBytes": 682274816,
+      "treeWorkingSetBytes": 932892672,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47591424,
+          "workingSetBytes": 154689536
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 232767488,
+          "workingSetBytes": 290197504
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15896576,
+          "workingSetBytes": 50843648
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 244432896,
+          "workingSetBytes": 294236160
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:10.6832375+00:00",
+      "elapsedSeconds": 2.0601581,
+      "rootCpuOneCorePercent": 48.5399639959671,
+      "rootCpuMachinePercent": 3.0337477497479437,
+      "treeCpuOneCorePercent": 48.5399639959671,
+      "treeCpuMachinePercent": 3.0337477497479437,
+      "rootPrivateBytes": 230973440,
+      "rootWorkingSetBytes": 288423936,
+      "treePrivateBytes": 682536960,
+      "treeWorkingSetBytes": 932331520,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47607808,
+          "workingSetBytes": 154705920
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 1,
+          "cpuOneCorePercent": 48.5399639959671,
+          "privateBytes": 230973440,
+          "workingSetBytes": 288423936
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15896576,
+          "workingSetBytes": 50843648
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 246472704,
+          "workingSetBytes": 295432192
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:12.7261999+00:00",
+      "elapsedSeconds": 2.0429624,
+      "rootCpuOneCorePercent": 97.89705380774507,
+      "rootCpuMachinePercent": 6.118565862984067,
+      "treeCpuOneCorePercent": 97.89705380774507,
+      "treeCpuMachinePercent": 6.118565862984067,
+      "rootPrivateBytes": 231002112,
+      "rootWorkingSetBytes": 288452608,
+      "treePrivateBytes": 682631168,
+      "treeWorkingSetBytes": 932429824,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47607808,
+          "workingSetBytes": 154705920
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 97.89705380774507,
+          "privateBytes": 231002112,
+          "workingSetBytes": 288452608
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15896576,
+          "workingSetBytes": 50843648
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 246538240,
+          "workingSetBytes": 295501824
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:14.7831754+00:00",
+      "elapsedSeconds": 2.0569755,
+      "rootCpuOneCorePercent": 194.46026459722052,
+      "rootCpuMachinePercent": 12.153766537326282,
+      "treeCpuOneCorePercent": 194.46026459722052,
+      "treeCpuMachinePercent": 12.153766537326282,
+      "rootPrivateBytes": 230055936,
+      "rootWorkingSetBytes": 287440896,
+      "treePrivateBytes": 683573248,
+      "treeWorkingSetBytes": 933326848,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3170304,
+          "workingSetBytes": 15265792
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49577984,
+          "workingSetBytes": 156581888
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 4,
+          "cpuOneCorePercent": 194.46026459722052,
+          "privateBytes": 230055936,
+          "workingSetBytes": 287440896
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15855616,
+          "workingSetBytes": 50827264
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 246538240,
+          "workingSetBytes": 295567360
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:16.8225871+00:00",
+      "elapsedSeconds": 2.0394117,
+      "rootCpuOneCorePercent": 98.06749662169733,
+      "rootCpuMachinePercent": 6.129218538856083,
+      "treeCpuOneCorePercent": 98.06749662169733,
+      "treeCpuMachinePercent": 6.129218538856083,
+      "rootPrivateBytes": 230064128,
+      "rootWorkingSetBytes": 287461376,
+      "treePrivateBytes": 683646976,
+      "treeWorkingSetBytes": 933367808,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49553408,
+          "workingSetBytes": 156557312
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 98.06749662169733,
+          "privateBytes": 230064128,
+          "workingSetBytes": 287461376
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 246538240,
+          "workingSetBytes": 295571456
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:18.8565433+00:00",
+      "elapsedSeconds": 2.0339562,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 228491264,
+      "rootWorkingSetBytes": 285720576,
+      "treePrivateBytes": 682106880,
+      "treeWorkingSetBytes": 931659776,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49586176,
+          "workingSetBytes": 156590080
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 228491264,
+          "workingSetBytes": 285720576
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 246538240,
+          "workingSetBytes": 295571456
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:20.8952711+00:00",
+      "elapsedSeconds": 2.0387278,
+      "rootCpuOneCorePercent": 98.10039378479068,
+      "rootCpuMachinePercent": 6.131274611549418,
+      "treeCpuOneCorePercent": 98.10039378479068,
+      "treeCpuMachinePercent": 6.131274611549418,
+      "rootPrivateBytes": 227745792,
+      "rootWorkingSetBytes": 285605888,
+      "treePrivateBytes": 679383040,
+      "treeWorkingSetBytes": 929660928,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47607808,
+          "workingSetBytes": 154705920
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 98.10039378479068,
+          "privateBytes": 227745792,
+          "workingSetBytes": 285605888
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 246538240,
+          "workingSetBytes": 295571456
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:23.9063031+00:00",
+      "elapsedSeconds": 3.011032,
+      "rootCpuOneCorePercent": 166.05602331692256,
+      "rootCpuMachinePercent": 10.37850145730766,
+      "treeCpuOneCorePercent": 166.05602331692256,
+      "treeCpuMachinePercent": 10.37850145730766,
+      "rootPrivateBytes": 230678528,
+      "rootWorkingSetBytes": 289001472,
+      "treePrivateBytes": 682307584,
+      "treeWorkingSetBytes": 933048320,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47599616,
+          "workingSetBytes": 154697728
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 5,
+          "cpuOneCorePercent": 166.05602331692256,
+          "privateBytes": 230678528,
+          "workingSetBytes": 289001472
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 246538240,
+          "workingSetBytes": 295571456
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:25.9571246+00:00",
+      "elapsedSeconds": 2.0508215,
+      "rootCpuOneCorePercent": 97.52189549407396,
+      "rootCpuMachinePercent": 6.0951184683796225,
+      "treeCpuOneCorePercent": 97.52189549407396,
+      "treeCpuMachinePercent": 6.0951184683796225,
+      "rootPrivateBytes": 230793216,
+      "rootWorkingSetBytes": 289271808,
+      "treePrivateBytes": 683085824,
+      "treeWorkingSetBytes": 934666240,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49573888,
+          "workingSetBytes": 156577792
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 97.52189549407396,
+          "privateBytes": 230793216,
+          "workingSetBytes": 289271808
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295038976
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:27.9812840+00:00",
+      "elapsedSeconds": 2.0241594,
+      "rootCpuOneCorePercent": 148.20967162961574,
+      "rootCpuMachinePercent": 9.263104476850984,
+      "treeCpuOneCorePercent": 148.20967162961574,
+      "treeCpuMachinePercent": 9.263104476850984,
+      "rootPrivateBytes": 230707200,
+      "rootWorkingSetBytes": 289230848,
+      "treePrivateBytes": 682999808,
+      "treeWorkingSetBytes": 934625280,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49573888,
+          "workingSetBytes": 156577792
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 3,
+          "cpuOneCorePercent": 148.20967162961574,
+          "privateBytes": 230707200,
+          "workingSetBytes": 289230848
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295038976
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:30.0221944+00:00",
+      "elapsedSeconds": 2.0409104,
+      "rootCpuOneCorePercent": 97.99548280022483,
+      "rootCpuMachinePercent": 6.124717675014052,
+      "treeCpuOneCorePercent": 97.99548280022483,
+      "treeCpuMachinePercent": 6.124717675014052,
+      "rootPrivateBytes": 230895616,
+      "rootWorkingSetBytes": 289415168,
+      "treePrivateBytes": 683208704,
+      "treeWorkingSetBytes": 934830080,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49594368,
+          "workingSetBytes": 156598272
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 97.99548280022483,
+          "privateBytes": 230895616,
+          "workingSetBytes": 289415168
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295038976
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:32.0542369+00:00",
+      "elapsedSeconds": 2.0320425,
+      "rootCpuOneCorePercent": 196.8462765911638,
+      "rootCpuMachinePercent": 12.302892286947737,
+      "treeCpuOneCorePercent": 196.8462765911638,
+      "treeCpuMachinePercent": 12.302892286947737,
+      "rootPrivateBytes": 231227392,
+      "rootWorkingSetBytes": 289718272,
+      "treePrivateBytes": 681574400,
+      "treeWorkingSetBytes": 933257216,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47628288,
+          "workingSetBytes": 154722304
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 4,
+          "cpuOneCorePercent": 196.8462765911638,
+          "privateBytes": 231227392,
+          "workingSetBytes": 289718272
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295038976
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:34.0968397+00:00",
+      "elapsedSeconds": 2.0426028,
+      "rootCpuOneCorePercent": 391.65715429353173,
+      "rootCpuMachinePercent": 24.478572143345733,
+      "treeCpuOneCorePercent": 391.65715429353173,
+      "treeCpuMachinePercent": 24.478572143345733,
+      "rootPrivateBytes": 201166848,
+      "rootWorkingSetBytes": 259751936,
+      "treePrivateBytes": 651509760,
+      "treeWorkingSetBytes": 903290880,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47624192,
+          "workingSetBytes": 154718208
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 8,
+          "cpuOneCorePercent": 391.65715429353173,
+          "privateBytes": 201166848,
+          "workingSetBytes": 259751936
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295043072
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:36.1370944+00:00",
+      "elapsedSeconds": 2.0402547,
+      "rootCpuOneCorePercent": 441.1213952846181,
+      "rootCpuMachinePercent": 27.57008720528863,
+      "treeCpuOneCorePercent": 441.1213952846181,
+      "treeCpuMachinePercent": 27.57008720528863,
+      "rootPrivateBytes": 212426752,
+      "rootWorkingSetBytes": 267829248,
+      "treePrivateBytes": 662765568,
+      "treeWorkingSetBytes": 911364096,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47620096,
+          "workingSetBytes": 154714112
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 9,
+          "cpuOneCorePercent": 441.1213952846181,
+          "privateBytes": 212426752,
+          "workingSetBytes": 267829248
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295043072
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:38.1763079+00:00",
+      "elapsedSeconds": 2.0392135,
+      "rootCpuOneCorePercent": 441.34662702066265,
+      "rootCpuMachinePercent": 27.584164188791416,
+      "treeCpuOneCorePercent": 441.34662702066265,
+      "treeCpuMachinePercent": 27.584164188791416,
+      "rootPrivateBytes": 191950848,
+      "rootWorkingSetBytes": 248446976,
+      "treePrivateBytes": 642297856,
+      "treeWorkingSetBytes": 891990016,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47628288,
+          "workingSetBytes": 154722304
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 9,
+          "cpuOneCorePercent": 441.34662702066265,
+          "privateBytes": 191950848,
+          "workingSetBytes": 248446976
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295043072
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:40.2197719+00:00",
+      "elapsedSeconds": 2.043464,
+      "rootCpuOneCorePercent": 244.68255863572833,
+      "rootCpuMachinePercent": 15.29265991473302,
+      "treeCpuOneCorePercent": 244.68255863572833,
+      "treeCpuMachinePercent": 15.29265991473302,
+      "rootPrivateBytes": 201633792,
+      "rootWorkingSetBytes": 257228800,
+      "treePrivateBytes": 651956224,
+      "treeWorkingSetBytes": 900751360,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47603712,
+          "workingSetBytes": 154697728
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 5,
+          "cpuOneCorePercent": 244.68255863572833,
+          "privateBytes": 201633792,
+          "workingSetBytes": 257228800
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295047168
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:42.2575425+00:00",
+      "elapsedSeconds": 2.0377706,
+      "rootCpuOneCorePercent": 98.14647438725439,
+      "rootCpuMachinePercent": 6.134154649203399,
+      "treeCpuOneCorePercent": 98.14647438725439,
+      "treeCpuMachinePercent": 6.134154649203399,
+      "rootPrivateBytes": 203325440,
+      "rootWorkingSetBytes": 259104768,
+      "treePrivateBytes": 653676544,
+      "treeWorkingSetBytes": 902656000,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47632384,
+          "workingSetBytes": 154726400
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 98.14647438725439,
+          "privateBytes": 203325440,
+          "workingSetBytes": 259104768
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295047168
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:44.2802062+00:00",
+      "elapsedSeconds": 2.0226637,
+      "rootCpuOneCorePercent": 98.87951219968006,
+      "rootCpuMachinePercent": 6.179969512480004,
+      "treeCpuOneCorePercent": 98.87951219968006,
+      "treeCpuMachinePercent": 6.179969512480004,
+      "rootPrivateBytes": 204988416,
+      "rootWorkingSetBytes": 260644864,
+      "treePrivateBytes": 655294464,
+      "treeWorkingSetBytes": 904175616,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47632384,
+          "workingSetBytes": 154726400
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 98.87951219968006,
+          "privateBytes": 204988416,
+          "workingSetBytes": 260644864
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295047168
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129548288,
+          "workingSetBytes": 103952384
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:46.3208037+00:00",
+      "elapsedSeconds": 2.0405975,
+      "rootCpuOneCorePercent": 294.03152753053945,
+      "rootCpuMachinePercent": 18.376970470658716,
+      "treeCpuOneCorePercent": 294.03152753053945,
+      "treeCpuMachinePercent": 18.376970470658716,
+      "rootPrivateBytes": 205897728,
+      "rootWorkingSetBytes": 261898240,
+      "treePrivateBytes": 658214912,
+      "treeWorkingSetBytes": 907321344,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49598464,
+          "workingSetBytes": 156598272
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 6,
+          "cpuOneCorePercent": 294.03152753053945,
+          "privateBytes": 205897728,
+          "workingSetBytes": 261898240
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15900672,
+          "workingSetBytes": 50847744
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295047168
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:48.3581649+00:00",
+      "elapsedSeconds": 2.0373612,
+      "rootCpuOneCorePercent": 245.4154913718785,
+      "rootCpuMachinePercent": 15.338468210742406,
+      "treeCpuOneCorePercent": 245.4154913718785,
+      "treeCpuMachinePercent": 15.338468210742406,
+      "rootPrivateBytes": 209752064,
+      "rootWorkingSetBytes": 264896512,
+      "treePrivateBytes": 660070400,
+      "treeWorkingSetBytes": 908431360,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47607808,
+          "workingSetBytes": 154701824
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 5,
+          "cpuOneCorePercent": 245.4154913718785,
+          "privateBytes": 209752064,
+          "workingSetBytes": 264896512
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15892480,
+          "workingSetBytes": 50839552
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295063552
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:50.4052284+00:00",
+      "elapsedSeconds": 2.0470635,
+      "rootCpuOneCorePercent": 244.2523155730147,
+      "rootCpuMachinePercent": 15.265769723313419,
+      "treeCpuOneCorePercent": 244.2523155730147,
+      "treeCpuMachinePercent": 15.265769723313419,
+      "rootPrivateBytes": 219275264,
+      "rootWorkingSetBytes": 274419712,
+      "treePrivateBytes": 669618176,
+      "treeWorkingSetBytes": 917979136,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47632384,
+          "workingSetBytes": 154726400
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 5,
+          "cpuOneCorePercent": 244.2523155730147,
+          "privateBytes": 219275264,
+          "workingSetBytes": 274419712
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15892480,
+          "workingSetBytes": 50839552
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295063552
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:52.4704511+00:00",
+      "elapsedSeconds": 2.0652227,
+      "rootCpuOneCorePercent": 242.1046408215443,
+      "rootCpuMachinePercent": 15.13154005134652,
+      "treeCpuOneCorePercent": 242.1046408215443,
+      "treeCpuMachinePercent": 15.13154005134652,
+      "rootPrivateBytes": 215760896,
+      "rootWorkingSetBytes": 272543744,
+      "treePrivateBytes": 666103808,
+      "treeWorkingSetBytes": 916103168,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47632384,
+          "workingSetBytes": 154726400
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 5,
+          "cpuOneCorePercent": 242.1046408215443,
+          "privateBytes": 215760896,
+          "workingSetBytes": 272543744
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15892480,
+          "workingSetBytes": 50839552
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295063552
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:55.2276507+00:00",
+      "elapsedSeconds": 2.7571996,
+      "rootCpuOneCorePercent": 36.268683631029106,
+      "rootCpuMachinePercent": 2.266792726939319,
+      "treeCpuOneCorePercent": 36.268683631029106,
+      "treeCpuMachinePercent": 2.266792726939319,
+      "rootPrivateBytes": 219205632,
+      "rootWorkingSetBytes": 276447232,
+      "treePrivateBytes": 671514624,
+      "treeWorkingSetBytes": 921878528,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49598464,
+          "workingSetBytes": 156598272
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 1,
+          "cpuOneCorePercent": 36.268683631029106,
+          "privateBytes": 219205632,
+          "workingSetBytes": 276447232
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15892480,
+          "workingSetBytes": 50839552
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295063552
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:57.2708175+00:00",
+      "elapsedSeconds": 2.0431668,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 220794880,
+      "rootWorkingSetBytes": 277176320,
+      "treePrivateBytes": 673071104,
+      "treeWorkingSetBytes": 922574848,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49565696,
+          "workingSetBytes": 156565504
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 220794880,
+          "workingSetBytes": 277176320
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15892480,
+          "workingSetBytes": 50839552
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295063552
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:33:59.3128351+00:00",
+      "elapsedSeconds": 2.0420176,
+      "rootCpuOneCorePercent": 146.91352317433504,
+      "rootCpuMachinePercent": 9.18209519839594,
+      "treeCpuOneCorePercent": 146.91352317433504,
+      "treeCpuMachinePercent": 9.18209519839594,
+      "rootPrivateBytes": 228159488,
+      "rootWorkingSetBytes": 284147712,
+      "treePrivateBytes": 678490112,
+      "treeWorkingSetBytes": 927703040,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47620096,
+          "workingSetBytes": 154714112
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 3,
+          "cpuOneCorePercent": 146.91352317433504,
+          "privateBytes": 228159488,
+          "workingSetBytes": 284147712
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15892480,
+          "workingSetBytes": 50839552
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295071744
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:01.3361677+00:00",
+      "elapsedSeconds": 2.0233326,
+      "rootCpuOneCorePercent": 49.423411652636844,
+      "rootCpuMachinePercent": 3.0889632282898027,
+      "treeCpuOneCorePercent": 49.423411652636844,
+      "treeCpuMachinePercent": 3.0889632282898027,
+      "rootPrivateBytes": 230445056,
+      "rootWorkingSetBytes": 286560256,
+      "treePrivateBytes": 680783872,
+      "treeWorkingSetBytes": 930123776,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47628288,
+          "workingSetBytes": 154722304
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 1,
+          "cpuOneCorePercent": 49.423411652636844,
+          "privateBytes": 230445056,
+          "workingSetBytes": 286560256
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15892480,
+          "workingSetBytes": 50839552
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295071744
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:03.3672826+00:00",
+      "elapsedSeconds": 2.0311149,
+      "rootCpuOneCorePercent": 49.23404382489637,
+      "rootCpuMachinePercent": 3.077127739056023,
+      "treeCpuOneCorePercent": 49.23404382489637,
+      "treeCpuMachinePercent": 3.077127739056023,
+      "rootPrivateBytes": 230055936,
+      "rootWorkingSetBytes": 285667328,
+      "treePrivateBytes": 680386560,
+      "treeWorkingSetBytes": 929222656,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47620096,
+          "workingSetBytes": 154714112
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 1,
+          "cpuOneCorePercent": 49.23404382489637,
+          "privateBytes": 230055936,
+          "workingSetBytes": 285667328
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15892480,
+          "workingSetBytes": 50839552
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295071744
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:05.4087946+00:00",
+      "elapsedSeconds": 2.041512,
+      "rootCpuOneCorePercent": 391.8664205745545,
+      "rootCpuMachinePercent": 24.491651285909658,
+      "treeCpuOneCorePercent": 391.8664205745545,
+      "treeCpuMachinePercent": 24.491651285909658,
+      "rootPrivateBytes": 232460288,
+      "rootWorkingSetBytes": 290004992,
+      "treePrivateBytes": 684732416,
+      "treeWorkingSetBytes": 935407616,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49561600,
+          "workingSetBytes": 156561408
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 8,
+          "cpuOneCorePercent": 391.8664205745545,
+          "privateBytes": 232460288,
+          "workingSetBytes": 290004992
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15892480,
+          "workingSetBytes": 50839552
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295071744
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:07.4560660+00:00",
+      "elapsedSeconds": 2.0472714,
+      "rootCpuOneCorePercent": 146.53650707961827,
+      "rootCpuMachinePercent": 9.158531692476142,
+      "treeCpuOneCorePercent": 146.53650707961827,
+      "treeCpuMachinePercent": 9.158531692476142,
+      "rootPrivateBytes": 233091072,
+      "rootWorkingSetBytes": 289681408,
+      "treePrivateBytes": 685559808,
+      "treeWorkingSetBytes": 935272448,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49676288,
+          "workingSetBytes": 156672000
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 3,
+          "cpuOneCorePercent": 146.53650707961827,
+          "privateBytes": 233091072,
+          "workingSetBytes": 289681408
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15974400,
+          "workingSetBytes": 50917376
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295071744
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:09.5007484+00:00",
+      "elapsedSeconds": 2.0446824,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 233152512,
+      "rootWorkingSetBytes": 289931264,
+      "treePrivateBytes": 685621248,
+      "treeWorkingSetBytes": 935522304,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49676288,
+          "workingSetBytes": 156672000
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 233152512,
+          "workingSetBytes": 289931264
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15974400,
+          "workingSetBytes": 50917376
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295071744
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:11.5438132+00:00",
+      "elapsedSeconds": 2.0430648,
+      "rootCpuOneCorePercent": 97.89214713111402,
+      "rootCpuMachinePercent": 6.118259195694626,
+      "treeCpuOneCorePercent": 97.89214713111402,
+      "treeCpuMachinePercent": 6.118259195694626,
+      "rootPrivateBytes": 233107456,
+      "rootWorkingSetBytes": 290009088,
+      "treePrivateBytes": 683560960,
+      "treeWorkingSetBytes": 933679104,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47661056,
+          "workingSetBytes": 154750976
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 97.89214713111402,
+          "privateBytes": 233107456,
+          "workingSetBytes": 290009088
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15974400,
+          "workingSetBytes": 50917376
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295071744
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:13.5784921+00:00",
+      "elapsedSeconds": 2.0346789,
+      "rootCpuOneCorePercent": 245.73902054029264,
+      "rootCpuMachinePercent": 15.35868878376829,
+      "treeCpuOneCorePercent": 245.73902054029264,
+      "treeCpuMachinePercent": 15.35868878376829,
+      "rootPrivateBytes": 237142016,
+      "rootWorkingSetBytes": 294760448,
+      "treePrivateBytes": 687603712,
+      "treeWorkingSetBytes": 938438656,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3215360,
+          "workingSetBytes": 15286272
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154759168
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 5,
+          "cpuOneCorePercent": 245.73902054029264,
+          "privateBytes": 237142016,
+          "workingSetBytes": 294760448
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15974400,
+          "workingSetBytes": 50917376
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295071744
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:15.6058488+00:00",
+      "elapsedSeconds": 2.0273567,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 237142016,
+      "rootWorkingSetBytes": 294768640,
+      "treePrivateBytes": 687579136,
+      "treeWorkingSetBytes": 938422272,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47644672,
+          "workingSetBytes": 154734592
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 237142016,
+          "workingSetBytes": 294768640
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295071744
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:17.6472752+00:00",
+      "elapsedSeconds": 2.0414264,
+      "rootCpuOneCorePercent": 48.985356513465284,
+      "rootCpuMachinePercent": 3.0615847820915802,
+      "treeCpuOneCorePercent": 48.985356513465284,
+      "treeCpuMachinePercent": 3.0615847820915802,
+      "rootPrivateBytes": 237584384,
+      "rootWorkingSetBytes": 295264256,
+      "treePrivateBytes": 688046080,
+      "treeWorkingSetBytes": 938942464,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154759168
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 1,
+          "cpuOneCorePercent": 48.985356513465284,
+          "privateBytes": 237584384,
+          "workingSetBytes": 295264256
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295071744
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:19.6826325+00:00",
+      "elapsedSeconds": 2.0353573,
+      "rootCpuOneCorePercent": 196.52569109119074,
+      "rootCpuMachinePercent": 12.282855693199421,
+      "treeCpuOneCorePercent": 196.52569109119074,
+      "treeCpuMachinePercent": 12.282855693199421,
+      "rootPrivateBytes": 237584384,
+      "rootWorkingSetBytes": 295264256,
+      "treePrivateBytes": 688037888,
+      "treeWorkingSetBytes": 938938368,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47661056,
+          "workingSetBytes": 154750976
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 4,
+          "cpuOneCorePercent": 196.52569109119074,
+          "privateBytes": 237584384,
+          "workingSetBytes": 295264256
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295075840
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:21.7228254+00:00",
+      "elapsedSeconds": 2.0401929,
+      "rootCpuOneCorePercent": 49.0149730449508,
+      "rootCpuMachinePercent": 3.063435815309425,
+      "treeCpuOneCorePercent": 49.0149730449508,
+      "treeCpuMachinePercent": 3.063435815309425,
+      "rootPrivateBytes": 237666304,
+      "rootWorkingSetBytes": 295297024,
+      "treePrivateBytes": 688128000,
+      "treeWorkingSetBytes": 938979328,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154759168
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 1,
+          "cpuOneCorePercent": 49.0149730449508,
+          "privateBytes": 237666304,
+          "workingSetBytes": 295297024
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295075840
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:23.7684854+00:00",
+      "elapsedSeconds": 2.04566,
+      "rootCpuOneCorePercent": 97.76795752959926,
+      "rootCpuMachinePercent": 6.110497345599954,
+      "treeCpuOneCorePercent": 97.76795752959926,
+      "treeCpuMachinePercent": 6.110497345599954,
+      "rootPrivateBytes": 206061568,
+      "rootWorkingSetBytes": 263712768,
+      "treePrivateBytes": 656506880,
+      "treeWorkingSetBytes": 907390976,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47652864,
+          "workingSetBytes": 154755072
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 97.76795752959926,
+          "privateBytes": 206061568,
+          "workingSetBytes": 263712768
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295075840
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:26.6268718+00:00",
+      "elapsedSeconds": 2.8583864,
+      "rootCpuOneCorePercent": 139.9390929092022,
+      "rootCpuMachinePercent": 8.746193306825138,
+      "treeCpuOneCorePercent": 139.9390929092022,
+      "treeCpuMachinePercent": 8.746193306825138,
+      "rootPrivateBytes": 209670144,
+      "rootWorkingSetBytes": 264867840,
+      "treePrivateBytes": 662097920,
+      "treeWorkingSetBytes": 910434304,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49635328,
+          "workingSetBytes": 156643328
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 4,
+          "cpuOneCorePercent": 139.9390929092022,
+          "privateBytes": 209670144,
+          "workingSetBytes": 264867840
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295075840
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:28.6624847+00:00",
+      "elapsedSeconds": 2.0356129,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 209674240,
+      "rootWorkingSetBytes": 264871936,
+      "treePrivateBytes": 660127744,
+      "treeWorkingSetBytes": 908558336,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47661056,
+          "workingSetBytes": 154763264
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 209674240,
+          "workingSetBytes": 264871936
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245227520,
+          "workingSetBytes": 295075840
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:30.6998073+00:00",
+      "elapsedSeconds": 2.0373226,
+      "rootCpuOneCorePercent": 49.08402822410157,
+      "rootCpuMachinePercent": 3.0677517640063483,
+      "treeCpuOneCorePercent": 49.08402822410157,
+      "treeCpuMachinePercent": 3.0677517640063483,
+      "rootPrivateBytes": 210046976,
+      "rootWorkingSetBytes": 265269248,
+      "treePrivateBytes": 660639744,
+      "treeWorkingSetBytes": 909004800,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 1,
+          "cpuOneCorePercent": 49.08402822410157,
+          "privateBytes": 210046976,
+          "workingSetBytes": 265269248
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245358592,
+          "workingSetBytes": 295116800
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:32.7484923+00:00",
+      "elapsedSeconds": 2.048685,
+      "rootCpuOneCorePercent": 195.24719515201215,
+      "rootCpuMachinePercent": 12.20294969700076,
+      "treeCpuOneCorePercent": 195.24719515201215,
+      "treeCpuMachinePercent": 12.20294969700076,
+      "rootPrivateBytes": 196448256,
+      "rootWorkingSetBytes": 254521344,
+      "treePrivateBytes": 647024640,
+      "treeWorkingSetBytes": 898244608,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47652864,
+          "workingSetBytes": 154755072
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 4,
+          "cpuOneCorePercent": 195.24719515201215,
+          "privateBytes": 196448256,
+          "workingSetBytes": 254521344
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245358592,
+          "workingSetBytes": 295120896
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:34.8030790+00:00",
+      "elapsedSeconds": 2.0545867,
+      "rootCpuOneCorePercent": 584.0590713451031,
+      "rootCpuMachinePercent": 36.503691959068945,
+      "treeCpuOneCorePercent": 584.0590713451031,
+      "treeCpuMachinePercent": 36.503691959068945,
+      "rootPrivateBytes": 211800064,
+      "rootWorkingSetBytes": 266022912,
+      "treePrivateBytes": 662392832,
+      "treeWorkingSetBytes": 909762560,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 12,
+          "cpuOneCorePercent": 584.0590713451031,
+          "privateBytes": 211800064,
+          "workingSetBytes": 266022912
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245358592,
+          "workingSetBytes": 295120896
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:36.8443033+00:00",
+      "elapsedSeconds": 2.0412243,
+      "rootCpuOneCorePercent": 342.93144560350373,
+      "rootCpuMachinePercent": 21.433215350218983,
+      "treeCpuOneCorePercent": 342.93144560350373,
+      "treeCpuMachinePercent": 21.433215350218983,
+      "rootPrivateBytes": 191082496,
+      "rootWorkingSetBytes": 247545856,
+      "treePrivateBytes": 643641344,
+      "treeWorkingSetBytes": 893157376,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49635328,
+          "workingSetBytes": 156643328
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 7,
+          "cpuOneCorePercent": 342.93144560350373,
+          "privateBytes": 191082496,
+          "workingSetBytes": 247545856
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245358592,
+          "workingSetBytes": 295120896
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:38.8873323+00:00",
+      "elapsedSeconds": 2.043029,
+      "rootCpuOneCorePercent": 146.84079374301587,
+      "rootCpuMachinePercent": 9.177549608938492,
+      "treeCpuOneCorePercent": 146.84079374301587,
+      "treeCpuMachinePercent": 9.177549608938492,
+      "rootPrivateBytes": 201388032,
+      "rootWorkingSetBytes": 256647168,
+      "treePrivateBytes": 653946880,
+      "treeWorkingSetBytes": 902266880,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49635328,
+          "workingSetBytes": 156643328
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 3,
+          "cpuOneCorePercent": 146.84079374301587,
+          "privateBytes": 201388032,
+          "workingSetBytes": 256647168
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245358592,
+          "workingSetBytes": 295129088
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:40.9438109+00:00",
+      "elapsedSeconds": 2.0564786,
+      "rootCpuOneCorePercent": 291.7608770643176,
+      "rootCpuMachinePercent": 18.23505481651985,
+      "treeCpuOneCorePercent": 291.7608770643176,
+      "treeCpuMachinePercent": 18.23505481651985,
+      "rootPrivateBytes": 204652544,
+      "rootWorkingSetBytes": 260055040,
+      "treePrivateBytes": 655204352,
+      "treeWorkingSetBytes": 903761920,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47628288,
+          "workingSetBytes": 154730496
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 6,
+          "cpuOneCorePercent": 291.7608770643176,
+          "privateBytes": 204652544,
+          "workingSetBytes": 260055040
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245358592,
+          "workingSetBytes": 295129088
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:42.9807470+00:00",
+      "elapsedSeconds": 2.0369361,
+      "rootCpuOneCorePercent": 343.6533919743481,
+      "rootCpuMachinePercent": 21.478336998396756,
+      "treeCpuOneCorePercent": 343.6533919743481,
+      "treeCpuMachinePercent": 21.478336998396756,
+      "rootPrivateBytes": 218779648,
+      "rootWorkingSetBytes": 273264640,
+      "treePrivateBytes": 669372416,
+      "treeWorkingSetBytes": 917012480,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 7,
+          "cpuOneCorePercent": 343.6533919743481,
+          "privateBytes": 218779648,
+          "workingSetBytes": 273264640
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245358592,
+          "workingSetBytes": 295129088
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:45.0318532+00:00",
+      "elapsedSeconds": 2.0511062,
+      "rootCpuOneCorePercent": 146.26253872178827,
+      "rootCpuMachinePercent": 9.141408670111767,
+      "treeCpuOneCorePercent": 146.26253872178827,
+      "treeCpuMachinePercent": 9.141408670111767,
+      "rootPrivateBytes": 219086848,
+      "rootWorkingSetBytes": 274206720,
+      "treePrivateBytes": 671928320,
+      "treeWorkingSetBytes": 920117248,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49635328,
+          "workingSetBytes": 156643328
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 3,
+          "cpuOneCorePercent": 146.26253872178827,
+          "privateBytes": 219086848,
+          "workingSetBytes": 274206720
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245686272,
+          "workingSetBytes": 295440384
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129548288,
+          "workingSetBytes": 103952384
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:47.0586256+00:00",
+      "elapsedSeconds": 2.0267724,
+      "rootCpuOneCorePercent": 49.339531167880516,
+      "rootCpuMachinePercent": 3.0837206979925322,
+      "treeCpuOneCorePercent": 49.339531167880516,
+      "treeCpuMachinePercent": 3.0837206979925322,
+      "rootPrivateBytes": 219500544,
+      "rootWorkingSetBytes": 274669568,
+      "treePrivateBytes": 672493568,
+      "treeWorkingSetBytes": 920793088,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49635328,
+          "workingSetBytes": 156643328
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 1,
+          "cpuOneCorePercent": 49.339531167880516,
+          "privateBytes": 219500544,
+          "workingSetBytes": 274669568
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15978496,
+          "workingSetBytes": 50921472
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245792768,
+          "workingSetBytes": 295632896
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:49.1071334+00:00",
+      "elapsedSeconds": 2.0485078,
+      "rootCpuOneCorePercent": 97.63204221140872,
+      "rootCpuMachinePercent": 6.102002638213045,
+      "treeCpuOneCorePercent": 97.63204221140872,
+      "treeCpuMachinePercent": 6.102002638213045,
+      "rootPrivateBytes": 218636288,
+      "rootWorkingSetBytes": 274653184,
+      "treePrivateBytes": 671588352,
+      "treeWorkingSetBytes": 920735744,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49635328,
+          "workingSetBytes": 156643328
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 97.63204221140872,
+          "privateBytes": 218636288,
+          "workingSetBytes": 274653184
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15937536,
+          "workingSetBytes": 50880512
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245792768,
+          "workingSetBytes": 295632896
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:51.1434298+00:00",
+      "elapsedSeconds": 2.0362964,
+      "rootCpuOneCorePercent": 491.0876432330775,
+      "rootCpuMachinePercent": 30.692977702067342,
+      "treeCpuOneCorePercent": 491.0876432330775,
+      "treeCpuMachinePercent": 30.692977702067342,
+      "rootPrivateBytes": 223956992,
+      "rootWorkingSetBytes": 279953408,
+      "treePrivateBytes": 676892672,
+      "treeWorkingSetBytes": 926019584,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49618944,
+          "workingSetBytes": 156626944
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 10,
+          "cpuOneCorePercent": 491.0876432330775,
+          "privateBytes": 223956992,
+          "workingSetBytes": 279953408
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15937536,
+          "workingSetBytes": 50880512
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245792768,
+          "workingSetBytes": 295632896
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:53.1844085+00:00",
+      "elapsedSeconds": 2.0409787,
+      "rootCpuOneCorePercent": 293.97661033895156,
+      "rootCpuMachinePercent": 18.373538146184472,
+      "treeCpuOneCorePercent": 293.97661033895156,
+      "treeCpuMachinePercent": 18.373538146184472,
+      "rootPrivateBytes": 211746816,
+      "rootWorkingSetBytes": 268464128,
+      "treePrivateBytes": 662732800,
+      "treeWorkingSetBytes": 912674816,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 6,
+          "cpuOneCorePercent": 293.97661033895156,
+          "privateBytes": 211746816,
+          "workingSetBytes": 268464128
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15937536,
+          "workingSetBytes": 50880512
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245792768,
+          "workingSetBytes": 295632896
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:55.2286169+00:00",
+      "elapsedSeconds": 2.0442084,
+      "rootCpuOneCorePercent": 244.5934573011245,
+      "rootCpuMachinePercent": 15.28709108132028,
+      "treeCpuOneCorePercent": 244.5934573011245,
+      "treeCpuMachinePercent": 15.28709108132028,
+      "rootPrivateBytes": 224116736,
+      "rootWorkingSetBytes": 280268800,
+      "treePrivateBytes": 675094528,
+      "treeWorkingSetBytes": 924471296,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47661056,
+          "workingSetBytes": 154763264
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 5,
+          "cpuOneCorePercent": 244.5934573011245,
+          "privateBytes": 224116736,
+          "workingSetBytes": 280268800
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15937536,
+          "workingSetBytes": 50880512
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245792768,
+          "workingSetBytes": 295632896
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:34:58.1629322+00:00",
+      "elapsedSeconds": 2.9343153,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 233963520,
+      "rootWorkingSetBytes": 288514048,
+      "treePrivateBytes": 684933120,
+      "treeWorkingSetBytes": 932708352,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47652864,
+          "workingSetBytes": 154755072
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 233963520,
+          "workingSetBytes": 288514048
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15937536,
+          "workingSetBytes": 50880512
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245792768,
+          "workingSetBytes": 295632896
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:00.2139347+00:00",
+      "elapsedSeconds": 2.0510025,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 233971712,
+      "rootWorkingSetBytes": 288522240,
+      "treePrivateBytes": 684957696,
+      "treeWorkingSetBytes": 932732928,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 233971712,
+          "workingSetBytes": 288522240
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15937536,
+          "workingSetBytes": 50880512
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245792768,
+          "workingSetBytes": 295632896
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:02.2406455+00:00",
+      "elapsedSeconds": 2.0267108,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 233996288,
+      "rootWorkingSetBytes": 288546816,
+      "treePrivateBytes": 684982272,
+      "treeWorkingSetBytes": 932757504,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 233996288,
+          "workingSetBytes": 288546816
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15937536,
+          "workingSetBytes": 50880512
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245792768,
+          "workingSetBytes": 295632896
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:04.2812469+00:00",
+      "elapsedSeconds": 2.0406014,
+      "rootCpuOneCorePercent": 98.01032185903627,
+      "rootCpuMachinePercent": 6.125645116189767,
+      "treeCpuOneCorePercent": 98.01032185903627,
+      "treeCpuMachinePercent": 6.125645116189767,
+      "rootPrivateBytes": 224468992,
+      "rootWorkingSetBytes": 280989696,
+      "treePrivateBytes": 675454976,
+      "treeWorkingSetBytes": 925200384,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 98.01032185903627,
+          "privateBytes": 224468992,
+          "workingSetBytes": 280989696
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15937536,
+          "workingSetBytes": 50880512
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245792768,
+          "workingSetBytes": 295632896
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:06.3214451+00:00",
+      "elapsedSeconds": 2.0401982,
+      "rootCpuOneCorePercent": 245.07422857249853,
+      "rootCpuMachinePercent": 15.317139285781158,
+      "treeCpuOneCorePercent": 245.07422857249853,
+      "treeCpuMachinePercent": 15.317139285781158,
+      "rootPrivateBytes": 229752832,
+      "rootWorkingSetBytes": 286068736,
+      "treePrivateBytes": 682688512,
+      "treeWorkingSetBytes": 932143104,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49618944,
+          "workingSetBytes": 156626944
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 5,
+          "cpuOneCorePercent": 245.07422857249853,
+          "privateBytes": 229752832,
+          "workingSetBytes": 286068736
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15937536,
+          "workingSetBytes": 50880512
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245792768,
+          "workingSetBytes": 295641088
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:08.3643101+00:00",
+      "elapsedSeconds": 2.042865,
+      "rootCpuOneCorePercent": 195.80344271403152,
+      "rootCpuMachinePercent": 12.23771516962697,
+      "treeCpuOneCorePercent": 195.80344271403152,
+      "treeCpuMachinePercent": 12.23771516962697,
+      "rootPrivateBytes": 229281792,
+      "rootWorkingSetBytes": 284459008,
+      "treePrivateBytes": 680267776,
+      "treeWorkingSetBytes": 928677888,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 4,
+          "cpuOneCorePercent": 195.80344271403152,
+          "privateBytes": 229281792,
+          "workingSetBytes": 284459008
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15937536,
+          "workingSetBytes": 50880512
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245792768,
+          "workingSetBytes": 295641088
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:10.3939887+00:00",
+      "elapsedSeconds": 2.0296786,
+      "rootCpuOneCorePercent": 147.80665273802464,
+      "rootCpuMachinePercent": 9.23791579612654,
+      "treeCpuOneCorePercent": 147.80665273802464,
+      "treeCpuMachinePercent": 9.23791579612654,
+      "rootPrivateBytes": 215478272,
+      "rootWorkingSetBytes": 271503360,
+      "treePrivateBytes": 666464256,
+      "treeWorkingSetBytes": 915722240,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 3,
+          "cpuOneCorePercent": 147.80665273802464,
+          "privateBytes": 215478272,
+          "workingSetBytes": 271503360
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15937536,
+          "workingSetBytes": 50880512
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245792768,
+          "workingSetBytes": 295641088
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:12.4432888+00:00",
+      "elapsedSeconds": 2.0493001,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 215261184,
+      "rootWorkingSetBytes": 271134720,
+      "treePrivateBytes": 666271744,
+      "treeWorkingSetBytes": 915374080,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 215261184,
+          "workingSetBytes": 271134720
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15937536,
+          "workingSetBytes": 50880512
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245817344,
+          "workingSetBytes": 295661568
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:14.5001400+00:00",
+      "elapsedSeconds": 2.0568512,
+      "rootCpuOneCorePercent": 48.61800406368725,
+      "rootCpuMachinePercent": 3.0386252539804532,
+      "treeCpuOneCorePercent": 48.61800406368725,
+      "treeCpuMachinePercent": 3.0386252539804532,
+      "rootPrivateBytes": 223133696,
+      "rootWorkingSetBytes": 278106112,
+      "treePrivateBytes": 674050048,
+      "treeWorkingSetBytes": 922300416,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3170304,
+          "workingSetBytes": 15265792
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47656960,
+          "workingSetBytes": 154759168
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 1,
+          "cpuOneCorePercent": 48.61800406368725,
+          "privateBytes": 223133696,
+          "workingSetBytes": 278106112
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15896576,
+          "workingSetBytes": 50864128
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245817344,
+          "workingSetBytes": 295661568
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:16.5568582+00:00",
+      "elapsedSeconds": 2.0567182,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 224563200,
+      "rootWorkingSetBytes": 279482368,
+      "treePrivateBytes": 677564416,
+      "treeWorkingSetBytes": 925622272,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49639424,
+          "workingSetBytes": 156647424
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 224563200,
+          "workingSetBytes": 279482368
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245841920,
+          "workingSetBytes": 295690240
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:18.5947119+00:00",
+      "elapsedSeconds": 2.0378537,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 224559104,
+      "rootWorkingSetBytes": 279478272,
+      "treePrivateBytes": 677560320,
+      "treeWorkingSetBytes": 925618176,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49639424,
+          "workingSetBytes": 156647424
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 224559104,
+          "workingSetBytes": 279478272
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245841920,
+          "workingSetBytes": 295690240
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:20.6380427+00:00",
+      "elapsedSeconds": 2.0433308,
+      "rootCpuOneCorePercent": 48.939701784948376,
+      "rootCpuMachinePercent": 3.0587313615592735,
+      "treeCpuOneCorePercent": 48.939701784948376,
+      "treeCpuMachinePercent": 3.0587313615592735,
+      "rootPrivateBytes": 224587776,
+      "rootWorkingSetBytes": 279519232,
+      "treePrivateBytes": 675618816,
+      "treeWorkingSetBytes": 923791360,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 1,
+          "cpuOneCorePercent": 48.939701784948376,
+          "privateBytes": 224587776,
+          "workingSetBytes": 279519232
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245841920,
+          "workingSetBytes": 295698432
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:22.6734143+00:00",
+      "elapsedSeconds": 2.0353716,
+      "rootCpuOneCorePercent": 49.131077587994255,
+      "rootCpuMachinePercent": 3.070692349249641,
+      "treeCpuOneCorePercent": 49.131077587994255,
+      "treeCpuMachinePercent": 3.070692349249641,
+      "rootPrivateBytes": 224587776,
+      "rootWorkingSetBytes": 279519232,
+      "treePrivateBytes": 675602432,
+      "treeWorkingSetBytes": 923774976,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47652864,
+          "workingSetBytes": 154755072
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 1,
+          "cpuOneCorePercent": 49.131077587994255,
+          "privateBytes": 224587776,
+          "workingSetBytes": 279519232
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245841920,
+          "workingSetBytes": 295698432
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:24.7061862+00:00",
+      "elapsedSeconds": 2.0327719,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 224587776,
+      "rootWorkingSetBytes": 279519232,
+      "treePrivateBytes": 675618816,
+      "treeWorkingSetBytes": 923799552,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 224587776,
+          "workingSetBytes": 279519232
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245841920,
+          "workingSetBytes": 295706624
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:26.7489366+00:00",
+      "elapsedSeconds": 2.0427504,
+      "rootCpuOneCorePercent": 97.90721372518149,
+      "rootCpuMachinePercent": 6.119200857823843,
+      "treeCpuOneCorePercent": 97.90721372518149,
+      "treeCpuMachinePercent": 6.119200857823843,
+      "rootPrivateBytes": 225034240,
+      "rootWorkingSetBytes": 278515712,
+      "treePrivateBytes": 678035456,
+      "treeWorkingSetBytes": 924676096,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49635328,
+          "workingSetBytes": 156643328
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 2,
+          "cpuOneCorePercent": 97.90721372518149,
+          "privateBytes": 225034240,
+          "workingSetBytes": 278515712
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245846016,
+          "workingSetBytes": 295714816
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:29.6939960+00:00",
+      "elapsedSeconds": 2.9450594,
+      "rootCpuOneCorePercent": 33.955172517063666,
+      "rootCpuMachinePercent": 2.122198282316479,
+      "treeCpuOneCorePercent": 33.955172517063666,
+      "treeCpuMachinePercent": 2.122198282316479,
+      "rootPrivateBytes": 223739904,
+      "rootWorkingSetBytes": 277311488,
+      "treePrivateBytes": 676741120,
+      "treeWorkingSetBytes": 923471872,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49635328,
+          "workingSetBytes": 156643328
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 1,
+          "cpuOneCorePercent": 33.955172517063666,
+          "privateBytes": 223739904,
+          "workingSetBytes": 277311488
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245846016,
+          "workingSetBytes": 295714816
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:31.7254091+00:00",
+      "elapsedSeconds": 2.0314131,
+      "rootCpuOneCorePercent": 0,
+      "rootCpuMachinePercent": 0,
+      "treeCpuOneCorePercent": 0,
+      "treeCpuMachinePercent": 0,
+      "rootPrivateBytes": 223653888,
+      "rootWorkingSetBytes": 277278720,
+      "treePrivateBytes": 674689024,
+      "treeWorkingSetBytes": 921571328,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 223653888,
+          "workingSetBytes": 277278720
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245846016,
+          "workingSetBytes": 295718912
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:33.7766975+00:00",
+      "elapsedSeconds": 2.0512884,
+      "rootCpuOneCorePercent": 292.4990947153019,
+      "rootCpuMachinePercent": 18.28119341970637,
+      "treeCpuOneCorePercent": 292.4990947153019,
+      "treeCpuMachinePercent": 18.28119341970637,
+      "rootPrivateBytes": 207757312,
+      "rootWorkingSetBytes": 262430720,
+      "treePrivateBytes": 658792448,
+      "treeWorkingSetBytes": 906723328,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 6,
+          "cpuOneCorePercent": 292.4990947153019,
+          "privateBytes": 207757312,
+          "workingSetBytes": 262430720
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245846016,
+          "workingSetBytes": 295718912
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:35.8085827+00:00",
+      "elapsedSeconds": 2.0318852,
+      "rootCpuOneCorePercent": 639.799925704464,
+      "rootCpuMachinePercent": 39.987495356529,
+      "treeCpuOneCorePercent": 639.799925704464,
+      "treeCpuMachinePercent": 39.987495356529,
+      "rootPrivateBytes": 209768448,
+      "rootWorkingSetBytes": 262459392,
+      "treePrivateBytes": 662769664,
+      "treeWorkingSetBytes": 908623872,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49635328,
+          "workingSetBytes": 156643328
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 13,
+          "cpuOneCorePercent": 639.799925704464,
+          "privateBytes": 209768448,
+          "workingSetBytes": 262459392
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245846016,
+          "workingSetBytes": 295718912
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:37.8708570+00:00",
+      "elapsedSeconds": 2.0622743,
+      "rootCpuOneCorePercent": 290.94092866307847,
+      "rootCpuMachinePercent": 18.183808041442404,
+      "treeCpuOneCorePercent": 290.94092866307847,
+      "treeCpuMachinePercent": 18.183808041442404,
+      "rootPrivateBytes": 217976832,
+      "rootWorkingSetBytes": 269037568,
+      "treePrivateBytes": 670978048,
+      "treeWorkingSetBytes": 915202048,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49635328,
+          "workingSetBytes": 156643328
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 6,
+          "cpuOneCorePercent": 290.94092866307847,
+          "privateBytes": 217976832,
+          "workingSetBytes": 269037568
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245846016,
+          "workingSetBytes": 295718912
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:40.1447207+00:00",
+      "elapsedSeconds": 2.2738637,
+      "rootCpuOneCorePercent": 175.91203905493543,
+      "rootCpuMachinePercent": 10.994502440933465,
+      "treeCpuOneCorePercent": 175.91203905493543,
+      "treeCpuMachinePercent": 10.994502440933465,
+      "rootPrivateBytes": 228667392,
+      "rootWorkingSetBytes": 280662016,
+      "treePrivateBytes": 681594880,
+      "treeWorkingSetBytes": 926752768,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49561600,
+          "workingSetBytes": 156569600
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 4,
+          "cpuOneCorePercent": 175.91203905493543,
+          "privateBytes": 228667392,
+          "workingSetBytes": 280662016
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245846016,
+          "workingSetBytes": 295718912
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:42.1916933+00:00",
+      "elapsedSeconds": 2.0469726,
+      "rootCpuOneCorePercent": 244.2631620960632,
+      "rootCpuMachinePercent": 15.26644763100395,
+      "treeCpuOneCorePercent": 244.2631620960632,
+      "treeCpuMachinePercent": 15.26644763100395,
+      "rootPrivateBytes": 228995072,
+      "rootWorkingSetBytes": 281837568,
+      "treePrivateBytes": 681996288,
+      "treeWorkingSetBytes": 928002048,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49635328,
+          "workingSetBytes": 156643328
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 5,
+          "cpuOneCorePercent": 244.2631620960632,
+          "privateBytes": 228995072,
+          "workingSetBytes": 281837568
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245846016,
+          "workingSetBytes": 295718912
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:44.2364037+00:00",
+      "elapsedSeconds": 2.0447104,
+      "rootCpuOneCorePercent": 391.25345085543654,
+      "rootCpuMachinePercent": 24.453340678464784,
+      "treeCpuOneCorePercent": 391.25345085543654,
+      "treeCpuMachinePercent": 24.453340678464784,
+      "rootPrivateBytes": 230076416,
+      "rootWorkingSetBytes": 282857472,
+      "treePrivateBytes": 681111552,
+      "treeWorkingSetBytes": 927150080,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47669248,
+          "workingSetBytes": 154771456
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 8,
+          "cpuOneCorePercent": 391.25345085543654,
+          "privateBytes": 230076416,
+          "workingSetBytes": 282857472
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245846016,
+          "workingSetBytes": 295718912
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:46.2759729+00:00",
+      "elapsedSeconds": 2.0395692,
+      "rootCpuOneCorePercent": 294.1797709045616,
+      "rootCpuMachinePercent": 18.3862356815351,
+      "treeCpuOneCorePercent": 294.1797709045616,
+      "treeCpuMachinePercent": 18.3862356815351,
+      "rootPrivateBytes": 229834752,
+      "rootWorkingSetBytes": 283664384,
+      "treePrivateBytes": 682876928,
+      "treeWorkingSetBytes": 929873920,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 49676288,
+          "workingSetBytes": 156684288
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 6,
+          "cpuOneCorePercent": 294.1797709045616,
+          "privateBytes": 229834752,
+          "workingSetBytes": 283664384
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245846016,
+          "workingSetBytes": 295723008
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:48.3254827+00:00",
+      "elapsedSeconds": 2.0495098,
+      "rootCpuOneCorePercent": 341.5450855614352,
+      "rootCpuMachinePercent": 21.3465678475897,
+      "treeCpuOneCorePercent": 341.5450855614352,
+      "treeCpuMachinePercent": 21.3465678475897,
+      "rootPrivateBytes": 231432192,
+      "rootWorkingSetBytes": 284790784,
+      "treePrivateBytes": 682487808,
+      "treeWorkingSetBytes": 929112064,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47689728,
+          "workingSetBytes": 154791936
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 7,
+          "cpuOneCorePercent": 341.5450855614352,
+          "privateBytes": 231432192,
+          "workingSetBytes": 284790784
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245846016,
+          "workingSetBytes": 295727104
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:50.3627869+00:00",
+      "elapsedSeconds": 2.0373042,
+      "rootCpuOneCorePercent": 245.42235764300688,
+      "rootCpuMachinePercent": 15.33889735268793,
+      "treeCpuOneCorePercent": 245.42235764300688,
+      "treeCpuMachinePercent": 15.33889735268793,
+      "rootPrivateBytes": 196087808,
+      "rootWorkingSetBytes": 253255680,
+      "treePrivateBytes": 647110656,
+      "treeWorkingSetBytes": 897544192,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47656960,
+          "workingSetBytes": 154759168
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 5,
+          "cpuOneCorePercent": 245.42235764300688,
+          "privateBytes": 196087808,
+          "workingSetBytes": 253255680
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245846016,
+          "workingSetBytes": 295727104
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    },
+    {
+      "capturedAtUtc": "2026-11-22T17:35:52.4018640+00:00",
+      "elapsedSeconds": 2.0390771,
+      "rootCpuOneCorePercent": 245.2089722355275,
+      "rootCpuMachinePercent": 15.32556076472047,
+      "treeCpuOneCorePercent": 245.2089722355275,
+      "treeCpuMachinePercent": 15.32556076472047,
+      "rootPrivateBytes": 207360000,
+      "rootWorkingSetBytes": 262750208,
+      "treePrivateBytes": 658415616,
+      "treeWorkingSetBytes": 907071488,
+      "processes": [
+        {
+          "pid": 62912,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 3211264,
+          "workingSetBytes": 15282176
+        },
+        {
+          "pid": 66872,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 8781824,
+          "workingSetBytes": 23670784
+        },
+        {
+          "pid": 24336,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 47689728,
+          "workingSetBytes": 154791936
+        },
+        {
+          "pid": 24180,
+          "name": "cc-switch",
+          "cpuDeltaSeconds": 5,
+          "cpuOneCorePercent": 245.2089722355275,
+          "privateBytes": 207360000,
+          "workingSetBytes": 262750208
+        },
+        {
+          "pid": 3184,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 15933440,
+          "workingSetBytes": 50876416
+        },
+        {
+          "pid": 44280,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 245846016,
+          "workingSetBytes": 295727104
+        },
+        {
+          "pid": 66504,
+          "name": "msedgewebview2",
+          "cpuDeltaSeconds": 0,
+          "cpuOneCorePercent": 0,
+          "privateBytes": 129593344,
+          "workingSetBytes": 103972864
+        }
+      ]
+    }
+  ]
+}

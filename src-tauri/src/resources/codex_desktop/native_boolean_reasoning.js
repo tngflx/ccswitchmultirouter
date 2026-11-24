@@ -5,6 +5,9 @@
 // All DOM is reversible presentation. The current native callback remains the
 // only writer of selection state; no capability or preference is persisted.
 const nativeBooleanInstallation = {};
+const nativeBooleanEffortLabelSelector =
+  "[class*='ModelPickerTriggerEffortLabel-']";
+const nativeBooleanEffortLabelLimit = 32;
 const nativeBooleanOwn = (value, key) => {
   if (!value || !["object", "function"].includes(typeof value))
     return undefined;
@@ -217,9 +220,7 @@ const nativeBooleanBinding = (button) => {
   const owner = owners[0];
   const ownerEffort = nativeBooleanOwn(owner, "reasoningEffort");
   if (ownerEffort !== effort) return null;
-  const effects = button.querySelectorAll(
-    "[class*='ModelPickerTriggerEffortLabel-']",
-  );
+  const effects = button.querySelectorAll(nativeBooleanEffortLabelSelector);
   if (effects.length !== 1) return null;
   const effect = effects[0];
   const parent = button.parentElement;
@@ -281,17 +282,6 @@ const nativeBooleanSelectedModel = (button) => {
   return candidates.length === 1 && new Set(candidates).size === 1
     ? candidates[0]
     : null;
-};
-const nativeBooleanHasCurrentBinding = (model) => {
-  const effects = document.querySelectorAll(
-    "[class*='ModelPickerTriggerEffortLabel-']",
-  );
-  for (const effect of effects) {
-    const button = effect.closest("button");
-    const binding = button && nativeBooleanBinding(button);
-    if (binding?.model === model) return true;
-  }
-  return false;
 };
 const nativeBooleanRestoreRecord = (record) => {
   record.active = false;
@@ -361,10 +351,8 @@ const syncNativeBooleanReasoningControls = () => {
     restoreNativeBooleanReasoningControls();
     return;
   }
-  const effects = document.querySelectorAll(
-    "[class*='ModelPickerTriggerEffortLabel-']",
-  );
-  if (effects.length > 32) {
+  const effects = document.querySelectorAll(nativeBooleanEffortLabelSelector);
+  if (effects.length > nativeBooleanEffortLabelLimit) {
     restoreNativeBooleanReasoningControls();
     return;
   }
@@ -537,8 +525,7 @@ const nativeBooleanSubtreeHasTrigger = (node) => {
   for (let index = 0; index < pending.length && index < 256; index += 1) {
     const element = pending[index];
     if (nativeBooleanOwnedNode(element)) continue;
-    if (element.matches?.("[class*='ModelPickerTriggerEffortLabel-']"))
-      return true;
+    if (element.matches?.(nativeBooleanEffortLabelSelector)) return true;
     for (
       let child = element.firstElementChild;
       child;
@@ -686,12 +673,29 @@ const installNativeBooleanReasoningObserver = () => {
     entry.observer.observe(parent, { childList: true });
   return true;
 };
+const readNativeBooleanReasoningSelection = () => {
+  if (!nativeBooleanProvider()) return null;
+  const effects = document.querySelectorAll(nativeBooleanEffortLabelSelector);
+  if (effects.length > nativeBooleanEffortLabelLimit) return null;
+  const selected = new Set();
+  const seen = new Set();
+  for (const effect of effects) {
+    const button = effect.closest("button");
+    if (!button || seen.has(button)) continue;
+    seen.add(button);
+    const model = nativeBooleanSelectedModel(button);
+    if (model) selected.add(model);
+  }
+  return selected;
+};
 // This is separate from runtime installation and model/list correctness. Only
 // a currently owned, correctly labelled native control proves that these
 // binary aliases are actually usable despite account-wide graded preferences.
-const readNativeBooleanReasoningControlState = (model) => {
+const readNativeBooleanReasoningControlState = (model, selectedModels) => {
   const row = typeof model === "string" ? catalogRowForName(model) : null;
   const marker = nativeBooleanMarker(row);
+  if (typeof installationIsCurrent === "function" && !installationIsCurrent())
+    return { status: "runtime_unverified", model };
   if (
     !nativeBooleanProvider() ||
     !row ||
@@ -700,22 +704,13 @@ const readNativeBooleanReasoningControlState = (model) => {
   ) {
     return { status: "not_active", model };
   }
-  const records = state.nativeBooleanReasoningControls;
-  if (
-    state.nativeBooleanReasoningUnverifiedModels?.has(model) &&
-    nativeBooleanHasCurrentBinding(model)
-  ) {
-    // React can commit new Fiber props without changing this trigger's DOM.
-    // Reconcile a previously invalid observation before reporting it as stale.
-    syncNativeBooleanReasoningControls();
-    if (state.nativeBooleanReasoningUnverifiedModels?.has(model))
-      return { status: "unverified", model };
-  }
+  // Fiber-only changes are reconciled by the renderer heartbeat. Diagnostics
+  // report the mounted control without changing it.
   if (state.nativeBooleanReasoningUnverifiedModels?.has(model))
     return { status: "unverified", model };
   const ready = [];
   let observed = false;
-  for (const record of records?.values() || []) {
+  for (const record of state.nativeBooleanReasoningControls?.values() || []) {
     if (record.model !== model) continue;
     observed = true;
     const binding = nativeBooleanBinding(record.button);
@@ -747,16 +742,27 @@ const readNativeBooleanReasoningControlState = (model) => {
     });
   }
   if (ready.length === 1) return ready[0];
-  // A mounted picker can prove only its selected model. An included Boolean
-  // row with no current binding is therefore an observation gap, not evidence
-  // that its control is malformed. Keep malformed or ambiguous current
-  // bindings unverified when a record exists for the requested model.
-  return { status: observed ? "unverified" : "not_observed", model };
+  if (observed) return { status: "unverified", model };
+  // A selected trigger may precede the first reconciliation. Keep that gap
+  // unverified until the adapter has proved its control on the current trigger.
+  const currentSelection =
+    selectedModels === undefined
+      ? readNativeBooleanReasoningSelection()
+      : selectedModels;
+  return {
+    status:
+      currentSelection === null || currentSelection.has(model)
+        ? "unverified"
+        : "not_observed",
+    model,
+  };
 };
 // Reinjection owns a new generation. Old scheduled frames and listeners are
 // restoration state only and cannot survive registration of the new helpers.
 if (typeof state.nativeBooleanReasoningRestore === "function")
   state.nativeBooleanReasoningRestore();
 state.nativeBooleanReasoningRestore = restoreNativeBooleanReasoningControls;
+state.readNativeBooleanReasoningSelectionDiagnostics =
+  readNativeBooleanReasoningSelection;
 state.readNativeBooleanReasoningControlDiagnostics =
   readNativeBooleanReasoningControlState;

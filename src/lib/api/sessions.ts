@@ -20,6 +20,21 @@ export interface PurgeArchivedSessionsResult {
   errors: string[];
 }
 
+export type CodexBackupItem = Pick<
+  DeleteSessionOptions,
+  "sessionId" | "sourcePath"
+>;
+
+export interface CodexBackupPreview {
+  manifestHash: string;
+  sessions: {
+    sessionId: string;
+    title: string;
+    projectPath?: string | null;
+    conflict: boolean;
+  }[];
+}
+
 export const sessionsApi = {
   async list(): Promise<SessionMeta[]> {
     return await invoke("list_sessions");
@@ -51,6 +66,27 @@ export const sessionsApi = {
     providerId: string,
   ): Promise<PurgeArchivedSessionsResult> {
     return await invoke("purge_archived_sessions", { providerId });
+  },
+
+  async exportCodexBackup(
+    targetPath: string,
+    items: CodexBackupItem[],
+  ): Promise<{ count: number }> {
+    return await invoke("export_codex_session_backup", { targetPath, items });
+  },
+
+  async inspectCodexBackup(sourcePath: string): Promise<CodexBackupPreview> {
+    return await invoke("inspect_codex_session_backup", { sourcePath });
+  },
+
+  async importCodexBackup(
+    sourcePath: string,
+    manifestHash: string,
+  ): Promise<{ restored: number; skipped: number }> {
+    return await invoke("import_codex_session_backup", {
+      sourcePath,
+      manifestHash,
+    });
   },
 
   async launchTerminal(options: {

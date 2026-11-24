@@ -3,6 +3,7 @@
 // or applies picker defaults. Owner preparation is not network authorization.
 const codexContinuationIntents = Object.freeze({
   AutoRecovery: "AutoRecovery",
+  UsageLimitResume: "UsageLimitResume",
   OwnerContinue: "OwnerContinue",
 });
 const codexContinuationOwnData = (value, key) => {
@@ -84,9 +85,18 @@ for (const key of [
     throw new Error("Invalid embedded temporary usage-limit markers");
   continuationTemporaryUsageLimitMarkers[key] = markers;
 }
-const codexContinuationTerminalErrorCode = (eventName, payload) => {
+const continuationCodexPlanCreditSuggestion =
+  normalizeContinuationTerminalError("to purchase more credits");
+const codexContinuationTerminalErrorClassification = (
+  eventName,
+  payload,
+  { ignoreCodexPlanCreditSuggestion = false } = {},
+) => {
   if (continuationTerminalErrorPolicy.cancelledEvents.includes(eventName))
-    return continuationTerminalErrorPolicy.cancelledCode;
+    return {
+      terminalCode: continuationTerminalErrorPolicy.cancelledCode,
+      temporaryUsageLimit: false,
+    };
   // Match each field separately, so neighboring fields cannot form a marker.
   const summary = continuationTerminalErrorPolicy.summaryPaths
     .map((pointer) => continuationTerminalErrorAtPath(payload, pointer))
@@ -96,6 +106,7 @@ const codexContinuationTerminalErrorCode = (eventName, payload) => {
     .map((pointer) => continuationTerminalErrorAtPath(payload, pointer))
     .filter((value) => value !== undefined)
     .map((value) => normalizeContinuationTerminalError(JSON.stringify(value)));
+  const errorDetails = [...summary, ...serialized];
   const matchesMarker = (values, markers) =>
     values.some((value) => markers.some((marker) => value.includes(marker)));
   const retryMessages = continuationTemporaryUsageLimitPolicy.retryMessagePaths
@@ -115,7 +126,7 @@ const codexContinuationTerminalErrorCode = (eventName, payload) => {
   const temporaryUsageLimit =
     !explicitRetryDenial &&
     !matchesMarker(
-      [...summary, ...serialized],
+      errorDetails,
       continuationTemporaryUsageLimitMarkers.retryDenialMarkers,
     ) &&
     matchesMarker(
@@ -127,10 +138,14 @@ const codexContinuationTerminalErrorCode = (eventName, payload) => {
       continuationTemporaryUsageLimitMarkers.retryMarkers,
     ) &&
     !matchesMarker(
-      [...summary, ...serialized],
+      ignoreCodexPlanCreditSuggestion
+        ? errorDetails.map((value) =>
+            value.replace(continuationCodexPlanCreditSuggestion, ""),
+          )
+        : errorDetails,
       continuationTemporaryUsageLimitMarkers.hardLimitMarkers,
     );
-  return (
+  const terminalCode =
     continuationTerminalErrorCategories.find(
       (category) =>
         !(
@@ -142,8 +157,30 @@ const codexContinuationTerminalErrorCode = (eventName, payload) => {
     )?.code ||
     (explicitRetryDenial
       ? continuationTerminalErrorPolicy.nonRetryable.categoryCode
-      : null)
-  );
+      : null);
+  return { terminalCode, temporaryUsageLimit };
+};
+const codexContinuationTerminalErrorCode = (eventName, payload) =>
+  codexContinuationTerminalErrorClassification(eventName, payload).terminalCode;
+const codexPlanLimitWithCreditSuggestion =
+  /^You['’]ve hit your usage limit\. (?:Upgrade to Pro \(https:\/\/chatgpt\.com\/explore\/pro\), visit |Visit )https:\/\/chatgpt\.com\/settings\/usage to purchase more credits or try again (?:later|at [^.\r\n]+)\.$/;
+const codexContinuationIsTemporaryUsageLimit = (error) => {
+  // Codex reports usageLimitExceeded for plan resets and hard quota failures.
+  // Only its plan-limit message with a retry offer can exempt the purchase
+  // suggestion from the ordinary hard-limit checks.
+  const message = codexContinuationOwnData(error, "message");
+  const ignoreCodexPlanCreditSuggestion =
+    codexContinuationOwnData(error, "codexErrorInfo") ===
+      "usageLimitExceeded" &&
+    typeof message === "string" &&
+    codexPlanLimitWithCreditSuggestion.test(message);
+  const { temporaryUsageLimit, terminalCode } =
+    codexContinuationTerminalErrorClassification(
+      "",
+      { error },
+      { ignoreCodexPlanCreditSuggestion },
+    );
+  return temporaryUsageLimit && !terminalCode;
 };
 // One canonical persisted action document. Explicit installation upgrades legacy
 // records before owner references can exist; reads and action writes never try
@@ -237,11 +274,16 @@ const codexContinuationActionRecords = (value, allowUnidentified = false) => {
   }
   return Object.freeze(records);
 };
+// Every read checks the serialized storage value. Reuse only the last fully
+// validated v2 document when its contents match exactly.
+let codexContinuationActionDocumentCache = null;
 const parseCodexContinuationActionDocument = (raw, legacyMode = "deny") => {
   if (raw !== null && typeof raw !== "string")
     throw new Error("Codex action evidence has invalid serialized data");
   if (raw === null && legacyMode === "deny")
     throw new Error("Codex action evidence is unavailable");
+  if (codexContinuationActionDocumentCache?.raw === raw)
+    return codexContinuationActionDocumentCache.document;
   const parsed = raw === null ? {} : JSON.parse(raw);
   const fields = codexContinuationActionOwnFields(parsed);
   const keys = Object.keys(fields);
@@ -258,11 +300,13 @@ const parseCodexContinuationActionDocument = (raw, legacyMode = "deny") => {
       !codexContinuationActionIdIsValid(fields.revision)
     )
       throw new Error("Codex action evidence has an unsupported document");
-    return Object.freeze({
+    const document = Object.freeze({
       schemaVersion: 2,
       revision: fields.revision,
       actions: codexContinuationActionRecords(fields.actions),
     });
+    codexContinuationActionDocumentCache = { raw, document };
+    return document;
   }
   if (legacyMode === "deny")
     throw new Error(
@@ -609,7 +653,12 @@ const codexOwnerUserActionEvidenceIsCurrent = (threadId, evidence) => {
 };
 const continuationStatus = (value) =>
   String(value?.type || value || "").toLowerCase();
-const classifyCodexContinuationThread = (thread, threadId, expectedModel) => {
+const classifyCodexContinuationThread = (
+  thread,
+  threadId,
+  expectedModel,
+  { temporaryUsageLimitVerified = false } = {},
+) => {
   const requestedModel = String(expectedModel || "").trim();
   if (!requestedModel || requestedModel.toLowerCase() === "unknown") {
     return { ready: false, reason: "The interrupted Codex model is required" };
@@ -646,7 +695,10 @@ const classifyCodexContinuationThread = (thread, threadId, expectedModel) => {
   ) {
     return { ready: false, reason: "The latest Codex turn was cancelled" };
   }
-  if (codexContinuationTerminalErrorCode("", { error: turn?.error })) {
+  if (
+    !temporaryUsageLimitVerified &&
+    codexContinuationTerminalErrorCode("", { error: turn?.error })
+  ) {
     return {
       ready: false,
       reason: "The latest Codex turn needs a user action",
@@ -721,6 +773,79 @@ const codexOwnerContinuationPendingStateIsClear = (thread) => {
       return false;
   }
   return true;
+};
+const classifyCodexUsageLimitContinuationThread = (
+  thread,
+  threadId,
+  expectedModel,
+  expectedTurnId,
+  nativeObservation,
+) => {
+  const turns = codexContinuationOwnData(thread, "turns");
+  const turn =
+    Array.isArray(turns) && turns.length
+      ? codexContinuationOwnData(turns, String(turns.length - 1))
+      : null;
+  if (
+    codexContinuationOwnData(thread, "id") !== threadId ||
+    codexContinuationOwnData(turn, "id") !== expectedTurnId
+  )
+    return {
+      ready: false,
+      reason: "The latest Codex turn does not match the usage-limited turn",
+    };
+  const status = codexContinuationOwnData(thread, "status");
+  const statusType = codexContinuationOwnData(status, "type");
+  const turnStatus = codexContinuationOwnData(turn, "status");
+  if (turnStatus === "completed")
+    return { ready: false, reason: "The usage-limited Codex turn completed" };
+  if (statusType === "active" && turnStatus === "inProgress")
+    return {
+      ready: false,
+      usageLimitDeferred: true,
+      reason: "The usage-limited Codex turn is still active",
+    };
+  const error = codexContinuationOwnData(turn, "error");
+  if (
+    !["failed", "interrupted"].includes(turnStatus) ||
+    !codexContinuationIsTemporaryUsageLimit(error)
+  )
+    return {
+      ready: false,
+      reason:
+        "The latest Codex turn is no longer a temporary usage-limit failure",
+    };
+  if (
+    (statusType !== "idle" && statusType !== "systemError") ||
+    !codexOwnerContinuationPendingStateIsClear(thread)
+  )
+    return {
+      ready: false,
+      usageLimitDeferred: true,
+      reason: "The usage-limited Codex thread is not ready for continuation",
+    };
+  if (nativeObservation) {
+    const threadModel = Object.getOwnPropertyDescriptor(thread, "model");
+    const turnModel = codexContinuationOwnData(turn, "model");
+    if (
+      (threadModel && !Object.hasOwn(threadModel, "value")) ||
+      codexContinuationOwnData(thread, "modelProvider") !==
+        nativeObservation.modelProvider ||
+      [threadModel?.value, turnModel].some(
+        (model) => model != null && model !== expectedModel,
+      )
+    )
+      return {
+        ready: false,
+        reason: "The usage-limited Codex thread changed provider or model",
+      };
+    // Native thread and turn reads can omit the model. The exact observed
+    // turn, verified local client, and current provider bind this continuation.
+    return { ready: true, turnId: expectedTurnId };
+  }
+  return classifyCodexContinuationThread(thread, threadId, expectedModel, {
+    temporaryUsageLimitVerified: true,
+  });
 };
 const classifyCodexOwnerContinuationThread = (thread, binding) => {
   const unavailable = (reason, blocker = "thread_binding_unavailable") => ({
@@ -883,32 +1008,21 @@ const readExactCodexContinuationThread = async (
   }
   return { thread, request };
 };
-// Owner exact-turn readbacks need metadata and only the latest turn. Never
-// materialize the full transcript or silently fall back on an old protocol.
-const readExactCodexOwnerContinuationThread = async (
+// Read only metadata and the latest turn. Readiness polling must not load
+// conversation items, including when the interrupted thread is still active.
+const readBoundedCodexContinuationThread = async (
   client,
   threadId,
-  ownerTarget,
-  ownerReferenceIsCurrent,
+  ensureCurrent = () => {},
+  retainTerminalError = true,
 ) => {
-  const ensureCurrent = () => {
-    if (
-      ownerReferenceIsCurrent() !== true ||
-      !codexContinuationClientIsCurrent(client) ||
-      codexVerifiedAppServerOriginalRequest(
-        client,
-        codexContinuationRequestPatchVersion,
-      ) !== ownerTarget.request
-    )
-      throw new Error("The owner Codex view is no longer current");
-  };
   ensureCurrent();
   const { thread, request } = await readExactCodexContinuationThread(
     client,
     threadId,
     false,
   );
-  ensureCurrent();
+  ensureCurrent(request);
   const page = await readOwnedCodexContinuationRequest(
     client,
     "thread/turns/list",
@@ -920,11 +1034,10 @@ const readExactCodexOwnerContinuationThread = async (
       itemsView: "notLoaded",
     },
   );
-  ensureCurrent();
+  ensureCurrent(page.request);
   const turns = codexContinuationOwnData(page.response, "data");
   const nextCursor = codexContinuationOwnData(page.response, "nextCursor");
   if (
-    request !== ownerTarget.request ||
     page.request !== request ||
     !Array.isArray(turns) ||
     turns.length > 1 ||
@@ -937,8 +1050,8 @@ const readExactCodexOwnerContinuationThread = async (
   )
     throw new Error("The owner Codex bounded history is unavailable");
   const snapshot = {};
-  // Copy only finite descriptor allowlists, never raw config/paths/errors or
-  // getter values. The shared classifier refuses accessor-backed proof fields.
+  // Retain finite proof fields. Automatic recovery also needs terminal error
+  // metadata to reject user cancellation and permanent failures.
   for (const key of [
     "id",
     "model",
@@ -968,14 +1081,46 @@ const readExactCodexOwnerContinuationThread = async (
     )
       throw new Error("The owner Codex bounded history is unavailable");
     const latest = {};
-    for (const key of ["id", "status", "model"]) {
+    const fields = retainTerminalError
+      ? ["id", "status", "model", "error"]
+      : ["id", "status", "model"];
+    for (const key of fields) {
       const descriptor = Object.getOwnPropertyDescriptor(turn, key);
+      if (
+        retainTerminalError &&
+        descriptor &&
+        !Object.hasOwn(descriptor, "value")
+      )
+        throw new Error("The Codex bounded turn metadata is unavailable");
       if (descriptor) Object.defineProperty(latest, key, descriptor);
     }
     snapshot.turns.push(latest);
   }
   return { thread: snapshot, request };
 };
+const readExactCodexOwnerContinuationThread = (
+  client,
+  threadId,
+  ownerTarget,
+  ownerReferenceIsCurrent,
+) =>
+  readBoundedCodexContinuationThread(
+    client,
+    threadId,
+    (request) => {
+      if (
+        ownerReferenceIsCurrent() !== true ||
+        !codexContinuationClientIsCurrent(client) ||
+        (request && request !== ownerTarget.request) ||
+        codexVerifiedAppServerOriginalRequest(
+          client,
+          codexContinuationRequestPatchVersion,
+        ) !== ownerTarget.request
+      )
+        throw new Error("The owner Codex view is no longer current");
+    },
+    false,
+  );
 const continuationInstallationIsCurrent = () =>
   typeof installationIsCurrent !== "function" || installationIsCurrent();
 const codexContinuationLocalClients = () =>
@@ -1047,6 +1192,27 @@ const readCodexContinuationAcknowledgement = (
     return null;
   return turnIds[0];
 };
+const readCodexNativeUsageLimitObservation = (
+  threadId,
+  turnId,
+  model,
+  observedAtMs,
+  client,
+) => {
+  const read = codexContinuationOwnData(
+    state,
+    "getCodexNativeUsageLimitCandidate",
+  );
+  const observation =
+    typeof read === "function" ? read(threadId, turnId, client) : null;
+  // The proxy can supply the model even when the exact native turn omits it.
+  return observation &&
+    observation.observedAtMs === observedAtMs &&
+    (observation.model === null || observation.model === model) &&
+    codexContinuationActionThreadIdIsValid(observation.modelProvider)
+    ? observation
+    : null;
+};
 const prepareCodexContinuation = async (
   threadId,
   recoveryId,
@@ -1055,6 +1221,8 @@ const prepareCodexContinuation = async (
   intent = codexContinuationIntents.AutoRecovery,
   ownerTarget = null,
   ownerViewReference = null,
+  expectedTurnId = null,
+  requireNativeObservation = false,
 ) => {
   if (!Object.values(codexContinuationIntents).includes(intent))
     return {
@@ -1062,6 +1230,34 @@ const prepareCodexContinuation = async (
       reason: "The Codex continuation intent is invalid",
     };
   const isOwner = intent === codexContinuationIntents.OwnerContinue;
+  const isUsageLimitResume =
+    intent === codexContinuationIntents.UsageLimitResume;
+  const readNativeObservation = (client) =>
+    readCodexNativeUsageLimitObservation(
+      threadId,
+      expectedTurnId,
+      expectedModel,
+      observedAtMs,
+      client,
+    );
+  const nativeObservation = requireNativeObservation
+    ? readNativeObservation()
+    : null;
+  const nativeObservationIsCurrent = (client) => {
+    const current = readNativeObservation(client);
+    return (
+      !!current &&
+      current.model === nativeObservation.model &&
+      current.modelProvider === nativeObservation.modelProvider
+    );
+  };
+  if (requireNativeObservation && !nativeObservation)
+    return {
+      submitted: false,
+      usageLimitDeferred: true,
+      reason:
+        "The observed Codex usage-limit interruption is no longer current",
+    };
   const ownerReferenceIsCurrent = () =>
     !isOwner ||
     (typeof codexOwnerRemoteViewReferenceIsCurrent === "function" &&
@@ -1073,10 +1269,19 @@ const prepareCodexContinuation = async (
         threadId,
         ownerTarget?.userActionEvidence,
       ));
-  const classifyThread = (thread) =>
-    isOwner
-      ? classifyCodexOwnerContinuationThread(thread, ownerTarget)
-      : classifyCodexContinuationThread(thread, threadId, expectedModel);
+  const classifyThread = (thread) => {
+    if (isOwner)
+      return classifyCodexOwnerContinuationThread(thread, ownerTarget);
+    if (isUsageLimitResume)
+      return classifyCodexUsageLimitContinuationThread(
+        thread,
+        threadId,
+        expectedModel,
+        expectedTurnId,
+        nativeObservation,
+      );
+    return classifyCodexContinuationThread(thread, threadId, expectedModel);
+  };
   const readThread = (client) =>
     isOwner
       ? readExactCodexOwnerContinuationThread(
@@ -1085,7 +1290,7 @@ const prepareCodexContinuation = async (
           ownerTarget,
           ownerReferenceIsCurrent,
         )
-      : readExactCodexContinuationThread(client, threadId);
+      : readBoundedCodexContinuationThread(client, threadId);
   if (!ownerReferenceIsCurrent())
     return {
       submitted: false,
@@ -1144,6 +1349,9 @@ const prepareCodexContinuation = async (
       reason:
         "The user changed or stopped the Codex thread after this request started",
     };
+  // Native observations are bound to the client that verified the exact turn.
+  if (requireNativeObservation)
+    clients = clients.filter(nativeObservationIsCurrent);
   for (const client of clients) {
     let binding;
     try {
@@ -1163,7 +1371,12 @@ const prepareCodexContinuation = async (
         reason: "The owner Codex view is no longer current",
       };
     const before = classifyThread(binding.thread);
-    if (!before.ready) return { submitted: false, reason: before.reason };
+    if (!before.ready)
+      return {
+        submitted: false,
+        reason: before.reason,
+        usageLimitDeferred: before.usageLimitDeferred === true,
+      };
     // A second read prevents a cached failure from resuming after the user has
     // already started a newer turn. No action is taken on active user work.
     const current = await readThread(client);
@@ -1179,6 +1392,7 @@ const prepareCodexContinuation = async (
     if (!ready.ready || ready.turnId !== before.turnId) {
       return {
         submitted: false,
+        usageLimitDeferred: ready.usageLimitDeferred === true,
         reason:
           ready.reason || "The latest Codex turn changed before continuation",
       };
@@ -1205,6 +1419,7 @@ const prepareCodexContinuation = async (
         return {
           submitted: false,
           mutationAttempted: false,
+          usageLimitDeferred: isUsageLimitResume,
           reason: "The Codex compatibility runtime was replaced",
         };
       if (
@@ -1217,6 +1432,14 @@ const prepareCodexContinuation = async (
           reason:
             "The user changed or stopped the Codex thread before continuation",
         };
+      if (requireNativeObservation && !nativeObservationIsCurrent(client))
+        return {
+          submitted: false,
+          mutationAttempted: false,
+          usageLimitDeferred: true,
+          reason:
+            "The observed Codex usage-limit interruption is no longer current",
+        };
       if (
         !codexContinuationClientIsCurrent(client) ||
         codexVerifiedAppServerOriginalRequest(
@@ -1227,6 +1450,7 @@ const prepareCodexContinuation = async (
         return {
           submitted: false,
           mutationAttempted: false,
+          usageLimitDeferred: isUsageLimitResume,
           reason:
             "Codex Desktop request client was not found with its guarded activity hook",
         };
@@ -1246,16 +1470,18 @@ const prepareCodexContinuation = async (
         return {
           submitted: false,
           mutationAttempted: false,
+          usageLimitDeferred: isUsageLimitResume,
           reason: isOwner
             ? "The owner Codex thread could not be read"
             : String(error?.message || error),
         };
       }
+      const newerUserAction =
+        !isOwner && codexContinuationHasNewerUserAction(threadId, observedAtMs);
       if (
         !continuationInstallationIsCurrent() ||
         !ownerReferenceIsCurrent() ||
-        (!isOwner &&
-          codexContinuationHasNewerUserAction(threadId, observedAtMs)) ||
+        newerUserAction ||
         !codexContinuationClientIsCurrent(client) ||
         latest.request !== preparedRequest ||
         codexVerifiedAppServerOriginalRequest(
@@ -1266,14 +1492,24 @@ const prepareCodexContinuation = async (
         return {
           submitted: false,
           mutationAttempted: false,
+          usageLimitDeferred: isUsageLimitResume && !newerUserAction,
           reason:
             "Codex continuation authorization changed while reading the thread",
+        };
+      if (requireNativeObservation && !nativeObservationIsCurrent(client))
+        return {
+          submitted: false,
+          mutationAttempted: false,
+          usageLimitDeferred: true,
+          reason:
+            "The observed Codex usage-limit interruption is no longer current",
         };
       const latestReady = classifyThread(latest.thread);
       if (!latestReady.ready || latestReady.turnId !== failedTurnId)
         return {
           submitted: false,
           mutationAttempted: false,
+          usageLimitDeferred: latestReady.usageLimitDeferred === true,
           reason:
             latestReady.reason ||
             "The latest Codex turn changed before continuation",
@@ -1295,6 +1531,7 @@ const prepareCodexContinuation = async (
             return {
               submitted: false,
               mutationAttempted: false,
+              usageLimitDeferred: currentReady.usageLimitDeferred === true,
               reason: "Codex continuation changed after final confirmation",
             };
           const markerKey = `${threadId}:${failedTurnId}`;
@@ -1311,16 +1548,21 @@ const prepareCodexContinuation = async (
               reason: "Codex continuation submission evidence is unavailable",
             };
           }
-          if (hasPrevious)
+          if (hasPrevious) {
+            const submitted =
+              codexContinuationOwnData(previous, "status") === "submitted";
+            const turnId = codexContinuationOwnData(previous, "turnId");
             return {
-              submitted:
-                codexContinuationOwnData(previous, "status") === "submitted",
+              submitted,
               mutationAttempted: true,
-              reason:
-                codexContinuationOwnData(previous, "status") === "submitted"
-                  ? "Continuation was already submitted for this interrupted turn"
-                  : "A continuation was already attempted; its result is uncertain",
+              ...(submitted && codexContinuationActionThreadIdIsValid(turnId)
+                ? { turnId }
+                : {}),
+              reason: submitted
+                ? "Continuation was already submitted for this interrupted turn"
+                : "A continuation was already attempted; its result is uncertain",
             };
+          }
           // Persist before sending: a lost response or renderer restart must not
           // cause another continue to be submitted for the same failed turn.
           try {
@@ -1338,6 +1580,18 @@ const prepareCodexContinuation = async (
             };
           }
           try {
+            // Bulk resume calls the verified original sender directly. Capture
+            // its activity before sending so a fast failure can be observed.
+            const observeStart =
+              isUsageLimitResume &&
+              typeof captureCodexNativeUsageLimitAcknowledgement === "function"
+                ? captureCodexNativeUsageLimitAcknowledgement(
+                    client,
+                    threadId,
+                    expectedModel,
+                    { request: preparedRequest, baseTurnId: failedTurnId },
+                  )
+                : undefined;
             const started = await preparedRequest("turn/start", {
               threadId,
               input: [{ type: "text", text: "continue" }],
@@ -1360,6 +1614,7 @@ const prepareCodexContinuation = async (
               status: "submitted",
               turnId,
             });
+            observeStart?.(started);
             return {
               submitted: true,
               mutationAttempted: true,
@@ -1390,7 +1645,28 @@ const prepareCodexContinuation = async (
       },
     };
   }
-  return { submitted: false, mutationAttempted: false, reason };
+  // Every eligible client failed its initial exact read. A newer local user
+  // action is still authoritative if it arrived while those reads ran.
+  const nativeInitialReadUnavailable =
+    requireNativeObservation && clients.length > 0;
+  if (
+    nativeInitialReadUnavailable &&
+    codexContinuationHasNewerUserAction(threadId, observedAtMs)
+  )
+    return {
+      submitted: false,
+      reason:
+        "The user changed or stopped the Codex thread before continuation",
+    };
+  return {
+    submitted: false,
+    mutationAttempted: false,
+    usageLimitDeferred: isUsageLimitResume,
+    ...(nativeInitialReadUnavailable
+      ? { usageLimitInitialReadUnavailable: true }
+      : {}),
+    reason,
+  };
 };
 const codexContinuationMutationAttempted = (job) => {
   if (!job) return false;
@@ -1414,24 +1690,52 @@ const startCodexContinuationJob = (
   intent = codexContinuationIntents.AutoRecovery,
   ownerTarget = null,
   ownerViewReference = null,
+  expectedTurnId = null,
+  requireNativeObservation = false,
 ) => {
   const id = String(threadId || "").trim();
   const token = String(recoveryId || "").trim();
-  const model = String(expectedModel || "").trim();
+  const isUsageLimitResume =
+    intent === codexContinuationIntents.UsageLimitResume;
+  const model =
+    isUsageLimitResume && requireNativeObservation && expectedModel === null
+      ? null
+      : String(expectedModel || "").trim();
   if (!id || !token)
     return {
       started: false,
       reason: "An exact Codex thread and recovery id are required",
     };
-  if (!model || model.toLowerCase() === "unknown")
+  if (model === "" || model?.toLowerCase() === "unknown")
     return {
       started: false,
       reason: "The interrupted Codex model is required",
+    };
+  if (
+    isUsageLimitResume &&
+    !codexContinuationActionThreadIdIsValid(expectedTurnId)
+  )
+    return {
+      started: false,
+      reason: "The usage-limited Codex turn is required",
     };
   if (!Number.isFinite(observedAtMs) || observedAtMs <= 0)
     return {
       started: false,
       reason: "The interrupted turn observation time is required",
+    };
+  if (
+    requireNativeObservation &&
+    !readCodexNativeUsageLimitObservation(
+      id,
+      expectedTurnId,
+      model,
+      observedAtMs,
+    )
+  )
+    return {
+      started: false,
+      reason: "This Codex renderer does not have the usage-limit interruption",
     };
   const existing = state.codexContinuationJobs[token];
   if (existing && existing.threadId !== id)
@@ -1444,6 +1748,9 @@ const startCodexContinuationJob = (
     (existing.expectedModel !== model ||
       existing.observedAtMs !== observedAtMs ||
       (existing.intent || codexContinuationIntents.AutoRecovery) !== intent ||
+      (isUsageLimitResume &&
+        (existing.expectedBaseTurnId !== expectedTurnId ||
+          existing.requireNativeObservation !== requireNativeObservation)) ||
       (intent === codexContinuationIntents.OwnerContinue &&
         existing.ownerViewReference !== ownerViewReference))
   )
@@ -1468,6 +1775,9 @@ const startCodexContinuationJob = (
     ...(intent === codexContinuationIntents.OwnerContinue
       ? { ownerViewReference, expectedBaseTurnId: ownerTarget.latestTurnId }
       : {}),
+    ...(isUsageLimitResume
+      ? { expectedBaseTurnId: expectedTurnId, requireNativeObservation }
+      : {}),
   };
   const job = {
     ...binding,
@@ -1484,6 +1794,8 @@ const startCodexContinuationJob = (
     intent,
     ownerTarget,
     ownerViewReference,
+    expectedTurnId,
+    requireNativeObservation,
   ).then(
     (result) => {
       if (
@@ -1525,6 +1837,7 @@ const startCodexContinuationJob = (
       Object.assign(job, {
         submitted: false,
         mutationAttempted: false,
+        usageLimitDeferred: isUsageLimitResume,
         status: "completed",
         reason:
           intent === codexContinuationIntents.OwnerContinue
@@ -1543,6 +1856,25 @@ state.startCodexContinuation = (
   observedAtMs,
 ) =>
   startCodexContinuationJob(threadId, recoveryId, expectedModel, observedAtMs);
+state.startCodexUsageLimitContinuation = (
+  threadId,
+  recoveryId,
+  expectedModel,
+  observedAtMs,
+  expectedTurnId,
+  requireNativeObservation,
+) =>
+  startCodexContinuationJob(
+    threadId,
+    recoveryId,
+    expectedModel,
+    observedAtMs,
+    codexContinuationIntents.UsageLimitResume,
+    null,
+    null,
+    expectedTurnId,
+    requireNativeObservation === true,
+  );
 // This prepares only. A future native owner dispatcher must authenticate and
 // reauthorize its canonical transaction before using the shared commit bridge.
 // Browser-supplied bindings/prompts/RPC are not accepted by this operation.
@@ -1595,13 +1927,7 @@ state.startCodexOwnerContinuation = (viewReference, operationId) => {
 state.confirmCodexContinuation = (jobId) => {
   const id = typeof jobId === "string" ? jobId : "";
   const job = state.codexContinuationJobs[id];
-  if (
-    !job ||
-    ![
-      codexContinuationIntents.AutoRecovery,
-      codexContinuationIntents.OwnerContinue,
-    ].includes(job.intent)
-  )
+  if (!job || !Object.values(codexContinuationIntents).includes(job.intent))
     return {
       started: false,
       reason: "An exact continuation is required",
@@ -1646,6 +1972,8 @@ state.confirmCodexContinuation = (jobId) => {
         status: "completed",
         submitted: false,
         mutationAttempted: false,
+        usageLimitDeferred:
+          job.intent === codexContinuationIntents.UsageLimitResume,
         reason: "The Codex thread could not be confirmed",
       });
     },
@@ -1753,7 +2081,12 @@ state.readCodexContinuationJob = (jobId) => {
       projected[key] = value;
   }
   let invalidEvidence = false;
-  for (const key of ["submitted", "mutationAttempted"]) {
+  for (const key of [
+    "submitted",
+    "mutationAttempted",
+    "usageLimitDeferred",
+    "usageLimitInitialReadUnavailable",
+  ]) {
     const descriptor = Object.getOwnPropertyDescriptor(job, key);
     if (!descriptor) continue;
     if (!("value" in descriptor) || typeof descriptor.value !== "boolean") {

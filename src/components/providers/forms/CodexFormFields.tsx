@@ -70,6 +70,10 @@ import {
   CommaSeparatedListInput,
 } from "./CodexKeyGroupModels";
 import { CodexCatalogViewport } from "./CodexCatalogViewport";
+import {
+  CodexCatalogSyncReview,
+  type CodexCatalogSyncMode,
+} from "./CodexCatalogSyncReview";
 import { CodexModelReasoningCard } from "./CodexModelReasoningCard";
 import { CodexModelReasoningEditor } from "./CodexModelReasoningEditor";
 import { CodexModelReasoningSummary } from "./CodexModelReasoningSummary";
@@ -94,6 +98,7 @@ import {
   isExplicitCodexReasoningCapability,
   reconcileFetchedCodexCatalogRows,
   selectOnlyCodexCatalogRowsWithReasoningEffort,
+  type CodexCatalogSyncSource,
 } from "@/lib/codexCatalogReconciliation";
 import { enableOnlyConfirmedFreeCatalogModels } from "@/lib/freeModelCatalog";
 import { pruneOutdatedCodexCatalogModels } from "@/lib/codexCatalogVersionPruning";
@@ -917,15 +922,10 @@ function buildCodexProviderReadinessIdentity({
 function mergeFetchedModelsIntoCatalogRows(
   rows: CodexCatalogRow[],
   fetchedModels: FetchedModel[],
-  source: {
-    providerId?: string;
-    providerName?: string;
-    baseUrl?: string;
-    websiteUrl?: string;
-  } = {},
+  source: CodexCatalogSyncSource,
   authoritative = false,
-): CodexCatalogRow[] {
-  const result = reconcileFetchedCodexCatalogRows(rows, fetchedModels, source, {
+) {
+  return reconcileFetchedCodexCatalogRows(rows, fetchedModels, source, {
     appendNew: true,
     createRow: (seed) => createCatalogRow(seed),
     existingMetadataMode: authoritative ? "refresh" : "fill-missing",
@@ -933,7 +933,66 @@ function mergeFetchedModelsIntoCatalogRows(
     includeUnboundRemoteRows: true,
     markMissingRemoteDisabled: true,
   });
-  return result.rows;
+}
+
+interface PendingCatalogSync {
+  models: FetchedModel[];
+  coverage: "complete" | "key-groups";
+  isCurrent: () => boolean;
+}
+
+function planCatalogSync(
+  currentRows: CodexCatalogRow[],
+  review: PendingCatalogSync,
+  source: CodexCatalogSyncSource,
+) {
+  const { rows, missingRows } = review.models.length
+    ? mergeFetchedModelsIntoCatalogRows(
+        currentRows,
+        review.models,
+        source,
+        review.coverage === "complete",
+      )
+    : { rows: currentRows, missingRows: [] };
+  const missingIds = new Set(missingRows.map((row) => row.rowId));
+  const existing = currentRows.map((row, index) => ({
+    before: row,
+    after: row.model.trim() ? rows[index] : row,
+    missing: Boolean(row.model.trim()) && missingIds.has(row.rowId),
+  }));
+  const missing = existing.filter((row) => row.missing);
+  const occupiedModelKeys = new Set(
+    currentRows.map((row) => normalizeCodexPublicModelKey(row.model)),
+  );
+  const retainedModelKeys = new Set(
+    existing
+      .filter((row) => !row.missing)
+      .map(({ before }) => normalizeCodexPublicModelKey(before.model)),
+  );
+  const added: CodexCatalogRow[] = [];
+  const conflicts: Array<{ row: CodexCatalogRow; canReplace: boolean }> = [];
+  for (const row of rows.slice(currentRows.length)) {
+    const key = normalizeCodexPublicModelKey(row.model);
+    if (occupiedModelKeys.has(key)) {
+      conflicts.push({ row, canReplace: !retainedModelKeys.has(key) });
+    } else {
+      added.push(row);
+    }
+    occupiedModelKeys.add(key);
+    retainedModelKeys.add(key);
+  }
+  return {
+    existing,
+    added,
+    conflicts,
+    missingModels: missing.map(({ before }) => before.model),
+    enabledMissingCount: missing.filter(
+      ({ before }) => before.enabled !== false,
+    ).length,
+    hasMetadataChanges: existing.some(
+      ({ before, after, missing }) => !missing && before !== after,
+    ),
+  };
 }
 
 /** Bind only fresh maintained constants to their original, trusted transport. */
@@ -1110,6 +1169,7 @@ export function CodexFormFields({
     identity: modelFetchIdentity,
     models: [] as FetchedModel[],
     fetching: false,
+    review: null as PendingCatalogSync | null,
   }));
   const fetchedModels =
     modelDiscoveryState.identity === modelFetchIdentity
@@ -1118,6 +1178,10 @@ export function CodexFormFields({
   const isFetchingModels =
     modelDiscoveryState.identity === modelFetchIdentity &&
     modelDiscoveryState.fetching;
+  const pendingCatalogSync =
+    modelDiscoveryState.identity === modelFetchIdentity
+      ? modelDiscoveryState.review
+      : null;
 
   useLayoutEffect(() => {
     const owner = modelFetchOwnershipRef.current;
@@ -1126,7 +1190,12 @@ export function CodexFormFields({
     setModelDiscoveryState((previous) =>
       previous.identity === modelFetchIdentity
         ? previous
-        : { identity: modelFetchIdentity, models: [], fetching: false },
+        : {
+            identity: modelFetchIdentity,
+            models: [],
+            fetching: false,
+            review: null,
+          },
     );
     return () => {
       // Invalidate committed ownership before queued promise callbacks run,
@@ -1148,12 +1217,21 @@ export function CodexFormFields({
       isCurrent,
       start: () =>
         setModelDiscoveryState((previous) =>
-          isCurrent() ? { ...previous, fetching: true } : previous,
+          isCurrent()
+            ? { ...previous, fetching: true, review: null }
+            : previous,
         ),
       setModels: (models: FetchedModel[]) =>
         setModelDiscoveryState((previous) =>
+          isCurrent() ? { ...previous, models } : previous,
+        ),
+      review: (
+        models: FetchedModel[],
+        coverage: PendingCatalogSync["coverage"],
+      ) =>
+        setModelDiscoveryState((previous) =>
           isCurrent()
-            ? { identity: modelFetchIdentity, models, fetching: true }
+            ? { ...previous, review: { models, coverage, isCurrent } }
             : previous,
         ),
       finish: () =>
@@ -1875,7 +1953,7 @@ export function CodexFormFields({
           }
           request.setModels(models);
           if (onCatalogModelsChange) {
-            const rows = mergeFetchedModelsIntoCatalogRows(
+            const { rows } = mergeFetchedModelsIntoCatalogRows(
               catalogRowsRef.current,
               models,
               { providerId, providerName, baseUrl: codexBaseUrl, websiteUrl },
@@ -1952,21 +2030,16 @@ export function CodexFormFields({
     )
       .then((models) => {
         if (!request.isCurrent()) return;
-        request.setModels(models);
         if (onCatalogModelsChange) {
-          const mergedRows = mergeFetchedModelsIntoCatalogRows(
-            catalogRowsRef.current,
+          request.review(
             models,
-            {
-              providerId,
-              providerName,
-              baseUrl: codexBaseUrl,
-              websiteUrl,
-            },
-            isCompleteCodexCatalogFetch(apiKeyGroups),
+            isCompleteCodexCatalogFetch(apiKeyGroups)
+              ? "complete"
+              : "key-groups",
           );
-          commitCatalogRows(() => mergedRows, { repairDefault: true });
+          return;
         }
+        request.setModels(models);
         if (models.length === 0) {
           toast.info(t("providerForm.fetchModelsEmpty"));
         } else {
@@ -2006,6 +2079,76 @@ export function CodexFormFields({
     officialManagedOAuth,
     t,
   ]);
+
+  const catalogSyncPlan = useMemo(
+    () =>
+      pendingCatalogSync &&
+      planCatalogSync(catalogRows, pendingCatalogSync, {
+        providerId,
+        providerName,
+        baseUrl: codexBaseUrl,
+        websiteUrl,
+      }),
+    [
+      catalogRows,
+      pendingCatalogSync,
+      providerId,
+      providerName,
+      codexBaseUrl,
+      websiteUrl,
+    ],
+  );
+
+  const closeCatalogSyncReview = (useDiscoveredModels = false) => {
+    if (!pendingCatalogSync?.isCurrent()) return;
+    modelFetchOwnershipRef.current.sequence += 1;
+    setModelDiscoveryState((current) => ({
+      ...current,
+      models: useDiscoveredModels ? pendingCatalogSync.models : current.models,
+      fetching: false,
+      review: null,
+    }));
+  };
+
+  const applyCatalogSync = (
+    mode: CodexCatalogSyncMode,
+    includeNew: boolean,
+  ) => {
+    if (
+      !pendingCatalogSync?.isCurrent() ||
+      !pendingCatalogSync.models.length ||
+      !catalogSyncPlan ||
+      !onCatalogModelsChange ||
+      catalogRowsRef.current !== catalogRows ||
+      (mode !== "keep" && pendingCatalogSync.coverage !== "complete")
+    ) {
+      return;
+    }
+    const rows = catalogSyncPlan.existing.flatMap(
+      ({ before, after, missing }) => {
+        if (!missing) return [after];
+        if (mode === "replace") return [];
+        return [mode === "disable" ? after : before];
+      },
+    );
+    const added = [...catalogSyncPlan.added];
+    if (mode === "replace") {
+      added.push(
+        ...catalogSyncPlan.conflicts
+          .filter(({ canReplace }) => canReplace)
+          .map(({ row }) => row),
+      );
+      // A newly discovered binding with the same public ID cannot inherit an
+      // override from the missing row it replaces.
+      reconcileProtocolOverrides(rows);
+    }
+    const additions = includeNew
+      ? added.map((row) => ({ ...row, enabled: true }))
+      : added;
+    closeCatalogSyncReview(true);
+    commitCatalogRows(() => [...rows, ...additions], { repairDefault: true });
+    toast.success(t("codexConfig.modelSync.applied"));
+  };
 
   const confirmedFreeModelCount = useMemo(
     () => fetchedModels.filter((model) => model.isFree === true).length,
@@ -2901,7 +3044,7 @@ export function CodexFormFields({
                   onApiKeyGroupsChange(next);
                 }}
                 onModelsFetched={(models) => {
-                  const mergedRows = mergeFetchedModelsIntoCatalogRows(
+                  const { rows } = mergeFetchedModelsIntoCatalogRows(
                     catalogRowsRef.current,
                     models,
                     {
@@ -2911,7 +3054,7 @@ export function CodexFormFields({
                       websiteUrl,
                     },
                   );
-                  commitCatalogRows(() => mergedRows, { repairDefault: true });
+                  commitCatalogRows(() => rows, { repairDefault: true });
                 }}
               />
               <div className="flex items-center gap-2">
@@ -3063,6 +3206,34 @@ export function CodexFormFields({
             );
             setIsProtocolProbeProgressOpen(true);
           }}
+        />
+      )}
+
+      {pendingCatalogSync && catalogSyncPlan && (
+        <CodexCatalogSyncReview
+          fetchedCount={pendingCatalogSync.models.length}
+          addedModels={catalogSyncPlan.added.map((row) => row.model)}
+          conflictingModels={catalogSyncPlan.conflicts.map(
+            ({ row, canReplace }) => ({
+              model: row.model,
+              canReplace,
+            }),
+          )}
+          missingModels={catalogSyncPlan.missingModels}
+          enabledMissingCount={catalogSyncPlan.enabledMissingCount}
+          hasMetadataChanges={catalogSyncPlan.hasMetadataChanges}
+          coverage={pendingCatalogSync.coverage}
+          restoreFocusRef={fetchModelsButtonRef}
+          onApply={applyCatalogSync}
+          onCancel={() =>
+            closeCatalogSyncReview(
+              pendingCatalogSync.models.length > 0 &&
+                !catalogSyncPlan.added.length &&
+                !catalogSyncPlan.conflicts.length &&
+                !catalogSyncPlan.missingModels.length &&
+                !catalogSyncPlan.hasMetadataChanges,
+            )
+          }
         />
       )}
 

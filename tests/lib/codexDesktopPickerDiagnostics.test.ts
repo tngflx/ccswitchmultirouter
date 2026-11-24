@@ -144,7 +144,7 @@ describe("Codex Desktop picker observer diagnostics", () => {
     try {
       const state = { ...h.state, nativeReasoningVisibilityRequired: true };
       const visibility = `
-        const codexCurrentNativeReasoningQueryCaches = () => new Set(state.reasoningQueryCaches.keys());
+        const codexCurrentNativeReasoningOwnerProof = () => ({caches: new Set(state.reasoningQueryCaches.keys())});
         ${reader}
       `;
       expect(loadDiagnostics(state, visibility)()).toMatchObject({
@@ -156,6 +156,259 @@ describe("Codex Desktop picker observer diagnostics", () => {
       h.dispose();
     }
   });
+
+  it("proves current scope ownership once per diagnostics sample across managed caches", () => {
+    const first = harness((value) => ({ models: value.data }));
+    const second = harness((value) => ({ models: value.data }));
+    try {
+      const clients = [first.client, second.client];
+      const resolveCaches = clients.map((client) =>
+        vi.spyOn(client, "getQueryCache"),
+      );
+      const root = { current: {} };
+      const enabled = new Set(efforts);
+      const state = {
+        ...first.state,
+        nativeReasoningVisibilityRequired: true,
+        nativeReasoningVisibilityAtoms: [{ scope: {}, resolve: vi.fn() }],
+        scopedAppServerScopeCandidates: new Set(
+          clients.map((queryClient) => ({
+            chain: {},
+            node: { queryClient },
+            queryClient,
+            get: () => enabled,
+            set: vi.fn(),
+            watch: vi.fn(),
+          })),
+        ),
+        scopedAppServerRootIdentities: [root.current],
+        reasoningQueryCaches: new Map([
+          ...first.state.reasoningQueryCaches,
+          ...second.state.reasoningQueryCaches,
+        ]),
+        root,
+      };
+      const native = readFileSync(
+        resource("native_reasoning_visibility.js"),
+        "utf8",
+      );
+      const read = loadDiagnostics(
+        state,
+        `
+          const window = { __codexRoot: { _internalRoot: state.root } };
+          const document = { getElementById: () => null };
+          ${native}
+        `,
+      );
+      expect(read()).toMatchObject({
+        status: "ready",
+        successObserverCount: 2,
+      });
+      for (const resolveCache of resolveCaches)
+        expect(resolveCache).toHaveBeenCalledTimes(1);
+
+      root.current = {};
+      expect(read()).toMatchObject({
+        status: "unverified",
+        nativeVisibilityUnverifiedObserverCount: 2,
+      });
+    } finally {
+      second.dispose();
+      first.dispose();
+    }
+  });
+
+  it("verifies a Boolean-only picker without consulting the graded visibility reader", () => {
+    const h = harness(() => ({ models: [row(["none", "medium"])] }));
+    try {
+      const model = "relay";
+      const state = {
+        ...h.state,
+        payload: {
+          ...payload(),
+          models: [
+            {
+              model,
+              supported_reasoning_levels: [],
+              ccSwitchReasoningControl: {
+                kind: "boolean",
+                disableAllowed: true,
+                fingerprint: "canonical-binary",
+              },
+            },
+          ],
+        },
+        nativeReasoningVisibilityRequired: true,
+        currentNativeCaches: new Set<object>([h.client.getQueryCache()]),
+        readGradedVisibility: vi.fn(() => ({
+          status: "unverified",
+          missingEfforts: [],
+        })),
+        readNativeBooleanReasoningControlDiagnostics: vi.fn<() => object>(),
+      };
+      const read = loadDiagnostics(
+        state,
+        `
+          const codexCurrentNativeReasoningOwnerProof = () => ({caches: state.currentNativeCaches});
+          const readCodexNativeReasoningVisibility = state.readGradedVisibility;
+        `,
+      );
+      state.readNativeBooleanReasoningControlDiagnostics.mockReturnValue({
+        status: "ready",
+        model,
+        selectedState: "on",
+        visibleStates: ["off", "on"],
+      });
+      expect(read()).toMatchObject({
+        status: "ready",
+        booleanControlReadyModelCount: 1,
+        nativeVisibilityUnverifiedObserverCount: 0,
+      });
+      state.readNativeBooleanReasoningControlDiagnostics.mockReturnValue({
+        status: "ready",
+        model: "other-model",
+        selectedState: "on",
+        visibleStates: ["off", "on"],
+      });
+      expect(read()).toMatchObject({
+        status: "unverified",
+        booleanControlUnverifiedModelCount: 1,
+        nativeVisibilityUnverifiedObserverCount: 0,
+      });
+      expect(state.readGradedVisibility).not.toHaveBeenCalled();
+      expect(
+        state.readNativeBooleanReasoningControlDiagnostics,
+      ).toHaveBeenCalledTimes(2);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it("shares a single current selection snapshot across Boolean observer checks", () => {
+    const select = () => ({ models: [row(["none", "medium"])] });
+    const h = harness(select);
+    const other = new QueryObserver(h.client, {
+      queryKey: key,
+      enabled: false,
+      select,
+    });
+    const unsubscribe = other.subscribe(() => {});
+    try {
+      const selected = new Set(["relay"]);
+      const state = {
+        ...h.state,
+        payload: {
+          ...payload(),
+          models: [
+            {
+              model: "relay",
+              supported_reasoning_levels: [],
+              ccSwitchReasoningControl: {
+                kind: "boolean",
+                disableAllowed: true,
+                fingerprint: "canonical-binary",
+              },
+            },
+          ],
+        },
+        readNativeBooleanReasoningSelectionDiagnostics: vi.fn(() => selected),
+        readNativeBooleanReasoningControlDiagnostics: vi.fn(
+          (model: string, selections?: Set<string>) => ({
+            model,
+            status: selections?.has(model) ? "unverified" : "not_observed",
+          }),
+        ),
+      };
+      expect(loadDiagnostics(state)()).toMatchObject({
+        status: "unverified",
+        successObserverCount: 2,
+        booleanControlUnverifiedModelCount: 1,
+        booleanControlNotObservedModelCount: 0,
+      });
+      expect(
+        state.readNativeBooleanReasoningSelectionDiagnostics,
+      ).toHaveBeenCalledTimes(1);
+      expect(
+        state.readNativeBooleanReasoningControlDiagnostics.mock.calls,
+      ).toEqual([
+        ["relay", selected],
+        ["relay", selected],
+      ]);
+    } finally {
+      unsubscribe();
+      h.dispose();
+    }
+  });
+
+  it("skips graded proof for an explicitly effort-free current catalog and still checks cache ownership", () => {
+    const h = harness(() => ({ models: [row([])] }));
+    try {
+      h.state.payload.models[0].supported_reasoning_levels = [];
+      const state = {
+        ...h.state,
+        nativeReasoningVisibilityRequired: true,
+        currentNativeCaches: new Set<object>([
+          h.client.getQueryCache(),
+        ]) as Set<object> | null,
+      };
+      const read = loadDiagnostics(
+        state,
+        `const codexCurrentNativeReasoningOwnerProof = () => ({caches: state.currentNativeCaches});`,
+      );
+      expect(read()).toMatchObject({
+        status: "ready",
+        nativeVisibilityUnverifiedObserverCount: 0,
+      });
+
+      state.currentNativeCaches = null;
+      expect(read()).toMatchObject({
+        status: "unverified",
+        nativeVisibilityUnverifiedObserverCount: 1,
+      });
+      state.currentNativeCaches = new Set([{}]);
+      expect(read()).toMatchObject({
+        status: "pending",
+        pickerObserverCount: 0,
+      });
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it.each([
+    {
+      model: "unknown",
+      supported_reasoning_levels: [],
+      reasoning: { controlKind: "unknown" },
+    },
+    { model: "graded", supported_reasoning_levels: ["high"] },
+    {
+      model: "malformed-boolean",
+      supported_reasoning_levels: [],
+      ccSwitchReasoningControl: { kind: "boolean", disableAllowed: true },
+    },
+  ])(
+    "keeps visibility proof required when an active $model row is absent from the selection",
+    (catalogRow) => {
+      const h = harness(() => ({ models: [row([])] }));
+      try {
+        h.state.payload.models[0].supported_reasoning_levels = [];
+        h.state.payload.modelNames.push(catalogRow.model);
+        h.state.payload.models.push(catalogRow);
+        const state = { ...h.state, nativeReasoningVisibilityRequired: true };
+        const read = loadDiagnostics(
+          state,
+          `const codexCurrentNativeReasoningOwnerProof = () => ({caches: new Set(state.reasoningQueryCaches.keys())});`,
+        );
+        expect(read()).toMatchObject({
+          status: "unverified",
+          nativeVisibilityUnverifiedObserverCount: 1,
+        });
+      } finally {
+        h.dispose();
+      }
+    },
+  );
 
   it("keeps unobserved Boolean controls unverified without treating transport aliases as graded mismatches", () => {
     const marker = {
@@ -193,7 +446,7 @@ describe("Codex Desktop picker observer diagnostics", () => {
     };
     const nativeVisible = new Set(["low", "medium", "high", "xhigh"]);
     const visibilityCode = `
-      const codexCurrentNativeReasoningQueryCaches = () => new Set(state.reasoningQueryCaches.keys());
+      const codexCurrentNativeReasoningOwnerProof = () => ({caches: new Set(state.reasoningQueryCaches.keys())});
       const readCodexNativeReasoningVisibility = () => ({status: "mismatch", missingEfforts: ["none"]});
     `;
     expect(loadDiagnostics(state, visibilityCode)()).toMatchObject({
@@ -331,6 +584,57 @@ describe("Codex Desktop picker observer diagnostics", () => {
     expect(loadDiagnostics(state)()).toMatchObject({
       status: "ready",
       booleanControlReadyModelCount: 1,
+      booleanControlUnverifiedModelCount: 0,
+      booleanControlNotObservedModelCount: 1,
+    });
+  });
+
+  it("does not treat an inactive native Boolean bridge as a malformed control", () => {
+    const marker = {
+      kind: "boolean",
+      disableAllowed: true,
+      fingerprint: "canonical-binary",
+    };
+    const model = "inactive-bridge";
+    const observer = {
+      options: { queryKey: key },
+      getCurrentResult: () => ({
+        status: "success",
+        data: {
+          models: [
+            {
+              model,
+              supportedReasoningEfforts: ["none", "medium"].map(
+                (reasoningEffort) => ({ reasoningEffort }),
+              ),
+            },
+          ],
+        },
+      }),
+    };
+    const cache = { getAll: () => [{ queryKey: key, observers: [observer] }] };
+    const state: Record<string, any> = {
+      payload: {
+        ...payload(),
+        modelNames: [model],
+        models: [
+          {
+            model,
+            supported_reasoning_levels: [],
+            ccSwitchReasoningControl: marker,
+          },
+        ],
+      },
+      reasoningQueryCaches: new Map([[cache, {}]]),
+      readNativeBooleanReasoningControlDiagnostics: () => ({
+        status: "not_active",
+        model,
+      }),
+    };
+
+    expect(loadDiagnostics(state)()).toMatchObject({
+      status: "ready",
+      booleanControlReadyModelCount: 0,
       booleanControlUnverifiedModelCount: 0,
       booleanControlNotObservedModelCount: 1,
     });
@@ -864,7 +1168,7 @@ type ModelObservationSnapshot = {
   }>;
 };
 const observationVisibility = `
-  const codexCurrentNativeReasoningQueryCaches = () => state.currentNativeCaches;
+  const codexCurrentNativeReasoningOwnerProof = () => ({caches: state.currentNativeCaches});
   const readCodexNativeReasoningVisibility = (_cache, requested) => {
     state.visibilityReadCount += 1;
     return {status: state.visibilityStatus, missingEfforts: requested.filter(effort => !state.nativeVisibleEfforts.has(effort))};

@@ -31,10 +31,6 @@ import {
   withLocalReleaseCargoTarget,
 } from "./release-build-config.mjs";
 import { buildHistoryRepairSidecar } from "./local-build-pipeline.mjs";
-import {
-  createBuildApprovalScope,
-  requireBuildApproval,
-} from "./build-approval.mjs";
 
 const SCRIPT_REPO = fileURLToPath(new URL("../", import.meta.url));
 const DEFAULT_GITHUB_REPOSITORY = "tngflx/ccswitchmultirouter";
@@ -43,7 +39,6 @@ export function parseLocalReleaseOptions(args) {
   const options = {
     releaseRoot: "",
     skipBuild: false,
-    confirmBuild: false,
     noTypecheck: false,
     reason: "manual",
     help: false,
@@ -56,10 +51,6 @@ export function parseLocalReleaseOptions(args) {
     }
     if (["--skip-build", "-SkipBuild"].includes(argument)) {
       options.skipBuild = true;
-      continue;
-    }
-    if (argument === "--confirm-build") {
-      options.confirmBuild = true;
       continue;
     }
     if (["--no-typecheck", "-NoTypecheck"].includes(argument)) {
@@ -575,14 +566,6 @@ export function runLocalRelease(
   } = {},
 ) {
   const repo = path.resolve(repoRoot);
-  if (!options.skipBuild) {
-    requireBuildApproval({
-      args: [],
-      environment,
-      operation: "the local release build",
-      allowEnvironmentApproval: true,
-    });
-  }
   const releaseRoot = assertReleaseOutputRoot(
     repo,
     path.resolve(resolveRoot(repo, options.releaseRoot)),
@@ -656,7 +639,6 @@ export function runLocalRelease(
               [
                 "tauri",
                 "build",
-                "--confirm-build",
                 "--bundles",
                 "nsis",
                 "--config",
@@ -726,24 +708,9 @@ export function main(args = process.argv.slice(2), dependencies = {}) {
   const options = parseLocalReleaseOptions(args);
   if (options.help) {
     console.log(
-      "Usage: node scripts/local-release-pipeline.mjs [--confirm-build] [--release-root PATH] [--skip-build] [--no-typecheck] [--reason TEXT]",
+      "Usage: node scripts/local-release-pipeline.mjs [--release-root PATH] [--skip-build] [--no-typecheck] [--reason TEXT]",
     );
     return;
-  }
-  if (!options.skipBuild) {
-    requireBuildApproval({
-      args,
-      operation: "the local release build",
-    });
-    const approval = createBuildApprovalScope(dependencies.environment);
-    try {
-      return runLocalRelease(options, {
-        ...dependencies,
-        environment: approval.environment,
-      });
-    } finally {
-      approval.cleanup();
-    }
   }
   return runLocalRelease(options, dependencies);
 }

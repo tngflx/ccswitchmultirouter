@@ -18,7 +18,6 @@ const FILETIME_UNIX_OFFSET = 116444736000000000n;
 const validPid = (value) => Number.isSafeInteger(value) && value > 0;
 const object = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
-const CURRENT_BUILD_APPROVAL_FLAG = "--confirm-build";
 export const parseGuardianJson = (source) =>
   JSON.parse(source.replace(/^\uFEFF/, ""), (key, value, context) => {
     if (key === "processStartedAtTicks" && typeof value === "number") {
@@ -247,11 +246,7 @@ export async function devSessionRecoveryPlan({
     Object.assign(plan, {
       Executable: canonicalPath(session.supervisorExecutablePath),
       SupervisorPid: session.supervisorPid,
-      // A persisted approval is historical state. It must never be replayed
-      // into a later recovery launch as if it were current consent.
-      Args: session.args.filter(
-        (argument) => argument !== CURRENT_BUILD_APPROVAL_FLAG,
-      ),
+      Args: [...session.args],
       Roots: [...session.roots],
       Session: session,
       SessionJson: sessionJson,

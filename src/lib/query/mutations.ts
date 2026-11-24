@@ -148,21 +148,26 @@ async function warnIfActiveCodexProjectionPending(
   }
 }
 
-export const useAddProviderMutation = (appId: AppId) => {
+type ProviderMutationTarget = { appId: AppId; providerId: string };
+
+export const useAddProviderMutation = () => {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
 
   return useMutation({
-    mutationFn: async (
-      providerInput: Omit<Provider, "id"> & {
+    mutationFn: async ({
+      appId,
+      ...providerInput
+    }: {
+      appId: AppId;
+    } & Omit<Provider, "id"> & {
         providerKey?: string;
         teDescriptor?: TeStaticProviderDescriptor;
         addToLive?: boolean;
         ensureClaudeDesktopOfficialSeed?: boolean;
         ensureCodexOfficialSeed?: boolean;
         ensureGrokBuildOfficialSeed?: boolean;
-      },
-    ) => {
+      }) => {
       const {
         providerKey: _providerKey,
         teDescriptor,
@@ -248,7 +253,7 @@ export const useAddProviderMutation = (appId: AppId) => {
       await providersApi.add(newProvider, appId, addToLive);
       return { ...newProvider, tePublishStatus: undefined };
     },
-    onSuccess: async (provider) => {
+    onSuccess: async (provider, { appId }) => {
       await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
 
       if (appId === "opencode") {
@@ -306,7 +311,7 @@ export const useAddProviderMutation = (appId: AppId) => {
         }),
       );
     },
-    onError: (error: Error) => {
+    onError: (error: Error, { appId }) => {
       const rawDetail = extractErrorMessage(error);
       const detail =
         (appId === "pi"
@@ -321,7 +326,7 @@ export const useAddProviderMutation = (appId: AppId) => {
         }),
       );
     },
-    onSettled: async () => {
+    onSettled: async (_data, _error, { appId }) => {
       if (appId === "pi") {
         await invalidatePiProviderCaches(queryClient);
       }
@@ -329,16 +334,18 @@ export const useAddProviderMutation = (appId: AppId) => {
   });
 };
 
-export const useUpdateProviderMutation = (appId: AppId) => {
+export const useUpdateProviderMutation = () => {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
 
   return useMutation({
     mutationFn: async ({
+      appId,
       provider,
       originalId,
       teDescriptor,
     }: {
+      appId: AppId;
       provider: Provider;
       originalId?: string;
       teDescriptor?: TeStaticProviderDescriptor;
@@ -356,15 +363,15 @@ export const useUpdateProviderMutation = (appId: AppId) => {
       await providersApi.update(provider, appId, originalId);
       return { provider };
     },
-    onSuccess: async (result, variables) => {
+    onSuccess: async (result, { appId, originalId }) => {
       const provider = result.provider;
       await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
       await queryClient.invalidateQueries({
         queryKey: usageKeys.script(provider.id, appId),
       });
-      if (variables.originalId && variables.originalId !== provider.id) {
+      if (originalId && originalId !== provider.id) {
         await queryClient.invalidateQueries({
-          queryKey: usageKeys.script(variables.originalId, appId),
+          queryKey: usageKeys.script(originalId, appId),
         });
       }
       if (appId === "openclaw") {
@@ -393,7 +400,7 @@ export const useUpdateProviderMutation = (appId: AppId) => {
         }),
       );
     },
-    onError: (error: Error) => {
+    onError: (error: Error, { appId }) => {
       const rawDetail = extractErrorMessage(error);
       const detail =
         (appId === "pi"
@@ -408,7 +415,7 @@ export const useUpdateProviderMutation = (appId: AppId) => {
         }),
       );
     },
-    onSettled: async () => {
+    onSettled: async (_data, _error, { appId }) => {
       if (appId === "pi") {
         await invalidatePiProviderCaches(queryClient);
       }
@@ -416,15 +423,15 @@ export const useUpdateProviderMutation = (appId: AppId) => {
   });
 };
 
-export const useDeleteProviderMutation = (appId: AppId) => {
+export const useDeleteProviderMutation = () => {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
 
   return useMutation({
-    mutationFn: async (providerId: string) => {
+    mutationFn: async ({ appId, providerId }: ProviderMutationTarget) => {
       await providersApi.delete(providerId, appId);
     },
-    onSuccess: async () => {
+    onSuccess: async (_data, { appId }) => {
       await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
 
       if (appId === "opencode") {
@@ -470,7 +477,7 @@ export const useDeleteProviderMutation = (appId: AppId) => {
         },
       );
     },
-    onError: (error: Error) => {
+    onError: (error: Error, { appId }) => {
       const rawDetail = extractErrorMessage(error);
       const detail =
         (appId === "pi"
@@ -485,7 +492,7 @@ export const useDeleteProviderMutation = (appId: AppId) => {
         }),
       );
     },
-    onSettled: async () => {
+    onSettled: async (_data, _error, { appId }) => {
       if (appId === "pi") {
         await invalidatePiProviderCaches(queryClient);
       }
@@ -493,18 +500,21 @@ export const useDeleteProviderMutation = (appId: AppId) => {
   });
 };
 
-export const useSwitchProviderMutation = (appId: AppId) => {
+export const useSwitchProviderMutation = () => {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
 
   return useMutation({
-    mutationFn: async (providerId: string): Promise<SwitchResult> => {
+    mutationFn: async ({
+      appId,
+      providerId,
+    }: ProviderMutationTarget): Promise<SwitchResult> => {
       return await providersApi.switch(providerId, appId);
     },
-    onSuccess: () => {
+    onSuccess: (_data, { appId }) => {
       refreshProviderSwitchQueries(queryClient, appId);
     },
-    onError: (error: Error, providerId: string) => {
+    onError: (error: Error, { appId, providerId }) => {
       const detail = extractErrorMessage(error) || t("common.unknown");
 
       const recoveryActions = createProviderSwitchFailureToastOptions({
@@ -588,7 +598,7 @@ export const useSwitchProviderMutation = (appId: AppId) => {
         },
       );
     },
-    onSettled: () => {
+    onSettled: (_data, _error, { appId }) => {
       if (appId === "pi") {
         void invalidatePiProviderCaches(queryClient).catch((error) => {
           console.error(

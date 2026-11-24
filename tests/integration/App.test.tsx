@@ -35,6 +35,7 @@ vi.mock("sonner", () => ({
     success: (...args: unknown[]) => toastSuccessMock(...args),
     error: (...args: unknown[]) => toastErrorMock(...args),
     warning: (...args: unknown[]) => toastWarningMock(...args),
+    info: vi.fn(),
   },
 }));
 
@@ -45,6 +46,7 @@ vi.mock("@/components/providers/ProviderList", () => ({
     isLoading,
     onSwitch,
     onEdit,
+    onDelete,
     onDuplicate,
     onConfigureUsage,
     onOpenWebsite,
@@ -61,6 +63,11 @@ vi.mock("@/components/providers/ProviderList", () => ({
         switch
       </button>
       <button onClick={() => onEdit(providers[currentProviderId])}>edit</button>
+      {Object.values(providers).map((provider: any) => (
+        <button key={provider.id} onClick={() => onDelete(provider)}>
+          delete {provider.id}
+        </button>
+      ))}
       <button onClick={() => onDuplicate(providers[currentProviderId])}>
         duplicate
       </button>
@@ -393,6 +400,141 @@ describe("App integration with MSW", () => {
       read.mockRestore();
     }
   }, 15_000);
+
+  it("renders provider inventory while the current provider lookup is pending", async () => {
+    let finishCurrent!: (providerId: string) => void;
+    const currentPending = new Promise<string>((resolve) => {
+      finishCurrent = resolve;
+    });
+    const current = vi
+      .spyOn(providersApi, "getCurrent")
+      .mockReturnValue(currentPending);
+    try {
+      const { default: App } = await import("@/App");
+      renderApp(App);
+
+      await waitFor(() => {
+        const list = screen.getByTestId("provider-list");
+        expect(list).toHaveTextContent("claude-1");
+        expect(list).toHaveAttribute("aria-busy", "false");
+        expect(current).toHaveBeenCalledWith("claude");
+      });
+      expect(screen.getByTestId("current-provider")).toBeEmptyDOMElement();
+
+      await act(async () => finishCurrent("claude-1"));
+      await waitFor(() =>
+        expect(screen.getByTestId("current-provider")).toHaveTextContent(
+          "claude-1",
+        ),
+      );
+    } finally {
+      finishCurrent("claude-1");
+      current.mockRestore();
+    }
+  }, 15_000);
+
+  it.each([
+    { navigation: "staying in Codex", switchDuring: null },
+    {
+      navigation: "switching to Claude during the current lookup",
+      switchDuring: "lookup",
+    },
+    {
+      navigation: "switching to Claude during the fallback switch",
+      switchDuring: "fallback",
+    },
+  ])(
+    "waits for the current provider before deleting an active MultiRouter when $navigation",
+    async ({ switchDuring }) => {
+      setProviders("codex", {
+        "codex-router": {
+          id: "codex-router",
+          name: "MultiRouter",
+          settingsConfig: {
+            codexRouting: { schemaVersion: 2, enabled: true, routes: [] },
+          },
+        },
+        "codex-openai": {
+          id: "codex-openai",
+          name: "OpenAI",
+          settingsConfig: {},
+          category: "official",
+        },
+      });
+      setCurrentProviderId("codex", "codex-router");
+
+      let finishCurrent!: (providerId: string) => void;
+      const currentPending = new Promise<string>((resolve) => {
+        finishCurrent = resolve;
+      });
+      const readCurrent = providersApi.getCurrent;
+      const current = vi
+        .spyOn(providersApi, "getCurrent")
+        .mockImplementation((appId) =>
+          appId === "codex" ? currentPending : readCurrent(appId),
+        );
+      let finishFallback!: () => void;
+      const fallbackPending = new Promise<void>((resolve) => {
+        finishFallback = resolve;
+      });
+      const performSwitch = providersApi.switch;
+      const switchProvider = vi
+        .spyOn(providersApi, "switch")
+        .mockImplementationOnce(async (providerId, appId) => {
+          await fallbackPending;
+          return performSwitch(providerId, appId);
+        });
+      const deleteProvider = vi.spyOn(providersApi, "delete");
+      try {
+        const { default: App } = await import("@/App");
+        renderApp(App);
+        fireEvent.click(screen.getByText("switch-codex"));
+
+        fireEvent.click(await screen.findByText("delete codex-router"));
+        expect(screen.getByTestId("current-provider")).toBeEmptyDOMElement();
+        await act(async () => {
+          fireEvent.click(await screen.findByText("confirm-delete"));
+        });
+        expect(deleteProvider).not.toHaveBeenCalled();
+
+        if (switchDuring === "lookup") {
+          fireEvent.click(screen.getByText("switch-claude"));
+          expect(screen.getByTestId("app-switcher")).toHaveTextContent(
+            "claude",
+          );
+          expect(switchProvider).not.toHaveBeenCalled();
+        }
+
+        current.mockImplementation(readCurrent);
+        await act(async () => finishCurrent("codex-router"));
+        await waitFor(() =>
+          expect(switchProvider).toHaveBeenCalledWith("codex-openai", "codex"),
+        );
+        if (switchDuring === "fallback") {
+          fireEvent.click(screen.getByText("switch-claude"));
+          expect(screen.getByTestId("app-switcher")).toHaveTextContent(
+            "claude",
+          );
+          expect(deleteProvider).not.toHaveBeenCalled();
+        }
+
+        await act(async () => finishFallback());
+        await waitFor(() => {
+          expect(deleteProvider).toHaveBeenCalledWith("codex-router", "codex");
+        });
+        expect(switchProvider.mock.invocationCallOrder[0]).toBeLessThan(
+          deleteProvider.mock.invocationCallOrder[0],
+        );
+      } finally {
+        finishCurrent("codex-router");
+        finishFallback();
+        current.mockRestore();
+        switchProvider.mockRestore();
+        deleteProvider.mockRestore();
+      }
+    },
+    15_000,
+  );
 
   it("covers basic provider flows via real hooks", async () => {
     const { default: App } = await import("@/App");
@@ -902,6 +1044,23 @@ describe("App integration with MSW", () => {
 
     const { default: App } = await import("@/App");
     renderApp(App);
+    expect(
+      screen.getByRole("toolbar", { name: "Application toolbar" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("region", { name: "Codex session recovery" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByTestId("codex-usage-limit-resume-row"),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("codex-usage-limit-resume-button"),
+      ).toHaveTextContent("No sessions ready"),
+    );
+    expect(
+      screen.getByTestId("codex-usage-limit-resume-button"),
+    ).toBeDisabled();
     fireEvent.click(screen.getByText("switch-codex"));
     await waitFor(() =>
       expect(screen.getByTestId("provider-list").textContent).toContain(
@@ -1399,9 +1558,19 @@ describe("App integration with MSW", () => {
     expect(screen.getByTestId("codex-router-workspace")).toBeInTheDocument();
   });
 
-  it("opens the Codex usage page from the Codex toolbar", async () => {
+  it("shows the recovery ribbon only on the main Providers page", async () => {
+    setSettings({ firstRunNoticeConfirmed: true });
     const { default: App } = await import("@/App");
-    renderApp(App);
+    const { container } = renderApp(App);
+    const header = container.querySelector("header")!;
+    const dragBarHeight = Number.parseInt(header.style.top, 10);
+    const recoveryRegion = { name: "Codex session recovery" };
+
+    expect(screen.getByRole("region", recoveryRegion)).toBeVisible();
+    expect(header).toHaveStyle({ height: "104px" });
+    expect(header.parentElement).toHaveStyle({
+      paddingTop: `${dragBarHeight + 104}px`,
+    });
 
     fireEvent.click(screen.getByText("switch-codex"));
     await waitFor(() =>
@@ -1415,6 +1584,73 @@ describe("App integration with MSW", () => {
     await waitFor(() =>
       expect(screen.getByTestId("codex-usage-page")).toBeInTheDocument(),
     );
+    expect(screen.queryByRole("region", recoveryRegion)).toBeNull();
+    expect(screen.queryByTestId("codex-usage-limit-resume-button")).toBeNull();
+    expect(header).toHaveStyle({ height: "64px" });
+    expect(header.parentElement).toHaveStyle({
+      paddingTop: `${dragBarHeight + 64}px`,
+    });
+
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Navigation" })).getByRole(
+        "button",
+      ),
+    );
+    expect(screen.getByRole("region", recoveryRegion)).toBeVisible();
+    expect(header).toHaveStyle({ height: "104px" });
+  }, 15_000);
+
+  it("resumes eligible Codex sessions from the Codex recovery row with proxy and Stream Retry off", async () => {
+    setSettings({ enableLocalProxy: false, streamRetryMode: "off" });
+    let eligibility = { count: 2, complete: false };
+    const resumeRequests: unknown[] = [];
+    server.use(
+      http.post("http://tauri.local/get_codex_usage_limit_resume_count", () =>
+        HttpResponse.json(eligibility),
+      ),
+      http.post(
+        "http://tauri.local/resume_codex_usage_limited_turns",
+        async ({ request }) => {
+          resumeRequests.push(await request.json());
+          eligibility = { count: 0, complete: true };
+          return HttpResponse.json({
+            submitted: 2,
+            deferred: 0,
+            skipped: 0,
+            uncertain: 0,
+          });
+        },
+      ),
+    );
+
+    const { default: App } = await import("@/App");
+    renderApp(App);
+    expect(
+      screen.getByTestId("codex-usage-limit-resume-row"),
+    ).toBeInTheDocument();
+    const resumeButton = screen.getByTestId("codex-usage-limit-resume-button");
+    await waitFor(() =>
+      expect(resumeButton).toHaveTextContent("Continue 2 sessions"),
+    );
+    expect(resumeButton).toBeEnabled();
+    expect(document.querySelector("header")).toHaveStyle({ height: "104px" });
+    expect(screen.getByTestId("codex-usage-limit-resume-row")).toHaveStyle({
+      height: "40px",
+    });
+    expect(screen.getByTestId("codex-usage-limit-resume-row")).toContainElement(
+      resumeButton,
+    );
+    expect(
+      screen.getByTestId("stream-retry-header-toggle"),
+    ).not.toContainElement(resumeButton);
+
+    fireEvent.click(resumeButton);
+
+    await waitFor(() =>
+      expect(resumeButton).toHaveTextContent("No sessions ready"),
+    );
+    expect(resumeButton).toBeDisabled();
+    expect(resumeRequests).toEqual([{}]);
   });
 
   it("opens the persistent Codex status and repair entry when no drift dialog exists", async () => {
@@ -1530,6 +1766,11 @@ describe("App integration with MSW", () => {
     localStorage.setItem("cc-switch-last-view", "skills");
     const { default: App } = await import("@/App");
     renderApp(App);
+
+    expect(
+      screen.queryByRole("region", { name: "Codex session recovery" }),
+    ).toBeNull();
+    expect(document.querySelector("header")).toHaveStyle({ height: "64px" });
 
     expect(
       await screen.findByTestId("unified-skills-panel"),

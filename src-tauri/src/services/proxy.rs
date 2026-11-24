@@ -344,6 +344,12 @@ enum ClaudeTakeoverAuthPolicy {
     ManagedAccount { keep_auth_token: bool },
 }
 
+#[derive(Default)]
+struct CodexGuardianLifecycle {
+    handle: Option<GuardianHandle>,
+    retain_observation: bool,
+}
+
 #[derive(Clone)]
 pub struct ProxyService {
     db: Arc<Database>,
@@ -352,7 +358,7 @@ pub struct ProxyService {
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
     app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
     switch_locks: SwitchLockManager,
-    pub(crate) codex_guardian: Arc<Mutex<Option<GuardianHandle>>>,
+    codex_guardian: Arc<Mutex<CodexGuardianLifecycle>>,
     pub(crate) codex_guardian_status: Arc<Mutex<codex_guardian::CodexGuardianStatus>>,
     /// 启动恢复失败但端口只是被临时占用时保留的接管意图。
     ///
@@ -403,7 +409,7 @@ impl ProxyService {
             external_openai_api_server: Arc::new(RwLock::new(None)),
             app_handle: Arc::new(RwLock::new(None)),
             switch_locks: SwitchLockManager::new(),
-            codex_guardian: Arc::new(Mutex::new(None)),
+            codex_guardian: Arc::new(Mutex::new(CodexGuardianLifecycle::default())),
             codex_guardian_status: Arc::new(Mutex::new(codex_guardian::CodexGuardianStatus {
                 active: false,
                 codex_running: false,
@@ -1157,7 +1163,7 @@ impl ProxyService {
         // 5. 启动代理服务器
         match self.start().await {
             Ok(info) => {
-                self.ensure_codex_guardian_started();
+                self.ensure_managed_codex_guardian_started().await;
                 Ok(info)
             }
             Err(e) => {
@@ -1371,7 +1377,7 @@ impl ProxyService {
                         self.takeover_live_config_best_effort(&app).await?;
                     }
                     self.refresh_active_target_from_current_provider(&app).await;
-                    self.run_post_takeover_lifecycle(&app);
+                    self.run_post_takeover_lifecycle(&app).await;
                     return Ok(());
                 }
                 restore_existing_backup_before_takeover = has_backup;
@@ -1451,7 +1457,7 @@ impl ProxyService {
                 }
             }
 
-            self.run_post_takeover_lifecycle(&app);
+            self.run_post_takeover_lifecycle(&app).await;
 
             return Ok(());
         }
@@ -1465,7 +1471,7 @@ impl ProxyService {
 
         if !current_config.enabled {
             if app == AppType::Codex {
-                self.stop_codex_guardian();
+                self.on_codex_takeover_disabled(true).await;
             }
             return Ok(()); // 未接管，幂等返回
         }
@@ -1499,6 +1505,9 @@ impl ProxyService {
             .update_proxy_config_for_app(updated_config)
             .await
             .map_err(|e| format!("清除 {app_type_str} enabled 状态失败: {e}"))?;
+        if app == AppType::Codex {
+            self.on_codex_takeover_disabled(false).await;
+        }
 
         // 4) 清除该应用的健康状态（关闭代理时重置队列状态）
         self.db
@@ -2005,6 +2014,9 @@ impl ProxyService {
             .update_proxy_config_for_app(updated_config)
             .await
             .map_err(|e| format!("清除 {app_type_str} enabled 状态失败: {e}"))?;
+        if *app == AppType::Codex {
+            self.on_codex_takeover_disabled(false).await;
+        }
 
         self.db
             .clear_provider_health_for_app(app_type_str)
@@ -2130,7 +2142,7 @@ impl ProxyService {
             return Err(e);
         }
 
-        self.run_post_takeover_lifecycle(app_type);
+        self.run_post_takeover_lifecycle(app_type).await;
         Ok(())
     }
 
@@ -2537,12 +2549,17 @@ impl ProxyService {
 
         // 4. 清除所有应用的 enabled 状态（用户手动关闭，不需要下次自动恢复）
         for app_type in ["claude", "codex", "gemini", "grokbuild"] {
+            let _guard = self.switch_locks.lock_for_app(app_type).await;
             if let Ok(mut config) = self.db.get_proxy_config_for_app(app_type).await {
                 if config.enabled {
                     config.enabled = false;
                     if let Err(e) = self.db.update_proxy_config_for_app(config).await {
                         log::warn!("清除 {app_type} enabled 状态失败: {e}");
+                        continue;
                     }
+                }
+                if app_type == AppType::Codex.as_str() {
+                    self.on_codex_takeover_disabled(false).await;
                 }
             }
         }
@@ -5522,52 +5539,72 @@ impl ProxyService {
 
     /// 只在接管已经写入并验证成功后启动 Codex Desktop 的 best-effort 收尾。
     /// guardian/CDP 不属于 HTTP 路由事务，失败只记录诊断，不能反向破坏已验证接管。
-    fn run_post_takeover_lifecycle(&self, app_type: &AppType) {
+    async fn run_post_takeover_lifecycle(&self, app_type: &AppType) {
         if !should_run_codex_post_takeover(app_type) {
             return;
         }
-        self.ensure_codex_guardian_started();
+        self.ensure_managed_codex_guardian_started().await;
         self.try_repair_codex_model_picker_after_takeover();
     }
 
-    fn ensure_codex_guardian_started(&self) {
+    async fn ensure_managed_codex_guardian_started(&self) {
+        let mut lifecycle = self.codex_guardian.lock().await;
+        self.ensure_codex_guardian_started(&mut lifecycle, true);
+    }
+
+    pub(crate) async fn retain_codex_recovery_observer(&self) {
+        let mut lifecycle = self.codex_guardian.lock().await;
+        lifecycle.retain_observation = true;
+        self.ensure_codex_guardian_started(&mut lifecycle, false);
+    }
+
+    fn ensure_codex_guardian_started(
+        &self,
+        lifecycle: &mut CodexGuardianLifecycle,
+        manage_model_picker: bool,
+    ) {
+        if let Some(handle) = lifecycle.handle.as_ref() {
+            if manage_model_picker {
+                handle.set_model_picker_management(true);
+            }
+            return;
+        }
+
         run_automatic_codex_desktop_effect(|| {
-            let handle_arc = self.codex_guardian.clone();
-            let status_arc = self.codex_guardian_status.clone();
+            let handle = codex_guardian::start_codex_guardian(manage_model_picker);
+            log::info!("Codex 守护: 已启动生命周期监测");
+            // 定期同步状态到 ProxyService 字段，供 Tauri command 读取
+            let handle_status = handle.status.clone();
+            let status = self.codex_guardian_status.clone();
             tauri::async_runtime::spawn(async move {
-                let mut guard = handle_arc.lock().await;
-                if guard.is_none() {
-                    let handle = codex_guardian::start_codex_guardian();
-                    log::info!("Codex 守护: 已启动生命周期监测");
-                    // 定期同步状态到 ProxyService 字段，供 Tauri command 读取
-                    let handle_status = handle.status.clone();
-                    let s = status_arc.clone();
-                    tauri::async_runtime::spawn(async move {
-                        loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            let status = handle_status.lock().await.clone();
-                            if !status.active {
-                                *s.lock().await = status;
-                                break;
-                            }
-                            *s.lock().await = status;
-                        }
-                    });
-                    *guard = Some(handle);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let snapshot = handle_status.lock().await.clone();
+                    let active = snapshot.active;
+                    *status.lock().await = snapshot;
+                    if !active {
+                        break;
+                    }
                 }
             });
+            lifecycle.handle = Some(handle);
         });
     }
 
-    fn stop_codex_guardian(&self) {
-        let handle_arc = self.codex_guardian.clone();
-        tauri::async_runtime::spawn(async move {
-            let mut guard = handle_arc.lock().await;
-            if let Some(handle) = guard.take() {
+    async fn on_codex_takeover_disabled(&self, already_disabled: bool) {
+        let mut lifecycle = self.codex_guardian.lock().await;
+        if lifecycle.retain_observation {
+            if let Some(handle) = lifecycle.handle.as_ref() {
+                handle.set_model_picker_management(false);
+            }
+        } else if already_disabled {
+            // On the first disable, the takeover guardian can reconcile the
+            // picker against the restored live configuration.
+            if let Some(handle) = lifecycle.handle.take() {
                 handle.stop();
                 log::info!("Codex 守护: 已停止生命周期监测");
             }
-        });
+        }
     }
     fn write_codex_live_verbatim(&self, config: &Value) -> Result<(), String> {
         self.write_codex_live_snapshot(config, true)
@@ -6210,6 +6247,34 @@ mod tests {
             !dispatched.get(),
             "unit tests must not start real Desktop/CDP background work"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_codex_unlock_keeps_recovery_observation_across_takeover_changes() {
+        let service = ProxyService::new(Arc::new(Database::memory().expect("init db")));
+        let observer = GuardianHandle::for_test(false);
+        let observer_status = observer.status.clone();
+        service.codex_guardian.lock().await.handle = Some(observer);
+        service.retain_codex_recovery_observer().await;
+
+        service.ensure_managed_codex_guardian_started().await;
+        service.retain_codex_recovery_observer().await;
+        {
+            let lifecycle = service.codex_guardian.lock().await;
+            let handle = lifecycle.handle.as_ref().expect("guardian");
+            assert!(Arc::ptr_eq(&handle.status, &observer_status));
+            assert!(handle.manages_model_picker());
+        }
+
+        service.on_codex_takeover_disabled(false).await;
+        service
+            .set_takeover_for_app("codex", false)
+            .await
+            .expect("already disabled");
+        let lifecycle = service.codex_guardian.lock().await;
+        let handle = lifecycle.handle.as_ref().expect("retained observer");
+        assert!(Arc::ptr_eq(&handle.status, &observer_status));
+        assert!(!handle.manages_model_picker());
     }
 
     #[test]

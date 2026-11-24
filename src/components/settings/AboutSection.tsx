@@ -480,6 +480,17 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
     try {
       const policies = await settingsApi.setToolAutoUpdate(toolName, enabled);
       setToolAutoUpdate(policies);
+
+      if (enabled) {
+        try {
+          await settingsApi.runToolAutoUpdate(toolName);
+        } catch (error) {
+          toast.error(t("settings.toolAutoUpdateRunFailed"), {
+            description: extractErrorMessage(error) || undefined,
+            closeButton: true,
+          });
+        }
+      }
     } catch (error) {
       toast.error(t("settings.toolAutoUpdateFailed"), {
         description: extractErrorMessage(error) || undefined,

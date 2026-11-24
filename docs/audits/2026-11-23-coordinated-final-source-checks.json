@@ -1,0 +1,170 @@
+{
+  "SchemaVersion": 1,
+  "StartedAtUtc": "2026-11-23T13:27:18.1330569+00:00",
+  "EndedAtUtc": "2026-11-23T13:28:49.9029105+00:00",
+  "ClientTimezone": "Asia/Singapore",
+  "Scope": "Coordinated final source verification only, not live CPU/memory/provider audit",
+  "Checks": [
+    {
+      "Command": "pnpm performance:verify",
+      "ExitCode": 0
+    },
+    {
+      "Command": "cargo test --manifest-path src-tauri/Cargo.toml --lib --jobs 2 -- proxy::forwarder:: services::session_usage_codex codex_state_db::tests proxy::codex_subagent_reasoning:: codex_multirouter:: codex_guardian:: --test-threads=2 --color=never",
+      "ExitCode": 0
+    },
+    {
+      "Command": "cargo clippy --manifest-path src-tauri/Cargo.toml --jobs 2 -- -D warnings",
+      "ExitCode": 0
+    },
+    {
+      "Command": "cargo fmt --check --manifest-path src-tauri/Cargo.toml",
+      "ExitCode": 0
+    },
+    {
+      "Command": "pnpm typecheck",
+      "ExitCode": 0
+    },
+    {
+      "Command": "pnpm format:check",
+      "ExitCode": 0
+    },
+    {
+      "Command": "pnpm exec prettier --check performance runner, runner tests and observer tests",
+      "ExitCode": 0
+    },
+    {
+      "Command": "git diff --check",
+      "ExitCode": 0
+    }
+  ],
+  "Failure": null,
+  "SourcesStableDuringChecks": true,
+  "ChangedPaths": [],
+  "SourceHashes": [
+    {
+      "Path": "src-tauri/src/proxy/forwarder.rs",
+      "BeforeSha256": "E273899DFB71990BAFB50322D69E579467C14AEC9D71B8F9AF3D9F826C5120E7",
+      "AfterSha256": "E273899DFB71990BAFB50322D69E579467C14AEC9D71B8F9AF3D9F826C5120E7",
+      "Unchanged": true
+    },
+    {
+      "Path": "src-tauri/src/services/session_usage_codex.rs",
+      "BeforeSha256": "CC2EA350FD0782973F68D970C555AD89CAD2E45250296E7717BD246C43938929",
+      "AfterSha256": "CC2EA350FD0782973F68D970C555AD89CAD2E45250296E7717BD246C43938929",
+      "Unchanged": true
+    },
+    {
+      "Path": "scripts/verify-resource-performance.mjs",
+      "BeforeSha256": "8B97D22A9615C56286B1F5019412A4A24BB673AE0EC66D517537CAFAF68FCC4E",
+      "AfterSha256": "8B97D22A9615C56286B1F5019412A4A24BB673AE0EC66D517537CAFAF68FCC4E",
+      "Unchanged": true
+    },
+    {
+      "Path": "scripts/verify-resource-performance.node-test.mjs",
+      "BeforeSha256": "2A410C2BBDE1F4E9F44A60FCCC8BC1F10A7DC52ADDD18263D3DA59F9544EECC0",
+      "AfterSha256": "2A410C2BBDE1F4E9F44A60FCCC8BC1F10A7DC52ADDD18263D3DA59F9544EECC0",
+      "Unchanged": true
+    },
+    {
+      "Path": "src-tauri/src/codex_guardian.rs",
+      "BeforeSha256": "D458463DFB2617410F24555EBBBB6F2977F8CA1149918862CA4DDAB2B3A18FEA",
+      "AfterSha256": "D458463DFB2617410F24555EBBBB6F2977F8CA1149918862CA4DDAB2B3A18FEA",
+      "Unchanged": true
+    },
+    {
+      "Path": "src-tauri/src/codex_desktop.rs",
+      "BeforeSha256": "9D863DEA63EF0120DDA9BF73DAE9244DA4E0445DFF81B4618629A38D41AC4A9A",
+      "AfterSha256": "9D863DEA63EF0120DDA9BF73DAE9244DA4E0445DFF81B4618629A38D41AC4A9A",
+      "Unchanged": true
+    },
+    {
+      "Path": "src-tauri/src/proxy/codex_turn_recovery.rs",
+      "BeforeSha256": "4F43E6170945397FCF74BB2397AEABFE4BA8DECD11A81BE8D4781E0357DE4B89",
+      "AfterSha256": "4F43E6170945397FCF74BB2397AEABFE4BA8DECD11A81BE8D4781E0357DE4B89",
+      "Unchanged": true
+    },
+    {
+      "Path": "src-tauri/src/resources/codex_desktop/native_usage_limit_observer.js",
+      "BeforeSha256": "84CC538EC31A02548108E17A03AE8FEB6A12AA141D4F997CA339FEA929823866",
+      "AfterSha256": "84CC538EC31A02548108E17A03AE8FEB6A12AA141D4F997CA339FEA929823866",
+      "Unchanged": true
+    },
+    {
+      "Path": "src-tauri/src/resources/codex_desktop/client_discovery.js",
+      "BeforeSha256": "D84A63489A6D099560A7C3B717A28C1F27225289B32AD29CAC2B353A5CDFD1C5",
+      "AfterSha256": "D84A63489A6D099560A7C3B717A28C1F27225289B32AD29CAC2B353A5CDFD1C5",
+      "Unchanged": true
+    },
+    {
+      "Path": "src-tauri/src/resources/codex_desktop/continuation.js",
+      "BeforeSha256": "1BFDF2F25E94088CA2C73DD8D215AFE0B4881A3E006D952E5FCBCFFEA3F4905C",
+      "AfterSha256": "1BFDF2F25E94088CA2C73DD8D215AFE0B4881A3E006D952E5FCBCFFEA3F4905C",
+      "Unchanged": true
+    },
+    {
+      "Path": "src-tauri/src/resources/codex_desktop/renderer_runtime.js",
+      "BeforeSha256": "8761D88D37B04E28C34B221747321510268FB65882536AC8F8C8D34AAE6A908B",
+      "AfterSha256": "8761D88D37B04E28C34B221747321510268FB65882536AC8F8C8D34AAE6A908B",
+      "Unchanged": true
+    },
+    {
+      "Path": "tests/lib/codexDesktopNativeUsageLimitObserver.test.ts",
+      "BeforeSha256": "F5ED00163D9D240CB0D7622526CB4D1694B6353672DE94F35D7B4077BDB2073E",
+      "AfterSha256": "F5ED00163D9D240CB0D7622526CB4D1694B6353672DE94F35D7B4077BDB2073E",
+      "Unchanged": true
+    },
+    {
+      "Path": "tests/lib/codexDesktopClientDiscovery.test.ts",
+      "BeforeSha256": "E98A13D9FF176E7761DCDA9915F551A10667C6B93AF8E2EE4015D43D6349DDBC",
+      "AfterSha256": "E98A13D9FF176E7761DCDA9915F551A10667C6B93AF8E2EE4015D43D6349DDBC",
+      "Unchanged": true
+    },
+    {
+      "Path": "tests/lib/codexDesktopContinuation.test.ts",
+      "BeforeSha256": "F9EAFAC50B99BB3BCEB5423CF24629E88480B8EFA5B00651E8EB153BEE85BD06",
+      "AfterSha256": "F9EAFAC50B99BB3BCEB5423CF24629E88480B8EFA5B00651E8EB153BEE85BD06",
+      "Unchanged": true
+    },
+    {
+      "Path": "tests/lib/codexDesktopRequestClientOwnership.test.ts",
+      "BeforeSha256": "BC320CA0111FEEB12ECBCCD7D9A73BB70E8F9CF9FC053AECCF1AD5B62274F855",
+      "AfterSha256": "BC320CA0111FEEB12ECBCCD7D9A73BB70E8F9CF9FC053AECCF1AD5B62274F855",
+      "Unchanged": true
+    },
+    {
+      "Path": "tests/lib/codexDesktopScopeOwnership.test.ts",
+      "BeforeSha256": "64E0130789C75C73B6E5177FBCBFB871837CEAE3587AAE3A0E6D5F7F074D9CC7",
+      "AfterSha256": "64E0130789C75C73B6E5177FBCBFB871837CEAE3587AAE3A0E6D5F7F074D9CC7",
+      "Unchanged": true
+    },
+    {
+      "Path": "src-tauri/src/codex_state_db.rs",
+      "BeforeSha256": "8FCD7181F088E3CF16C6652C24DD32115489423D4F1895A209E428FABA1200FC",
+      "AfterSha256": "8FCD7181F088E3CF16C6652C24DD32115489423D4F1895A209E428FABA1200FC",
+      "Unchanged": true
+    },
+    {
+      "Path": "src-tauri/src/proxy/codex_subagent_reasoning.rs",
+      "BeforeSha256": "052B4A3531B06C66AFEE53BB164938B6402250DADFE16F214F6F5008D2115E90",
+      "AfterSha256": "052B4A3531B06C66AFEE53BB164938B6402250DADFE16F214F6F5008D2115E90",
+      "Unchanged": true
+    },
+    {
+      "Path": "src-tauri/Cargo.toml",
+      "BeforeSha256": "4E5B6C755E16FD53B127A9501044E841B7E61D0CAAB014120B14B71B55559358",
+      "AfterSha256": "4E5B6C755E16FD53B127A9501044E841B7E61D0CAAB014120B14B71B55559358",
+      "Unchanged": true
+    },
+    {
+      "Path": "src-tauri/Cargo.lock",
+      "BeforeSha256": "61470F54F06A81653C35910DEA9ADBC5B64ADFB9CA69539620E8AB0F38560BE4",
+      "AfterSha256": "61470F54F06A81653C35910DEA9ADBC5B64ADFB9CA69539620E8AB0F38560BE4",
+      "Unchanged": true
+    }
+  ],
+  "ScopedSourceChecksPassed": true,
+  "AppBuildRunRestartInstallOrReplacement": false,
+  "AlternateTargetsOrOutputFolders": false,
+  "WholeCheckoutAllPerformanceIssuesEliminated": false
+}

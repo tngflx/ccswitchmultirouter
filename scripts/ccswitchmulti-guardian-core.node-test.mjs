@@ -293,7 +293,6 @@ test("unavailable watcher inspection fails closed and suppresses installed fallb
 
 test("dev fallback persists canonical budget before launch and preserves exact identities", async (t) => {
   const f = devFixture(t);
-  f.session.args = ["--confirm-build", ...f.session.args];
   f.session.supervisorRestartTimesMs = [NOW_MS - 100];
   delete f.session.restartTimesMs;
   f.session.workerIdentity = { CreationDate: "2026-10-21T11:00:02.1234567Z" };
@@ -307,7 +306,7 @@ test("dev fallback persists canonical budget before launch and preserves exact i
         current.workerIdentity.CreationDate,
         "2026-10-21T11:00:02.1234567Z",
       );
-      assert.deepEqual(plan.Args, ["--delay", "0", "argument with spaces"]);
+      assert.deepEqual(plan.Args, f.session.args);
       f.launches.push(plan);
       return 99;
     },

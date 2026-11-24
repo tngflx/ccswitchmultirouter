@@ -1,0 +1,1516 @@
+{
+  "schemaVersion": 1,
+  "observedAtUtc": "2026-11-23T18:53:39.720Z",
+  "clientTimezone": "Asia/Singapore",
+  "targetPid": 42320,
+  "processStartedAtUtc": "2026-11-23T18:05:50.228Z",
+  "readScope": "At most4MiB tail per configured log; timestamp-filtered to verified process restart",
+  "rawLogTextOrIdentifiersPersisted": false,
+  "appLifecycleChanged": false,
+  "sourceChanged": false,
+  "files": {
+    "app": {
+      "sizeBytes": 13719822,
+      "tailBytes": 4194304,
+      "truncatedFile": true,
+      "tailEarliestTimestampUtc": "2026-11-22T20:31:54.000Z",
+      "tailLatestTimestampUtc": "2026-11-23T18:53:38.000Z",
+      "coversRestartBoundary": true,
+      "postRestartEarliestTimestampUtc": "2026-11-23T18:06:06.000Z",
+      "postRestartLatestTimestampUtc": "2026-11-23T18:53:38.000Z",
+      "postRestartRecords": 299,
+      "unparsedOrContinuationLines": 3,
+      "levels": {
+        "INFO": 167,
+        "WARN": 132
+      },
+      "modules": {
+        "cc_switch_lib::database::dao::usage_rollup": 1,
+        "cc_switch_lib": 17,
+        "cc_switch_lib::app_store": 1,
+        "cc_switch_lib::proxy::http_client": 1,
+        "cc_switch_lib::services::proxy": 8,
+        "cc_switch_lib::database::dao::proxy": 2,
+        "cc_switch_lib::proxy::server": 1,
+        "cc_switch_lib::codex_desktop": 2,
+        "cc_switch_lib::services::session_usage_codex": 172,
+        "cc_switch_lib::codex_guardian": 9,
+        "cc_switch_lib::proxy::forwarder": 84,
+        "cc_switch_lib::proxy::usage::logger": 1
+      },
+      "eventCounts": {},
+      "markerCounts": {
+        "sync_deferred": 127,
+        "sync_completed": 45
+      },
+      "statuses": {},
+      "syncSummaries": [
+        {
+          "atUtc": "2026-11-23T18:07:03.000Z",
+          "imported": 0,
+          "skipped": 1,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:08:05.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:09:07.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:10:09.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:11:11.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:12:13.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:13:16.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:14:18.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:15:20.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:16:22.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:17:24.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:18:26.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:19:28.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:20:30.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:21:33.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:22:35.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:23:37.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:24:39.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:25:41.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:26:44.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:27:46.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:28:48.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:29:50.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:30:52.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:31:54.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:32:56.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:33:59.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:35:01.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:36:03.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:37:05.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:38:07.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:39:10.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:40:12.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:41:14.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:42:16.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:43:18.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:44:20.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:45:22.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:46:25.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:47:27.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:48:29.000Z",
+          "imported": 0,
+          "skipped": 0,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:49:31.000Z",
+          "imported": 0,
+          "skipped": 4,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:50:33.000Z",
+          "imported": 0,
+          "skipped": 5,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:51:36.000Z",
+          "imported": 0,
+          "skipped": 6,
+          "deferred": 127,
+          "scanned": 1375
+        },
+        {
+          "atUtc": "2026-11-23T18:52:41.000Z",
+          "imported": 15,
+          "skipped": 17,
+          "deferred": 127,
+          "scanned": 1378
+        }
+      ],
+      "requestWire": {
+        "reports": 0,
+        "totalBytes": 0,
+        "maximumBytes": 0,
+        "atLeastOneMiBSends": 0,
+        "sendsPerObservedMinute": 0,
+        "wireMiBPerObservedMinute": 0
+      },
+      "reasoning": {
+        "prepared": 0,
+        "children": 0,
+        "childHigh": 0,
+        "exactUltraRestoredParent": 0,
+        "exactUltraRestoredParentMax": 0
+      },
+      "minuteBuckets": {
+        "2026-11-23T18:06:00.000Z": {
+          "records": 160,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 129
+        },
+        "2026-11-23T18:07:00.000Z": {
+          "records": 3,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 2
+        },
+        "2026-11-23T18:08:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:09:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:10:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:11:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:12:00.000Z": {
+          "records": 3,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:13:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:14:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:15:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:16:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:17:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:18:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:19:00.000Z": {
+          "records": 3,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:20:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:21:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:22:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:23:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:24:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:25:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:26:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:27:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:28:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:29:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:30:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:31:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:32:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:33:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:35:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:36:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:37:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:38:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:39:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:40:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:41:00.000Z": {
+          "records": 3,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:42:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:43:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:44:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:45:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:46:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:47:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:48:00.000Z": {
+          "records": 1,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:49:00.000Z": {
+          "records": 12,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 1
+        },
+        "2026-11-23T18:50:00.000Z": {
+          "records": 9,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:51:00.000Z": {
+          "records": 20,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:52:00.000Z": {
+          "records": 32,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        },
+        "2026-11-23T18:53:00.000Z": {
+          "records": 17,
+          "sends": 0,
+          "wireBytes": 0,
+          "warnings": 0
+        }
+      }
+    },
+    "router": {
+      "sizeBytes": 15797539,
+      "tailBytes": 4194304,
+      "truncatedFile": true,
+      "tailEarliestTimestampUtc": "2026-11-23T17:31:16.124Z",
+      "tailLatestTimestampUtc": "2026-11-23T18:53:39.752Z",
+      "coversRestartBoundary": true,
+      "postRestartEarliestTimestampUtc": "2026-11-23T18:49:00.868Z",
+      "postRestartLatestTimestampUtc": "2026-11-23T18:53:39.752Z",
+      "postRestartRecords": 911,
+      "unparsedOrContinuationLines": 1,
+      "levels": {},
+      "modules": {},
+      "eventCounts": {
+        "request_classified": 84,
+        "route_resolved": 84,
+        "request_prepared": 84,
+        "auth_prepared": 84,
+        "request_health": 84,
+        "request_body_accounting": 84,
+        "request_health_review_approved": 83,
+        "upstream_send": 84,
+        "upstream_status": 82,
+        "response_ready": 82,
+        "stream_outcome": 76
+      },
+      "markerCounts": {},
+      "statuses": {
+        "200": 82
+      },
+      "syncSummaries": [],
+      "requestWire": {
+        "reports": 84,
+        "totalBytes": 62048849,
+        "maximumBytes": 1724906,
+        "atLeastOneMiBSends": 26,
+        "sendsPerObservedMinute": 18.07202994793534,
+        "wireMiBPerObservedMinute": 12.730969217424368
+      },
+      "reasoning": {
+        "prepared": 84,
+        "children": 33,
+        "childHigh": 33,
+        "exactUltraRestoredParent": 41,
+        "exactUltraRestoredParentMax": 41
+      },
+      "minuteBuckets": {
+        "2026-11-23T18:49:00.000Z": {
+          "records": 97,
+          "sends": 9,
+          "wireBytes": 3062447,
+          "warnings": 0
+        },
+        "2026-11-23T18:50:00.000Z": {
+          "records": 88,
+          "sends": 8,
+          "wireBytes": 5985879,
+          "warnings": 0
+        },
+        "2026-11-23T18:51:00.000Z": {
+          "records": 203,
+          "sends": 19,
+          "wireBytes": 17682239,
+          "warnings": 0
+        },
+        "2026-11-23T18:52:00.000Z": {
+          "records": 337,
+          "sends": 31,
+          "wireBytes": 23365983,
+          "warnings": 0
+        },
+        "2026-11-23T18:53:00.000Z": {
+          "records": 186,
+          "sends": 17,
+          "wireBytes": 11952301,
+          "warnings": 0
+        }
+      }
+    }
+  },
+  "nonDeferredWarningDistribution": {
+    "cc_switch_lib": {
+      "count": 3,
+      "timestampsUtc": [
+        "2026-11-23T18:06:06.000Z",
+        "2026-11-23T18:06:06.000Z",
+        "2026-11-23T18:06:06.000Z"
+      ]
+    },
+    "cc_switch_lib::services::proxy": {
+      "count": 1,
+      "timestampsUtc": [
+        "2026-11-23T18:06:07.000Z"
+      ]
+    },
+    "cc_switch_lib::proxy::usage::logger": {
+      "count": 1,
+      "timestampsUtc": [
+        "2026-11-23T18:49:07.000Z"
+      ]
+    }
+  },
+  "laterTailStreamOutcomeSummary": {
+    "completed|other_fixed_value": 101,
+    "cancelled|other_fixed_value": 7
+  },
+  "laterTailRequestHealth": {
+    "thresholdExceeded": 52,
+    "compactionRecommended": 31,
+    "orphanedToolOutputs": 0,
+    "undeclaredWebSearchHistory": 0,
+    "reports": 117
+  },
+  "laterDetailReadAtUtc": "2026-11-23T18:54:54.191Z",
+  "deferredWarningClassification": {
+    "counts": {
+      "prefix_proof_unavailable": 116,
+      "continuation_proof_unavailable": 5,
+      "missing_parent": 6
+    },
+    "firstUtc": "2026-11-23T18:06:31.000Z",
+    "lastUtc": "2026-11-23T18:07:02.000Z"
+  },
+  "windowCorrelation": {
+    "observedAtUtc": "2026-11-23T18:59:01.446Z",
+    "method": "Numeric log correlation only; inclusive timestamp windows, no causal CPU attribution; app headers have one-second precision",
+    "resourceEvidence": "docs/audits/2026-11-24-restart-42320-process-tree-resource.json",
+    "coverage": {
+      "app": {
+        "fileSizeBytes": 13740610,
+        "tailReadBytes": 4194304,
+        "tailEarliestUtc": "2026-11-22T20:42:51.000Z",
+        "tailLatestUtc": "2026-11-23T18:59:00.000Z",
+        "timestampResolution": "one-second log headers; exact subsecond boundary attribution unavailable"
+      },
+      "router": {
+        "fileSizeBytes": 16416228,
+        "tailReadBytes": 4194304,
+        "tailEarliestUtc": "2026-11-23T17:36:57.563Z",
+        "tailLatestUtc": "2026-11-23T18:59:01.061Z",
+        "timestampResolution": "milliseconds"
+      }
+    },
+    "windows": [
+      {
+        "name": "first_backend_only",
+        "from": "2026-11-23T18:52:23.511Z",
+        "to": "2026-11-23T18:53:23.652Z",
+        "durationSeconds": 60.141,
+        "files": {
+          "app": {
+            "coveredByTail": true,
+            "records": 30,
+            "eventCounts": {},
+            "upstreamStatuses": {},
+            "upstreamWireBytes": 0,
+            "wireByteReports": 0,
+            "maxWireBytes": 0,
+            "sendsAtLeastOneMiB": 0,
+            "healthReports": 0,
+            "sizeThresholdExceeded": 0,
+            "compactionRecommended": 0,
+            "warningCount": 0,
+            "errorCount": 0,
+            "markerCounts": {
+              "syncCompleted": 1,
+              "syncDeferredWarning": 0,
+              "guardianWarning": 0,
+              "capacityPressure": 0,
+              "retryOrErrorFallback": 0,
+              "dnsFailure": 0,
+              "streamDropped": 0,
+              "databaseOrDiskFull": 0
+            },
+            "syncSummaries": [
+              {
+                "atUtc": "2026-11-23T18:52:41.000Z",
+                "imported": 15,
+                "skipped": 17,
+                "deferred": 127,
+                "scanned": 1378
+              }
+            ],
+            "bins5Seconds": [
+              {
+                "offsetStartSeconds": 0,
+                "offsetEndSeconds": 5,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 5,
+                "offsetEndSeconds": 10,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 10,
+                "offsetEndSeconds": 15,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 15,
+                "offsetEndSeconds": 20,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 20,
+                "offsetEndSeconds": 25,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 25,
+                "offsetEndSeconds": 30,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 30,
+                "offsetEndSeconds": 35,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 35,
+                "offsetEndSeconds": 40,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 40,
+                "offsetEndSeconds": 45,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 45,
+                "offsetEndSeconds": 50,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 50,
+                "offsetEndSeconds": 55,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 55,
+                "offsetEndSeconds": 60,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 60,
+                "offsetEndSeconds": 60.141,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              }
+            ],
+            "sendsPerMinute": 0,
+            "upstreamWireMiB": 0
+          },
+          "router": {
+            "coveredByTail": true,
+            "records": 328,
+            "eventCounts": {
+              "route_resolved": 30,
+              "request_prepared": 30,
+              "auth_prepared": 30,
+              "upstream_status": 30,
+              "response_ready": 30,
+              "request_health": 30,
+              "request_body_accounting": 30,
+              "request_health_review_approved": 30,
+              "upstream_send": 30,
+              "stream_outcome": 29,
+              "request_classified": 29
+            },
+            "upstreamStatuses": {
+              "200": 30
+            },
+            "upstreamWireBytes": 22306366,
+            "wireByteReports": 30,
+            "maxWireBytes": 1706546,
+            "sendsAtLeastOneMiB": 9,
+            "healthReports": 30,
+            "sizeThresholdExceeded": 12,
+            "compactionRecommended": 9,
+            "warningCount": 0,
+            "errorCount": 0,
+            "markerCounts": {
+              "syncCompleted": 0,
+              "syncDeferredWarning": 0,
+              "guardianWarning": 0,
+              "capacityPressure": 0,
+              "retryOrErrorFallback": 0,
+              "dnsFailure": 0,
+              "streamDropped": 0,
+              "databaseOrDiskFull": 0
+            },
+            "syncSummaries": [],
+            "bins5Seconds": [
+              {
+                "offsetStartSeconds": 0,
+                "offsetEndSeconds": 5,
+                "prepared": 2,
+                "sends": 2,
+                "wireBytes": 576316,
+                "statusCount": 5,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 5,
+                "offsetEndSeconds": 10,
+                "prepared": 4,
+                "sends": 4,
+                "wireBytes": 3939488,
+                "statusCount": 2,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 10,
+                "offsetEndSeconds": 15,
+                "prepared": 2,
+                "sends": 2,
+                "wireBytes": 2176825,
+                "statusCount": 4,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 15,
+                "offsetEndSeconds": 20,
+                "prepared": 3,
+                "sends": 3,
+                "wireBytes": 1276235,
+                "statusCount": 3,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 20,
+                "offsetEndSeconds": 25,
+                "prepared": 4,
+                "sends": 4,
+                "wireBytes": 3980345,
+                "statusCount": 3,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 25,
+                "offsetEndSeconds": 30,
+                "prepared": 1,
+                "sends": 1,
+                "wireBytes": 715089,
+                "statusCount": 2,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 30,
+                "offsetEndSeconds": 35,
+                "prepared": 4,
+                "sends": 4,
+                "wireBytes": 2593193,
+                "statusCount": 2,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 35,
+                "offsetEndSeconds": 40,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 2,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 40,
+                "offsetEndSeconds": 45,
+                "prepared": 3,
+                "sends": 3,
+                "wireBytes": 2159281,
+                "statusCount": 1,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 45,
+                "offsetEndSeconds": 50,
+                "prepared": 1,
+                "sends": 1,
+                "wireBytes": 357394,
+                "statusCount": 1,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 50,
+                "offsetEndSeconds": 55,
+                "prepared": 2,
+                "sends": 2,
+                "wireBytes": 526347,
+                "statusCount": 4,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 55,
+                "offsetEndSeconds": 60,
+                "prepared": 3,
+                "sends": 3,
+                "wireBytes": 3641471,
+                "statusCount": 1,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 60,
+                "offsetEndSeconds": 60.141,
+                "prepared": 1,
+                "sends": 1,
+                "wireBytes": 364382,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              }
+            ],
+            "sendsPerMinute": 29.929665286576547,
+            "upstreamWireMiB": 21.273008346557617
+          }
+        }
+      },
+      {
+        "name": "corrected_process_tree",
+        "from": "2026-11-23T18:56:25.9357972+00:00",
+        "to": "2026-11-23T18:57:25.9569782+00:00",
+        "durationSeconds": 60.021,
+        "files": {
+          "app": {
+            "coveredByTail": true,
+            "records": 14,
+            "eventCounts": {},
+            "upstreamStatuses": {},
+            "upstreamWireBytes": 0,
+            "wireByteReports": 0,
+            "maxWireBytes": 0,
+            "sendsAtLeastOneMiB": 0,
+            "healthReports": 0,
+            "sizeThresholdExceeded": 0,
+            "compactionRecommended": 0,
+            "warningCount": 0,
+            "errorCount": 0,
+            "markerCounts": {
+              "syncCompleted": 1,
+              "syncDeferredWarning": 0,
+              "guardianWarning": 0,
+              "capacityPressure": 0,
+              "retryOrErrorFallback": 0,
+              "dnsFailure": 0,
+              "streamDropped": 0,
+              "databaseOrDiskFull": 0
+            },
+            "syncSummaries": [
+              {
+                "atUtc": "2026-11-23T18:56:51.000Z",
+                "imported": 2,
+                "skipped": 13,
+                "deferred": 127,
+                "scanned": 1378
+              }
+            ],
+            "bins5Seconds": [
+              {
+                "offsetStartSeconds": 0,
+                "offsetEndSeconds": 5,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 5,
+                "offsetEndSeconds": 10,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 10,
+                "offsetEndSeconds": 15,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 15,
+                "offsetEndSeconds": 20,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 20,
+                "offsetEndSeconds": 25,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 25,
+                "offsetEndSeconds": 30,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 30,
+                "offsetEndSeconds": 35,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 35,
+                "offsetEndSeconds": 40,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 40,
+                "offsetEndSeconds": 45,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 45,
+                "offsetEndSeconds": 50,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 50,
+                "offsetEndSeconds": 55,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 55,
+                "offsetEndSeconds": 60,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 60,
+                "offsetEndSeconds": 60.021,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              }
+            ],
+            "sendsPerMinute": 0,
+            "upstreamWireMiB": 0
+          },
+          "router": {
+            "coveredByTail": true,
+            "records": 146,
+            "eventCounts": {
+              "request_prepared": 14,
+              "auth_prepared": 14,
+              "request_health": 14,
+              "request_body_accounting": 14,
+              "request_health_review_approved": 13,
+              "upstream_send": 14,
+              "stream_outcome": 13,
+              "request_classified": 13,
+              "route_resolved": 13,
+              "upstream_status": 12,
+              "response_ready": 12
+            },
+            "upstreamStatuses": {
+              "200": 12
+            },
+            "upstreamWireBytes": 11059536,
+            "wireByteReports": 14,
+            "maxWireBytes": 1750967,
+            "sendsAtLeastOneMiB": 3,
+            "healthReports": 14,
+            "sizeThresholdExceeded": 13,
+            "compactionRecommended": 4,
+            "warningCount": 0,
+            "errorCount": 0,
+            "markerCounts": {
+              "syncCompleted": 0,
+              "syncDeferredWarning": 0,
+              "guardianWarning": 0,
+              "capacityPressure": 0,
+              "retryOrErrorFallback": 0,
+              "dnsFailure": 0,
+              "streamDropped": 0,
+              "databaseOrDiskFull": 0
+            },
+            "syncSummaries": [],
+            "bins5Seconds": [
+              {
+                "offsetStartSeconds": 0,
+                "offsetEndSeconds": 5,
+                "prepared": 1,
+                "sends": 1,
+                "wireBytes": 430107,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 5,
+                "offsetEndSeconds": 10,
+                "prepared": 2,
+                "sends": 2,
+                "wireBytes": 2174101,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 10,
+                "offsetEndSeconds": 15,
+                "prepared": 3,
+                "sends": 3,
+                "wireBytes": 1916574,
+                "statusCount": 1,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 15,
+                "offsetEndSeconds": 20,
+                "prepared": 2,
+                "sends": 2,
+                "wireBytes": 915122,
+                "statusCount": 3,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 20,
+                "offsetEndSeconds": 25,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 1,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 25,
+                "offsetEndSeconds": 30,
+                "prepared": 1,
+                "sends": 1,
+                "wireBytes": 1744726,
+                "statusCount": 1,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 30,
+                "offsetEndSeconds": 35,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 1,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 35,
+                "offsetEndSeconds": 40,
+                "prepared": 2,
+                "sends": 2,
+                "wireBytes": 1184294,
+                "statusCount": 1,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 40,
+                "offsetEndSeconds": 45,
+                "prepared": 1,
+                "sends": 1,
+                "wireBytes": 490057,
+                "statusCount": 2,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 45,
+                "offsetEndSeconds": 50,
+                "prepared": 2,
+                "sends": 2,
+                "wireBytes": 2204555,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 50,
+                "offsetEndSeconds": 55,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 2,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 55,
+                "offsetEndSeconds": 60,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              },
+              {
+                "offsetStartSeconds": 60,
+                "offsetEndSeconds": 60.021,
+                "prepared": 0,
+                "sends": 0,
+                "wireBytes": 0,
+                "statusCount": 0,
+                "warnings": 0,
+                "errors": 0
+              }
+            ],
+            "sendsPerMinute": 13.99510171439996,
+            "upstreamWireMiB": 10.547195434570312
+          }
+        }
+      }
+    ],
+    "caveats": [
+      "Concurrent real traffic and uncontrolled workload; differences do not prove improvement due to a particular code fix.",
+      "No tests or generated provider requests. No builds or lifecycle/source changes.",
+      "Historical pre-restart warning storms are excluded.",
+      "Requests and responses may straddle each window; status counts need not equal send counts."
+    ]
+  }
+}

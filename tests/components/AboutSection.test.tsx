@@ -16,6 +16,7 @@ const checkUpdateMock = vi.hoisted(() => vi.fn());
 const toastErrorMock = vi.hoisted(() => vi.fn());
 const getToolAutoUpdateSettingsMock = vi.hoisted(() => vi.fn());
 const setToolAutoUpdateMock = vi.hoisted(() => vi.fn());
+const runToolAutoUpdateMock = vi.hoisted(() => vi.fn());
 vi.mock("sonner", () => ({
   toast: { error: toastErrorMock, success: vi.fn(), info: vi.fn() },
 }));
@@ -45,6 +46,7 @@ vi.mock("@/lib/api", () => ({
     runToolLifecycleAction: vi.fn(),
     getToolAutoUpdateSettings: getToolAutoUpdateSettingsMock,
     setToolAutoUpdate: setToolAutoUpdateMock,
+    runToolAutoUpdate: runToolAutoUpdateMock,
   },
 }));
 
@@ -84,6 +86,7 @@ describe("AboutSection", () => {
         codex: true,
         [tool]: enabled,
       }));
+    runToolAutoUpdateMock.mockReset().mockResolvedValue(false);
     getToolVersionsMock.mockImplementation(async ([name]: [string]) => [
       {
         name,
@@ -150,6 +153,49 @@ describe("AboutSection", () => {
     expect(switches[0]).toHaveAttribute("aria-checked", "false");
   });
 
+  it("runs an immediate update after enabling a CLI policy", async () => {
+    render(<AboutSection isPortable={false} />);
+    const switches = await screen.findAllByRole("switch");
+    await waitFor(() => expect(switches[2]).not.toBeDisabled());
+
+    fireEvent.click(switches[2]);
+
+    await waitFor(() =>
+      expect(runToolAutoUpdateMock).toHaveBeenCalledWith("gemini"),
+    );
+    expect(runToolAutoUpdateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not run an immediate update when disabling a CLI policy", async () => {
+    render(<AboutSection isPortable={false} />);
+    const switches = await screen.findAllByRole("switch");
+    await waitFor(() => expect(switches[1]).not.toBeDisabled());
+
+    fireEvent.click(switches[1]);
+
+    await waitFor(() =>
+      expect(setToolAutoUpdateMock).toHaveBeenCalledWith("codex", false),
+    );
+    expect(runToolAutoUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the enabled policy and reports an immediate update failure", async () => {
+    runToolAutoUpdateMock.mockRejectedValue("updater unavailable");
+    render(<AboutSection isPortable={false} />);
+    const switches = await screen.findAllByRole("switch");
+    await waitFor(() => expect(switches[2]).not.toBeDisabled());
+
+    fireEvent.click(switches[2]);
+
+    await waitFor(() =>
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "settings.toolAutoUpdateRunFailed",
+        expect.objectContaining({ description: "updater unavailable" }),
+      ),
+    );
+    expect(switches[2]).toHaveAttribute("aria-checked", "true");
+  });
+
   it("keeps the saved policy unchanged and reports a failed save", async () => {
     setToolAutoUpdateMock.mockRejectedValue("settings file is read-only");
     render(<AboutSection isPortable={false} />);
@@ -166,6 +212,18 @@ describe("AboutSection", () => {
     );
     expect(switches[1]).toHaveAttribute("aria-checked", "true");
     expect(switches[1]).not.toBeDisabled();
+  });
+
+  it("always unlocks switches when disabling a CLI policy", async () => {
+    render(<AboutSection isPortable={false} />);
+    const switches = await screen.findAllByRole("switch");
+    await waitFor(() => expect(switches[1]).not.toBeDisabled());
+
+    fireEvent.click(switches[1]);
+
+    await waitFor(() => expect(switches[1]).not.toBeDisabled());
+    expect(switches[1]).toHaveAttribute("aria-checked", "false");
+    expect(runToolAutoUpdateMock).not.toHaveBeenCalled();
   });
 
   it("does not allow policy changes when loading the saved settings fails", async () => {

@@ -58,11 +58,16 @@ type RuntimeState = {
   reasoningQueryCaches?: Map<object, { dispose?: () => void }>;
   reasoningObserverPrototypes?: Map<object, { dispose: () => void }>;
   readCodexModelPickerDiagnostics?: () => Record<string, unknown>;
+  collectCodexNativeUsageLimitCandidates?: () => Promise<{
+    candidates: unknown[];
+    complete: boolean;
+  } | null>;
   [key: string]: unknown;
 };
 const assembleRuntime = (
   catalog: ReturnType<typeof payload>,
   fingerprint = runtimeFingerprint,
+  recoveryOnly = false,
 ) => {
   const fragments: Record<string, string> = {
     CATALOG_PAYLOAD_SELECTION: "catalog_payload_selection.js",
@@ -81,6 +86,7 @@ const assembleRuntime = (
     SUMMARY_HANDOFF: "summary_handoff.js",
     CODEX_CONTINUATION: "continuation.js",
     OWNER_REMOTE_VIEW: "owner_remote_view.js",
+    NATIVE_USAGE_LIMIT_OBSERVER: "native_usage_limit_observer.js",
     APP_SERVER_MODEL_LIST_SCOPE: "app_server_model_list_scope.js",
   };
   let script = renderer;
@@ -90,12 +96,18 @@ const assembleRuntime = (
       throw new Error(
         `The production renderer resource slot is missing: ${slot}`,
       );
-    script = script.replace(marker, resource(filename));
+    script = script.replace(marker, () => resource(filename));
   }
+  const unfilledSlot = script.match(/\/\*__CCSWITCH_(\w+)_CORE__\*\//)?.[1];
+  if (unfilledSlot)
+    throw new Error(
+      `The test renderer resource slot is unfilled: ${unfilledSlot}`,
+    );
   return (
     script
       .replace("__CCSWITCH_CATALOG_PAYLOAD__", JSON.stringify(catalog))
       .replace("__CCSWITCH_CATALOG_RELEASED__", "false")
+      .replace("__CCSWITCH_RECOVERY_ONLY__", String(recoveryOnly))
       .replace("__CCSWITCH_PATCH_KEY__", JSON.stringify(patchKey))
       .replace(
         "__CCSWITCH_RENDERER_RUNTIME_FINGERPRINT__",
@@ -131,6 +143,7 @@ const createHarness = (
     importPending?: boolean;
     numericImport?: Promise<object>;
     runtimeFingerprint?: string;
+    recoveryOnly?: boolean;
     state?: RuntimeState;
   } = {},
 ) => {
@@ -188,6 +201,12 @@ const createHarness = (
     text: async () => options.fetchSources?.[_url] ?? "",
   }));
   const performanceEntries = options.performanceEntries ?? [];
+  const storage = new Map<string, string>();
+  const localStorage = {
+    getItem: (key: string) => storage.get(key) ?? null,
+    setItem: (key: string, value: string) => storage.set(key, value),
+    removeItem: (key: string) => storage.delete(key),
+  };
   let heartbeat: (() => void) | undefined;
   const setInterval = vi.fn((callback: () => void) => {
     heartbeat = callback;
@@ -206,7 +225,7 @@ const createHarness = (
     "setTimeout",
     "clearTimeout",
     "globalThis",
-    `return ${assembleRuntime(options.catalog ?? payload(), options.runtimeFingerprint ?? runtimeFingerprint)}`,
+    `return ${assembleRuntime(options.catalog ?? payload(), options.runtimeFingerprint ?? runtimeFingerprint, options.recoveryOnly)}`,
   );
   const execute = async () => {
     const result = await run(
@@ -217,17 +236,19 @@ const createHarness = (
         now: () => 0,
         getEntriesByType: () => performanceEntries.map((name) => ({ name })),
       },
-      { getItem: () => null, setItem() {}, removeItem() {} },
+      localStorage,
       fetch,
       importModule,
       setInterval,
       () => {},
-      (callback: () => void) => {
-        callback();
-        return 1;
-      },
-      () => {},
-      {},
+      options.recoveryOnly
+        ? setTimeout
+        : (callback: () => void) => {
+            callback();
+            return 1;
+          },
+      options.recoveryOnly ? clearTimeout : () => {},
+      { crypto: globalThis.crypto },
     );
     // Module/scope discovery intentionally must not block installation. Let
     // its bounded async work settle, then exercise the installed heartbeat.
@@ -245,6 +266,7 @@ const createHarness = (
     },
     importModule,
     fetch,
+    window,
     setInterval,
     pulse: () => heartbeat?.(),
     replaceReactRoot: (scope: object) => {
@@ -355,6 +377,185 @@ const nativeVisible = (
     )
     .map((level) => level.reasoningEffort);
 describe("Codex Desktop current numeric-bundle runtime integration", () => {
+  it("observes active turns at startup without installing picker patches", async () => {
+    const queryClient = new QueryClient();
+    const picker = createPicker(queryClient);
+    const native = createNativeVisibilityFixture(queryClient);
+    const atomScope = {};
+    const statusAtom = {
+      scope: atomScope,
+      kind: "signal-family",
+      read() {},
+      resolve() {},
+    };
+    const managerToken = { scope: atomScope, cache: "signal", resolve() {} };
+    const managerFactory = new Function(
+      'return function manager(e,t,n){var o=n("status-module"); return function(scope,host){const status=scope.get(o.M4,host); if(status.client)return status.client.rpc; throw Error("AppServerManager RPC is unavailable for hostId:");}}',
+    )();
+    native.webpack.cache.manager = {
+      id: "manager",
+      loaded: true,
+      exports: {
+        V: managerFactory(undefined, undefined, () => ({ M4: statusAtom })),
+        p: managerToken,
+      },
+    };
+    native.webpack.cache["status-module"] = {
+      id: "status-module",
+      loaded: true,
+      exports: { M4: statusAtom },
+    };
+    Object.assign(native.webpack.requireModule, {
+      m: { manager: managerFactory },
+    });
+    let running = true;
+    const sendRequest = vi.fn(
+      async (method: string, _params?: object, _options?: unknown) => {
+        if (method === "thread/loaded/list")
+          return { data: ["fixture-thread"], nextCursor: null };
+        if (method === "thread/read")
+          return {
+            thread: {
+              id: "fixture-thread",
+              status: running
+                ? { type: "active", activeFlags: [] }
+                : { type: "systemError" },
+              model: "sol",
+              modelProvider: provider,
+              turns: [],
+            },
+          };
+        if (method === "thread/turns/list")
+          return {
+            data: [
+              {
+                id: "fixture-turn",
+                status: running ? "inProgress" : "failed",
+                items: [],
+                itemsView: "notLoaded",
+                error: running
+                  ? null
+                  : {
+                      message: "You've hit your usage limit. Try again later.",
+                      codexErrorInfo: "usageLimitExceeded",
+                    },
+              },
+            ],
+            nextCursor: null,
+          };
+        if (method === "model/list") return rawModels;
+        throw new Error("Unexpected app-server request");
+      },
+    );
+    const rpc = Object.assign(function rpc() {}, {
+      sendRequest,
+      getCompatibleThreadSortKey() {},
+      supportsPaginatedThreadHistory() {},
+    });
+    Object.setPrototypeOf(rpc, {
+      dup() {},
+      onRpcBroken() {},
+      map() {},
+      toString: () => "[object RpcStub]",
+    });
+    const rpcClient = { hostId: "local", rpc };
+    const managerProvider = { forHost: (_host: string) => rpc };
+    Object.assign(native.scope, {
+      scope: atomScope,
+      get: (token: object) => {
+        if (token === statusAtom) return { status: "ready", client: rpcClient };
+        if (token === managerToken) return managerProvider;
+        return native.get(token);
+      },
+    });
+    const harness = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+      recoveryOnly: true,
+    });
+    try {
+      expect(await harness.execute()).toMatchObject({ recoveryOnly: true });
+      expect(harness.state.appServerClients).toHaveLength(1);
+      expect(sendRequest).toHaveBeenCalledWith("thread/loaded/list", {
+        cursor: null,
+        limit: 32,
+      });
+      const loadedListCalls = () =>
+        sendRequest.mock.calls.filter(
+          ([method]) => method === "thread/loaded/list",
+        ).length;
+      const requestCalls = (method: string) =>
+        sendRequest.mock.calls.filter(
+          ([calledMethod]) => calledMethod === method,
+        ).length;
+      expect(loadedListCalls()).toBe(1);
+      expect(requestCalls("thread/read")).toBe(1);
+      expect(requestCalls("thread/turns/list")).toBe(1);
+      await harness.tick();
+      expect(loadedListCalls()).toBe(1);
+      const hook = managerProvider.forHost("local");
+      const modelListParams = { limit: 5 };
+      expect(await hook.sendRequest("model/list", modelListParams)).toBe(
+        rawModels,
+      );
+      expect(sendRequest).toHaveBeenLastCalledWith(
+        "model/list",
+        modelListParams,
+        undefined,
+      );
+      expect(picker.efforts()).toEqual(nativeVisibleEfforts);
+      expect(harness.state.reasoningQueryCaches?.size ?? 0).toBe(0);
+      expect(harness.window.addEventListener).not.toHaveBeenCalled();
+
+      running = false;
+      expect(harness.setInterval).toHaveBeenCalledTimes(1);
+      expect(
+        await harness.state.collectCodexNativeUsageLimitCandidates?.(),
+      ).toEqual({
+        candidates: [
+          expect.objectContaining({
+            threadId: "fixture-thread",
+            turnId: "fixture-turn",
+          }),
+        ],
+        complete: true,
+      });
+    } finally {
+      harness.dispose();
+      picker.dispose();
+      queryClient.clear();
+    }
+  });
+
+  it("keeps the installed picker and its catalog when recovery attaches to a full runtime", async () => {
+    const queryClient = new QueryClient();
+    const picker = createPicker(queryClient);
+    const native = createNativeVisibilityFixture(queryClient);
+    const full = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+    });
+    try {
+      await full.execute();
+      const runtimeGeneration = full.state.runtimeGeneration;
+      const installedPayload = full.state.payload;
+      const collect = full.state.collectCodexNativeUsageLimitCandidates;
+      const recovery = createHarness(native.webpack.namespace, {
+        reactScope: native.scope,
+        recoveryOnly: true,
+        state: full.state,
+      });
+      expect(await recovery.execute()).toMatchObject({ recoveryOnly: false });
+      expect(full.state.collectCodexNativeUsageLimitCandidates).toBe(collect);
+      expect(full.state.runtimeGeneration).toBe(runtimeGeneration);
+      expect(full.state.payload).toBe(installedPayload);
+      expect(recovery.setInterval).not.toHaveBeenCalled();
+      expect(picker.efforts()).toEqual(allEfforts);
+    } finally {
+      full.dispose();
+      picker.dispose();
+      queryClient.clear();
+    }
+  });
+
   it("rebinds a positively mounted retained RPC scope before pending bundle discovery", async () => {
     const queryClient = new QueryClient();
     const rpcBase = {
