@@ -96,6 +96,60 @@ describe("wizard Sub-Agent selection authority", () => {
 });
 
 describe("buildCodexMultiRouterWizardPlan subagent version", () => {
+  it("disables only the requested Sub-Agent roles while preserving profile data", () => {
+    const plan: Provider = {
+      id: "router",
+      name: "Router",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          routes: [
+            {
+              id: "route",
+              targetProviderId: deepseekSource.id,
+              modelSelection: { mode: "all" },
+            },
+          ],
+          subagentV2: {
+            schemaVersion: 2,
+            selectionPolicy: "balanced",
+            profiles: {
+              "deepseek-v4-flash": {
+                model: "deepseek-v4-flash",
+                enabled: true,
+                inputModalities: ["text", "image"],
+                questionnaire: {
+                  taskStrengths: ["repository_exploration"],
+                  optimization: "balanced",
+                  writeScope: "read_only",
+                  preference: "eligible",
+                },
+                reasoning: { policy: "delegated" },
+                overrides: {
+                  roleName: "Explorer",
+                  nicknameCandidates: ["Scout"],
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+    const original =
+      plan.settingsConfig.codexRouting.subagentV2.profiles["deepseek-v4-flash"];
+    const result = buildCodexMultiRouterWizardPlan(
+      [deepseekSource, plan],
+      [deepseekSource],
+      plan,
+      { disabledSubagentModels: ["DEEPSEEK-V4-FLASH"] },
+    );
+    const profile =
+      result.plan.settingsConfig.codexRouting.subagentV2.profiles[
+        "deepseek-v4-flash"
+      ];
+    expect(profile).toEqual({ ...original, enabled: false });
+  });
+
   it("keeps canonical official auth entirely out of the Router route", () => {
     const official: Provider = {
       id: "codex-official",

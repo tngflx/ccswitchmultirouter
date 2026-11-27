@@ -3,18 +3,63 @@
 //! 负责选择和管理代理目标供应商，实现智能故障转移
 
 use crate::app_config::AppType;
-use crate::database::Database;
+use crate::codex_multirouter::catalog::share_provider_catalog;
+use crate::codex_multirouter::compile_inputs::{routing_inputs_revision, RoutingInputsRevision};
+use crate::codex_multirouter::compiler::{
+    compile_v2, enabled_provider_v2_plan, CodexRoutingCompileError,
+};
+use crate::database::{Database, ProviderRevision};
 use crate::error::AppError;
 use crate::provider::Provider;
 use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerConfig};
-use std::collections::HashMap;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
-use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::timeout;
 
 use super::codex_traffic_policy::resolve_codex_traffic_policy;
+use super::error::ProxyError;
+use super::providers::{CodexV2RouteIndex, ResolvedCodexRoute};
+
+const MAX_CACHED_CODEX_ROUTERS: usize = 4;
+
+pub(super) struct CodexV2RoutePlan {
+    pub(super) index: CodexV2RouteIndex,
+    providers: HashMap<String, Provider>,
+}
+
+impl CodexV2RoutePlan {
+    pub(super) fn resolve(
+        &self,
+        router: &Provider,
+        body: &Value,
+        explicit_route_id: Option<&str>,
+    ) -> Result<Option<ResolvedCodexRoute>, ProxyError> {
+        self.index
+            .resolve(router, body, &self.providers, explicit_route_id)
+            .map_err(codex_v2_compile_error)
+    }
+}
+
+struct CachedCodexV2Routes {
+    provider_id: String,
+    routing: Value,
+    sqlite: ProviderRevision,
+    inputs: RoutingInputsRevision,
+    compiled: Result<Arc<CodexV2RoutePlan>, CodexRoutingCompileError>,
+}
+
+fn codex_v2_compile_error(error: CodexRoutingCompileError) -> ProxyError {
+    ProxyError::ConfigError(format!(
+        "Codex MultiRouter v2 编译失败 [{}]: {}",
+        error.code, error.message
+    ))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CodexAdmissionQueueTimeout {
@@ -32,6 +77,10 @@ pub struct ProviderRouter {
     /// Shared Codex admission gates. Permits are retained by the forwarder for the
     /// complete response lifetime, including streamed bodies.
     codex_route_admission: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
+    codex_v2_routes: Mutex<VecDeque<CachedCodexV2Routes>>,
+    codex_v2_compile: Mutex<()>,
+    #[cfg(test)]
+    codex_v2_compile_count: AtomicUsize,
 }
 
 impl ProviderRouter {
@@ -41,7 +90,154 @@ impl ProviderRouter {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
             codex_route_admission: Arc::new(RwLock::new(HashMap::new())),
+            codex_v2_routes: Mutex::new(VecDeque::new()),
+            codex_v2_compile: Mutex::new(()),
+            #[cfg(test)]
+            codex_v2_compile_count: AtomicUsize::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn codex_v2_compile_count(&self) -> usize {
+        self.codex_v2_compile_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn resolve_codex_v2_route(
+        &self,
+        provider: &Provider,
+        body: &Value,
+        explicit_route_id: Option<&str>,
+    ) -> Result<Option<ResolvedCodexRoute>, ProxyError> {
+        self.resolve_codex_v2_route_with(provider, body, explicit_route_id, routing_inputs_revision)
+    }
+
+    fn resolve_codex_v2_route_with(
+        &self,
+        provider: &Provider,
+        body: &Value,
+        explicit_route_id: Option<&str>,
+        inputs_revision: impl Fn() -> Option<RoutingInputsRevision>,
+    ) -> Result<Option<ResolvedCodexRoute>, ProxyError> {
+        let Some(plan) = self.codex_v2_route_plan_with(provider, inputs_revision)? else {
+            return Ok(None);
+        };
+        plan.resolve(provider, body, explicit_route_id)
+    }
+
+    pub(super) fn codex_v2_route_plan(
+        &self,
+        provider: &Provider,
+    ) -> Result<Option<Arc<CodexV2RoutePlan>>, ProxyError> {
+        self.codex_v2_route_plan_with(provider, routing_inputs_revision)
+    }
+
+    fn codex_v2_route_plan_with(
+        &self,
+        provider: &Provider,
+        inputs_revision: impl Fn() -> Option<RoutingInputsRevision>,
+    ) -> Result<Option<Arc<CodexV2RoutePlan>>, ProxyError> {
+        let Some(routing) = provider.settings_config.get("codexRouting") else {
+            return Ok(None);
+        };
+        if routing.get("schemaVersion").and_then(Value::as_u64) != Some(2) {
+            return Ok(None);
+        }
+
+        let sqlite_revision = || {
+            self.db
+                .provider_revision()
+                .map_err(|error| ProxyError::DatabaseError(error.to_string()))
+        };
+        let cached = |sqlite, inputs: Option<&RoutingInputsRevision>| {
+            let inputs = inputs?;
+            self.codex_v2_routes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .find(|entry| {
+                    entry.sqlite == sqlite
+                        && &entry.inputs == inputs
+                        && entry.provider_id == provider.id
+                        && &entry.routing == routing
+                })
+                .map(|entry| entry.compiled.clone())
+        };
+        let inputs = inputs_revision();
+        if let Some(compiled) = cached(sqlite_revision()?, inputs.as_ref()) {
+            return compiled.map(Some).map_err(codex_v2_compile_error);
+        }
+
+        // A cold miss may be shared by concurrent requests. Recheck after acquiring
+        // the compile lock while allowing hits to keep using the cache directly.
+        let _compile = self
+            .codex_v2_compile
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for _ in 0..2 {
+            let inputs = inputs_revision();
+            let sqlite = sqlite_revision()?;
+            if let Some(compiled) = cached(sqlite, inputs.as_ref()) {
+                return compiled.map(Some).map_err(codex_v2_compile_error);
+            }
+
+            let Some(plan) = enabled_provider_v2_plan(provider).map_err(codex_v2_compile_error)?
+            else {
+                return Ok(None);
+            };
+            let target_ids = plan
+                .routes
+                .iter()
+                .map(|route| route.target_provider_id.trim())
+                .filter(|id| !id.is_empty())
+                .collect::<HashSet<_>>();
+            let mut providers = self
+                .db
+                .get_providers_by_id(AppType::Codex.as_str(), target_ids)
+                .map_err(|error| ProxyError::DatabaseError(error.to_string()))?;
+            #[cfg(test)]
+            self.codex_v2_compile_count.fetch_add(1, Ordering::Relaxed);
+            let compiled = compile_v2(&plan, &providers);
+
+            // Publish only when the read transaction and the compiler both saw
+            // the revision we checked for a hit. A racing change gets a fresh pass.
+            if (inputs.is_some() && inputs_revision() != inputs) || sqlite_revision()? != sqlite {
+                continue;
+            }
+            let compiled = compiled.map(|compiled| {
+                for provider in providers.values_mut() {
+                    share_provider_catalog(provider);
+                }
+                Arc::new(CodexV2RoutePlan {
+                    index: CodexV2RouteIndex::new(compiled, provider, &providers),
+                    providers,
+                })
+            });
+            if let Some(inputs) = inputs {
+                let mut cache = self
+                    .codex_v2_routes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                cache.retain(|entry| {
+                    entry.sqlite == sqlite
+                        && entry.inputs == inputs
+                        && entry.provider_id != provider.id
+                });
+                if cache.len() == MAX_CACHED_CODEX_ROUTERS {
+                    cache.pop_front();
+                }
+                cache.push_back(CachedCodexV2Routes {
+                    provider_id: provider.id.clone(),
+                    routing: routing.clone(),
+                    sqlite,
+                    inputs,
+                    compiled: compiled.clone(),
+                });
+            }
+            return compiled.map(Some).map_err(codex_v2_compile_error);
+        }
+        Err(ProxyError::ConfigError(
+            "Codex MultiRouter settings changed while resolving the request".to_string(),
+        ))
     }
 
     pub async fn acquire_codex_route_admission(
@@ -138,23 +334,9 @@ impl ProviderRouter {
 
         if auto_failover_enabled {
             // 故障转移开启：仅按队列顺序依次尝试（P1 → P2 → ...）
-            let all_providers = self.db.get_all_providers(app_type)?;
-
-            // 使用 DAO 返回的排序结果，确保和前端展示一致
-            let ordered_ids: Vec<String> = self
-                .db
-                .get_failover_queue(app_type)?
-                .into_iter()
-                .map(|item| item.provider_id)
-                .collect();
-
-            total_providers = ordered_ids.len();
-
-            for provider_id in ordered_ids {
-                let Some(provider) = all_providers.get(&provider_id).cloned() else {
-                    continue;
-                };
-
+            let providers = self.db.get_failover_providers(app_type)?;
+            total_providers = providers.len();
+            for provider in providers {
                 let circuit_key = format!("{app_type}:{}", provider.id);
                 let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
 
@@ -388,6 +570,7 @@ mod tests {
     use crate::database::Database;
     use serde_json::json;
     use serial_test::serial;
+    use std::cell::Cell;
     use std::env;
     use tempfile::TempDir;
 
@@ -632,5 +815,302 @@ mod tests {
         let third = router.allow_provider_request("a", "claude").await;
         assert!(third.allowed);
         assert!(third.used_half_open_permit);
+    }
+
+    fn codex_target(id: &str, model_count: usize) -> Provider {
+        let models = (0..model_count)
+            .map(|index| json!({"model": format!("{id}-model-{index}")}))
+            .collect::<Vec<_>>();
+        Provider::with_id(
+            id.to_string(),
+            format!("Target {id}"),
+            json!({
+                "apiFormat": "openai_responses",
+                "apiKey": format!("test-key-{id}"),
+                "baseUrl": format!("https://{id}.example.test/v1"),
+                "modelCatalog": {"models": models}
+            }),
+            None,
+        )
+    }
+
+    fn codex_router(id: &str, target_id: &str, route_label: &str) -> Provider {
+        Provider::with_id(
+            id.to_string(),
+            format!("Router {id}"),
+            json!({
+                "codexRouting": {
+                    "schemaVersion": 2,
+                    "enabled": true,
+                    "defaultRouteId": "route",
+                    "routes": [{
+                        "id": "route",
+                        "label": route_label,
+                        "enabled": true,
+                        "targetProviderId": target_id,
+                        "modelSelection": {"mode": "all"},
+                        "matchPrefixes": [],
+                        "aliases": {},
+                        "authPolicy": {"source": "provider_config"}
+                    }]
+                }
+            }),
+            None,
+        )
+    }
+
+    fn resolve_cached_route(
+        router: &ProviderRouter,
+        provider: &Provider,
+        body: &Value,
+        revision: u64,
+    ) -> Result<Option<ResolvedCodexRoute>, ProxyError> {
+        router.resolve_codex_v2_route_with(provider, body, None, || {
+            Some(RoutingInputsRevision::for_test(revision))
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn codex_router_cache_reuses_compiled_plan_for_small_and_large_text_and_raw_requests() {
+        let _home = TempHome::new();
+        for model_count in [2, 512] {
+            let db = Arc::new(Database::memory().unwrap());
+            let target = codex_target("target", model_count);
+            db.save_provider(AppType::Codex.as_str(), &target).unwrap();
+            let router = ProviderRouter::new(db);
+            let provider = codex_router("router", "target", "Route");
+            let model = format!("target-model-{}", model_count - 1);
+
+            let text = json!({"model": model, "input": "hello"});
+            let raw = json!({});
+            for _ in 0..8 {
+                let resolved = resolve_cached_route(&router, &provider, &text, 1)
+                    .unwrap()
+                    .expect("text resolves by model name");
+                assert_eq!(resolved.matched_by, "exact");
+                assert_eq!(resolved.upstream_model, model);
+
+                let resolved = router
+                    .resolve_codex_v2_route_with(&provider, &raw, Some(" ROUTE "), || {
+                        Some(RoutingInputsRevision::for_test(1))
+                    })
+                    .unwrap()
+                    .expect("model-less raw request resolves by explicit route id");
+                assert_eq!(resolved.matched_by, "explicit_route_id");
+                assert_eq!(resolved.target_provider_id, "target");
+            }
+            assert_eq!(router.codex_v2_compile_count(), 1);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn codex_router_cache_compiles_one_plan_for_concurrent_cold_requests() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let target = codex_target("target", 128);
+        db.save_provider(AppType::Codex.as_str(), &target).unwrap();
+        let router = ProviderRouter::new(db);
+        let provider = codex_router("router", "target", "Route");
+        let body = json!({"model": "target-model-127"});
+        let workers = 8;
+        let first_revision = std::sync::Barrier::new(workers);
+
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let router = &router;
+                let provider = &provider;
+                let body = &body;
+                let first_revision = &first_revision;
+                scope.spawn(move || {
+                    let first_read = Cell::new(true);
+                    let resolved = router
+                        .resolve_codex_v2_route_with(provider, body, None, || {
+                            if first_read.replace(false) {
+                                first_revision.wait();
+                            }
+                            Some(RoutingInputsRevision::for_test(1))
+                        })
+                        .unwrap()
+                        .expect("concurrent call selects the compiled route");
+                    assert_eq!(resolved.upstream_model, "target-model-127");
+                });
+            }
+        });
+
+        assert_eq!(router.codex_v2_compile_count(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn codex_router_cache_invalidates_after_catalog_edit_and_deletion() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let mut target = codex_target("target", 2);
+        db.save_provider(AppType::Codex.as_str(), &target).unwrap();
+        let router = ProviderRouter::new(db.clone());
+        let provider = codex_router("router", "target", "Route");
+        let old_request = json!({"model": "target-model-0"});
+        let new_request = json!({"model": "target-model-edited"});
+
+        assert!(resolve_cached_route(&router, &provider, &old_request, 1)
+            .unwrap()
+            .is_some());
+        assert_eq!(router.codex_v2_compile_count(), 1);
+
+        target.settings_config["modelCatalog"]["models"][0]["model"] = json!("target-model-edited");
+        db.save_provider(AppType::Codex.as_str(), &target).unwrap();
+        assert!(resolve_cached_route(&router, &provider, &old_request, 1)
+            .unwrap()
+            .is_none());
+        assert!(resolve_cached_route(&router, &provider, &new_request, 1)
+            .unwrap()
+            .is_some());
+        assert_eq!(router.codex_v2_compile_count(), 2);
+
+        db.delete_provider(AppType::Codex.as_str(), &target.id)
+            .unwrap();
+        for _ in 0..4 {
+            let error = resolve_cached_route(&router, &provider, &new_request, 1)
+                .expect_err("deleted target must invalidate the cached plan");
+            assert!(error.to_string().contains("target_provider_missing"));
+        }
+        assert_eq!(router.codex_v2_compile_count(), 3);
+
+        db.save_provider(AppType::Codex.as_str(), &target).unwrap();
+        assert!(resolve_cached_route(&router, &provider, &new_request, 1)
+            .unwrap()
+            .is_some());
+        assert_eq!(router.codex_v2_compile_count(), 4);
+    }
+
+    #[test]
+    #[serial]
+    fn codex_router_cache_invalidates_after_external_catalog_commit() {
+        let home = TempHome::new();
+        let path = home.dir.path().join("router-cache.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        let db = Arc::new(Database::from_connection(conn));
+        db.create_tables().unwrap();
+        let mut target = codex_target("target", 12);
+        db.save_provider(AppType::Codex.as_str(), &target).unwrap();
+        let router = ProviderRouter::new(db);
+        let provider = codex_router("router", "target", "Route");
+        let request = json!({"model": "target-model-0"});
+        assert!(resolve_cached_route(&router, &provider, &request, 1)
+            .unwrap()
+            .is_some());
+
+        target.settings_config["modelCatalog"]["models"][0]["enabled"] = json!(false);
+        let mut external = rusqlite::Connection::open(&path).unwrap();
+        let update = external.transaction().unwrap();
+        assert_eq!(
+            update
+                .execute(
+                    "UPDATE providers SET settings_config = ?1 WHERE id = ?2 AND app_type = ?3",
+                    rusqlite::params![
+                        target.settings_config.to_string(),
+                        target.id,
+                        AppType::Codex.as_str()
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+        assert!(resolve_cached_route(&router, &provider, &request, 1)
+            .unwrap()
+            .is_some());
+        assert_eq!(router.codex_v2_compile_count(), 1);
+        update.commit().unwrap();
+
+        for _ in 0..4 {
+            assert!(resolve_cached_route(&router, &provider, &request, 1)
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(router.codex_v2_compile_count(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn codex_router_cache_invalidates_after_router_plan_and_external_input_changes() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let target = codex_target("target", 2);
+        db.save_provider(AppType::Codex.as_str(), &target).unwrap();
+        let router = ProviderRouter::new(db);
+        let mut provider = codex_router("router", "target", "Route");
+        let request = json!({"model": "target-model-0"});
+
+        let resolved = resolve_cached_route(&router, &provider, &request, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.effective_provider.name, "Route");
+        assert_eq!(router.codex_v2_compile_count(), 1);
+
+        provider.settings_config["codexRouting"]["routes"][0]["label"] = json!("Changed");
+        let resolved = resolve_cached_route(&router, &provider, &request, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.effective_provider.name, "Changed");
+        assert_eq!(router.codex_v2_compile_count(), 2);
+
+        for _ in 0..4 {
+            assert!(resolve_cached_route(&router, &provider, &request, 2)
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(router.codex_v2_compile_count(), 3);
+    }
+
+    #[test]
+    #[serial]
+    fn codex_router_cache_retries_when_sqlite_or_external_revision_changes_during_compile() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let mut target = codex_target("target", 4);
+        db.save_provider(AppType::Codex.as_str(), &target).unwrap();
+        let provider = codex_router("router", "target", "Route");
+        let request = json!({"model": "target-model-0"});
+
+        let router = ProviderRouter::new(db.clone());
+        let resolved = router
+            .resolve_codex_v2_route_with(&provider, &request, None, || {
+                let revision = if router.codex_v2_compile_count() == 0 {
+                    1
+                } else {
+                    2
+                };
+                Some(RoutingInputsRevision::for_test(revision))
+            })
+            .unwrap();
+        assert!(resolved.is_some());
+        assert!(resolve_cached_route(&router, &provider, &request, 2)
+            .unwrap()
+            .is_some());
+        assert_eq!(router.codex_v2_compile_count(), 2);
+
+        let router = ProviderRouter::new(db.clone());
+        target.settings_config["modelCatalog"]["models"][0]["enabled"] = json!(false);
+        let edited_catalog = Cell::new(false);
+        let resolved = router
+            .resolve_codex_v2_route_with(&provider, &request, None, || {
+                if router.codex_v2_compile_count() == 1 && !edited_catalog.replace(true) {
+                    db.save_provider(AppType::Codex.as_str(), &target).unwrap();
+                }
+                Some(RoutingInputsRevision::for_test(1))
+            })
+            .unwrap();
+        assert!(edited_catalog.get());
+        assert!(resolved.is_none());
+        assert!(resolve_cached_route(&router, &provider, &request, 1)
+            .unwrap()
+            .is_none());
+        assert_eq!(router.codex_v2_compile_count(), 2);
     }
 }

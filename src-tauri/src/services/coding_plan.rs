@@ -3,6 +3,9 @@
 //! 支持 Kimi For Coding、智谱 GLM、MiniMax 的 Token Plan 额度查询。
 //! 复用 subscription 模块的 SubscriptionQuota / QuotaTier 类型。
 
+use super::model_fetch::{
+    read_bounded_model_body, ModelBodyError, MAX_ERROR_RESPONSE_BYTES, MAX_MODEL_RESPONSE_BYTES,
+};
 use super::subscription::{
     CredentialStatus, QuotaTier, SubscriptionQuota, TIER_FIVE_HOUR, TIER_MONTHLY, TIER_WEEKLY_LIMIT,
 };
@@ -1083,10 +1086,16 @@ pub(crate) async fn volcengine_openapi_call(
 
     let resp = match resp {
         Ok(r) => r,
-        Err(e) => return VolcCall::Transient(format!("Network error: {e}")),
+        Err(e) => return VolcCall::Transient(format!("Network error: {}", e.without_url())),
     };
 
     let status = resp.status();
+    let redact = |detail: String| {
+        crate::redact_known_secrets_strict(
+            &detail,
+            &[access_key_id.to_owned(), secret_access_key.to_owned()],
+        )
+    };
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return VolcCall::Auth(format!(
             "Authentication failed (HTTP {status}). {VOLCENGINE_AKSK_HINT}"
@@ -1096,25 +1105,30 @@ pub(crate) async fn volcengine_openapi_call(
         // 火山 OpenAPI 网关对签名/凭据类错误常返 4xx（多为 HTTP 400）并携带与 200
         // 路径相同的 ResponseMetadata.Error 信封，而非 401/403。这里也解析信封，让
         // Bearer 被拒时仍能给出 AK/SK 引导并标记凭据失效，而不是当成普通 API 错误。
-        let raw = resp.text().await.unwrap_or_default();
+        let raw = match read_bounded_model_body(resp.bytes_stream(), MAX_ERROR_RESPONSE_BYTES).await
+        {
+            Ok(body) => body,
+            Err(error) => return VolcCall::Soft(format!("API error (HTTP {status}): {error}")),
+        };
+        let raw = String::from_utf8_lossy(&raw);
         if let Ok(body) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some((code, msg)) = volcengine_response_error(&body) {
                 if volcengine_is_auth_error_code(&code) {
-                    return VolcCall::Auth(format!(
+                    return VolcCall::Auth(redact(format!(
                         "Authentication failed (HTTP {status}, {code}): {msg}. {VOLCENGINE_AKSK_HINT}"
-                    ));
+                    )));
                 }
-                return VolcCall::Soft(format!("API error (HTTP {status}, {code}): {msg}"));
+                return VolcCall::Soft(redact(format!("API error (HTTP {status}, {code}): {msg}")));
             }
         }
-        return VolcCall::Soft(format!("API error (HTTP {status}): {raw}"));
+        return VolcCall::Soft(redact(format!("API error (HTTP {status}): {raw}")));
     }
 
-    // 同 Bearer 路径：先 bytes() 再解析——读体失败是瞬时（Transient），解析失败
-    // 是确定性（Soft）。reqwest 的 json() 把读体错误也包成 decode，无法区分。
-    let raw = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => return VolcCall::Transient(format!("Failed to read response: {e}")),
+    // 区分瞬时的读取失败与确定性的响应大小或 JSON 格式错误。
+    let raw = match read_bounded_model_body(resp.bytes_stream(), MAX_MODEL_RESPONSE_BYTES).await {
+        Ok(body) => body,
+        Err(error @ ModelBodyError::Transport(_)) => return VolcCall::Transient(error.to_string()),
+        Err(error @ ModelBodyError::TooLarge(_)) => return VolcCall::Soft(error.to_string()),
     };
     let body: serde_json::Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,
@@ -1124,11 +1138,11 @@ pub(crate) async fn volcengine_openapi_call(
     // 火山 OpenAPI 业务错误常以 200 + ResponseMetadata.Error 返回。
     if let Some((code, msg)) = volcengine_response_error(&body) {
         if volcengine_is_auth_error_code(&code) {
-            return VolcCall::Auth(format!(
+            return VolcCall::Auth(redact(format!(
                 "Authentication failed ({code}): {msg}. {VOLCENGINE_AKSK_HINT}"
-            ));
+            )));
         }
-        return VolcCall::Soft(format!("API error ({code}): {msg}"));
+        return VolcCall::Soft(redact(format!("API error ({code}): {msg}")));
     }
 
     VolcCall::Body(body)

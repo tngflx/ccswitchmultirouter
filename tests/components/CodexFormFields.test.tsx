@@ -42,6 +42,8 @@ import type {
 
 const reasoningApiMocks = vi.hoisted(() => ({
   resolve: vi.fn(),
+  resolveBatch: vi.fn(),
+  resolveSingle: vi.fn(),
   trigger: vi.fn(),
 }));
 
@@ -51,7 +53,8 @@ vi.mock("@/lib/api/providers", () => ({
 
 vi.mock("@/lib/api/codexSubagentV2", () => ({
   codexSubagentV2Api: {
-    resolveModelReasoningCapability: reasoningApiMocks.resolve,
+    resolveModelReasoningCapability: reasoningApiMocks.resolveSingle,
+    resolveModelReasoningCapabilities: reasoningApiMocks.resolveBatch,
     triggerModelReasoningDetection: reasoningApiMocks.trigger,
   },
 }));
@@ -107,10 +110,24 @@ beforeEach(() => {
   });
   vi.mocked(providersApi.bindCodexPresetReasoningEvidence).mockReset();
   reasoningApiMocks.resolve.mockReset();
+  reasoningApiMocks.resolveBatch.mockReset();
+  reasoningApiMocks.resolveSingle.mockReset();
   reasoningApiMocks.trigger.mockReset();
   reasoningApiMocks.resolve.mockImplementation(
     async (_settings, _provider, model) =>
       createUnknownReasoningResolution(model),
+  );
+  reasoningApiMocks.resolveSingle.mockImplementation(
+    (settings, provider, model) =>
+      reasoningApiMocks.resolve(settings, provider, model),
+  );
+  reasoningApiMocks.resolveBatch.mockImplementation(
+    (settings, provider, models: string[]) =>
+      Promise.all(
+        models.map((model) =>
+          reasoningApiMocks.resolve(settings, provider, model),
+        ),
+      ),
   );
 });
 
@@ -320,7 +337,10 @@ function deferred<T>() {
 async function waitForReasoningResolution() {
   await act(async () => {
     await Promise.all(
-      reasoningApiMocks.resolve.mock.results.map((result) => result.value),
+      [
+        ...reasoningApiMocks.resolveBatch.mock.results,
+        ...reasoningApiMocks.resolveSingle.mock.results,
+      ].map((result) => result.value),
     );
   });
 }
@@ -1006,6 +1026,126 @@ describe("CodexFormFields local model routing", () => {
     fireEvent.change(search, { target: { value: "new-alias" } });
     expect(screen.getByLabelText("Include visible-model")).toBeInTheDocument();
     await waitForReasoningResolution();
+  });
+
+  it.each([2, 128])(
+    "applies an external catalog of %i rows without serializing it for change detection",
+    (rowCount) => {
+      const models = Array.from({ length: rowCount }, (_, index) => ({
+        model: `snapshot-model-${index}`,
+        baseInstructions: "i".repeat(1024),
+        enabled: false,
+      }));
+      const stringify = vi.spyOn(JSON, "stringify");
+      let catalogSerializations: number;
+      try {
+        const { updateCatalog } = renderCatalogHarness(models);
+        updateCatalog(models.map((row) => ({ ...row })));
+        const replacement = "snapshot-model-new";
+        updateCatalog([
+          { ...models[0], model: replacement },
+          ...models.slice(1),
+        ]);
+        expect(screen.getByLabelText(`Include ${replacement}`)).toBeVisible();
+        expect(screen.queryByLabelText("Include snapshot-model-0")).toBeNull();
+        catalogSerializations = stringify.mock.calls.filter(([value]) => {
+          const rows = Array.isArray(value)
+            ? value
+            : (value?.catalog ?? value?.settings?.modelCatalog?.models);
+          return (
+            Array.isArray(rows) &&
+            rows.some((row) => row?.model?.startsWith?.("snapshot-model-"))
+          );
+        }).length;
+      } finally {
+        stringify.mockRestore();
+      }
+      expect(catalogSerializations).toBe(0);
+    },
+  );
+
+  it.each([2, 128])(
+    "uses one reasoning request for the visible models of a %i-row draft",
+    async (rowCount) => {
+      const models = Array.from({ length: rowCount }, (_, index) => ({
+        model: `draft-model-${index}`,
+        baseInstructions: "draft instruction ".repeat(64),
+      }));
+      renderCatalogHarness(models);
+
+      await waitFor(() =>
+        expect(reasoningApiMocks.resolveBatch).toHaveBeenCalledTimes(1),
+      );
+      await waitForReasoningResolution();
+      expect(reasoningApiMocks.resolveBatch).toHaveBeenCalledTimes(1);
+      expect(reasoningApiMocks.resolveBatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          modelCatalog: {
+            models: models.map((model) => expect.objectContaining(model)),
+          },
+        }),
+        expect.any(String),
+        expect.arrayContaining(["draft-model-0", "draft-model-1"]),
+      );
+      expect(reasoningApiMocks.resolveSingle).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps successful reasoning results when an individual model has no result", async () => {
+    reasoningApiMocks.resolveBatch.mockResolvedValue([
+      createSupportedReasoningResolution("working-model", ["high"], "high"),
+    ]);
+    renderCatalogHarness([
+      { model: "unavailable-model" },
+      { model: "working-model" },
+    ]);
+    expect(await screen.findByText("Codex levels: high")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Configure reasoning capabilities for unavailable-model",
+      }),
+    );
+    expect(
+      screen.getByText("Unknown (using server default)"),
+    ).toBeInTheDocument();
+    expect(reasoningApiMocks.resolveSingle).not.toHaveBeenCalled();
+  });
+
+  it("skips superseded draft requests while the previous batch is active", async () => {
+    const initial = deferred<CodexModelReasoningResolution[]>();
+    const latest = deferred<CodexModelReasoningResolution[]>();
+    reasoningApiMocks.resolveBatch
+      .mockReturnValueOnce(initial.promise)
+      .mockReturnValueOnce(latest.promise);
+    const { updateIdentity } = renderReadinessIdentityHarness({
+      catalog: [{ model: "changing-model" }],
+    });
+    await waitFor(() =>
+      expect(reasoningApiMocks.resolveBatch).toHaveBeenCalledTimes(1),
+    );
+
+    updateIdentity({ baseUrl: "https://intermediate.example/v1" });
+    updateIdentity({ baseUrl: "https://latest.example/v1" });
+    expect(reasoningApiMocks.resolveBatch).toHaveBeenCalledTimes(1);
+    await act(async () =>
+      initial.resolve([
+        createSupportedReasoningResolution("changing-model", ["low"], "low"),
+      ]),
+    );
+
+    expect(reasoningApiMocks.resolveBatch).toHaveBeenCalledTimes(2);
+    expect(reasoningApiMocks.resolveBatch).toHaveBeenLastCalledWith(
+      expect.objectContaining({ base_url: "https://latest.example/v1" }),
+      expect.any(String),
+      ["changing-model"],
+    );
+    expect(screen.queryByText("Codex levels: low")).not.toBeInTheDocument();
+    await act(async () =>
+      latest.resolve([
+        createSupportedReasoningResolution("changing-model", ["high"], "high"),
+      ]),
+    );
+    expect(screen.getByText("Codex levels: high")).toBeInTheDocument();
   });
 
   it("keeps external catalogue loads editable after capability hydration", async () => {

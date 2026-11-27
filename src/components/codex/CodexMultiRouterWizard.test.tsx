@@ -2526,4 +2526,108 @@ describe("CodexMultiRouterWizard", () => {
     ).toBeChecked();
     expect(screen.getAllByText("1000000 ctx")).toHaveLength(3);
   });
+
+  it("makes an undeclared reasoning save actionable and preserves the role on disable", async () => {
+    prepareCodexProviderSetBatch.mockReset();
+    commitCodexProviderSetBatch.mockReset();
+    restoreCodexProviderProtocolEvidence.mockReset();
+    const source: Provider = {
+      id: "reasoning-source",
+      name: "Reasoning Source",
+      category: "custom",
+      meta: {
+        codexProtocolMode: "manual",
+        apiFormat: "openai_responses",
+      },
+      settingsConfig: {
+        baseUrl: "https://example.invalid/v1",
+        auth: { OPENAI_API_KEY: "test-only" },
+        modelCatalog: { models: [{ model: "reasoning-model" }] },
+      },
+    };
+    const profile = {
+      model: "reasoning-model",
+      enabled: true,
+      inputModalities: ["text", "image"] as ["text", "image"],
+      questionnaire: {
+        taskStrengths: ["repository_exploration"],
+        optimization: "balanced",
+        writeScope: "read_only",
+        preference: "eligible",
+      },
+      reasoning: { policy: "delegated" },
+      overrides: { roleName: "Explorer", nicknameCandidates: ["Scout"] },
+    };
+    const plan: Provider = {
+      id: "reasoning-plan",
+      name: "Reasoning Plan",
+      settingsConfig: {
+        codexRouting: {
+          schemaVersion: 2,
+          enabled: true,
+          routes: [
+            {
+              id: "reasoning-route",
+              targetProviderId: source.id,
+              modelSelection: { mode: "all" },
+              authPolicy: { source: "provider_config" },
+            },
+          ],
+          subagentVersion: "v2",
+          subagentV2: {
+            schemaVersion: 2,
+            selectionPolicy: "balanced",
+            profiles: { "reasoning-model": profile },
+          },
+        },
+      },
+    };
+    restoreCodexProviderProtocolEvidence.mockResolvedValue(null);
+    prepareCodexProviderSetBatch
+      .mockRejectedValueOnce(
+        new Error(
+          "configuration incomplete (unknown_reasoning_capability_requires_declaration): reasoning-model",
+        ),
+      )
+      .mockResolvedValue({
+        digest: "saved",
+        sourcePreviews: [],
+        blocked: false,
+      });
+    commitCodexProviderSetBatch.mockImplementation(
+      async (_sources, router) => ({
+        router,
+        editorRouter: router,
+        sourceSnapshots: [],
+        projections: [],
+        status: "committed",
+      }),
+    );
+
+    renderWizard([source, plan], { mode: "edit", planId: plan.id });
+    fireEvent.click(screen.getByRole("button", { name: "Save and enable" }));
+    const saveButton = screen.getByRole("button", { name: "Save and publish" });
+    await waitFor(() => expect(saveButton).toBeEnabled());
+    fireEvent.click(saveButton);
+
+    await waitFor(() =>
+      expect(prepareCodexProviderSetBatch).toHaveBeenCalled(),
+    );
+    const reasoningAlert = await screen.findByRole("alert");
+    expect(reasoningAlert).toHaveTextContent(
+      "Sub-Agent reasoning capability is undeclared",
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Disable these Sub-Agent roles and save",
+      }),
+    );
+    await waitFor(() => expect(commitCodexProviderSetBatch).toHaveBeenCalled());
+    const retriedRouter = commitCodexProviderSetBatch.mock.calls.at(-1)![1];
+    expect(
+      retriedRouter.settingsConfig.codexRouting.subagentV2.profiles[
+        "reasoning-model"
+      ],
+    ).toEqual({ ...profile, enabled: false });
+  });
 });

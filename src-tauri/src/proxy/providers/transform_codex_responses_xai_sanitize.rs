@@ -29,7 +29,7 @@ use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::Value;
 
-use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
+use crate::proxy::sse::{strip_sse_field, TextSseFrames};
 
 /// Codex plugin-private fields removed recursively at any nesting depth.
 const RECURSIVE_UNSUPPORTED_FIELDS: &[&str] = &["external_web_access"];
@@ -135,8 +135,7 @@ pub(crate) fn apply_xai_native_responses_request_compat(
     settings: &Value,
 ) {
     if let Some(upstream_model) = upstream_model {
-        let allowed = collect_xai_catalog_model_ids(settings);
-        if let Some((from, to)) = rewrite_xai_unknown_request_model(body, upstream_model, &allowed)
+        if let Some((from, to)) = rewrite_xai_unknown_request_model(body, upstream_model, settings)
         {
             log::info!(
                 "[Codex] Rewrote xAI-unknown request model {from} -> {to} (provider={provider_id})"
@@ -148,10 +147,10 @@ pub(crate) fn apply_xai_native_responses_request_compat(
     }
 }
 
-pub(crate) fn rewrite_xai_unknown_request_model(
+fn rewrite_xai_unknown_request_model(
     body: &mut Value,
     upstream_model: &str,
-    allowed_models: &HashSet<String>,
+    settings: &Value,
 ) -> Option<(String, String)> {
     let upstream = upstream_model.trim();
     if upstream.is_empty() {
@@ -162,39 +161,38 @@ pub(crate) fn rewrite_xai_unknown_request_model(
         .get("model")
         .and_then(Value::as_str)
         .map(str::trim)
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
     if !requested.is_empty()
         && (requested.eq_ignore_ascii_case(upstream)
-            || request_is_grok_model(&requested)
-            || allowed_models
-                .iter()
-                .any(|model| model.eq_ignore_ascii_case(&requested)))
+            || request_is_grok_model(requested)
+            || xai_catalog_contains_model(settings, requested))
     {
         return None;
     }
+    let requested = requested.to_string();
     object.insert("model".to_string(), Value::String(upstream.to_string()));
     Some((requested, upstream.to_string()))
 }
 
-pub(crate) fn collect_xai_catalog_model_ids(settings: &Value) -> HashSet<String> {
-    let mut ids = HashSet::new();
-    let Some(models) = crate::codex_multirouter::catalog::catalog_models(settings) else {
-        return ids;
-    };
-    for entry in models {
-        for key in ["model", "slug", "id"] {
-            if let Some(id) = entry
-                .get(key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-            {
-                ids.insert(id.to_string());
-            }
-        }
-    }
-    ids
+#[cfg(test)]
+thread_local! {
+    static XAI_CATALOG_ROW_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn xai_catalog_contains_model(settings: &Value, requested: &str) -> bool {
+    crate::codex_multirouter::catalog::catalog_models(settings)
+        .unwrap_or_default()
+        .iter()
+        .any(|entry| {
+            #[cfg(test)]
+            XAI_CATALOG_ROW_VISITS.with(|visits| visits.set(visits.get() + 1));
+            ["model", "slug", "id"].iter().any(|&key| {
+                entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.trim().eq_ignore_ascii_case(requested))
+            })
+        })
 }
 
 pub(crate) fn request_is_grok_model(request: &str) -> bool {
@@ -791,17 +789,148 @@ fn rewrite_custom_item_id_references(
     }
 }
 
-#[derive(Debug, Clone, Default)]
 struct XaiCustomCallStreamState {
     codex_item_id: String,
     arguments: String,
-    emitted_input: String,
+    input_decoder: PartialCustomInputDecoder,
+    emitted_input_len: usize,
+}
+
+#[derive(Default)]
+struct PartialCustomInputDecoder {
+    phase: CustomInputPhase,
+    scan_offset: usize,
+    decoded: String,
+    last_argument_len: usize,
+    #[cfg(test)]
+    scanned_steps: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+enum CustomInputPhase {
+    #[default]
+    ObjectStart,
+    KeyStart,
+    Key(Option<usize>),
+    Colon {
+        is_input: bool,
+    },
+    ValueStart {
+        is_input: bool,
+    },
+    SkipValue {
+        depth: usize,
+        in_string: bool,
+        escaped: bool,
+    },
+    Input,
+    Finished,
+}
+
+impl PartialCustomInputDecoder {
+    fn update(&mut self, arguments: &str) {
+        if arguments.len() == self.last_argument_len {
+            return;
+        }
+        self.last_argument_len = arguments.len();
+
+        use CustomInputPhase::*;
+        let bytes = arguments.as_bytes();
+        while self.scan_offset < bytes.len() {
+            if matches!(self.phase, Finished) {
+                return;
+            }
+            #[cfg(test)]
+            {
+                self.scanned_steps += 1;
+            }
+            let offset = self.scan_offset;
+            let byte = bytes[offset];
+            let whitespace = matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
+            let mut consumed = 1;
+            self.phase = match self.phase {
+                ObjectStart if whitespace => ObjectStart,
+                ObjectStart if byte == b'{' => KeyStart,
+                KeyStart if whitespace => KeyStart,
+                KeyStart if byte == b'"' => Key(Some(0)),
+                Key(matched) if byte == b'"' => Colon {
+                    is_input: matched == Some(CUSTOM_TOOL_INPUT_FIELD.len()),
+                },
+                Key(matched) => {
+                    let Some((character, width)) = decode_json_string_character(arguments, offset)
+                    else {
+                        break;
+                    };
+                    consumed = width;
+                    Key(matched.and_then(|index| {
+                        let expected = *CUSTOM_TOOL_INPUT_FIELD.as_bytes().get(index)?;
+                        (char::from(expected) == character).then_some(index + 1)
+                    }))
+                }
+                Colon { is_input } if whitespace => Colon { is_input },
+                Colon { is_input } if byte == b':' => ValueStart { is_input },
+                ValueStart { is_input } if whitespace => ValueStart { is_input },
+                ValueStart { is_input: true } if byte == b'"' => Input,
+                ValueStart { .. } => {
+                    self.phase = SkipValue {
+                        depth: 0,
+                        in_string: false,
+                        escaped: false,
+                    };
+                    continue;
+                }
+                // Values before top-level input can contain nested objects, arrays, and quoted
+                // punctuation. Only an unquoted, unnested comma starts another key.
+                SkipValue {
+                    depth,
+                    in_string,
+                    escaped,
+                } => {
+                    if in_string {
+                        SkipValue {
+                            depth,
+                            in_string: escaped || byte != b'"',
+                            escaped: !escaped && byte == b'\\',
+                        }
+                    } else {
+                        match byte {
+                            b',' if depth == 0 => KeyStart,
+                            b'}' if depth == 0 => Finished,
+                            b'"' | b'{' | b'[' | b'}' | b']' => SkipValue {
+                                depth: match byte {
+                                    b'{' | b'[' => depth + 1,
+                                    b'}' | b']' => depth.saturating_sub(1),
+                                    _ => depth,
+                                },
+                                in_string: byte == b'"',
+                                escaped: false,
+                            },
+                            _ => self.phase,
+                        }
+                    }
+                }
+                Input if byte == b'"' => Finished,
+                Input => {
+                    let Some((character, width)) = decode_json_string_character(arguments, offset)
+                    else {
+                        break;
+                    };
+                    self.decoded.push(character);
+                    consumed = width;
+                    Input
+                }
+                _ => Finished,
+            };
+            self.scan_offset += consumed;
+        }
+    }
 }
 
 struct XaiNativeResponsesSseRewriter {
     tool_context: super::transform_codex_chat::CodexToolContext,
     namespace_map: HashMap<String, super::transform_codex_responses_namespace::NamespacedName>,
-    custom_calls: HashMap<String, XaiCustomCallStreamState>,
+    // A completed ID suppresses late or duplicate argument events without retaining its payload.
+    custom_calls: HashMap<String, Option<XaiCustomCallStreamState>>,
 }
 
 impl XaiNativeResponsesSseRewriter {
@@ -821,21 +950,42 @@ impl XaiNativeResponsesSseRewriter {
             Some("response.output_item.added") => {
                 self.remember_custom_call_from_event(&event);
             }
-            Some("response.function_call_arguments.delta")
-                if event
+            Some("response.function_call_arguments.delta") => {
+                if let Some(state) = event
                     .get("item_id")
                     .and_then(Value::as_str)
-                    .is_some_and(|item_id| self.custom_calls.contains_key(item_id)) =>
-            {
-                return self.rewrite_custom_arguments_delta(event);
+                    .and_then(|item_id| self.custom_calls.get_mut(item_id))
+                {
+                    return match state {
+                        Some(state) => Self::rewrite_custom_arguments_delta(event, state),
+                        None => (Vec::new(), true),
+                    };
+                }
             }
-            Some("response.function_call_arguments.done")
-                if event
+            Some("response.function_call_arguments.done") => {
+                if let Some(state) = event
                     .get("item_id")
                     .and_then(Value::as_str)
-                    .is_some_and(|item_id| self.custom_calls.contains_key(item_id)) =>
-            {
-                return self.rewrite_custom_arguments_done(event);
+                    .and_then(|item_id| self.custom_calls.get_mut(item_id))
+                {
+                    return match state.take() {
+                        Some(state) => Self::rewrite_custom_arguments_done(event, state),
+                        None => (Vec::new(), true),
+                    };
+                }
+            }
+            Some("response.output_item.done") => {
+                if let Some(state) = event
+                    .get("item")
+                    .and_then(|item| item.get("id"))
+                    .and_then(Value::as_str)
+                    .and_then(|item_id| self.custom_calls.get_mut(item_id))
+                {
+                    *state = None;
+                }
+            }
+            Some("response.completed" | "response.incomplete" | "response.failed") => {
+                self.custom_calls.clear();
             }
             _ => {}
         }
@@ -875,75 +1025,59 @@ impl XaiNativeResponsesSseRewriter {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        let mut input_decoder = PartialCustomInputDecoder::default();
+        input_decoder.update(&arguments);
         self.custom_calls.insert(
             original_item_id.to_string(),
-            XaiCustomCallStreamState {
+            Some(XaiCustomCallStreamState {
                 codex_item_id,
                 arguments,
-                emitted_input: String::new(),
-            },
+                input_decoder,
+                emitted_input_len: 0,
+            }),
         );
     }
 
-    fn rewrite_custom_arguments_delta(&mut self, mut event: Value) -> (Vec<Value>, bool) {
-        let Some(original_item_id) = event
-            .get("item_id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-        else {
-            return (vec![event], false);
-        };
-        let Some(state) = self.custom_calls.get_mut(&original_item_id) else {
-            return (vec![event], false);
-        };
+    fn rewrite_custom_arguments_delta(
+        mut event: Value,
+        state: &mut XaiCustomCallStreamState,
+    ) -> (Vec<Value>, bool) {
         if let Some(delta) = event.get("delta").and_then(Value::as_str) {
             state.arguments.push_str(delta);
         }
-        let Some(decoded) = decode_partial_custom_input(&state.arguments) else {
-            return (Vec::new(), true);
-        };
-        let Some(delta) = decoded
-            .strip_prefix(&state.emitted_input)
-            .map(ToString::to_string)
-        else {
-            return (Vec::new(), true);
-        };
+        state.input_decoder.update(&state.arguments);
+        let decoded = &state.input_decoder.decoded;
+        let delta = &decoded[state.emitted_input_len..];
         if delta.is_empty() {
             return (Vec::new(), true);
         }
-        state.emitted_input = decoded;
+        state.emitted_input_len = decoded.len();
         event["type"] = Value::String("response.custom_tool_call_input.delta".to_string());
         event["item_id"] = Value::String(state.codex_item_id.clone());
-        event["delta"] = Value::String(delta);
+        event["delta"] = Value::String(delta.to_string());
         (vec![event], true)
     }
 
-    fn rewrite_custom_arguments_done(&mut self, mut event: Value) -> (Vec<Value>, bool) {
-        let Some(original_item_id) = event
-            .get("item_id")
+    fn rewrite_custom_arguments_done(
+        mut event: Value,
+        state: XaiCustomCallStreamState,
+    ) -> (Vec<Value>, bool) {
+        let arguments = event
+            .get("arguments")
             .and_then(Value::as_str)
-            .map(ToString::to_string)
-        else {
-            return (vec![event], false);
-        };
-        let Some(state) = self.custom_calls.get_mut(&original_item_id) else {
-            return (vec![event], false);
-        };
-        if let Some(arguments) = event.get("arguments").and_then(Value::as_str) {
-            state.arguments = arguments.to_string();
-        }
-        let input = custom_tool_input_from_xai_arguments(&Value::String(state.arguments.clone()));
+            .unwrap_or(&state.arguments);
+        let input = super::transform_codex_chat::custom_tool_input_from_chat_arguments(arguments);
+        let emitted_input = &state.input_decoder.decoded[..state.emitted_input_len];
         let missing_delta = input
-            .strip_prefix(&state.emitted_input)
+            .strip_prefix(emitted_input)
             .filter(|delta| !delta.is_empty())
             .map(ToString::to_string);
-        state.emitted_input = input.clone();
 
         let mut events = Vec::with_capacity(2);
         if let Some(delta) = missing_delta {
             let mut delta_event = serde_json::json!({
                 "type": "response.custom_tool_call_input.delta",
-                "item_id": state.codex_item_id,
+                "item_id": &state.codex_item_id,
                 "delta": delta
             });
             if let Some(output_index) = event.get("output_index").cloned() {
@@ -956,10 +1090,7 @@ impl XaiNativeResponsesSseRewriter {
                 "type".to_string(),
                 Value::String("response.custom_tool_call_input.done".to_string()),
             );
-            obj.insert(
-                "item_id".to_string(),
-                Value::String(state.codex_item_id.clone()),
-            );
+            obj.insert("item_id".to_string(), Value::String(state.codex_item_id));
             obj.remove("arguments");
             obj.insert("input".to_string(), Value::String(input));
         }
@@ -981,16 +1112,15 @@ where
     E: std::error::Error + Send + 'static,
 {
     async_stream::stream! {
-        let mut buffer = String::new();
-        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut frames = TextSseFrames::default();
         let mut rewriter = XaiNativeResponsesSseRewriter::new(tool_context, namespace_map);
 
         tokio::pin!(stream);
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
-                    while let Some(block) = take_sse_block(&mut buffer) {
+                    frames.push(&bytes);
+                    while let Some(block) = frames.next_block() {
                         if block.trim().is_empty() {
                             continue;
                         }
@@ -1006,10 +1136,7 @@ where
             }
         }
 
-        if !utf8_remainder.is_empty() {
-            buffer.push_str(&String::from_utf8_lossy(&utf8_remainder));
-        }
-        let tail = std::mem::take(&mut buffer);
+        let tail = frames.tail();
         if !tail.trim().is_empty() {
             for rewritten in rewrite_xai_native_sse_block(&tail, &mut rewriter) {
                 yield Ok(rewritten);
@@ -1056,109 +1183,63 @@ fn rewrite_xai_native_sse_block(
         .collect()
 }
 
-fn decode_partial_custom_input(arguments: &str) -> Option<String> {
-    if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(arguments) {
-        return obj
-            .get(CUSTOM_TOOL_INPUT_FIELD)
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
+fn decode_json_string_character(arguments: &str, offset: usize) -> Option<(char, usize)> {
+    let character = arguments[offset..].chars().next()?;
+    match character {
+        '\\' => decode_json_escape(arguments.as_bytes(), offset),
+        '\0'..='\u{001f}' => None,
+        _ => Some((character, character.len_utf8())),
     }
-
-    let key_start = arguments.find("\"input\"")? + "\"input\"".len();
-    let after_key = arguments.get(key_start..)?;
-    let colon = after_key.find(':')?;
-    let value = after_key.get(colon + 1..)?.trim_start();
-    let encoded = value.strip_prefix('"')?;
-    Some(decode_partial_json_string(encoded))
 }
 
-fn decode_partial_json_string(encoded: &str) -> String {
-    let chars: Vec<char> = encoded.chars().collect();
-    let mut decoded = String::new();
-    let mut index = 0;
-    while index < chars.len() {
-        let ch = chars[index];
-        if ch == '"' {
-            break;
-        }
-        if ch != '\\' {
-            decoded.push(ch);
-            index += 1;
-            continue;
-        }
-        if index + 1 >= chars.len() {
-            break;
-        }
-        let escape = chars[index + 1];
-        match escape {
-            '"' | '\\' | '/' => {
-                decoded.push(escape);
-                index += 2;
-            }
-            'b' => {
-                decoded.push('\u{0008}');
-                index += 2;
-            }
-            'f' => {
-                decoded.push('\u{000c}');
-                index += 2;
-            }
-            'n' => {
-                decoded.push('\n');
-                index += 2;
-            }
-            'r' => {
-                decoded.push('\r');
-                index += 2;
-            }
-            't' => {
-                decoded.push('\t');
-                index += 2;
-            }
-            'u' => {
-                if index + 6 > chars.len() {
-                    break;
+fn decode_json_escape(bytes: &[u8], offset: usize) -> Option<(char, usize)> {
+    let escape = *bytes.get(offset + 1)?;
+    let decoded = match escape {
+        b'"' => ('"', 2),
+        b'\\' => ('\\', 2),
+        b'/' => ('/', 2),
+        b'b' => ('\u{0008}', 2),
+        b'f' => ('\u{000c}', 2),
+        b'n' => ('\n', 2),
+        b'r' => ('\r', 2),
+        b't' => ('\t', 2),
+        b'u' => {
+            let high = parse_hex_quad(bytes.get(offset + 2..offset + 6)?)?;
+            if (0xD800..=0xDBFF).contains(&high) {
+                if bytes.get(offset + 6) != Some(&b'\\') || bytes.get(offset + 7) != Some(&b'u') {
+                    return None;
                 }
-                let hex: String = chars[index + 2..index + 6].iter().collect();
-                let Ok(code) = u16::from_str_radix(&hex, 16) else {
-                    break;
-                };
-                if (0xD800..=0xDBFF).contains(&code) {
-                    if index + 12 > chars.len()
-                        || chars[index + 6] != '\\'
-                        || chars[index + 7] != 'u'
-                    {
-                        break;
-                    }
-                    let low_hex: String = chars[index + 8..index + 12].iter().collect();
-                    let Ok(low) = u16::from_str_radix(&low_hex, 16) else {
-                        break;
-                    };
-                    if !(0xDC00..=0xDFFF).contains(&low) {
-                        break;
-                    }
-                    let scalar =
-                        0x10000 + (((code as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00);
-                    let Some(ch) = char::from_u32(scalar) else {
-                        break;
-                    };
-                    decoded.push(ch);
-                    index += 12;
-                    continue;
+                let low = parse_hex_quad(bytes.get(offset + 8..offset + 12)?)?;
+                if !(0xDC00..=0xDFFF).contains(&low) {
+                    return None;
                 }
-                if (0xDC00..=0xDFFF).contains(&code) {
-                    break;
+                let scalar = 0x10000 + (((high as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00);
+                (char::from_u32(scalar)?, 12)
+            } else {
+                if (0xDC00..=0xDFFF).contains(&high) {
+                    return None;
                 }
-                let Some(ch) = char::from_u32(code as u32) else {
-                    break;
-                };
-                decoded.push(ch);
-                index += 6;
+                (char::from_u32(high as u32)?, 6)
             }
-            _ => break,
         }
+        _ => return None,
+    };
+    Some(decoded)
+}
+
+fn parse_hex_quad(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() != 4 {
+        return None;
     }
-    decoded
+    bytes.iter().try_fold(0u16, |value, byte| {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return None,
+        };
+        Some((value << 4) | u16::from(digit))
+    })
 }
 
 #[cfg(test)]
@@ -1724,6 +1805,122 @@ mod tests {
         assert_eq!(deltas, "Deploy 🚀 now");
     }
 
+    #[test]
+    fn partial_custom_input_decoder_scans_appended_bytes_once() {
+        for size in [8, 32_768] {
+            let text = "a".repeat(size);
+            let prefix = format!(r#"{{"metadata":[{{"input":"{text}"}}, "escaped \"input\""]"#);
+            let suffix = format!(r#", "\u0069nput" : "{text}\uD83D\uDE80\n""#);
+            let complete = format!("{prefix}{suffix}}}");
+            let mut decoder = PartialCustomInputDecoder::default();
+            for end in 1..=prefix.len() {
+                decoder.update(&prefix[..end]);
+                decoder.update(&prefix[..end]);
+                assert!(decoder.decoded.is_empty());
+                assert_eq!(decoder.scan_offset, end);
+            }
+            // The scanner visits the start of each skipped value twice to change phases.
+            assert_eq!(decoder.scanned_steps, prefix.len() + 1);
+            for end in prefix.len() + 1..=complete.len() {
+                decoder.update(&complete[..end]);
+                decoder.update(&complete[..end]);
+            }
+            assert_eq!(decoder.decoded, format!("{text}🚀\n"));
+            assert_eq!(decoder.scan_offset, complete.len() - 1);
+            // Each visit advances the cursor or waits on a bounded JSON escape.
+            assert!(decoder.scanned_steps <= complete.len() + 12);
+
+            let missing = format!("{prefix}}}");
+            let mut decoder = PartialCustomInputDecoder::default();
+            for end in 1..=missing.len() {
+                decoder.update(&missing[..end]);
+            }
+            assert!(decoder.decoded.is_empty());
+            assert_eq!(decoder.scan_offset, missing.len());
+            assert_eq!(decoder.scanned_steps, missing.len() + 1);
+        }
+    }
+
+    #[test]
+    fn streaming_custom_tool_input_finalizes_interleaved_calls_in_order() {
+        let request = json!({"tools": [{"type": "custom", "name": "apply_patch"}]});
+        let tool_context =
+            super::super::transform_codex_chat::build_codex_tool_context_from_request(&request);
+        let mut rewriter = XaiNativeResponsesSseRewriter::new(tool_context, HashMap::new());
+        let item_event = |kind, id, arguments| {
+            json!({
+                "type": kind,
+                "item": {
+                    "type": "function_call",
+                    "id": id,
+                    "name": "apply_patch",
+                    "arguments": arguments
+                }
+            })
+        };
+        let delta_event = |id, delta| {
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": id,
+                "delta": delta
+            })
+        };
+        let done_event = |id, arguments| {
+            json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": id,
+                "output_index": 2,
+                "arguments": arguments
+            })
+        };
+
+        for id in ["fc_first", "fc_second", "fc_third"] {
+            rewriter.rewrite_event(item_event("response.output_item.added", id, ""));
+        }
+        let (events, _) = rewriter.rewrite_event(delta_event("fc_first", r#"{"input":"first"#));
+        assert_eq!(events[0]["delta"], "first");
+        let (events, _) = rewriter.rewrite_event(delta_event("fc_second", r#"{"input":"old"#));
+        assert_eq!(events[0]["delta"], "old");
+        let (events, _) = rewriter.rewrite_event(delta_event("fc_third", r#"{"input":"third"}"#));
+        assert_eq!(events[0]["delta"], "third");
+
+        let (events, _) =
+            rewriter.rewrite_event(done_event("fc_first", r#"{"input":"first suffix"}"#));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "response.custom_tool_call_input.delta");
+        assert_eq!(events[0]["delta"], " suffix");
+        assert_eq!(events[0]["output_index"], 2);
+        assert_eq!(events[1]["type"], "response.custom_tool_call_input.done");
+        assert_eq!(events[1]["input"], "first suffix");
+        assert!(rewriter.custom_calls["fc_first"].is_none());
+
+        let (events, _) =
+            rewriter.rewrite_event(done_event("fc_second", r#"{"input":"new value"}"#));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "response.custom_tool_call_input.done");
+        assert_eq!(events[0]["input"], "new value");
+        assert!(rewriter.custom_calls["fc_second"].is_none());
+
+        for (id, arguments) in [
+            ("fc_first", r#"{"input":"first suffix"}"#),
+            ("fc_third", r#"{"input":"third"}"#),
+        ] {
+            let (events, _) =
+                rewriter.rewrite_event(item_event("response.output_item.done", id, arguments));
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["type"], "response.output_item.done");
+            assert_eq!(events[0]["item"]["type"], "custom_tool_call");
+            assert!(rewriter.custom_calls[id].is_none());
+            assert!(rewriter
+                .rewrite_event(done_event(id, arguments))
+                .0
+                .is_empty());
+            assert!(rewriter.rewrite_event(delta_event(id, "late")).0.is_empty());
+        }
+        rewriter.rewrite_event(json!({"type": "response.completed"}));
+        assert!(rewriter.custom_calls.is_empty());
+    }
+
     #[tokio::test]
     async fn streaming_ordinary_function_done_normalizes_whole_float_arguments() {
         let request = json!({
@@ -1853,18 +2050,18 @@ mod tests {
 
     #[test]
     fn upstream_protocol_remaps_unknown_subagent_model_but_preserves_grok_and_catalog_models() {
-        let allowed = collect_xai_catalog_model_ids(&json!({
+        let settings = json!({
             "modelCatalog": {
                 "models": [
                     {"slug": "grok-4.6"},
                     {"model": "visible-grok", "upstreamModel": "grok-4.5"}
                 ]
             }
-        }));
+        });
 
         let mut unknown = json!({"model": "gpt-5.6-sol", "input": []});
         assert_eq!(
-            rewrite_xai_unknown_request_model(&mut unknown, "grok-4.6", &allowed),
+            rewrite_xai_unknown_request_model(&mut unknown, "grok-4.6", &settings),
             Some(("gpt-5.6-sol".to_string(), "grok-4.6".to_string()))
         );
         assert_eq!(unknown["model"], "grok-4.6");
@@ -1872,7 +2069,7 @@ mod tests {
         for model in ["grok-4.7-fast", "xai/Grok-4.7-Fast", "visible-grok"] {
             let mut known = json!({"model": model});
             assert_eq!(
-                rewrite_xai_unknown_request_model(&mut known, "grok-4.6", &allowed),
+                rewrite_xai_unknown_request_model(&mut known, "grok-4.6", &settings),
                 None,
                 "{model} must remain selectable"
             );
@@ -1882,19 +2079,67 @@ mod tests {
 
     #[test]
     fn upstream_protocol_missing_model_uses_upstream_and_empty_upstream_never_invents_one() {
-        let allowed = HashSet::new();
+        let settings = json!({});
         let mut missing = json!({"input": []});
         assert_eq!(
-            rewrite_xai_unknown_request_model(&mut missing, "grok-4.6", &allowed),
+            rewrite_xai_unknown_request_model(&mut missing, "grok-4.6", &settings),
             Some((String::new(), "grok-4.6".to_string()))
         );
         assert_eq!(missing["model"], "grok-4.6");
 
         let mut body = json!({"model": "gpt-5.6-sol"});
         assert_eq!(
-            rewrite_xai_unknown_request_model(&mut body, "  ", &allowed),
+            rewrite_xai_unknown_request_model(&mut body, "  ", &settings),
             None
         );
         assert_eq!(body["model"], "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn xai_request_model_only_visits_catalog_for_unmatched_models() {
+        for row_count in [12, 512] {
+            let rows = (0..row_count)
+                .map(|index| json!({"slug": format!(" extra-model-{index} ")}))
+                .collect::<Vec<_>>();
+            let settings = json!({"modelCatalog": {"models": rows}});
+            XAI_CATALOG_ROW_VISITS.with(|visits| visits.set(0));
+
+            for model in ["pinned-model", "xai/Grok-4.5", ""] {
+                let mut body = json!({"model": model});
+                apply_xai_native_responses_request_compat(
+                    &mut body,
+                    "xai-target",
+                    Some("pinned-model"),
+                    &settings,
+                );
+                assert_eq!(
+                    body["model"],
+                    if model.is_empty() {
+                        "pinned-model"
+                    } else {
+                        model
+                    }
+                );
+            }
+            assert_eq!(XAI_CATALOG_ROW_VISITS.with(|visits| visits.replace(0)), 0);
+
+            for (model, expected_model, expected_visits) in [
+                ("EXTRA-MODEL-0", "EXTRA-MODEL-0", 1),
+                ("unknown-model", "pinned-model", row_count),
+            ] {
+                let mut body = json!({"model": model});
+                apply_xai_native_responses_request_compat(
+                    &mut body,
+                    "xai-target",
+                    Some("pinned-model"),
+                    &settings,
+                );
+                assert_eq!(body["model"], expected_model);
+                assert_eq!(
+                    XAI_CATALOG_ROW_VISITS.with(|visits| visits.replace(0)),
+                    expected_visits
+                );
+            }
+        }
     }
 }

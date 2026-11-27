@@ -79,6 +79,7 @@ const createHarness = (
   });
   const recordFailure = vi.fn();
   const rememberCodexUserTurnAction = vi.fn();
+  const captureCodexNativeUsageLimitTurnStart = vi.fn();
   const source = discoveryCore
     .replace(
       "CODEX_RENDERER_SCOPE_OBJECT_SCAN_LIMIT = 100000",
@@ -100,6 +101,7 @@ const createHarness = (
     "yieldReactDiscovery",
     "installationIsCurrent",
     "rememberCodexUserTurnAction",
+    "captureCodexNativeUsageLimitTurnStart",
     `${source}\nreturn { patchAppServerModuleClients, patchCodexScopedAppServerClients, refreshCodexScopedAppServerClients, codexAppServerClientHasCurrentOwner, codexDeclaredDependencyScope, codexScopeQueryClient, codexQueryObserverPrototype, codexRendererScopeRootsMatchCurrent, codexRendererScopeCandidates, codexRendererScopeSnapshotIsCurrent, codexCurrentAppServerScopeHints, codexRendererMountedNodes, codexRendererScopePathIsCurrent };`,
   )(
     state,
@@ -113,6 +115,7 @@ const createHarness = (
     lifecycle.yieldDiscovery ?? (async () => {}),
     lifecycle.isCurrent ?? (() => true),
     rememberCodexUserTurnAction,
+    captureCodexNativeUsageLimitTurnStart,
   ) as {
     patchAppServerModuleClients: (module: object) => number;
     patchCodexScopedAppServerClients: (module: object) => Promise<number>;
@@ -146,6 +149,7 @@ const createHarness = (
     patchRequest,
     recordFailure,
     rememberCodexUserTurnAction,
+    captureCodexNativeUsageLimitTurnStart,
   };
 };
 
@@ -1410,6 +1414,18 @@ describe("Codex Desktop declared client discovery", () => {
         "turn/start",
         { threadId: "thread-1" },
       );
+      expect(
+        harness.captureCodexNativeUsageLimitTurnStart,
+      ).toHaveBeenCalledWith(
+        harness.state.appServerClients?.[0],
+        "turn/start",
+        {
+          threadId: "thread-1",
+        },
+      );
+      expect(
+        harness.captureCodexNativeUsageLimitTurnStart.mock.calls[0]?.[0],
+      ).not.toBe(sourceClient);
       await (
         sourceClient.rpc as unknown as {
           retrySafetyBufferedTurn: (params: {

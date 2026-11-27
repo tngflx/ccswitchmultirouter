@@ -10,12 +10,15 @@
 use super::{
     codex_subagent_reasoning::desktop_recovery_metadata,
     codex_turn_recovery::{
-        begin_turn, forward_error_is_recoverable, handle_recovery_forward_error,
-        mark_observed_turn_completed, observe_responses_turn_json, observe_responses_turn_stream,
-        provider_fingerprint, schedule_turn_recovery, track_turn, TurnRecoveryContext,
+        begin_turn, finish_observed_turn, forward_error_is_recoverable,
+        handle_recovery_forward_error, mark_observed_turn_completed,
+        observe_recovery_forward_response, observe_responses_turn_json,
+        observe_responses_turn_stream, provider_fingerprint, schedule_turn_recovery, track_turn,
+        TurnRecoveryContext,
     },
     content_encoding::{
-        decompress_body, get_content_encoding, is_supported_content_encoding, CodexInboundEncoding,
+        decompress_body_with_limit, get_content_encoding, is_supported_content_encoding,
+        CodexInboundEncoding, MAX_REQUEST_BODY_BYTES,
     },
     error_mapper::{
         actionable_upstream_error_message, get_error_message, map_proxy_error_to_status,
@@ -29,14 +32,16 @@ use super::{
         CLAUDE_PARSER_CONFIG, CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
     handler_context::RequestContext,
+    hyper_client::MAX_RESPONSE_BODY_BYTES,
     orchestration_runtime,
     providers::{
         codex_chat_common::extract_reasoning_field_text,
-        codex_chat_history::{
-            record_responses_sse_stream, record_responses_sse_stream_with_request,
-        },
+        codex_chat_history::{record_responses_sse_event, record_responses_sse_stream},
         codex_reasoning_mapping::{
             create_desktop_reasoning_mapping_stream, map_completed_response_for_desktop,
+        },
+        codex_terminal::{
+            deferred_usage_limit_period, explicit_retry_decision, terminal_error_payload,
         },
         get_adapter, get_claude_api_format,
         hosted_tools::bridge::HOSTED_TOOL_LOOP_HEADER,
@@ -54,22 +59,24 @@ use super::{
         streaming_retry::{
             create_resilient_anthropic_sse_stream_from_responses_with_web_search_options_and_context,
             create_resilient_anthropic_upstream_sse_stream,
-            create_resilient_chat_sse_stream_with_context,
-            create_resilient_responses_sse_stream_with_context, ByteStream, StreamLogContext,
-            StreamReconnector,
+            create_resilient_chat_sse_stream_with_context, create_resilient_responses_sse_frames,
+            create_resilient_responses_sse_stream_with_context, ByteStream, NativeResponsesFrame,
+            StreamLogContext, StreamReconnector,
         },
         transform, transform_codex_anthropic, transform_codex_chat,
         transform_codex_responses_namespace, transform_codex_responses_xai_sanitize,
         transform_gemini, transform_responses,
     },
     response_processor::{
-        create_logged_passthrough_stream, create_transformed_usage_collector,
-        create_usage_collector, process_response, process_response_with_stream_hint,
-        read_decoded_body, strip_entity_headers_for_rebuilt_body,
-        strip_hop_by_hop_response_headers, usage_logging_enabled,
+        build_streaming_response, create_logged_passthrough_stream,
+        create_logged_preparsed_sse_stream, create_transformed_usage_collector,
+        create_usage_collector, handle_non_streaming_with_history, process_response,
+        process_response_with_stream_hint, read_decoded_body,
+        strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
+        usage_logging_enabled, SseUsageCollector,
     },
     server::ProxyState,
-    sse::{strip_sse_field, take_sse_block},
+    sse::{strip_sse_field, SseBlocks},
     types::*,
     usage::parser::TokenUsage,
     ProxyError,
@@ -93,10 +100,33 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use serde_json::{json, Value};
 
 const FORCE_EXTERNAL_OPENAI_API_HEADER: &str = "x-cc-switch-external-openai-api";
+
+async fn collect_request_body_with_limit(
+    body: axum::body::Body,
+    limit: usize,
+) -> Result<Bytes, ProxyError> {
+    Limited::new(body, limit)
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes())
+        .map_err(|error| {
+            if error.downcast_ref::<LengthLimitError>().is_some() {
+                ProxyError::InvalidRequest(format!(
+                    "Request body exceeds size limit of {limit} bytes"
+                ))
+            } else {
+                ProxyError::Internal(format!("Failed to read request body: {error}"))
+            }
+        })
+}
+
+async fn collect_request_body(body: axum::body::Body) -> Result<Bytes, ProxyError> {
+    collect_request_body_with_limit(body, MAX_REQUEST_BODY_BYTES).await
+}
 
 // ============================================================================
 // 健康检查和状态查询（简单端点）
@@ -191,11 +221,7 @@ pub async fn handle_raw_openai_passthrough(
     let uri = parts.uri;
     let headers = parts.headers;
     let extensions = parts.extensions;
-    let body_bytes = req_body
-        .collect()
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
-        .to_bytes();
+    let body_bytes = collect_request_body(req_body).await?;
     let endpoint = raw_openai_passthrough_endpoint_with_query(&uri);
     let is_image_request =
         method == axum::http::Method::POST && codex_image_edit_endpoint(&endpoint);
@@ -606,7 +632,9 @@ fn codex_catalog_models_response(mut catalog: Value) -> Value {
     let mut ids = Vec::new();
     let mut entries = Vec::new();
     collect_string_array(&mut ids, catalog.get("models"));
-    collect_model_objects(&mut entries, catalog.get("models"), None);
+    collect_model_objects(&mut entries, catalog.get("models"), |id, source| {
+        Some(openai_model_entry_with_source(id, "cc-switch", source))
+    });
     ids.sort();
     ids.dedup();
     entries.extend(
@@ -763,6 +791,7 @@ fn observe_aggressive_json_recovery(
     stream: impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     context: TurnRecoveryContext,
     expected_bytes: Option<u64>,
+    period_limit_only: bool,
 ) -> ByteStream {
     let tracked = track_turn(&context);
     Box::pin(async_stream::stream! {
@@ -787,12 +816,16 @@ fn observe_aggressive_json_recovery(
                     // HTTP framing can stop polling after the final data frame,
                     // without polling None. Classify before yielding that frame.
                     if expected_bytes == Some(received_bytes) {
-                        observe_captured_recovery_json(&captured, oversized, &context);
+                        observe_captured_recovery_json(&captured, oversized, &context, period_limit_only);
                         finished = true;
                     }
                 }
                 Err(_) if !finished => {
-                    schedule_turn_recovery(context.clone(), "downstream_json_error");
+                    if period_limit_only {
+                        mark_observed_turn_completed(&context);
+                    } else {
+                        schedule_turn_recovery(context.clone(), "downstream_json_error");
+                    }
                     finished = true;
                 }
                 _ => {}
@@ -800,19 +833,42 @@ fn observe_aggressive_json_recovery(
             yield item;
         }
         if !finished {
-            observe_captured_recovery_json(&captured, oversized, &context);
+            observe_captured_recovery_json(&captured, oversized, &context, period_limit_only);
         }
     })
 }
 
-fn observe_captured_recovery_json(captured: &[u8], oversized: bool, context: &TurnRecoveryContext) {
+fn observe_captured_recovery_json(
+    captured: &[u8],
+    oversized: bool,
+    context: &TurnRecoveryContext,
+    period_limit_only: bool,
+) {
     if !oversized {
         match serde_json::from_slice::<Value>(captured) {
+            Ok(value) if period_limit_only => {
+                // Some providers deliver an HTTP 401/403 error through a
+                // response adapter. Only a structured error may establish a
+                // hard quota in this path. HTTP auth errors cannot auto-retry.
+                let typed_error = [
+                    "/error/code",
+                    "/error/type",
+                    "/response/error/code",
+                    "/response/error/type",
+                    "/code",
+                ]
+                .iter()
+                .any(|path| value.pointer(path).is_some_and(Value::is_string));
+                let deferred =
+                    typed_error && deferred_usage_limit_period("error", &value).is_some();
+                finish_observed_turn(context, deferred);
+                return;
+            }
             Ok(value) => {
                 observe_responses_turn_json(&value, context);
                 return;
             }
-            Err(error) if error.is_eof() => {
+            Err(error) if !period_limit_only && error.is_eof() => {
                 schedule_turn_recovery(context.clone(), "downstream_json_eof");
                 return;
             }
@@ -860,6 +916,10 @@ fn finalize_aggressive_recovery(
                 response.status(),
                 StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT
             ) && (response.status().is_success()
+                || matches!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                )
                 || forward_error_is_recoverable(&ProxyError::UpstreamError {
                     status: response.status().as_u16(),
                     body: None,
@@ -875,6 +935,10 @@ fn finalize_aggressive_recovery(
                     }) =>
         {
             let (parts, body) = response.into_parts();
+            let period_limit_only = matches!(
+                parts.status,
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            );
             let expected_bytes = http_body::Body::size_hint(&body).exact().or_else(|| {
                 parts
                     .headers
@@ -883,15 +947,20 @@ fn finalize_aggressive_recovery(
                     .and_then(|value| value.parse::<u64>().ok())
             });
             if expected_bytes == Some(0) {
-                // HTTP framing can skip an empty body entirely. Treat an empty
-                // expected JSON response as truncated before handing it to Hyper.
-                observe_captured_recovery_json(&[], false, &context);
+                // HTTP framing can skip an empty body. Observe this before
+                // handing the response to Hyper.
+                observe_captured_recovery_json(&[], false, &context, period_limit_only);
                 return Ok(axum::response::Response::from_parts(parts, body));
             }
             let stream = body
                 .into_data_stream()
                 .map(|item| item.map_err(std::io::Error::other));
-            let stream = observe_aggressive_json_recovery(stream, context, expected_bytes);
+            let stream = observe_aggressive_json_recovery(
+                stream,
+                context,
+                expected_bytes,
+                period_limit_only,
+            );
             Ok(axum::response::Response::from_parts(
                 parts,
                 axum::body::Body::from_stream(stream),
@@ -905,6 +974,21 @@ fn finalize_aggressive_recovery(
             handle_recovery_forward_error(context, &error, "response_processing_failed");
             Err(error)
         }
+    }
+}
+
+fn observe_forwarded_usage_limit(
+    recovery_context: &mut Option<TurnRecoveryContext>,
+    status: StatusCode,
+    bytes: &[u8],
+) {
+    if bytes.len() <= MAX_RECOVERY_JSON_BYTES
+        && recovery_context
+            .as_ref()
+            .is_some_and(|context| observe_recovery_forward_response(context, status, bytes))
+    {
+        // The upstream terminal decision supersedes the client-facing observer.
+        *recovery_context = None;
     }
 }
 
@@ -1109,11 +1193,7 @@ async fn handle_messages_for_app(
     let uri = parts.uri;
     let headers = parts.headers;
     let mut extensions = parts.extensions;
-    let body_bytes = body
-        .collect()
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
-        .to_bytes();
+    let body_bytes = collect_request_body(body).await?;
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
     let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
@@ -1665,6 +1745,14 @@ fn decode_codex_request_body(
     headers: &mut axum::http::HeaderMap,
     body_bytes: Bytes,
 ) -> Result<Bytes, ProxyError> {
+    decode_codex_request_body_with_limit(headers, body_bytes, MAX_REQUEST_BODY_BYTES)
+}
+
+fn decode_codex_request_body_with_limit(
+    headers: &mut axum::http::HeaderMap,
+    body_bytes: Bytes,
+    max_decoded_bytes: usize,
+) -> Result<Bytes, ProxyError> {
     let Some(encoding) = get_content_encoding(headers) else {
         return Ok(body_bytes);
     };
@@ -1676,7 +1764,7 @@ fn decode_codex_request_body(
     }
 
     log::debug!("[Codex] 解压请求体: content-encoding={encoding}");
-    let decompressed = match decompress_body(&encoding, &body_bytes) {
+    let decompressed = match decompress_body_with_limit(&encoding, &body_bytes, max_decoded_bytes) {
         Ok(Some(decompressed)) => decompressed,
         // is_supported_content_encoding 已确保编码受支持，正常不会返回 None；
         // 防御性兜底：宁可报错，也不能把压缩字节当 JSON 透传下去。
@@ -1745,11 +1833,7 @@ pub async fn handle_chat_completions(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let mut extensions = parts.extensions;
-    let body_bytes = req_body
-        .collect()
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
-        .to_bytes();
+    let body_bytes = collect_request_body(req_body).await?;
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
     let mut body: Value = serde_json::from_slice(&body_bytes)
@@ -1988,11 +2072,7 @@ pub async fn handle_image_generations(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let mut extensions = parts.extensions;
-    let body_bytes = req_body
-        .collect()
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
-        .to_bytes();
+    let body_bytes = collect_request_body(req_body).await?;
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
     let body: Value = serde_json::from_slice(&body_bytes)
@@ -2121,35 +2201,17 @@ fn resolve_codex_image_generation_provider(
     if !codex_provider_has_routing_config(provider) {
         return Ok(None);
     }
+    if codex_provider_has_v2_routing(provider) {
+        return resolve_codex_v2_image_generation_provider(state, provider, body);
+    }
 
     let request_model = body
         .get("model")
         .and_then(|value| value.as_str())
         .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(ToString::to_string);
-    for model in codex_image_generation_route_probe_models(state, provider, body)? {
-        let mut probe_body = body.clone();
-        probe_body["model"] = json!(model);
-        let v2_routing = codex_provider_has_v2_routing(provider);
-        if let Some(candidate) =
-            resolve_codex_v2_runtime_provider_from_db(state, provider, &probe_body, None)?
-        {
-            if provider_is_codex_image_generation_oauth_target(&candidate) {
-                return prepare_codex_image_generation_provider(candidate, body).map(Some);
-            }
-            if request_model
-                .as_deref()
-                .is_some_and(|request_model| request_model.eq_ignore_ascii_case(&model))
-                && codex_route_provider_matched_request_model(&candidate)
-            {
-                return Ok(None);
-            }
-            continue;
-        }
-        if v2_routing {
-            continue;
-        }
+        .filter(|model| !model.is_empty());
+    for model in codex_image_generation_route_probe_models(provider, request_model) {
+        let probe_body = json!({"model": model});
         let Some(route_provider) =
             super::providers::resolve_codex_model_routed_provider(provider, &probe_body)
         else {
@@ -2159,9 +2221,7 @@ fn resolve_codex_image_generation_provider(
         if provider_is_codex_image_generation_oauth_target(&candidate) {
             return prepare_codex_image_generation_provider(candidate, body).map(Some);
         }
-        if request_model
-            .as_deref()
-            .is_some_and(|request_model| request_model.eq_ignore_ascii_case(&model))
+        if request_model.is_some_and(|request_model| request_model.eq_ignore_ascii_case(&model))
             && codex_route_provider_matched_request_model(&candidate)
         {
             // 用户显式把 gpt-image-* 这类图片模型路由到非官方 Images API 时，保留
@@ -2173,44 +2233,66 @@ fn resolve_codex_image_generation_provider(
     resolve_codex_image_generation_official_route_by_identity(state, provider, body)
 }
 
+fn resolve_codex_v2_image_generation_provider(
+    state: &ProxyState,
+    provider: &crate::provider::Provider,
+    body: &Value,
+) -> Result<Option<crate::provider::Provider>, ProxyError> {
+    let Some(plan) = state.provider_router.codex_v2_route_plan(provider)? else {
+        return Ok(None);
+    };
+    if let Some(resolved) = plan.resolve(provider, body, None)? {
+        let candidate = resolved.into_effective_provider();
+        return provider_is_codex_image_generation_oauth_target(&candidate)
+            .then(|| prepare_codex_image_generation_provider(candidate, body))
+            .transpose();
+    }
+
+    // Keep the catalog's model order when selecting a textual probe. The
+    // official auth decision belongs to the route and is shared by all its models.
+    let mut checked_routes = std::collections::HashSet::new();
+    for model in &plan.index.compiled.model_catalog {
+        if !model_looks_like_openai_codex_route(&model.visible_model)
+            || !checked_routes.insert(model.route_id.as_str())
+        {
+            continue;
+        }
+        let probe_body = json!({"model": model.visible_model});
+        if let Some(resolved) = plan.resolve(provider, &probe_body, None)? {
+            let candidate = resolved.into_effective_provider();
+            if provider_is_codex_image_generation_oauth_target(&candidate) {
+                return prepare_codex_image_generation_provider(candidate, body).map(Some);
+            }
+        }
+    }
+
+    // A native image route can be usable even without a matching text model.
+    // Resolve its identity from the same plan so route auth and exclusions apply.
+    for route in &plan.index.compiled.routes {
+        if !route.enabled || checked_routes.contains(route.id.as_str()) {
+            continue;
+        }
+        if let Some(resolved) = plan.resolve(provider, &Value::Null, Some(&route.id))? {
+            let mut candidate = resolved.into_effective_provider();
+            if provider_is_codex_image_generation_oauth_target(&candidate) {
+                candidate.settings_config["codexResolvedRouteMatched"] = Value::Bool(false);
+                return prepare_codex_image_generation_provider(candidate, body).map(Some);
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn resolve_codex_v2_runtime_provider_from_db(
     state: &ProxyState,
     provider: &crate::provider::Provider,
     body: &Value,
     explicit_route_id: Option<&str>,
 ) -> Result<Option<crate::provider::Provider>, ProxyError> {
-    if provider
-        .settings_config
-        .pointer("/codexRouting/schemaVersion")
-        .and_then(Value::as_u64)
-        != Some(2)
-    {
-        return Ok(None);
-    }
-    let providers = state
-        .db
-        .get_all_providers("codex")
-        .map_err(|error| ProxyError::DatabaseError(error.to_string()))?
-        .into_iter()
-        .collect::<std::collections::HashMap<_, _>>();
-    let resolved = if explicit_route_id.is_some() {
-        super::providers::resolve_codex_v2_raw_passthrough_provider(
-            provider,
-            body,
-            &providers,
-            explicit_route_id,
-        )
-    } else {
-        super::providers::resolve_codex_v2_routed_provider(provider, body, &providers)
-    };
-    resolved
+    state
+        .provider_router
+        .resolve_codex_v2_route(provider, body, explicit_route_id)
         .map(|resolved| resolved.map(super::providers::ResolvedCodexRoute::into_effective_provider))
-        .map_err(|error| {
-            ProxyError::ConfigError(format!(
-                "Codex MultiRouter v2 编译失败 [{}]: {}",
-                error.code, error.message
-            ))
-        })
 }
 
 /// 判断 provider 是否显式包含 Codex router 配置。
@@ -2240,51 +2322,15 @@ fn codex_provider_has_v2_routing(provider: &crate::provider::Provider) -> bool {
 /// 里匹配 `gpt-5.5` / `gpt-5.4` 等文本模型；因此先尝试真实请求模型，再从
 /// catalog 和一组稳定 OpenAI/Codex 模型名里探测 official route。
 fn codex_image_generation_route_probe_models(
-    state: &ProxyState,
     provider: &crate::provider::Provider,
-    body: &Value,
-) -> Result<Vec<String>, ProxyError> {
-    let mut models = Vec::new();
-    if let Some(model) = body.get("model").and_then(|value| value.as_str()) {
-        push_unique_probe_model(&mut models, model);
-    }
-
-    if codex_provider_has_v2_routing(provider) {
-        let providers = state
-            .db
-            .get_all_providers("codex")
-            .map_err(|error| ProxyError::DatabaseError(error.to_string()))?
-            .into_iter()
-            .collect::<std::collections::HashMap<_, _>>();
-        let compiled = crate::codex_multirouter::compiler::compile_provider_v2(
-            provider, &providers,
-        )
-        .map_err(|error| {
-            ProxyError::ConfigError(format!(
-                "Codex MultiRouter v2 compile failed [{}]: {}",
-                error.code, error.message
-            ))
-        })?;
-        if let Some((_, compiled)) = compiled {
-            for model in compiled.visible_models {
-                if model_looks_like_openai_codex_route(&model) {
-                    push_unique_probe_model(&mut models, &model);
-                }
-            }
-        }
-    } else if let Some(entries) =
-        crate::codex_multirouter::catalog::catalog_models(&provider.settings_config)
-    {
-        for entry in entries {
-            if let Some(model) = codex_catalog_model_id(entry) {
-                if model_looks_like_openai_codex_route(&model) {
-                    push_unique_probe_model(&mut models, &model);
-                }
-            }
-        }
-    }
-
-    for model in [
+    request_model: Option<&str>,
+) -> Vec<String> {
+    let catalog = crate::codex_multirouter::catalog::provider_catalog_models(provider)
+        .into_iter()
+        .flatten()
+        .filter_map(codex_catalog_model_id)
+        .filter(|model| model_looks_like_openai_codex_route(model));
+    let fallback = [
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -2292,20 +2338,15 @@ fn codex_image_generation_route_probe_models(
         "gpt-5.4",
         "gpt-5.4-mini",
         "gpt-5.3-codex-spark",
-    ] {
-        push_unique_probe_model(&mut models, model);
-    }
-
-    Ok(models)
-}
-
-/// 向探测列表追加非空且不重复的模型名。
-fn push_unique_probe_model(models: &mut Vec<String>, model: &str) {
-    let model = model.trim();
-    if model.is_empty() || models.iter().any(|item| item.eq_ignore_ascii_case(model)) {
-        return;
-    }
-    models.push(model.to_string());
+    ];
+    let mut seen = std::collections::HashSet::new();
+    request_model
+        .into_iter()
+        .map(str::to_string)
+        .chain(catalog)
+        .chain(fallback.into_iter().map(str::to_string))
+        .filter(|model| seen.insert(model.to_ascii_lowercase()))
+        .collect()
 }
 
 /// 粗略识别 OpenAI/Codex 文本 route 名称，避免用 Qwen/DeepSeek route 误探测 official。
@@ -2367,12 +2408,6 @@ fn resolve_codex_image_generation_official_route_by_identity(
         let mut route_provider =
             super::providers::build_codex_route_probe_provider(provider, route, None);
         if let Some(settings) = route_provider.settings_config.as_object_mut() {
-            if codex_provider_has_v2_routing(provider) {
-                // This legacy probe builder carries a router catalog snapshot.
-                // V2 image policy must follow the current target catalog instead.
-                settings.remove("modelCatalog");
-                settings.remove("model_catalog");
-            }
             // 这里是 endpoint 专属兜底，不是请求模型真实命中该 route。把 matched
             // 标成 false，便于日志和后续转换区分“图片原生能力回官方”和普通模型匹配。
             settings.insert("codexResolvedRouteMatched".to_string(), json!(false));
@@ -2458,9 +2493,8 @@ fn prepare_codex_image_generation_provider(
     body: &Value,
 ) -> Result<crate::provider::Provider, ProxyError> {
     codex_image_generation_catalog_entry(&provider, body)?;
-    if let Some(mut settings) = provider.settings_config.as_object().cloned() {
+    if let Some(settings) = provider.settings_config.as_object_mut() {
         settings.remove("codexResolvedUpstreamModelOverride");
-        provider.settings_config = Value::Object(settings);
     }
     Ok(provider)
 }
@@ -2469,10 +2503,10 @@ fn codex_image_generation_catalog_entry<'a>(
     provider: &'a crate::provider::Provider,
     body: &Value,
 ) -> Result<Option<&'a Value>, ProxyError> {
-    use crate::codex_multirouter::catalog::{lookup_catalog_model, CatalogModelLookup};
+    use crate::codex_multirouter::catalog::{lookup_provider_catalog_model, CatalogModelLookup};
 
     if let Some(model) = body.get("model").and_then(Value::as_str) {
-        match lookup_catalog_model(&provider.settings_config, model) {
+        match lookup_provider_catalog_model(provider, model) {
             CatalogModelLookup::Found(entry)
                 if entry.get("enabled").and_then(Value::as_bool) == Some(false) =>
             {
@@ -2914,13 +2948,23 @@ fn external_openai_api_models_response(
             if profile.app_type.as_deref() == Some("codex")
                 && codex_provider_has_v2_routing(&provider)
             {
-                external_codex_router_model_entries(state, profile)?
+                external_codex_router_model_entries(state, &provider, profile)?
             } else {
                 external_provider_model_entries(&provider, profile)
             }
         }
         ExternalOpenAiApiBackendType::CodexRouterRoute => {
-            external_codex_router_model_entries(state, profile)?
+            let provider = profile
+                .provider_id
+                .as_deref()
+                .map(|id| state.db.get_provider_by_id(id, AppType::Codex.as_str()))
+                .transpose()
+                .map_err(|error| ProxyError::DatabaseError(error.to_string()))?
+                .flatten();
+            match provider {
+                Some(provider) => external_codex_router_model_entries(state, &provider, profile)?,
+                None => Vec::new(),
+            }
         }
     };
     Ok(json!({
@@ -2945,11 +2989,10 @@ fn resolve_external_provider_source(
     let Some(provider_id) = profile.provider_id.as_deref() else {
         return Ok(None);
     };
-    let providers = state
+    state
         .db
-        .get_all_providers(app_type)
-        .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
-    Ok(providers.get(provider_id).cloned())
+        .get_provider_by_id(provider_id, app_type)
+        .map_err(|error| ProxyError::DatabaseError(error.to_string()))
 }
 
 /// 从普通 provider 配置中提取可展示模型。
@@ -2959,25 +3002,26 @@ fn external_provider_model_entries(
 ) -> Vec<Value> {
     let mut ids = Vec::new();
     let mut entries = Vec::new();
-    let catalog_models = crate::codex_multirouter::catalog::read_catalog(&provider.settings_config)
+    let catalog_models = crate::codex_multirouter::catalog::read_provider_catalog(provider)
         .and_then(|catalog| catalog.get("models"));
+    let project = provider_model_projection(provider);
     // 官方 OAuth provider 的目录由前端通过专用 Codex 模型接口持久化；这里只读取
     // provider/profile 的真实数据，避免无条件混入与账号权限无关的旧静态模型。
     if catalog_models.is_some() {
         collect_string_array(&mut ids, catalog_models);
-        collect_model_objects(&mut entries, catalog_models, Some(provider));
+        collect_model_objects(&mut entries, catalog_models, &project);
     } else {
         collect_string_array(&mut ids, provider.settings_config.get("models"));
         collect_string_array(&mut ids, provider.settings_config.get("modelList"));
         collect_model_objects(
             &mut entries,
             provider.settings_config.get("models"),
-            Some(provider),
+            &project,
         );
         collect_model_objects(
             &mut entries,
             provider.settings_config.get("modelList"),
-            Some(provider),
+            &project,
         );
         if let Some(model) = provider
             .settings_config
@@ -2996,70 +3040,26 @@ fn external_provider_model_entries(
     entries.extend(
         ids.into_iter()
             .filter(|id| !id.trim().is_empty())
-            .map(|id| openai_model_entry_for_provider(&id, "cc-switch", &Value::Null, provider)),
+            .filter_map(|id| project(&id, &Value::Null)),
     );
-    retain_included_provider_catalog_entries(provider, &mut entries);
     dedup_openai_model_entries(entries)
-}
-
-/// Apply the same canonical inventory admission to ordinary and legacy-router
-/// model lists. An unloaded/unknown catalog is not an authoritative empty one.
-fn retain_included_provider_catalog_entries(
-    provider: &crate::provider::Provider,
-    entries: &mut Vec<Value>,
-) {
-    if crate::codex_multirouter::catalog::read_catalog(&provider.settings_config).is_none() {
-        return;
-    }
-    entries.retain(|entry| {
-        let Some(id) = entry.get("id").and_then(Value::as_str) else {
-            return false;
-        };
-        matches!(
-            crate::codex_multirouter::catalog::lookup_catalog_model(
-                &provider.settings_config, id,
-            ),
-            crate::codex_multirouter::catalog::CatalogModelLookup::Found(row)
-                if row.get("enabled").and_then(Value::as_bool) != Some(false)
-        )
-    });
 }
 
 /// 从 Codex router route 中提取可展示模型。
 fn external_codex_router_model_entries(
     state: &ProxyState,
+    provider: &crate::provider::Provider,
     profile: &ExternalOpenAiApiProfile,
 ) -> Result<Vec<Value>, ProxyError> {
-    let Some(provider_id) = profile.provider_id.as_deref() else {
-        return Ok(Vec::new());
-    };
-    let providers = state
-        .db
-        .get_all_providers("codex")
-        .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
-    let Some(provider) = providers.get(provider_id) else {
-        return Ok(Vec::new());
-    };
     if codex_provider_has_v2_routing(provider) {
-        let providers = providers
-            .iter()
-            .map(|(id, provider)| (id.clone(), provider.clone()))
-            .collect::<std::collections::HashMap<_, _>>();
-        let compiled = crate::codex_multirouter::compiler::compile_provider_v2(
-            provider, &providers,
-        )
-        .map_err(|error| {
-            ProxyError::ConfigError(format!(
-                "Codex MultiRouter v2 compile failed [{}]: {}",
-                error.code, error.message
-            ))
-        })?;
-        let Some((_, compiled)) = compiled else {
+        let Some(plan) = state.provider_router.codex_v2_route_plan(provider)? else {
             return Ok(Vec::new());
         };
-        let entries = compiled
+        let entries = plan
+            .index
+            .compiled
             .model_catalog
-            .into_iter()
+            .iter()
             .filter(|model| {
                 profile
                     .route_id
@@ -3078,8 +3078,8 @@ fn external_codex_router_model_entries(
                         json!(model.capability_summary.input_modalities),
                     );
                 }
-                if let Some(reasoning) = model.capability_summary.reasoning {
-                    source.insert("reasoning".to_string(), reasoning);
+                if let Some(reasoning) = &model.capability_summary.reasoning {
+                    source.insert("reasoning".to_string(), reasoning.clone());
                 }
                 if let Some(supported) = model.capability_summary.supports_parallel_tool_calls {
                     source.insert("supportsParallelToolCalls".to_string(), json!(supported));
@@ -3095,9 +3095,10 @@ fn external_codex_router_model_entries(
     }
     let mut ids = Vec::new();
     let mut entries = Vec::new();
-    let catalog_models = crate::codex_multirouter::catalog::read_catalog(&provider.settings_config)
+    let catalog_models = crate::codex_multirouter::catalog::read_provider_catalog(provider)
         .and_then(|catalog| catalog.get("models"));
     let catalog_sources = collect_model_sources_by_id(catalog_models);
+    let project = provider_model_projection(provider);
     if let Some(routes) = provider
         .settings_config
         .pointer("/codexRouting/routes")
@@ -3112,17 +3113,18 @@ fn external_codex_router_model_entries(
             {
                 continue;
             }
+            let route_ids_start = ids.len();
             collect_string_array(&mut ids, route.pointer("/match/models"));
             collect_string_array(&mut ids, route.get("models"));
             collect_string_array(&mut ids, route.pointer("/modelSelection/models"));
-            collect_model_objects(&mut entries, route.pointer("/match/models"), Some(provider));
-            collect_model_objects(&mut entries, route.get("models"), Some(provider));
+            collect_model_objects(&mut entries, route.pointer("/match/models"), &project);
+            collect_model_objects(&mut entries, route.get("models"), &project);
             collect_model_objects(
                 &mut entries,
                 route.pointer("/modelSelection/models"),
-                Some(provider),
+                &project,
             );
-            if ids.is_empty() {
+            if ids.len() == route_ids_start {
                 collect_string_array(&mut ids, route.pointer("/match/prefixes"));
                 collect_string_array(&mut ids, route.get("matchPrefixes"));
                 collect_string_array(&mut ids, route.get("match_prefixes"));
@@ -3137,12 +3139,14 @@ fn external_codex_router_model_entries(
     entries.extend(
         ids.into_iter()
             .filter(|id| !id.trim().is_empty())
-            .map(|id| {
-                let source = catalog_sources.get(id.as_str()).unwrap_or(&Value::Null);
-                openai_model_entry_for_provider(&id, "cc-switch", source, provider)
+            .filter_map(|id| {
+                let source = catalog_sources
+                    .get(id.as_str())
+                    .copied()
+                    .unwrap_or(&Value::Null);
+                project(&id, source)
             }),
     );
-    retain_included_provider_catalog_entries(provider, &mut entries);
     Ok(dedup_openai_model_entries(entries))
 }
 
@@ -3161,7 +3165,7 @@ fn collect_string_array(ids: &mut Vec<String>, value: Option<&Value>) {
 fn collect_model_objects(
     entries: &mut Vec<Value>,
     value: Option<&Value>,
-    provider: Option<&crate::provider::Provider>,
+    project: impl Fn(&str, &Value) -> Option<Value>,
 ) {
     if let Some(values) = value.and_then(|value| value.as_array()) {
         for value in values {
@@ -3174,28 +3178,21 @@ fn collect_model_objects(
                     .and_then(Value::as_str)
                     .map(str::to_string)
             }) {
-                entries.push(match provider {
-                    Some(provider) => {
-                        openai_model_entry_for_provider(&id, "cc-switch", value, provider)
-                    }
-                    // These sources are already compiled catalog projections,
-                    // not raw persisted provider metadata.
-                    None => openai_model_entry_with_source(&id, "cc-switch", value),
-                });
+                entries.extend(project(&id, value));
             }
         }
     }
 }
 
 /// 按模型 id 建立 catalog 对象索引，供 route 只有字符串 match 时回填上下文窗口。
-fn collect_model_sources_by_id(value: Option<&Value>) -> std::collections::HashMap<String, Value> {
+fn collect_model_sources_by_id(value: Option<&Value>) -> std::collections::HashMap<String, &Value> {
     let mut sources = std::collections::HashMap::new();
     if let Some(values) = value.and_then(|value| value.as_array()) {
         for value in values {
             let Some(id) = codex_catalog_model_id(value) else {
                 continue;
             };
-            sources.entry(id).or_insert_with(|| value.clone());
+            sources.entry(id).or_insert(value);
         }
     }
     sources
@@ -3211,17 +3208,51 @@ fn openai_model_entry(id: &str, owner: &str) -> Value {
     })
 }
 
-/// 根据 catalog/source 对象构造 OpenAI model entry，透传明确的上下文窗口与显示名字段。
-fn openai_model_entry_for_provider(
-    id: &str,
-    owner: &str,
-    source: &Value,
+/// Admit and resolve model entries through the same catalog index for the entire listing.
+fn provider_model_projection(
     provider: &crate::provider::Provider,
-) -> Value {
-    let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_for_model_source(
-        provider, id, source,
-    );
-    openai_model_entry_with_reasoning_source(id, owner, source, resolved.capability)
+) -> impl Fn(&str, &Value) -> Option<Value> + '_ {
+    use crate::codex_multirouter::catalog::{
+        provider_catalog_models, CatalogModelIndex, CatalogModelLookup,
+    };
+    use crate::reasoning_capabilities::{
+        catalog::global_library, provider_metadata::detect_platform,
+        resolve_codex_model_capability_for_indexed_provider,
+        resolve_codex_model_capability_for_model_source,
+    };
+
+    let index =
+        provider_catalog_models(provider).map(|_| CatalogModelIndex::for_provider(provider));
+    let platform = detect_platform(provider);
+    let library = std::cell::OnceCell::new();
+    let official_models = std::cell::OnceCell::new();
+    move |id, source| {
+        let resolved = if let Some(index) = &index {
+            match index.lookup(id) {
+                CatalogModelLookup::Found(row)
+                    if row.get("enabled").and_then(Value::as_bool) != Some(false) => {}
+                _ => return None,
+            }
+            resolve_codex_model_capability_for_indexed_provider(
+                provider,
+                index,
+                platform,
+                id,
+                library.get_or_init(global_library).as_deref(),
+                official_models.get_or_init(|| {
+                    crate::codex_config::codex_official_models_snapshot().unwrap_or_default()
+                }),
+            )
+        } else {
+            resolve_codex_model_capability_for_model_source(provider, id, source)
+        };
+        Some(openai_model_entry_with_reasoning_source(
+            id,
+            "cc-switch",
+            source,
+            resolved.capability,
+        ))
+    }
 }
 
 /// Serialize an already-compiled catalog projection without reinterpreting its
@@ -3714,29 +3745,115 @@ fn rebuilt_codex_responses_stream(
     super::hyper_client::ProxyResponse::streamed(status, headers, stream)
 }
 
-#[cfg(test)]
-thread_local! {
-    static MESSAGES_HISTORY_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 fn codex_messages_history_request(
     provider: &crate::provider::Provider,
     endpoint: &str,
-    original_request: &[u8],
-) -> Result<Option<Value>, ProxyError> {
+    mut original_request: Value,
+) -> Option<Value> {
     if !super::providers::should_convert_codex_responses_to_messages(provider, endpoint) {
-        return Ok(None);
+        return None;
     }
-    // Only the winning Messages route records request input. These decoded
-    // bytes precede any role overrides or per-provider request transforms.
-    #[cfg(test)]
-    MESSAGES_HISTORY_PARSES.with(|count| count.set(count.get() + 1));
-    let mut request: Value = serde_json::from_slice(original_request)
-        .map_err(|e| ProxyError::Internal(format!("Failed to read request history input: {e}")))?;
-    if let Some(fields) = request.as_object_mut() {
+    // Only the winning Messages route needs the client's input. Keep its
+    // existing allocation and discard the rest of the original request.
+    if let Some(fields) = original_request.as_object_mut() {
         fields.retain(|key, _| key == "input");
     }
-    Ok(Some(request))
+    Some(original_request)
+}
+
+async fn handle_codex_messages_responses(
+    upstream: CodexTransformUpstream,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    request_is_streaming: bool,
+    connection_guard: Option<ActiveConnectionGuard>,
+    request: Value,
+) -> Result<axum::response::Response, ProxyError> {
+    let CodexTransformUpstream {
+        response,
+        stream_reconnect,
+    } = upstream;
+    let is_sse = response.is_sse();
+    if !request_is_streaming && !is_sse {
+        return handle_non_streaming_with_history(
+            response,
+            ctx,
+            state,
+            &CODEX_PARSER_CONFIG,
+            connection_guard,
+            Some((state.codex_chat_history.as_ref(), &request)),
+        )
+        .await;
+    }
+
+    let status = response.status();
+    let headers = response.headers().clone();
+    let usage = is_sse
+        .then(|| create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG))
+        .flatten();
+    let frames = create_resilient_responses_sse_frames(
+        Box::pin(response.bytes_stream()),
+        stream_reconnect,
+        Some(StreamLogContext {
+            request_trace: ctx.request_health_trace.clone(),
+            session_id: ctx.session_id.clone(),
+            model: ctx
+                .outbound_model
+                .clone()
+                .unwrap_or_else(|| ctx.request_model.clone()),
+            provider_id: ctx.provider.id.clone(),
+        }),
+        ctx.app_config.capacity_retry_enabled,
+        usage.is_some(),
+    );
+    let history = state.codex_chat_history.clone();
+    let stream = observe_codex_messages_responses(frames, history, request, usage.clone());
+    if !is_sse {
+        return process_response(
+            rebuilt_codex_responses_stream(status, headers, stream),
+            ctx,
+            state,
+            &CODEX_PARSER_CONFIG,
+            connection_guard,
+        )
+        .await;
+    }
+    let stream = create_logged_preparsed_sse_stream(
+        stream,
+        ctx.tag,
+        usage,
+        ctx.streaming_timeout_config(),
+        connection_guard,
+    );
+    Ok(build_streaming_response(status, headers, ctx.tag, stream))
+}
+
+fn observe_codex_messages_responses(
+    frames: impl futures::Stream<Item = Result<NativeResponsesFrame, std::io::Error>> + Send + 'static,
+    history: std::sync::Arc<super::providers::codex_chat_history::CodexChatHistoryStore>,
+    request: Value,
+    usage: Option<SseUsageCollector>,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    async_stream::stream! {
+        let mut current_response_id = None;
+        futures::pin_mut!(frames);
+        while let Some(result) = frames.next().await {
+            match result {
+                Ok(NativeResponsesFrame { bytes, payload, collect_usage }) => {
+                    if let Some(payload) = payload {
+                        record_responses_sse_event(
+                            &payload, &mut current_response_id, history.as_ref(), &request,
+                        ).await;
+                        if let Some(collector) = usage.as_ref().filter(|_| collect_usage) {
+                            collector.push(payload).await;
+                        }
+                    }
+                    yield Ok(bytes);
+                }
+                Err(error) => yield Err(error),
+            }
+        }
+    }
 }
 
 pub async fn handle_grokbuild_responses(
@@ -3773,11 +3890,7 @@ async fn handle_responses_for_app(
         super::codex_router_log::append_event("request_classified", &fields);
     }
 
-    let body_bytes = req_body
-        .collect()
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
-        .to_bytes();
+    let body_bytes = collect_request_body(req_body).await?;
     let body_bytes = decode_and_record_codex_inbound_encoding(
         &app_type,
         &mut headers,
@@ -3787,6 +3900,7 @@ async fn handle_responses_for_app(
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
     let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+    drop(body_bytes);
     let desktop_reasoning = app_type == AppType::Codex
         && super::providers::is_codex_desktop_reasoning_client(
             &headers,
@@ -3956,9 +4070,8 @@ async fn handle_responses_for_app(
         }
     };
     let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
-    // Captured before `body` is moved into the forwarder: the flat-name →
-    // {namespace, name} map used to restore the native Responses upstream's
-    // function-call names (see the namespace-restore dispatch below).
+    // Flat-name → {namespace, name} map used to restore the native
+    // Responses upstream's function-call names.
     let namespace_restore_map = transform_codex_responses_namespace::namespace_restore_map(&body);
     if let Some(context) = recovery_context.as_mut() {
         context.session_id = ctx.session_id.clone();
@@ -3968,11 +4081,11 @@ async fn handle_responses_for_app(
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
-        .forward_with_retry(
+        .forward_with_retry_body(
             &app_type,
             method,
             &endpoint,
-            body,
+            std::borrow::Cow::Borrowed(&body),
             headers,
             extensions,
             ctx.get_providers(),
@@ -4003,6 +4116,20 @@ async fn handle_responses_for_app(
             .unwrap_or_else(|| ctx.request_model.clone());
         context.provider_id = ctx.provider.id.clone();
     }
+    let response = if recovery_context.is_some()
+        && matches!(
+            response.status(),
+            StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+        )
+        && !response.is_sse()
+    {
+        let (response_headers, status, body_bytes) =
+            read_decoded_body(response, ctx.tag, std::time::Duration::ZERO).await?;
+        observe_forwarded_usage_limit(&mut recovery_context, status, &body_bytes);
+        super::hyper_client::ProxyResponse::buffered(status, response_headers, body_bytes)
+    } else {
+        response
+    };
     let response_result = async {
         let desktop_reasoning_mapping = desktop_reasoning
             && super::providers::resolve_codex_native_responses_reasoning_projection(
@@ -4030,48 +4157,18 @@ async fn handle_responses_for_app(
         }
 
         if let Some(request_body_for_history) =
-            codex_messages_history_request(&ctx.provider, &endpoint, &body_bytes)?
+            codex_messages_history_request(&ctx.provider, &endpoint, body)
         {
-            let rebuilt = if is_stream || response.is_sse() {
-                let status = response.status();
-                let response_headers = response.headers().clone();
-                let stream = create_resilient_responses_sse_stream_with_context(
-                    Box::pin(response.bytes_stream()),
+            return handle_codex_messages_responses(
+                CodexTransformUpstream {
+                    response,
                     stream_reconnect,
-                    Some(StreamLogContext {
-                        request_trace: ctx.request_health_trace.clone(),
-                        session_id: ctx.session_id.clone(),
-                        model: ctx
-                            .outbound_model
-                            .clone()
-                            .unwrap_or_else(|| ctx.request_model.clone()),
-                        provider_id: ctx.provider.id.clone(),
-                    }),
-                    ctx.app_config.capacity_retry_enabled,
-                );
-                let stream = record_responses_sse_stream_with_request(
-                    stream,
-                    state.codex_chat_history.clone(),
-                    request_body_for_history,
-                );
-                rebuilt_codex_responses_stream(status, response_headers, stream)
-            } else {
-                let (response_headers, status, body_bytes) =
-                    read_decoded_body(response, ctx.tag, std::time::Duration::ZERO).await?;
-                if let Ok(resp_json) = serde_json::from_slice::<Value>(&body_bytes) {
-                    state
-                        .codex_chat_history
-                        .record_exchange(&request_body_for_history, &resp_json)
-                        .await;
-                }
-                super::hyper_client::ProxyResponse::buffered(status, response_headers, body_bytes)
-            };
-            return process_response(
-                rebuilt,
+                },
                 &ctx,
                 &state,
-                &CODEX_PARSER_CONFIG,
+                is_stream,
                 connection_guard,
+                request_body_for_history,
             )
             .await;
         }
@@ -4227,11 +4324,7 @@ pub async fn handle_alpha_search(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let mut extensions = parts.extensions;
-    let body_bytes = req_body
-        .collect()
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
-        .to_bytes();
+    let body_bytes = collect_request_body(req_body).await?;
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
     let body: Value = serde_json::from_slice(&body_bytes)
@@ -4300,11 +4393,7 @@ async fn handle_responses_compact_for_app(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let mut extensions = parts.extensions;
-    let body_bytes = req_body
-        .collect()
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
-        .to_bytes();
+    let body_bytes = collect_request_body(req_body).await?;
     let body_bytes = decode_and_record_codex_inbound_encoding(
         &app_type,
         &mut headers,
@@ -4314,6 +4403,7 @@ async fn handle_responses_compact_for_app(
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+    drop(body_bytes);
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
@@ -4330,11 +4420,11 @@ async fn handle_responses_compact_for_app(
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
-        .forward_with_retry(
+        .forward_with_retry_body(
             &app_type,
             method,
             &endpoint,
-            body,
+            std::borrow::Cow::Borrowed(&body),
             headers,
             extensions,
             ctx.get_providers(),
@@ -4372,48 +4462,18 @@ async fn handle_responses_compact_for_app(
     }
 
     if let Some(request_body_for_history) =
-        codex_messages_history_request(&ctx.provider, &endpoint, &body_bytes)?
+        codex_messages_history_request(&ctx.provider, &endpoint, body)
     {
-        let rebuilt = if is_stream || response.is_sse() {
-            let status = response.status();
-            let response_headers = response.headers().clone();
-            let stream = create_resilient_responses_sse_stream_with_context(
-                Box::pin(response.bytes_stream()),
+        return handle_codex_messages_responses(
+            CodexTransformUpstream {
+                response,
                 stream_reconnect,
-                Some(StreamLogContext {
-                    request_trace: ctx.request_health_trace.clone(),
-                    session_id: ctx.session_id.clone(),
-                    model: ctx
-                        .outbound_model
-                        .clone()
-                        .unwrap_or_else(|| ctx.request_model.clone()),
-                    provider_id: ctx.provider.id.clone(),
-                }),
-                ctx.app_config.capacity_retry_enabled,
-            );
-            let stream = record_responses_sse_stream_with_request(
-                stream,
-                state.codex_chat_history.clone(),
-                request_body_for_history,
-            );
-            rebuilt_codex_responses_stream(status, response_headers, stream)
-        } else {
-            let (response_headers, status, body_bytes) =
-                read_decoded_body(response, ctx.tag, std::time::Duration::ZERO).await?;
-            if let Ok(resp_json) = serde_json::from_slice::<Value>(&body_bytes) {
-                state
-                    .codex_chat_history
-                    .record_exchange(&request_body_for_history, &resp_json)
-                    .await;
-            }
-            super::hyper_client::ProxyResponse::buffered(status, response_headers, body_bytes)
-        };
-        return process_response(
-            rebuilt,
+            },
             &ctx,
             &state,
-            &CODEX_PARSER_CONFIG,
+            is_stream,
             connection_guard,
+            request_body_for_history,
         )
         .await;
     }
@@ -5893,15 +5953,37 @@ fn codex_proxy_error_json(
 ) -> Value {
     let result_unknown = codex_response_result_unknown(error);
     let image_result_unknown = result_unknown && codex_image_endpoint(endpoint);
-    let (mut body, upstream_status) = match error {
+    let (mut body, upstream_status, upstream_period_limit) = match error {
         ProxyError::UpstreamError { status, body } => {
-            let parsed_body = body
-                .as_deref()
-                .map(|body| serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!(body)));
-            (
-                transform_codex_chat::chat_error_to_response_error(parsed_body.as_ref()),
-                Some(*status),
-            )
+            let parsed_body = body.as_deref().map(terminal_error_payload);
+            let mut projected =
+                transform_codex_chat::chat_error_to_response_error(parsed_body.as_ref());
+            let upstream_period_limit = parsed_body
+                .as_ref()
+                .filter(|_| {
+                    matches!(
+                        endpoint.split('?').next(),
+                        Some("/responses" | "/v1/responses")
+                    )
+                })
+                .map(|payload| {
+                    let period_limit = deferred_usage_limit_period("error", payload).is_some();
+                    let projected_error = &mut projected["error"];
+                    if period_limit
+                        && projected_error["type"] == "upstream_error"
+                        && (projected_error["code"].is_null()
+                            || projected_error["code"] == "usage_limit_reached")
+                    {
+                        // Desktop may only receive the HTTP envelope and this projected body.
+                        projected_error["type"] = json!("usage_limit_reached");
+                        projected_error["code"] = json!("usage_limit_reached");
+                    }
+                    if let Some(retryable) = explicit_retry_decision(payload) {
+                        projected_error["retryable"] = Value::Bool(retryable);
+                    }
+                    period_limit
+                });
+            (projected, Some(*status), upstream_period_limit)
         }
         _ => (
             json!({
@@ -5918,6 +6000,7 @@ fn codex_proxy_error_json(
                     "param": Value::Null,
                 }
             }),
+            None,
             None,
         ),
     };
@@ -6050,6 +6133,14 @@ fn codex_proxy_error_json(
         );
     }
 
+    // The projected error retains only selected provider fields. If a hidden
+    // terminal conflict was lost in that projection, keep the refusal on the
+    // wire so Desktop cannot register the error as a resumable period limit.
+    if upstream_period_limit == Some(false) && deferred_usage_limit_period("error", &body).is_some()
+    {
+        body["error"]["retryable"] = Value::Bool(false);
+    }
+
     body
 }
 
@@ -6110,11 +6201,7 @@ pub async fn handle_gemini(
     let method = parts.method.clone();
     let headers = parts.headers;
     let mut extensions = parts.extensions;
-    let body_bytes = req_body
-        .collect()
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
-        .to_bytes();
+    let body_bytes = collect_request_body(req_body).await?;
     extensions.insert(super::forwarder::ClientRequestBodyBytes(body_bytes.len()));
     // GET 类只读端点（/v1beta/models、/v1beta/models/<model> 等）没有请求体，
     // 不能强制 parse 为 JSON —— 否则空 body 会被拒绝。
@@ -6192,29 +6279,16 @@ async fn responses_sse_stream_to_anthropic_message(
     max_web_search_uses: Option<u64>,
     body_timeout: std::time::Duration,
 ) -> Result<Value, ProxyError> {
-    let collect = async move {
-        let converted = super::providers::streaming_responses::create_anthropic_sse_stream_from_responses_with_web_search_options(
+    let events =
+        super::providers::streaming_responses::create_anthropic_event_stream_from_responses(
             stream,
             hosted_web_search_name,
             max_web_search_uses,
+            MAX_RESPONSE_BODY_BYTES,
         );
-        tokio::pin!(converted);
-        let mut body = Vec::new();
-        while let Some(chunk) = converted.next().await {
-            body.extend_from_slice(&chunk.map_err(|error| {
-                ProxyError::ForwardFailed(format!(
-                    "Failed to transform upstream Responses SSE: {error}"
-                ))
-            })?);
-        }
-        String::from_utf8(body).map_err(|error| {
-            ProxyError::TransformError(format!(
-                "Transformed Anthropic SSE was not valid UTF-8: {error}"
-            ))
-        })
-    };
-    let body = if body_timeout.is_zero() {
-        collect.await?
+    let collect = collect_anthropic_message_with_limit(events, MAX_RESPONSE_BODY_BYTES);
+    if body_timeout.is_zero() {
+        collect.await
     } else {
         tokio::time::timeout(body_timeout, collect)
             .await
@@ -6223,18 +6297,32 @@ async fn responses_sse_stream_to_anthropic_message(
                     "响应体读取超时: {}s（上游发完响应头后 body 未到达）",
                     body_timeout.as_secs()
                 ))
-            })??
-    };
-    transform_codex_anthropic::anthropic_sse_to_message_value(&body)
+            })?
+    }
+}
+
+async fn collect_anthropic_message_with_limit(
+    events: impl futures::Stream<
+        Item = Result<super::providers::streaming_responses::AnthropicStreamEvent, ProxyError>,
+    >,
+    limit: usize,
+) -> Result<Value, ProxyError> {
+    tokio::pin!(events);
+    let mut encoded_size = 0;
+    let mut message = transform_codex_anthropic::AnthropicMessageAccumulator::default();
+    while let Some(event) = events.next().await {
+        message.push_event(event?.into_budgeted_payload(&mut encoded_size, limit)?)?;
+    }
+    message.finish()
 }
 
 /// 把 OpenAI Responses SSE 流聚合成一个完整的 Responses JSON 对象，供下游转成 Anthropic
 /// 非流响应。仅在 Codex OAuth 把 `stream:false` 强制升级为 SSE 的场景下调用。
 ///
-/// 复用 `proxy::sse` 的 `take_sse_block`/`strip_sse_field`：`take_sse_block` 同时支持
+/// 复用 `proxy::sse` 的 `SseBlocks`/`strip_sse_field`：`SseBlocks` 同时支持
 /// `\n\n` 与 `\r\n\r\n` 两种分隔符，`strip_sse_field` 兼容带/不带空格的字段写法。
 pub(crate) fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
-    let mut buffer = body.trim_start_matches('\u{feff}').to_string();
+    let mut blocks = SseBlocks::new(body.trim_start_matches('\u{feff}'));
     let mut completed_response: Option<Value> = None;
     let mut output_items = Vec::new();
     let mut output_text_deltas = Vec::new();
@@ -6311,13 +6399,13 @@ pub(crate) fn responses_sse_to_response_value(body: &str) -> Result<Value, Proxy
         Ok(())
     };
 
-    while let Some(block) = take_sse_block(&mut buffer) {
-        process_block(&block, true)?;
+    for block in blocks.by_ref() {
+        process_block(block, true)?;
     }
     // 最后一个事件后可能没有空行分隔（错标 SSE 兜底/非规范上游常见）：
     // 残余 buffer 当最后一块处理，否则尾部的 response.completed 会被丢掉。
     // 已完成时的跳过判定在闭包内（C8）。
-    process_block(&buffer, false)?;
+    process_block(blocks.remaining(), false)?;
 
     let mut response = completed_response.ok_or_else(|| {
         ProxyError::TransformError("No response.completed event in upstream SSE".to_string())
@@ -6490,7 +6578,7 @@ fn sse_block_parts(block: &str) -> Option<(String, String)> {
 fn chat_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
     // 剥 BOM：嗅探器接受 BOM 开头，但 strip_sse_field 按行首精确匹配，
     // 不剥会让首个 data 行静默丢失
-    let mut buffer = body.trim_start_matches('\u{feff}').to_string();
+    let mut blocks = SseBlocks::new(body.trim_start_matches('\u{feff}'));
 
     let mut id = Value::Null;
     let mut created = Value::Null;
@@ -6658,14 +6746,14 @@ fn chat_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
             Ok(())
         };
 
-    while let Some(block) = take_sse_block(&mut buffer) {
-        if let Some((event, data)) = sse_block_parts(&block) {
+    for block in blocks.by_ref() {
+        if let Some((event, data)) = sse_block_parts(block) {
             process_event(&event, &data, true)?;
         }
     }
     // 最后一个事件后可能没有空行分隔（半截流/非规范上游）：残余 buffer 当最后一块
     // 处理，strict=false 容忍被掐断的尾块（C2）。
-    if let Some((event, data)) = sse_block_parts(&buffer) {
+    if let Some((event, data)) = sse_block_parts(blocks.remaining()) {
         process_event(&event, &data, false)?;
     }
 
@@ -7018,10 +7106,11 @@ mod tests {
         chat_completion_to_response_from_verified_profile, chat_sse_to_response_value,
         classify_body_for_diagnostics, codex_catalog_models_response, codex_proxy_error_json,
         codex_proxy_error_status, codex_request_classification_fields,
+        collect_anthropic_message_with_limit, collect_request_body_with_limit,
         create_codex_chat_sse_stream_from_verified_profile,
-        decode_and_record_codex_inbound_encoding, external_openai_api_models_response,
-        external_openai_api_unsupported_response, is_codex_desktop_request,
-        is_verified_codex_desktop_request, mark_external_openai_headers,
+        decode_and_record_codex_inbound_encoding, decode_codex_request_body_with_limit,
+        external_openai_api_models_response, external_openai_api_unsupported_response,
+        is_codex_desktop_request, is_verified_codex_desktop_request, mark_external_openai_headers,
         request_is_literal_continue, resolve_codex_image_generation_provider,
         resolve_external_codex_router_raw_target, resolve_external_codex_router_target,
         resolve_forward_error_provider_for_logging, resolve_forward_error_route_provider,
@@ -7062,6 +7151,83 @@ mod tests {
     use serde_json::{json, Value};
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn transformed_sse_collection_enforces_response_budget() {
+        use crate::proxy::providers::streaming_responses::{
+            create_anthropic_event_stream_from_responses,
+            create_anthropic_sse_stream_from_responses,
+        };
+
+        let json = Bytes::from_static(
+            br#"{"id":"resp_1","model":"test","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}"#,
+        );
+        let upstream = || {
+            let bytes = json.clone();
+            futures::stream::once(async move { Ok::<_, std::io::Error>(bytes) })
+        };
+        let wire_chunks = create_anthropic_sse_stream_from_responses(upstream())
+            .collect::<Vec<_>>()
+            .await;
+        let wire_size = wire_chunks
+            .iter()
+            .map(|item| item.as_ref().unwrap().len())
+            .sum();
+        let events =
+            || create_anthropic_event_stream_from_responses(upstream(), None, None, wire_size);
+        let message = collect_anthropic_message_with_limit(events(), wire_size)
+            .await
+            .expect("message at the exact transformed SSE budget");
+        assert_eq!(message.pointer("/content/0/text"), Some(&json!("hello")));
+        let wire = wire_chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.unwrap().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            message,
+            super::transform_codex_anthropic::anthropic_sse_to_message_value(
+                std::str::from_utf8(&wire).expect("UTF-8 SSE"),
+            )
+            .unwrap()
+        );
+        let error = collect_anthropic_message_with_limit(events(), wire_size - 1)
+            .await
+            .expect_err("converted SSE must be bounded");
+        assert!(matches!(error, ProxyError::ResponseBodyTooLarge(size) if size == wire_size));
+    }
+
+    #[tokio::test]
+    async fn raw_request_body_collection_rejects_bytes_over_limit() {
+        let body = || {
+            axum::body::Body::from_stream(futures::stream::iter([
+                Ok::<_, std::convert::Infallible>(Bytes::from_static(b"123")),
+                Ok(Bytes::from_static(b"45")),
+            ]))
+        };
+        let accepted = collect_request_body_with_limit(body(), 5).await.unwrap();
+        assert_eq!(accepted, Bytes::from_static(b"12345"));
+        let error = collect_request_body_with_limit(body(), 4)
+            .await
+            .expect_err("body over the raw limit must be rejected");
+        assert!(
+            matches!(error, ProxyError::InvalidRequest(message) if message.contains("size limit"))
+        );
+    }
+
+    #[test]
+    fn compressed_request_body_rejects_expansion_over_limit() {
+        let payload = vec![0u8; 32 * 1024];
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(&payload), 0)
+            .expect("compress request payload");
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("zstd"));
+        let error =
+            decode_codex_request_body_with_limit(&mut headers, Bytes::from(compressed), 1024)
+                .expect_err("decoded request over the limit must be rejected");
+        assert!(
+            matches!(error, ProxyError::InvalidRequest(message) if message.contains("decompress"))
+        );
+    }
 
     #[test]
     fn desktop_recovery_identity_uses_only_matching_turn_metadata() {
@@ -7127,6 +7293,141 @@ mod tests {
     }
 
     #[test]
+    fn forward_daily_limit_records_only_verified_exact_parent_turns() {
+        use crate::proxy::codex_turn_recovery::{
+            mark_turn_completed, proxy_usage_limit_turns, recovery_reserved_for_test, track_turn,
+        };
+
+        let raw = r#"error: code=403 reason="DAILY_LIMIT_EXCEEDED" message="daily usage limit exceeded" metadata=map[]"#;
+        let normalized = r#"{"error":{"type":"usage_limit_reached","code":"usage_limit_reached","message":"Daily usage limit exceeded. The upstream provider's daily Codex allowance is exhausted.","param":null,"upstream_reason":"DAILY_LIMIT_EXCEEDED"}}"#;
+        let typed = r#"{"error":{"code":"usage_limit_reached","message":"The upstream provider's usage limit has been reached."}}"#;
+        let temporary = r#"{"error":{"type":"usage_limit_reached","message":"Usage limit reached. Try again later."}}"#;
+        let forbidden = r#"{"error":{"type":"usage_limit_reached","message":"Permission denied. Usage limit reached. Try again later."}}"#;
+        for (status, error_body, subagent, matching_thread, eligible) in [
+            (403, raw, false, true, true),
+            (429, normalized, false, true, true),
+            (429, typed, false, true, true),
+            (403, temporary, false, true, true),
+            (403, forbidden, false, true, false),
+            (403, raw, true, true, false),
+            (429, normalized, false, false, false),
+        ] {
+            let thread = uuid::Uuid::new_v4().to_string();
+            let turn = uuid::Uuid::new_v4().to_string();
+            let session_header = if matching_thread {
+                thread.clone()
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert("originator", HeaderValue::from_static("Codex Desktop"));
+            headers.insert("session-id", session_header.parse().unwrap());
+            let mut body = json!({"client_metadata": {
+                "x-codex-turn-metadata": {
+                    "thread_id": thread, "turn_id": turn, "request_kind": "turn"
+                }
+            }});
+            if subagent {
+                body["client_metadata"]["x-openai-subagent"] = json!("collab_spawn");
+            }
+
+            let context =
+                super::desktop_recovery_identity(&headers, &body).map(|(thread_id, turn_id)| {
+                    let mut context = final_recovery_context("forward-daily-limit");
+                    context.desktop_thread_id = thread_id;
+                    context.desktop_turn_id = turn_id;
+                    context
+                });
+            let tracking = context.as_ref().map(track_turn);
+            let response = super::finalize_aggressive_recovery(
+                Err(ProxyError::UpstreamError {
+                    status,
+                    body: Some(error_body.into()),
+                }),
+                context,
+            );
+            assert!(
+                matches!(response, Err(ProxyError::UpstreamError { status: actual, .. }) if actual == status)
+            );
+            drop(tracking);
+
+            let candidate = proxy_usage_limit_turns().into_iter().find(|candidate| {
+                candidate.thread_id == thread || candidate.thread_id == session_header
+            });
+            assert_eq!(
+                candidate.map(|candidate| (candidate.thread_id, candidate.turn_id)),
+                eligible.then(|| (thread.clone(), turn))
+            );
+            for thread_id in [&thread, &session_header] {
+                assert!(!recovery_reserved_for_test(thread_id));
+                mark_turn_completed(thread_id);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_usage_limit_survives_final_response_processing() {
+        use crate::proxy::codex_turn_recovery::{
+            mark_turn_completed, proxy_usage_limit_turns, recovery_reserved_for_test, track_turn,
+        };
+
+        for (status, raw, content_type, expected) in [
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"code":"usage_limit_reached","message":"Daily usage limit exceeded."}}"#,
+                "application/json",
+                true,
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                "Weekly usage limit reached.",
+                "text/plain",
+                true,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"code":"usage_limit_reached","message":"Monthly usage limit reached.","retryable":false}}"#,
+                "application/json",
+                false,
+            ),
+        ] {
+            let mut context = final_recovery_context("upstream-before-adapter");
+            let turn = uuid::Uuid::new_v4().to_string();
+            context.desktop_turn_id = Some(turn.clone());
+            let tracking = track_turn(&context);
+            let mut recovery_context = Some(context.clone());
+            super::observe_forwarded_usage_limit(&mut recovery_context, status, raw.as_bytes());
+
+            // An adapter can keep the status but replace or lose the original error.
+            let rebuilt = Bytes::from_static(br#"{"message":"request failed"}"#);
+            let response = axum::response::Response::builder()
+                .status(status)
+                .header("content-type", content_type)
+                .body(axum::body::Body::from(rebuilt.clone()))
+                .unwrap();
+            let response =
+                super::finalize_aggressive_recovery(Ok(response), recovery_context).unwrap();
+            tracking.hand_off_to_stream();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()["content-type"], content_type);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                rebuilt
+            );
+
+            let candidate = proxy_usage_limit_turns()
+                .into_iter()
+                .find(|candidate| candidate.thread_id == context.desktop_thread_id);
+            assert_eq!(
+                candidate.map(|candidate| candidate.turn_id),
+                expected.then_some(turn)
+            );
+            assert!(!recovery_reserved_for_test(&context.desktop_thread_id));
+            mark_turn_completed(&context.desktop_thread_id);
+        }
+    }
+
+    #[test]
     fn only_winning_messages_provider_reads_original_responses_history_input() {
         let provider = |format: &str| {
             Provider::with_id(
@@ -7138,31 +7439,94 @@ mod tests {
         };
         let native = provider("openai_responses");
         let messages = provider("openai_messages");
-        let original = br#"{"model":"role-selected-by-client","input":[{"role":"user","content":"original input"}],"tools":[{"type":"web_search"}]}"#;
-        for endpoint in ["/v1/responses", "/responses/compact"] {
-            super::MESSAGES_HISTORY_PARSES.with(|count| count.set(0));
-            // The native path has no reason to even deserialize the snapshot.
-            assert!(
-                super::codex_messages_history_request(&native, endpoint, b"unread")
-                    .unwrap()
-                    .is_none()
-            );
+        for (endpoint, size) in [("/v1/responses", 1), ("/responses/compact", 8192)] {
+            let original = || {
+                json!({
+                    "model": "role-selected-by-client",
+                    "input": vec![json!({"role": "user", "content": "original input"}); size],
+                    "tools": [{"type": "web_search"}]
+                })
+            };
             for _ in 0..3 {
                 assert!(
-                    super::codex_messages_history_request(&native, endpoint, original)
-                        .unwrap()
-                        .is_none()
+                    super::codex_messages_history_request(&native, endpoint, original()).is_none()
                 );
             }
-            super::MESSAGES_HISTORY_PARSES.with(|count| assert_eq!(count.get(), 0));
-            let captured = super::codex_messages_history_request(&messages, endpoint, original)
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                captured,
-                json!({"input":[{"role":"user","content":"original input"}]})
+            let original = original();
+            let original_input = original["input"].as_array().unwrap().as_ptr();
+            let captured =
+                super::codex_messages_history_request(&messages, endpoint, original).unwrap();
+            let captured_input = captured["input"].as_array().unwrap();
+            assert_eq!(captured_input.as_ptr(), original_input);
+            assert_eq!(captured_input.len(), size);
+            assert_eq!(captured_input[0]["content"], "original input");
+            assert_eq!(captured.as_object().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_response_stream_shares_payload_with_usage_and_history() {
+        let request = json!({"input":[{"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"Check status"}]}]});
+        let completed = json!({
+            "type":"response.completed",
+            "response":{
+                "id":"resp_messages",
+                "status":"completed",
+                "usage":{"input_tokens":21,"output_tokens":5},
+                "output":[{"type":"function_call","call_id":"call_status",
+                    "name":"get_status","arguments":"{}"}]
+            }
+        });
+        let wire = format!("event: response.completed\r\ndata: {completed}\r\n\r\n");
+        for logging in [false, true] {
+            let history = std::sync::Arc::new(
+                super::super::providers::codex_chat_history::CodexChatHistoryStore::default(),
             );
-            super::MESSAGES_HISTORY_PARSES.with(|count| assert_eq!(count.get(), 1));
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let collector = logging.then(|| {
+                let captured = captured.clone();
+                super::SseUsageCollector::new(std::time::Instant::now(), None, move |events, _| {
+                    *captured.lock().unwrap() = Some(events);
+                })
+            });
+            let chunks = wire
+                .as_bytes()
+                .chunks(1)
+                .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>();
+            let frames = super::create_resilient_responses_sse_frames(
+                Box::pin(futures::stream::iter(chunks)),
+                None,
+                None,
+                true,
+                logging,
+            );
+            let observed = super::observe_codex_messages_responses(
+                frames,
+                history.clone(),
+                request.clone(),
+                collector.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+            assert_eq!(observed.len(), 1);
+            assert_eq!(observed[0].as_ref().unwrap().as_ref(), wire.as_bytes());
+
+            let mut follow_up = json!({"previous_response_id":"resp_messages","input":[
+                {"type":"function_call_output","call_id":"call_status","output":"ok"}]});
+            assert_eq!(history.enrich_request(&mut follow_up).await, 1);
+            assert_eq!(follow_up["input"][0], request["input"][0]);
+            assert_eq!(follow_up["input"][1]["call_id"], "call_status");
+            if let Some(collector) = collector {
+                collector.finish().await;
+                assert_eq!(
+                    captured.lock().unwrap().as_deref(),
+                    Some(std::slice::from_ref(&completed))
+                );
+            } else {
+                assert!(captured.lock().unwrap().is_none());
+            }
         }
     }
 
@@ -9051,6 +9415,68 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
+    async fn final_json_auth_status_records_only_bounded_typed_period_limits() {
+        use crate::proxy::codex_turn_recovery::{
+            mark_turn_completed, proxy_usage_limit_turns, recovery_reserved_for_test,
+        };
+        let daily = r#"{"error":{"code":"daily_usage_limit_exceeded","message":"Daily usage limit exceeded."}}"#;
+        let oversized = format!("{}{}", " ".repeat(super::MAX_RECOVERY_JSON_BYTES), daily);
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            for (body_text, expected) in [
+                (daily, true),
+                (
+                    r#"{"error":{"code":"authentication_error","message":"Authentication failed."}}"#,
+                    false,
+                ),
+                (
+                    r#"{"error":{"code":"permission_denied","message":"Daily usage limit exceeded."}}"#,
+                    false,
+                ),
+                (r#"{"message":"Daily usage limit exceeded."}"#, false),
+                (r#""Daily usage limit exceeded.""#, false),
+                (r#"{"error":{"code":"daily_usage_limit_exceeded""#, false),
+                ("", false),
+                (oversized.as_str(), false),
+            ] {
+                let mut context = final_recovery_context("final-period-json");
+                let turn = uuid::Uuid::new_v4().to_string();
+                context.desktop_turn_id = Some(turn.clone());
+                let bytes = Bytes::copy_from_slice(body_text.as_bytes());
+                let middle = bytes.len() / 2;
+                let chunks =
+                    [bytes.slice(..middle), bytes.slice(middle..)].map(Ok::<_, std::io::Error>);
+                let response = axum::response::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/problem+json")
+                    .header("content-length", bytes.len().to_string())
+                    .body(axum::body::Body::from_stream(futures::stream::iter(chunks)))
+                    .unwrap();
+                let response =
+                    super::finalize_aggressive_recovery(Ok(response), Some(context.clone()))
+                        .unwrap();
+                assert_eq!(response.status(), status);
+                assert_eq!(
+                    response.headers()["content-type"],
+                    "application/problem+json"
+                );
+                assert_eq!(
+                    response.into_body().collect().await.unwrap().to_bytes(),
+                    bytes
+                );
+                let candidate = proxy_usage_limit_turns()
+                    .into_iter()
+                    .find(|candidate| candidate.thread_id == context.desktop_thread_id);
+                assert_eq!(
+                    candidate.map(|candidate| candidate.turn_id),
+                    expected.then_some(turn)
+                );
+                assert!(!recovery_reserved_for_test(&context.desktop_thread_id));
+                mark_turn_completed(&context.desktop_thread_id);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn final_json_permanent_http_status_does_not_continue_transient_looking_body() {
         use crate::proxy::codex_turn_recovery::recovery_reserved_for_test;
         let bytes = Bytes::from_static(
@@ -9322,7 +9748,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
 
     #[test]
     fn responses_sse_to_response_value_handles_crlf_delimiters() {
-        // 真实 HTTP SSE 按规范使用 \r\n\r\n 分隔事件；take_sse_block 必须同时处理两种分隔符，
+        // 真实 HTTP SSE 可能使用 \r\n\r\n 分隔事件，解析器必须同时处理两种分隔符，
         // 否则此路径在任何标准上游（含 Codex OAuth HTTPS 后端）下都会 TransformError。
         let sse = "event: response.output_item.done\r\n\
 data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\r\n\
@@ -10074,6 +10500,68 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
     }
 
     #[test]
+    fn codex_responses_http_error_types_plaintext_period_limit() {
+        let error = ProxyError::UpstreamError {
+            status: 403,
+            body: Some("daily usage limit exceeded".to_owned()),
+        };
+
+        let body = codex_proxy_error_json("Test Provider", "test-model", "/responses", &error);
+        let projected = &body["error"];
+        assert_eq!(projected["type"], "usage_limit_reached");
+        assert_eq!(projected["code"], "usage_limit_reached");
+        assert_eq!(projected["upstream_status"], 403);
+        assert_eq!(projected["provider"], "Test Provider");
+        assert!(projected["message"]
+            .as_str()
+            .unwrap()
+            .contains("daily usage limit exceeded"));
+        assert_eq!(
+            super::super::providers::codex_terminal::deferred_usage_limit_period("error", &body),
+            Some("Daily")
+        );
+
+        let image = codex_proxy_error_json(
+            "Test Provider",
+            "test-model",
+            "/v1/images/generations",
+            &error,
+        );
+        assert_eq!(image["error"]["code"], "cc_switch_upstream_error");
+    }
+
+    #[test]
+    fn codex_responses_http_error_keeps_period_limit_rejections_ineligible() {
+        use super::super::providers::codex_terminal::deferred_usage_limit_period;
+
+        for extra in [
+            json!({ "retryable": false }),
+            json!({ "additionalDetails": "Access denied" }),
+            json!({ "additionalDetails": "Billing failed" }),
+        ] {
+            let mut upstream_error = extra.as_object().unwrap().clone();
+            upstream_error.insert("message".to_owned(), json!("Daily usage limit exceeded."));
+            upstream_error.insert("type".to_owned(), json!("usage_limit_reached"));
+            upstream_error.insert("code".to_owned(), json!("usage_limit_reached"));
+            let payload = json!({ "error": upstream_error });
+            assert_eq!(deferred_usage_limit_period("error", &payload), None);
+
+            let body = codex_proxy_error_json(
+                "Test Provider",
+                "test-model",
+                "/responses?stream=true",
+                &ProxyError::UpstreamError {
+                    status: 429,
+                    body: Some(payload.to_string()),
+                },
+            );
+            assert_eq!(body["error"]["code"], "usage_limit_reached");
+            assert_eq!(body["error"]["retryable"], false);
+            assert_eq!(deferred_usage_limit_period("error", &body), None);
+        }
+    }
+
+    #[test]
     fn codex_proxy_html_error_is_upstream_guidance_not_a_local_proxy_failure() {
         for status in [502, 520, 524] {
             let body = codex_proxy_error_json(
@@ -10375,6 +10863,74 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deepseek\",\"
             .filter_map(|entry| entry["id"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["included"]);
+    }
+
+    #[test]
+    fn external_provider_model_listing_indexes_the_canonical_catalog_once() {
+        use crate::codex_multirouter::catalog::take_catalog_row_visits;
+
+        for size in [8, 512] {
+            let models = (0..size)
+                .map(|index| {
+                    json!({
+                        "model": format!("fixture-{index}"),
+                        "displayName": "Fixture",
+                        "enabled": index % 2 == 0
+                    })
+                })
+                .collect::<Vec<_>>();
+            let provider = Provider::with_id(
+                "catalog-fixture".to_string(),
+                "Catalog Fixture".to_string(),
+                json!({"modelCatalog": {"models": models}}),
+                None,
+            );
+            take_catalog_row_visits();
+            let entries = super::external_provider_model_entries(
+                &provider,
+                &external_provider_backend_profile(&provider.id),
+            );
+            assert_eq!(take_catalog_row_visits(), size);
+            assert_eq!(entries.len(), size / 2);
+            assert_eq!(entries[0]["id"], "fixture-0");
+            assert_eq!(entries[0]["displayName"], "Fixture");
+        }
+    }
+
+    #[test]
+    fn external_codex_router_model_listing_keeps_prefix_only_routes_after_model_routes() {
+        let provider = Provider::with_id(
+            "legacy-router".to_string(),
+            "Legacy Router".to_string(),
+            json!({
+                "codexRouting": {
+                    "routes": [
+                        {
+                            "id": "model-route",
+                            "match": { "models": ["model-route"] }
+                        },
+                        {
+                            "id": "prefix-route",
+                            "match": { "prefixes": ["prefix-route-"] }
+                        }
+                    ]
+                }
+            }),
+            None,
+        );
+        let mut profile = external_provider_backend_profile(&provider.id);
+        profile.default_model = None;
+
+        let state = build_state(Arc::new(Database::memory().expect("memory db")));
+        let entries = super::external_codex_router_model_entries(&state, &provider, &profile)
+            .expect("router model entries");
+        let ids = entries
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&"model-route"));
+        assert!(ids.contains(&"prefix-route-"));
     }
 
     #[test]

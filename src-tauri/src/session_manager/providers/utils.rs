@@ -1,12 +1,71 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset};
 use serde_json::Value;
 
+use crate::file_revision::FileRevision;
+
 /// Maximum number of characters for session titles (shared across providers).
 pub const TITLE_MAX_CHARS: usize = 80;
+
+pub(super) struct FileCache<T> {
+    entries: HashMap<PathBuf, (FileRevision, T, u64)>,
+    scan: u64,
+    #[cfg(test)]
+    pub(super) loads: usize,
+}
+
+impl<T> Default for FileCache<T> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            scan: 0,
+            #[cfg(test)]
+            loads: 0,
+        }
+    }
+}
+
+impl<T: Clone> FileCache<T> {
+    pub(super) fn refresh<R>(&mut self, scan: impl FnOnce(&mut Self) -> R) -> R {
+        self.scan = self.scan.wrapping_add(1);
+        let result = scan(self);
+        self.entries.retain(|_, entry| entry.2 == self.scan);
+        result
+    }
+
+    pub(super) fn read<E>(
+        &mut self,
+        path: &Path,
+        load: impl FnOnce(&mut File) -> Result<T, E>,
+    ) -> Option<T> {
+        let mut file = File::open(path).ok()?;
+        let revision = FileRevision::from_file(&file);
+        if let Some((saved, value, scan)) = self.entries.get_mut(path) {
+            if revision.as_ref() == Some(saved) {
+                *scan = self.scan;
+                return Some(value.clone());
+            }
+        }
+
+        #[cfg(test)]
+        {
+            self.loads += 1;
+        }
+        let value = load(&mut file).ok()?;
+        // Reopen after reading so a replacement at the same path cannot publish stale metadata.
+        let stable =
+            revision.filter(|revision| FileRevision::read(path).as_ref() == Some(revision));
+        if let Some(revision) = stable {
+            self.entries
+                .insert(path.to_path_buf(), (revision, value.clone(), self.scan));
+        }
+        Some(value)
+    }
+}
 
 /// Read the first `head_n` lines and last `tail_n` lines from a file.
 /// For small files (< 16 KB), reads all lines once to avoid unnecessary seeking.
@@ -15,13 +74,20 @@ pub fn read_head_tail_lines(
     head_n: usize,
     tail_n: usize,
 ) -> io::Result<(Vec<String>, Vec<String>)> {
-    let file = File::open(path)?;
+    read_open_file_head_tail_lines(&mut File::open(path)?, head_n, tail_n)
+}
+
+pub(super) fn read_open_file_head_tail_lines(
+    file: &mut File,
+    head_n: usize,
+    tail_n: usize,
+) -> io::Result<(Vec<String>, Vec<String>)> {
     let file_len = file.metadata()?.len();
 
     // For small files, read all lines once and split
     if file_len < 16_384 {
         let reader = BufReader::new(file);
-        let all: Vec<String> = reader.lines().map_while(Result::ok).collect();
+        let all = read_utf8_lines(reader.lines())?;
         let head = all.iter().take(head_n).cloned().collect();
         let skip = all.len().saturating_sub(tail_n);
         let tail = all.into_iter().skip(skip).collect();
@@ -29,15 +95,14 @@ pub fn read_head_tail_lines(
     }
 
     // Read head lines from the beginning
-    let reader = BufReader::new(file);
-    let head: Vec<String> = reader.lines().take(head_n).map_while(Result::ok).collect();
+    let reader = BufReader::new(&mut *file);
+    let head = read_utf8_lines(reader.lines().take(head_n))?;
 
     // Seek to last ~16 KB for tail lines
     let seek_pos = file_len.saturating_sub(16_384);
-    let mut file2 = File::open(path)?;
-    file2.seek(SeekFrom::Start(seek_pos))?;
-    let tail_reader = BufReader::new(file2);
-    let all_tail: Vec<String> = tail_reader.lines().map_while(Result::ok).collect();
+    file.seek(SeekFrom::Start(seek_pos))?;
+    let tail_reader = BufReader::new(file);
+    let all_tail = read_utf8_lines(tail_reader.lines())?;
 
     // Skip first partial line if we seeked into the middle of a line
     let skip_first = if seek_pos > 0 { 1 } else { 0 };
@@ -46,6 +111,18 @@ pub fn read_head_tail_lines(
     let tail = usable.into_iter().skip(skip).collect();
 
     Ok((head, tail))
+}
+
+fn read_utf8_lines(lines: impl Iterator<Item = io::Result<String>>) -> io::Result<Vec<String>> {
+    let mut result = Vec::new();
+    for line in lines {
+        match line {
+            Ok(line) => result.push(line),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(result)
 }
 
 pub fn parse_timestamp_to_ms(value: &Value) -> Option<i64> {

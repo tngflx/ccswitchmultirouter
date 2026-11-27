@@ -36,8 +36,15 @@ const planUsageLimit = {
   message:
     "You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at 7:45 PM.",
 };
+const dailyUsageLimit = {
+  code: "usage_limit_reached",
+  type: "usage_limit_reached",
+  message:
+    "Daily usage limit exceeded. The upstream provider’s daily Codex allowance is exhausted.",
+};
 
 const session = (id: string, status = "active", turnStatus = "inProgress") => ({
+  readState: undefined as unknown,
   thread: {
     id,
     status: {
@@ -86,7 +93,11 @@ const expectCompleteScan = (scan: Scan | null) => {
 
 const continuationMarkerKey = "ccswitch-codex-continuations-v1";
 
-const fail = (target: Session, error = usageLimit, status = "failed") => {
+const fail = (
+  target: Session,
+  error: NonNullable<Session["turn"]["error"]> = usageLimit,
+  status = "failed",
+) => {
   target.thread.status.type = "systemError";
   target.turn.status = status;
   target.turn.error = { ...error, additionalDetails: "private fixture" };
@@ -160,11 +171,35 @@ const harness = (...sessions: Session[]) => {
           nextCursor: end < sessions.length ? String(end) : null,
         };
       }
+      if (method === "thread/list") {
+        const start = Number(params.cursor ?? 0);
+        const end = start + Number(params.limit);
+        const page = sessions.slice(start, end);
+        const readStates = Object.fromEntries(
+          page
+            .filter(({ readState }) => readState !== undefined)
+            .map(({ thread, readState }) => [
+              thread.id,
+              structuredClone(readState),
+            ]),
+        );
+        return {
+          data: page.map(({ thread }) => structuredClone(thread)),
+          readStates,
+          nextCursor: end < sessions.length ? String(end) : null,
+        };
+      }
       const target = sessions.find(
         ({ thread }) => thread.id === params.threadId,
       );
-      if (method === "thread/read" && params.includeTurns === false)
-        return { thread: structuredClone(target?.thread) };
+      if (method === "thread/read" && params.includeTurns === false) {
+        const response: Record<string, unknown> = {
+          thread: structuredClone(target?.thread),
+        };
+        if (target?.readState !== undefined)
+          response.readState = structuredClone(target.readState);
+        return response;
+      }
       if (method === "thread/read" && params.includeTurns === true && target)
         return {
           thread: structuredClone({ ...target.thread, turns: [target.turn] }),
@@ -175,22 +210,47 @@ const harness = (...sessions: Session[]) => {
     },
   );
   const makeClient = (hostId = "local", original = request) => {
+    const persistedAwareRequest = async (
+      method: string,
+      params: Record<string, unknown>,
+    ) => {
+      if (method !== "thread/list") return original(method, params);
+      try {
+        return await original(method, params);
+      } catch {
+        const start = Number(params.cursor ?? 0);
+        const end = start + Number(params.limit);
+        const page = sessions.slice(start, end);
+        return {
+          data: page.map(({ thread }) => structuredClone(thread)),
+          readStates: Object.fromEntries(
+            page
+              .filter(({ readState }) => readState !== undefined)
+              .map(({ thread, readState }) => [
+                thread.id,
+                structuredClone(readState),
+              ]),
+          ),
+          nextCursor: end < sessions.length ? String(end) : null,
+        };
+      }
+    };
     const client = {
       hostId,
       getCompatibleThreadSortKey() {},
       supportsPaginatedThreadHistory() {},
-      sendRequest: original,
+      sendRequest: persistedAwareRequest,
     };
-    const wrapper = vi.fn(original);
+    const wrapper = vi.fn(persistedAwareRequest);
     Object.defineProperty(wrapper, "__ccSwitchRequestHook", {
       value: Object.freeze({
         client,
-        original,
+        original: persistedAwareRequest,
         version: "standalone",
       }),
     });
     return Object.assign(client, {
-      __ccSwitchOriginalSendRequest: original,
+      __ccSwitchOriginalSendRequest: persistedAwareRequest,
       sendRequest: wrapper,
       __ccSwitchModelRequestPatch: "standalone",
     });
@@ -212,11 +272,58 @@ const harness = (...sessions: Session[]) => {
 };
 
 describe("native Codex usage-limit observation", () => {
+  it("verifies the latest running turn and its failure when the turn page omits its cursor", async () => {
+    const target = session("cursorless");
+    const { state, request } = harness(target);
+    const original = request.getMockImplementation()!;
+    request.mockImplementation(async (method, params) => {
+      if (method === "thread/turns/list")
+        return { data: [structuredClone(target.turn)] };
+      return original(method, params);
+    });
+
+    expectCompleteScan(
+      await state.collectCodexNativeUsageLimitCandidates(),
+    ).toEqual([]);
+    fail(target);
+    expectCompleteScan(
+      await state.collectCodexNativeUsageLimitCandidates(),
+    ).toEqual([
+      expect.objectContaining({
+        threadId: target.thread.id,
+        turnId: target.turn.id,
+      }),
+    ]);
+  });
+
+  it("accepts a terminal loaded-session page when its cursor is omitted", async () => {
+    const target = session("loaded-cursorless");
+    const { state, request } = harness(target);
+    const original = request.getMockImplementation()!;
+    request.mockImplementation(async (method, params) => {
+      if (method === "thread/loaded/list") return { data: [target.thread.id] };
+      return original(method, params);
+    });
+
+    expectCompleteScan(
+      await state.collectCodexNativeUsageLimitCandidates(),
+    ).toEqual([]);
+    fail(target);
+    expectCompleteScan(
+      await state.collectCodexNativeUsageLimitCandidates(),
+    ).toEqual([
+      expect.objectContaining({
+        threadId: target.thread.id,
+        turnId: target.turn.id,
+      }),
+    ]);
+  });
+
   it.each([
     { status: "active", turnStatus: "inProgress" },
     { status: "idle", turnStatus: "completed" },
   ])(
-    "reports only the displaced proxy turn when the newer turn is $turnStatus",
+    "reconciles proxy turns when the latest turn is $turnStatus using one bounded read",
     async ({ status, turnStatus }) => {
       const replacement = session("replacement", status, turnStatus);
       const unrelated = Array.from({ length: 64 }, (_, index) =>
@@ -239,7 +346,7 @@ describe("native Codex usage-limit observation", () => {
         ).toEqual({
           candidates: [],
           complete: true,
-          staleProxyTurns: [old],
+          staleProxyTurns: turnStatus === "completed" ? [old, same] : [old],
         });
         expect(
           request.mock.calls.filter(
@@ -260,6 +367,86 @@ describe("native Codex usage-limit observation", () => {
       }
     },
   );
+
+  it.each([
+    "completed",
+    "failed",
+    "inProgress",
+    "pending approval",
+    "inconsistent model",
+    "unreadable",
+  ])(
+    "displaces a completed exact proxy turn only if its peer confirms it (%s)",
+    async (peerStatus) => {
+      const target = session("shared-completed", "idle", "completed");
+      const { state, makeClient, request } = harness(target);
+      const original = request.getMockImplementation()!;
+      const peerRequest = vi.fn(async (method, params) => {
+        if (method === "thread/read" && peerStatus === "inProgress")
+          return {
+            thread: { ...target.thread, status: { type: "active" } },
+          };
+        if (method === "thread/read" && peerStatus === "pending approval")
+          return { thread: { ...target.thread, pendingApproval: true } };
+        if (method === "thread/turns/list") {
+          if (peerStatus === "unreadable") throw new Error("Peer unavailable");
+          return {
+            data: [
+              {
+                ...target.turn,
+                status: ["failed", "inProgress"].includes(peerStatus)
+                  ? peerStatus
+                  : "completed",
+                error: peerStatus === "failed" ? dailyUsageLimit : null,
+                ...(peerStatus === "inconsistent model"
+                  ? { model: "other-model" }
+                  : {}),
+              },
+            ],
+            nextCursor: null,
+          };
+        }
+        return original(method, params);
+      });
+      state.appServerClients.push(makeClient("local", peerRequest));
+      const proxy = {
+        threadId: target.thread.id,
+        turnId: target.turn.id,
+        observedAtMs: Date.now(),
+      };
+      expect(
+        await state.collectCodexNativeUsageLimitCandidates([proxy]),
+      ).toEqual({
+        candidates: [],
+        complete: peerStatus !== "unreadable",
+        ...(peerStatus === "completed" ? { staleProxyTurns: [proxy] } : {}),
+      });
+    },
+  );
+
+  it("keeps a completed exact proxy turn when an unrelated thread makes the scan incomplete", async () => {
+    const target = session("completed", "idle", "completed");
+    const unrelated = session("unreadable", "idle", "completed");
+    const { state, request } = harness(target, unrelated);
+    const original = request.getMockImplementation()!;
+    request.mockImplementation(async (method, params) => {
+      if (method === "thread/read" && params.threadId === unrelated.thread.id)
+        throw new Error("Fixture thread unavailable");
+      return original(method, params);
+    });
+    const proxy = {
+      threadId: target.thread.id,
+      turnId: target.turn.id,
+      observedAtMs: Date.now(),
+    };
+    expect(await state.collectCodexNativeUsageLimitCandidates([proxy])).toEqual(
+      incompleteScan(),
+    );
+    expect(request.mock.calls).toContainEqual([
+      "thread/turns/list",
+      expect.objectContaining({ threadId: target.thread.id }),
+    ]);
+  });
 
   it("requires a strictly newer recorded owner action to displace the same proxy turn", async () => {
     vi.useFakeTimers();
@@ -352,6 +539,55 @@ describe("native Codex usage-limit observation", () => {
       expect(await state.collectCodexNativeUsageLimitCandidates([old])).toEqual(
         { candidates: [], complete: true, staleProxyTurns: [old] },
       );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses proxy usage-limit evidence that arrives during a pending scan", async () => {
+    vi.useFakeTimers();
+    try {
+      const head = session("late-proxy", "active", "inProgress");
+      const stalled = Array.from({ length: 16 }, (_, index) =>
+        session(`stalled-late-proxy-${index}`, "idle", "completed"),
+      );
+      const { state, request, rememberAction } = harness(
+        ...stalled.slice(0, 8),
+        head,
+        ...stalled.slice(8),
+      );
+      rememberAction("turn/start", {
+        threadId: head.thread.id,
+        model: "request-model",
+      });
+      const original = request.getMockImplementation()!;
+      request.mockImplementation(async (method, params) => {
+        if (method === "thread/read" && params.threadId !== head.thread.id)
+          return new Promise(() => {});
+        return original(method, params);
+      });
+
+      const firstPoll = state.collectCodexNativeUsageLimitCandidates();
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(await firstPoll).toEqual(incompleteScan());
+
+      fail(head);
+      const proxy = {
+        threadId: head.thread.id,
+        turnId: head.turn.id,
+        observedAtMs: Date.now(),
+      };
+      const pending = state.collectCodexNativeUsageLimitCandidates([proxy]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(await pending).toEqual(incompleteScan());
+
+      request.mockImplementation(original);
+      expect(
+        await state.collectCodexNativeUsageLimitCandidates([proxy]),
+      ).toEqual({
+        candidates: [expect.objectContaining({ threadId: head.thread.id })],
+        complete: true,
+      });
     } finally {
       vi.useRealTimers();
     }
@@ -611,7 +847,11 @@ describe("native Codex usage-limit observation", () => {
       const secondary = makeClient("local", secondaryRequest);
       const primary = state.appServerClients[0];
       state.appServerClients = [primary, secondary];
-      request.mockImplementation(async () => ({ data: [], nextCursor: null }));
+      request.mockImplementation(async (method) =>
+        method === "thread/list"
+          ? { data: [], readStates: {}, nextCursor: null }
+          : { data: [], nextCursor: null },
+      );
 
       const params = { threadId: target.thread.id, model: target.thread.model };
       rememberAction("turn/start", params);
@@ -629,6 +869,7 @@ describe("native Codex usage-limit observation", () => {
       ]);
       expect(request.mock.calls.map(([method]) => method)).toEqual([
         "thread/loaded/list",
+        "thread/list",
       ]);
       expect(
         secondaryRequest.mock.calls.map(([method, args]) => [
@@ -637,6 +878,7 @@ describe("native Codex usage-limit observation", () => {
         ]),
       ).toEqual([
         ["thread/loaded/list", undefined],
+        ["thread/list", undefined],
         ["thread/read", target.thread.id],
         ["thread/turns/list", target.thread.id],
       ]);
@@ -692,7 +934,7 @@ describe("native Codex usage-limit observation", () => {
           threadId: target.thread.id,
           input: [{ type: "text", text: "continue" }],
         });
-      expect(request).toHaveBeenCalledTimes(1);
+      expect(request).toHaveBeenCalledTimes(2);
     },
   );
 
@@ -858,6 +1100,159 @@ describe("native Codex usage-limit observation", () => {
     ).toEqual([expect.objectContaining({ turnId: primary.turn.id })]);
   });
 
+  it.each([
+    { phase: "preparation", peerResult: "matching" },
+    { phase: "confirmation", peerResult: "matching" },
+    { phase: "preparation", peerResult: "conflicting" },
+    { phase: "confirmation", peerResult: "conflicting" },
+    { phase: "preparation", peerResult: "timed out" },
+    { phase: "confirmation", peerResult: "timed out" },
+  ])(
+    "waits for shared-thread verification during $phase when the peer is $peerResult",
+    async ({ phase, peerResult }) => {
+      vi.useFakeTimers();
+      try {
+        const shared = session("shared-recovery");
+        const alternate = session(shared.thread.id);
+        const { state, startTurn, makeClient } = harness(shared);
+        const timedOut = peerResult === "timed out";
+        let releasePeer = () => {};
+        const peerReleased = new Promise<void>((resolve) => {
+          releasePeer = resolve;
+        });
+        let holdPeer = false;
+        const readPeerThread = vi.fn(async () => {
+          // The metadata and turn reads each have a shorter RPC deadline.
+          // Stagger them so the overall verification can hit its own limit.
+          if (holdPeer && timedOut)
+            await new Promise((resolve) => setTimeout(resolve, 1_000));
+          return { thread: structuredClone(alternate.thread) };
+        });
+        const readPeerTurn = vi.fn(async () => {
+          if (holdPeer) await peerReleased;
+          return { data: [structuredClone(alternate.turn)], nextCursor: null };
+        });
+        state.appServerClients.push(
+          makeClient(
+            "local",
+            vi.fn(async (method) => {
+              if (method === "thread/loaded/list")
+                return { data: [shared.thread.id], nextCursor: null };
+              if (method === "thread/read") return readPeerThread();
+              if (method === "thread/turns/list") return readPeerTurn();
+              throw new Error("Unexpected peer RPC");
+            }),
+          ),
+        );
+        expectCompleteScan(
+          await state.collectCodexNativeUsageLimitCandidates(),
+        ).toEqual([]);
+        fail(shared);
+        fail(alternate);
+        const initial = await state.collectCodexNativeUsageLimitCandidates();
+        expectCompleteScan(initial).toHaveLength(1);
+        const [candidate] = initial!.candidates;
+        const start = () => {
+          const { started, jobId } = state.startCodexUsageLimitContinuation(
+            candidate.threadId,
+            "continue-shared",
+            candidate.model,
+            candidate.observedAtMs,
+            candidate.turnId,
+            true,
+          );
+          expect(started).toBe(true);
+          return jobId;
+        };
+        const preparedJobId = phase === "confirmation" ? start() : null;
+        if (preparedJobId) {
+          await vi.advanceTimersByTimeAsync(0);
+          expect(state.readCodexContinuationJob(preparedJobId)).toMatchObject({
+            status: "prepared",
+          });
+        }
+
+        if (peerResult === "conflicting") {
+          alternate.turn.id = "newer-peer-turn";
+          alternate.turn.status = "inProgress";
+          alternate.turn.error = null;
+          alternate.thread.status.type = "active";
+        }
+        holdPeer = true;
+        readPeerThread.mockClear();
+        readPeerTurn.mockClear();
+        const scan = state.collectCodexNativeUsageLimitCandidates();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(readPeerThread).toHaveBeenCalledTimes(1);
+        expect(
+          state.getCodexNativeUsageLimitCandidate(
+            candidate.threadId,
+            candidate.turnId,
+          ),
+        ).toBeNull();
+
+        const jobId = preparedJobId ?? start();
+        if (preparedJobId)
+          expect(state.confirmCodexContinuation(jobId).started).toBe(true);
+        const job = () => state.readCodexContinuationJob(jobId);
+        await vi.advanceTimersByTimeAsync(timedOut ? 2_999 : 100);
+        expect(readPeerTurn).toHaveBeenCalledTimes(1);
+        expect(job()).toMatchObject({
+          status: phase === "preparation" ? "pending" : "confirming",
+        });
+        expect(startTurn).not.toHaveBeenCalled();
+
+        if (timedOut) {
+          await vi.advanceTimersByTimeAsync(1);
+          expect(await scan).toEqual(incompleteScan());
+        } else {
+          releasePeer();
+          await vi.advanceTimersByTimeAsync(0);
+          expect((await scan)?.complete).toBe(true);
+        }
+        if (peerResult !== "matching") {
+          expect(job()).toMatchObject({
+            status: "completed",
+            submitted: false,
+            mutationAttempted: false,
+            usageLimitDeferred: true,
+          });
+          expect(state.commitCodexContinuation(jobId).started).toBe(false);
+          expect(startTurn).not.toHaveBeenCalled();
+          releasePeer();
+          await vi.advanceTimersByTimeAsync(0);
+          expect(startTurn).not.toHaveBeenCalled();
+          return;
+        }
+
+        if (phase === "preparation") {
+          expect(job()).toMatchObject({ status: "prepared" });
+          expect(state.confirmCodexContinuation(jobId).started).toBe(true);
+          await vi.advanceTimersByTimeAsync(0);
+        }
+        expect(job()).toMatchObject({ status: "confirmed" });
+        expect(startTurn).not.toHaveBeenCalled();
+        startTurn.mockResolvedValue({
+          turn: { id: "continued", status: "inProgress" },
+        });
+        expect(state.commitCodexContinuation(jobId).started).toBe(true);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(job()).toMatchObject({
+          status: "completed",
+          submitted: true,
+          turnId: "continued",
+        });
+        expect(startTurn).toHaveBeenCalledTimes(1);
+        expect(startTurn).toHaveBeenCalledWith({
+          threadId: shared.thread.id,
+          input: [{ type: "text", text: "continue" }],
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it.each(["active", "idle"])(
     "reports a verified replacement in a partial scan when the overlapping client was %s",
     async (initialStatus) => {
@@ -869,6 +1264,12 @@ describe("native Codex usage-limit observation", () => {
       const alternateRequest = vi.fn(async (method: string) => {
         if (method === "thread/loaded/list")
           return { data: [shared.thread.id], nextCursor: null };
+        if (method === "thread/list")
+          return {
+            data: [alternate.thread],
+            readStates: {},
+            nextCursor: null,
+          };
         if (method === "thread/read") return { thread: alternate.thread };
         return { data: [alternate.turn], nextCursor: null };
       });
@@ -1168,10 +1569,105 @@ describe("native Codex usage-limit observation", () => {
     ]);
     expect(request.mock.calls.map(([method]) => method)).toEqual([
       "thread/loaded/list",
+      "thread/list",
       "thread/read",
       "thread/turns/list",
     ]);
   });
+
+  it("counts the exact acknowledged turn that hits a daily usage limit before the first scan", async () => {
+    const target = session("daily-limit");
+    const historical = session("historical-daily-limit");
+    const { state, request, rememberAction, captureTurnStart } = harness(
+      target,
+      historical,
+    );
+    const params = { threadId: target.thread.id, model: target.thread.model };
+    rememberAction("turn/start", params);
+    const acknowledge = captureTurnStart(
+      state.appServerClients[0],
+      "turn/start",
+      params,
+    );
+    expect(acknowledge).toBeTypeOf("function");
+    acknowledge?.({ turn: structuredClone(target.turn) });
+    fail(target, dailyUsageLimit);
+    fail(historical, dailyUsageLimit);
+
+    expectCompleteScan(
+      await state.collectCodexNativeUsageLimitCandidates(),
+    ).toEqual([
+      expect.objectContaining({
+        threadId: target.thread.id,
+        turnId: target.turn.id,
+        model: target.thread.model,
+        modelProvider: target.thread.modelProvider,
+      }),
+    ]);
+    expect(request).not.toHaveBeenCalledWith(
+      "thread/turns/list",
+      expect.objectContaining({ threadId: historical.thread.id }),
+    );
+  });
+
+  it.each([
+    {
+      ...dailyUsageLimit,
+      message: "The upstream provider's weekly usage limit was exceeded.",
+    },
+    {
+      ...dailyUsageLimit,
+      message: "The upstream provider's monthly usage limit was exceeded.",
+    },
+    {
+      codexErrorInfo: "other",
+      message: `unexpected status 429 Too Many Requests: ${JSON.stringify({ error: dailyUsageLimit })}, url: http://localhost/responses`,
+    },
+  ])(
+    "counts an observed running turn that hits a typed usage limit: %j",
+    async (error) => {
+      const target = session("running-limit");
+      const { state } = harness(target);
+      expectCompleteScan(
+        await state.collectCodexNativeUsageLimitCandidates(),
+      ).toEqual([]);
+
+      fail(target, error);
+
+      expectCompleteScan(
+        await state.collectCodexNativeUsageLimitCandidates(),
+      ).toEqual([
+        expect.objectContaining({
+          threadId: target.thread.id,
+          turnId: target.turn.id,
+        }),
+      ]);
+    },
+  );
+
+  it.each([
+    { message: dailyUsageLimit.message },
+    {
+      codexErrorInfo: "other",
+      message: `unexpected status 403 Forbidden: ${dailyUsageLimit.message}, url: http://localhost/responses`,
+    },
+    { ...dailyUsageLimit, retryable: false },
+    { ...dailyUsageLimit, message: "Daily usage limit. Do not retry." },
+  ])(
+    "withholds an observed turn when its usage-limit error is %j",
+    async (error) => {
+      const target = session("ineligible-limit");
+      const { state } = harness(target);
+      expectCompleteScan(
+        await state.collectCodexNativeUsageLimitCandidates(),
+      ).toEqual([]);
+      fail(target, error);
+
+      expectCompleteScan(
+        await state.collectCodexNativeUsageLimitCandidates(),
+      ).toEqual([]);
+    },
+  );
 
   it("accepts a terminal usage-limit turn that predates the first active scan", async () => {
     const initial = session("late");
@@ -1207,6 +1703,186 @@ describe("native Codex usage-limit observation", () => {
       }),
     ]);
   });
+
+  it("recovers exact unread usage-limit turns on the first scan using only bounded latest-turn reads", async () => {
+    const failed = session("unread-failed");
+    const idle = session("unread-idle");
+    const stale = session("stale-unread");
+    const manuallyUnread = session("manually-unread");
+    const archived = session("archived-unread");
+    const unloaded = session("unloaded-unread");
+    const capacity = session("unread-capacity");
+    const history = Array.from({ length: 64 }, (_, index) =>
+      session(`historical-${index}`),
+    );
+    const unread = [failed, idle, stale, archived, unloaded, capacity];
+    for (const target of [...unread, manuallyUnread, ...history]) fail(target);
+    for (const target of unread)
+      target.readState = {
+        firstUnread: { type: "turn", turnId: target.turn.id },
+        revision: "delivery-revision",
+      };
+    idle.thread.status.type = "idle";
+    stale.turn.id = "later-turn";
+    manuallyUnread.readState = {
+      firstUnread: { type: "threadStart" },
+      revision: "manual-revision",
+    };
+    Object.assign(archived.thread, { archived: true });
+    unloaded.thread.status.type = "notLoaded";
+    fail(capacity, {
+      code: "service_unavailable_error",
+      message: "Provider capacity exhausted",
+    });
+    const { state, request } = harness(...unread, manuallyUnread, ...history);
+
+    for (let poll = 1; poll <= 2; poll++) {
+      expectCompleteScan(
+        await state.collectCodexNativeUsageLimitCandidates(),
+      ).toEqual(
+        [failed, idle].map((target) =>
+          expect.objectContaining({
+            threadId: target.thread.id,
+            turnId: target.turn.id,
+          }),
+        ),
+      );
+      expect(
+        request.mock.calls.filter(([method]) => method === "thread/turns/list"),
+      ).toHaveLength(4 * poll);
+      expect(request).not.toHaveBeenCalledWith(
+        "thread/read",
+        expect.objectContaining({ includeTurns: true }),
+      );
+    }
+  });
+
+  it("uses the persisted unread receipt when thread/read omits readState", async () => {
+    const target = session("unread-without-thread-read-state");
+    target.readState = {
+      firstUnread: { type: "turn", turnId: target.turn.id },
+      revision: "persisted-revision",
+    };
+    fail(target);
+    const { state, request } = harness(target);
+    const original = request.getMockImplementation();
+    request.mockImplementation(async (method, params) => {
+      const response = await original?.(method, params);
+      if (method !== "thread/read" || params.includeTurns !== false)
+        return response;
+      const withoutReadState = { ...(response as Record<string, unknown>) };
+      delete withoutReadState.readState;
+      return withoutReadState;
+    });
+
+    expectCompleteScan(
+      await state.collectCodexNativeUsageLimitCandidates(),
+    ).toEqual([expect.objectContaining({ threadId: target.thread.id })]);
+  });
+
+  it.each([
+    { method: "turn/start", actionOffsetMs: 400, counted: true },
+    { method: "turn/start", actionOffsetMs: 600, counted: false },
+    { method: "turn/interrupt", actionOffsetMs: 600, counted: false },
+  ])(
+    "checks $method at $actionOffsetMs against the exact unread turn",
+    async ({ method, actionOffsetMs, counted }) => {
+      const target = session("unread-after-action");
+      const startedAt = Math.floor(Date.now() / 1000) - 1;
+      const timestamp = (startedAt * 1000 + 500).toString(16).padStart(12, "0");
+      target.turn.id = `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7000-8000-000000000000`;
+      Object.assign(target.turn, { startedAt });
+      target.readState = {
+        firstUnread: { type: "turn", turnId: target.turn.id },
+        revision: "delivery-revision",
+      };
+      fail(target);
+      const { state, rememberAction } = harness(target);
+      const clock = vi
+        .spyOn(Date, "now")
+        .mockReturnValueOnce(startedAt * 1000 + actionOffsetMs);
+      try {
+        rememberAction(method, { threadId: target.thread.id });
+      } finally {
+        clock.mockRestore();
+      }
+
+      for (let poll = 0; poll < 2; poll++)
+        expectCompleteScan(
+          await state.collectCodexNativeUsageLimitCandidates(),
+        ).toHaveLength(counted ? 1 : 0);
+    },
+  );
+
+  it.each(["unchanged", "marked read", "revised", "stopped"])(
+    "rechecks an unread usage-limit turn before continuation when its evidence is %s",
+    async (change) => {
+      const target = session("unread-resume");
+      fail(target, dailyUsageLimit);
+      const receipt = {
+        firstUnread: { type: "turn", turnId: target.turn.id },
+        revision: "original-revision",
+      };
+      target.readState = receipt;
+      const { state, startTurn, rememberAction } = harness(target);
+      const scan = await state.collectCodexNativeUsageLimitCandidates();
+      expectCompleteScan(scan).toHaveLength(1);
+      const candidate = scan!.candidates[0];
+      startTurn.mockResolvedValue({
+        turn: { id: "continued-turn", status: "inProgress" },
+      });
+
+      const { started, jobId } = state.startCodexUsageLimitContinuation(
+        candidate.threadId,
+        "resume-unread-turn",
+        candidate.model,
+        candidate.observedAtMs,
+        candidate.turnId,
+        true,
+      );
+      expect(started).toBe(true);
+      await vi.waitFor(() =>
+        expect(state.readCodexContinuationJob(jobId)).toMatchObject({
+          status: "prepared",
+        }),
+      );
+      if (change === "marked read")
+        target.readState = { ...receipt, firstUnread: null };
+      if (change === "revised")
+        target.readState = { ...receipt, revision: "new-revision" };
+      if (change === "stopped")
+        rememberAction("turn/interrupt", { threadId: candidate.threadId });
+      expect(state.confirmCodexContinuation(jobId).started).toBe(true);
+      if (change === "unchanged") {
+        await vi.waitFor(() =>
+          expect(state.readCodexContinuationJob(jobId)).toMatchObject({
+            status: "confirmed",
+          }),
+        );
+        expect(state.commitCodexContinuation(jobId).started).toBe(true);
+      }
+      await vi.waitFor(() =>
+        expect(state.readCodexContinuationJob(jobId)).toMatchObject({
+          status: "completed",
+          submitted: change === "unchanged",
+        }),
+      );
+      expect(startTurn).toHaveBeenCalledTimes(change === "unchanged" ? 1 : 0);
+      if (change === "unchanged")
+        expect(startTurn).toHaveBeenCalledWith(
+          expect.objectContaining({
+            threadId: candidate.threadId,
+            input: [{ type: "text", text: "continue" }],
+          }),
+        );
+      expect(
+        state.getCodexNativeUsageLimitCandidate(
+          candidate.threadId,
+          candidate.turnId,
+        ),
+      ).toBeNull();
+    },
+  );
 
   it.each(["start intent", "terminal acknowledgement"])(
     "does not turn %s and a seconds timestamp into exact running-turn proof",
@@ -1334,6 +2010,7 @@ describe("native Codex usage-limit observation", () => {
           ).toEqual([]);
           expect(request.mock.calls.map(([method]) => method)).toEqual([
             "thread/loaded/list",
+            "thread/list",
           ]);
           expect(
             state.getCodexNativeUsageLimitCandidate(
@@ -1641,7 +2318,31 @@ describe("native Codex usage-limit observation", () => {
     ).toEqual([]);
     expect(request.mock.calls).toEqual([
       ["thread/loaded/list", { cursor: null, limit: 32 }],
+      [
+        "thread/list",
+        {
+          cursor: null,
+          limit: 32,
+          sortKey: "updated_at",
+          sortDirection: "desc",
+          archived: false,
+          sourceKinds: ["appServer"],
+          modelProviders: [],
+        },
+      ],
       ["thread/loaded/list", { cursor: null, limit: 32 }],
+      [
+        "thread/list",
+        {
+          cursor: null,
+          limit: 32,
+          sortKey: "updated_at",
+          sortDirection: "desc",
+          archived: false,
+          sourceKinds: ["appServer"],
+          modelProviders: [],
+        },
+      ],
     ]);
   });
 
@@ -1796,7 +2497,7 @@ describe("native Codex usage-limit observation", () => {
           ),
         ).toEqual([latest]);
         expect(request).toHaveBeenCalledTimes(
-          pages.length + metadata.length + 1,
+          pages.length + metadata.length + 1 + cursors.length,
         );
       }
     },
@@ -1830,17 +2531,42 @@ describe("native Codex usage-limit observation", () => {
 
   it("rejects a nonconsecutive loaded-session cursor cycle", async () => {
     const { state, request } = harness();
-    request
-      .mockResolvedValueOnce({ data: [], nextCursor: "second" })
-      .mockResolvedValueOnce({ data: [], nextCursor: "third" })
-      .mockResolvedValueOnce({ data: [], nextCursor: "second" });
+    let loadedCall = 0;
+    request.mockImplementation(async (method) => {
+      if (method === "thread/list")
+        return { data: [], readStates: {}, nextCursor: null };
+      const responses = [
+        { data: [], nextCursor: "second" },
+        { data: [], nextCursor: "third" },
+        { data: [], nextCursor: "second" },
+      ];
+      return responses[loadedCall++];
+    });
     expect(await state.collectCodexNativeUsageLimitCandidates()).toEqual(
       incompleteScan(),
     );
-    expect(request.mock.calls).toEqual([
+    expect(
+      request.mock.calls.filter(([method]) => method === "thread/loaded/list"),
+    ).toEqual([
       ["thread/loaded/list", { cursor: null, limit: 32 }],
       ["thread/loaded/list", { cursor: "second", limit: 32 }],
       ["thread/loaded/list", { cursor: "third", limit: 32 }],
+    ]);
+    expect(
+      request.mock.calls.filter(([method]) => method === "thread/list"),
+    ).toEqual([
+      [
+        "thread/list",
+        {
+          cursor: null,
+          limit: 32,
+          sortKey: "updated_at",
+          sortDirection: "desc",
+          archived: false,
+          sourceKinds: ["appServer"],
+          modelProviders: [],
+        },
+      ],
     ]);
   });
 
@@ -2022,8 +2748,10 @@ describe("native Codex usage-limit observation", () => {
       const candidates = scan?.candidates;
       expect(candidates).toHaveLength(1);
 
-      request.mockImplementation(async (_method, { cursor }) => {
+      request.mockImplementation(async (method, { cursor }) => {
         await new Promise((resolve) => setTimeout(resolve, 2_000));
+        if (method === "thread/list")
+          return { data: [], readStates: {}, nextCursor: null };
         const next = Number(cursor ?? 0) + 1;
         return { data: [], nextCursor: next < 17 ? String(next) : null };
       });
@@ -2068,6 +2796,7 @@ describe("native Codex usage-limit observation", () => {
         expect(await overlappingPoll).toEqual(incompleteScan());
         expect(request.mock.calls.map(([method]) => method)).toEqual([
           "thread/loaded/list",
+          "thread/list",
           "thread/read",
           "thread/turns/list",
         ]);

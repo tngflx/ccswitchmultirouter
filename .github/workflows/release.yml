@@ -29,7 +29,7 @@ jobs:
           - os: ubuntu-22.04
           - os: ubuntu-22.04-arm
             arch: arm64
-          - os: macos-14
+          - os: macos-15-intel
 
     steps:
       - name: Checkout
@@ -39,6 +39,30 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: '20'
+
+      - name: Setup pinned pnpm with Corepack
+        if: runner.os != 'Windows' || runner.arch != 'ARM64'
+        shell: bash
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack install
+          node --version
+          test "$(pnpm --version)" = "$(node -p "require('./package.json').packageManager.split('@').pop()")"
+
+      - name: Setup pinned pnpm with Corepack (Windows ARM64)
+        if: runner.os == 'Windows' && runner.arch == 'ARM64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = '0'
+          corepack enable
+          corepack install
+          node --version
+          $expected = node -p "require('./package.json').packageManager.split('@').pop()"
+          if ((pnpm --version) -ne $expected) { throw "pnpm version does not match packageManager" }
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -134,21 +158,6 @@ jobs:
           apt_get install -y --no-install-recommends libsoup-3.0-dev \
             || apt_get install -y --no-install-recommends libsoup2.4-dev
 
-      - name: Setup pnpm
-        if: runner.os != 'Windows' || runner.arch != 'ARM64'
-        uses: pnpm/action-setup@v6
-        with:
-          run_install: false
-
-      - name: Setup pnpm (Windows ARM64)
-        if: runner.os == 'Windows' && runner.arch == 'ARM64'
-        shell: pwsh
-        run: |
-          corepack enable
-          corepack install
-          node --version
-          pnpm --version
-
       - name: Get pnpm store directory
         if: runner.os != 'Windows' || runner.arch != 'ARM64'
         id: pnpm-store
@@ -236,7 +245,6 @@ jobs:
                 echo "✅ 使用一行 Base64 私钥，已构造两行文件"
               else
                 echo "❌ TAURI_SIGNING_PRIVATE_KEY 格式无法识别：既不是两行原文，也不是其 base64，亦非一行 base64" >&2
-                echo "密钥前10个字符: $(echo "$RAW" | head -c 10)..." >&2
                 exit 1
               fi
             fi
@@ -322,7 +330,7 @@ jobs:
       - name: Build Tauri App (macOS)
         if: runner.os == 'macOS'
         shell: bash
-        timeout-minutes: 60
+        timeout-minutes: 120
         env:
           APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}

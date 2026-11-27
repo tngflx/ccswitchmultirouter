@@ -6,7 +6,9 @@
 //! 支持检测官方 Codex 客户端 (codex_vscode, codex_cli_rs)
 
 use super::{AuthInfo, AuthStrategy, ProviderAdapter};
-use crate::codex_multirouter::catalog::{catalog_models, lookup_catalog_model, CatalogModelLookup};
+use crate::codex_multirouter::catalog::{
+    lookup_provider_catalog_model, provider_catalog_models, CatalogModelLookup,
+};
 use crate::codex_multirouter::compiler::{
     compile_provider_v2, CodexRoutingCompileError, CompiledCodexModel, CompiledCodexRoute,
     CompiledCodexRoutingPlan,
@@ -15,9 +17,7 @@ use crate::codex_multirouter::protocol_capability::{
     provider_api_transport_declaration_for_model, ProviderApiTransportDeclaration,
 };
 use crate::codex_multirouter::provider_set::codex_model_follows_automatic_protocol;
-use crate::codex_multirouter::schema::{
-    CodexRouteAuthPolicy, CodexRouteAuthSource, CodexRoutingConfigV2,
-};
+use crate::codex_multirouter::schema::{CodexRouteAuthPolicy, CodexRouteAuthSource};
 use crate::provider::{
     AuthBinding, AuthBindingSource, CodexCacheConfig, CodexChatReasoningConfig,
     CodexOfficialAuthMode, Provider, ProviderMeta,
@@ -472,16 +472,18 @@ pub fn codex_route_supports_responses_compaction(provider: &Provider) -> bool {
 /// Resolved providers retain the request-local marker so retry materialization
 /// cannot erase the contract.
 pub fn codex_multirouter_needs_plaintext_v2_collaboration(provider: &Provider) -> bool {
-    if provider
+    provider
         .settings_config
         .get(CODEX_ROUTER_PLAINTEXT_V2_COLLABORATION)
         .and_then(JsonValue::as_bool)
         == Some(true)
-    {
-        return true;
-    }
+        || codex_routing_needs_plaintext_v2_collaboration(
+            provider.settings_config.get("codexRouting"),
+        )
+}
 
-    let Some(routing) = provider.settings_config.get("codexRouting") else {
+fn codex_routing_needs_plaintext_v2_collaboration(routing: Option<&JsonValue>) -> bool {
+    let Some(routing) = routing else {
         return false;
     };
     if routing
@@ -698,43 +700,7 @@ pub fn resolve_codex_v2_routed_provider(
     body: &JsonValue,
     providers: &HashMap<String, Provider>,
 ) -> Result<Option<ResolvedCodexRoute>, CodexRoutingCompileError> {
-    let Some((_plan, compiled)) = compile_codex_v2_runtime_plan(router_provider, providers)? else {
-        return Ok(None);
-    };
-    let request_model = body
-        .get("model")
-        .and_then(JsonValue::as_str)
-        .map(str::trim)
-        .filter(|model| !model.is_empty());
-    let Some(request_model) = request_model else {
-        return Ok(None);
-    };
-    let exact_model = compiled
-        .model_catalog
-        .iter()
-        .find(|model| model.visible_model.eq_ignore_ascii_case(request_model));
-    let (route, matched_by) = if let Some(model) = exact_model {
-        (
-            compiled
-                .routes
-                .iter()
-                .find(|route| route.id == model.route_id)
-                .expect("compiled model route must exist"),
-            "exact",
-        )
-    } else {
-        return Ok(None);
-    };
-
-    build_resolved_codex_v2_route(
-        router_provider,
-        &compiled,
-        route,
-        Some(request_model),
-        matched_by,
-        providers,
-    )
-    .map(Some)
+    resolve_codex_v2_raw_passthrough_provider(router_provider, body, providers, None)
 }
 
 /// Resolve raw OpenAI-compatible endpoints through schema v2 without falling back to legacy
@@ -746,73 +712,107 @@ pub fn resolve_codex_v2_raw_passthrough_provider(
     providers: &HashMap<String, Provider>,
     explicit_route_id: Option<&str>,
 ) -> Result<Option<ResolvedCodexRoute>, CodexRoutingCompileError> {
-    let Some((_plan, compiled)) = compile_codex_v2_runtime_plan(router_provider, providers)? else {
+    let Some((_plan, compiled)) = compile_provider_v2(router_provider, providers)? else {
         return Ok(None);
     };
-    let request_model = body
-        .get("model")
-        .and_then(JsonValue::as_str)
-        .map(str::trim)
-        .filter(|model| !model.is_empty());
+    CodexV2RouteIndex::new(compiled, router_provider, providers).resolve(
+        router_provider,
+        body,
+        providers,
+        explicit_route_id,
+    )
+}
 
-    let (route, matched_by) = if let Some(route_id) = explicit_route_id {
-        let Some(route) = compiled
+pub(crate) struct CodexV2RouteIndex {
+    pub(crate) compiled: CompiledCodexRoutingPlan,
+    enabled_routes_by_id: HashMap<String, usize>,
+    models_by_name: HashMap<String, (usize, usize)>,
+    route_auth: Vec<Option<CodexV2RouteAuth>>,
+    plaintext_v2_collaboration: bool,
+}
+
+impl CodexV2RouteIndex {
+    pub(crate) fn new(
+        compiled: CompiledCodexRoutingPlan,
+        router_provider: &Provider,
+        providers: &HashMap<String, Provider>,
+    ) -> Self {
+        let route_positions = compiled
             .routes
             .iter()
-            .find(|route| route.enabled && route.id.eq_ignore_ascii_case(route_id.trim()))
-        else {
-            return Ok(None);
-        };
-        (route, "explicit_route_id")
-    } else if let Some(request_model) = request_model {
-        let exact = compiled
-            .model_catalog
-            .iter()
-            .find(|model| model.visible_model.eq_ignore_ascii_case(request_model))
-            .and_then(|model| {
-                compiled
-                    .routes
-                    .iter()
-                    .find(|route| route.enabled && route.id == model.route_id)
-            });
-        if let Some(route) = exact {
-            (route, "exact")
+            .enumerate()
+            .map(|(index, route)| (route.id.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let mut enabled_routes_by_id = HashMap::new();
+        let mut route_auth = Vec::with_capacity(compiled.routes.len());
+        for (index, route) in compiled.routes.iter().enumerate() {
+            if route.enabled {
+                enabled_routes_by_id
+                    .entry(route.id.to_ascii_lowercase())
+                    .or_insert(index);
+            }
+            route_auth.push(
+                providers
+                    .get(&route.target_provider_id)
+                    .map(|target| CodexV2RouteAuth::new(target, &route.auth_policy)),
+            );
+        }
+        let mut models_by_name = HashMap::with_capacity(compiled.model_catalog.len());
+        for (index, model) in compiled.model_catalog.iter().enumerate() {
+            let route_index = route_positions[model.route_id.as_str()];
+            models_by_name
+                .entry(model.visible_model.to_ascii_lowercase())
+                .or_insert((route_index, index));
+        }
+        Self {
+            compiled,
+            enabled_routes_by_id,
+            models_by_name,
+            route_auth,
+            plaintext_v2_collaboration: codex_routing_needs_plaintext_v2_collaboration(
+                router_provider.settings_config.get("codexRouting"),
+            ),
+        }
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        router_provider: &Provider,
+        body: &JsonValue,
+        providers: &HashMap<String, Provider>,
+        explicit_route_id: Option<&str>,
+    ) -> Result<Option<ResolvedCodexRoute>, CodexRoutingCompileError> {
+        let request_model = body
+            .get("model")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
+        let exact =
+            request_model.and_then(|model| self.models_by_name.get(&model.to_ascii_lowercase()));
+        let (route_index, model, matched_by) = if let Some(route_id) = explicit_route_id {
+            let Some(&route_index) = self
+                .enabled_routes_by_id
+                .get(&route_id.trim().to_ascii_lowercase())
+            else {
+                return Ok(None);
+            };
+            let model = exact
+                .filter(|&&(model_route_index, _)| model_route_index == route_index)
+                .map(|&(_, index)| &self.compiled.model_catalog[index]);
+            (route_index, model, "explicit_route_id")
+        } else if let Some(&(route_index, model_index)) = exact {
+            (
+                route_index,
+                Some(&self.compiled.model_catalog[model_index]),
+                "exact",
+            )
         } else {
             return Ok(None);
-        }
-    } else {
-        return Ok(None);
-    };
-
-    build_resolved_codex_v2_route(
-        router_provider,
-        &compiled,
-        route,
-        request_model,
-        matched_by,
-        providers,
-    )
-    .map(Some)
-}
-
-fn compile_codex_v2_runtime_plan(
-    router_provider: &Provider,
-    providers: &HashMap<String, Provider>,
-) -> Result<Option<(CodexRoutingConfigV2, CompiledCodexRoutingPlan)>, CodexRoutingCompileError> {
-    compile_provider_v2(router_provider, providers)
-}
-
-fn build_resolved_codex_v2_route(
-    router_provider: &Provider,
-    compiled: &CompiledCodexRoutingPlan,
-    route: &CompiledCodexRoute,
-    request_model: Option<&str>,
-    matched_by: &'static str,
-    providers: &HashMap<String, Provider>,
-) -> Result<ResolvedCodexRoute, CodexRoutingCompileError> {
-    let target_provider =
-        providers
+        };
+        let route = &self.compiled.routes[route_index];
+        let (target_provider, auth) = providers
             .get(&route.target_provider_id)
+            .zip(self.route_auth[route_index].as_ref())
             .ok_or_else(|| CodexRoutingCompileError {
                 code: "target_provider_missing".to_string(),
                 message: format!(
@@ -820,11 +820,38 @@ fn build_resolved_codex_v2_route(
                     route.id, route.target_provider_id
                 ),
             })?;
-    let compiled_model = request_model.and_then(|request_model| {
-        compiled.model_catalog.iter().find(|model| {
-            model.route_id == route.id && model.visible_model.eq_ignore_ascii_case(request_model)
-        })
-    });
+        let plaintext_v2_collaboration = self.plaintext_v2_collaboration
+            || router_provider
+                .settings_config
+                .get(CODEX_ROUTER_PLAINTEXT_V2_COLLABORATION)
+                .and_then(JsonValue::as_bool)
+                == Some(true);
+        Ok(Some(build_resolved_codex_v2_route(
+            router_provider,
+            &self.compiled.dependency_fingerprint,
+            route,
+            request_model,
+            model,
+            matched_by,
+            target_provider,
+            auth,
+            plaintext_v2_collaboration,
+        )))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_resolved_codex_v2_route(
+    router_provider: &Provider,
+    dependency_fingerprint: &str,
+    route: &CompiledCodexRoute,
+    request_model: Option<&str>,
+    compiled_model: Option<&CompiledCodexModel>,
+    matched_by: &'static str,
+    target_provider: &Provider,
+    auth: &CodexV2RouteAuth,
+    plaintext_v2_collaboration: bool,
+) -> ResolvedCodexRoute {
     let visible_model = request_model.unwrap_or_default().to_string();
     let canonical_model = compiled_model
         .map(|model| model.canonical_model.clone())
@@ -841,11 +868,13 @@ fn build_resolved_codex_v2_route(
         &upstream_model,
         compiled_model,
         matched_by,
+        auth,
+        plaintext_v2_collaboration,
     );
-    let protocol = explain_codex_responses_upstream_protocol(&effective_provider);
     let (api_format, api_format_source) = compiled_model
         .map(|model| (model.api_format.clone(), model.api_format_source.clone()))
         .unwrap_or_else(|| {
+            let protocol = explain_codex_responses_upstream_protocol(&effective_provider);
             (
                 protocol.protocol.api_format().to_string(),
                 "provider".to_string(),
@@ -858,7 +887,7 @@ fn build_resolved_codex_v2_route(
         .get_or_insert_with(ProviderMeta::default);
     meta.api_format = Some(api_format.clone());
 
-    Ok(ResolvedCodexRoute {
+    ResolvedCodexRoute {
         route_id: route.id.clone(),
         target_provider_id: route.target_provider_id.clone(),
         visible_model,
@@ -866,14 +895,11 @@ fn build_resolved_codex_v2_route(
         upstream_model,
         api_format,
         api_format_source,
-        auth_owner: codex_v2_auth_owner(&effective_codex_v2_auth_policy(
-            target_provider,
-            &route.auth_policy,
-        )),
-        dependency_fingerprint: compiled.dependency_fingerprint.clone(),
+        auth_owner: codex_v2_auth_owner(&auth.policy),
+        dependency_fingerprint: dependency_fingerprint.to_string(),
         matched_by,
         effective_provider,
-    })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -886,6 +912,8 @@ fn materialize_codex_v2_provider(
     upstream_model: &str,
     compiled_model: Option<&CompiledCodexModel>,
     matched_by: &str,
+    auth: &CodexV2RouteAuth,
+    plaintext_v2_collaboration: bool,
 ) -> Provider {
     let mut materialized = target_provider.clone();
     materialized.id = format!("{}::route::{}", router_provider.id, route.id);
@@ -893,11 +921,10 @@ fn materialize_codex_v2_provider(
         .label
         .clone()
         .unwrap_or_else(|| target_provider.name.clone());
-    let mut settings = target_provider
-        .settings_config
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
+    let mut settings = match std::mem::take(&mut materialized.settings_config) {
+        JsonValue::Object(settings) => settings,
+        _ => Map::new(),
+    };
     settings.insert(
         CODEX_ROUTER_PARENT_PROVIDER_ID.to_string(),
         JsonValue::String(router_provider.id.clone()),
@@ -941,14 +968,14 @@ fn materialize_codex_v2_provider(
             JsonValue::String(upstream_model.to_string()),
         );
     }
-    if codex_multirouter_needs_plaintext_v2_collaboration(router_provider) {
+    if plaintext_v2_collaboration {
         settings.insert(
             CODEX_ROUTER_PLAINTEXT_V2_COLLABORATION.to_string(),
             JsonValue::Bool(true),
         );
     }
 
-    let mut meta = materialized.meta.clone().unwrap_or_default();
+    let mut meta = materialized.meta.take().unwrap_or_default();
     if let Some(model) = compiled_model {
         settings.insert(
             "apiFormat".to_string(),
@@ -986,12 +1013,7 @@ fn materialize_codex_v2_provider(
         meta.api_format = Some(model.api_format.clone());
     }
 
-    apply_effective_codex_v2_auth_context(
-        target_provider,
-        &route.auth_policy,
-        &mut settings,
-        &mut meta,
-    );
+    auth.apply(&mut settings, &mut meta);
     materialized.settings_config = JsonValue::Object(settings);
     materialized.meta = Some(meta);
 
@@ -1049,28 +1071,31 @@ fn codex_official_auth_policy(
         })
 }
 
-fn effective_codex_v2_auth_policy(
-    target_provider: &Provider,
-    route_policy: &CodexRouteAuthPolicy,
-) -> CodexRouteAuthPolicy {
-    if is_canonical_codex_official_provider(target_provider) {
-        codex_official_auth_policy(target_provider, Some(route_policy))
-    } else {
-        route_policy.clone()
-    }
+struct CodexV2RouteAuth {
+    policy: CodexRouteAuthPolicy,
+    reset_official_auth: bool,
 }
 
-fn apply_effective_codex_v2_auth_context(
-    target_provider: &Provider,
-    route_policy: &CodexRouteAuthPolicy,
-    settings: &mut Map<String, JsonValue>,
-    meta: &mut ProviderMeta,
-) {
-    let policy = effective_codex_v2_auth_policy(target_provider, route_policy);
-    if is_canonical_codex_official_provider(target_provider) {
-        reset_codex_official_auth_materialization(settings, meta);
+impl CodexV2RouteAuth {
+    fn new(target_provider: &Provider, route_policy: &CodexRouteAuthPolicy) -> Self {
+        let reset_official_auth = is_canonical_codex_official_provider(target_provider);
+        let policy = if reset_official_auth {
+            codex_official_auth_policy(target_provider, Some(route_policy))
+        } else {
+            route_policy.clone()
+        };
+        Self {
+            policy,
+            reset_official_auth,
+        }
     }
-    apply_codex_v2_auth_policy(&policy, settings, meta);
+
+    fn apply(&self, settings: &mut Map<String, JsonValue>, meta: &mut ProviderMeta) {
+        if self.reset_official_auth {
+            reset_codex_official_auth_materialization(settings, meta);
+        }
+        apply_codex_v2_auth_policy(&self.policy, settings, meta);
+    }
 }
 
 /// Resolve account-scoped capabilities with the same authentication owner as
@@ -1080,13 +1105,12 @@ pub(crate) fn materialize_codex_v2_auth_context(
     route_policy: &CodexRouteAuthPolicy,
 ) -> Provider {
     let mut materialized = target_provider.clone();
-    let mut settings = target_provider
-        .settings_config
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    let mut meta = target_provider.meta.clone().unwrap_or_default();
-    apply_effective_codex_v2_auth_context(target_provider, route_policy, &mut settings, &mut meta);
+    let mut settings = match std::mem::take(&mut materialized.settings_config) {
+        JsonValue::Object(settings) => settings,
+        _ => Map::new(),
+    };
+    let mut meta = materialized.meta.take().unwrap_or_default();
+    CodexV2RouteAuth::new(target_provider, route_policy).apply(&mut settings, &mut meta);
     // Runtime routes also have request-local IDs. Keeping this clone distinct
     // prevents later canonical-provider materialization from replacing a
     // legacy route-owned account with the Desktop login.
@@ -1120,12 +1144,11 @@ pub fn materialize_codex_official_auth(
 
     let policy = codex_official_auth_policy(provider, legacy_fallback);
     let mut materialized = provider.clone();
-    let mut settings = materialized
-        .settings_config
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    let mut meta = materialized.meta.clone().unwrap_or_default();
+    let mut settings = match std::mem::take(&mut materialized.settings_config) {
+        JsonValue::Object(settings) => settings,
+        _ => Map::new(),
+    };
+    let mut meta = materialized.meta.take().unwrap_or_default();
     reset_codex_official_auth_materialization(&mut settings, &mut meta);
     apply_codex_v2_auth_policy(&policy, &mut settings, &mut meta);
     materialized.settings_config = JsonValue::Object(settings);
@@ -1784,14 +1807,14 @@ pub(crate) fn validate_codex_provider_api_capability(
             .map(ToString::to_string)
             .or_else(|| model_identity(model))
     };
-    let model = match lookup_catalog_model(&provider.settings_config, requested_canonical_model) {
+    let model = match lookup_provider_catalog_model(provider, requested_canonical_model) {
         CatalogModelLookup::Found(model)
             if model_upstream(model).as_deref() == Some(upstream_model.trim()) =>
         {
             model
         }
         CatalogModelLookup::Ambiguous => return Ok(()),
-        _ => match lookup_catalog_model(&provider.settings_config, upstream_model) {
+        _ => match lookup_provider_catalog_model(provider, upstream_model) {
             CatalogModelLookup::Found(model)
                 if model_upstream(model).as_deref() == Some(upstream_model.trim()) =>
             {
@@ -2236,7 +2259,7 @@ pub(crate) fn codex_provider_has_legacy_mixed_model_transports(provider: &Provid
     {
         return false;
     }
-    let Some(models) = catalog_models(&provider.settings_config) else {
+    let Some(models) = provider_catalog_models(provider) else {
         return false;
     };
     let mut has_responses = false;
@@ -3348,7 +3371,7 @@ fn codex_provider_catalog_upstream_model_for_request(
     provider: &Provider,
     request_model: &str,
 ) -> Option<String> {
-    match lookup_catalog_model(&provider.settings_config, request_model) {
+    match lookup_provider_catalog_model(provider, request_model) {
         CatalogModelLookup::Found(model)
             if model.get("enabled").and_then(JsonValue::as_bool) != Some(false) =>
         {
@@ -3369,7 +3392,7 @@ pub(crate) fn validate_codex_catalog_request_model(
     provider: &Provider,
     request_model: &str,
 ) -> Result<(), ProxyError> {
-    match lookup_catalog_model(&provider.settings_config, request_model) {
+    match lookup_provider_catalog_model(provider, request_model) {
         CatalogModelLookup::Ambiguous => Err(ProxyError::ConfigError(format!(
             "Codex model `{}` has an ambiguous catalog identity; select a unique public model",
             request_model.trim()
@@ -4513,7 +4536,7 @@ impl CodexAdapter {
         provider: &'a Provider,
         request_model: &str,
     ) -> Option<&'a str> {
-        crate::codex_multirouter::catalog::catalog_models(&provider.settings_config)
+        crate::codex_multirouter::catalog::provider_catalog_models(provider)
             .and_then(|models| {
                 models.iter().find(|model| {
                     model
@@ -10568,6 +10591,8 @@ wire_api = "responses"
                     "context-model",
                     None,
                     "exact",
+                    &CodexV2RouteAuth::new(&target, &route.auth_policy),
+                    false,
                 );
                 assert_ne!(context.id, target.id);
                 assert_eq!(

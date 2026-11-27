@@ -8,7 +8,7 @@ use super::codex_reasoning_controls::CodexReasoningProjection;
 use super::providers::codex_reasoning::{
     CodexReasoningEffort, ReasoningSupportKind, ResolvedSubagentReasoningCapability,
 };
-use crate::codex_multirouter::catalog::{lookup_catalog_model, CatalogModelLookup};
+use crate::codex_multirouter::catalog::{lookup_provider_catalog_model, CatalogModelLookup};
 use crate::provider::Provider;
 use crate::reasoning_capabilities::CapabilitySource;
 use axum::http::HeaderMap;
@@ -190,7 +190,7 @@ fn desktop_ultra_candidate(
         && capability.effort_map.get(&ultra)
             == capability.effort_map.get(&CodexReasoningEffort::XHigh)
         && matches!(
-            lookup_catalog_model(&provider.settings_config, capability_model),
+            lookup_provider_catalog_model(provider, capability_model),
             CatalogModelLookup::Missing
         )
     {

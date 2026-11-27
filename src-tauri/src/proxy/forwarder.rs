@@ -867,18 +867,7 @@ impl RequestForwarder {
         provider: &Provider,
         body: &Value,
     ) -> Result<Option<super::providers::ResolvedCodexRoute>, ProxyError> {
-        if !codex_provider_has_v2_routing(provider) {
-            return Ok(None);
-        }
-        let providers = self.load_codex_v2_target_providers(provider)?;
-        super::providers::resolve_codex_v2_routed_provider(provider, body, &providers).map_err(
-            |error| {
-                ProxyError::ConfigError(format!(
-                    "Codex MultiRouter v2 编译失败 [{}]: {}",
-                    error.code, error.message
-                ))
-            },
-        )
+        self.router.resolve_codex_v2_route(provider, body, None)
     }
 
     fn resolve_codex_v2_raw_route(
@@ -887,22 +876,8 @@ impl RequestForwarder {
         body: &Value,
         explicit_route_id: Option<&str>,
     ) -> Result<Option<super::providers::ResolvedCodexRoute>, ProxyError> {
-        if !codex_provider_has_v2_routing(provider) {
-            return Ok(None);
-        }
-        let providers = self.load_codex_v2_target_providers(provider)?;
-        super::providers::resolve_codex_v2_raw_passthrough_provider(
-            provider,
-            body,
-            &providers,
-            explicit_route_id,
-        )
-        .map_err(|error| {
-            ProxyError::ConfigError(format!(
-                "Codex MultiRouter v2 raw 编译失败 [{}]: {}",
-                error.code, error.message
-            ))
-        })
+        self.router
+            .resolve_codex_v2_route(provider, body, explicit_route_id)
     }
 
     /// Resolve one raw passthrough attempt before account-pool expansion.
@@ -996,48 +971,6 @@ impl RequestForwarder {
         Ok(super::providers::materialize_codex_official_auth(
             provider, None,
         ))
-    }
-
-    fn load_codex_v2_target_providers(
-        &self,
-        provider: &Provider,
-    ) -> Result<HashMap<String, Provider>, ProxyError> {
-        let routes = provider
-            .settings_config
-            .pointer("/codexRouting/routes")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                ProxyError::ConfigError(
-                    "Codex MultiRouter v2 routing.routes is not an array".to_string(),
-                )
-            })?;
-        let mut providers = HashMap::new();
-        for target_provider_id in routes
-            .iter()
-            .filter_map(|route| route.get("targetProviderId"))
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-        {
-            if providers.contains_key(target_provider_id) {
-                continue;
-            }
-            let target_provider = self
-                .router
-                .get_provider_by_id(target_provider_id, AppType::Codex.as_str())
-                .map_err(|error| {
-                    ProxyError::ConfigError(format!(
-                        "读取 Codex MultiRouter v2 目标供应商 '{target_provider_id}' 失败: {error}"
-                    ))
-                })?
-                .ok_or_else(|| {
-                    ProxyError::ConfigError(format!(
-                        "Codex MultiRouter v2 引用了不存在的目标供应商 '{target_provider_id}'"
-                    ))
-                })?;
-            providers.insert(target_provider_id.to_string(), target_provider);
-        }
-        Ok(providers)
     }
 
     async fn expand_codex_account_pool(
@@ -1446,6 +1379,29 @@ impl RequestForwarder {
         extensions: Extensions,
         providers: Vec<Provider>,
     ) -> Result<ForwardResult, ForwardError> {
+        self.forward_with_retry_body(
+            app_type,
+            method,
+            endpoint,
+            Cow::Owned(body),
+            headers,
+            extensions,
+            providers,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn forward_with_retry_body(
+        &self,
+        app_type: &AppType,
+        method: http::Method,
+        endpoint: &str,
+        body: Cow<'_, Value>,
+        headers: axum::http::HeaderMap,
+        extensions: Extensions,
+        providers: Vec<Provider>,
+    ) -> Result<ForwardResult, ForwardError> {
         let guard = ActiveConnectionGuard::acquire(self.status.clone()).await;
         {
             let mut s = self.status.write().await;
@@ -1753,7 +1709,7 @@ impl RequestForwarder {
         app_type: &AppType,
         method: http::Method,
         endpoint: &str,
-        mut body: Value,
+        mut body: Cow<'_, Value>,
         headers: axum::http::HeaderMap,
         extensions: Extensions,
         providers: Vec<Provider>,
@@ -8700,8 +8656,9 @@ fn normalize_codex_terminal_quota_body(body: Option<&str>) -> String {
         .to_string();
     };
 
-    if let Ok(value) = serde_json::from_str::<Value>(body) {
-        let error_type = value
+    let payload = super::providers::codex_terminal::terminal_error_payload(body);
+    if payload.is_object() {
+        let error_type = payload
             .pointer("/error/type")
             .and_then(Value::as_str)
             .map(str::trim)
@@ -8721,7 +8678,7 @@ fn normalize_codex_terminal_quota_body(body: Option<&str>) -> String {
             .to_string();
         }
 
-        let error_code = value
+        let error_code = payload
             .pointer("/error/code")
             .and_then(Value::as_str)
             .map(str::trim)
@@ -8738,20 +8695,20 @@ fn normalize_codex_terminal_quota_body(body: Option<&str>) -> String {
         }
     }
 
-    let normalized = body.to_ascii_lowercase();
-    let daily = normalized.contains("daily_limit_exceeded")
-        || normalized.contains("daily usage limit exceeded")
-        || normalized.contains("daily_usage_limit_exceeded");
-    let message = if daily {
-        "Daily usage limit exceeded. The upstream provider's daily Codex allowance is exhausted."
-    } else {
-        "The upstream provider's usage limit has been reached."
-    };
-    let upstream_reason = if daily {
-        "DAILY_LIMIT_EXCEEDED"
-    } else {
-        "USAGE_LIMIT_REACHED"
-    };
+    let (message, upstream_reason) =
+        match super::providers::codex_terminal::deferred_usage_limit_period("error", &payload) {
+            Some(period) => (
+                format!(
+                    "{period} usage limit exceeded. The upstream provider's {} Codex allowance is exhausted.",
+                    period.to_ascii_lowercase()
+                ),
+                format!("{}_LIMIT_EXCEEDED", period.to_ascii_uppercase()),
+            ),
+            None => (
+                "The upstream provider's usage limit has been reached.".to_owned(),
+                "USAGE_LIMIT_REACHED".to_owned(),
+            ),
+        };
 
     json!({
         "error": {
@@ -9426,7 +9383,10 @@ fn build_forward_attempt_providers_preserving_codex_router_context(
 /// Codex may run pre-turn compaction against the model used before the switch;
 /// when the state DB knows the new model, use it as the routing truth so the
 /// compaction follows the model the user actually switched to.
-fn apply_codex_compaction_current_model(body: &mut Value, current_model: Option<&str>) -> bool {
+fn apply_codex_compaction_current_model(
+    body: &mut Cow<'_, Value>,
+    current_model: Option<&str>,
+) -> bool {
     let Some(current_model) = current_model.filter(|model| !model.is_empty()) else {
         return false;
     };
@@ -9436,7 +9396,7 @@ fn apply_codex_compaction_current_model(body: &mut Value, current_model: Option<
         .map(str::trim)
         .filter(|model| !model.is_empty());
     if request_model.is_none_or(|model| !model.eq_ignore_ascii_case(current_model)) {
-        body["model"] = Value::String(current_model.to_string());
+        body.to_mut()["model"] = Value::String(current_model.to_string());
         true
     } else {
         false
@@ -13426,12 +13386,14 @@ mod tests {
             }
         });
 
-        let mut body = json!({ "model": "gpt-5.6-sol" });
+        let original_body = json!({ "model": "gpt-5.6-sol" });
+        let mut body = Cow::Borrowed(&original_body);
         assert!(apply_codex_compaction_current_model(
             &mut body,
             Some("qwen3.6")
         ));
         assert_eq!(body["model"], "qwen3.6");
+        assert_eq!(original_body["model"], "gpt-5.6-sol");
         let attempts = build_forward_attempt_providers_preserving_codex_router_context(
             &AppType::Codex,
             &[provider.clone()],
@@ -18079,6 +18041,43 @@ mod tests {
             .and_then(Value::as_str)
             .is_some_and(|message| message.contains("Daily usage limit exceeded")));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn codex_terminal_quota_normalization_preserves_eligible_periods() {
+        use super::super::providers::codex_terminal::{
+            deferred_usage_limit_period, terminal_error_code_from_body, terminal_error_payload,
+        };
+
+        for (raw, period) in [
+            (r#"error: reason="WEEKLY_LIMIT_EXCEEDED""#, Some("Weekly")),
+            (
+                r#"{"error":{"code":"MONTHLY_LIMIT_EXCEEDED"}}"#,
+                Some("Monthly"),
+            ),
+            (
+                "Daily usage limit exceeded. Billing payment required.",
+                None,
+            ),
+            (
+                r#"{"error":{"message":"Daily usage limit exceeded.","code":"permission_denied"}}"#,
+                None,
+            ),
+            (
+                r#"{"retryable":false,"error":{"message":"Daily usage limit exceeded."}}"#,
+                None,
+            ),
+        ] {
+            let body = normalize_codex_terminal_quota_body(Some(raw));
+            assert_eq!(
+                terminal_error_code_from_body(&body),
+                Some("insufficient_quota")
+            );
+            assert_eq!(
+                deferred_usage_limit_period("error", &terminal_error_payload(&body)),
+                period
+            );
+        }
     }
 
     async fn initial_http_retry_fixture(

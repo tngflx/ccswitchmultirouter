@@ -2,12 +2,13 @@ use super::provider::{sanitize_claude_settings_for_live, ProviderService};
 use crate::app_config::{AppType, MultiAppConfig};
 use crate::error::AppError;
 use crate::provider::Provider;
-use chrono::Utc;
+use chrono::{NaiveDateTime, Utc};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
 
-const MAX_BACKUPS: usize = 10;
+const MAX_BACKUPS: usize = 2;
+const CONFIG_BACKUP_TIMESTAMP_FORMAT: &str = "%Y%m%d_%H%M%S";
 
 /// 配置导入导出相关业务逻辑
 pub struct ConfigService;
@@ -19,7 +20,7 @@ impl ConfigService {
             return Ok(String::new());
         }
 
-        let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+        let timestamp = Utc::now().format(CONFIG_BACKUP_TIMESTAMP_FORMAT);
         let backup_id = format!("backup_{timestamp}");
 
         let backup_dir = config_path
@@ -33,12 +34,16 @@ impl ConfigService {
         let contents = fs::read(config_path).map_err(|e| AppError::io(config_path, e))?;
         fs::write(&backup_path, contents).map_err(|e| AppError::io(&backup_path, e))?;
 
-        Self::cleanup_old_backups(&backup_dir, MAX_BACKUPS)?;
+        Self::cleanup_old_backups(&backup_dir, MAX_BACKUPS, &backup_path)?;
 
         Ok(backup_id)
     }
 
-    fn cleanup_old_backups(backup_dir: &Path, retain: usize) -> Result<(), AppError> {
+    fn cleanup_old_backups(
+        backup_dir: &Path,
+        retain: usize,
+        published_backup: &Path,
+    ) -> Result<(), AppError> {
         if retain == 0 {
             return Ok(());
         }
@@ -47,11 +52,19 @@ impl ConfigService {
             Ok(iter) => iter
                 .filter_map(|entry| entry.ok())
                 .filter(|entry| {
-                    entry
-                        .path()
-                        .extension()
-                        .map(|ext| ext == "json")
-                        .unwrap_or(false)
+                    let filename = entry.file_name();
+                    filename
+                        .to_str()
+                        .and_then(|name| name.strip_prefix("backup_")?.strip_suffix(".json"))
+                        .is_some_and(|timestamp| {
+                            timestamp.len() == 15
+                                && NaiveDateTime::parse_from_str(
+                                    timestamp,
+                                    CONFIG_BACKUP_TIMESTAMP_FORMAT,
+                                )
+                                .is_ok()
+                        })
+                        && entry.file_type().is_ok_and(|kind| kind.is_file())
                 })
                 .collect::<Vec<_>>(),
             Err(_) => return Ok(()),
@@ -64,10 +77,15 @@ impl ConfigService {
         let remove_count = entries.len().saturating_sub(retain);
         let mut sorted = entries;
 
-        sorted.sort_by(|a, b| {
-            let a_time = a.metadata().and_then(|m| m.modified()).ok();
-            let b_time = b.metadata().and_then(|m| m.modified()).ok();
-            a_time.cmp(&b_time)
+        sorted.sort_by_cached_key(|entry| {
+            (
+                entry.path().as_path() == published_backup,
+                entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok(),
+                entry.file_name(),
+            )
         });
 
         for entry in sorted.into_iter().take(remove_count) {

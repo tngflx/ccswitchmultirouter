@@ -910,7 +910,7 @@ fn codex_router_routes(provider: &Provider) -> Vec<&Value> {
 /// 从 provider 配置中提取页面和 /v1/models 可展示的模型 id。
 fn collect_provider_models(provider: &Provider) -> Vec<String> {
     let mut ids = BTreeSet::new();
-    let catalog_models = crate::codex_multirouter::catalog::read_catalog(&provider.settings_config)
+    let catalog_models = crate::codex_multirouter::catalog::read_provider_catalog(provider)
         .and_then(|catalog| catalog.get("models"));
     if catalog_models.is_some() {
         collect_model_array(&mut ids, catalog_models);

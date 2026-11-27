@@ -11,11 +11,13 @@
 use crate::config::get_claude_config_dir;
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
+use crate::file_revision::FileRevision;
 use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::usage_stats::{
     effective_usage_log_filter, find_model_pricing, should_skip_session_insert, DedupKey,
 };
+use rusqlite::OptionalExtension;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,7 +25,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 /// 同步结果
@@ -56,39 +58,59 @@ pub fn session_sync_mutex() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// `session_log_sync` 中供 Claude 增量扫描使用的游标快照。
-#[derive(Debug, Clone, Copy, Default)]
-struct ClaudeSyncCursor {
-    last_modified: i64,
-    last_line_offset: i64,
-    last_byte_offset: Option<i64>,
-    last_tail_fingerprint: Option<i64>,
+/// One collector's persisted progress in `session_log_sync`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SessionSyncCursor {
+    pub(crate) last_modified: i64,
+    pub(crate) last_line_offset: i64,
+    pub(crate) last_byte_offset: Option<i64>,
+    pub(crate) last_tail_fingerprint: Option<i64>,
+    pub(crate) last_source_revision: Option<i64>,
+    pub(crate) deferred_until: Option<i64>,
 }
 
-/// 一次性预取同步游标，避免 Claude 历史目录中的每个文件都重新抢数据库锁。
-/// 查询失败必须中止，不能把错误当成空游标后全量重放。
-fn load_claude_sync_cursors(db: &Database) -> Result<HashMap<String, ClaudeSyncCursor>, AppError> {
+impl SessionSyncCursor {
+    pub(crate) fn matches_source_revision(self, revision: Option<i64>, modified: i64) -> bool {
+        revision.is_some()
+            && revision == self.last_source_revision
+            && modified == self.last_modified
+    }
+}
+
+/// Load the discovered cursors under one lock and one indexed statement.
+/// A failed lookup must not trigger a replay from an empty cursor.
+pub(crate) fn load_session_sync_cursors(
+    db: &Database,
+    keys: impl IntoIterator<Item = String>,
+) -> Result<HashMap<String, SessionSyncCursor>, AppError> {
     let conn = lock_conn!(db.conn);
-    let mut stmt = conn
-        .prepare(
-            "SELECT file_path, last_modified, last_line_offset, last_byte_offset,
-                    last_tail_fingerprint
-             FROM session_log_sync",
+    let mut statement = conn
+        .prepare_cached(
+            "SELECT last_modified, last_line_offset, last_byte_offset, last_tail_fingerprint,
+                    last_source_revision, deferred_until
+             FROM session_log_sync WHERE file_path = ?1",
         )
-        .map_err(|e| AppError::Database(format!("预取 Claude 同步游标失败: {e}")))?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            ClaudeSyncCursor {
-                last_modified: row.get(1)?,
-                last_line_offset: row.get(2)?,
-                last_byte_offset: row.get(3)?,
-                last_tail_fingerprint: row.get(4)?,
-            },
-        ))
-    });
-    rows.and_then(|rows| rows.collect::<Result<HashMap<_, _>, _>>())
-        .map_err(|e| AppError::Database(format!("预取 Claude 同步游标失败: {e}")))
+        .map_err(|error| AppError::Database(format!("读取会话同步游标失败: {error}")))?;
+    let mut cursors = HashMap::new();
+    for key in keys {
+        let cursor = statement
+            .query_row([&key], |row| {
+                Ok(SessionSyncCursor {
+                    last_modified: row.get(0)?,
+                    last_line_offset: row.get(1)?,
+                    last_byte_offset: row.get(2)?,
+                    last_tail_fingerprint: row.get(3)?,
+                    last_source_revision: row.get(4)?,
+                    deferred_until: row.get(5)?,
+                })
+            })
+            .optional()
+            .map_err(|error| AppError::Database(format!("读取会话同步游标失败: {error}")))?;
+        if let Some(cursor) = cursor {
+            cursors.insert(key, cursor);
+        }
+    }
+    Ok(cursors)
 }
 
 fn merge_sync_step(
@@ -190,7 +212,10 @@ pub fn sync_claude_session_logs(db: &Database) -> Result<SessionSyncResult, AppE
 
     // 收集所有 .jsonl 文件
     let jsonl_files = collect_jsonl_files(&projects_dir);
-    let cursors = load_claude_sync_cursors(db)?;
+    let keys = jsonl_files
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned());
+    let cursors = load_session_sync_cursors(db, keys)?;
 
     for file_path in &jsonl_files {
         result.files_scanned += 1;
@@ -252,40 +277,28 @@ pub fn sync_claude_session_logs(db: &Database) -> Result<SessionSyncResult, AppE
 fn collect_jsonl_files(projects_dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
 
-    let entries = match fs::read_dir(projects_dir) {
-        Ok(e) => e,
-        Err(_) => return files,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in cached_directory_children(projects_dir) {
         if !path.is_dir() {
             continue;
         }
         // 每个项目目录下的 .jsonl 文件
-        if let Ok(sub_entries) = fs::read_dir(&path) {
-            for sub_entry in sub_entries.flatten() {
-                let sub_path = sub_entry.path();
-                if sub_path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    // 主会话 JSONL 文件
-                    files.push(sub_path);
-                } else if sub_path.is_dir() {
-                    // 扫描子 agent 目录: 项目/SESSION_ID/subagents/*.jsonl
-                    let subagents_dir = sub_path.join("subagents");
-                    if subagents_dir.is_dir() {
-                        push_jsonl_children(&subagents_dir, &mut files);
+        for sub_path in cached_directory_children(&path) {
+            if sub_path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                // 主会话 JSONL 文件
+                files.push(sub_path);
+            } else if sub_path.is_dir() {
+                // 扫描子 agent 目录: 项目/SESSION_ID/subagents/*.jsonl
+                let subagents_dir = sub_path.join("subagents");
+                if subagents_dir.is_dir() {
+                    push_jsonl_children(&subagents_dir, &mut files);
 
-                        // 额外下探 Workflow 子 agent:
-                        // 项目/SESSION_ID/subagents/workflows/wf_<ID>/*.jsonl
-                        let workflows_dir = subagents_dir.join("workflows");
-                        if workflows_dir.is_dir() {
-                            if let Ok(wf_entries) = fs::read_dir(&workflows_dir) {
-                                for wf_entry in wf_entries.flatten() {
-                                    let wf_path = wf_entry.path();
-                                    if wf_path.is_dir() {
-                                        push_jsonl_children(&wf_path, &mut files);
-                                    }
-                                }
+                    // 额外下探 Workflow 子 agent:
+                    // 项目/SESSION_ID/subagents/workflows/wf_<ID>/*.jsonl
+                    let workflows_dir = subagents_dir.join("workflows");
+                    if workflows_dir.is_dir() {
+                        for wf_path in cached_directory_children(&workflows_dir) {
+                            if wf_path.is_dir() {
+                                push_jsonl_children(&wf_path, &mut files);
                             }
                         }
                     }
@@ -299,14 +312,61 @@ fn collect_jsonl_files(projects_dir: &Path) -> Vec<PathBuf> {
 
 /// 将 `dir` 下直接子层的所有 `.jsonl` 文件追加到 `files`（不递归）。
 fn push_jsonl_children(dir: &Path, files: &mut Vec<PathBuf>) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                files.push(path);
-            }
+    for path in cached_directory_children(dir) {
+        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            files.push(path);
         }
     }
+}
+
+#[derive(Clone)]
+struct CachedDirectoryChildren {
+    modified: i64,
+    length: u64,
+    children: Vec<PathBuf>,
+}
+
+static CLAUDE_DIRECTORY_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedDirectoryChildren>>> =
+    OnceLock::new();
+
+/// Directory membership changes are much less frequent than session polls.
+/// Reuse the discovered child paths while the directory metadata is stable.
+/// Individual JSONL files still pass through `FileRevision`, so edits inside a
+/// stable directory remain visible to the incremental parser.
+fn cached_directory_children(dir: &Path) -> Vec<PathBuf> {
+    let metadata = match fs::metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(_) => return Vec::new(),
+    };
+    let modified = metadata_modified_nanos(&metadata);
+    let length = metadata.len();
+    let cache = CLAUDE_DIRECTORY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = cache.get(dir) {
+        if cached.modified == modified && cached.length == length {
+            return cached.children.clone();
+        }
+    }
+    #[cfg(test)]
+    CLAUDE_DIRECTORY_READS.with(|count| count.set(count.get() + 1));
+    let children: Vec<PathBuf> = match fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().map(|entry| entry.path()).collect(),
+        Err(_) => return Vec::new(),
+    };
+    if cache.len() >= 2048 {
+        cache.clear();
+    }
+    cache.insert(
+        dir.to_path_buf(),
+        CachedDirectoryChildren {
+            modified,
+            length,
+            children: children.clone(),
+        },
+    );
+    children
 }
 
 #[derive(Debug, Default)]
@@ -319,6 +379,13 @@ struct ClaudeFileSync {
 }
 
 const CLAUDE_TAIL_FINGERPRINT_BYTES: i64 = 4096;
+
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_TAIL_READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CLAUDE_PARSED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CLAUDE_DIRECTORY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 fn claude_tail_fingerprint(tail: &[u8]) -> i64 {
     let mut hasher = Sha256::new();
@@ -340,6 +407,8 @@ fn read_claude_tail_before(file: &mut fs::File, end: i64) -> Result<Vec<u8>, App
         file.read_exact(&mut tail)
             .map_err(|e| AppError::Config(format!("无法读取 Claude 游标边界尾部: {e}")))?;
     }
+    #[cfg(test)]
+    CLAUDE_TAIL_READ_BYTES.with(|count| count.set(count.get() + tail.len()));
     Ok(tail)
 }
 
@@ -359,25 +428,34 @@ fn push_claude_committed_tail(tail: &mut Vec<u8>, bytes: &[u8]) {
 fn sync_single_file(
     db: &Database,
     file_path: &Path,
-    cursor: Option<&ClaudeSyncCursor>,
+    cursor: Option<&SessionSyncCursor>,
 ) -> Result<ClaudeFileSync, AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    let metadata = fs::metadata(file_path)
+    let mut file =
+        fs::File::open(file_path).map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
+    let metadata = file
+        .metadata()
         .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
     let file_modified = metadata_modified_nanos(&metadata);
     let file_size = metadata.len() as i64;
+    let revision = FileRevision::from_file_metadata(&file, &metadata);
+    let revision_fingerprint = revision.map(|revision| revision.fingerprint());
 
     let last_modified = cursor.map_or(0, |value| value.last_modified);
     let last_byte_offset = cursor.and_then(|value| value.last_byte_offset);
     let last_fingerprint = cursor.and_then(|value| value.last_tail_fingerprint);
 
-    if file_modified <= last_modified {
-        return Ok(ClaudeFileSync::default());
+    if let Some(cursor) =
+        cursor.filter(|cursor| cursor.matches_source_revision(revision_fingerprint, file_modified))
+    {
+        return Ok(ClaudeFileSync {
+            incomplete_tail: cursor
+                .last_byte_offset
+                .is_some_and(|offset| offset < file_size),
+            ..Default::default()
+        });
     }
-
-    let mut file =
-        fs::File::open(file_path).map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
 
     let (start_byte, legacy_lines, mut tail_bytes) = match last_byte_offset {
         Some(offset) => {
@@ -399,18 +477,30 @@ fn sync_single_file(
                 );
                 let tail = read_claude_tail_before(&mut file, file_size)?;
                 let fingerprint = claude_tail_fingerprint(&tail);
+                if revision.is_some() && FileRevision::read(file_path) != revision {
+                    return Err(AppError::Config(
+                        "Claude session changed during read".into(),
+                    ));
+                }
                 let conn = lock_conn!(db.conn);
-                update_claude_sync_state_on_conn(
+                write_session_sync_cursor(
                     &conn,
                     &file_path_str,
-                    file_modified,
-                    file_size,
-                    Some(fingerprint),
+                    SessionSyncCursor {
+                        last_modified: file_modified,
+                        last_byte_offset: Some(file_size),
+                        last_tail_fingerprint: Some(fingerprint),
+                        last_source_revision: revision_fingerprint,
+                        ..Default::default()
+                    },
                 )?;
                 return Ok(ClaudeFileSync {
                     pinned_rewrite: Some(reason),
                     ..Default::default()
                 });
+            }
+            if revision.is_none() && offset == file_size && file_modified <= last_modified {
+                return Ok(ClaudeFileSync::default());
             }
             (offset, 0, seed.unwrap_or_default())
         }
@@ -466,6 +556,8 @@ fn sync_single_file(
             continue;
         }
 
+        #[cfg(test)]
+        CLAUDE_PARSED_BYTES.with(|count| count.set(count.get() + buffer.len()));
         let value: serde_json::Value = match serde_json::from_slice(&buffer) {
             Ok(v) => v,
             Err(_) => continue,
@@ -554,6 +646,11 @@ fn sync_single_file(
         }
     }
 
+    if revision.is_some() && FileRevision::read(file_path) != revision {
+        return Err(AppError::Config(
+            "Claude session changed during read".into(),
+        ));
+    }
     let mut imported: u32 = 0;
     let mut skipped: u32 = 0;
     let conn = lock_conn!(db.conn);
@@ -605,12 +702,16 @@ fn sync_single_file(
         file_modified
     };
     let fingerprint = claude_tail_fingerprint(&tail_bytes);
-    update_claude_sync_state_on_conn(
+    write_session_sync_cursor(
         &tx,
         &file_path_str,
-        stamped_modified,
-        committed_offset,
-        Some(fingerprint),
+        SessionSyncCursor {
+            last_modified: stamped_modified,
+            last_byte_offset: Some(committed_offset),
+            last_tail_fingerprint: Some(fingerprint),
+            last_source_revision: revision_fingerprint.filter(|_| read_error.is_none()),
+            ..Default::default()
+        },
     )?;
     tx.commit()
         .map_err(|e| AppError::Database(format!("提交 Claude 会话用量导入事务失败: {e}")))?;
@@ -624,12 +725,10 @@ fn sync_single_file(
     })
 }
 
-fn update_claude_sync_state_on_conn(
+pub(crate) fn write_session_sync_cursor(
     conn: &rusqlite::Connection,
     file_path: &str,
-    last_modified: i64,
-    byte_offset: i64,
-    tail_fingerprint: Option<i64>,
+    cursor: SessionSyncCursor,
 ) -> Result<(), AppError> {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -639,25 +738,27 @@ fn update_claude_sync_state_on_conn(
     conn.prepare_cached(
         "INSERT OR REPLACE INTO session_log_sync
              (file_path, last_modified, last_line_offset, last_synced_at, last_byte_offset,
-              last_tail_fingerprint)
-         VALUES (?1, ?2, 0, ?3, ?4, ?5)",
+              last_tail_fingerprint, last_source_revision, deferred_until)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )
     .and_then(|mut statement| {
         statement.execute(rusqlite::params![
             file_path,
-            last_modified,
+            cursor.last_modified,
+            cursor.last_line_offset,
             now,
-            byte_offset,
-            tail_fingerprint
+            cursor.last_byte_offset,
+            cursor.last_tail_fingerprint,
+            cursor.last_source_revision,
+            cursor.deferred_until
         ])
     })
-    .map_err(|e| AppError::Database(format!("更新 Claude 同步状态失败: {e}")))?;
+    .map_err(|e| AppError::Database(format!("更新会话同步状态失败: {e}")))?;
     Ok(())
 }
 
-/// 获取 session_log_sync 表中某条目的同步进度。
-///
-/// Shared by all session_usage_* parsers.
+/// Read the legacy progress fields in import regressions.
+#[cfg(test)]
 pub(crate) fn get_sync_state(db: &Database, file_path: &str) -> Result<(i64, i64), AppError> {
     let conn = lock_conn!(db.conn);
     let result = conn.query_row(
@@ -893,7 +994,7 @@ mod tests {
     }
 
     fn sync_claude_test_file(db: &Database, path: &Path) -> Result<ClaudeFileSync, AppError> {
-        let cursors = load_claude_sync_cursors(db)?;
+        let cursors = load_session_sync_cursors(db, [path.to_string_lossy().into_owned()])?;
         let cursor = cursors.get(path.to_string_lossy().as_ref()).copied();
         sync_single_file(db, path, cursor.as_ref())
     }
@@ -1074,6 +1175,41 @@ mod tests {
     }
 
     #[test]
+    fn collect_jsonl_files_reuses_unchanged_directory_listings() {
+        let tmp = std::env::temp_dir().join(format!("cc-switch-test-{}", uuid::Uuid::new_v4()));
+        let project = tmp.join("project");
+        let session_dir = project.join("session");
+        let subagents_dir = session_dir.join("subagents");
+        let workflow_dir = subagents_dir.join("workflows").join("wf_test");
+        fs::create_dir_all(&workflow_dir).unwrap();
+        fs::write(project.join("main.jsonl"), "{}\n").unwrap();
+        fs::write(subagents_dir.join("agent.jsonl"), "{}\n").unwrap();
+        fs::write(workflow_dir.join("agent.jsonl"), "{}\n").unwrap();
+
+        CLAUDE_DIRECTORY_READS.with(|count| count.set(0));
+        let first = collect_jsonl_files(&tmp);
+        let first_reads = CLAUDE_DIRECTORY_READS.with(std::cell::Cell::get);
+        let second = collect_jsonl_files(&tmp);
+        let second_reads = CLAUDE_DIRECTORY_READS.with(std::cell::Cell::get) - first_reads;
+
+        assert_eq!(first.len(), 3);
+        assert_eq!(second, first);
+        assert_eq!(first_reads, 6);
+        assert_eq!(second_reads, 0);
+
+        fs::write(project.join("new-session.jsonl"), "{}\n").unwrap();
+        let third = collect_jsonl_files(&tmp);
+        assert_eq!(
+            third.len(),
+            4,
+            "new files must invalidate the directory cache"
+        );
+        assert!(third.iter().any(|path| path.ends_with("new-session.jsonl")));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
     fn test_collect_jsonl_files_includes_workflow_subagents() {
         // Claude Code Workflow 把子 agent transcript 嵌在
         // 项目/SESSION_ID/subagents/workflows/wf_<ID>/ 下，比普通子 agent 深一层。
@@ -1179,6 +1315,48 @@ mod tests {
     }
 
     #[test]
+    fn upstream_session_cursor_unchanged_incomplete_tail_does_no_content_work(
+    ) -> Result<(), AppError> {
+        let temp = tempfile::tempdir().unwrap();
+        for padding in [16, 256 * 1024] {
+            let db = Database::memory()?;
+            let path = temp.path().join(format!("session-{padding}.jsonl"));
+            let first = upstream_session_cursor_assistant_line("msg_first", 4);
+            let pending = upstream_session_cursor_assistant_line("msg_pending", 6);
+            let prefix = format!("{first}\n");
+            let incomplete = format!(r#"{{"padding":"{}","#, "x".repeat(padding));
+            let rest = pending.strip_prefix('{').unwrap();
+            fs::write(&path, format!("{prefix}{incomplete}")).unwrap();
+            if FileRevision::read(&path).is_none() {
+                continue;
+            }
+            assert_eq!(sync_claude_test_file(&db, &path)?.imported, 1);
+            CLAUDE_TAIL_READ_BYTES.with(|count| count.set(0));
+            CLAUDE_PARSED_BYTES.with(|count| count.set(0));
+
+            for _ in 0..8 {
+                let sync = sync_claude_test_file(&db, &path)?;
+                assert_eq!((sync.imported, sync.skipped), (0, 0));
+                assert!(sync.incomplete_tail);
+            }
+            assert_eq!(CLAUDE_TAIL_READ_BYTES.with(std::cell::Cell::get), 0);
+            assert_eq!(CLAUDE_PARSED_BYTES.with(std::cell::Cell::get), 0);
+
+            let suffix = format!("{incomplete}{rest}\n");
+            fs::write(&path, format!("{prefix}{suffix}")).unwrap();
+            let sync = sync_claude_test_file(&db, &path)?;
+            assert_eq!((sync.imported, sync.skipped), (1, 0));
+            assert!(!sync.incomplete_tail);
+            assert_eq!(
+                CLAUDE_TAIL_READ_BYTES.with(std::cell::Cell::get),
+                prefix.len()
+            );
+            assert_eq!(CLAUDE_PARSED_BYTES.with(std::cell::Cell::get), suffix.len());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn upstream_session_cursor_rewrite_with_growth_does_not_import_rewritten_range(
     ) -> Result<(), AppError> {
         let db = Database::memory()?;
@@ -1214,6 +1392,38 @@ mod tests {
         assert_eq!(rewrite_sync.pinned_rewrite, Some("重写"));
 
         fs::remove_dir_all(&tmp).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_session_cursor_equal_timestamp_keeps_append_and_rewrite_recovery(
+    ) -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let original = upstream_session_cursor_assistant_line("msg_old", 5);
+        let appended = upstream_session_cursor_assistant_line("msg_app", 6);
+        fs::write(&path, format!("{original}\n")).unwrap();
+        let stamp = fs::metadata(&path).unwrap().modified().unwrap();
+        let restore_stamp = || {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(stamp))
+                .unwrap();
+        };
+        assert_eq!(sync_claude_test_file(&db, &path)?.imported, 1);
+        fs::write(&path, format!("{original}\n{appended}\n")).unwrap();
+        restore_stamp();
+        let next = sync_claude_test_file(&db, &path)?;
+        assert_eq!((next.imported, next.skipped), (1, 0));
+        let rewritten = upstream_session_cursor_assistant_line("msg_new", 7);
+        fs::write(&path, format!("{original}\n{rewritten}\n")).unwrap();
+        restore_stamp();
+        let next = sync_claude_test_file(&db, &path)?;
+        assert_eq!(next.imported, 0);
+        assert_eq!(next.pinned_rewrite, Some("重写"));
         Ok(())
     }
 
@@ -1265,7 +1475,7 @@ mod tests {
         let first = sync_claude_test_file(&db, &file)?;
         assert_eq!(first.imported, 1);
         assert!(first.incomplete_tail);
-        let cursor = load_claude_sync_cursors(&db)?
+        let cursor = load_session_sync_cursors(&db, [file.to_string_lossy().into_owned()])?
             .get(file.to_string_lossy().as_ref())
             .copied()
             .expect("Claude cursor");
@@ -1313,7 +1523,7 @@ mod tests {
         let truncated = sync_claude_test_file(&db, &file)?;
         assert_eq!(truncated.imported, 0);
         assert_eq!(truncated.pinned_rewrite, Some("截断"));
-        let pinned_offset = load_claude_sync_cursors(&db)?
+        let pinned_offset = load_session_sync_cursors(&db, [file.to_string_lossy().into_owned()])?
             .get(file.to_string_lossy().as_ref())
             .and_then(|cursor| cursor.last_byte_offset);
         assert_eq!(pinned_offset, Some(3));

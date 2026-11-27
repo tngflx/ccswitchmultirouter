@@ -3,6 +3,7 @@
 
 use crate::{error::AppError, provider::Provider};
 use serde_json::Value;
+use std::sync::OnceLock;
 
 const OFFICIAL_CONTEXT_DEFAULTS: &str =
     include_str!("../../src/config/codexOfficialContextDefaults.json");
@@ -65,7 +66,10 @@ fn upstream_id(entry: &Value) -> Option<&str> {
 /// This registry contains verified native defaults only. Published API specs
 /// are display references and must not authorize ChatGPT account enlargement.
 pub(crate) fn official_default_context_window(model: &str) -> Option<u64> {
-    let defaults: Value = serde_json::from_str(OFFICIAL_CONTEXT_DEFAULTS).ok()?;
+    static DEFAULTS: OnceLock<Option<Value>> = OnceLock::new();
+    let defaults = DEFAULTS
+        .get_or_init(|| serde_json::from_str(OFFICIAL_CONTEXT_DEFAULTS).ok())
+        .as_ref()?;
     defaults
         .get("models")?
         .as_array()?
@@ -175,6 +179,15 @@ pub(crate) struct TrustedOfficialModel {
 }
 
 pub(crate) fn trusted_official_models(provider: &Provider) -> Vec<TrustedOfficialModel> {
+    trusted_official_models_from(provider, || {
+        crate::codex_config::codex_official_models_snapshot().unwrap_or_default()
+    })
+}
+
+pub(crate) fn trusted_official_models_from<T: AsRef<[Value]>>(
+    provider: &Provider,
+    official_models: impl FnOnce() -> T,
+) -> Vec<TrustedOfficialModel> {
     if !crate::codex_config::codex_provider_record_is_official(provider) {
         return Vec::new();
     }
@@ -191,19 +204,14 @@ pub(crate) fn trusted_official_models(provider: &Provider) -> Vec<TrustedOfficia
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    models.extend(
-        crate::codex_config::codex_official_models_cache()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|entry| {
-                Some(TrustedOfficialModel {
-                    id: model_id(entry)?.to_string(),
-                    default: context_window(entry),
-                    account_maximum: None,
-                    source: "official_directory",
-                })
-            }),
-    );
+    models.extend(official_models().as_ref().iter().filter_map(|entry| {
+        Some(TrustedOfficialModel {
+            id: model_id(entry)?.to_string(),
+            default: context_window(entry),
+            account_maximum: None,
+            source: "official_directory",
+        })
+    }));
     models
 }
 
@@ -216,7 +224,7 @@ fn trusted_model<'a>(
         .find(|entry| entry.id.eq_ignore_ascii_case(model.trim()))
 }
 
-fn resolved_from_models(
+pub(crate) fn resolved_from_models(
     model: &str,
     row_max: Option<u64>,
     models: &[TrustedOfficialModel],
@@ -236,17 +244,6 @@ fn resolved_from_models(
         maximum.map_or(default, |maximum| default.min(maximum)),
         source,
     ))
-}
-
-pub(crate) fn resolved_official_context_window(
-    provider: &Provider,
-    model: &str,
-    row_max: Option<u64>,
-) -> Option<(u64, &'static str)> {
-    if !crate::codex_config::codex_provider_record_is_official(provider) {
-        return None;
-    }
-    resolved_from_models(model, row_max, &trusted_official_models(provider))
 }
 
 pub(crate) fn apply_official_context_defaults(provider: &Provider, settings: &mut Value) {
@@ -289,14 +286,26 @@ pub(crate) fn validate_official_context_changes(
     previous: Option<&Provider>,
     models: &[TrustedOfficialModel],
 ) -> Result<(), AppError> {
+    validate_official_context_rows(
+        provider,
+        previous,
+        crate::codex_multirouter::catalog::provider_catalog_models(provider).unwrap_or_default(),
+        models,
+    )
+}
+
+pub(crate) fn validate_official_context_rows(
+    provider: &Provider,
+    previous: Option<&Provider>,
+    rows: &[Value],
+    models: &[TrustedOfficialModel],
+) -> Result<(), AppError> {
     if !crate::codex_config::codex_provider_record_is_official(provider) {
         return Ok(());
     }
     let provider_window =
         checked_context_window(&provider.settings_config, PROVIDER_CONTEXT_FIELDS)?;
-    for entry in crate::codex_multirouter::catalog::catalog_models(&provider.settings_config)
-        .unwrap_or_default()
-    {
+    for entry in rows {
         let row_window = checked_context_window(entry, MODEL_CONTEXT_FIELDS)?;
         // An invalid editable maximum must not silently disappear and become
         // an unrestricted context declaration through another alias.
@@ -311,8 +320,8 @@ pub(crate) fn validate_official_context_changes(
         let unchanged = previous.is_some_and(|previous| {
             crate::codex_config::codex_provider_record_is_official(previous)
                 && official_auth_binding_matches(provider, previous)
-                && crate::codex_multirouter::catalog::catalog_models(&previous.settings_config)
-                    .is_some_and(|models| {
+                && crate::codex_multirouter::catalog::provider_catalog_models(previous).is_some_and(
+                    |models| {
                         models.iter().any(|prior| {
                             model_id(prior) == Some(model)
                                 && upstream_id(prior).unwrap_or(model) == upstream
@@ -325,7 +334,8 @@ pub(crate) fn validate_official_context_changes(
                                     )
                                 }) == Some(window)
                         })
-                    })
+                    },
+                )
         });
         if unchanged {
             continue;

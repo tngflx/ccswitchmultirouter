@@ -715,6 +715,95 @@ fn image_edits_v2_explicit_third_party_image_route_is_not_hijacked() {
     );
 }
 
+#[test]
+fn codex_images_text_and_external_models_share_the_sqlite_route_plan() {
+    for catalog_size in [1, 128] {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let router = v2_router(
+            json!([
+                v2_route(
+                    "image-api",
+                    "image-target",
+                    json!({"mode": "all"}),
+                    "provider_config"
+                ),
+                v2_route(
+                    "official",
+                    "codex-official",
+                    json!({"mode": "all"}),
+                    "managed_codex_oauth"
+                )
+            ]),
+            "image-api",
+        );
+        let mut image_target = v2_target_provider(
+            "image-target",
+            "openai_responses",
+            json!([{"model": "gpt-image-2"}]),
+        );
+        let official_models = (0..catalog_size)
+            .map(|index| json!({"model": format!("gpt-5-fixture-{index}")}))
+            .collect::<Vec<_>>();
+        let official = managed_oauth_official_provider("codex-official", json!(official_models));
+        for provider in [&router, &image_target, &official] {
+            db.save_provider("codex", provider).expect("save provider");
+        }
+        let state = build_state(db.clone());
+        let profile = ExternalOpenAiApiProfile {
+            backend_type: ExternalOpenAiApiBackendType::CodexRouterRoute,
+            provider_id: Some(router.id.clone()),
+            ..Default::default()
+        };
+        let image_body = json!({"model": "gpt-image-2", "prompt": "edit the image"});
+        let text_body = json!({"model": "gpt-5-fixture-0"});
+
+        for image_available in [true, false] {
+            if !image_available {
+                image_target.settings_config["modelCatalog"]["models"][0]["enabled"] =
+                    Value::Bool(false);
+                db.save_provider("codex", &image_target)
+                    .expect("exclude removed image model");
+            }
+            for _ in 0..3 {
+                let text =
+                    resolve_codex_v2_runtime_provider_from_db(&state, &router, &text_body, None)
+                        .expect("resolve text model")
+                        .expect("text route");
+                assert_eq!(text.settings_config["codexResolvedRouteId"], "official");
+
+                let image = resolve_codex_image_generation_provider(&state, &router, &image_body)
+                    .expect("resolve image provider");
+                if image_available {
+                    assert!(
+                        image.is_none(),
+                        "the exact third-party route owns the image model"
+                    );
+                } else {
+                    let fallback = image.expect("official image fallback after exclusion");
+                    assert_eq!(fallback.settings_config["codexResolvedRouteId"], "official");
+                    assert!(fallback
+                        .settings_config
+                        .get("codexResolvedUpstreamModelOverride")
+                        .is_none());
+                }
+
+                let models = external_openai_api_models_response(&state, &profile)
+                    .expect("list external models");
+                let entries = models["data"].as_array().expect("model entries");
+                assert_eq!(entries.len(), catalog_size + usize::from(image_available));
+                assert_eq!(
+                    entries.iter().any(|entry| entry["id"] == "gpt-image-2"),
+                    image_available
+                );
+            }
+            assert_eq!(
+                state.provider_router.codex_v2_compile_count(),
+                if image_available { 1 } else { 2 }
+            );
+        }
+    }
+}
+
 /// Without an enabled official route there is nothing to fall back to: the
 /// resolver must return `None` so the normal fail-closed routing decides.
 #[test]

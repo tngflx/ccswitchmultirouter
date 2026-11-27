@@ -1,6 +1,7 @@
-// The guardian samples the verified local app-server clients. A terminal snapshot
-// alone cannot establish that a session was running while we observed it.
+// Use exact running observations or the app server's durable unread turn
+// delivery. A terminal snapshot by itself cannot establish eligibility.
 const codexNativeUsageLimitPageSize = 32;
+const codexNativeUsageLimitMaxDiscoveryPages = 8;
 const codexNativeUsageLimitConcurrentReads = 8;
 // Return before the guardian's four-second CDP deadline.
 const codexNativeUsageLimitBridgeWaitMs = 3000;
@@ -67,6 +68,36 @@ const codexNativeUsageLimitActionIsCurrent = (threadId, evidence) =>
     evidence,
     readCodexOwnerUserActionEvidence(threadId),
   );
+
+const codexNativeUsageLimitUnreadActionAllows = (userAction, turn, turnId) => {
+  if (
+    [userAction.localMethod, userAction.persistedMethod].some(
+      (method) => method !== null && method !== "turn/start",
+    )
+  )
+    return false;
+  const actionAtMs = Math.max(
+    userAction.localAtMs ?? 0,
+    userAction.persistedAtMs ?? 0,
+  );
+  if (!actionAtMs) return true;
+  const startedAt = codexContinuationOwnData(turn, "startedAt");
+  if (!Number.isSafeInteger(startedAt) || startedAt <= 0) return false;
+  const startedAtMs = startedAt * 1000;
+  if (!Number.isSafeInteger(startedAtMs)) return false;
+  if (actionAtMs < startedAtMs) return true;
+  // The turn's seconds timestamp cannot order a same-second replacement.
+  // Server-generated UUIDv7 turn IDs carry millisecond precision.
+  if (
+    actionAtMs >= startedAtMs + 1000 ||
+    !/^[\da-f]{8}-[\da-f]{4}-7[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(
+      turnId,
+    )
+  )
+    return false;
+  const turnIdAtMs = Number.parseInt(turnId.slice(0, 13).replace("-", ""), 16);
+  return turnIdAtMs < startedAtMs + 1000 && actionAtMs < turnIdAtMs;
+};
 
 const codexNativeUsageLimitAcknowledgementIsCurrent = (
   threadId,
@@ -193,6 +224,12 @@ const codexNativeUsageLimitReadLoaded = async (scan, source) => {
       result.response,
       "data",
       codexNativeUsageLimitPageSize,
+      {
+        // Codex Desktop omits nextCursor on a terminal loaded-session page.
+        // The bounded page size and the cursor cycle guard still prevent
+        // unbounded history reads when the field is present.
+        allowMissingCursor: true,
+      },
     );
     for (let row = 0; row < page.length; row++) {
       const threadId = codexOwnerRemoteId(
@@ -202,13 +239,116 @@ const codexNativeUsageLimitReadLoaded = async (scan, source) => {
         throw new Error("Codex loaded-session binding is unavailable");
       threads.add(threadId);
     }
-    const nextCursor = codexContinuationOwnData(result.response, "nextCursor");
+    const nextCursor = codexContinuationPageCursor(result.response, true);
     if (cursors.has(nextCursor))
       throw new Error("Codex loaded-session cursor repeated");
     cursors.add(nextCursor);
     cursor = nextCursor;
   } while (cursor !== null);
   return threads;
+};
+
+const codexNativeUsageLimitReadPersisted = async (scan, source) => {
+  const threads = new Set();
+  const readStates = new Map();
+  const cursors = new Set();
+  let cursor = null;
+  for (let pageIndex = 0; ; pageIndex += 1) {
+    if (pageIndex >= codexNativeUsageLimitMaxDiscoveryPages)
+      throw new Error("Codex persisted-session discovery exceeded its bound");
+    let result;
+    try {
+      result = await readOwnedCodexContinuationRequest(
+        source.client,
+        "thread/list",
+        {
+          cursor,
+          limit: codexNativeUsageLimitPageSize,
+          sortKey: "updated_at",
+          sortDirection: "desc",
+          archived: false,
+          sourceKinds: ["appServer"],
+          modelProviders: [],
+        },
+      );
+    } catch (error) {
+      // Older app-server clients do not expose thread/list. The loaded-session
+      // source remains authoritative for those clients, so keep that scan
+      // usable while preserving strict validation for responses we received.
+      if (
+        error instanceof CodexContinuationReadUnavailable &&
+        error.message === "Codex thread/list could not be read" &&
+        pageIndex === 0
+      )
+        return { threads, readStates, complete: true };
+      throw error;
+    }
+    if (
+      !codexNativeUsageLimitScanIsCurrent(scan) ||
+      !codexNativeUsageLimitSourceIsCurrent(source) ||
+      result.request !== source.request
+    )
+      throw new Error("Codex persisted-session source changed");
+    const page = codexOwnerRemoteReadPage(
+      result.response,
+      "data",
+      codexNativeUsageLimitPageSize,
+      { allowMissingCursor: true },
+    );
+    let readStatesValue = codexContinuationOwnData(
+      result.response,
+      "readStates",
+    );
+    // Empty pages have no persisted rows to bind. Older app-server builds may
+    // omit the empty read-state map, so treat that shape as an empty map while
+    // still failing closed whenever rows need exact receipts.
+    if (readStatesValue === undefined && page.length === 0)
+      readStatesValue = {};
+    if (
+      !readStatesValue ||
+      typeof readStatesValue !== "object" ||
+      Array.isArray(readStatesValue)
+    )
+      throw new Error("Codex persisted-session read states are unavailable");
+    for (let row = 0; row < page.length; row += 1) {
+      const thread = codexContinuationOwnData(page.values, String(row));
+      const threadId = codexOwnerRemoteId(
+        codexContinuationOwnData(thread, "id"),
+      );
+      if (!threadId || threads.has(threadId))
+        throw new Error("Codex persisted-session binding is unavailable");
+      threads.add(threadId);
+      const receiptDescriptor = Object.getOwnPropertyDescriptor(
+        readStatesValue,
+        threadId,
+      );
+      if (receiptDescriptor && !Object.hasOwn(receiptDescriptor, "value"))
+        throw new Error("Codex persisted-session read state is unavailable");
+      const receipt = receiptDescriptor?.value;
+      const anchor = codexContinuationOwnData(receipt, "firstUnread");
+      const turnId = codexOwnerRemoteId(
+        codexContinuationOwnData(anchor, "turnId"),
+      );
+      const revision = codexContinuationOwnData(receipt, "revision");
+      if (
+        codexContinuationOwnData(anchor, "type") === "turn" &&
+        turnId &&
+        typeof revision === "string" &&
+        revision.length > 0 &&
+        revision.length <= 256
+      )
+        readStates.set(threadId, {
+          firstUnread: { type: "turn", turnId },
+          revision,
+        });
+    }
+    const nextCursor = codexContinuationPageCursor(result.response, true);
+    if (cursors.has(nextCursor))
+      throw new Error("Codex persisted-session cursor repeated");
+    cursors.add(nextCursor);
+    if (nextCursor === null) return { threads, readStates, complete: true };
+    cursor = nextCursor;
+  }
 };
 
 const codexNativeUsageLimitReadTurn = async (
@@ -218,14 +358,17 @@ const codexNativeUsageLimitReadTurn = async (
   previous,
   idlePeers,
   proxyHeads,
+  fallbackReadState,
 ) => {
   const userAction = captureCodexOwnerUserActionEvidence(threadId);
   if (!userAction) throw new Error("Codex user-action evidence is unavailable");
-  const { thread, request } = await readExactCodexContinuationThread(
-    source.client,
-    threadId,
-    false,
-  );
+  const { thread, request, unreadTurn } =
+    await readExactCodexContinuationThread(
+      source.client,
+      threadId,
+      false,
+      fallbackReadState,
+    );
   if (
     request !== source.request ||
     !codexNativeUsageLimitScanIsCurrent(scan) ||
@@ -244,6 +387,7 @@ const codexNativeUsageLimitReadTurn = async (
     return acknowledgement?.source === source ? acknowledgement : null;
   };
   if (
+    codexContinuationOwnData(thread, "archived") === true ||
     codexContinuationOwnData(thread, "ephemeral") === true ||
     codexContinuationOwnData(thread, "parentThreadId") != null ||
     codexContinuationOwnData(sessionSource, "subAgent") != null ||
@@ -283,16 +427,21 @@ const codexNativeUsageLimitReadTurn = async (
       userAction,
       previous,
       priorObservation,
+      unreadTurn,
       acknowledgedTurn,
       readAcknowledgement,
       proxyHeads,
     });
   const needsProxyHead =
     proxyHeads && status !== "notLoaded" && !scan.proxyWaitExpired;
+  const needsUnreadHead =
+    (status === "idle" || status === "systemError") &&
+    (unreadTurn || previous?.unreadRevision);
   if (
     status !== "active" &&
     (priorObservation == null || priorObservation.runningProof === false) &&
     acknowledgedTurn == null &&
+    !needsUnreadHead &&
     !needsProxyHead
   ) {
     idlePeers?.set(source, readLatestTurn);
@@ -310,6 +459,7 @@ const codexNativeUsageLimitReadLatestTurn = async ({
   userAction,
   previous,
   priorObservation,
+  unreadTurn,
   acknowledgedTurn,
   readAcknowledgement,
   proxyHeads,
@@ -360,7 +510,10 @@ const codexNativeUsageLimitReadLatestTurn = async ({
     throw new Error(
       "Codex thread evidence changed while reading the latest turn",
     );
-  const { values } = codexOwnerRemoteReadPage(page.response, "data", 1);
+  // This read only uses the newest turn and never follows the cursor.
+  const { values } = codexOwnerRemoteReadPage(page.response, "data", 1, {
+    allowMissingCursor: true,
+  });
   const turn = codexContinuationOwnData(values, "0");
   const turnId = codexOwnerRemoteId(codexContinuationOwnData(turn, "id"));
   const turnStatus = codexContinuationOwnData(turn, "status");
@@ -397,14 +550,6 @@ const codexNativeUsageLimitReadLatestTurn = async ({
     // Keep the count partial until the exact turn is readable or proof expires.
     return null;
   }
-  // The metadata and head can straddle a state change. Wait for the latest
-  // turn to agree with the thread's loaded activity before displacing proof.
-  if (
-    proxyHeads &&
-    status !== "notLoaded" &&
-    (status === "active") === (turnStatus === "inProgress")
-  )
-    proxyHeads.set(source, { turnId, userAction, readAtMs });
   if (matchedAcknowledgement)
     codexNativeUsageLimitAcknowledgements.delete(threadId);
   const modelEvidence = [
@@ -414,6 +559,24 @@ const codexNativeUsageLimitReadLatestTurn = async ({
     matchedAcknowledgement?.model,
   ];
   const model = modelEvidence.find((value) => value != null) ?? null;
+  const modelIsConsistent =
+    model?.toLowerCase() !== "unknown" &&
+    modelEvidence.every((value) => value == null || value === model);
+  const pendingStateIsClear =
+    modelIsConsistent && codexOwnerContinuationPendingStateIsClear(thread);
+  // The metadata and head can straddle a state change. Wait for the latest
+  // turn to agree with the thread's loaded activity before displacing proof.
+  if (
+    proxyHeads &&
+    status !== "notLoaded" &&
+    (status === "active") === (turnStatus === "inProgress")
+  )
+    proxyHeads.set(source, {
+      turnId,
+      userAction,
+      readAtMs,
+      settledCompleted: turnStatus === "completed" && pendingStateIsClear,
+    });
   const currentTurn = {
     source,
     threadId,
@@ -425,14 +588,10 @@ const codexNativeUsageLimitReadLatestTurn = async ({
   // A peer without running proof can verify the failure binding or contradict
   // it. Its terminal observation cannot qualify a turn on its own.
   const rejectedTurn = { ...currentTurn, runningProof: false };
-  if (
-    model?.toLowerCase() === "unknown" ||
-    modelEvidence.some((value) => value != null && value !== model)
-  )
+  if (!modelIsConsistent)
     return status === "active" && previous?.turnId === turnId
       ? { source, threadId, turnId }
       : rejectedTurn;
-  const pendingStateIsClear = codexOwnerContinuationPendingStateIsClear(thread);
   if (
     status === "active" &&
     turnStatus === "inProgress" &&
@@ -475,11 +634,58 @@ const codexNativeUsageLimitReadLatestTurn = async ({
   if (turnStatus !== "failed" && turnStatus !== "interrupted")
     return rejectedTurn;
   const error = codexContinuationOwnData(turn, "error");
-  if (!codexContinuationIsTemporaryUsageLimit(error)) return rejectedTurn;
-  if (status === "notLoaded" || !pendingStateIsClear)
-    return hasRunningProof ? currentTurn : rejectedTurn;
-  if (!hasRunningProof) return { ...rejectedTurn, settledUsageLimit: true };
+  if (!codexContinuationIsUsageLimitInterruption(error)) return rejectedTurn;
+  const eligibleUnreadTurn =
+    unreadTurn?.turnId === turnId &&
+    codexNativeUsageLimitUnreadActionAllows(userAction, turn, turnId);
+  if (status === "notLoaded" && !pendingStateIsClear)
+    return hasRunningProof && eligibleUnreadTurn ? currentTurn : rejectedTurn;
+  if (status === "notLoaded" && !eligibleUnreadTurn)
+    // Keep exact running proof across renderer eviction without publishing a
+    // candidate until a durable unread receipt verifies the failed turn.
+    return hasRunningProof
+      ? { ...currentTurn, observedAtMs: undefined }
+      : rejectedTurn;
+  if (status === "notLoaded" && !hasRunningProof) {
+    if (!eligibleUnreadTurn)
+      return {
+        ...rejectedTurn,
+        settledUsageLimit:
+          !previous?.unreadRevision || previous.turnId !== turnId,
+      };
+    const verifiedAtMs = Date.now();
+    return {
+      ...rejectedTurn,
+      unreadRevision: unreadTurn.revision,
+      observedAtMs:
+        priorObservation?.turnId === turnId &&
+        priorObservation.unreadRevision === unreadTurn.revision
+          ? (priorObservation.observedAtMs ?? verifiedAtMs)
+          : verifiedAtMs,
+      verifiedAtMs,
+    };
+  }
+  if (!pendingStateIsClear) return hasRunningProof ? currentTurn : rejectedTurn;
   const verifiedAtMs = Date.now();
+  if (!hasRunningProof) {
+    if (!eligibleUnreadTurn)
+      return {
+        ...rejectedTurn,
+        settledUsageLimit:
+          !previous?.unreadRevision || previous.turnId !== turnId,
+      };
+    return {
+      ...rejectedTurn,
+      unreadRevision: unreadTurn.revision,
+      observedAtMs:
+        priorObservation?.turnId === turnId &&
+        priorObservation.unreadRevision === unreadTurn.revision
+          ? (priorObservation.observedAtMs ?? verifiedAtMs)
+          : verifiedAtMs,
+      verifiedAtMs,
+    };
+  }
+  if (status === "notLoaded" && !eligibleUnreadTurn) return rejectedTurn;
   return {
     ...currentTurn,
     observedAtMs: previousTurn?.observedAtMs ?? verifiedAtMs,
@@ -495,13 +701,11 @@ const readCodexNativeUsageLimitMarkers = () => {
   }
 };
 
-const codexNativeUsageLimitBindingForThread = (
+const codexNativeUsageLimitStoredBindingForThread = (
   threadId,
   now,
   readMarkers = readCodexNativeUsageLimitMarkers,
 ) => {
-  if (codexNativeUsageLimitScan?.pendingSharedThreads?.has(threadId))
-    return null;
   const observations = codexNativeUsageLimitTurns.get(threadId);
   if (!observations) return null;
   let candidate;
@@ -564,6 +768,59 @@ const codexNativeUsageLimitBindingForThread = (
   return { candidate };
 };
 
+const codexNativeUsageLimitBindingForThread = (threadId, now, readMarkers) =>
+  codexNativeUsageLimitScan?.pendingSharedThreads?.has(threadId)
+    ? null
+    : codexNativeUsageLimitStoredBindingForThread(threadId, now, readMarkers);
+
+const codexNativeUsageLimitPendingVerification = (
+  threadId,
+  turnId,
+  model,
+  observedAtMs,
+  client,
+) => {
+  const scan = codexNativeUsageLimitScan;
+  if (
+    !scan?.pendingSharedThreads?.has(threadId) ||
+    !codexNativeUsageLimitScanIsCurrent(scan)
+  )
+    return;
+  const candidate = codexNativeUsageLimitStoredBindingForThread(
+    threadId,
+    Date.now(),
+  )?.candidate;
+  // Only use prior evidence to wait for work already in flight. The caller
+  // must check the reconciled observation again before any continuation.
+  if (
+    !candidate ||
+    candidate.turnId !== turnId ||
+    candidate.observedAtMs !== observedAtMs ||
+    (candidate.model !== null && candidate.model !== model) ||
+    (client && candidate.source.client !== client)
+  )
+    return;
+
+  const waiters = scan.sharedThreadWaiters;
+  const existing = waiters.get(threadId);
+  if (existing) return existing.promise;
+  let resolve;
+  const promise = new Promise((finish) => {
+    resolve = finish;
+  });
+  const settle = (reviewed) => {
+    clearTimeout(timer);
+    waiters.delete(threadId);
+    resolve(reviewed);
+  };
+  const timer = setTimeout(
+    () => settle(false),
+    codexNativeUsageLimitBridgeWaitMs,
+  );
+  waiters.set(threadId, { promise, settle });
+  return promise;
+};
+
 const projectCodexNativeUsageLimitCandidate = ({
   threadId,
   turnId,
@@ -577,17 +834,40 @@ state.getCodexNativeUsageLimitCandidate = (threadId, turnId, client) => {
     threadId,
     Date.now(),
   )?.candidate;
-  return candidate &&
-    candidate.turnId === turnId &&
-    (!client || candidate.source.client === client)
-    ? projectCodexNativeUsageLimitCandidate(candidate)
-    : null;
+  if (
+    !candidate ||
+    candidate.turnId !== turnId ||
+    (client && candidate.source.client !== client)
+  )
+    return null;
+  const projection = projectCodexNativeUsageLimitCandidate(candidate);
+  return candidate.unreadRevision
+    ? { ...projection, unreadRevision: candidate.unreadRevision }
+    : projection;
+};
+
+const invalidateCodexNativeUsageLimitUnreadObservation = (
+  client,
+  { threadId, turnId, unreadRevision, observedAtMs },
+) => {
+  const observations = codexNativeUsageLimitTurns.get(threadId);
+  const source = codexNativeUsageLimitSources.get(client);
+  const current = observations?.get(source);
+  if (
+    current?.turnId !== turnId ||
+    current.observedAtMs !== observedAtMs ||
+    current.unreadRevision !== unreadRevision
+  )
+    return;
+  observations.delete(source);
+  if (!observations.size) codexNativeUsageLimitTurns.delete(threadId);
 };
 
 const codexNativeUsageLimitStaleProxyTurns = (
   scan,
   proxyTurnsByThread,
   now,
+  complete,
 ) => {
   const stale = [];
   for (const [threadId, proxyTurns] of proxyTurnsByThread) {
@@ -597,6 +877,7 @@ const codexNativeUsageLimitStaleProxyTurns = (
     const first = heads.values().next().value;
     let earliestReadAtMs = first.readAtMs;
     let agreed = true;
+    let allSettledCompleted = complete;
     for (const [source, head] of heads) {
       if (
         head.turnId !== first.turnId ||
@@ -609,6 +890,7 @@ const codexNativeUsageLimitStaleProxyTurns = (
         break;
       }
       earliestReadAtMs = Math.min(earliestReadAtMs, head.readAtMs);
+      allSettledCompleted &&= head.settledCompleted;
     }
     if (!agreed) continue;
     const ownerActionAtMs = Math.max(
@@ -625,7 +907,9 @@ const codexNativeUsageLimitStaleProxyTurns = (
             scanned.turnId === proxy.turnId &&
             scanned.observedAtMs === proxy.observedAtMs,
         ) &&
-        (proxy.turnId !== first.turnId || ownerActionAtMs > proxy.observedAtMs)
+        (proxy.turnId !== first.turnId ||
+          ownerActionAtMs > proxy.observedAtMs ||
+          allSettledCompleted)
       )
         stale.push(proxy);
     }
@@ -638,6 +922,8 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
   try {
     const acknowledgements = new Map(codexNativeUsageLimitAcknowledgements);
     const loadedBySource = new Map();
+    const persistedBySource = new Map();
+    const readStatesBySource = new Map();
     for (
       let index = 0;
       index < sources.length && codexNativeUsageLimitScanIsCurrent(scan);
@@ -648,23 +934,42 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
         index + codexNativeUsageLimitConcurrentReads,
       );
       const results = await Promise.all(
-        batch.map((source) =>
-          codexNativeUsageLimitReadLoaded(scan, source).catch(() => null),
-        ),
+        batch.map(async (source) => {
+          const [loaded, persisted] = await Promise.all([
+            codexNativeUsageLimitReadLoaded(scan, source).catch(() => null),
+            codexNativeUsageLimitReadPersisted(scan, source).catch(() => null),
+          ]);
+          return { loaded, persisted };
+        }),
       );
-      batch.forEach((source, offset) =>
-        loadedBySource.set(source, results[offset]),
-      );
+      batch.forEach((source, offset) => {
+        const { loaded, persisted } = results[offset];
+        loadedBySource.set(source, loaded);
+        persistedBySource.set(source, persisted?.threads ?? null);
+        readStatesBySource.set(source, persisted?.readStates ?? null);
+      });
     }
     if (!codexNativeUsageLimitScanIsCurrent(scan)) return false;
     const threadSources = new Map();
     let allThreadsRead = true;
-    for (const [source, loaded] of loadedBySource) {
-      if (!loaded) {
+    for (const source of sources) {
+      const loaded = loadedBySource.get(source);
+      const persisted = persistedBySource.get(source);
+      if (!loaded && !persisted) {
         allThreadsRead = false;
         continue;
       }
-      for (const threadId of loaded) {
+      if (!loaded || !persisted) allThreadsRead = false;
+      const discovered = new Set(loaded ?? []);
+      // Persisted rows matter for recovery when a renderer has evicted the
+      // session from its loaded list. Only an exact unread receipt can make
+      // such a row eligible, so avoid binding every persisted session to
+      // every overlapping renderer.
+      const readStates = readStatesBySource.get(source);
+      for (const threadId of persisted ?? []) {
+        if (readStates?.has(threadId)) discovered.add(threadId);
+      }
+      for (const threadId of discovered) {
         // Loaded thread IDs alone cannot identify an app-server connection.
         if (!threadSources.has(threadId))
           threadSources.set(threadId, new Set());
@@ -794,6 +1099,7 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
                   previous?.get(source),
                   idlePeers,
                   proxyHeads,
+                  readStatesBySource.get(source)?.get(threadId),
                 ),
               );
               if (!codexNativeUsageLimitScanIsCurrent(scan)) return;
@@ -828,7 +1134,9 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
             }
             if (
               !Array.from(observations.values()).some(
-                (turn) => !turn.readFailed && turn.runningProof !== false,
+                (turn) =>
+                  !turn.readFailed &&
+                  (turn.runningProof !== false || turn.observedAtMs),
               )
             ) {
               // Once no source has running proof, an old terminal read has
@@ -845,6 +1153,7 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
             if (proxyHeads?.size === listedSources.size)
               scan.proxyHeads.set(threadId, proxyHeads);
             scan.pendingSharedThreads.delete(threadId);
+            scan.sharedThreadWaiters.get(threadId)?.settle(true);
           }
         },
       ),
@@ -873,6 +1182,9 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
       }
     }
     return false;
+  } finally {
+    for (const waiter of scan.sharedThreadWaiters.values())
+      waiter.settle(false);
   }
 };
 
@@ -913,6 +1225,7 @@ state.collectCodexNativeUsageLimitCandidates = async (proxyTurns = []) => {
       sources,
       generation: state.runtimeGeneration,
       threadSources: null,
+      sharedThreadWaiters: new Map(),
       invalidatedThreads: new Set(),
       proxyTurnsByThread,
       proxyHeads: new Map(),
@@ -920,6 +1233,15 @@ state.collectCodexNativeUsageLimitCandidates = async (proxyTurns = []) => {
     };
   }
   const scan = codexNativeUsageLimitScan;
+  // A proxy failure can be recorded after a native scan has started. Add
+  // newly observed threads to the in-flight scan so they receive a head read.
+  // Keep an already-sampled thread's original proxy binding until the next
+  // scan. Replacing it here would mark a changed request as stale before the
+  // native read that fenced the original binding has completed.
+  for (const [threadId, turns] of proxyTurnsByThread) {
+    if (!scan.proxyTurnsByThread.has(threadId))
+      scan.proxyTurnsByThread.set(threadId, turns);
+  }
   scan.finished ??= scanCodexNativeUsageLimitCandidates(scan);
   let timer;
   try {
@@ -966,7 +1288,12 @@ state.collectCodexNativeUsageLimitCandidates = async (proxyTurns = []) => {
       codexNativeUsageLimitCurrentSources().length === scan.sources.length;
     const complete = completed === true && sameSources;
     const staleProxyTurns = sameSources
-      ? codexNativeUsageLimitStaleProxyTurns(scan, proxyTurnsByThread, now)
+      ? codexNativeUsageLimitStaleProxyTurns(
+          scan,
+          proxyTurnsByThread,
+          now,
+          complete,
+        )
       : [];
     return {
       candidates,

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -15,13 +15,19 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::database::{Database, ProviderRevision};
+
 use super::providers::codex_terminal::{
-    classify_native_responses_terminal, is_retryable_usage_limit_payload, terminal_error_code,
-    terminal_error_code_from_body, NativeResponsesEvidence, NativeResponsesTerminalDisposition,
+    classify_native_responses_terminal, deferred_usage_limit_period, is_deferred_usage_limit,
+    is_retryable_usage_limit_payload, terminal_error_code, terminal_error_code_from_body,
+    terminal_error_payload, NativeResponsesEvidence, NativeResponsesTerminalDisposition,
 };
 use super::sse::strip_sse_field;
 
 const RECOVERY_STATE_TTL: Duration = Duration::from_secs(15 * 60);
+// Keep the crash snapshot inside the restore TTL for long-running work. All
+// active turns share this checkpoint and durable transitions reset the clock.
+const RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 // Permit a short gap between native snapshots without presenting an old
 // confirmation indefinitely if the renderer stops answering.
 const NATIVE_USAGE_LIMIT_CONFIRMATION_TTL: Duration = Duration::from_secs(30);
@@ -284,6 +290,34 @@ struct UsageLimitCandidate {
 }
 
 impl UsageLimitCandidate {
+    fn from_active_proxy_turn(
+        state: &RecoveryState,
+        context: &TurnRecoveryContext,
+        now: Instant,
+    ) -> Option<Self> {
+        if !context.desktop_eligible
+            || state.phase != RecoveryPhase::ActiveRequest
+            || state.tracked_epoch.as_deref() != Some(state.action_epoch.as_str())
+            || state.tracked.as_ref().is_none_or(|tracked| {
+                tracked.recovery_id != context.recovery_id
+                    || tracked.desktop_turn_id != context.desktop_turn_id
+            })
+        {
+            return None;
+        }
+        let turn = ObservedUsageLimitTurn {
+            thread_id: context.desktop_thread_id.clone(),
+            turn_id: context.desktop_turn_id.clone()?,
+            model: Some(context.desktop_model.clone()),
+            observed_at_ms: context.observed_at_ms,
+        };
+        turn.is_valid().then_some(Self {
+            turn,
+            proxy_observed_at: Some(now),
+            native_evidence: NativeUsageLimitEvidence::Absent,
+        })
+    }
+
     fn has_current_proxy_observation(&self, now: Instant) -> bool {
         self.proxy_observed_at
             .is_some_and(|observed| now.saturating_duration_since(observed) <= RECOVERY_STATE_TTL)
@@ -393,6 +427,7 @@ impl Default for RecoveryState {
 struct RecoveryStates {
     threads: HashMap<String, RecoveryState>,
     native_usage_limit_snapshot_completed_at: Option<Instant>,
+    last_persisted_at: Option<Instant>,
 }
 
 impl Deref for RecoveryStates {
@@ -410,6 +445,10 @@ impl DerefMut for RecoveryStates {
 }
 
 static RECOVERY_STATES: OnceLock<Mutex<RecoveryStates>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_PERSIST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 fn recovery_states() -> &'static Mutex<RecoveryStates> {
     RECOVERY_STATES.get_or_init(|| Mutex::new(RecoveryStates::default()))
@@ -624,7 +663,7 @@ fn reserve_continuation(
         .continuations
         .insert(operation_id.to_owned(), transaction);
     state.updated_at = Instant::now();
-    if !persist_states(&states) {
+    if !persist_states(&mut states) {
         return Err(OwnerContinuationError::StorageUnavailable);
     }
     Ok(OwnerContinuationReservation::Reserved(
@@ -681,7 +720,7 @@ pub(crate) fn authorize_owner_continuation_commit(operation: &OwnerContinuationO
 
 fn authorize_owner_continuation_commit_with(
     operation: &OwnerContinuationOperation,
-    persist: impl FnOnce(&HashMap<String, RecoveryState>) -> bool,
+    persist: impl FnOnce(&mut RecoveryStates) -> bool,
 ) -> bool {
     authorize_continuation_commit(operation, None, persist)
 }
@@ -689,7 +728,7 @@ fn authorize_owner_continuation_commit_with(
 fn authorize_continuation_commit(
     operation: &OwnerContinuationOperation,
     usage_limit: Option<&UsageLimitCandidate>,
-    persist: impl FnOnce(&HashMap<String, RecoveryState>) -> bool,
+    persist: impl FnOnce(&mut RecoveryStates) -> bool,
 ) -> bool {
     if !RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst) {
         return false;
@@ -719,7 +758,7 @@ fn authorize_continuation_commit(
     state.updated_at = Instant::now();
     // Do not roll back an uncertain durable-write failure to a replayable
     // reservation. A failed write positively prevents this caller from sending.
-    persist(&states)
+    persist(&mut states)
 }
 
 pub(crate) fn finish_owner_continuation(
@@ -775,7 +814,7 @@ pub(crate) fn finish_owner_continuation(
     }
     state.updated_at = Instant::now();
     let receipt = record.receipt();
-    if !persist_states(&states) && receipt.mutation_attempted {
+    if !persist_states(&mut states) && receipt.mutation_attempted {
         return fallback;
     }
     receipt
@@ -819,7 +858,7 @@ pub(crate) fn reconcile_owner_accepted_turn(
     record.budget_reconciled = true;
     state.submitted = 0;
     state.updated_at = Instant::now();
-    persist_states(&states)
+    persist_states(&mut states)
 }
 
 fn reserve_recovery(context: &TurnRecoveryContext) -> Option<u32> {
@@ -894,7 +933,7 @@ fn reserve_recovery(context: &TurnRecoveryContext) -> Option<u32> {
     state.commit_charged = false;
     state.updated_at = now;
     let attempt = state.submitted.saturating_add(1);
-    persist_states(&states).then_some(attempt)
+    persist_states(&mut states).then_some(attempt)
 }
 
 // Test-only simulation/cleanup. Runtime completions must carry their observed context.
@@ -909,11 +948,15 @@ pub(crate) fn mark_turn_completed(session_id: &str) {
                 states.remove(session_id);
             }
         }
-        persist_states(&states);
+        persist_states(&mut states);
     }
 }
 
 pub(crate) fn mark_observed_turn_completed(context: &TurnRecoveryContext) {
+    finish_observed_turn(context, false);
+}
+
+pub(super) fn finish_observed_turn(context: &TurnRecoveryContext, deferred_usage_limit: bool) {
     if let Ok(mut states) = recovery_states().lock() {
         let owned = states.get(&context.desktop_thread_id).is_some_and(|state| {
             state.phase != RecoveryPhase::AwaitingContinuation
@@ -925,7 +968,14 @@ pub(crate) fn mark_observed_turn_completed(context: &TurnRecoveryContext) {
         });
         if owned {
             let state = states.get_mut(&context.desktop_thread_id).unwrap();
-            if state.usage_limit.as_ref().is_some_and(|candidate| {
+            let candidate = if deferred_usage_limit {
+                UsageLimitCandidate::from_active_proxy_turn(state, context, Instant::now())
+            } else {
+                None
+            };
+            if let Some(candidate) = candidate {
+                state.usage_limit = Some(candidate);
+            } else if state.usage_limit.as_ref().is_some_and(|candidate| {
                 context.desktop_turn_id.as_deref() == Some(candidate.turn.turn_id.as_str())
             }) {
                 state.usage_limit = None;
@@ -934,7 +984,7 @@ pub(crate) fn mark_observed_turn_completed(context: &TurnRecoveryContext) {
             if state.continuations.is_empty() && state.usage_limit.is_none() {
                 states.remove(&context.desktop_thread_id);
             }
-            persist_states(&states);
+            persist_states(&mut states);
         }
     }
 }
@@ -951,7 +1001,7 @@ fn mark_observed_tool_step_completed(context: &TurnRecoveryContext) {
             {
                 state.phase = RecoveryPhase::ToolStepComplete;
                 state.updated_at = Instant::now();
-                persist_states(&states);
+                persist_states(&mut states);
             }
         }
     }
@@ -983,7 +1033,7 @@ fn retire_uninspectable_stream(context: &TurnRecoveryContext) {
             states.remove(&context.desktop_thread_id);
         }
     }
-    persist_states(&states);
+    persist_states(&mut states);
 }
 
 /// Every unproven user input is a new native action epoch. A literal continue
@@ -1006,7 +1056,7 @@ pub(crate) fn begin_turn(session_id: &str, preserve_spent_budget: bool) {
         } else {
             reset_automatic_state(state, !preserve_spent_budget);
         }
-        persist_states(&states);
+        persist_states(&mut states);
     }
 }
 
@@ -1037,7 +1087,7 @@ fn authorize_reserved_recovery(context: &TurnRecoveryContext) -> bool {
 
 fn authorize_reserved_recovery_with(
     context: &TurnRecoveryContext,
-    persist: impl FnOnce(&HashMap<String, RecoveryState>) -> bool,
+    persist: impl FnOnce(&mut RecoveryStates) -> bool,
 ) -> bool {
     if !RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst) {
         return false;
@@ -1065,7 +1115,7 @@ fn authorize_reserved_recovery_with(
     state.submitted = state.submitted.saturating_add(1);
     state.commit_charged = true;
     state.updated_at = Instant::now();
-    persist(&states)
+    persist(&mut states)
 }
 
 #[cfg(test)]
@@ -1111,7 +1161,7 @@ fn release_refused_recovery_commit(context: &TurnRecoveryContext) {
             state.commit_charged = false;
         }
         state.updated_at = Instant::now();
-        persist_states(&states);
+        persist_states(&mut states);
     }
 }
 
@@ -1153,7 +1203,7 @@ fn finish_reserved_recovery(context: &TurnRecoveryContext, submitted: bool) -> u
     state.reservation_intent = None;
     state.updated_at = Instant::now();
     let submitted = state.submitted;
-    persist_states(&states);
+    persist_states(&mut states);
     submitted
 }
 
@@ -1188,7 +1238,7 @@ fn cancel_reserved_recovery(context: &TurnRecoveryContext) {
             states.remove(&context.desktop_thread_id);
         }
     }
-    persist_states(&states);
+    persist_states(&mut states);
 }
 
 #[cfg(test)]
@@ -1245,7 +1295,7 @@ impl Drop for TrackedTurn {
                 if state.continuations.is_empty() {
                     states.remove(&self.context.desktop_thread_id);
                 }
-                persist_states(&states);
+                persist_states(&mut states);
             }
         }
     }
@@ -1278,7 +1328,7 @@ pub(crate) fn track_turn(context: &TurnRecoveryContext) -> TrackedTurn {
                 state.commit_charged = false;
                 state.phase = RecoveryPhase::ActiveRequest;
                 state.updated_at = Instant::now();
-                persist_states(&states);
+                persist_states(&mut states);
                 owns_state = true;
             }
         }
@@ -1294,18 +1344,14 @@ pub(crate) fn track_turn(context: &TurnRecoveryContext) -> TrackedTurn {
                     let Ok(mut states) = recovery_states().lock() else {
                         return;
                     };
-                    let Some(state) = states.get_mut(&heartbeat_context.desktop_thread_id) else {
-                        return;
-                    };
-                    if state.phase != RecoveryPhase::ActiveRequest
-                        || !state.tracked.as_ref().is_some_and(|tracked| {
-                            tracked.recovery_id == heartbeat_context.recovery_id
-                        })
-                    {
+                    if !refresh_recovery_lease(
+                        &mut states,
+                        &heartbeat_context,
+                        RecoveryPhase::ActiveRequest,
+                        Instant::now(),
+                    ) {
                         return;
                     }
-                    state.updated_at = Instant::now();
-                    persist_states(&states);
                 }
             })
         });
@@ -1385,11 +1431,15 @@ fn validate_ledger(ledger: &RecoveryLedger, config_scope: &str) -> bool {
 fn import_owner_continuations(ledger: &RecoveryLedger) {
     if let Ok(mut states) = recovery_states().lock() {
         for entry in &ledger.continuations {
+            if entry.transaction.status == OwnerContinuationStatus::Reserved {
+                // A reservation has no mutation evidence. It belongs to the
+                // previous process epoch and must not block a fresh native
+                // observation of the same deterministic thread/turn operation.
+                continue;
+            }
             let state = states.entry(entry.thread_id.clone()).or_default();
             let mut transaction = entry.transaction.clone();
             transaction.status = match transaction.status {
-                // A reservation from another process is never replayed.
-                OwnerContinuationStatus::Reserved => OwnerContinuationStatus::Refused,
                 OwnerContinuationStatus::Committing => OwnerContinuationStatus::Uncertain,
                 other => other,
             };
@@ -1583,10 +1633,16 @@ fn persist_states_to_path(
     persist_ledger_to_path(path, &bytes)
 }
 
-fn persist_states(states: &HashMap<String, RecoveryState>) -> bool {
+fn persist_states(states: &mut RecoveryStates) -> bool {
+    persist_states_at(states, Instant::now())
+}
+
+fn persist_states_at(states: &mut RecoveryStates, now: Instant) -> bool {
     if !RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst) {
         return false;
     }
+    #[cfg(test)]
+    RECOVERY_PERSIST_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     #[cfg(not(test))]
     if persist_states_to_path(states, &recovery_path()).is_err() {
         RECOVERY_STORAGE_HEALTHY.store(false, Ordering::SeqCst);
@@ -1595,10 +1651,38 @@ fn persist_states(states: &HashMap<String, RecoveryState>) -> bool {
         );
         return false;
     }
-    // Routine tests still never touch the running user's ledger. Dedicated
-    // tests exercise this same IO helper explicitly with an isolated tempfile.
-    #[cfg(test)]
-    let _ = states;
+    states.last_persisted_at = Some(now);
+    true
+}
+
+fn refresh_recovery_lease(
+    states: &mut RecoveryStates,
+    context: &TurnRecoveryContext,
+    phase: RecoveryPhase,
+    now: Instant,
+) -> bool {
+    if !RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst) {
+        return false;
+    }
+    let Some(state) = states.get_mut(&context.desktop_thread_id) else {
+        return false;
+    };
+    if state.phase != phase
+        || state
+            .tracked
+            .as_ref()
+            .is_none_or(|tracked| tracked.recovery_id != context.recovery_id)
+    {
+        return false;
+    }
+    state.updated_at = now;
+    // Callers hold the recovery lock, so simultaneous heartbeats share the
+    // snapshot and its timestamp with both automatic and owner transitions.
+    if states.last_persisted_at.is_none_or(|previous| {
+        now.saturating_duration_since(previous) >= RECOVERY_CHECKPOINT_INTERVAL
+    }) {
+        return persist_states_at(states, now);
+    }
     true
 }
 
@@ -1618,7 +1702,7 @@ pub(crate) fn clear_persisted_recovery() {
     ensure_owner_ledger_loaded();
     if let Ok(mut states) = recovery_states().lock() {
         states.retain(|_, state| retire_automatic_scheduling_for_exit(state));
-        persist_states(&states);
+        persist_states(&mut states);
     }
 }
 
@@ -1626,6 +1710,34 @@ fn ledger_is_current(ledger: &RecoveryLedger, config_scope: &str, now: i64) -> b
     ledger.config_scope == config_scope
         && ledger.saved_at <= now
         && now.saturating_sub(ledger.saved_at) <= RECOVERY_STATE_TTL.as_secs() as i64
+}
+
+fn should_skip_reserved_only_turn(
+    turn: &PersistedTurn,
+    continuations: &[PersistedContinuation],
+) -> bool {
+    if turn.submitted != 0
+        || turn.phase != RecoveryPhase::AwaitingContinuation
+        || turn.commit_charged
+    {
+        return false;
+    }
+    let Some(desktop_turn_id) = turn.context.desktop_turn_id.as_deref() else {
+        return false;
+    };
+    let same_thread = continuations
+        .iter()
+        .filter(|entry| entry.thread_id == turn.context.desktop_thread_id);
+    let mut found_owner_evidence = false;
+    for entry in same_thread {
+        if entry.transaction.status != OwnerContinuationStatus::Reserved {
+            return false;
+        }
+        if entry.transaction.base_turn_id == desktop_turn_id {
+            found_owner_evidence = true;
+        }
+    }
+    found_owner_evidence
 }
 
 /// Called only after proxy takeover restoration. Recovery is production-safe:
@@ -1654,7 +1766,16 @@ fn restore_ledger(ledger: Option<RecoveryLedger>, budget: u32, db: &crate::datab
     }) else {
         return;
     };
+    let continuations = &ledger.continuations;
     for turn in ledger.turns {
+        if should_skip_reserved_only_turn(&turn, continuations) {
+            // A previous process may have checkpointed an unsubmitted
+            // usage-limit turn alongside an owner reservation. The
+            // reservation has no mutation evidence and was discarded during
+            // import, so restoring this turn would veto a fresh native
+            // observation of the same thread and turn.
+            continue;
+        }
         let mut context = turn.context;
         let submitted = turn.submitted.saturating_add(u32::from(
             turn.phase == RecoveryPhase::CommittingRecovery && !turn.commit_charged,
@@ -1713,6 +1834,8 @@ fn restore_ledger(ledger: Option<RecoveryLedger>, budget: u32, db: &crate::datab
 
 pub(crate) fn provider_fingerprint(provider: &crate::provider::Provider) -> String {
     use sha2::{Digest, Sha256};
+    #[cfg(test)]
+    PROVIDER_FINGERPRINT_CALLS.with(|calls| calls.set(calls.get() + 1));
     let serialized = serde_json::to_vec(&provider.settings_config).unwrap_or_default();
     hex::encode(Sha256::digest(serialized))
 }
@@ -1725,22 +1848,80 @@ fn durable_provider_matches(
         && provider_fingerprint(provider) == context.provider_fingerprint
 }
 
+#[cfg(test)]
+thread_local! {
+    static PROVIDER_FINGERPRINT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RECOVERY_PROVIDER_ROW_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(not(test))]
-fn recovery_binding_is_current(context: &TurnRecoveryContext, next_attempt: u32) -> bool {
-    recovery_policy_allows_attempt(
+static RECOVERY_DATABASE: OnceLock<Weak<Database>> = OnceLock::new();
+
+#[cfg(not(test))]
+pub(crate) fn register_database(db: &Arc<Database>) {
+    let _ = RECOVERY_DATABASE.set(Arc::downgrade(db));
+}
+
+// One binding per reservation, shared between the scheduler and authorization.
+struct RecoveryProviderBinding {
+    db: Weak<Database>,
+    cached_match: Mutex<Option<(ProviderRevision, bool)>>,
+}
+
+impl RecoveryProviderBinding {
+    fn new(db: Weak<Database>) -> Self {
+        Self {
+            db,
+            cached_match: Mutex::new(None),
+        }
+    }
+
+    fn is_current(
+        &self,
+        context: &TurnRecoveryContext,
+        next_attempt: u32,
+        current_budget: Option<u32>,
+    ) -> bool {
+        current_budget.is_some_and(|budget| {
+            recovery_policy_allows_attempt(context, next_attempt, budget)
+                && self.provider_matches(context) == Some(true)
+        })
+    }
+
+    fn provider_matches(&self, context: &TurnRecoveryContext) -> Option<bool> {
+        let db = self.db.upgrade()?;
+        let mut cached = self.cached_match.lock().ok()?;
+        let revision = db.provider_revision().ok()?;
+        if let Some((_, matches)) = cached.filter(|(previous, _)| *previous == revision) {
+            return Some(matches);
+        }
+
+        #[cfg(test)]
+        RECOVERY_PROVIDER_ROW_LOOKUPS.with(|calls| calls.set(calls.get() + 1));
+        let matches = db
+            .get_provider_by_id(&context.durable_provider_id, "codex")
+            .ok()?
+            .is_some_and(|provider| durable_provider_matches(context, &provider));
+        // SQLite may have changed between the revision sample and row read.
+        if db.provider_revision().ok()? != revision {
+            return None;
+        }
+        *cached = Some((revision, matches));
+        Some(matches)
+    }
+}
+
+#[cfg(not(test))]
+fn recovery_binding_is_current(
+    binding: &RecoveryProviderBinding,
+    context: &TurnRecoveryContext,
+    next_attempt: u32,
+) -> bool {
+    binding.is_current(
         context,
         next_attempt,
-        crate::settings::get_settings().stream_recovery_budget(),
-    ) && crate::settings::get_current_provider(&crate::app_config::AppType::Codex).as_deref()
-        == Some(context.durable_provider_id.as_str())
-        && crate::database::Database::init_readonly()
-            .ok()
-            .and_then(|db| {
-                db.get_provider_by_id(&context.durable_provider_id, "codex")
-                    .ok()
-                    .flatten()
-            })
-            .is_some_and(|provider| durable_provider_matches(context, &provider))
+        crate::settings::codex_recovery_budget_for_provider(&context.durable_provider_id),
+    )
 }
 
 fn recovery_policy_allows_attempt(
@@ -1790,49 +1971,67 @@ pub(crate) fn handle_recovery_forward_error(
         }
         schedule_turn_recovery(context, reason);
     } else {
-        mark_observed_turn_completed(&context);
+        let manual_usage_limit = matches!(
+            error,
+            super::error::ProxyError::UpstreamError { status, body: Some(body) }
+                if {
+                    let payload = terminal_error_payload(body);
+                    is_deferred_usage_limit("error", &payload)
+                        || (*status == 403 && is_retryable_usage_limit_payload(&payload))
+                }
+        );
+        finish_observed_turn(&context, manual_usage_limit);
     }
 }
 
-fn record_proxy_usage_limit(context: &TurnRecoveryContext) {
-    let Some(turn_id) = context.desktop_turn_id.as_ref() else {
-        return;
-    };
-    let turn = ObservedUsageLimitTurn {
-        thread_id: context.desktop_thread_id.clone(),
-        turn_id: turn_id.clone(),
-        model: Some(context.desktop_model.clone()),
-        observed_at_ms: context.observed_at_ms,
-    };
-    if !context.desktop_eligible || !turn.is_valid() {
-        return;
+/// Observe an authoritative upstream usage limit before an adapter can strip
+/// its evidence. A handled response must bypass the final response observer
+/// for the same request so it cannot reopen or clear the completed turn.
+pub(crate) fn observe_recovery_forward_response(
+    context: &TurnRecoveryContext,
+    status: http::StatusCode,
+    body: &[u8],
+) -> bool {
+    if !matches!(
+        status,
+        http::StatusCode::FORBIDDEN | http::StatusCode::TOO_MANY_REQUESTS
+    ) {
+        return false;
     }
+    let body = String::from_utf8_lossy(body);
+    let payload = terminal_error_payload(&body);
+    if is_deferred_usage_limit("error", &payload) {
+        finish_observed_turn(context, true);
+    } else if is_retryable_usage_limit_payload(&payload) {
+        if status == http::StatusCode::TOO_MANY_REQUESTS {
+            record_proxy_usage_limit(context);
+            schedule_turn_recovery(context.clone(), "upstream_usage_limit_response");
+        } else {
+            finish_observed_turn(context, true);
+        }
+    } else {
+        return false;
+    }
+    true
+}
+
+fn record_proxy_usage_limit(context: &TurnRecoveryContext) {
     let Ok(mut states) = recovery_states().lock() else {
         return;
     };
-    let Some(state) = states.get_mut(&turn.thread_id) else {
+    let Some(state) = states.get_mut(&context.desktop_thread_id) else {
         return;
     };
-    if state.phase != RecoveryPhase::ActiveRequest
-        || state.tracked_epoch.as_deref() != Some(state.action_epoch.as_str())
-        || state.tracked.as_ref().is_none_or(|tracked| {
-            tracked.recovery_id != context.recovery_id
-                || tracked.desktop_turn_id != context.desktop_turn_id
-        })
-    {
+    let now = Instant::now();
+    let Some(candidate) = UsageLimitCandidate::from_active_proxy_turn(state, context, now) else {
         return;
-    }
+    };
     // The running request reached a terminal failure. Its Drop must retain
     // the click candidate independently of the automatic retry budget.
     state.phase = RecoveryPhase::Idle;
-    let now = Instant::now();
-    state.usage_limit = Some(UsageLimitCandidate {
-        turn,
-        proxy_observed_at: Some(now),
-        native_evidence: NativeUsageLimitEvidence::Absent,
-    });
+    state.usage_limit = Some(candidate);
     state.updated_at = now;
-    persist_states(&states);
+    persist_states(&mut states);
 }
 
 impl ObservedUsageLimitTurn {
@@ -1991,6 +2190,18 @@ fn merge_native_usage_limit_candidates(
         };
         candidate.native_evidence = NativeUsageLimitEvidence::Displaced;
     }
+    // A renderer can report the terminal usage-limit failure after CC Switch
+    // has been restarted. The restored ledger may still describe the exact
+    // request as active, which would otherwise block the native observation
+    // forever. Reconcile only an exact, current tracked turn. A mismatched
+    // turn, model, or action epoch must remain blocked by the normal guards.
+    for turn in observed.values().filter_map(Option::as_ref) {
+        if let Some(state) = states.get_mut(&turn.thread_id) {
+            if native_terminal_turn_matches_active_state(state, turn) {
+                reset_automatic_state(state, false);
+            }
+        }
+    }
     let reconcile_candidate =
         |state: &mut RecoveryState, observation: Option<&Option<ObservedUsageLimitTurn>>| {
             let Some(candidate) = state.usage_limit.as_mut() else {
@@ -2091,6 +2302,28 @@ fn merge_native_usage_limit_candidates(
     }
 }
 
+fn native_terminal_turn_matches_active_state(
+    state: &RecoveryState,
+    turn: &ObservedUsageLimitTurn,
+) -> bool {
+    if !matches!(
+        state.phase,
+        RecoveryPhase::ActiveRequest | RecoveryPhase::ToolStepComplete
+    ) || state.tracked_epoch.as_deref() != Some(state.action_epoch.as_str())
+    {
+        return false;
+    }
+    let Some(tracked) = state.tracked.as_ref() else {
+        return false;
+    };
+    tracked.desktop_thread_id == turn.thread_id
+        && tracked.desktop_turn_id.as_deref() == Some(turn.turn_id.as_str())
+        && turn
+            .model
+            .as_ref()
+            .is_none_or(|model| model == &tracked.desktop_model)
+}
+
 fn eligible_usage_limit_candidate(state: &RecoveryState) -> Option<&UsageLimitCandidate> {
     let candidate = state.usage_limit.as_ref()?;
     if !candidate.has_current_evidence(Instant::now())
@@ -2153,37 +2386,73 @@ pub(crate) fn codex_usage_limit_resume_count() -> Result<UsageLimitResumeCount, 
 enum UsageLimitResumeOutcome {
     Submitted,
     Deferred,
+    DesktopUnavailable(&'static str),
     Skipped,
     Uncertain,
 }
 
 #[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageLimitResumeReport {
     submitted: usize,
     deferred: usize,
+    desktop_unavailable: usize,
     skipped: usize,
     uncertain: usize,
+}
+
+impl UsageLimitResumeReport {
+    fn record(&mut self, outcome: UsageLimitResumeOutcome) {
+        match outcome {
+            UsageLimitResumeOutcome::Submitted => self.submitted += 1,
+            UsageLimitResumeOutcome::Deferred => self.deferred += 1,
+            UsageLimitResumeOutcome::DesktopUnavailable(blocker) => {
+                self.deferred += 1;
+                self.desktop_unavailable += 1;
+                log::warn!("[Codex/Recovery] usage-limit submission deferred: {blocker}");
+            }
+            UsageLimitResumeOutcome::Skipped => self.skipped += 1,
+            UsageLimitResumeOutcome::Uncertain => self.uncertain += 1,
+        }
+    }
 }
 
 pub(crate) async fn resume_usage_limited_turns() -> Result<UsageLimitResumeReport, String> {
     static BATCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _batch = BATCH
         .try_lock()
-        .map_err(|_| "Codex Auto Resume is already running")?;
+        .map_err(|_| "CC Switch is already sending continue to usage-limited Codex sessions")?;
     let candidates = usage_limit_resume_snapshot()?;
     let mut outcomes = futures::stream::iter(candidates)
         .map(|(epoch, candidate)| resume_usage_limited_turn(epoch, candidate))
         .buffer_unordered(4);
     let mut report = UsageLimitResumeReport::default();
     while let Some(outcome) = outcomes.next().await {
-        match outcome {
-            UsageLimitResumeOutcome::Submitted => report.submitted += 1,
-            UsageLimitResumeOutcome::Deferred => report.deferred += 1,
-            UsageLimitResumeOutcome::Skipped => report.skipped += 1,
-            UsageLimitResumeOutcome::Uncertain => report.uncertain += 1,
-        }
+        report.record(outcome);
     }
     Ok(report)
+}
+
+async fn await_desktop_continuation<F: std::future::Future>(
+    submit: F,
+    preparation_deadline: tokio::time::Instant,
+    commit_started: impl FnOnce() -> bool,
+) -> Option<F::Output> {
+    tokio::pin!(submit);
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(preparation_deadline) => {}
+        result = &mut submit => return Some(result),
+    }
+    // Once authorized, only the already-polled submission can finish. Its
+    // renderer has its own acknowledgement deadline.
+    if commit_started() {
+        tokio::time::timeout(crate::codex_desktop::CODEX_CONTINUATION_ACK_TIMEOUT, submit)
+            .await
+            .ok()
+    } else {
+        None
+    }
 }
 
 async fn resume_usage_limited_turn(
@@ -2203,8 +2472,8 @@ async fn resume_usage_limited_turn(
     };
     let renderer_operation_id = uuid::Uuid::new_v4().to_string();
     let (observed_at_ms, require_native_observation) = candidate.continuation_observation();
-    let result = tokio::time::timeout(
-        DESKTOP_READY_TIMEOUT,
+    let commit_started = AtomicBool::new(false);
+    let result = await_desktop_continuation(
         crate::codex_desktop::submit_codex_usage_limit_continuation(
             &turn.thread_id,
             &renderer_operation_id,
@@ -2213,25 +2482,46 @@ async fn resume_usage_limited_turn(
             &turn.turn_id,
             require_native_observation,
             |final_commit| {
-                if final_commit {
-                    authorize_continuation_commit(&operation, Some(&candidate), persist_states)
-                } else {
-                    owner_continuation_is_reserved(&operation)
+                if !final_commit {
+                    return owner_continuation_is_reserved(&operation);
                 }
+                let authorized =
+                    authorize_continuation_commit(&operation, Some(&candidate), persist_states);
+                if authorized {
+                    commit_started.store(true, Ordering::Relaxed);
+                }
+                authorized
             },
         ),
+        tokio::time::Instant::now() + DESKTOP_READY_TIMEOUT,
+        || commit_started.load(Ordering::Relaxed),
     )
     .await;
-    finish_usage_limit_resume(&operation, &candidate, result.ok().and_then(Result::ok))
+    finish_usage_limit_resume(&operation, &candidate, result)
 }
 
 fn finish_usage_limit_resume(
     operation: &OwnerContinuationOperation,
     candidate: &UsageLimitCandidate,
-    result: Option<crate::codex_desktop::CodexContinuationResult>,
+    result: Option<Result<crate::codex_desktop::CodexContinuationResult, String>>,
 ) -> UsageLimitResumeOutcome {
+    let blocker = match result.as_ref() {
+        Some(Ok(result)) if !result.submitted => Some(desktop_readiness_blocker(&result.message)),
+        Some(Err(error)) => Some(desktop_readiness_blocker(error)),
+        _ => None,
+    };
+    let desktop_unavailable = blocker.filter(|blocker| {
+        matches!(
+            *blocker,
+            "compatibility_runtime_unavailable"
+                | "desktop_request_client_unavailable"
+                | "desktop_command_timeout"
+                | "desktop_connection_unavailable"
+                | "desktop_target_unavailable"
+        )
+    });
     let (outcome, deferred) = match result {
-        Some(result) if result.submitted => (
+        Some(Ok(result)) if result.submitted => (
             result
                 .turn_id
                 .map_or(OwnerContinuationOutcome::Uncertain, |turn_id| {
@@ -2239,19 +2529,24 @@ fn finish_usage_limit_resume(
                 }),
             false,
         ),
-        Some(result) if result.mutation_attempted => (OwnerContinuationOutcome::Uncertain, false),
-        Some(result) => (
+        Some(Ok(result)) if result.mutation_attempted => {
+            (OwnerContinuationOutcome::Uncertain, false)
+        }
+        Some(Ok(result)) => (
             OwnerContinuationOutcome::Refused,
-            result.usage_limit_deferred,
+            result.usage_limit_deferred || desktop_unavailable.is_some(),
         ),
         // The journal distinguishes read-only preparation from an authorized
         // send when the transport stops yielding a result.
-        None => (OwnerContinuationOutcome::Uncertain, true),
+        Some(Err(_)) | None => (OwnerContinuationOutcome::Uncertain, true),
     };
     let receipt = finish_owner_continuation(operation, outcome);
     match receipt.status {
         OwnerContinuationStatus::Submitted => UsageLimitResumeOutcome::Submitted,
         OwnerContinuationStatus::Committing | OwnerContinuationStatus::Uncertain => {
+            if let Some(blocker) = blocker {
+                log::warn!("[Codex/Recovery] usage-limit submission unconfirmed: {blocker}");
+            }
             UsageLimitResumeOutcome::Uncertain
         }
         OwnerContinuationStatus::Refused => {
@@ -2269,12 +2564,12 @@ fn finish_usage_limit_resume(
                         == OwnerContinuationStatus::Refused
                 {
                     state.continuations.remove(&operation.operation_id);
-                    persist_states(&states);
+                    persist_states(&mut states);
                 }
-                return if current {
-                    UsageLimitResumeOutcome::Deferred
-                } else {
-                    UsageLimitResumeOutcome::Skipped
+                return match (current, desktop_unavailable) {
+                    (true, Some(blocker)) => UsageLimitResumeOutcome::DesktopUnavailable(blocker),
+                    (true, None) => UsageLimitResumeOutcome::Deferred,
+                    (false, _) => UsageLimitResumeOutcome::Skipped,
                 };
             }
             if current {
@@ -2305,27 +2600,43 @@ pub(crate) fn schedule_turn_recovery(context: TurnRecoveryContext, reason: &'sta
 
     log_recovery_event(&context, "scheduled", reason, Some(next_attempt));
     #[cfg(not(test))]
-    tokio::spawn(run_turn_recovery(
-        context,
-        reason,
-        next_attempt,
-        |context, next_attempt| async move {
-            let authorization_context = context.clone();
-            crate::codex_desktop::submit_codex_continuation(
-                &context.desktop_thread_id,
-                &format!("{}:{next_attempt}", context.recovery_id),
-                &context.desktop_model,
-                context.observed_at_ms,
-                move |final_commit| {
-                    recovery_is_active(&authorization_context)
-                        && recovery_binding_is_current(&authorization_context, next_attempt)
-                        && (!final_commit || authorize_reserved_recovery(&authorization_context))
-                },
-            )
-            .await
-        },
-        recovery_binding_is_current,
-    ));
+    {
+        let binding = Arc::new(RecoveryProviderBinding::new(
+            RECOVERY_DATABASE.get().cloned().unwrap_or_default(),
+        ));
+        let submit_binding = Arc::clone(&binding);
+        tokio::spawn(run_turn_recovery(
+            context,
+            reason,
+            next_attempt,
+            move |context, next_attempt| {
+                let submit_binding = Arc::clone(&submit_binding);
+                async move {
+                    let authorization_context = context.clone();
+                    crate::codex_desktop::submit_codex_continuation(
+                        &context.desktop_thread_id,
+                        &format!("{}:{next_attempt}", context.recovery_id),
+                        &context.desktop_model,
+                        context.observed_at_ms,
+                        move |final_commit| {
+                            recovery_is_active(&authorization_context)
+                                && recovery_binding_is_current(
+                                    &submit_binding,
+                                    &authorization_context,
+                                    next_attempt,
+                                )
+                                && (!final_commit
+                                    || authorize_reserved_recovery(&authorization_context))
+                        },
+                    )
+                    .await
+                }
+            },
+            move |context, next_attempt| {
+                recovery_binding_is_current(&binding, context, next_attempt)
+            },
+        ));
+    }
 }
 
 /// Logical failed-chat continuation has its own backoff. It never replays the
@@ -2366,17 +2677,23 @@ async fn wait_for_continuation_backoff(
         }
         // Refresh the canonical lease during a long wait. Otherwise unrelated
         // thread activity could prune a third (20-minute) wait at the 15m TTL.
-        if let Ok(mut states) = recovery_states().lock() {
-            if let Some(state) = states.get_mut(&context.desktop_thread_id) {
-                if state
-                    .tracked
-                    .as_ref()
-                    .is_some_and(|tracked| tracked.recovery_id == context.recovery_id)
-                {
-                    state.updated_at = Instant::now();
-                    persist_states(&states);
-                }
-            }
+        let lease_current = recovery_states().lock().is_ok_and(|mut states| {
+            refresh_recovery_lease(
+                &mut states,
+                context,
+                RecoveryPhase::ReservedRecovery,
+                Instant::now(),
+            )
+        });
+        if !lease_current {
+            cancel_reserved_recovery(context);
+            let reason = if RECOVERY_STORAGE_HEALTHY.load(Ordering::SeqCst) {
+                "turn_activity_changed"
+            } else {
+                "recovery_storage_unavailable"
+            };
+            log_recovery_event(context, "cancelled", reason, Some(next_attempt));
+            return false;
         }
         if tokio::time::Instant::now() >= until {
             return true;
@@ -2523,9 +2840,13 @@ async fn run_turn_recovery_with_deadline_reporter<Submit, SubmitFuture, Binding,
         }
         // The renderer bridge checks the exact thread's terminal state;
         // it never types into whichever composer happens to be visible.
-        let result = tokio::time::timeout_at(deadline, submit(context.clone(), next_attempt)).await;
+        let result =
+            await_desktop_continuation(submit(context.clone(), next_attempt), deadline, || {
+                recovery_commit_started(&context)
+            })
+            .await;
         match result {
-            Err(_) => {
+            None => {
                 // CDP can lose the acknowledgement after the renderer has
                 // started its mutation. Consume only a potentially committed
                 // attempt; read-only preparation has not spent the budget.
@@ -2543,7 +2864,7 @@ async fn run_turn_recovery_with_deadline_reporter<Submit, SubmitFuture, Binding,
                 );
                 return;
             }
-            Ok(result) => match result {
+            Some(result) => match result {
                 Ok(result) if result.submitted => {
                     let submitted = finish_reserved_recovery(&context, true);
                     log_recovery_event(&context, "submitted", reason, Some(submitted));
@@ -2814,6 +3135,7 @@ fn apply_recovery_decision(context: &TurnRecoveryContext, decision: RecoveryDeci
             record_proxy_usage_limit(context);
             schedule_turn_recovery(context.clone(), reason);
         }
+        RecoveryDecision::DeferredUsageLimit => finish_observed_turn(context, true),
     }
 }
 
@@ -2823,6 +3145,7 @@ enum RecoveryDecision {
     ToolStepComplete,
     Recover(&'static str),
     UsageLimit(&'static str),
+    DeferredUsageLimit,
     Ignore,
 }
 
@@ -2832,6 +3155,15 @@ fn recovery_decision(
     payload: &Value,
     evidence: NativeResponsesEvidence,
 ) -> RecoveryDecision {
+    let deferred = if matches!(disposition, NativeResponsesTerminalDisposition::Completed) {
+        deferred_usage_limit_period(event_name, payload).is_some()
+    } else {
+        is_deferred_usage_limit(event_name, payload)
+    };
+    if deferred {
+        return RecoveryDecision::DeferredUsageLimit;
+    }
+
     let reason = match disposition {
         NativeResponsesTerminalDisposition::Completed if evidence.valid_tool_calls > 0 => {
             return RecoveryDecision::ToolStepComplete;
@@ -2868,12 +3200,22 @@ fn parse_event(block: &str) -> Option<(String, Value)> {
         }
     }
     let payload = serde_json::from_str::<Value>(&data.join("\n")).ok()?;
-    let event_name = event_name.or_else(|| {
-        payload
-            .get("type")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    })?;
+    let event_name = event_name
+        .or_else(|| {
+            payload
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            // Responses-to-Chat adapters expose a failed Responses event as a
+            // plain Chat error envelope. Preserve the terminal boundary for the
+            // recovery observer without changing the client-facing payload.
+            payload
+                .get("error")
+                .filter(|error| error.is_object())
+                .map(|_| "response.failed".to_string())
+        })?;
     Some((event_name, payload))
 }
 
@@ -2987,6 +3329,42 @@ mod tests {
     }
 
     #[test]
+    fn terminal_usage_limit_response_records_exact_active_proxy_turn() {
+        let context = exact_usage_limit_context("response-boundary", 1);
+        let tracking = track_turn(&context);
+        assert!(observe_recovery_forward_response(
+            &context,
+            http::StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":{"code":"usage_limit_reached","message":"Daily usage limit exceeded."}}"#,
+        ));
+        let candidate = proxy_usage_limit_turns()
+            .into_iter()
+            .find(|candidate| candidate.thread_id == context.desktop_thread_id);
+        assert_eq!(
+            candidate.map(|candidate| candidate.turn_id),
+            context.desktop_turn_id
+        );
+        drop(tracking);
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[test]
+    fn terminal_usage_limit_response_ignores_generic_rate_limit_body() {
+        let context = exact_usage_limit_context("response-boundary-generic", 1);
+        let tracking = track_turn(&context);
+        assert!(!observe_recovery_forward_response(
+            &context,
+            http::StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":{"code":"rate_limit_exceeded","message":"Try again later."}}"#,
+        ));
+        assert!(!proxy_usage_limit_turns()
+            .into_iter()
+            .any(|candidate| candidate.thread_id == context.desktop_thread_id));
+        drop(tracking);
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[test]
     fn usage_limit_candidate_preserves_the_existing_automatic_budget_and_fences_old_clicks() {
         let context = exact_usage_limit_context("bulk-resume-aggressive", 1);
         let tracking = track_turn(&context);
@@ -3054,7 +3432,7 @@ mod tests {
             finish_usage_limit_resume(
                 &operation,
                 &candidate,
-                Some(crate::codex_desktop::CodexContinuationResult {
+                Some(Ok(crate::codex_desktop::CodexContinuationResult {
                     submitted: false,
                     mutation_attempted: false,
                     usage_limit_deferred: true,
@@ -3062,7 +3440,7 @@ mod tests {
                     debug_port: None,
                     target_id: None,
                     message: String::new(),
-                }),
+                })),
             ),
             UsageLimitResumeOutcome::Skipped,
         );
@@ -3142,6 +3520,68 @@ mod tests {
     }
 
     #[test]
+    fn bulk_resume_reports_an_unavailable_desktop_only_before_a_possible_send() {
+        let context = exact_usage_limit_context("bulk-resume-desktop-unavailable", 0);
+        let tracking = track_turn(&context);
+        record_proxy_usage_limit(&context);
+        drop(tracking);
+        let (epoch, candidate) = usage_limit_resume_snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|(epoch, _)| epoch.thread_id == context.desktop_thread_id)
+            .unwrap();
+        let reserve = || {
+            reserve_continuation(
+                &epoch,
+                &candidate.turn.turn_id,
+                &candidate.operation_id(),
+                Some(&candidate),
+            )
+            .unwrap()
+        };
+        let unavailable = || Some(Err("port 9229: failed to list CDP targets: REDACTED".into()));
+        let OwnerContinuationReservation::Reserved(operation) = reserve() else {
+            panic!("the first click should reserve");
+        };
+        let deferred = finish_usage_limit_resume(&operation, &candidate, unavailable());
+        assert_eq!(
+            deferred,
+            UsageLimitResumeOutcome::DesktopUnavailable("desktop_target_unavailable"),
+        );
+
+        let OwnerContinuationReservation::Reserved(retry) = reserve() else {
+            panic!("a connection error before authorization should allow retry");
+        };
+        assert!(authorize_continuation_commit(
+            &retry,
+            Some(&candidate),
+            persist_states,
+        ));
+        let uncertain = finish_usage_limit_resume(&retry, &candidate, unavailable());
+        assert_eq!(uncertain, UsageLimitResumeOutcome::Uncertain);
+        assert!(matches!(
+            reserve(),
+            OwnerContinuationReservation::AttachOnly(receipt)
+                if receipt.status == OwnerContinuationStatus::Uncertain
+        ));
+
+        let mut report = UsageLimitResumeReport::default();
+        report.record(deferred);
+        report.record(uncertain);
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            serde_json::json!({
+                "submitted": 0,
+                "deferred": 1,
+                "desktopUnavailable": 1,
+                "skipped": 0,
+                "uncertain": 1,
+            }),
+        );
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
     fn native_snapshots_merge_matching_turns_and_require_current_evidence() {
         let turn = ObservedUsageLimitTurn {
             thread_id: "bulk-resume-overlapping-views".into(),
@@ -3195,6 +3635,78 @@ mod tests {
         assert!(eligible_usage_limit_candidate(&states[&turn.thread_id]).is_some());
         merge_native_usage_limit_candidates(&mut states, Vec::new(), Vec::new(), Vec::new(), true);
         assert!(!states.contains_key(&turn.thread_id));
+    }
+
+    #[test]
+    fn exact_native_terminal_turn_reconciles_a_restored_active_request() {
+        let mut tracked = exact_usage_limit_context("native-restored-active", 3);
+        tracked.desktop_turn_id = Some("native-restored-active-turn".into());
+        let action_epoch = "current-action-epoch".to_string();
+        let mut states = HashMap::from([(
+            tracked.desktop_thread_id.clone(),
+            RecoveryState {
+                submitted: 2,
+                phase: RecoveryPhase::ActiveRequest,
+                tracked: Some(tracked.clone()),
+                tracked_epoch: Some(action_epoch.clone()),
+                action_epoch,
+                ..RecoveryState::default()
+            },
+        )]);
+
+        merge_native_usage_limit_candidates(
+            &mut states,
+            vec![ObservedUsageLimitTurn {
+                thread_id: tracked.desktop_thread_id.clone(),
+                turn_id: tracked.desktop_turn_id.clone().unwrap(),
+                model: Some(tracked.desktop_model.clone()),
+                observed_at_ms: tracked.observed_at_ms + 1,
+            }],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+
+        let state = &states[&tracked.desktop_thread_id];
+        assert_eq!(state.phase, RecoveryPhase::Idle);
+        assert_eq!(state.submitted, 2);
+        assert!(state.tracked.is_none());
+        assert!(eligible_usage_limit_candidate(state).is_some());
+    }
+
+    #[test]
+    fn mismatched_native_terminal_turn_does_not_clear_active_request() {
+        let mut tracked = exact_usage_limit_context("native-mismatched-active", 3);
+        tracked.desktop_turn_id = Some("tracked-turn".into());
+        let action_epoch = "current-action-epoch".to_string();
+        let mut states = HashMap::from([(
+            tracked.desktop_thread_id.clone(),
+            RecoveryState {
+                phase: RecoveryPhase::ActiveRequest,
+                tracked: Some(tracked.clone()),
+                tracked_epoch: Some(action_epoch.clone()),
+                action_epoch,
+                ..RecoveryState::default()
+            },
+        )]);
+
+        merge_native_usage_limit_candidates(
+            &mut states,
+            vec![ObservedUsageLimitTurn {
+                thread_id: tracked.desktop_thread_id.clone(),
+                turn_id: "different-turn".into(),
+                model: Some(tracked.desktop_model.clone()),
+                observed_at_ms: tracked.observed_at_ms + 1,
+            }],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+
+        let state = &states[&tracked.desktop_thread_id];
+        assert_eq!(state.phase, RecoveryPhase::ActiveRequest);
+        assert!(state.usage_limit.is_none());
+        assert!(eligible_usage_limit_candidate(state).is_none());
     }
 
     #[test]
@@ -4479,7 +4991,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_reserved_startup_is_refused_and_committing_startup_is_uncertain_never_replayed() {
+    fn owner_reserved_startup_is_discarded_and_committing_startup_is_uncertain_never_replayed() {
         for commit in [false, true] {
             let (epoch, operation) = owner_test_operation(if commit {
                 "restore-committing"
@@ -4499,20 +5011,171 @@ mod tests {
             assert!(!owner_continuation_epoch_is_current(&epoch));
             assert!(!authorize_owner_continuation_commit(&operation));
             let states = recovery_states().lock().unwrap();
-            let restored = &states[&epoch.thread_id];
-            assert_eq!(restored.phase, RecoveryPhase::Idle);
-            assert_eq!(
-                restored.continuations[&operation.operation_id].status,
-                if commit {
+            if commit {
+                let restored = &states[&epoch.thread_id];
+                assert_eq!(restored.phase, RecoveryPhase::Idle);
+                assert_eq!(
+                    restored.continuations[&operation.operation_id].status,
                     OwnerContinuationStatus::Uncertain
-                } else {
-                    OwnerContinuationStatus::Refused
-                }
-            );
-            assert!(restored.tracked.is_none());
+                );
+                assert!(restored.tracked.is_none());
+            } else {
+                assert!(!states.contains_key(&epoch.thread_id));
+            }
             drop(states);
             cleanup_owner_test(&epoch);
         }
+    }
+
+    #[test]
+    fn imported_reserved_owner_operation_allows_fresh_native_observation() {
+        let context = exact_usage_limit_context("restart-reserved-native", 0);
+        let epoch = capture_owner_continuation_epoch(&context.desktop_thread_id).unwrap();
+        let turn = ObservedUsageLimitTurn {
+            thread_id: context.desktop_thread_id.clone(),
+            turn_id: context.desktop_turn_id.clone().unwrap(),
+            model: Some(context.desktop_model.clone()),
+            observed_at_ms: context.observed_at_ms,
+        };
+        let candidate = UsageLimitCandidate {
+            turn: turn.clone(),
+            proxy_observed_at: None,
+            native_evidence: NativeUsageLimitEvidence::Confirmed {
+                observed_at_ms: turn.observed_at_ms,
+                confirmed_at: Instant::now(),
+            },
+        };
+        let operation_id = candidate.operation_id();
+        let reservation =
+            reserve_continuation(&epoch, &candidate.turn.turn_id, &operation_id, None).unwrap();
+        assert!(matches!(
+            reservation,
+            OwnerContinuationReservation::Reserved(_)
+        ));
+
+        let state = recovery_states()
+            .lock()
+            .unwrap()
+            .remove(&epoch.thread_id)
+            .unwrap();
+        let ledger = ledger_from_states(&HashMap::from([(epoch.thread_id.clone(), state)]));
+        import_owner_continuations(&ledger);
+        assert!(!recovery_states()
+            .lock()
+            .unwrap()
+            .contains_key(&epoch.thread_id));
+
+        let mut states = recovery_states().lock().unwrap();
+        states.replace_native_usage_limit_snapshot(vec![turn], Vec::new(), true);
+        drop(states);
+        let (fresh_epoch, fresh_candidate) = usage_limit_resume_snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|(_, candidate)| candidate.turn.thread_id == context.desktop_thread_id)
+            .expect("fresh native observation should remain eligible after restart");
+        assert_eq!(fresh_candidate.operation_id(), operation_id);
+        assert!(matches!(
+            reserve_continuation(
+                &fresh_epoch,
+                &fresh_candidate.turn.turn_id,
+                &fresh_candidate.operation_id(),
+                Some(&fresh_candidate),
+            ),
+            Ok(OwnerContinuationReservation::Reserved(_))
+        ));
+        cleanup_owner_test(&epoch);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn restore_skips_unsubmitted_reserved_only_turn_for_fresh_native_observation() {
+        let _home = crate::config::TestHomeGuard::new();
+        let database = crate::database::Database::memory().unwrap();
+        let provider = crate::provider::Provider::with_id(
+            "restore-reserved-only-provider".into(),
+            "test".into(),
+            serde_json::json!({"baseUrl":"https://example.test"}),
+            None,
+        );
+        database.save_provider("codex", &provider).unwrap();
+
+        let mut context = exact_usage_limit_context(
+            &format!("restore-reserved-only-{}", uuid::Uuid::new_v4()),
+            0,
+        );
+        context.durable_provider_id = provider.id.clone();
+        context.provider_fingerprint = provider_fingerprint(&provider);
+        let tracking = track_turn(&context);
+        record_proxy_usage_limit(&context);
+        drop(tracking);
+        let epoch = capture_owner_continuation_epoch(&context.desktop_thread_id).unwrap();
+        let (_, candidate) = usage_limit_resume_snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|(_, candidate)| candidate.turn.thread_id == context.desktop_thread_id)
+            .expect("the proxy failure should create a usage-limit candidate");
+        let operation_id = candidate.operation_id();
+        let OwnerContinuationReservation::Reserved(operation) = reserve_continuation(
+            &epoch,
+            &candidate.turn.turn_id,
+            &operation_id,
+            Some(&candidate),
+        )
+        .unwrap() else {
+            panic!("the owner operation must begin as a reservation");
+        };
+        let state = recovery_states()
+            .lock()
+            .unwrap()
+            .remove(&context.desktop_thread_id)
+            .unwrap();
+        let ledger =
+            ledger_from_states(&HashMap::from([(context.desktop_thread_id.clone(), state)]));
+        assert_eq!(ledger.turns.len(), 1);
+        assert_eq!(ledger.turns[0].submitted, 0);
+        assert_eq!(ledger.turns[0].phase, RecoveryPhase::AwaitingContinuation);
+        assert!(should_skip_reserved_only_turn(
+            ledger.turns.last().unwrap(),
+            &ledger.continuations,
+        ));
+        let submitted_turn = PersistedTurn {
+            context: context.clone(),
+            submitted: 1,
+            phase: RecoveryPhase::AwaitingContinuation,
+            commit_charged: false,
+        };
+        assert!(!should_skip_reserved_only_turn(
+            &submitted_turn,
+            &ledger.continuations,
+        ));
+        let mut newer_turn = submitted_turn;
+        newer_turn.submitted = 0;
+        newer_turn.context.desktop_turn_id = Some("newer-turn-after-reservation".into());
+        assert!(!should_skip_reserved_only_turn(
+            &newer_turn,
+            &ledger.continuations,
+        ));
+        import_owner_continuations(&ledger);
+        restore_ledger(Some(ledger), 0, &database);
+
+        let turn = ObservedUsageLimitTurn {
+            thread_id: context.desktop_thread_id.clone(),
+            turn_id: context.desktop_turn_id.clone().unwrap(),
+            model: Some(context.desktop_model.clone()),
+            observed_at_ms: context.observed_at_ms,
+        };
+        recovery_states()
+            .lock()
+            .unwrap()
+            .replace_native_usage_limit_snapshot(vec![turn], Vec::new(), true);
+        let (_, candidate) = usage_limit_resume_snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|(_, candidate)| candidate.turn.thread_id == context.desktop_thread_id)
+            .expect("fresh native observation should remain eligible after restore");
+        assert_eq!(candidate.operation_id(), operation_id);
+        drop(operation);
+        cleanup_owner_test(&epoch);
     }
 
     #[test]
@@ -4709,6 +5372,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
     async fn third_backoff_heartbeats_the_canonical_lease_before_unrelated_pruning() {
         let mut pending = context("third-backoff-lease", 3);
         for attempt in 1..=2 {
@@ -4718,6 +5382,7 @@ mod tests {
             observe_next_continuation(&mut pending).hand_off_to_stream();
         }
         assert_eq!(reserve_recovery(&pending), Some(3));
+        RECOVERY_PERSIST_CALLS.with(|calls| calls.set(0));
         assert!(continuation_backoff(3) > RECOVERY_STATE_TTL);
         {
             let mut states = recovery_states().lock().unwrap();
@@ -4744,12 +5409,66 @@ mod tests {
             assert_eq!(state.submitted, 2);
             assert!(state.updated_at >= beat_started);
         }
+        assert_eq!(
+            RECOVERY_PERSIST_CALLS.with(std::cell::Cell::get),
+            0,
+            "lease heartbeats must not persist the complete recovery ledger"
+        );
         let unrelated = context("third-backoff-unrelated-reservation", 1);
         assert_eq!(reserve_recovery(&unrelated), Some(1));
         assert!(recovery_is_active(&pending));
         drop(wait);
         mark_turn_completed(&pending.desktop_thread_id);
         mark_turn_completed(&unrelated.desktop_thread_id);
+    }
+
+    #[test]
+    fn long_recovery_leases_share_durable_checkpoints_inside_the_startup_ttl() {
+        let started = Instant::now();
+        let pending = context("checkpoint-reserved", 3);
+        let streaming = context("checkpoint-streaming", 3);
+        let mut states = RecoveryStates::default();
+        for (context, phase) in [
+            (&pending, RecoveryPhase::ReservedRecovery),
+            (&streaming, RecoveryPhase::ActiveRequest),
+        ] {
+            states.insert(
+                context.desktop_thread_id.clone(),
+                RecoveryState {
+                    tracked: Some(context.clone()),
+                    phase,
+                    updated_at: started,
+                    ..RecoveryState::default()
+                },
+            );
+        }
+
+        RECOVERY_PERSIST_CALLS.with(|calls| calls.set(0));
+        assert!(persist_states_at(&mut states, started));
+        for second in (5..=continuation_backoff(3).as_secs()).step_by(5) {
+            let now = started + Duration::from_secs(second);
+            assert!(refresh_recovery_lease(
+                &mut states,
+                &pending,
+                RecoveryPhase::ReservedRecovery,
+                now,
+            ));
+            if second % 30 == 0 {
+                assert!(refresh_recovery_lease(
+                    &mut states,
+                    &streaming,
+                    RecoveryPhase::ActiveRequest,
+                    now,
+                ));
+            }
+            assert!(now.duration_since(states.last_persisted_at.unwrap()) < RECOVERY_STATE_TTL);
+        }
+        assert_eq!(RECOVERY_PERSIST_CALLS.with(std::cell::Cell::get), 3);
+        assert_eq!(
+            states.last_persisted_at,
+            Some(started + continuation_backoff(3))
+        );
+        assert_eq!(ledger_from_states(&states).turns.len(), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -5082,6 +5801,17 @@ mod tests {
     }
 
     #[test]
+    fn transformed_chat_error_envelope_retains_response_failed_boundary() {
+        let parsed = parse_event(
+            "data: {\"error\":{\"message\":\"response failed as text\",\"type\":\"upstream_error\"}}",
+        )
+        .expect("transformed Chat error envelope should parse");
+
+        assert_eq!(parsed.0, "response.failed");
+        assert_eq!(parsed.1["error"]["message"], "response failed as text");
+    }
+
+    #[test]
     fn completed_json_tool_step_preserves_the_existing_continuation_budget() {
         let mut context = context("recovery-json-tool-step", 3);
         assert_eq!(reserve_recovery(&context), Some(1));
@@ -5178,7 +5908,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn hanging_desktop_submission_has_one_total_deadline_and_consumes_ambiguous_attempt() {
+    async fn hanging_desktop_submission_has_a_bounded_acknowledgement_and_consumes_attempt() {
         let context = context("recovery-total-ready-deadline", 1);
         assert_eq!(reserve_recovery(&context), Some(1));
         let started = tokio::time::Instant::now();
@@ -5197,11 +5927,31 @@ mod tests {
         .await;
         assert_eq!(
             started.elapsed(),
-            continuation_backoff(1) + DESKTOP_READY_TIMEOUT
+            continuation_backoff(1)
+                + DESKTOP_READY_TIMEOUT
+                + crate::codex_desktop::CODEX_CONTINUATION_ACK_TIMEOUT
         );
         assert!(!recovery_is_active(&context));
         assert_eq!(reserve_recovery(&context), None);
         mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_desktop_commit_keeps_its_acknowledgement_window() {
+        let commit_started = AtomicBool::new(false);
+        let readiness_deadline = tokio::time::Instant::now() + DESKTOP_READY_TIMEOUT;
+        let result = await_desktop_continuation(
+            async {
+                tokio::time::sleep_until(readiness_deadline - Duration::from_secs(1)).await;
+                commit_started.store(true, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                "new-turn-id"
+            },
+            readiness_deadline,
+            || commit_started.load(Ordering::Relaxed),
+        )
+        .await;
+        assert_eq!(result, Some("new-turn-id"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -5740,6 +6490,61 @@ mod tests {
     }
 
     #[test]
+    fn recovery_polling_reuses_provider_digest_until_sqlite_revision_changes() {
+        for model_count in [1, 4096] {
+            let db = Arc::new(Database::memory().unwrap());
+            let models = (0..model_count)
+                .map(|index| serde_json::json!({"model": format!("model-{index}")}))
+                .collect::<Vec<_>>();
+            let provider = crate::provider::Provider::with_id(
+                "recovery-provider".to_string(),
+                "Recovery provider".to_string(),
+                serde_json::json!({"modelCatalog": {"models": models}}),
+                None,
+            );
+            db.save_provider("codex", &provider).unwrap();
+            let provider = db
+                .get_provider_by_id(&provider.id, "codex")
+                .unwrap()
+                .unwrap();
+            let mut context = context("recovery-polling-revision", 3);
+            context.durable_provider_id = provider.id.clone();
+            context.provider_fingerprint = provider_fingerprint(&provider);
+            PROVIDER_FINGERPRINT_CALLS.with(|calls| calls.set(0));
+            RECOVERY_PROVIDER_ROW_LOOKUPS.with(|calls| calls.set(0));
+            let binding = Arc::new(RecoveryProviderBinding::new(Arc::downgrade(&db)));
+            let submit_binding = Arc::clone(&binding);
+
+            for _ in 0..=240 {
+                assert!(binding.is_current(&context, 3, Some(3)));
+            }
+            assert!(submit_binding.is_current(&context, 3, Some(3)));
+            assert!(!binding.is_current(&context, 3, Some(2)));
+            assert!(!binding.is_current(&context, 3, None));
+            db.set_setting("test-recovery-unrelated", "changed")
+                .unwrap();
+            assert!(binding.is_current(&context, 3, Some(3)));
+            assert_eq!(RECOVERY_PROVIDER_ROW_LOOKUPS.with(|calls| calls.get()), 1);
+            assert_eq!(PROVIDER_FINGERPRINT_CALLS.with(|calls| calls.get()), 1);
+
+            let mut edited = provider.clone();
+            edited.settings_config["modelCatalog"]["models"][0]["model"] =
+                serde_json::json!("replacement-model");
+            db.save_provider("codex", &edited).unwrap();
+            assert!(!submit_binding.is_current(&context, 3, Some(3)));
+            assert_eq!(PROVIDER_FINGERPRINT_CALLS.with(|calls| calls.get()), 2);
+
+            db.save_provider("codex", &provider).unwrap();
+            assert!(binding.is_current(&context, 3, Some(3)));
+            assert_eq!(PROVIDER_FINGERPRINT_CALLS.with(|calls| calls.get()), 3);
+            db.delete_provider("codex", &provider.id).unwrap();
+            assert!(!submit_binding.is_current(&context, 3, Some(3)));
+            assert_eq!(RECOVERY_PROVIDER_ROW_LOOKUPS.with(|calls| calls.get()), 4);
+            assert_eq!(PROVIDER_FINGERPRINT_CALLS.with(|calls| calls.get()), 3);
+        }
+    }
+
+    #[test]
     #[serial_test::serial]
     fn startup_restores_valid_router_budget_and_preserves_new_live_requests() {
         let _home = crate::config::TestHomeGuard::new();
@@ -6050,6 +6855,157 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn terminal_period_usage_limits_are_deferred_for_manual_continuation() {
+        use super::super::error::ProxyError;
+
+        let raw_http = exact_usage_limit_context("deferred-raw-daily-limit", 3);
+        let normalized_http = exact_usage_limit_context("deferred-normalized-daily-limit", 3);
+        let sse = exact_usage_limit_context("deferred-weekly-limit-sse", 3);
+        let json = exact_usage_limit_context("deferred-monthly-limit-json", 3);
+        let daily = serde_json::json!({
+            "type": "usage_limit_reached",
+            "code": "usage_limit_reached",
+            "message": "Daily usage limit exceeded. The upstream provider's daily Codex allowance is exhausted.",
+            "param": null,
+            "upstream_reason": "DAILY_LIMIT_EXCEEDED"
+        });
+        for (context, status, body) in [
+            (&raw_http, 403, "daily usage limit exceeded".to_owned()),
+            (
+                &normalized_http,
+                429,
+                serde_json::json!({"error": daily}).to_string(),
+            ),
+        ] {
+            let error = ProxyError::UpstreamError {
+                status,
+                body: Some(body),
+            };
+            assert!(!forward_error_is_recoverable(&error));
+            let tracking = track_turn(context);
+            handle_recovery_forward_error(context.clone(), &error, "upstream_request_failed");
+            drop(tracking);
+        }
+
+        let weekly = serde_json::json!({
+            "type": "response.failed",
+            "response": {"status": "failed", "error": {"code": "WEEKLY_LIMIT_EXCEEDED"}}
+        });
+        let frame = Bytes::from(format!("event: response.failed\ndata: {weekly}\n\n"));
+        let stream = futures::stream::iter([Ok::<_, std::io::Error>(frame.clone())]);
+        let output = observe_responses_turn_stream(stream, sse.clone())
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(output[0].as_ref().unwrap(), &frame);
+
+        let tracking = track_turn(&json);
+        observe_responses_turn_json(
+            &serde_json::json!({
+                "status": "failed",
+                "error": {"message": "Monthly usage limit reached."}
+            }),
+            &json,
+        );
+        drop(tracking);
+
+        let candidates = usage_limit_resume_snapshot().unwrap();
+        for context in [&raw_http, &normalized_http, &sse, &json] {
+            let candidate = candidates
+                .iter()
+                .find(|(epoch, _)| epoch.thread_id == context.desktop_thread_id)
+                .map(|(_, candidate)| candidate)
+                .unwrap_or_else(|| panic!("missing candidate for {}", context.desktop_thread_id));
+            assert_eq!(
+                Some(&candidate.turn.turn_id),
+                context.desktop_turn_id.as_ref()
+            );
+            assert!(!recovery_reserved_for_test(&context.desktop_thread_id));
+            mark_turn_completed(&context.desktop_thread_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_error_envelope_preserves_hard_usage_limit_for_manual_continuation() {
+        let context = exact_usage_limit_context("deferred-chat-error-envelope", 3);
+        let upstream = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"USAGE_LIMIT_EXCEEDED\",\"type\":\"upstream_error\",\"message\":\"Daily usage limit exceeded. The upstream provider's daily Codex allowance is exhausted.\"}}}\n\n",
+        ))]);
+        let converted =
+            super::super::providers::openai_compat::create_chat_sse_stream_from_codex_responses(
+                upstream,
+                "gpt-test".to_string(),
+            );
+
+        let output = observe_responses_turn_stream(converted, context.clone())
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            String::from_utf8_lossy(output[0].as_ref().unwrap()).contains("USAGE_LIMIT_EXCEEDED")
+        );
+        assert_eq!(
+            output[1].as_ref().unwrap(),
+            &Bytes::from_static(b"data: [DONE]\n\n")
+        );
+
+        let candidates = usage_limit_resume_snapshot().unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|(epoch, _)| epoch.thread_id == context.desktop_thread_id)
+            .map(|(_, candidate)| candidate)
+            .expect("chat error envelope should create a usage-limit candidate");
+        assert_eq!(
+            candidate.turn.turn_id,
+            context.desktop_turn_id.clone().unwrap()
+        );
+        assert!(!recovery_reserved_for_test(&context.desktop_thread_id));
+        mark_turn_completed(&context.desktop_thread_id);
+    }
+
+    #[test]
+    fn deferred_period_limits_require_the_current_exact_desktop_request() {
+        use super::super::error::ProxyError;
+
+        let unbound = context("deferred-unbound-limit", 3);
+        let mut external = exact_usage_limit_context("deferred-external-limit", 3);
+        external.desktop_eligible = false;
+        let cancelled = exact_usage_limit_context("deferred-cancelled-request", 3);
+        let superseded = exact_usage_limit_context("deferred-superseded-request", 3);
+        let mut latest = superseded.clone();
+        latest.desktop_turn_id = Some("newer-turn".into());
+        latest.recovery_id = "newer-recovery".into();
+        latest.observed_at_ms += 1;
+
+        let error = ProxyError::UpstreamError {
+            status: 403,
+            body: Some("Daily usage limit exceeded.".into()),
+        };
+        let unbound_tracking = track_turn(&unbound);
+        drop(track_turn(&cancelled));
+        let superseded_tracking = track_turn(&superseded);
+        let latest_tracking = track_turn(&latest);
+        for context in [&unbound, &external, &cancelled, &superseded] {
+            handle_recovery_forward_error(context.clone(), &error, "upstream_request_failed");
+            assert!(usage_limit_resume_snapshot()
+                .unwrap()
+                .iter()
+                .all(|(epoch, _)| epoch.thread_id != context.desktop_thread_id));
+        }
+        {
+            let states = recovery_states().lock().unwrap();
+            let current = states.get(&latest.desktop_thread_id).unwrap();
+            assert_eq!(current.phase, RecoveryPhase::ActiveRequest);
+            assert_eq!(
+                current
+                    .tracked
+                    .as_ref()
+                    .map(|tracked| tracked.recovery_id.as_str()),
+                Some(latest.recovery_id.as_str())
+            );
+        }
+        drop((unbound_tracking, superseded_tracking, latest_tracking));
+    }
+
     #[test]
     fn request_failure_recovery_includes_retryable_http_timeouts_and_early_rejections() {
         use super::super::error::ProxyError;
@@ -6181,16 +7137,47 @@ mod tests {
             body: Some(serde_json::json!({"error": error}).to_string()),
         }));
 
-        for message in [
-            "Daily usage limit reached. Please try again later.",
-            "Weekly usage limit reached. Please retry later.",
-            "Monthly usage limit reached. Wait for the reset.",
-            "Usage limit reached; quota exhausted. Retry later.",
-            "Usage limit reached; billing payment required. Retry later.",
-            "Usage limit reached; insufficient credit balance. Retry later.",
-            "Usage limit reached. Permission denied; retry later.",
-            "Usage limit reached. Token expired; retry later.",
-            "Usage limit reached. User cancelled the turn; retry later.",
+        for (message, expected) in [
+            (
+                "Daily usage limit reached. Please try again later.",
+                RecoveryDecision::DeferredUsageLimit,
+            ),
+            (
+                "Weekly usage limit reached. Please retry later.",
+                RecoveryDecision::DeferredUsageLimit,
+            ),
+            (
+                "Monthly usage limit reached. Wait for the reset.",
+                RecoveryDecision::DeferredUsageLimit,
+            ),
+            (
+                "Usage limit reached; quota exhausted. Retry later.",
+                RecoveryDecision::Ignore,
+            ),
+            (
+                "Daily usage limit reached; billing payment required. Retry later.",
+                RecoveryDecision::Ignore,
+            ),
+            (
+                "Daily usage limit reached; insufficient credit balance. Retry later.",
+                RecoveryDecision::Ignore,
+            ),
+            (
+                "Daily usage limit reached. Permission denied; retry later.",
+                RecoveryDecision::Ignore,
+            ),
+            (
+                "Daily usage limit reached. Token expired; retry later.",
+                RecoveryDecision::Ignore,
+            ),
+            (
+                "Daily usage limit reached. User cancelled the turn; retry later.",
+                RecoveryDecision::Ignore,
+            ),
+            (
+                "Daily usage limit reached. Do not retry.",
+                RecoveryDecision::Ignore,
+            ),
         ] {
             let error = serde_json::json!({"type": "usage_limit_reached", "message": message});
             let payload = serde_json::json!({"response": {"status": "failed", "error": error}});
@@ -6201,7 +7188,7 @@ mod tests {
                     &payload,
                     evidence,
                 ),
-                RecoveryDecision::Ignore,
+                expected,
                 "{message}"
             );
             assert!(
@@ -6365,6 +7352,53 @@ mod tests {
         );
         assert!(stream_interruption_is_recoverable(tool_call));
         assert!(stream_interruption_is_recoverable(empty));
+    }
+
+    #[test]
+    fn output_embedded_period_limits_defer_completed_and_failed_turns() {
+        let completed = serde_json::json!({
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Daily usage limit reached. Please try again later."
+                    }]
+                }]
+            }
+        });
+        assert_eq!(
+            recovery_decision(
+                NativeResponsesTerminalDisposition::Completed,
+                "response.completed",
+                &completed,
+                NativeResponsesEvidence::default(),
+            ),
+            RecoveryDecision::DeferredUsageLimit
+        );
+
+        let failed = serde_json::json!({
+            "response": {
+                "status": "failed",
+                "output": [{
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Weekly usage limit reached. Please try again later."
+                    }]
+                }]
+            }
+        });
+        assert_eq!(
+            recovery_decision(
+                NativeResponsesTerminalDisposition::Failed,
+                "response.failed",
+                &failed,
+                NativeResponsesEvidence::default(),
+            ),
+            RecoveryDecision::DeferredUsageLimit
+        );
     }
 
     #[tokio::test]

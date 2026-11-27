@@ -10,7 +10,7 @@ use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-use crate::proxy::sse::{append_utf8_safe, take_sse_block};
+use crate::proxy::sse::TextSseFrames;
 
 /// Convert a completed Responses value for the Codex Desktop presentation shape.
 ///
@@ -279,26 +279,23 @@ where
     E: Send + 'static,
 {
     async_stream::stream! {
-        let mut buffer = String::new();
-        let mut utf8_remainder = Vec::new();
+        let mut frames = TextSseFrames::default();
         let mut open_reasoning = HashSet::new();
         futures::pin_mut!(stream);
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
-                    while let Some(block) = take_sse_block(&mut buffer) {
+                    frames.push(&bytes);
+                    while let Some(block) = frames.next_block() {
                         yield Ok(map_sse_block_for_desktop(&block, &mut open_reasoning));
                     }
                 }
                 Err(error) => yield Err(error),
             }
         }
-        if !utf8_remainder.is_empty() {
-            buffer.push_str(&String::from_utf8_lossy(&utf8_remainder));
-        }
-        if !buffer.trim().is_empty() {
-            yield Ok(map_sse_block_for_desktop(&buffer, &mut open_reasoning));
+        let tail = frames.tail();
+        if !tail.trim().is_empty() {
+            yield Ok(map_sse_block_for_desktop(&tail, &mut open_reasoning));
         }
     }
 }

@@ -125,6 +125,51 @@ describe("OwnerRemoteSettings", () => {
     expect(screen.getByText("settings.ownerRemote.boundary")).toBeVisible();
   });
 
+  it("offers a transport-neutral setup guide without changing the owner service", async () => {
+    await mount();
+
+    const tailscaleTab = screen.getByRole("tab", {
+      name: "settings.ownerRemote.transportTailscale",
+    });
+    const cloudflareTab = screen.getByRole("tab", {
+      name: "settings.ownerRemote.transportCloudflare",
+    });
+    const teamViewerTab = screen.getByRole("tab", {
+      name: "settings.ownerRemote.transportTeamViewer",
+    });
+
+    expect(tailscaleTab).toHaveAttribute("aria-selected", "true");
+    expect(cloudflareTab).toHaveAttribute("aria-selected", "false");
+    expect(teamViewerTab).toHaveAttribute("aria-selected", "false");
+    expect(
+      screen.getByRole("tabpanel", {
+        name: "",
+      }),
+    ).toHaveTextContent("settings.ownerRemote.privateNetwork");
+
+    fireEvent.click(cloudflareTab);
+    expect(cloudflareTab).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tabpanel")).toHaveTextContent(
+      "settings.ownerRemote.cloudflareFullDescription",
+    );
+    expect(
+      screen.getByRole("link", {
+        name: "settings.ownerRemote.cloudflareDashboard",
+      }),
+    ).toHaveAttribute("href", "https://dash.cloudflare.com/");
+
+    fireEvent.click(teamViewerTab);
+    expect(teamViewerTab).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tabpanel")).toHaveTextContent(
+      "settings.ownerRemote.teamViewerDescription",
+    );
+    expect(
+      screen.getByRole("link", { name: "settings.ownerRemote.teamViewerOpen" }),
+    ).toHaveAttribute("href", "https://web.teamviewer.com/");
+    expect(ownerRemoteApi.start).not.toHaveBeenCalled();
+    expect(ownerRemoteApi.createInvite).not.toHaveBeenCalled();
+  });
+
   it("reads Tailscale status without connecting or verifying on mount", async () => {
     await mount(stopped, tailscaleMissing);
     expect(tailscaleApi.getStatus).toHaveBeenCalledTimes(1);

@@ -10,7 +10,7 @@ use crate::proxy::{
     json_canonical::{
         canonical_json_string, canonicalize_json_string_if_parseable, canonicalize_tool_arguments,
     },
-    sse::{append_utf8_safe, strip_sse_field, take_sse_block},
+    sse::{strip_sse_field, TextSseFrames},
 };
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
@@ -1222,16 +1222,15 @@ pub fn create_chat_sse_stream_from_codex_responses<E: std::error::Error + Send +
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
     async_stream::stream! {
         let mut state = ResponsesToChatSseState::new(fallback_model);
-        let mut buffer = String::new();
-        let mut utf8_remainder = Vec::new();
+        let mut frames = TextSseFrames::default();
         let mut failed = false;
 
         tokio::pin!(stream);
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    append_utf8_safe(&mut buffer, &mut utf8_remainder, bytes.as_ref());
-                    while let Some(block) = take_sse_block(&mut buffer) {
+                    frames.push(&bytes);
+                    while let Some(block) = frames.next_block() {
                         match state.handle_sse_block(&block) {
                             Ok(events) => {
                                 for event in events {
@@ -1889,17 +1888,27 @@ fn current_unix_timestamp() -> u64 {
 
 /// 规整不同 Responses 错误形状里的 error 对象。
 fn normalize_error_object(error: &Value) -> Value {
+    let object = error.as_object();
     json!({
-        "message": error
-            .get("message")
-            .and_then(|value| value.as_str())
-            .unwrap_or("Upstream Codex OAuth request failed"),
-        "type": error
-            .get("type")
-            .and_then(|value| value.as_str())
+        "message": match error {
+            Value::String(message) => message.as_str(),
+            _ => object
+                .and_then(|value| value.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("Upstream Codex OAuth request failed"),
+        },
+        "type": object
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
             .unwrap_or("upstream_error"),
-        "code": error.get("code").cloned().unwrap_or(Value::Null),
-        "param": error.get("param").cloned().unwrap_or(Value::Null)
+        "code": object
+            .and_then(|value| value.get("code"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "param": object
+            .and_then(|value| value.get("param"))
+            .cloned()
+            .unwrap_or(Value::Null)
     })
 }
 
@@ -3156,6 +3165,39 @@ mod tests {
     }
 
     #[test]
+    fn responses_error_normalizes_top_level_and_nested_string_errors() {
+        let top_level = responses_error_to_chat_error(Some(&json!({
+            "error": "top-level failure"
+        })));
+        assert_eq!(
+            top_level,
+            json!({
+                "error": {
+                    "message": "top-level failure",
+                    "type": "upstream_error",
+                    "code": null,
+                    "param": null
+                }
+            })
+        );
+
+        let nested = responses_error_to_chat_error(Some(&json!({
+            "response": {"error": "nested failure"}
+        })));
+        assert_eq!(
+            nested,
+            json!({
+                "error": {
+                    "message": "nested failure",
+                    "type": "upstream_error",
+                    "code": null,
+                    "param": null
+                }
+            })
+        );
+    }
+
+    #[test]
     fn responses_tool_call_maps_to_chat_tool_call() {
         let response = json!({
             "id": "resp_tools",
@@ -3208,5 +3250,24 @@ mod tests {
         assert!(output.contains("\"completion_tokens\":2"));
         assert!(output.contains("\"prompt_tokens\":1"));
         assert!(output.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn response_failed_sse_string_error_becomes_chat_error_envelope() {
+        let upstream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":\"response failed as text\"}}\n\n",
+        ))]);
+
+        let output = create_chat_sse_stream_from_codex_responses(upstream, "fallback".to_string())
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+            .collect::<String>();
+
+        assert!(output.contains(
+            r#"data: {"error":{"message":"response failed as text","type":"upstream_error","code":null,"param":null}}"#
+        ));
+        assert!(output.ends_with("data: [DONE]\n\n"));
     }
 }

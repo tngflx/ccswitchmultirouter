@@ -14,6 +14,17 @@ const codexContinuationOwnData = (value, key) => {
     ? descriptor.value
     : undefined;
 };
+const codexContinuationPageCursor = (response, allowMissingCursor = false) => {
+  if (!response || typeof response !== "object") return undefined;
+  const cursor = Object.getOwnPropertyDescriptor(response, "nextCursor");
+  if (!cursor) return allowMissingCursor ? null : undefined;
+  if (!Object.hasOwn(cursor, "value")) return undefined;
+  const value = cursor.value;
+  if (value === null) return null;
+  return typeof value === "string" && value.length > 0 && value.length <= 4096
+    ? value
+    : undefined;
+};
 const continuationStorageKey = "ccswitch-codex-continuations-v1";
 const continuationActionStorageKey = "ccswitch-codex-user-turn-actions-v1";
 // The Rust terminal classifier owns this embedded policy. The renderer runs
@@ -77,6 +88,7 @@ for (const key of [
   "retryMarkers",
   "retryDenialMarkers",
   "hardLimitMarkers",
+  "periodLimitBlockingMarkers",
 ]) {
   const markers = continuationTemporaryUsageLimitPolicy[key]?.map(
     normalizeContinuationTerminalError,
@@ -85,50 +97,75 @@ for (const key of [
     throw new Error("Invalid embedded temporary usage-limit markers");
   continuationTemporaryUsageLimitMarkers[key] = markers;
 }
+const continuationPeriodUsageLimitMarkers = Object.values(
+  continuationTemporaryUsageLimitPolicy.periodLimitMarkers,
+).flatMap((markers) => markers.map(normalizeContinuationTerminalError));
 const continuationCodexPlanCreditSuggestion =
   normalizeContinuationTerminalError("to purchase more credits");
 const codexContinuationTerminalErrorClassification = (
   eventName,
   payload,
-  { ignoreCodexPlanCreditSuggestion = false } = {},
+  {
+    ignoreCodexPlanCreditSuggestion = false,
+    allowPeriodLimit = false,
+    transportError = null,
+  } = {},
 ) => {
   if (continuationTerminalErrorPolicy.cancelledEvents.includes(eventName))
     return {
       terminalCode: continuationTerminalErrorPolicy.cancelledCode,
       temporaryUsageLimit: false,
+      periodUsageLimit: false,
     };
-  // Match each field separately, so neighboring fields cannot form a marker.
-  const summary = continuationTerminalErrorPolicy.summaryPaths
-    .map((pointer) => continuationTerminalErrorAtPath(payload, pointer))
+  // Keep the provider response and Codex's transport error separate so
+  // their canonical fields can both veto a continuation.
+  const sources = transportError
+    ? [payload, { error: transportError }]
+    : [payload];
+  const readFields = (paths) =>
+    sources.flatMap((source) =>
+      paths.map((pointer) => continuationTerminalErrorAtPath(source, pointer)),
+    );
+  const summary = readFields(continuationTerminalErrorPolicy.summaryPaths)
     .filter((value) => typeof value === "string")
     .map(normalizeContinuationTerminalError);
-  const serialized = continuationTerminalErrorPolicy.serializedPaths
-    .map((pointer) => continuationTerminalErrorAtPath(payload, pointer))
+  const serialized = readFields(continuationTerminalErrorPolicy.serializedPaths)
     .filter((value) => value !== undefined)
     .map((value) => normalizeContinuationTerminalError(JSON.stringify(value)));
   const errorDetails = [...summary, ...serialized];
   const matchesMarker = (values, markers) =>
     values.some((value) => markers.some((marker) => value.includes(marker)));
-  const retryMessages = continuationTemporaryUsageLimitPolicy.retryMessagePaths
-    .map((pointer) => continuationTerminalErrorAtPath(payload, pointer))
+  const retryMessages = readFields(
+    continuationTemporaryUsageLimitPolicy.retryMessagePaths,
+  )
     .filter((value) => typeof value === "string")
     .map(normalizeContinuationTerminalError);
   // Read the shared known error paths only. Request/debug metadata and string
   // "false" are not an explicit provider decision about this failed turn.
   const explicitRetryDenial =
-    continuationTerminalErrorPolicy.nonRetryable.retryablePaths.some(
-      (pointer) => continuationTerminalErrorAtPath(payload, pointer) === false,
-    ) ||
+    readFields(
+      continuationTerminalErrorPolicy.nonRetryable.retryablePaths,
+    ).includes(false) ||
     matchesMarker(
       summary,
       continuationTemporaryUsageLimitMarkers.retryDenialMarkers,
     );
-  const temporaryUsageLimit =
-    !explicitRetryDenial &&
-    !matchesMarker(
+  const retryDenied =
+    explicitRetryDenial ||
+    matchesMarker(
       errorDetails,
       continuationTemporaryUsageLimitMarkers.retryDenialMarkers,
-    ) &&
+    );
+  const periodUsageLimit =
+    allowPeriodLimit &&
+    !retryDenied &&
+    matchesMarker(summary, continuationPeriodUsageLimitMarkers) &&
+    !matchesMarker(
+      errorDetails,
+      continuationTemporaryUsageLimitMarkers.periodLimitBlockingMarkers,
+    );
+  const temporaryUsageLimit =
+    !retryDenied &&
     matchesMarker(
       summary,
       continuationTemporaryUsageLimitMarkers.usageMarkers,
@@ -149,7 +186,7 @@ const codexContinuationTerminalErrorClassification = (
     continuationTerminalErrorCategories.find(
       (category) =>
         !(
-          temporaryUsageLimit &&
+          (temporaryUsageLimit || periodUsageLimit) &&
           category.code === continuationTemporaryUsageLimitPolicy.categoryCode
         ) &&
         (matchesMarker(summary, category.markers) ||
@@ -158,29 +195,163 @@ const codexContinuationTerminalErrorClassification = (
     (explicitRetryDenial
       ? continuationTerminalErrorPolicy.nonRetryable.categoryCode
       : null);
-  return { terminalCode, temporaryUsageLimit };
+  const usageLimitBlocked =
+    retryDenied ||
+    matchesMarker(
+      errorDetails,
+      continuationTemporaryUsageLimitMarkers.hardLimitMarkers,
+    ) ||
+    matchesMarker(
+      errorDetails,
+      continuationTemporaryUsageLimitMarkers.periodLimitBlockingMarkers,
+    );
+  return {
+    terminalCode,
+    temporaryUsageLimit,
+    periodUsageLimit,
+    usageLimitBlocked,
+  };
 };
 const codexContinuationTerminalErrorCode = (eventName, payload) =>
   codexContinuationTerminalErrorClassification(eventName, payload).terminalCode;
 const codexPlanLimitWithCreditSuggestion =
   /^You['’]ve hit your usage limit\. (?:Upgrade to Pro \(https:\/\/chatgpt\.com\/explore\/pro\), visit |Visit )https:\/\/chatgpt\.com\/settings\/usage to purchase more credits or try again (?:later|at [^.\r\n]+)\.$/;
-const codexContinuationIsTemporaryUsageLimit = (error) => {
-  // Codex reports usageLimitExceeded for plan resets and hard quota failures.
-  // Only its plan-limit message with a retry offer can exempt the purchase
-  // suggestion from the ordinary hard-limit checks.
-  const message = codexContinuationOwnData(error, "message");
-  const ignoreCodexPlanCreditSuggestion =
+const codexUsageLimitTypedError = (error) => {
+  const code = codexContinuationOwnData(error, "code");
+  const type = codexContinuationOwnData(error, "type");
+  return (
     codexContinuationOwnData(error, "codexErrorInfo") ===
-      "usageLimitExceeded" &&
+      "usageLimitExceeded" ||
+    (code === "usage_limit_reached" && (type === undefined || type === code)) ||
+    (type === "usage_limit_reached" && code === undefined)
+  );
+};
+const codexUsageLimitExactCodeError = (error) =>
+  ["code", "type"].some(
+    (field) =>
+      codexContinuationOwnData(error, field) === "USAGE_LIMIT_EXCEEDED",
+  );
+// Codex may preserve the provider's error body only inside its HTTP error
+// message. Remove the exact status and URL envelope before classifying it.
+const codexRetryLimitTransportPattern =
+  /^exceeded retry limit, last status: (?:403 Forbidden|429 Too Many Requests)\s*$/i;
+const readCodexUsageLimitHttpError = (message) => {
+  if (typeof message !== "string") return null;
+  const retryLimit = codexRetryLimitTransportPattern.exec(message.trim());
+  if (retryLimit)
+    return {
+      error: {
+        message: `usage limit reached; ${retryLimit[0]}`,
+      },
+    };
+  const prefix =
+    /^unexpected status (?:403 Forbidden|429 Too Many Requests):\s*/i.exec(
+      message,
+    );
+  if (!prefix) return null;
+  const body = message
+    .slice(prefix[0].length)
+    .replace(/, url: https?:\/\/[^\s,]+(?:, request id: [^\s,]+)?\s*$/, "")
+    .trim();
+  if (!body.startsWith("{")) return { error: { message: body } };
+  try {
+    const payload = JSON.parse(body);
+    const error = codexContinuationOwnData(payload, "error");
+    return typeof error === "string"
+      ? { ...payload, error: { message: error } }
+      : payload;
+  } catch {
+    return null;
+  }
+};
+const codexContinuationIsUsageLimitInterruption = (
+  error,
+  { hasProxyObservation = false } = {},
+) => {
+  const info = codexContinuationOwnData(error, "codexErrorInfo");
+  const message = codexContinuationOwnData(error, "message");
+  const wrapped = readCodexUsageLimitHttpError(message);
+  const retryLimitTransport =
+    typeof message === "string" &&
+    codexRetryLimitTransportPattern.test(message.trim());
+  const hasTypedLimit =
+    codexUsageLimitTypedError(error) ||
+    (wrapped &&
+      [wrapped, wrapped.error, wrapped.response?.error].some(
+        codexUsageLimitTypedError,
+      ));
+  // Terminal stream errors can lose the provider code and HTTP status. An
+  // exact proxy observation can corroborate a plain limit-exhaustion message.
+  const plainLimitMessage =
+    (info === "other" || info === undefined) &&
+    typeof message === "string" &&
+    /^(?:(?:the upstream provider's|the|your) )?\w+ (?:usage )?limit (?:was |has been )?(?:exceeded|reached)[.!]?$/i.test(
+      message.trim(),
+    );
+  const hasProxyEvidence =
+    hasProxyObservation &&
+    (wrapped ||
+      plainLimitMessage ||
+      [
+        codexContinuationOwnData(error, "httpStatusCode"),
+        ...[
+          "httpConnectionFailed",
+          "responseStreamConnectionFailed",
+          "responseStreamDisconnected",
+          "responseTooManyFailedAttempts",
+        ].map((variant) =>
+          codexContinuationOwnData(
+            codexContinuationOwnData(info, variant),
+            "httpStatusCode",
+          ),
+        ),
+      ].some((status) => status === 403 || status === 429));
+  const allowPeriodLimit = !!(hasTypedLimit || hasProxyEvidence);
+  // Only the official Codex plan-reset message may exempt a purchase
+  // suggestion from the ordinary hard-limit checks.
+  const ignoreCodexPlanCreditSuggestion =
+    info === "usageLimitExceeded" &&
     typeof message === "string" &&
     codexPlanLimitWithCreditSuggestion.test(message);
-  const { temporaryUsageLimit, terminalCode } =
-    codexContinuationTerminalErrorClassification(
-      "",
-      { error },
-      { ignoreCodexPlanCreditSuggestion },
-    );
-  return temporaryUsageLimit && !terminalCode;
+  const transportError =
+    wrapped && allowPeriodLimit
+      ? {
+          code: codexContinuationOwnData(error, "code"),
+          type: codexContinuationOwnData(error, "type"),
+          additionalDetails: codexContinuationOwnData(
+            error,
+            "additionalDetails",
+          ),
+          codexErrorInfo: info,
+          retryable: codexContinuationOwnData(error, "retryable"),
+          providerDetails: wrapped.additionalDetails,
+        }
+      : null;
+  const {
+    terminalCode,
+    temporaryUsageLimit,
+    periodUsageLimit,
+    usageLimitBlocked,
+  } = codexContinuationTerminalErrorClassification(
+    "",
+    transportError ? wrapped : { error },
+    { ignoreCodexPlanCreditSuggestion, allowPeriodLimit, transportError },
+  );
+  const exactTypedLimit =
+    [
+      error,
+      ...(wrapped ? [wrapped, wrapped.error, wrapped.response?.error] : []),
+    ].some(codexUsageLimitExactCodeError) &&
+    (terminalCode === null ||
+      terminalCode === continuationTemporaryUsageLimitPolicy.categoryCode) &&
+    !usageLimitBlocked;
+  return (
+    (!terminalCode &&
+      (periodUsageLimit ||
+        (!wrapped && temporaryUsageLimit) ||
+        (hasProxyEvidence && retryLimitTransport && temporaryUsageLimit))) ||
+    exactTypedLimit
+  );
 };
 // One canonical persisted action document. Explicit installation upgrades legacy
 // records before owner references can exist; reads and action writes never try
@@ -774,6 +945,26 @@ const codexOwnerContinuationPendingStateIsClear = (thread) => {
   }
   return true;
 };
+const codexContinuationIsGenericDesktopFailure = (error) => {
+  if (!error || typeof error !== "object") return false;
+  const prototype = Object.getPrototypeOf(error);
+  if (prototype !== null && prototype !== Object.prototype) return false;
+  const message = codexContinuationOwnData(error, "message");
+  if (
+    typeof message !== "string" ||
+    !/^(?:an error occurred|something went wrong)[.!]?$/i.test(message.trim())
+  )
+    return false;
+  return Reflect.ownKeys(error).every((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(error, key);
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) return false;
+    return (
+      key === "message" ||
+      (key === "codexErrorInfo" && descriptor.value === "other") ||
+      (key === "additionalDetails" && descriptor.value === null)
+    );
+  });
+};
 const classifyCodexUsageLimitContinuationThread = (
   thread,
   threadId,
@@ -781,6 +972,8 @@ const classifyCodexUsageLimitContinuationThread = (
   expectedTurnId,
   nativeObservation,
 ) => {
+  if (codexContinuationOwnData(thread, "archived") === true)
+    return { ready: false, reason: "The Codex thread was archived" };
   const turns = codexContinuationOwnData(thread, "turns");
   const turn =
     Array.isArray(turns) && turns.length
@@ -806,14 +999,22 @@ const classifyCodexUsageLimitContinuationThread = (
       reason: "The usage-limited Codex turn is still active",
     };
   const error = codexContinuationOwnData(turn, "error");
+  // Desktop can replace a provider failure with a generic error. Only the
+  // proxy evidence for this exact failed turn can supply the missing reason.
+  const proxyCorroboratesGenericFailure =
+    !nativeObservation &&
+    turnStatus === "failed" &&
+    codexContinuationIsGenericDesktopFailure(error);
   if (
     !["failed", "interrupted"].includes(turnStatus) ||
-    !codexContinuationIsTemporaryUsageLimit(error)
+    (!proxyCorroboratesGenericFailure &&
+      !codexContinuationIsUsageLimitInterruption(error, {
+        hasProxyObservation: !nativeObservation,
+      }))
   )
     return {
       ready: false,
-      reason:
-        "The latest Codex turn is no longer a temporary usage-limit failure",
+      reason: "The latest Codex turn is no longer a usage-limit failure",
     };
   if (
     (statusType !== "idle" && statusType !== "systemError") ||
@@ -934,6 +1135,7 @@ const isCodexContinuationRequestClient = (client) =>
       codexContinuationRequestPatchVersion,
     ),
   );
+class CodexContinuationReadUnavailable extends Error {}
 // Readiness and mutation share this pure predicate; no Desktop RPC is needed
 // to reject a retained client whose activity hook is absent or replaced.
 const readOwnedCodexContinuationRequest = async (client, method, params) => {
@@ -956,7 +1158,7 @@ const readOwnedCodexContinuationRequest = async (client, method, params) => {
         timer = setTimeout(
           () =>
             reject(
-              new Error(
+              new CodexContinuationReadUnavailable(
                 method === "thread/read"
                   ? "Codex thread/read timed out"
                   : "Codex read-only request timed out",
@@ -966,6 +1168,12 @@ const readOwnedCodexContinuationRequest = async (client, method, params) => {
         );
       }),
     ]);
+  } catch (error) {
+    // Keep RPC failures distinct from the ownership and response checks.
+    if (error instanceof CodexContinuationReadUnavailable) throw error;
+    throw new CodexContinuationReadUnavailable(
+      `Codex ${method} could not be read`,
+    );
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -986,6 +1194,7 @@ const readExactCodexContinuationThread = async (
   client,
   threadId,
   includeTurns = true,
+  fallbackReadState = undefined,
 ) => {
   const { response, request } = await readOwnedCodexContinuationRequest(
     client,
@@ -1006,7 +1215,32 @@ const readExactCodexContinuationThread = async (
     if (!Array.isArray(turns) || turns.length !== 0)
       throw new Error("Codex returned unbounded metadata history");
   }
-  return { thread, request };
+  // Read state is response metadata, separate from the shared Thread object.
+  // An explicit response property, including null, is authoritative. A
+  // persisted list receipt is only a fallback for older Desktop responses
+  // that omit the property altogether.
+  const readStateDescriptor =
+    response && typeof response === "object"
+      ? Object.getOwnPropertyDescriptor(response, "readState")
+      : undefined;
+  if (readStateDescriptor && !Object.hasOwn(readStateDescriptor, "value"))
+    throw new Error("Codex returned an unavailable read state");
+  const readState = readStateDescriptor
+    ? readStateDescriptor.value
+    : fallbackReadState;
+  const anchor = codexContinuationOwnData(readState, "firstUnread");
+  const turnId = codexContinuationOwnData(anchor, "turnId");
+  const revision = codexContinuationOwnData(readState, "revision");
+  const unreadTurn =
+    responseThread &&
+    codexContinuationOwnData(anchor, "type") === "turn" &&
+    codexContinuationActionThreadIdIsValid(turnId) &&
+    typeof revision === "string" &&
+    revision.length > 0 &&
+    revision.length <= 256
+      ? { turnId, revision }
+      : null;
+  return { thread, request, unreadTurn };
 };
 // Read only metadata and the latest turn. Readiness polling must not load
 // conversation items, including when the interrupted thread is still active.
@@ -1017,11 +1251,8 @@ const readBoundedCodexContinuationThread = async (
   retainTerminalError = true,
 ) => {
   ensureCurrent();
-  const { thread, request } = await readExactCodexContinuationThread(
-    client,
-    threadId,
-    false,
-  );
+  const { thread, request, unreadTurn } =
+    await readExactCodexContinuationThread(client, threadId, false);
   ensureCurrent(request);
   const page = await readOwnedCodexContinuationRequest(
     client,
@@ -1036,17 +1267,11 @@ const readBoundedCodexContinuationThread = async (
   );
   ensureCurrent(page.request);
   const turns = codexContinuationOwnData(page.response, "data");
-  const nextCursor = codexContinuationOwnData(page.response, "nextCursor");
   if (
     page.request !== request ||
     !Array.isArray(turns) ||
     turns.length > 1 ||
-    (nextCursor !== null &&
-      !(
-        typeof nextCursor === "string" &&
-        nextCursor.length > 0 &&
-        nextCursor.length <= 4096
-      ))
+    codexContinuationPageCursor(page.response, true) === undefined
   )
     throw new Error("The owner Codex bounded history is unavailable");
   const snapshot = {};
@@ -1054,6 +1279,7 @@ const readBoundedCodexContinuationThread = async (
   // metadata to reject user cancellation and permanent failures.
   for (const key of [
     "id",
+    "archived",
     "model",
     "modelProvider",
     "status",
@@ -1096,7 +1322,7 @@ const readBoundedCodexContinuationThread = async (
     }
     snapshot.turns.push(latest);
   }
-  return { thread: snapshot, request };
+  return { thread: snapshot, request, unreadTurn };
 };
 const readExactCodexOwnerContinuationThread = (
   client,
@@ -1213,6 +1439,30 @@ const readCodexNativeUsageLimitObservation = (
     ? observation
     : null;
 };
+const pendingCodexNativeUsageLimitObservation = (
+  threadId,
+  turnId,
+  model,
+  observedAtMs,
+  client,
+) =>
+  typeof codexNativeUsageLimitPendingVerification === "function"
+    ? codexNativeUsageLimitPendingVerification(
+        threadId,
+        turnId,
+        model,
+        observedAtMs,
+        client,
+      )
+    : undefined;
+
+const deferUnverifiedCodexNativeUsageLimit = () => ({
+  submitted: false,
+  mutationAttempted: false,
+  usageLimitDeferred: true,
+  reason: "The observed Codex usage-limit interruption is no longer current",
+});
+
 const prepareCodexContinuation = async (
   threadId,
   recoveryId,
@@ -1223,6 +1473,7 @@ const prepareCodexContinuation = async (
   ownerViewReference = null,
   expectedTurnId = null,
   requireNativeObservation = false,
+  pendingNativeObservation,
 ) => {
   if (!Object.values(codexContinuationIntents).includes(intent))
     return {
@@ -1240,6 +1491,8 @@ const prepareCodexContinuation = async (
       observedAtMs,
       client,
     );
+  if (pendingNativeObservation && !(await pendingNativeObservation))
+    return deferUnverifiedCodexNativeUsageLimit();
   const nativeObservation = requireNativeObservation
     ? readNativeObservation()
     : null;
@@ -1248,16 +1501,12 @@ const prepareCodexContinuation = async (
     return (
       !!current &&
       current.model === nativeObservation.model &&
-      current.modelProvider === nativeObservation.modelProvider
+      current.modelProvider === nativeObservation.modelProvider &&
+      current.unreadRevision === nativeObservation.unreadRevision
     );
   };
   if (requireNativeObservation && !nativeObservation)
-    return {
-      submitted: false,
-      usageLimitDeferred: true,
-      reason:
-        "The observed Codex usage-limit interruption is no longer current",
-    };
+    return deferUnverifiedCodexNativeUsageLimit();
   const ownerReferenceIsCurrent = () =>
     !isOwner ||
     (typeof codexOwnerRemoteViewReferenceIsCurrent === "function" &&
@@ -1269,7 +1518,21 @@ const prepareCodexContinuation = async (
         threadId,
         ownerTarget?.userActionEvidence,
       ));
-  const classifyThread = (thread) => {
+  const classifyThread = ({ thread, unreadTurn }, client) => {
+    if (
+      nativeObservation?.unreadRevision &&
+      (unreadTurn?.turnId !== expectedTurnId ||
+        unreadTurn.revision !== nativeObservation.unreadRevision)
+    ) {
+      invalidateCodexNativeUsageLimitUnreadObservation(
+        client,
+        nativeObservation,
+      );
+      return {
+        ready: false,
+        reason: "The unread Codex usage-limit result changed",
+      };
+    }
     if (isOwner)
       return classifyCodexOwnerContinuationThread(thread, ownerTarget);
     if (isUsageLimitResume)
@@ -1291,6 +1554,25 @@ const prepareCodexContinuation = async (
           ownerReferenceIsCurrent,
         )
       : readBoundedCodexContinuationThread(client, threadId);
+  const unavailableRead = (reason, tryAnotherRenderer = false) => {
+    if (
+      isUsageLimitResume &&
+      codexContinuationHasNewerUserAction(threadId, observedAtMs)
+    )
+      return {
+        submitted: false,
+        mutationAttempted: false,
+        reason:
+          "The user changed or stopped the Codex thread before continuation",
+      };
+    return {
+      submitted: false,
+      mutationAttempted: false,
+      usageLimitDeferred: isUsageLimitResume,
+      ...(tryAnotherRenderer ? { usageLimitReadUnavailable: true } : {}),
+      reason,
+    };
+  };
   if (!ownerReferenceIsCurrent())
     return {
       submitted: false,
@@ -1352,11 +1634,14 @@ const prepareCodexContinuation = async (
   // Native observations are bound to the client that verified the exact turn.
   if (requireNativeObservation)
     clients = clients.filter(nativeObservationIsCurrent);
+  let allInitialReadsUnavailable = clients.length > 0;
   for (const client of clients) {
     let binding;
     try {
       binding = await readThread(client);
     } catch (error) {
+      allInitialReadsUnavailable &&=
+        error instanceof CodexContinuationReadUnavailable;
       reason = isOwner
         ? "The owner Codex thread could not be read"
         : String(error?.message || error);
@@ -1370,7 +1655,7 @@ const prepareCodexContinuation = async (
         submitted: false,
         reason: "The owner Codex view is no longer current",
       };
-    const before = classifyThread(binding.thread);
+    const before = classifyThread(binding, client);
     if (!before.ready)
       return {
         submitted: false,
@@ -1379,7 +1664,17 @@ const prepareCodexContinuation = async (
       };
     // A second read prevents a cached failure from resuming after the user has
     // already started a newer turn. No action is taken on active user work.
-    const current = await readThread(client);
+    let current;
+    try {
+      current = await readThread(client);
+    } catch (error) {
+      if (!isUsageLimitResume) throw error;
+      return unavailableRead(
+        String(error?.message || error),
+        !requireNativeObservation &&
+          error instanceof CodexContinuationReadUnavailable,
+      );
+    }
     if (
       !ownerReferenceIsCurrent() ||
       (isOwner && current.request !== ownerTarget.request)
@@ -1388,7 +1683,7 @@ const prepareCodexContinuation = async (
         submitted: false,
         reason: "The owner Codex view is no longer current",
       };
-    const ready = classifyThread(current.thread);
+    const ready = classifyThread(current, client);
     if (!ready.ready || ready.turnId !== before.turnId) {
       return {
         submitted: false,
@@ -1433,13 +1728,7 @@ const prepareCodexContinuation = async (
             "The user changed or stopped the Codex thread before continuation",
         };
       if (requireNativeObservation && !nativeObservationIsCurrent(client))
-        return {
-          submitted: false,
-          mutationAttempted: false,
-          usageLimitDeferred: true,
-          reason:
-            "The observed Codex usage-limit interruption is no longer current",
-        };
+        return deferUnverifiedCodexNativeUsageLimit();
       if (
         !codexContinuationClientIsCurrent(client) ||
         codexVerifiedAppServerOriginalRequest(
@@ -1457,6 +1746,17 @@ const prepareCodexContinuation = async (
       return null;
     };
     const confirm = async () => {
+      if (requireNativeObservation) {
+        const pending = pendingCodexNativeUsageLimitObservation(
+          threadId,
+          expectedTurnId,
+          expectedModel,
+          observedAtMs,
+          client,
+        );
+        if (pending && !(await pending))
+          return deferUnverifiedCodexNativeUsageLimit();
+      }
       const blocked = checkBeforeSend();
       if (blocked) return blocked;
       // Preparation may be separated from authorization by an arbitrary
@@ -1467,14 +1767,14 @@ const prepareCodexContinuation = async (
       try {
         latest = await readThread(client);
       } catch (error) {
-        return {
-          submitted: false,
-          mutationAttempted: false,
-          usageLimitDeferred: isUsageLimitResume,
-          reason: isOwner
+        return unavailableRead(
+          isOwner
             ? "The owner Codex thread could not be read"
             : String(error?.message || error),
-        };
+          isUsageLimitResume &&
+            !requireNativeObservation &&
+            error instanceof CodexContinuationReadUnavailable,
+        );
       }
       const newerUserAction =
         !isOwner && codexContinuationHasNewerUserAction(threadId, observedAtMs);
@@ -1497,14 +1797,8 @@ const prepareCodexContinuation = async (
             "Codex continuation authorization changed while reading the thread",
         };
       if (requireNativeObservation && !nativeObservationIsCurrent(client))
-        return {
-          submitted: false,
-          mutationAttempted: false,
-          usageLimitDeferred: true,
-          reason:
-            "The observed Codex usage-limit interruption is no longer current",
-        };
-      const latestReady = classifyThread(latest.thread);
+        return deferUnverifiedCodexNativeUsageLimit();
+      const latestReady = classifyThread(latest, client);
       if (!latestReady.ready || latestReady.turnId !== failedTurnId)
         return {
           submitted: false,
@@ -1522,7 +1816,7 @@ const prepareCodexContinuation = async (
           // Native final authorization happens only after confirm completed.
           const blocked = checkBeforeSend();
           if (blocked) return blocked;
-          const currentReady = classifyThread(latest.thread);
+          const currentReady = classifyThread(latest, client);
           if (
             latest.request !== preparedRequest ||
             !currentReady.ready ||
@@ -1608,13 +1902,25 @@ const prepareCodexContinuation = async (
                 reason: "Codex did not confirm the targeted continuation",
               };
             }
-            writeCodexContinuationMarker(markerKey, {
-              recoveryId,
-              intent,
-              status: "submitted",
-              turnId,
-            });
-            observeStart?.(started);
+            // The validated turn ID confirms delivery. If updating storage
+            // fails, the persisted attempted marker still prevents a resend.
+            try {
+              writeCodexContinuationMarker(markerKey, {
+                recoveryId,
+                intent,
+                status: "submitted",
+                turnId,
+              });
+            } catch {
+              recordFailure(
+                "Codex continuation receipt could not be persisted",
+              );
+            }
+            try {
+              observeStart?.(started);
+            } catch {
+              recordFailure("Codex continuation could not be observed");
+            }
             return {
               submitted: true,
               mutationAttempted: true,
@@ -1645,28 +1951,10 @@ const prepareCodexContinuation = async (
       },
     };
   }
-  // Every eligible client failed its initial exact read. A newer local user
-  // action is still authoritative if it arrived while those reads ran.
-  const nativeInitialReadUnavailable =
-    requireNativeObservation && clients.length > 0;
-  if (
-    nativeInitialReadUnavailable &&
-    codexContinuationHasNewerUserAction(threadId, observedAtMs)
-  )
-    return {
-      submitted: false,
-      reason:
-        "The user changed or stopped the Codex thread before continuation",
-    };
-  return {
-    submitted: false,
-    mutationAttempted: false,
-    usageLimitDeferred: isUsageLimitResume,
-    ...(nativeInitialReadUnavailable
-      ? { usageLimitInitialReadUnavailable: true }
-      : {}),
+  return unavailableRead(
     reason,
-  };
+    isUsageLimitResume && allInitialReadsUnavailable,
+  );
 };
 const codexContinuationMutationAttempted = (job) => {
   if (!job) return false;
@@ -1724,6 +2012,7 @@ const startCodexContinuationJob = (
       started: false,
       reason: "The interrupted turn observation time is required",
     };
+  let pendingNativeObservation;
   if (
     requireNativeObservation &&
     !readCodexNativeUsageLimitObservation(
@@ -1732,11 +2021,20 @@ const startCodexContinuationJob = (
       model,
       observedAtMs,
     )
-  )
-    return {
-      started: false,
-      reason: "This Codex renderer does not have the usage-limit interruption",
-    };
+  ) {
+    pendingNativeObservation = pendingCodexNativeUsageLimitObservation(
+      id,
+      expectedTurnId,
+      model,
+      observedAtMs,
+    );
+    if (!pendingNativeObservation)
+      return {
+        started: false,
+        reason:
+          "This Codex renderer does not have the usage-limit interruption",
+      };
+  }
   const existing = state.codexContinuationJobs[token];
   if (existing && existing.threadId !== id)
     return {
@@ -1796,6 +2094,7 @@ const startCodexContinuationJob = (
     ownerViewReference,
     expectedTurnId,
     requireNativeObservation,
+    pendingNativeObservation,
   ).then(
     (result) => {
       if (
@@ -2085,7 +2384,7 @@ state.readCodexContinuationJob = (jobId) => {
     "submitted",
     "mutationAttempted",
     "usageLimitDeferred",
-    "usageLimitInitialReadUnavailable",
+    "usageLimitReadUnavailable",
   ]) {
     const descriptor = Object.getOwnPropertyDescriptor(job, key);
     if (!descriptor) continue;

@@ -450,7 +450,8 @@ function App() {
   const useAppWindowControls =
     isLinux() && (settingsData?.useAppWindowControls ?? false);
   const dragBarHeight = useAppWindowControls ? 32 : DEFAULT_DRAG_BAR_HEIGHT;
-  const showCodexRecoveryRibbon = currentView === "providers";
+  const showCodexRecoveryRibbon =
+    activeApp === "codex" && currentView === "providers";
   const headerHeight =
     HEADER_HEIGHT +
     (showCodexRecoveryRibbon ? CODEX_USAGE_RESUME_ROW_HEIGHT : 0);

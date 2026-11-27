@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, readdirSync, statSync } from "node:fs";
+import { lstatSync, readdirSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,10 @@ import {
   runWindowsJsonQuery,
   windowsJsonQueryCommand,
 } from "./windows-json-query.mjs";
+import {
+  localReleaseCargoTargetOwnerPid,
+  localReleaseCargoTargetRoot,
+} from "./release-build-config.mjs";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
 const DEFAULT_MINIMUM_AGE_HOURS = 6;
@@ -50,6 +54,27 @@ function isReparsePoint(pathname) {
 }
 function isSupportedTargetName(name) {
   return name === "target" || /^target-/i.test(name);
+}
+function localReleaseOwnerPid(worktree, target) {
+  if (!samePath(path.dirname(target), localReleaseCargoTargetRoot(worktree))) {
+    return null;
+  }
+  return localReleaseCargoTargetOwnerPid(path.basename(target));
+}
+function releaseOwnerHasExited(pid) {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    // Unknown or inaccessible PIDs can still own a build.
+    return error?.code === "ESRCH";
+  }
+}
+function staleCutoff(now, minimumAgeHours) {
+  if (!Number.isFinite(minimumAgeHours) || minimumAgeHours < 0) {
+    throw new Error("MinimumAgeHours must be zero or greater");
+  }
+  return new Date(now.getTime() - minimumAgeHours * 60 * 60 * 1000);
 }
 export function parseCleanupOptions(args, { environment = process.env } = {}) {
   const options = {
@@ -180,14 +205,12 @@ export function assertCargoTargetPath(worktreeRoot, targetDir) {
   const sddTaskRoot = targetParent;
   const isSddTarget =
     targetNameSupported && samePath(path.dirname(sddTaskRoot), sddRoot);
-  if (!(isSrcTauriTarget || isReleaseTarget || isSddTarget)) {
+  const isLocalReleaseTarget = localReleaseOwnerPid(worktree, target) !== null;
+  if (
+    !(isSrcTauriTarget || isReleaseTarget || isSddTarget || isLocalReleaseTarget)
+  ) {
     throw new Error(
       `Cargo cleanup target must be a direct child of the worktree src-tauri directory or a supported release/SDD Cargo target: ${target}`,
-    );
-  }
-  if (!isReleaseTarget && !targetNameSupported) {
-    throw new Error(
-      `Cargo cleanup target name must be target or target-*: ${target}`,
     );
   }
   assertUnlinkedAncestors(target);
@@ -205,7 +228,7 @@ function directChildDirectories(root) {
     .filter((entry) => entry.isDirectory())
     .map((entry) => path.join(root, entry.name));
 }
-function candidateFromPath(worktreeRoot, targetPath, now, cutoff) {
+function candidateFromPath(worktreeRoot, targetPath, cutoff) {
   let item;
   try {
     item = lstatSync(targetPath);
@@ -214,7 +237,7 @@ function candidateFromPath(worktreeRoot, targetPath, now, cutoff) {
     throw error;
   }
   if (!item.isDirectory() || item.isSymbolicLink()) return null;
-  const lastWriteTime = statSync(targetPath).mtime;
+  const lastWriteTime = item.mtime;
   if (lastWriteTime > cutoff) return null;
   return {
     fullName: path.resolve(targetPath),
@@ -227,10 +250,7 @@ export function findStaleCargoTargetDirectories(
   minimumAgeHours = DEFAULT_MINIMUM_AGE_HOURS,
   now = new Date(),
 ) {
-  if (!Number.isFinite(minimumAgeHours) || minimumAgeHours < 0) {
-    throw new Error("MinimumAgeHours must be zero or greater");
-  }
-  const cutoff = new Date(now.getTime() - minimumAgeHours * 60 * 60 * 1000);
+  const cutoff = staleCutoff(now, minimumAgeHours);
   const candidates = [];
   for (const root of worktreeRoots) {
     const worktree = path.resolve(root);
@@ -238,13 +258,20 @@ export function findStaleCargoTargetDirectories(
     const srcTauri = path.join(worktree, "src-tauri");
     for (const target of directChildDirectories(srcTauri)) {
       if (!isSupportedTargetName(path.basename(target))) continue;
-      const candidate = candidateFromPath(worktree, target, now, cutoff);
+      const candidate = candidateFromPath(worktree, target, cutoff);
       if (candidate) candidates.push(candidate);
     }
     const releaseTarget = path.join(worktree, ".release-target");
     if (isDirectory(releaseTarget)) {
-      const candidate = candidateFromPath(worktree, releaseTarget, now, cutoff);
+      const candidate = candidateFromPath(worktree, releaseTarget, cutoff);
       if (candidate) candidates.push(candidate);
+    }
+    const localReleaseRoot = localReleaseCargoTargetRoot(worktree);
+    for (const target of directChildDirectories(localReleaseRoot)) {
+      const ownerPid = localReleaseCargoTargetOwnerPid(path.basename(target));
+      if (ownerPid === null) continue;
+      const candidate = candidateFromPath(worktree, target, cutoff);
+      if (candidate && releaseOwnerHasExited(ownerPid)) candidates.push(candidate);
     }
     const sddRoot = path.join(worktree, ".superpowers", "sdd");
     if (!isDirectory(sddRoot) || isReparsePoint(sddRoot)) continue;
@@ -252,7 +279,7 @@ export function findStaleCargoTargetDirectories(
       if (isReparsePoint(taskRoot)) continue;
       for (const target of directChildDirectories(taskRoot)) {
         if (!isSupportedTargetName(path.basename(target))) continue;
-        const candidate = candidateFromPath(worktree, target, now, cutoff);
+        const candidate = candidateFromPath(worktree, target, cutoff);
         if (candidate) candidates.push(candidate);
       }
     }
@@ -307,7 +334,11 @@ export function queryCargoBuildProcesses({ run = spawnSync } = {}) {
 export function removeCargoTargetDir(
   worktreeRoot,
   targetDir,
-  { run = spawnSync } = {},
+  {
+    run = spawnSync,
+    minimumAgeHours = DEFAULT_MINIMUM_AGE_HOURS,
+    now = new Date(),
+  } = {},
 ) {
   const target = assertCargoTargetPath(worktreeRoot, targetDir);
   const manifest = path.join(
@@ -327,6 +358,18 @@ export function removeCargoTargetDir(
       `Cargo manifest is missing for cleanup target: ${manifest}`,
     );
   }
+  const ownerPid = localReleaseOwnerPid(worktreeRoot, target);
+  if (ownerPid !== null) {
+    const cutoff = staleCutoff(now, minimumAgeHours);
+    if (
+      !releaseOwnerHasExited(ownerPid) ||
+      !candidateFromPath(worktreeRoot, target, cutoff)
+    ) {
+      throw new Error(
+        `Local release Cargo target is active or recently modified: ${target}`,
+      );
+    }
+  }
   const result = run(
     "cargo",
     ["clean", "--manifest-path", manifest, "--target-dir", target],
@@ -345,7 +388,8 @@ export function cleanupCargoCache({
   buildProcesses = [],
   dryRun = false,
   now = new Date(),
-  remove = removeCargoTargetDir,
+  remove = (worktree, target) =>
+    removeCargoTargetDir(worktree, target, { minimumAgeHours, now }),
   warn = console.warn,
   log = console.log,
 }) {
@@ -412,7 +456,11 @@ export function main(
     dryRun: options.dryRun,
     now,
     remove: (worktree, target) =>
-      removeCargoTargetDir(worktree, target, { run }),
+      removeCargoTargetDir(worktree, target, {
+        run,
+        minimumAgeHours: options.minimumAgeHours,
+        now,
+      }),
     warn,
     log,
   });

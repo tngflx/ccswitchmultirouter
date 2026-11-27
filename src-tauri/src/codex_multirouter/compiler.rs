@@ -1,4 +1,6 @@
-use crate::codex_multirouter::catalog::{catalog_models, lookup_catalog_model, CatalogModelLookup};
+use crate::codex_multirouter::catalog::{
+    catalog_models, lookup_catalog_model, CatalogModelIndex, CatalogModelLookup,
+};
 use crate::codex_multirouter::schema::{
     validate_v2, CodexModelSelection, CodexRouteAuthPolicy, CodexRoutingConfigV2,
     CodexRoutingRouteV2,
@@ -115,6 +117,16 @@ pub fn compile_provider_v2(
     router_provider: &Provider,
     providers: &HashMap<String, Provider>,
 ) -> Result<Option<(CodexRoutingConfigV2, CompiledCodexRoutingPlan)>, CodexRoutingCompileError> {
+    let Some(plan) = enabled_provider_v2_plan(router_provider)? else {
+        return Ok(None);
+    };
+    let compiled = compile_v2(&plan, providers)?;
+    Ok(Some((plan, compiled)))
+}
+
+pub(crate) fn enabled_provider_v2_plan(
+    router_provider: &Provider,
+) -> Result<Option<CodexRoutingConfigV2>, CodexRoutingCompileError> {
     let Some(routing) = router_provider.settings_config.get("codexRouting") else {
         return Ok(None);
     };
@@ -127,11 +139,7 @@ pub fn compile_provider_v2(
     let crate::codex_multirouter::schema::CodexRoutingDocument::V2(plan) = document else {
         return Ok(None);
     };
-    if !plan.enabled {
-        return Ok(None);
-    }
-    let compiled = compile_v2(&plan, providers)?;
-    Ok(Some((plan, compiled)))
+    Ok(plan.enabled.then_some(plan))
 }
 
 #[derive(Clone)]
@@ -144,6 +152,12 @@ struct ModelCandidate<'a> {
     upstream_model: String,
     model_entry: &'a Value,
     explicit_aliases: Vec<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROUTE_AUTH_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MODEL_CAPABILITY_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub fn compile_v2(
@@ -168,84 +182,116 @@ pub fn compile_v2(
         });
     }
 
+    let mut catalogs = HashMap::new();
+    for route in plan.routes.iter().filter(|route| route.enabled) {
+        if let Some(provider) = providers.get(&route.target_provider_id) {
+            catalogs
+                .entry(route.target_provider_id.as_str())
+                .or_insert_with(|| CatalogModelIndex::new(&provider.settings_config));
+        }
+    }
     let mut warnings = Vec::new();
-    let candidates = collect_candidates(plan, &providers, &mut warnings)?;
+    let candidates = collect_candidates(plan, &providers, &catalogs, &mut warnings)?;
     let collision_counts = canonical_collision_counts(&candidates);
     let canonical_owners = canonical_owner_counts(&candidates);
     let mut used_visible = HashSet::new();
     let mut model_catalog = Vec::new();
-    let official_models = crate::codex_config::codex_official_models_cache().unwrap_or_default();
+    let official_models = crate::codex_config::codex_official_models_snapshot().unwrap_or_default();
+    let library = crate::reasoning_capabilities::catalog::global_library();
     let mut route_visible_models = vec![Vec::new(); plan.routes.len()];
 
-    for candidate in candidates {
-        let route = &plan.routes[candidate.route_index];
-        let context_provider = crate::proxy::providers::materialize_codex_v2_auth_context(
-            candidate.provider,
+    // Candidates are collected in route order. Keep just the active route's
+    // authentication context and reuse it for all its catalog rows.
+    for route_candidates in candidates.chunk_by(|left, right| left.route_index == right.route_index)
+    {
+        let first = &route_candidates[0];
+        let route = &plan.routes[first.route_index];
+        let catalog = &catalogs[route.target_provider_id.as_str()];
+        let platform =
+            crate::reasoning_capabilities::provider_metadata::detect_platform(first.provider);
+        #[cfg(test)]
+        ROUTE_AUTH_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+        let materialized = crate::proxy::providers::materialize_codex_v2_auth_context(
+            first.provider,
             &route.auth_policy,
         );
-        let context_auth_changed = !crate::codex_context::official_auth_binding_matches(
-            &context_provider,
-            candidate.provider,
-        );
-        if context_auth_changed {
-            // Validate only the selected model against the route's actual
-            // authentication owner. Provider inventory remains owned by its
-            // saved source; route account B cannot inherit account A's limit.
-            let mut selected = context_provider.clone();
-            if let Some(settings) = selected.settings_config.as_object_mut() {
-                settings.insert(
-                    "modelCatalog".into(),
-                    json!({"models":[candidate.model_entry.clone()]}),
-                );
-                settings.remove("model_catalog");
-            }
-            let models = crate::codex_context::trusted_official_models(&selected);
-            crate::codex_context::validate_official_context_changes(&selected, None, &models)
+        let auth_changed =
+            !crate::codex_context::official_auth_binding_matches(&materialized, first.provider);
+        let context = if auth_changed {
+            &materialized
+        } else {
+            first.provider
+        };
+        let is_official = crate::codex_config::codex_provider_record_is_official(context);
+        let trusted_models = std::cell::OnceCell::new();
+        let official_context_models = || {
+            trusted_models
+                .get_or_init(|| {
+                    crate::codex_context::trusted_official_models_from(context, || &official_models)
+                })
+                .as_slice()
+        };
+
+        for candidate in route_candidates {
+            if auth_changed && is_official {
+                // Validate the selected row using the actual route auth owner.
+                crate::codex_context::validate_official_context_rows(
+                    context,
+                    None,
+                    std::slice::from_ref(candidate.model_entry),
+                    official_context_models(),
+                )
                 .map_err(|error| CodexRoutingCompileError {
                     code: "route_auth_context_unverified".into(),
                     message: format!("Route '{}' context: {error}", route.id),
                 })?;
-        }
-        let visible_names = if candidate.explicit_aliases.is_empty() {
-            vec![automatic_visible_model(
-                &candidate,
-                collision_counts
-                    .get(&candidate.canonical_model.to_ascii_lowercase())
-                    .copied()
-                    .unwrap_or(1),
-                canonical_owners
-                    .get(&candidate.canonical_model.to_ascii_lowercase())
-                    .copied()
-                    .unwrap_or(0),
-            )]
-        } else {
-            candidate.explicit_aliases.clone()
-        };
+            }
 
-        for requested_visible in visible_names {
-            let visible_model = unique_visible_model(
-                &requested_visible,
-                candidate.provider,
-                candidate.route_id,
-                &mut used_visible,
-                &mut warnings,
-            );
+            let automatic;
+            let visible_names = if candidate.explicit_aliases.is_empty() {
+                let canonical_key = candidate.canonical_model.to_ascii_lowercase();
+                automatic = automatic_visible_model(
+                    candidate,
+                    collision_counts.get(&canonical_key).copied().unwrap_or(1),
+                    canonical_owners.get(&canonical_key).copied().unwrap_or(0),
+                );
+                std::slice::from_ref(&automatic)
+            } else {
+                candidate.explicit_aliases.as_slice()
+            };
+
             let (api_format, api_format_source) =
                 effective_api_format(candidate.provider, candidate.model_entry);
-            let mut capability_summary = effective_capability_summary(
+            let context_window =
+                effective_context_window(context, candidate.model_entry, |model, maximum| {
+                    if is_official {
+                        crate::codex_context::resolved_from_models(
+                            model,
+                            maximum,
+                            official_context_models(),
+                        )
+                    } else {
+                        None
+                    }
+                });
+            let capability_summary = effective_capability_summary(
                 candidate.provider,
                 candidate.model_entry,
-                &official_models,
+                effective_reasoning_capability(
+                    candidate.provider,
+                    candidate.model_entry,
+                    catalog,
+                    platform,
+                    library.as_deref(),
+                    &official_models,
+                ),
+                &api_format,
+                platform,
+                context_window,
             );
-            if context_auth_changed {
-                let (window, source) =
-                    effective_context_window(&context_provider, candidate.model_entry);
-                capability_summary.context_window = window;
-                capability_summary.context_window_source = source;
-            }
-            route_visible_models[candidate.route_index].push(visible_model.clone());
-            model_catalog.push(CompiledCodexModel {
-                visible_model,
+
+            let compiled = CompiledCodexModel {
+                visible_model: String::new(),
                 canonical_model: candidate.canonical_model.clone(),
                 upstream_model: candidate.upstream_model.clone(),
                 display_name: model_display_name(candidate.model_entry, &candidate.canonical_model),
@@ -256,9 +302,28 @@ pub fn compile_v2(
                 api_format_source,
                 sort_index: None,
                 capability_summary,
-            });
+            };
+            let mut project_alias = |requested_visible: &str, mut model: CompiledCodexModel| {
+                model.visible_model = unique_visible_model(
+                    requested_visible,
+                    candidate.provider,
+                    candidate.route_id,
+                    &mut used_visible,
+                    &mut warnings,
+                );
+                route_visible_models[candidate.route_index].push(model.visible_model.clone());
+                model_catalog.push(model);
+            };
+            let (last, preceding) = visible_names
+                .split_last()
+                .expect("candidate has a visible model");
+            for requested_visible in preceding {
+                project_alias(requested_visible, compiled.clone());
+            }
+            project_alias(last, compiled);
         }
     }
+    drop(candidates);
 
     apply_router_model_order(plan, &mut model_catalog);
     // Route membership is unchanged by presentation ordering. Keep its derived
@@ -336,6 +401,7 @@ pub fn compile_v2(
 fn collect_candidates<'a>(
     plan: &'a CodexRoutingConfigV2,
     providers: &'a HashMap<String, Provider>,
+    catalogs: &HashMap<&str, CatalogModelIndex<'a>>,
     warnings: &mut Vec<CompilerWarning>,
 ) -> Result<Vec<ModelCandidate<'a>>, CodexRoutingCompileError> {
     let mut candidates = Vec::new();
@@ -355,6 +421,7 @@ fn collect_candidates<'a>(
                     ),
                 })?;
         let entries = provider_model_entries(provider)?;
+        let catalog = &catalogs[route.target_provider_id.as_str()];
         let ambiguous_model_error = |model: &str| CodexRoutingCompileError {
             code: "catalog_model_ambiguous".to_string(),
             message: format!(
@@ -372,8 +439,7 @@ fn collect_candidates<'a>(
                     // Resolve against the complete inventory first. An exact
                     // public owner, including an excluded one, must not be
                     // reinterpreted as a sibling's upstream identity.
-                    let canonical = match lookup_catalog_model(&provider.settings_config, reference)
-                    {
+                    let canonical = match catalog.lookup(reference) {
                         CatalogModelLookup::Found(row) => {
                             model_name(row).map(|model| model.to_ascii_lowercase())
                         }
@@ -412,7 +478,7 @@ fn collect_candidates<'a>(
             // An excluded duplicate still owns its exact public identity, so
             // fail closed instead of silently routing around that exclusion.
             if matches!(
-                lookup_catalog_model(&provider.settings_config, &canonical_model),
+                catalog.lookup(&canonical_model),
                 CatalogModelLookup::Ambiguous
             ) {
                 return Err(ambiguous_model_error(&canonical_model));
@@ -456,20 +522,38 @@ fn collect_candidates<'a>(
             }
         }
         let selected_candidates = &mut candidates[route_candidate_start..];
+        if route.aliases.is_empty() {
+            continue;
+        }
+        let mut selected_rows = HashMap::new();
+        let mut selected_upstreams = HashMap::new();
+        for (index, candidate) in selected_candidates.iter().enumerate() {
+            selected_rows.insert(std::ptr::from_ref(candidate.model_entry), index);
+            selected_upstreams
+                .entry(candidate.upstream_model.to_ascii_lowercase())
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(index));
+        }
         for (alias, target) in &route.aliases {
             let alias = alias.trim();
             if alias.is_empty() {
                 continue;
             }
-            let owner = resolve_route_alias_owner(provider, selected_candidates, alias, target)
-                .map_err(|()| CodexRoutingCompileError {
-                    code: "alias_target_ambiguous".to_string(),
-                    message: format!(
-                        "route {} alias `{alias}` targets ambiguous model `{target}` from provider {}",
-                        route_display(route, Some(provider)),
-                        provider_display(provider),
-                    ),
-                })?;
+            let owner = resolve_route_alias_owner(
+                catalog,
+                &selected_rows,
+                &selected_upstreams,
+                alias,
+                target,
+            )
+            .map_err(|()| CodexRoutingCompileError {
+                code: "alias_target_ambiguous".to_string(),
+                message: format!(
+                    "route {} alias `{alias}` targets ambiguous model `{target}` from provider {}",
+                    route_display(route, Some(provider)),
+                    provider_display(provider),
+                ),
+            })?;
             if let Some(owner) = owner {
                 selected_candidates[owner]
                     .explicit_aliases
@@ -494,36 +578,28 @@ fn collect_candidates<'a>(
 /// Exact public identities remain authoritative even when excluded/unselected;
 /// only a genuinely non-public target can use a unique selected upstream match.
 fn resolve_route_alias_owner(
-    provider: &Provider,
-    candidates: &[ModelCandidate<'_>],
+    catalog: &CatalogModelIndex<'_>,
+    selected_rows: &HashMap<*const Value, usize>,
+    selected_upstreams: &HashMap<String, Option<usize>>,
     visible: &str,
     target: &str,
 ) -> Result<Option<usize>, ()> {
-    let inventory = catalog_models(&provider.settings_config).ok_or(())?;
     for public in [visible.trim(), target.trim()] {
-        if !inventory
-            .iter()
-            .any(|entry| model_name(entry).is_some_and(|model| model.eq_ignore_ascii_case(public)))
-        {
+        if !catalog.has_public_model(public) {
             continue;
         }
-        return match lookup_catalog_model(&provider.settings_config, public) {
-            CatalogModelLookup::Found(row) => Ok(candidates
-                .iter()
-                .position(|candidate| std::ptr::eq(candidate.model_entry, row))),
+        return match catalog.lookup(public) {
+            CatalogModelLookup::Found(row) => {
+                Ok(selected_rows.get(&std::ptr::from_ref(row)).copied())
+            }
             CatalogModelLookup::Ambiguous => Err(()),
             CatalogModelLookup::Missing => Ok(None),
         };
     }
-    let mut upstream_matches = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, candidate)| candidate.upstream_model.eq_ignore_ascii_case(target.trim()));
-    let first = upstream_matches.next().map(|(index, _)| index);
-    if upstream_matches.next().is_some() {
-        Err(())
-    } else {
-        Ok(first)
+    match selected_upstreams.get(&target.trim().to_ascii_lowercase()) {
+        Some(Some(index)) => Ok(Some(*index)),
+        Some(None) => Err(()),
+        None => Ok(None),
     }
 }
 
@@ -1118,7 +1194,11 @@ fn normalize_api_format(value: &str) -> String {
     }
 }
 
-fn effective_context_window(provider: &Provider, model_entry: &Value) -> (Option<u64>, String) {
+fn effective_context_window(
+    provider: &Provider,
+    model_entry: &Value,
+    resolve_official: impl FnOnce(&str, Option<u64>) -> Option<(u64, &'static str)>,
+) -> (Option<u64>, String) {
     let (mut context_window, mut context_window_source) = value_with_source(
         crate::codex_context::explicit_context_window(
             model_entry,
@@ -1142,9 +1222,7 @@ fn effective_context_window(provider: &Provider, model_entry: &Value) -> (Option
             model_entry,
             &["maxContextWindow", "max_context_window"],
         );
-        if let Some((window, source)) =
-            crate::codex_context::resolved_official_context_window(provider, model, maximum)
-        {
+        if let Some((window, source)) = resolve_official(model, maximum) {
             context_window = Some(window);
             context_window_source = source.to_string();
         }
@@ -1155,9 +1233,11 @@ fn effective_context_window(provider: &Provider, model_entry: &Value) -> (Option
 fn effective_capability_summary(
     provider: &Provider,
     model_entry: &Value,
-    official_models: &[Value],
+    (reasoning, reasoning_source): (Option<Value>, String),
+    api_format: &str,
+    platform: Option<&str>,
+    (context_window, context_window_source): (Option<u64>, String),
 ) -> CodexModelCapabilitySummary {
-    let (context_window, context_window_source) = effective_context_window(provider, model_entry);
     let (input_modalities, input_modalities_source) = value_with_source(
         model_input_modalities(model_entry),
         string_array_field(
@@ -1171,8 +1251,6 @@ fn effective_capability_summary(
     )
     .filter(|value| !value.is_null())
     .cloned();
-    let (reasoning, reasoning_source) =
-        effective_reasoning_capability(provider, model_entry, official_models);
     // Keep a sanitized copy of an otherwise-unparseable model declaration in
     // the compile diagnostic. It remains separate from `reasoning`, so the
     // invalid declaration can never become a routable picker capability.
@@ -1197,7 +1275,7 @@ fn effective_capability_summary(
     );
 
     let (reasoning_summary_format, default_reasoning_summary) =
-        effective_reasoning_summary_metadata(provider, model_entry);
+        effective_reasoning_summary_metadata(model_entry, api_format, platform);
     let codex_ultra = effective_codex_ultra_overlay(model_entry, reasoning.as_ref());
 
     CodexModelCapabilitySummary {
@@ -1265,22 +1343,23 @@ fn effective_codex_ultra_overlay(model_entry: &Value, reasoning: Option<&Value>)
 fn effective_reasoning_capability(
     provider: &Provider,
     model_entry: &Value,
+    catalog: &CatalogModelIndex<'_>,
+    platform: Option<&str>,
+    library: Option<&crate::reasoning_capabilities::catalog::CapabilityLibrary>,
     official_models: &[Value],
 ) -> (Option<Value>, String) {
+    #[cfg(test)]
+    MODEL_CAPABILITY_RESOLUTIONS.with(|count| count.set(count.get() + 1));
     let canonical_model = string_field(model_entry, &["model", "id", "slug"]).unwrap_or("");
-    let library = crate::reasoning_capabilities::catalog::global_library();
-    let platform = crate::reasoning_capabilities::provider_metadata::detect_platform(provider);
-    let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_for_settings(
-        &provider.settings_config,
-        platform,
-        Some(crate::reasoning_capabilities::reasoning_provider_key(
+    let resolved =
+        crate::reasoning_capabilities::resolve_codex_model_capability_for_indexed_provider(
             provider,
-        )),
-        canonical_model,
-        library.as_ref(),
-        official_models,
-        |model| crate::reasoning_capabilities::current_detection_for_provider(provider, model),
-    );
+            catalog,
+            platform,
+            canonical_model,
+            library,
+            official_models,
+        );
 
     if let Some(capability) = resolved.capability {
         let source = match resolved.source {
@@ -1300,8 +1379,9 @@ fn effective_reasoning_capability(
 /// but the official DeepSeek Responses endpoint is an authoritative source for
 /// the same declaration and is safe to recognize by exact host plus transport.
 fn effective_reasoning_summary_metadata(
-    provider: &Provider,
     model_entry: &Value,
+    api_format: &str,
+    platform: Option<&str>,
 ) -> (Option<String>, Option<String>) {
     let format = string_field(
         model_entry,
@@ -1320,10 +1400,8 @@ fn effective_reasoning_summary_metadata(
     let model = string_field(model_entry, &["model", "id", "slug"])
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let official_deepseek_responses = effective_api_format(provider, model_entry).0
-        == "openai_responses"
-        && crate::reasoning_capabilities::provider_metadata::detect_platform(provider)
-            == Some("deepseek")
+    let official_deepseek_responses = api_format == "openai_responses"
+        && platform == Some("deepseek")
         && model.starts_with("deepseek");
     if official_deepseek_responses {
         return (Some("experimental".to_string()), Some("none".to_string()));
@@ -1713,6 +1791,49 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, HashMap};
 
+    fn model_capability_summary(
+        provider: &Provider,
+        model_entry: &Value,
+        official_models: &[Value],
+    ) -> CodexModelCapabilitySummary {
+        let catalog = CatalogModelIndex::new(&provider.settings_config);
+        let platform = crate::reasoning_capabilities::provider_metadata::detect_platform(provider);
+        let library = crate::reasoning_capabilities::catalog::global_library();
+        let context_window = effective_context_window(provider, model_entry, |model, maximum| {
+            if !crate::codex_config::codex_provider_record_is_official(provider) {
+                return None;
+            }
+            let models = crate::codex_context::trusted_official_models(provider);
+            crate::codex_context::resolved_from_models(model, maximum, &models)
+        });
+        effective_capability_summary(
+            provider,
+            model_entry,
+            effective_reasoning_capability(
+                provider,
+                model_entry,
+                &catalog,
+                platform,
+                library.as_deref(),
+                official_models,
+            ),
+            &effective_api_format(provider, model_entry).0,
+            platform,
+            context_window,
+        )
+    }
+
+    fn reasoning_summary_metadata(
+        provider: &Provider,
+        model_entry: &Value,
+    ) -> (Option<String>, Option<String>) {
+        effective_reasoning_summary_metadata(
+            model_entry,
+            &effective_api_format(provider, model_entry).0,
+            crate::reasoning_capabilities::provider_metadata::detect_platform(provider),
+        )
+    }
+
     fn provider(id: &str, name: &str, api_format: &str, models: Value) -> Provider {
         let mut provider = Provider::with_id(
             id.to_string(),
@@ -1776,7 +1897,7 @@ mod tests {
         ] {
             source.settings_config["baseUrl"] = json!(endpoint);
             assert_eq!(
-                effective_reasoning_summary_metadata(&source, &entry),
+                reasoning_summary_metadata(&source, &entry),
                 (None, None),
                 "{endpoint} must not acquire official DeepSeek summary metadata"
             );
@@ -1787,15 +1908,12 @@ mod tests {
         ] {
             source.settings_config["baseUrl"] = json!(endpoint);
             assert_eq!(
-                effective_reasoning_summary_metadata(&source, &entry),
+                reasoning_summary_metadata(&source, &entry),
                 (Some("experimental".into()), Some("none".into()))
             );
         }
         source.meta.as_mut().unwrap().api_format = Some("openai_chat".into());
-        assert_eq!(
-            effective_reasoning_summary_metadata(&source, &entry),
-            (None, None)
-        );
+        assert_eq!(reasoning_summary_metadata(&source, &entry), (None, None));
     }
 
     #[test]
@@ -1806,7 +1924,7 @@ mod tests {
             json!({"model": "deepseek-v4-flash", "reasoning_summary_format": "concise", "default_reasoning_summary": "auto"}),
         ] {
             assert_eq!(
-                effective_reasoning_summary_metadata(&source, &entry),
+                reasoning_summary_metadata(&source, &entry),
                 (Some("concise".into()), Some("auto".into()))
             );
         }
@@ -2028,20 +2146,20 @@ mod tests {
             });
         let entry =
             json!({"model":"visible-alias", "upstreamModel":"wire", "maxContextWindow":2000000});
-        let summary = effective_capability_summary(&provider, &entry, &[]);
+        let summary = model_capability_summary(&provider, &entry, &[]);
         assert_eq!(summary.context_window, Some(272000));
         assert_eq!(summary.context_window_source, "account_directory");
-        let capped = effective_capability_summary(
+        let capped = model_capability_summary(
             &provider,
             &json!({"model":"visible-alias", "upstreamModel":"wire", "maxContextWindow":128000}),
             &[],
         );
         assert_eq!(capped.context_window, Some(128000));
         provider.settings_config["model_context_window"] = json!("64000");
-        let provider_summary = effective_capability_summary(&provider, &entry, &[]);
+        let provider_summary = model_capability_summary(&provider, &entry, &[]);
         assert_eq!(provider_summary.context_window, Some(64000));
         assert_eq!(provider_summary.context_window_source, "provider");
-        let explicit = effective_capability_summary(
+        let explicit = model_capability_summary(
             &provider,
             &json!({"model":"visible-alias", "upstreamModel":"wire", "contextWindow":"1000000"}),
             &[],
@@ -2093,6 +2211,55 @@ mod tests {
             .map(|provider| (provider.id.clone(), provider))
             .collect::<HashMap<_, _>>();
         compile_v2(plan, &providers).expect("compile v2")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cold_compile_indexes_catalog_once_for_shared_routes() {
+        use crate::codex_multirouter::catalog::take_catalog_row_visits;
+
+        for row_count in [12, 256] {
+            let models = (0..row_count)
+                .map(|index| json!({"model": format!("public-{index}"), "upstreamModel": format!("wire-{index}")}))
+                .collect::<Vec<_>>();
+            let source = provider("source", "Source", "openai_chat", json!(models));
+            let mut first = route("first", "source", CodexModelSelection::All);
+            first.aliases.insert("first-a".into(), "wire-0".into());
+            first.aliases.insert("first-b".into(), "public-0".into());
+            let second = route(
+                "second",
+                "source",
+                CodexModelSelection::Include {
+                    models: (0..row_count)
+                        .map(|index| format!("wire-{index}"))
+                        .collect(),
+                },
+            );
+
+            take_catalog_row_visits();
+            ROUTE_AUTH_RESOLUTIONS.with(|count| count.set(0));
+            MODEL_CAPABILITY_RESOLUTIONS.with(|count| count.set(0));
+            let compiled = compile(&plan(vec![first, second]), [source]);
+            assert_eq!(take_catalog_row_visits(), row_count);
+            assert_eq!(ROUTE_AUTH_RESOLUTIONS.with(std::cell::Cell::get), 2);
+            assert_eq!(
+                MODEL_CAPABILITY_RESOLUTIONS.with(std::cell::Cell::get),
+                2 * row_count
+            );
+            assert_eq!(compiled.model_catalog.len(), 2 * row_count + 1);
+            let model = |alias: &str| {
+                compiled
+                    .model_catalog
+                    .iter()
+                    .find(|model| model.visible_model == alias)
+                    .unwrap()
+            };
+            assert_eq!(model("first-a").upstream_model, "wire-0");
+            assert_eq!(
+                model("first-a").capability_summary,
+                model("first-b").capability_summary
+            );
+        }
     }
 
     #[test]
@@ -3351,7 +3518,7 @@ mod tests {
             "supported_reasoning_levels": ["low", "medium", "high"],
             "default_reasoning_level": "medium"
         })];
-        let summary = effective_capability_summary(&provider, entry, &official);
+        let summary = model_capability_summary(&provider, entry, &official);
         assert_eq!(summary.reasoning_source, "official");
         assert_eq!(
             summary
@@ -3362,7 +3529,7 @@ mod tests {
         );
 
         let unknown = json!({"model": "vendor-custom", "upstreamModel": "vendor-custom"});
-        let unknown_summary = effective_capability_summary(&provider, &unknown, &official);
+        let unknown_summary = model_capability_summary(&provider, &unknown, &official);
         assert_eq!(unknown_summary.reasoning_source, "unknown");
         assert!(unknown_summary.reasoning.is_none());
     }

@@ -397,6 +397,11 @@ export function maintainDevCargoTarget({
       ),
     clean: () => {
       verifyPath(debugDirectory);
+      // Cargo parses --config as TOML. JSON.stringify preserves Windows
+      // backslashes, which TOML treats as escape sequences and rejects for
+      // paths such as `H:\\repos\\...`. Forward slashes are valid on Windows
+      // and keep the value valid on every supported platform.
+      const cargoBuildDirectory = EXPECTED_TARGET.replaceAll("\\", "/");
       requireBuildCommandSuccess(
         cargo(
           [
@@ -405,7 +410,7 @@ export function maintainDevCargoTarget({
             "--locked",
             "--offline",
             "--target-dir", EXPECTED_TARGET,
-            "--config", `build.build-dir=${JSON.stringify(EXPECTED_TARGET)}`,
+            "--config", `build.build-dir=${JSON.stringify(cargoBuildDirectory)}`,
           ],
           "inherit",
         ),

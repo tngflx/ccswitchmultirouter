@@ -1,9 +1,10 @@
 use futures::future::join_all;
 use serde::Serialize;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, Notify};
 
 use crate::codex_desktop::{
     candidate_debug_ports, collect_native_usage_limit_candidates, deactivate_codex_model_picker,
@@ -25,6 +26,7 @@ const GUARDIAN_IDLE_MAX_INTERVAL: Duration = Duration::from_secs(12);
 // picker verification at the normal cadence, but bound this heavier observer
 // to one scan per three guardian cycles unless its source set changes.
 const NATIVE_USAGE_SCAN_INTERVAL: Duration = Duration::from_secs(9);
+const NATIVE_USAGE_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GuardianCycleState {
@@ -86,6 +88,7 @@ struct NativeUsageScanCadence {
     next_due_at: Option<Instant>,
     source_signature: Vec<String>,
     expedited_incomplete: bool,
+    source_set_shrank: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -96,8 +99,17 @@ enum NativeUsageScan {
 }
 
 impl NativeUsageScanCadence {
-    fn next_scan(&mut self, sources: &[&str], force: bool, now: Instant) -> NativeUsageScan {
+    fn next_scan(
+        &mut self,
+        sources: &[&str],
+        source_enumeration_complete: bool,
+        force: bool,
+        now: Instant,
+    ) -> NativeUsageScan {
         if sources.is_empty() {
+            if !source_enumeration_complete {
+                return NativeUsageScan::Skip;
+            }
             if self.source_signature.is_empty() {
                 return NativeUsageScan::Skip;
             }
@@ -122,6 +134,11 @@ impl NativeUsageScanCadence {
             .map(|source| (*source).to_string())
             .collect::<Vec<_>>();
         signature.sort_unstable();
+        self.source_set_shrank = !self.source_signature.is_empty()
+            && self
+                .source_signature
+                .iter()
+                .any(|source| signature.binary_search(source).is_err());
         let source_changed = self.source_signature != signature;
         let due = self
             .next_due_at
@@ -168,7 +185,51 @@ enum PickerManagement {
 pub(crate) struct GuardianHandle {
     shutdown_tx: watch::Sender<bool>,
     picker_management: watch::Sender<PickerManagement>,
+    native_usage_refresh: Arc<NativeUsageRefresh>,
     pub(crate) status: Arc<Mutex<CodexGuardianStatus>>,
+}
+
+struct NativeUsageRefresh {
+    requested: AtomicU64,
+    completed: AtomicU64,
+    wake: Notify,
+    completion: Notify,
+}
+
+impl NativeUsageRefresh {
+    fn new() -> Self {
+        Self {
+            requested: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            wake: Notify::new(),
+            completion: Notify::new(),
+        }
+    }
+
+    fn request(&self) -> u64 {
+        let generation = self.requested.fetch_add(1, Ordering::AcqRel) + 1;
+        self.wake.notify_one();
+        generation
+    }
+
+    async fn wait_for(&self, generation: u64) -> Result<(), String> {
+        tokio::time::timeout(NATIVE_USAGE_REFRESH_TIMEOUT, async {
+            loop {
+                if self.completed.load(Ordering::Acquire) >= generation {
+                    return;
+                }
+                self.completion.notified().await;
+            }
+        })
+        .await
+        .map_err(|_| "Timed out waiting for the Codex recovery scan".to_string())
+    }
+
+    fn complete_pending(&self) {
+        let requested = self.requested.load(Ordering::Acquire);
+        self.completed.store(requested, Ordering::Release);
+        self.completion.notify_waiters();
+    }
 }
 
 /// 启动 Codex 桌面模型菜单生命周期守护。
@@ -178,6 +239,7 @@ pub(crate) struct GuardianHandle {
 /// 若 CDP 不可用则记录原因并等待。
 pub(crate) fn start_codex_guardian(manage_model_picker: bool) -> GuardianHandle {
     let (handle, shutdown_rx) = GuardianHandle::new(manage_model_picker);
+    let native_usage_refresh = handle.native_usage_refresh.clone();
     let inner = Arc::new(Mutex::new(GuardianInner {
         injected_target_ids: Vec::new(),
         injected_catalog_fingerprint: None,
@@ -189,7 +251,7 @@ pub(crate) fn start_codex_guardian(manage_model_picker: bool) -> GuardianHandle 
     let status = handle.status.clone();
     let management = handle.picker_management.clone();
     tauri::async_runtime::spawn(async move {
-        guardian_loop(status, inner, shutdown_rx, management).await;
+        guardian_loop(status, inner, shutdown_rx, management, native_usage_refresh).await;
     });
 
     handle
@@ -219,6 +281,7 @@ impl GuardianHandle {
                 } else {
                     PickerManagement::Observe
                 }),
+                native_usage_refresh: Arc::new(NativeUsageRefresh::new()),
                 status,
             },
             shutdown_rx,
@@ -245,6 +308,11 @@ impl GuardianHandle {
         });
     }
 
+    pub(crate) async fn request_native_usage_scan(&self) -> Result<(), String> {
+        let generation = self.native_usage_refresh.request();
+        self.native_usage_refresh.wait_for(generation).await
+    }
+
     pub(crate) fn stop(self) {
         let _ = self.shutdown_tx.send(true);
         clear_native_usage_limit_candidates();
@@ -256,8 +324,10 @@ async fn guardian_loop(
     inner: Arc<Mutex<GuardianInner>>,
     mut shutdown: watch::Receiver<bool>,
     picker_management: watch::Sender<PickerManagement>,
+    native_usage_refresh: Arc<NativeUsageRefresh>,
 ) {
     let mut cadence = GuardianCadence::default();
+    let mut force_native_usage_scan = false;
     loop {
         if *shutdown.borrow() {
             let mut s = status.lock().await;
@@ -271,11 +341,29 @@ async fn guardian_loop(
             return;
         }
 
-        let delay = cadence
-            .after_cycle(run_guardian_cycle(&status, &inner, &shutdown, &picker_management).await);
+        let delay = cadence.after_cycle(
+            run_guardian_cycle(
+                &status,
+                &inner,
+                &shutdown,
+                &picker_management,
+                &native_usage_refresh,
+                force_native_usage_scan,
+            )
+            .await,
+        );
+        if native_usage_refresh.completed.load(Ordering::Acquire)
+            >= native_usage_refresh.requested.load(Ordering::Acquire)
+        {
+            force_native_usage_scan = false;
+        }
 
         tokio::select! {
             _ = tokio::time::sleep(delay) => {},
+            _ = native_usage_refresh.wake.notified() => {
+                force_native_usage_scan = true;
+                inner.lock().await.native_usage_scan.expedite();
+            }
             _ = shutdown.changed() => {
                 let mut s = status.lock().await;
                 s.active = false;
@@ -294,6 +382,7 @@ async fn guardian_loop(
 struct GuardianTargetDestinations<'a> {
     picker: Vec<(String, String)>,
     native_usage: Vec<&'a str>,
+    native_usage_enumeration_complete: bool,
 }
 
 fn collect_guardian_target_destinations(
@@ -301,10 +390,12 @@ fn collect_guardian_target_destinations(
 ) -> GuardianTargetDestinations<'_> {
     let mut picker = Vec::new();
     let mut native_usage = Vec::new();
+    let mut native_usage_enumeration_complete = true;
     let mut seen_picker_ids = HashSet::new();
     let mut seen_websocket_urls = HashSet::new();
     for page in verified_pages {
         let Some(websocket_url) = page.web_socket_debugger_url.as_deref() else {
+            native_usage_enumeration_complete = false;
             continue;
         };
         if seen_picker_ids.insert(page.id.as_str()) {
@@ -319,6 +410,7 @@ fn collect_guardian_target_destinations(
     GuardianTargetDestinations {
         picker,
         native_usage,
+        native_usage_enumeration_complete,
     }
 }
 
@@ -341,17 +433,21 @@ async fn scan_native_usage_limit_sources(
     inner: &Arc<Mutex<GuardianInner>>,
     shutdown: &watch::Receiver<bool>,
     sources: &[&str],
+    source_enumeration_complete: bool,
     force: bool,
+    native_usage_refresh: &Arc<NativeUsageRefresh>,
 ) {
-    let scan = inner
-        .lock()
-        .await
-        .native_usage_scan
-        .next_scan(sources, force, Instant::now());
+    let scan = inner.lock().await.native_usage_scan.next_scan(
+        sources,
+        source_enumeration_complete,
+        force,
+        Instant::now(),
+    );
     match scan {
         NativeUsageScan::Skip => return,
         NativeUsageScan::Clear => {
             publish_native_usage_limit_candidates(shutdown, None);
+            native_usage_refresh.complete_pending();
             return;
         }
         NativeUsageScan::Scan => {}
@@ -364,8 +460,34 @@ async fn scan_native_usage_limit_sources(
         collect_native_usage_limit_candidates(source, &proxy_turns_json, &authorize)
     }))
     .await;
+    let source_set_complete = {
+        let guard = inner.lock().await;
+        !guard.native_usage_scan.source_set_shrank
+    };
+    let combined = combine_native_usage_limit_snapshots(
+        snapshots,
+        source_enumeration_complete,
+        source_set_complete,
+    );
+    let complete = combined.complete;
+    publish_native_usage_limit_candidates(shutdown, Some(combined));
+
+    // A pre-install bridge probe can return an incomplete snapshot while
+    // installing the renderer observer. Give an incomplete scan one expedited
+    // retry. Consecutive partial scans return to the normal sampling cadence.
+    inner.lock().await.native_usage_scan.finish_scan(complete);
+    if force {
+        native_usage_refresh.complete_pending();
+    }
+}
+
+fn combine_native_usage_limit_snapshots(
+    snapshots: Vec<NativeUsageLimitSnapshot>,
+    source_enumeration_complete: bool,
+    source_set_complete: bool,
+) -> NativeUsageLimitSnapshot {
     let mut combined = NativeUsageLimitSnapshot {
-        complete: !snapshots.is_empty(),
+        complete: !snapshots.is_empty() && source_enumeration_complete && source_set_complete,
         ..Default::default()
     };
     for snapshot in snapshots {
@@ -378,13 +500,7 @@ async fn scan_native_usage_limit_sources(
             .stale_proxy_turns
             .extend(snapshot.stale_proxy_turns);
     }
-    let complete = combined.complete;
-    publish_native_usage_limit_candidates(shutdown, Some(combined));
-
-    // A pre-install bridge probe can return an incomplete snapshot while
-    // installing the renderer observer. Give an incomplete scan one expedited
-    // retry. Consecutive partial scans return to the normal sampling cadence.
-    inner.lock().await.native_usage_scan.finish_scan(complete);
+    combined
 }
 
 fn finish_restored_picker_release(picker_management: &watch::Sender<PickerManagement>) {
@@ -400,6 +516,8 @@ async fn run_guardian_cycle(
     inner: &Arc<Mutex<GuardianInner>>,
     shutdown: &watch::Receiver<bool>,
     picker_management: &watch::Sender<PickerManagement>,
+    native_usage_refresh: &Arc<NativeUsageRefresh>,
+    force_native_usage_scan: bool,
 ) -> GuardianCycleState {
     // 1. 检查 Codex 主进程是否在运行。
     let running = detect_running_codex_main_process_async().await;
@@ -452,8 +570,17 @@ async fn run_guardian_cycle(
     let GuardianTargetDestinations {
         picker: current_targets,
         native_usage: native_usage_sources,
+        native_usage_enumeration_complete,
     } = collect_guardian_target_destinations(&verified_pages);
-    scan_native_usage_limit_sources(inner, shutdown, &native_usage_sources, false).await;
+    scan_native_usage_limit_sources(
+        inner,
+        shutdown,
+        &native_usage_sources,
+        native_usage_enumeration_complete,
+        force_native_usage_scan,
+        native_usage_refresh,
+    )
+    .await;
 
     if !cdp_available {
         let mut s = status.lock().await;
@@ -682,7 +809,15 @@ async fn run_guardian_cycle(
         }
     }
     if injection_succeeded && injected_target_count > 0 {
-        scan_native_usage_limit_sources(inner, shutdown, &native_usage_sources, true).await;
+        scan_native_usage_limit_sources(
+            inner,
+            shutdown,
+            &native_usage_sources,
+            native_usage_enumeration_complete,
+            true,
+            native_usage_refresh,
+        )
+        .await;
     }
     GuardianCycleState::WatchingRenderer
 }
@@ -1074,6 +1209,8 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+    use crate::proxy::codex_turn_recovery::ObservedUsageLimitTurn;
+
     #[test]
     fn native_usage_sources_keep_shared_target_ids_and_dedupe_websocket_aliases() {
         let first = "ws://127.0.0.1:9229/devtools/page/1";
@@ -1097,6 +1234,7 @@ mod tests {
 
         let destinations = collect_guardian_target_destinations(&verified_pages);
         assert_eq!(destinations.native_usage, [first, second, third]);
+        assert!(destinations.native_usage_enumeration_complete);
         assert_eq!(
             destinations.picker,
             [
@@ -1105,6 +1243,22 @@ mod tests {
                 ("second-page".to_string(), second.to_string()),
             ],
         );
+    }
+
+    #[test]
+    fn native_usage_source_without_a_websocket_is_partial() {
+        let verified_pages = [CdpTarget {
+            id: "missing-websocket".into(),
+            target_type: "page".into(),
+            title: "Codex".into(),
+            url: "app://-/index.html".into(),
+            web_socket_debugger_url: None,
+            source_endpoint: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+        }];
+
+        let destinations = collect_guardian_target_destinations(&verified_pages);
+        assert!(destinations.native_usage.is_empty());
+        assert!(!destinations.native_usage_enumeration_complete);
     }
 
     #[test]
@@ -1144,17 +1298,91 @@ mod tests {
         let sources = ["ws://127.0.0.1:9229/devtools/page/1"];
         let mut cadence = NativeUsageScanCadence::default();
         assert_eq!(
-            cadence.next_scan(&sources, false, now),
+            cadence.next_scan(&sources, true, false, now),
             NativeUsageScan::Scan
         );
         cadence.finish_scan(false);
         cadence.expedite();
-        assert_eq!(cadence.next_scan(&[], false, now), NativeUsageScan::Clear);
-        assert_eq!(cadence.next_scan(&[], false, now), NativeUsageScan::Skip);
         assert_eq!(
-            cadence.next_scan(&sources, false, now),
+            cadence.next_scan(&[], true, false, now),
+            NativeUsageScan::Clear
+        );
+        assert_eq!(
+            cadence.next_scan(&[], true, false, now),
+            NativeUsageScan::Skip
+        );
+        assert_eq!(
+            cadence.next_scan(&sources, true, false, now),
             NativeUsageScan::Scan
         );
+    }
+
+    #[test]
+    fn incomplete_empty_native_inventory_preserves_the_previous_scan_state() {
+        let now = Instant::now();
+        let sources = ["ws://127.0.0.1:9229/devtools/page/1"];
+        let mut cadence = NativeUsageScanCadence::default();
+
+        assert_eq!(
+            cadence.next_scan(&sources, true, false, now),
+            NativeUsageScan::Scan
+        );
+        cadence.finish_scan(true);
+
+        assert_eq!(
+            cadence.next_scan(&[], false, false, now + Duration::from_secs(1)),
+            NativeUsageScan::Skip
+        );
+        assert_eq!(cadence.source_signature, vec![sources[0].to_string()]);
+
+        assert_eq!(
+            cadence.next_scan(&[], true, false, now + Duration::from_secs(1)),
+            NativeUsageScan::Clear
+        );
+        assert!(cadence.source_signature.is_empty());
+    }
+
+    #[test]
+    fn native_usage_source_set_shrink_marks_the_next_snapshot_partial() {
+        let start = Instant::now();
+        let first = "ws://127.0.0.1:9229/devtools/page/1";
+        let second = "ws://127.0.0.1:9229/devtools/page/2";
+        let mut cadence = NativeUsageScanCadence::default();
+
+        assert_eq!(
+            cadence.next_scan(&[first, second], true, false, start),
+            NativeUsageScan::Scan
+        );
+        cadence.finish_scan(true);
+
+        assert_eq!(
+            cadence.next_scan(&[first], true, false, start + Duration::from_secs(1),),
+            NativeUsageScan::Scan
+        );
+        assert!(cadence.source_set_shrank);
+    }
+
+    #[test]
+    fn incomplete_native_source_inventory_keeps_candidates_in_a_partial_snapshot() {
+        let candidate: ObservedUsageLimitTurn = serde_json::from_value(json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "model": "gpt-test",
+            "observedAtMs": 1,
+        }))
+        .expect("valid observed usage-limit turn fixture");
+        let combined = combine_native_usage_limit_snapshots(
+            vec![NativeUsageLimitSnapshot {
+                candidates: vec![candidate.clone()],
+                complete: true,
+                ..Default::default()
+            }],
+            false,
+            true,
+        );
+
+        assert!(!combined.complete);
+        assert_eq!(combined.candidates, vec![candidate]);
     }
 
     #[test]
@@ -1295,6 +1523,21 @@ mod tests {
         assert!(current.active);
         assert!(current.codex_running);
         assert!(current.cdp_available);
+    }
+
+    #[tokio::test]
+    async fn native_usage_refresh_completes_waiters_for_the_requested_generation() {
+        let refresh = Arc::new(NativeUsageRefresh::new());
+        let generation = refresh.request();
+        let waiter = {
+            let refresh = refresh.clone();
+            tokio::spawn(async move { refresh.wait_for(generation).await })
+        };
+
+        refresh.complete_pending();
+
+        assert_eq!(waiter.await.expect("refresh waiter task"), Ok(()));
+        assert_eq!(refresh.completed.load(Ordering::Acquire), generation);
     }
 
     fn observed_target(

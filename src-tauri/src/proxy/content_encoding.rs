@@ -7,6 +7,13 @@
 use axum::http::header::HeaderMap;
 use std::io::Read;
 
+/// Maximum wire request size and decoded JSON size accepted by the proxy.
+///
+/// The router applies the same 200 MiB limit at the Axum layer for extractor
+/// routes. Raw `Request` handlers must enforce it themselves because they
+/// consume the body directly.
+pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 200 * 1024 * 1024;
+
 /// The normalized encoding chosen by a trusted native Codex caller before the
 /// request handler removes entity headers and rewrites the JSON body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,9 +116,8 @@ fn decompress_single(
             let zlib = flate2::read::ZlibDecoder::new(body);
             match read_with_output_limit(zlib, max_output_bytes) {
                 Ok(decompressed) => Ok(Some(decompressed)),
-                Err(zlib_err) => {
-                    // TooLarge 也要回退：raw 流被误判为 zlib 时可能在预算处截停，
-                    // 回退后若真是炸弹，raw 解码同样会触发 TooLarge。
+                Err(error @ DecompressError::TooLarge { .. }) => Err(error),
+                Err(DecompressError::Io(zlib_err)) => {
                     log::debug!("deflate 按 zlib 解压失败（{zlib_err}），回退 raw deflate");
                     let raw = flate2::read::DeflateDecoder::new(body);
                     Ok(Some(read_with_output_limit(raw, max_output_bytes)?))
@@ -166,12 +172,8 @@ pub(crate) fn decompress_body_with_limit(
     Ok(data)
 }
 
-/// 无输出上限的 [`decompress_body_with_limit`] 版本，供请求侧等已有自身
-/// 体积约束的调用方使用。
-pub(crate) fn decompress_body(
-    content_encoding: &str,
-    body: &[u8],
-) -> Result<Option<Vec<u8>>, std::io::Error> {
+#[cfg(test)]
+fn decompress_body(content_encoding: &str, body: &[u8]) -> Result<Option<Vec<u8>>, std::io::Error> {
     decompress_body_with_limit(content_encoding, body, usize::MAX).map_err(Into::into)
 }
 
@@ -186,7 +188,7 @@ pub(crate) fn is_supported_content_encoding(content_encoding: &str) -> bool {
 /// 从 header 提取 content-encoding（合并重复头，忽略 identity 与空值）。
 ///
 /// HTTP 允许重复 content-encoding 头，语义等同逗号拼接，故用 `get_all` 合并；
-/// 返回值可能含多个逗号分隔的 coding，交由 [`decompress_body`] 反向解码。
+/// 返回值可能含多个逗号分隔的 coding，交由 [`decompress_body_with_limit`] 反向解码。
 pub(crate) fn get_content_encoding(headers: &HeaderMap) -> Option<String> {
     let combined = headers
         .get_all("content-encoding")
@@ -311,6 +313,19 @@ mod tests {
             .unwrap();
         assert_eq!(out.len(), 64 * 1024);
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn zlib_output_over_limit_preserves_size_error() {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &[0; 2048]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let result = decompress_body_with_limit("deflate", &compressed, 1024);
+        assert!(matches!(
+            result,
+            Err(DecompressError::TooLarge { limit: 1024 })
+        ));
     }
 
     #[test]

@@ -6,6 +6,7 @@ import {
   cleanupDecision,
   findCargoTargetOwners,
   maintainCargoTarget,
+  maintainDevCargoTarget,
   parseCleanupOptions,
   processOwnsCargoTarget,
   windowsCargoProcesses,
@@ -337,4 +338,38 @@ test("maintenance cancels cleanup when the target becomes active after measureme
 
   assert.equal(result, "active");
   assert.deepEqual(calls, ["owners", "measure", "owners"]);
+});
+
+test("development cleanup passes a TOML-safe build directory to Cargo on Windows", () => {
+  const commands = [];
+  const expectedTarget = path.resolve("src-tauri", "target");
+  const result = maintainDevCargoTarget({
+    environment: {},
+    run: (executable, args) => {
+      commands.push({ executable, args });
+      if (args[0] === "metadata") {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            target_directory: expectedTarget,
+            build_directory: expectedTarget,
+          }),
+        };
+      }
+      return { status: 0 };
+    },
+    verifyPath: () => {},
+    measure: () => 7 * 1024 ** 3,
+    getProcesses: () => [],
+    log: () => {},
+  });
+
+  assert.equal(result, "clean");
+  const clean = commands.find(({ args }) => args[0] === "clean");
+  assert.ok(clean);
+  const config = clean.args[clean.args.indexOf("--config") + 1];
+  assert.equal(
+    config,
+    `build.build-dir=${JSON.stringify(expectedTarget.replaceAll("\\", "/"))}`,
+  );
 });

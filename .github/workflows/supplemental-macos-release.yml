@@ -14,7 +14,7 @@ permissions:
 jobs:
   macos-universal:
     name: Build and upload macOS universal assets
-    runs-on: macos-14
+    runs-on: macos-15-intel
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v6
@@ -25,6 +25,17 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: "20"
+
+      - name: Setup pinned pnpm with Corepack
+        shell: bash
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack install
+          node --version
+          test "$(pnpm --version)" = "$(node -p "require('./package.json').packageManager.split('@').pop()")"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -46,11 +57,6 @@ jobs:
             src-tauri/target/aarch64-apple-darwin/release/codex-history-repairer \
             src-tauri/target/x86_64-apple-darwin/release/codex-history-repairer \
             -output src-tauri/target/universal-apple-darwin/release/codex-history-repairer
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          run_install: false
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
@@ -111,7 +117,7 @@ jobs:
 
       - name: Build unsigned macOS bundles
         shell: bash
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: |
           set -euxo pipefail
           pnpm tauri build --target universal-apple-darwin

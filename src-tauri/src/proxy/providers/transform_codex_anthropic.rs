@@ -18,7 +18,7 @@ use super::transform_codex_chat::{
 use super::transform_responses::{sanitize_anthropic_tool_use_input, TOOL_RESULT_ERROR_MARKER};
 use crate::proxy::error::ProxyError;
 use crate::proxy::json_canonical::canonical_json_string;
-use crate::proxy::sse::{strip_sse_field, take_sse_block};
+use crate::proxy::sse::{strip_sse_field, SseBlocks};
 use crate::proxy::tool_media::{
     strip_and_clamp_media_from_tool_value, ToolMediaScope, TOOL_RESULT_MEDIA_ATTACHED_MARKER,
 };
@@ -1389,46 +1389,77 @@ pub(crate) fn anthropic_response_to_responses_with_context(
 /// stream): after looping over complete event blocks, it processes the residual
 /// buffer as the last event.
 pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
-    let mut message: Option<Value> = None;
-    // Collect blocks by content index along with the partial_json accumulator for their tool_use.
-    let mut blocks: BTreeMap<u64, Value> = BTreeMap::new();
-    let mut json_accum: BTreeMap<u64, String> = BTreeMap::new();
-    let mut stop_reason: Option<String> = None;
-    let mut delta_usage: Option<Value> = None;
-    let mut saw_message_stop = false;
+    let mut message = AnthropicMessageAccumulator::default();
+    let mut frames = SseBlocks::new(body);
+    for block in frames.by_ref() {
+        message.push_block(block)?;
+    }
+    message.push_block(frames.remaining())?;
+    message.finish()
+}
 
-    let mut buffer = body.to_string();
-    let process_block = |block: &str,
-                         message: &mut Option<Value>,
-                         blocks: &mut BTreeMap<u64, Value>,
-                         json_accum: &mut BTreeMap<u64, String>,
-                         stop_reason: &mut Option<String>,
-                         delta_usage: &mut Option<Value>,
-                         saw_message_stop: &mut bool|
-     -> Result<(), ProxyError> {
-        let mut data = String::new();
-        for line in block.lines() {
-            if let Some(chunk) = strip_sse_field(line, "data") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(chunk);
+#[derive(Default)]
+pub(crate) struct AnthropicMessageAccumulator {
+    message: Option<Value>,
+    blocks: BTreeMap<u64, Value>,
+    json_accum: BTreeMap<u64, String>,
+    stop_reason: Option<String>,
+    delta_usage: Option<serde_json::Map<String, Value>>,
+    saw_message_stop: bool,
+    #[cfg(test)]
+    pub(crate) parsed_bytes: usize,
+    #[cfg(test)]
+    appended_bytes: usize,
+}
+
+impl AnthropicMessageAccumulator {
+    fn push_block(&mut self, block: &str) -> Result<(), ProxyError> {
+        let mut lines = block
+            .lines()
+            .filter_map(|line| strip_sse_field(line, "data"))
+            .skip_while(|chunk| chunk.is_empty());
+        let Some(first) = lines.next() else {
+            return Ok(());
+        };
+        let joined;
+        let data = if let Some(second) = lines.next() {
+            let mut data = String::with_capacity(first.len() + second.len() + 1);
+            data.push_str(first);
+            for line in std::iter::once(second).chain(lines) {
+                data.push('\n');
+                data.push_str(line);
             }
-        }
-        if data.trim().is_empty() || data.trim() == "[DONE]" {
+            joined = data;
+            joined.as_str()
+        } else {
+            first
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
             return Ok(());
         }
-        let value: Value = match serde_json::from_str(data.trim()) {
-            Ok(v) => v,
-            Err(_) => return Ok(()), // Skip events that cannot be parsed (ping, etc.)
-        };
+        #[cfg(test)]
+        {
+            self.parsed_bytes += data.len();
+        }
+        if let Ok(event) = serde_json::from_str(data) {
+            self.push_event(event)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn push_event(&mut self, mut value: Value) -> Result<(), ProxyError> {
         match value.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "message_start" => {
                 // Only accept an object message; a malformed upstream could send a
                 // scalar/array here, and the later `message["content"] = …` index
                 // assignment would panic on a non-object Value.
-                if let Some(msg) = value.get("message").filter(|m| m.is_object()) {
-                    *message = Some(msg.clone());
+                if let Some(msg) = value
+                    .as_object_mut()
+                    .and_then(|fields| fields.remove("message"))
+                    .filter(Value::is_object)
+                {
+                    self.message = Some(msg);
                 }
             }
             "content_block_start" => {
@@ -1446,8 +1477,11 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
                     // has no way to tell that data was discarded. A text block recovers
                     // the common case; a tool-use block still yields nothing, exactly as
                     // it did before.
-                    let block = match value.get("content_block") {
-                        Some(block) if block.is_object() => block.clone(),
+                    let block = match value
+                        .as_object_mut()
+                        .and_then(|fields| fields.remove("content_block"))
+                    {
+                        Some(block) if block.is_object() => block,
                         malformed => {
                             if malformed.is_some() {
                                 log::warn!(
@@ -1457,42 +1491,36 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
                             json!({ "type": "text" })
                         }
                     };
-                    blocks.insert(index, block);
-                    json_accum.entry(index).or_default();
+                    self.blocks.insert(index, block);
                 }
             }
             "content_block_delta" => {
                 if let Some(index) = value.get("index").and_then(|v| v.as_u64()) {
-                    let delta = value.get("delta").cloned().unwrap_or(json!({}));
+                    let Some(delta) = value.get("delta") else {
+                        return Ok(());
+                    };
                     match delta.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                         "text_delta" => {
                             if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                append_str_field(
-                                    blocks.entry(index).or_insert(json!({})),
-                                    "text",
-                                    text,
-                                );
+                                self.append_str_field(index, "text", text);
                             }
                         }
                         "thinking_delta" => {
                             if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
-                                append_str_field(
-                                    blocks.entry(index).or_insert(json!({})),
-                                    "thinking",
-                                    text,
-                                );
+                                self.append_str_field(index, "thinking", text);
                             }
                         }
                         "signature_delta" => {
                             if let Some(sig) = delta.get("signature").and_then(|t| t.as_str()) {
-                                blocks.entry(index).or_insert(json!({}))["signature"] = json!(sig);
+                                self.blocks.entry(index).or_insert(json!({}))["signature"] =
+                                    json!(sig);
                             }
                         }
                         "input_json_delta" => {
                             if let Some(partial) =
                                 delta.get("partial_json").and_then(|t| t.as_str())
                             {
-                                json_accum.entry(index).or_default().push_str(partial);
+                                self.json_accum.entry(index).or_default().push_str(partial);
                             }
                         }
                         _ => {}
@@ -1501,11 +1529,11 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
             }
             "content_block_stop" => {
                 if let Some(index) = value.get("index").and_then(|v| v.as_u64()) {
-                    if let Some(accum) = json_accum.get(&index) {
+                    if let Some(accum) = self.json_accum.remove(&index) {
                         if !accum.trim().is_empty() {
                             let parsed: Value =
-                                serde_json::from_str(accum).unwrap_or_else(|_| json!({}));
-                            if let Some(block) = blocks.get_mut(&index) {
+                                serde_json::from_str(&accum).unwrap_or_else(|_| json!({}));
+                            if let Some(block) = self.blocks.get_mut(&index) {
                                 block["input"] = parsed;
                             }
                         }
@@ -1514,18 +1542,18 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
             }
             "message_delta" => {
                 if let Some(reason) = value.pointer("/delta/stop_reason").and_then(|v| v.as_str()) {
-                    *stop_reason = Some(reason.to_string());
+                    self.stop_reason = Some(reason.to_string());
                 }
-                if let Some(usage) = value.get("usage").and_then(Value::as_object) {
-                    let target = delta_usage.get_or_insert_with(|| json!({}));
-                    if let Some(target) = target.as_object_mut() {
-                        for (key, value) in usage {
-                            target.insert(key.clone(), value.clone());
-                        }
-                    }
+                if let Some(Value::Object(usage)) = value
+                    .as_object_mut()
+                    .and_then(|fields| fields.remove("usage"))
+                {
+                    self.delta_usage
+                        .get_or_insert_with(Default::default)
+                        .extend(usage);
                 }
             }
-            "message_stop" => *saw_message_stop = true,
+            "message_stop" => self.saw_message_stop = true,
             "error" => {
                 let msg = value
                     .pointer("/error/message")
@@ -1538,92 +1566,122 @@ pub fn anthropic_sse_to_message_value(body: &str) -> Result<Value, ProxyError> {
             _ => {}
         }
         Ok(())
-    };
-
-    while let Some(block) = take_sse_block(&mut buffer) {
-        process_block(
-            &block,
-            &mut message,
-            &mut blocks,
-            &mut json_accum,
-            &mut stop_reason,
-            &mut delta_usage,
-            &mut saw_message_stop,
-        )?;
-    }
-    // Tolerate the last event missing a trailing blank line (truncated stream).
-    if !buffer.trim().is_empty() {
-        process_block(
-            &buffer.clone(),
-            &mut message,
-            &mut blocks,
-            &mut json_accum,
-            &mut stop_reason,
-            &mut delta_usage,
-            &mut saw_message_stop,
-        )?;
     }
 
-    let mut message = message.ok_or_else(|| {
-        ProxyError::TransformError(
-            "anthropic SSE aggregation: missing message_start event".to_string(),
-        )
-    })?;
+    pub(crate) fn finish(mut self) -> Result<Value, ProxyError> {
+        let mut message = self.message.take().ok_or_else(|| {
+            ProxyError::TransformError(
+                "anthropic SSE aggregation: missing message_start event".to_string(),
+            )
+        })?;
 
-    if !saw_message_stop && stop_reason.is_none() {
-        if blocks.is_empty() {
-            return Err(ProxyError::TransformError(
-                "anthropic SSE aggregation: stream ended before message_stop".to_string(),
-            ));
+        if !self.saw_message_stop && self.stop_reason.is_none() {
+            if self.blocks.is_empty() {
+                return Err(ProxyError::TransformError(
+                    "anthropic SSE aggregation: stream ended before message_stop".to_string(),
+                ));
+            }
+            // Preserve partial content but make the truncation visible to Codex instead
+            // of returning a normal completed response.
+            self.stop_reason = Some("max_tokens".to_string());
         }
-        // Preserve partial content but make the truncation visible to Codex instead
-        // of returning a normal completed response.
-        stop_reason = Some("max_tokens".to_string());
-    }
 
-    // Merge in the content blocks (ordered by index), stop_reason, and cumulative
-    // message_delta usage. The Responses bridge reports final input tokens and
-    // server-tool counts there rather than in message_start.
-    let content: Vec<Value> = blocks.into_values().collect();
-    message["content"] = json!(content);
-    if let Some(reason) = stop_reason {
-        message["stop_reason"] = json!(reason);
-    }
-    if let Some(delta_usage) = delta_usage.and_then(|usage| usage.as_object().cloned()) {
-        if !message.get("usage").is_some_and(Value::is_object) {
-            message["usage"] = json!({});
+        // Merge in the content blocks (ordered by index), stop_reason, and cumulative
+        // message_delta usage. The Responses bridge reports final input tokens and
+        // server-tool counts there rather than in message_start.
+        let content: Vec<Value> = self.blocks.into_values().collect();
+        message["content"] = Value::Array(content);
+        if let Some(reason) = self.stop_reason {
+            message["stop_reason"] = json!(reason);
         }
-        if let Some(usage) = message.get_mut("usage").and_then(|u| u.as_object_mut()) {
-            for (key, value) in delta_usage {
-                if value.as_u64() == Some(0)
-                    && usage
-                        .get(&key)
-                        .and_then(Value::as_u64)
-                        .is_some_and(|existing| existing > 0)
-                {
-                    continue;
+        if let Some(delta_usage) = self.delta_usage {
+            if !message.get("usage").is_some_and(Value::is_object) {
+                message["usage"] = json!({});
+            }
+            if let Some(usage) = message.get_mut("usage").and_then(|u| u.as_object_mut()) {
+                for (key, value) in delta_usage {
+                    if value.as_u64() == Some(0)
+                        && usage
+                            .get(&key)
+                            .and_then(Value::as_u64)
+                            .is_some_and(|existing| existing > 0)
+                    {
+                        continue;
+                    }
+                    usage.insert(key, value);
                 }
-                usage.insert(key, value);
             }
         }
+
+        Ok(message)
     }
 
-    Ok(message)
-}
-
-/// Appends content to a string field of a JSON object (creating it if absent).
-fn append_str_field(block: &mut Value, field: &str, text: &str) {
-    let existing = block
-        .get(field)
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    block[field] = json!(format!("{existing}{text}"));
+    /// Append in place so fragmented text grows amortized linearly.
+    fn append_str_field(&mut self, index: u64, field: &str, text: &str) {
+        let block = self.blocks.entry(index).or_insert_with(|| json!({}));
+        match &mut block[field] {
+            Value::String(existing) => existing.push_str(text),
+            slot => *slot = Value::String(text.to_owned()),
+        }
+        #[cfg(test)]
+        {
+            self.appended_bytes += text.len();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_aggregation_appends_fragments_once_and_releases_tool_buffers() {
+        for fragments in [1, 4096] {
+            let mut typed = AnthropicMessageAccumulator::default();
+            let mut buffered = AnthropicMessageAccumulator::default();
+            let mut serialized_bytes = 0;
+            let mut push = |event: Value| {
+                let data = event.to_string();
+                serialized_bytes += data.len();
+                buffered.push_block(&format!("data: {data}")).unwrap();
+                typed.push_event(event).unwrap();
+            };
+            push(json!({"type":"message_start","message":{"id":"msg_test"}}));
+            push(json!({"type":"content_block_start","index":0,
+                "content_block":{"type":"text","text":""}}));
+            push(json!({"type":"content_block_start","index":1,
+                "content_block":{"type":"thinking","thinking":""}}));
+            for _ in 0..fragments {
+                push(json!({"type":"content_block_delta","index":0,
+                    "delta":{"type":"text_delta","text":"é"}}));
+                push(json!({"type":"content_block_delta","index":1,
+                    "delta":{"type":"thinking_delta","thinking":"思"}}));
+            }
+            push(json!({"type":"content_block_start","index":2,
+                "content_block":{"type":"tool_use","id":"tool_test","name":"search","input":{}}}));
+            push(json!({"type":"content_block_delta","index":2,
+                "delta":{"type":"input_json_delta","partial_json":"{\"query\":"}}));
+            push(json!({"type":"content_block_delta","index":2,
+                "delta":{"type":"input_json_delta","partial_json":"\"status\"}"}}));
+            for _ in 0..2 {
+                push(json!({"type":"content_block_stop","index":2}));
+            }
+            push(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{}}));
+            push(json!({"type":"message_stop"}));
+
+            assert_eq!(typed.appended_bytes, fragments * ("é".len() + "思".len()));
+            assert_eq!(typed.parsed_bytes, 0);
+            assert_eq!(buffered.parsed_bytes, serialized_bytes);
+            assert!(typed.json_accum.is_empty());
+            assert!(buffered.json_accum.is_empty());
+            let message = typed.finish().unwrap();
+            assert_eq!(message, buffered.finish().unwrap());
+            assert_eq!(message["content"][0]["text"], "é".repeat(fragments));
+            assert_eq!(message["content"][1]["thinking"], "思".repeat(fragments));
+            assert_eq!(message["content"][2]["input"], json!({"query":"status"}));
+            assert_eq!(message["usage"], json!({}));
+        }
+    }
 
     // ==================== Request: Responses → Anthropic ====================
 

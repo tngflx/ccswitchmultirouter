@@ -96,6 +96,7 @@ import {
   codexCatalogRowHasReasoningEffort,
   isCompleteCodexCatalogFetch,
   isExplicitCodexReasoningCapability,
+  jsonValuesEqual,
   reconcileFetchedCodexCatalogRows,
   selectOnlyCodexCatalogRowsWithReasoningEffort,
   type CodexCatalogSyncSource,
@@ -154,27 +155,7 @@ import type {
 } from "@/types/codexSubagentV2";
 
 const EMPTY_CODEX_API_KEY_GROUPS: CodexApiKeyGroup[] = [];
-const REASONING_LOOKUP_CONCURRENCY = 6;
-
-export async function resolveCodexReasoningCapabilities(
-  models: string[],
-  lookup: (model: string) => Promise<CodexModelReasoningResolution>,
-  isCancelled: () => boolean = () => false,
-): Promise<Array<readonly [string, CodexModelReasoningResolution]>> {
-  const results: Array<readonly [string, CodexModelReasoningResolution]> = [];
-  for (
-    let index = 0;
-    index < models.length && !isCancelled();
-    index += REASONING_LOOKUP_CONCURRENCY
-  ) {
-    const batch = models.slice(index, index + REASONING_LOOKUP_CONCURRENCY);
-    const batchResults = await Promise.all(
-      batch.map(async (model) => [model, await lookup(model)] as const),
-    );
-    results.push(...batchResults);
-  }
-  return results;
-}
+const EMPTY_CODEX_CHAT_REASONING: CodexChatReasoning = {};
 
 interface EndpointCandidate {
   url: string;
@@ -776,8 +757,10 @@ function catalogRowsMatchModels(
     const incoming = models[i];
     return (
       row.model === (incoming.model ?? "") &&
-      JSON.stringify(normalizeModelIdentityMetadata(row)) ===
-        JSON.stringify(normalizeModelIdentityMetadata(incoming)) &&
+      jsonValuesEqual(
+        normalizeModelIdentityMetadata(row),
+        normalizeModelIdentityMetadata(incoming),
+      ) &&
       catalogRowUpstreamModel(row) === catalogRowUpstreamModel(incoming) &&
       (row.displayName ?? "") === (incoming.displayName ?? "") &&
       String(row.contextWindow ?? "") ===
@@ -785,10 +768,10 @@ function catalogRowsMatchModels(
       (row.supportsParallelToolCalls ?? null) ===
         (incoming.supportsParallelToolCalls ?? null) &&
       (row.baseInstructions ?? "") === (incoming.baseInstructions ?? "") &&
-      JSON.stringify(row.inputModalities ?? []) ===
-        JSON.stringify(
-          incoming.inputModalities ?? incoming.input_modalities ?? [],
-        ) &&
+      jsonValuesEqual(
+        row.inputModalities ?? [],
+        incoming.inputModalities ?? incoming.input_modalities ?? [],
+      ) &&
       (row.supportsImage ?? null) ===
         (incoming.supportsImage ??
           incoming.supports_image ??
@@ -796,16 +779,18 @@ function catalogRowsMatchModels(
           null) &&
       (row.textOnly ?? null) ===
         (incoming.textOnly ?? incoming.text_only ?? null) &&
-      JSON.stringify(row.reasoning ?? null) ===
-        JSON.stringify(incoming.reasoning ?? null) &&
-      JSON.stringify(row.codexUltra ?? null) ===
-        JSON.stringify(incoming.codexUltra ?? null) &&
+      jsonValuesEqual(row.reasoning ?? null, incoming.reasoning ?? null) &&
+      jsonValuesEqual(row.codexUltra ?? null, incoming.codexUltra ?? null) &&
       (row.apiFormat ?? null) ===
         (incoming.apiFormat ?? incoming.api_format ?? null) &&
-      JSON.stringify(row.protocolCapability ?? null) ===
-        JSON.stringify(incoming.protocolCapability ?? null) &&
-      JSON.stringify(row.codexCache ?? null) ===
-        JSON.stringify(incoming.codexCache ?? incoming.codex_cache ?? null) &&
+      jsonValuesEqual(
+        row.protocolCapability ?? null,
+        incoming.protocolCapability ?? null,
+      ) &&
+      jsonValuesEqual(
+        row.codexCache ?? null,
+        incoming.codexCache ?? incoming.codex_cache ?? null,
+      ) &&
       (row.enabled ?? true) === (incoming.enabled ?? true) &&
       (row.sortIndex ?? null) === (incoming.sortIndex ?? null)
     );
@@ -833,7 +818,7 @@ interface CodexProviderReadinessIdentityInput {
   codexChatReasoning: CodexChatReasoning;
   promptCacheRouting: PromptCacheRoutingMode;
   defaultModel: string;
-  catalogModels: CodexCatalogModel[];
+  catalog: ReturnType<typeof buildCodexProviderReadinessCatalog>;
 }
 
 // 连接验证结果只属于发起请求时的完整 Provider 身份。这里保留精确凭据值用于
@@ -859,9 +844,9 @@ function buildCodexProviderReadinessIdentity({
   codexChatReasoning,
   promptCacheRouting,
   defaultModel,
-  catalogModels,
-}: CodexProviderReadinessIdentityInput): string {
-  return JSON.stringify({
+  catalog,
+}: CodexProviderReadinessIdentityInput) {
+  return {
     provider: {
       id: providerId ?? null,
       name: providerName ?? null,
@@ -892,29 +877,48 @@ function buildCodexProviderReadinessIdentity({
       promptCacheRouting,
     },
     defaultModel: defaultModel.trim(),
-    catalog: catalogModels.map((model) => ({
-      model: model.model.trim(),
-      upstreamModel: catalogRowUpstreamModel(model),
-      displayName: (model.displayName ?? model.display_name ?? "").trim(),
-      contextWindow: String(model.contextWindow ?? model.context_window ?? ""),
-      inputModalities: model.inputModalities ?? model.input_modalities ?? null,
-      supportsImage:
-        model.supportsImage ?? model.supports_image ?? model.vision ?? null,
-      textOnly: model.textOnly ?? model.text_only ?? null,
-      supportsParallelToolCalls:
-        model.supportsParallelToolCalls ??
-        model.supports_parallel_tool_calls ??
-        null,
-      baseInstructions:
-        model.baseInstructions ?? model.base_instructions ?? null,
-      reasoning: model.reasoning ?? null,
-      codexUltra: model.codexUltra ?? null,
-      codexCache: model.codexCache ?? model.codex_cache ?? null,
-      protocolCapability: model.protocolCapability ?? null,
-      enabled: model.enabled !== false,
-      sortIndex: model.sortIndex ?? null,
-    })),
-  });
+    catalog,
+  };
+}
+
+type CodexProviderReadinessIdentity = ReturnType<
+  typeof buildCodexProviderReadinessIdentity
+>;
+
+function buildCodexProviderReadinessCatalog(
+  models: readonly CodexCatalogModel[],
+) {
+  return models.map((model) => ({
+    model: model.model.trim(),
+    upstreamModel: catalogRowUpstreamModel(model),
+    displayName: (model.displayName ?? model.display_name ?? "").trim(),
+    contextWindow: String(model.contextWindow ?? model.context_window ?? ""),
+    inputModalities: model.inputModalities ?? model.input_modalities ?? null,
+    supportsImage:
+      model.supportsImage ?? model.supports_image ?? model.vision ?? null,
+    textOnly: model.textOnly ?? model.text_only ?? null,
+    supportsParallelToolCalls:
+      model.supportsParallelToolCalls ??
+      model.supports_parallel_tool_calls ??
+      null,
+    baseInstructions: model.baseInstructions ?? model.base_instructions ?? null,
+    reasoning: model.reasoning ?? null,
+    codexUltra: model.codexUltra ?? null,
+    codexCache: model.codexCache ?? model.codex_cache ?? null,
+    protocolCapability: model.protocolCapability ?? null,
+    enabled: model.enabled !== false,
+    sortIndex: model.sortIndex ?? null,
+  }));
+}
+
+interface CodexReasoningContext {
+  providerId: string;
+  settings: {
+    providerName: string;
+    base_url: string;
+    config: string;
+    modelCatalog: { models: CodexCatalogRow[] };
+  };
 }
 
 // 将远端 /models 返回合并进 Codex 模型映射；已有行保留用户显示名和已填上下文，
@@ -1103,7 +1107,7 @@ export function CodexFormFields({
   onImpersonateClaudeCodeChange = () => undefined,
   maxOutputTokens = "",
   onMaxOutputTokensChange = () => undefined,
-  codexChatReasoning = {},
+  codexChatReasoning = EMPTY_CODEX_CHAT_REASONING,
   onCodexChatReasoningChange,
   promptCacheRouting = "auto",
   onPromptCacheRoutingChange = () => undefined,
@@ -1241,9 +1245,9 @@ export function CodexFormFields({
     };
   }, [modelFetchIdentity]);
   const [reasoningResolutionState, setReasoningResolutionState] = useState<{
-    contextKey: string;
+    context: CodexReasoningContext | null;
     models: Record<string, CodexModelReasoningResolution>;
-  }>({ contextKey: "", models: {} });
+  }>({ context: null, models: {} });
   const [redetectingReasoningModel, setRedetectingReasoningModel] = useState<
     string | null
   >(null);
@@ -1266,10 +1270,10 @@ export function CodexFormFields({
   const [protocolProbeOutcome, setProtocolProbeOutcome] =
     useState<CodexProviderProtocolPreflightOutcome | null>(null);
   const [protocolProbeError, setProtocolProbeError] = useState("");
-  const [protocolProbeIdentity, setProtocolProbeIdentity] = useState<
-    string | null
-  >(null);
-  const protocolProbeIdentityRef = useRef<string | null>(null);
+  const [protocolProbeIdentity, setProtocolProbeIdentity] =
+    useState<CodexProviderReadinessIdentity | null>(null);
+  const protocolProbeIdentityRef =
+    useRef<CodexProviderReadinessIdentity | null>(null);
   const protocolProbeSeqRef = useRef(0);
   const [shouldHighlightFetchModels, setShouldHighlightFetchModels] =
     useState(false);
@@ -1448,81 +1452,87 @@ export function CodexFormFields({
   // Product-level Ultra is a UI overlay on a provider capability. It may
   // trigger a fresh resolver call, but must not evict the native capability
   // snapshot between the checkbox and its provider-effort selection.
-  const reasoningContextKey = JSON.stringify(
-    {
+  const reasoningContext = useMemo<CodexReasoningContext>(
+    () => ({
       providerId: providerId ?? "codex-draft",
       settings: reasoningSettingsConfig,
-    },
-    (key, value) => (key === "codexUltra" ? undefined : value),
+    }),
+    [providerId, reasoningSettingsConfig],
   );
-  const reasoningContextKeyRef = useRef(reasoningContextKey);
-  reasoningContextKeyRef.current = reasoningContextKey;
-  const reasoningResolutions =
-    reasoningResolutionState.contextKey === reasoningContextKey
-      ? reasoningResolutionState.models
-      : {};
+  const reasoningContextRef = useRef(reasoningContext);
+  const reasoningResolutions = useMemo(
+    () =>
+      jsonValuesEqual(
+        reasoningResolutionState.context,
+        reasoningContext,
+        "codexUltra",
+      )
+        ? reasoningResolutionState.models
+        : {},
+    [reasoningContext, reasoningResolutionState],
+  );
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    const previousContext = reasoningContextRef.current;
+    reasoningContextRef.current = reasoningContext;
+    if (jsonValuesEqual(previousContext, reasoningContext, "codexUltra")) {
+      return;
+    }
     reasoningDetectionRequestRef.current += 1;
     setRedetectingReasoningModel(null);
+  }, [reasoningContext]);
+
+  useEffect(() => {
     return () => {
       reasoningDetectionRequestRef.current += 1;
     };
-  }, [reasoningContextKey]);
+  }, []);
 
   useEffect(() => {
     const visibleModelSet = new Set(visibleReasoningModels);
-    const models = catalogRows
-      .filter((row) => row.enabled !== false)
+    const models = reasoningContext.settings.modelCatalog.models
       .map((row) => row.model.trim())
       .filter((model) => model && visibleModelSet.has(model));
     if (models.length === 0) {
       setReasoningResolutionState({
-        contextKey: reasoningContextKey,
+        context: reasoningContext,
         models: {},
       });
       return;
     }
     let cancelled = false;
-    // Let the previous viewport's active batch finish before issuing more IPC.
+    // Keep one viewport request active and skip drafts that changed in the queue.
     reasoningResolutionTailRef.current =
       reasoningResolutionTailRef.current.then(async () => {
-        const results = await resolveCodexReasoningCapabilities(
-          models,
-          async (model) => {
-            try {
-              return await codexSubagentV2Api.resolveModelReasoningCapability(
-                reasoningSettingsConfig,
-                providerId ?? "codex-draft",
-                model,
-              );
-            } catch {
-              console.warn("[CodexFormFields] reasoning resolution failed", {
-                model,
-              });
-              return unknownReasoningResolution(model);
-            }
-          },
-          () => cancelled,
-        );
         if (cancelled) return;
-        const next: Record<string, CodexModelReasoningResolution> = {};
-        for (const result of results) next[result[0]] = result[1];
+        let results: CodexModelReasoningResolution[] = [];
+        try {
+          results = await codexSubagentV2Api.resolveModelReasoningCapabilities(
+            reasoningContext.settings,
+            reasoningContext.providerId,
+            models,
+          );
+        } catch {
+          console.warn("[CodexFormFields] reasoning resolution failed");
+        }
+        if (cancelled) return;
+        const resolvedModels = new Map(
+          results.map((result) => [result.model, result]),
+        );
         setReasoningResolutionState({
-          contextKey: reasoningContextKey,
-          models: next,
+          context: reasoningContext,
+          models: Object.fromEntries(
+            models.map((model) => [
+              model,
+              resolvedModels.get(model) ?? unknownReasoningResolution(model),
+            ]),
+          ),
         });
       });
     return () => {
       cancelled = true;
     };
-  }, [
-    catalogRows,
-    providerId,
-    reasoningSettingsConfig,
-    reasoningContextKey,
-    visibleReasoningModels,
-  ]);
+  }, [reasoningContext, visibleReasoningModels]);
 
   const handleVisibleReasoningItemsChange = useCallback(
     (items: { row: CodexCatalogRow; index: number }[]) => {
@@ -1542,8 +1552,11 @@ export function CodexFormFields({
   const modelMappingSectionRef = useRef<HTMLDivElement | null>(null);
   const fetchModelsButtonRef = useRef<HTMLButtonElement | null>(null);
   // 记录上次发送给父组件的数据，避免重复触发
-  const lastSentModelsRef = useRef<CodexCatalogModel[]>(catalogModels);
-  const catalogPropKeyRef = useRef(JSON.stringify(catalogModels));
+  const lastSentCatalogRef = useRef<{
+    models: CodexCatalogModel[];
+    rows?: CodexCatalogRow[];
+  }>({ models: catalogModels });
+  const previousCatalogModelsRef = useRef(catalogModels);
   const pendingCatalogSyncRef = useRef<CodexCatalogModel[] | null>(null);
 
   const repairDefaultModel = useCallback(
@@ -1577,7 +1590,7 @@ export function CodexFormFields({
           validModels.has(normalizeCodexPublicModelKey(model)),
         ),
       );
-      if (JSON.stringify(nextOverrides) !== JSON.stringify(protocolOverrides)) {
+      if (!jsonValuesEqual(nextOverrides, protocolOverrides)) {
         onProtocolOverridesChange(nextOverrides);
       }
     },
@@ -1616,8 +1629,12 @@ export function CodexFormFields({
     });
   }, [catalogRows]);
 
-  const buildReadinessIdentityFor = useCallback(
-    (nextCatalogModels: CodexCatalogModel[]) =>
+  const readinessCatalog = useMemo(
+    () => buildCodexProviderReadinessCatalog(catalogRows),
+    [catalogRows],
+  );
+  const readinessIdentity = useMemo(
+    () =>
       buildCodexProviderReadinessIdentity({
         providerId,
         providerName,
@@ -1639,7 +1656,7 @@ export function CodexFormFields({
         codexChatReasoning,
         promptCacheRouting,
         defaultModel: codexModel,
-        catalogModels: nextCatalogModels,
+        catalog: readinessCatalog,
       }),
     [
       anthropicAuthField,
@@ -1661,16 +1678,13 @@ export function CodexFormFields({
       promptCacheRouting,
       providerId,
       providerName,
+      readinessCatalog,
       selectedXaiAccountId,
     ],
   );
-  const readinessIdentity = useMemo(
-    () => buildReadinessIdentityFor(catalogRows),
-    [buildReadinessIdentityFor, catalogRows],
-  );
   const snapshotReadinessIdentityRef = useRef<{
     snapshot: CodexProviderEditorSnapshot;
-    identity: string;
+    identity: CodexProviderReadinessIdentity;
   } | null>(null);
   if (
     codexProviderEditorSnapshot &&
@@ -1686,15 +1700,26 @@ export function CodexFormFields({
   }
   const readinessIdentityRef = useRef(readinessIdentity);
   readinessIdentityRef.current = readinessIdentity;
-  const bindProtocolProbeIdentity = useCallback((identity: string) => {
-    protocolProbeIdentityRef.current = identity;
-    setProtocolProbeIdentity(identity);
-  }, []);
+  const bindProtocolProbeIdentity = useCallback(
+    (identity: CodexProviderReadinessIdentity) => {
+      protocolProbeIdentityRef.current = identity;
+      setProtocolProbeIdentity(identity);
+    },
+    [],
+  );
 
   // 任一身份输入变化都立即使旧结果失效并取消其 UI ownership。异步请求本身可以
   // 自然结束，但 sequence/identity guard 会阻止旧进度与最终结果回写到新配置。
+  const lastReadinessIdentityRef =
+    useRef<CodexProviderReadinessIdentity | null>(null);
   useEffect(() => {
-    if (protocolProbeIdentityRef.current !== readinessIdentity) {
+    const configChanged = !jsonValuesEqual(
+      lastReadinessIdentityRef.current,
+      readinessIdentity,
+    );
+    lastReadinessIdentityRef.current = readinessIdentity;
+    if (!configChanged) return;
+    if (!jsonValuesEqual(protocolProbeIdentityRef.current, readinessIdentity)) {
       protocolProbeSeqRef.current += 1;
       protocolProbeIdentityRef.current = null;
       setProtocolProbeIdentity(null);
@@ -1711,14 +1736,22 @@ export function CodexFormFields({
     }
   }, [onProtocolProbeReceiptIdsChange, readinessIdentity]);
 
-  const isProtocolProbeStateCurrent =
-    protocolProbeIdentity === readinessIdentity;
+  const isProtocolProbeStateCurrent = useMemo(
+    () => jsonValuesEqual(protocolProbeIdentity, readinessIdentity),
+    [protocolProbeIdentity, readinessIdentity],
+  );
   const snapshotAdaptation = codexProviderEditorSnapshot?.adaptation ?? null;
+  const snapshotReadinessIdentity =
+    snapshotReadinessIdentityRef.current?.identity;
+  const isStoredReadinessCurrent = useMemo(
+    () => jsonValuesEqual(snapshotReadinessIdentity, readinessIdentity),
+    [snapshotReadinessIdentity, readinessIdentity],
+  );
   const displayedAdaptation =
     isProtocolProbeStateCurrent && protocolProbeOutcome?.adaptationPreview
       ? protocolProbeOutcome.adaptationPreview
       : snapshotAdaptation
-        ? snapshotReadinessIdentityRef.current?.identity === readinessIdentity
+        ? isStoredReadinessCurrent
           ? snapshotAdaptation
           : { ...snapshotAdaptation, status: "stale" as const }
         : null;
@@ -1767,28 +1800,30 @@ export function CodexFormFields({
   // 父 → 子：仅当 prop 数据真的变化（预设切换 / 编辑加载）时才重建 rowId；
   // 同 shape 时保留现有 rowId，避免编辑过程中焦点丢失。
   useEffect(() => {
-    const incomingCatalogKey = JSON.stringify(catalogModels);
-    const isExternalCatalogChange =
-      incomingCatalogKey !== catalogPropKeyRef.current;
-    catalogPropKeyRef.current = incomingCatalogKey;
-    if (isExternalCatalogChange) {
-      const syncedRows = hydrateCodexInputCapabilities(
-        catalogModels.map((model) => createCatalogRow(model)),
-        inputCapabilityReferences,
-      );
-      // Gate stale echoes before React can defer the state updater. Compare
-      // against hydrated rows so normalization cannot permanently block edits.
-      pendingCatalogSyncRef.current = syncedRows;
-      setCatalogRows((current) =>
-        catalogRowsMatchModels(current, syncedRows) ? current : syncedRows,
-      );
+    const previous = previousCatalogModelsRef.current;
+    previousCatalogModelsRef.current = catalogModels;
+    if (
+      catalogModels === lastSentCatalogRef.current.models ||
+      jsonValuesEqual(catalogModels, previous)
+    ) {
+      // The parent stores the same array emitted by the draft. Its echo needs
+      // neither fresh row IDs nor a second hydration pass.
+      return;
     }
-    // 同步更新 ref，避免父组件传入新数据时子→父 effect 误判为本地修改
-    lastSentModelsRef.current = catalogModels;
+    const syncedRows = hydrateCodexInputCapabilities(
+      catalogModels.map((model) => createCatalogRow(model)),
+      inputCapabilityReferences,
+    );
+    // Gate stale echoes before React can defer the state updater. Compare
+    // against hydrated rows so normalization cannot permanently block edits.
+    pendingCatalogSyncRef.current = syncedRows;
+    setCatalogRows((current) =>
+      catalogRowsMatchModels(current, syncedRows) ? current : syncedRows,
+    );
+    lastSentCatalogRef.current = { models: catalogModels };
   }, [catalogModels, inputCapabilityReferences]);
 
   // 子 → 父：rowId 是视图层概念，不应进入持久化数据；剥离后再回传。
-  // 注意：依赖数组不包含 catalogModels，避免父→子更新触发子→父回调形成循环。
   useEffect(() => {
     if (!onCatalogModelsChange) return;
     // 外部 catalog 同步进来时先等本地 rowId 重建完成，再允许子组件回写。
@@ -1797,12 +1832,16 @@ export function CodexFormFields({
         return;
       pendingCatalogSyncRef.current = null;
     }
+    const lastSent = lastSentCatalogRef.current;
+    if (lastSent.rows === catalogRows) return;
+    if (catalogRowsMatchModels(catalogRows, lastSent.models)) {
+      lastSent.rows = catalogRows;
+      return;
+    }
     const next: CodexCatalogModel[] = catalogRows.map(
       ({ rowId: _rowId, ...rest }) => rest,
     );
-    // 只有当数据真的变化时才通知父组件
-    if (catalogRowsMatchModels(catalogRows, lastSentModelsRef.current)) return;
-    lastSentModelsRef.current = next;
+    lastSentCatalogRef.current = { models: next, rows: catalogRows };
     onCatalogModelsChange(next);
   }, [catalogRows, catalogModels, onCatalogModelsChange]);
 
@@ -2266,7 +2305,7 @@ export function CodexFormFields({
     const probeSeq = ++protocolProbeSeqRef.current;
     const ownsCurrentIdentity = () =>
       probeSeq === protocolProbeSeqRef.current &&
-      readinessIdentityRef.current === probeIdentity;
+      jsonValuesEqual(readinessIdentityRef.current, probeIdentity);
     bindProtocolProbeIdentity(probeIdentity);
     setIsProtocolProbeConfirmOpen(false);
     setIsProtocolProbeProgressOpen(true);
@@ -2362,10 +2401,6 @@ export function CodexFormFields({
       const resultCounts = `Verified ${verified}, Partial ${partial}, Failed ${failed}`;
 
       if (allResponses) {
-        const resultIdentity = buildReadinessIdentityFor(
-          catalogRowsRef.current,
-        );
-        bindProtocolProbeIdentity(resultIdentity);
         const summary = `Deep probe complete: all models selected Responses; ${resultCounts}.`;
         const tone = failed > 0 || partial > 0 ? "warning" : "success";
         setProtocolProbeTone(tone);
@@ -2378,10 +2413,6 @@ export function CodexFormFields({
         return;
       }
       if (allChat) {
-        const resultIdentity = buildReadinessIdentityFor(
-          catalogRowsRef.current,
-        );
-        bindProtocolProbeIdentity(resultIdentity);
         const summary = `Deep probe complete: all models selected Chat Completions; ${resultCounts}.`;
         const tone = failed > 0 || partial > 0 ? "warning" : "success";
         setProtocolProbeTone(tone);
@@ -2405,8 +2436,6 @@ export function CodexFormFields({
         allVerified && hasMixedVerifiedTransports
           ? `Deep probe complete: different models selected different protocols; ${resultCounts}. Saving will split them into two same-protocol providers while keeping them as one model source.`
           : `Deep probe complete: some models are Partial/Failed, so automatic protocol selection is unavailable; ${resultCounts}. Saving will use the declared protocol without deep verification. Review the failed stages and retry when you want automatic selection.`;
-      const resultIdentity = buildReadinessIdentityFor(catalogRowsRef.current);
-      bindProtocolProbeIdentity(resultIdentity);
       const tone = allVerified
         ? "success"
         : verifiedRecords.length > 0
@@ -2438,7 +2467,6 @@ export function CodexFormFields({
     }
   }, [
     bindProtocolProbeIdentity,
-    buildReadinessIdentityFor,
     codexBaseUrl,
     codexApiKey,
     codexModel,
@@ -3429,11 +3457,15 @@ export function CodexFormFields({
                               onRedetect={async () => {
                                 const requestId =
                                   ++reasoningDetectionRequestRef.current;
-                                const contextKey = reasoningContextKey;
+                                const context = reasoningContext;
                                 const ownsCurrentContext = () =>
                                   requestId ===
                                     reasoningDetectionRequestRef.current &&
-                                  reasoningContextKeyRef.current === contextKey;
+                                  jsonValuesEqual(
+                                    reasoningContextRef.current,
+                                    context,
+                                    "codexUltra",
+                                  );
                                 setRedetectingReasoningModel(model);
                                 try {
                                   const outcome =
@@ -3446,6 +3478,10 @@ export function CodexFormFields({
                                     typeof outcome === "object" &&
                                     "found" in outcome
                                   ) {
+                                    // A pending viewport read may predate the
+                                    // detection that just updated the cache.
+                                    await reasoningResolutionTailRef.current;
+                                    if (!ownsCurrentContext()) return;
                                     const next =
                                       await codexSubagentV2Api.resolveModelReasoningCapability(
                                         reasoningSettingsConfig,
@@ -3454,9 +3490,13 @@ export function CodexFormFields({
                                       );
                                     if (!ownsCurrentContext()) return;
                                     setReasoningResolutionState((current) => ({
-                                      contextKey,
+                                      context,
                                       models: {
-                                        ...(current.contextKey === contextKey
+                                        ...(jsonValuesEqual(
+                                          current.context,
+                                          context,
+                                          "codexUltra",
+                                        )
                                           ? current.models
                                           : {}),
                                         [model]: next,

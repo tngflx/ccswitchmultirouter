@@ -33,6 +33,7 @@ use crate::proxy::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
@@ -75,12 +76,14 @@ pub(crate) fn codex_compaction_summary_from_envelope(encrypted_content: &str) ->
 
 /// Replace CCSwitchMulti compaction envelopes in a Responses request with a
 /// readable user message before forwarding to third-party upstreams.
-pub(crate) fn restore_codex_compaction_summary_in_request(body: &mut Value) -> bool {
-    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return false;
-    };
+pub(crate) fn restore_codex_compaction_summary_in_request(body: &mut Cow<'_, Value>) -> bool {
     let mut changed = false;
-    for item in input {
+    let item_count = body
+        .get("input")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    for index in 0..item_count {
+        let item = &body["input"][index];
         if item.get("type").and_then(Value::as_str) != Some("compaction") {
             continue;
         }
@@ -90,7 +93,7 @@ pub(crate) fn restore_codex_compaction_summary_in_request(body: &mut Value) -> b
         let Some(summary) = codex_compaction_summary_from_envelope(encrypted_content) else {
             continue;
         };
-        *item = json!({
+        body.to_mut()["input"][index] = json!({
             "type": "message",
             "role": "user",
             "content": [{
@@ -5622,7 +5625,7 @@ mod tests {
 
     #[test]
     fn native_responses_request_restores_compaction_summary_before_forwarding() {
-        let mut body = json!({
+        let original = json!({
             "model": "deepseek-v4-flash",
             "input": [
                 {
@@ -5632,8 +5635,10 @@ mod tests {
                 {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
             ]
         });
+        let mut body = Cow::Borrowed(&original);
 
         assert!(restore_codex_compaction_summary_in_request(&mut body));
+        assert_eq!(original["input"][0]["type"], "compaction");
         let input = body["input"].as_array().expect("input");
         assert_eq!(input[0]["type"], "message");
         assert_eq!(input[0]["role"], "user");
@@ -5642,6 +5647,11 @@ mod tests {
             .expect("summary text")
             .contains("compact summary"));
         assert_eq!(input[1]["type"], "message");
+
+        let already_restored = &*body;
+        let mut unchanged = Cow::Borrowed(already_restored);
+        assert!(!restore_codex_compaction_summary_in_request(&mut unchanged));
+        assert!(std::ptr::eq(&*unchanged, already_restored));
     }
 
     #[test]

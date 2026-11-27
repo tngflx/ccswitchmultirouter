@@ -26,11 +26,13 @@ mod database;
 mod deeplink;
 mod env_injection;
 mod error;
+mod file_revision;
 mod gemini_config;
 mod gemini_mcp;
 mod grok_config;
 pub mod hermes_config;
 mod init_status;
+mod json_projection;
 mod lightweight;
 #[cfg(target_os = "linux")]
 mod linux_fix;
@@ -754,6 +756,8 @@ pub fn run() {
             }
 
             let app_state = AppState::new(db);
+            #[cfg(not(test))]
+            crate::proxy::codex_turn_recovery::register_database(&app_state.db);
             // The renderer can mount while the async crash-recovery/takeover
             // pipeline below is still rebuilding Codex live config. Keep
             // consistency inspection behind an explicit readiness gate so that
@@ -1642,6 +1646,7 @@ pub fn run() {
             codex_runtime_refresh::refresh_codex_runtime_state,
             codex_config::get_codex_subagent_reasoning_capabilities,
             codex_config::resolve_codex_model_reasoning_capability,
+            codex_config::resolve_codex_model_reasoning_capabilities,
             codex_config::bind_codex_preset_reasoning_evidence,
             codex_config::trigger_codex_model_reasoning_detection,
             codex_config::inspect_codex_reasoning_capability,
@@ -1848,6 +1853,7 @@ pub fn run() {
             commands::diagnose_codex_multirouter,
             commands::unlock_codex_model_picker,
             commands::get_codex_guardian_status,
+            commands::refresh_codex_usage_limit_resume_count,
             commands::sync_codex_history_to_multirouter,
             commands::repair_codex_history_visibility,
             commands::list_codex_history_sessions,

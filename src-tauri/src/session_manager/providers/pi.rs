@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -9,13 +10,17 @@ use serde_json::Value;
 use crate::session_manager::{SessionMessage, SessionMeta};
 
 use super::utils::{
-    extract_text, parse_timestamp_to_ms, path_basename, truncate_summary, TITLE_MAX_CHARS,
+    extract_text, parse_timestamp_to_ms, path_basename, truncate_summary, FileCache,
+    TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "pi";
 pub(crate) const MAX_TREE_ENTRIES: usize = 500_000;
 const MAX_TREE_ID_BYTES: usize = 256;
 pub(crate) const MAX_SESSION_BYTES: u64 = 128 * 1024 * 1024;
+
+static SESSION_FILES: LazyLock<Mutex<FileCache<Option<SessionMeta>>>> =
+    LazyLock::new(Mutex::default);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionLayout {
@@ -209,9 +214,10 @@ fn resolve_global_session_dir(value: &str, home: &Path) -> Option<PathBuf> {
 
 pub fn scan_sessions() -> Vec<SessionMeta> {
     match resolve_session_root() {
-        SessionRootResolution::Available { root, layout, .. } => {
-            scan_sessions_in_root(&root, layout)
-        }
+        SessionRootResolution::Available { root, layout, .. } => SESSION_FILES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .refresh(|cache| scan_sessions_in_root_cached(&root, layout, cache)),
         SessionRootResolution::RequiresProjectContext {
             configured_path, ..
         } => {
@@ -227,17 +233,31 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
     }
 }
 
+#[cfg(test)]
 fn scan_sessions_in_root(root: &Path, layout: SessionLayout) -> Vec<SessionMeta> {
+    let mut cache = FileCache::default();
+    scan_sessions_in_root_cached(root, layout, &mut cache)
+}
+
+fn scan_sessions_in_root_cached(
+    root: &Path,
+    layout: SessionLayout,
+    cache: &mut FileCache<Option<SessionMeta>>,
+) -> Vec<SessionMeta> {
     let mut files = Vec::new();
     collect_jsonl_files(root, layout, &mut files, true);
     files
         .into_iter()
-        .filter_map(|path| match parse_session(&path) {
-            Ok(session) => Some(session),
-            Err(error) => {
-                log::debug!("Skipping invalid Pi session {}: {error}", path.display());
-                None
+        .filter_map(|path| {
+            let session = cache
+                .read(&path, |file| {
+                    Ok::<_, ()>(parse_session_from_file(&path, file).ok())
+                })
+                .flatten();
+            if session.is_none() {
+                log::debug!("Skipping invalid Pi session {}", path.display());
             }
+            session
         })
         .collect()
 }
@@ -317,7 +337,14 @@ fn layout_for_current_root(root: &Path) -> Result<SessionLayout, String> {
     Ok(layout)
 }
 
+#[cfg(test)]
 fn parse_session(path: &Path) -> Result<SessionMeta, String> {
+    let mut file = File::open(path)
+        .map_err(|error| format!("Failed to open Pi session {}: {error}", path.display()))?;
+    parse_session_from_file(path, &mut file)
+}
+
+fn parse_session_from_file(path: &Path, file: &mut File) -> Result<SessionMeta, String> {
     let source = path
         .canonicalize()
         .map_err(|error| format!("Failed to resolve Pi session {}: {error}", path.display()))?;
@@ -327,7 +354,7 @@ fn parse_session(path: &Path) -> Result<SessionMeta, String> {
         .to_string();
     let SessionTree {
         header, summary, ..
-    } = read_tree(&source)?;
+    } = read_tree_from_file(&source, file)?;
     let title = summary.explicit_name.flatten().or_else(|| {
         summary
             .first_user_message
@@ -359,9 +386,14 @@ fn parse_session(path: &Path) -> Result<SessionMeta, String> {
 
 fn read_tree(path: &Path) -> Result<SessionTree, String> {
     validate_file_size(path)?;
-    let reader = BufReader::new(
-        File::open(path).map_err(|error| format!("Failed to open Pi session: {error}"))?,
-    );
+    let mut file =
+        File::open(path).map_err(|error| format!("Failed to open Pi session: {error}"))?;
+    read_tree_from_file(path, &mut file)
+}
+
+fn read_tree_from_file(path: &Path, file: &mut File) -> Result<SessionTree, String> {
+    validate_file_size(path)?;
+    let reader = BufReader::new(file);
     let mut header = None;
     let mut parents = HashMap::<String, (Option<String>, usize)>::new();
     let mut latest_id = None;
@@ -1046,6 +1078,35 @@ mod tests {
         let project_sessions = scan_sessions_in_root(&root, SessionLayout::ProjectDirectories);
         assert_eq!(project_sessions.len(), 1);
         assert_eq!(project_sessions[0].session_id, "project-session");
+    }
+
+    #[test]
+    fn listing_reuses_unchanged_files_and_reloads_changed_revisions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("sessions");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("session.jsonl");
+        let session_json = |id: &str, title: &str| {
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"cwd\":\"/work\"}}\n{{\"type\":\"message\",\"id\":\"{id}-message\",\"parentId\":null,\"message\":{{\"role\":\"user\",\"content\":\"{title}\"}}}}\n"
+            )
+        };
+        fs::write(&path, session_json("session-1", "Initial prompt")).expect("session");
+
+        let mut cache = FileCache::default();
+        for _ in 0..5 {
+            let sessions = cache
+                .refresh(|cache| scan_sessions_in_root_cached(&root, SessionLayout::Flat, cache));
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].title.as_deref(), Some("Initial prompt"));
+        }
+        assert_eq!(cache.loads, 1);
+
+        fs::write(&path, session_json("session-1", "Updated prompt")).expect("rewrite");
+        let sessions =
+            cache.refresh(|cache| scan_sessions_in_root_cached(&root, SessionLayout::Flat, cache));
+        assert_eq!(sessions[0].title.as_deref(), Some("Updated prompt"));
+        assert_eq!(cache.loads, 2);
     }
 
     #[test]

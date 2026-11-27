@@ -9,7 +9,15 @@ import {
   within,
   fireEvent,
 } from "@testing-library/react";
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  beforeEach,
+  afterEach,
+  vi,
+} from "vitest";
 import { http, HttpResponse } from "msw";
 import { providersApi } from "@/lib/api/providers";
 import {
@@ -336,6 +344,11 @@ const renderApp = (AppComponent: ComponentType) => {
 
 describe("App integration with MSW", () => {
   // App 集成测试会打开 Radix dialog/focus guard；显式清理可避免 timeout 后污染下一条用例。
+  beforeAll(async () => {
+    // Let navigation tests measure interaction time after Vitest loads App.
+    await import("@/App");
+  }, 60_000);
+
   afterEach(() => {
     cleanup();
   });
@@ -1047,6 +1060,7 @@ describe("App integration with MSW", () => {
     expect(
       screen.getByRole("toolbar", { name: "Application toolbar" }),
     ).toBeInTheDocument();
+    fireEvent.click(screen.getByText("switch-codex"));
     expect(
       screen.getByRole("region", { name: "Codex session recovery" }),
     ).toBeInTheDocument();
@@ -1061,7 +1075,6 @@ describe("App integration with MSW", () => {
     expect(
       screen.getByTestId("codex-usage-limit-resume-button"),
     ).toBeDisabled();
-    fireEvent.click(screen.getByText("switch-codex"));
     await waitFor(() =>
       expect(screen.getByTestId("provider-list").textContent).toContain(
         "legacy-codex-router",
@@ -1558,7 +1571,7 @@ describe("App integration with MSW", () => {
     expect(screen.getByTestId("codex-router-workspace")).toBeInTheDocument();
   });
 
-  it("shows the recovery ribbon only on the main Providers page", async () => {
+  it("shows the recovery ribbon only on the Codex Providers page", async () => {
     setSettings({ firstRunNoticeConfirmed: true });
     const { default: App } = await import("@/App");
     const { container } = renderApp(App);
@@ -1566,13 +1579,19 @@ describe("App integration with MSW", () => {
     const dragBarHeight = Number.parseInt(header.style.top, 10);
     const recoveryRegion = { name: "Codex session recovery" };
 
+    expect(screen.queryByRole("region", recoveryRegion)).toBeNull();
+    expect(screen.queryByTestId("codex-usage-limit-resume-button")).toBeNull();
+    expect(header).toHaveStyle({ height: "64px" });
+    expect(header.parentElement).toHaveStyle({
+      paddingTop: `${dragBarHeight + 64}px`,
+    });
+
+    fireEvent.click(screen.getByText("switch-codex"));
     expect(screen.getByRole("region", recoveryRegion)).toBeVisible();
     expect(header).toHaveStyle({ height: "104px" });
     expect(header.parentElement).toHaveStyle({
       paddingTop: `${dragBarHeight + 104}px`,
     });
-
-    fireEvent.click(screen.getByText("switch-codex"));
     await waitFor(() =>
       expect(screen.getByTestId("provider-list").textContent).toContain(
         "codex-1",
@@ -1625,12 +1644,13 @@ describe("App integration with MSW", () => {
 
     const { default: App } = await import("@/App");
     renderApp(App);
+    fireEvent.click(screen.getByText("switch-codex"));
     expect(
       screen.getByTestId("codex-usage-limit-resume-row"),
     ).toBeInTheDocument();
     const resumeButton = screen.getByTestId("codex-usage-limit-resume-button");
     await waitFor(() =>
-      expect(resumeButton).toHaveTextContent("Continue 2 sessions"),
+      expect(resumeButton).toHaveTextContent("Send continue to 2 sessions"),
     );
     expect(resumeButton).toBeEnabled();
     expect(document.querySelector("header")).toHaveStyle({ height: "104px" });

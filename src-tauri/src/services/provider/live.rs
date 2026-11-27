@@ -853,13 +853,8 @@ pub(crate) fn write_live_with_common_config(
 
 /// 为 Codex live 写入构造配置：保留 DB 中的 `modelCatalog` 元数据，但只有菜单映射开启时才投射到 live。
 fn codex_settings_for_live_projection(provider: &Provider) -> Result<Value, AppError> {
-    let should_project = provider
-        .meta
-        .as_ref()
-        .map(|meta| meta.codex_model_catalog_projection_enabled(&provider.settings_config))
-        .unwrap_or_else(|| {
-            crate::codex_multirouter::catalog::read_catalog(&provider.settings_config).is_some()
-        });
+    let should_project =
+        crate::codex_multirouter::catalog::provider_catalog_projection_enabled(provider);
 
     let mut settings = provider.settings_config.clone();
     if should_project {

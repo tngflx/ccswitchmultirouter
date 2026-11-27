@@ -1,4 +1,5 @@
 pub(crate) mod catalog;
+pub(crate) mod compile_inputs;
 pub mod compiler;
 pub mod migration;
 pub mod mutation;

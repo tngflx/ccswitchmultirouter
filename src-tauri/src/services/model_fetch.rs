@@ -4,11 +4,19 @@
 //! 主要面向第三方聚合站（硅基流动、OpenRouter 等），以及把 Anthropic
 //! 协议挂在兼容子路径上的官方供应商（DeepSeek、Kimi、智谱 GLM 等）。
 
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, USER_AGENT};
+use futures::{Stream, StreamExt};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, ETAG, IF_NONE_MATCH, USER_AGENT,
+};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::{
+    sync::{Mutex, Semaphore},
+    time::Instant,
+};
 
 use crate::codex_multirouter::protocol_capability::normalize_protocol_capability_base_url;
 
@@ -398,6 +406,13 @@ const PRICING_CHARGE_KEYS: &[&str] = &[
 
 const FETCH_TIMEOUT_SECS: u64 = 15;
 const MAX_MODEL_LIST_PAGES: u64 = 100;
+pub(crate) const MAX_MODEL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MODEL_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_MODEL_RESPONSE_ROWS: usize = 100_000;
+pub(crate) const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
+const MAX_ZHIPU_DOC_BYTES: usize = 1024 * 1024;
+const ZHIPU_DETAIL_CONCURRENCY: usize = 4;
+const MAX_ZHIPU_DETAIL_REQUESTS: usize = 32;
 const MAX_REQUEST_HEADERS: usize = 64;
 const MAX_HEADER_NAME_BYTES: usize = 256;
 const MAX_HEADER_VALUE_BYTES: usize = 16 * 1024;
@@ -414,6 +429,8 @@ const ZHIPU_MODEL_OVERVIEW_MD_URL: &str =
 /// 原版只把它用于定价导入，但该 API 也包含 `limit.context`。这里作为通用兜底：
 /// 仅当 provider 的 `api` 前缀能匹配当前成功的 `/models` endpoint 时才使用。
 const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
+const MODELS_DEV_CACHE_TTL: Duration = Duration::from_secs(300);
+const MODELS_DEV_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// 404/405 响应体截断长度：避免把几十 KB HTML 404 页整页保留到错误串里。
 const ERROR_BODY_MAX_CHARS: usize = 512;
@@ -485,7 +502,7 @@ async fn fetch_volcengine_plan_models(
     .await
     {
         crate::services::coding_plan::VolcCall::Body(body) => {
-            let models = parse_volcengine_plan_models(&body);
+            let models = parse_volcengine_plan_models(&body)?;
             if models.is_empty() {
                 Err(format!("{action} returned no models"))
             } else {
@@ -557,13 +574,17 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
             {
                 return Err("Model discovery response origin is not authorized".to_string());
             }
-            let body = response.text().await.unwrap_or_default();
-            let mut parsed = parse_provider_models_response_with_pagination(
-                &body,
+            let mut remaining_bytes = MAX_MODEL_TOTAL_BYTES;
+            let mut remaining_rows = MAX_MODEL_RESPONSE_ROWS;
+            let mut parsed = read_model_list_page(
+                response.bytes_stream(),
+                &mut remaining_bytes,
+                &mut remaining_rows,
                 &log_secrets,
                 options.base_url,
                 resolved_models_url.as_str(),
-            )?;
+            )
+            .await?;
             if parsed.pagination.is_some_and(|page| page.page_no != 1) {
                 return Err("Model list pagination must start at page 1".to_string());
             }
@@ -606,10 +627,7 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
                     })?;
                 if !page_response.status().is_success() {
                     let page_status = page_response.status();
-                    let page_body = redact_model_fetch_error_body(
-                        page_response.text().await.unwrap_or_default(),
-                        &log_secrets,
-                    );
+                    let page_body = read_model_fetch_error_body(page_response, &log_secrets).await;
                     return Err(format!(
                         "HTTP {page_status} fetching model page {page_no}: {page_body}"
                     ));
@@ -618,13 +636,15 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
                 if page_models_url.origin() != resolved_models_url.origin() {
                     return Err("Model list page response origin is not authorized".to_string());
                 }
-                let page_body = page_response.text().await.unwrap_or_default();
-                let page = parse_provider_models_response_with_pagination(
-                    &page_body,
+                let page = read_model_list_page(
+                    page_response.bytes_stream(),
+                    &mut remaining_bytes,
+                    &mut remaining_rows,
                     &log_secrets,
                     options.base_url,
                     page_models_url.as_str(),
-                )?;
+                )
+                .await?;
                 let pagination = page.pagination.ok_or_else(|| {
                     format!(
                         "Model list page {page_no} omitted pagination metadata before completion"
@@ -672,16 +692,12 @@ pub async fn fetch_models(options: FetchModelsRequest<'_>) -> Result<Vec<Fetched
         }
 
         if status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED {
-            let body = redact_model_fetch_error_body(
-                response.text().await.unwrap_or_default(),
-                &log_secrets,
-            );
+            let body = read_model_fetch_error_body(response, &log_secrets).await;
             last_err = Some(format!("HTTP {status}: {body}"));
             continue;
         }
 
-        let body =
-            redact_model_fetch_error_body(response.text().await.unwrap_or_default(), &log_secrets);
+        let body = read_model_fetch_error_body(response, &log_secrets).await;
         return Err(format!("HTTP {status}: {body}"));
     }
 
@@ -706,13 +722,90 @@ fn parse_provider_models_response(
     base_url: &str,
     models_url: &str,
 ) -> Result<Vec<FetchedModel>, String> {
-    parse_provider_models_response_with_pagination(body, known_secrets, base_url, models_url)
-        .map(|parsed| parsed.models)
+    parse_provider_models_response_with_pagination(
+        body,
+        known_secrets,
+        base_url,
+        models_url,
+        MAX_MODEL_RESPONSE_ROWS,
+    )
+    .map(|parsed| parsed.models)
 }
 
 struct ParsedProviderModels {
     models: Vec<FetchedModel>,
     pagination: Option<ModelListPagination>,
+    rows_read: usize,
+}
+
+struct ParsedModelInventory {
+    entries: Vec<ModelEntry>,
+    pagination: Option<ModelListPagination>,
+    rows_read: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ModelBodyError {
+    #[error("Failed to read model fetch response: {0}")]
+    Transport(reqwest::Error),
+    #[error("Model fetch response exceeds its remaining size limit ({0} bytes)")]
+    TooLarge(usize),
+}
+
+pub(crate) async fn read_bounded_model_body(
+    chunks: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>>,
+    limit: usize,
+) -> Result<Vec<u8>, ModelBodyError> {
+    futures::pin_mut!(chunks);
+    let mut body = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|error| ModelBodyError::Transport(error.without_url()))?;
+        if chunk.len() > limit - body.len() {
+            return Err(ModelBodyError::TooLarge(limit));
+        }
+        let required = body.len() + chunk.len();
+        if required > body.capacity() {
+            let capacity = body.capacity().saturating_mul(2).max(required).min(limit);
+            body.reserve_exact(capacity - body.len());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+pub(crate) async fn read_model_fetch_error_body(
+    response: reqwest::Response,
+    known_secrets: &[String],
+) -> String {
+    match read_bounded_model_body(response.bytes_stream(), MAX_ERROR_RESPONSE_BYTES).await {
+        Ok(body) => redact_model_fetch_error_body(&String::from_utf8_lossy(&body), known_secrets),
+        Err(error) => crate::redact_known_secrets(&error.to_string(), known_secrets),
+    }
+}
+
+async fn read_model_list_page(
+    chunks: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>>,
+    remaining_bytes: &mut usize,
+    remaining_rows: &mut usize,
+    known_secrets: &[String],
+    base_url: &str,
+    models_url: &str,
+) -> Result<ParsedProviderModels, String> {
+    let body = read_bounded_model_body(chunks, MAX_MODEL_RESPONSE_BYTES.min(*remaining_bytes))
+        .await
+        .map_err(|error| crate::redact_known_secrets(&error.to_string(), known_secrets))?;
+    let text = std::str::from_utf8(&body)
+        .map_err(|_| "Model fetch response was not valid UTF-8".to_string())?;
+    let parsed = parse_provider_models_response_with_pagination(
+        text.strip_prefix('\u{feff}').unwrap_or(text),
+        known_secrets,
+        base_url,
+        models_url,
+        *remaining_rows,
+    )?;
+    *remaining_bytes -= body.len();
+    *remaining_rows -= parsed.rows_read;
+    Ok(parsed)
 }
 
 fn parse_provider_models_response_with_pagination(
@@ -720,18 +813,28 @@ fn parse_provider_models_response_with_pagination(
     known_secrets: &[String],
     base_url: &str,
     models_url: &str,
+    remaining_rows: usize,
 ) -> Result<ParsedProviderModels, String> {
-    let (entries, pagination) = parse_model_inventory(
+    let ParsedModelInventory {
+        entries,
+        pagination,
+        rows_read,
+    } = parse_model_inventory(
         body,
         known_secrets,
         is_native_google_models_discovery(base_url, models_url),
+        remaining_rows,
     )?;
     let openrouter_contract = is_openrouter_models_discovery(base_url, models_url);
     let models = entries
         .into_iter()
         .map(|entry| fetched_model_from_entry(entry, base_url, models_url, openrouter_contract))
         .collect();
-    Ok(ParsedProviderModels { models, pagination })
+    Ok(ParsedProviderModels {
+        models,
+        pagination,
+        rows_read,
+    })
 }
 
 pub(crate) fn openrouter_discovery_model_entry(
@@ -743,7 +846,11 @@ pub(crate) fn openrouter_discovery_model_entry(
     if !is_openrouter_models_discovery(base_url, models_url) {
         return Err(());
     }
-    let (entries, pagination) = parse_model_inventory(body, &[], false).map_err(|_| ())?;
+    let ParsedModelInventory {
+        entries,
+        pagination,
+        ..
+    } = parse_model_inventory(body, &[], false, MAX_MODEL_RESPONSE_ROWS).map_err(|_| ())?;
     if pagination.is_some() {
         return Err(());
     }
@@ -756,7 +863,7 @@ pub(crate) fn openrouter_discovery_model_entry(
     }
     let mut matches = entries.into_iter().filter(|entry| {
         let identity = extract_model_identity_fields(&entry.extra);
-        let mut request_aliases = Vec::new();
+        let mut request_aliases = HashSet::new();
         for alias in [identity.canonical_slug, identity.slug]
             .into_iter()
             .flatten()
@@ -779,8 +886,14 @@ fn parse_model_inventory(
     body: &str,
     known_secrets: &[String],
     native_google_models: bool,
-) -> Result<(Vec<ModelEntry>, Option<ModelListPagination>), String> {
-    let response: ModelsResponse = serde_json::from_str(body).map_err(|error| {
+    remaining_rows: usize,
+) -> Result<ParsedModelInventory, String> {
+    if body.len() > MAX_MODEL_RESPONSE_BYTES {
+        return Err(format!(
+            "Model fetch response exceeds the maximum page size ({MAX_MODEL_RESPONSE_BYTES} bytes)"
+        ));
+    }
+    let mut response: ModelsResponse = serde_json::from_str(body).map_err(|error| {
         let detail = format!("Failed to parse response: {error}");
         crate::redact_known_secrets(&detail, known_secrets)
     })?;
@@ -791,10 +904,6 @@ fn parse_model_inventory(
             .unwrap_or_else(|| "provider reported model-list failure".to_string());
         return Err(format!("Model fetch failed: {detail}"));
     }
-    let error_detail = response
-        .error_message()
-        .map(|message| crate::redact_known_secrets(message, known_secrets))
-        .unwrap_or_else(|| redact_model_fetch_error_body(body.to_string(), known_secrets));
     let output_pagination =
         match response.output.as_ref() {
             Some(output) if output.total.is_some() || output.page_no.is_some() => {
@@ -812,18 +921,24 @@ fn parse_model_inventory(
             }
             _ => None,
         };
-    let inventory_size = response
-        .data
+    let data_rows = response.data.as_ref().map(Vec::len);
+    let rich_rows = response.models.as_ref().map(rich_model_count);
+    let output_rows = response
+        .output
         .as_ref()
-        .map(Vec::len)
-        .or_else(|| response.models.as_ref().map(rich_model_count))
-        .or_else(|| {
-            response
-                .output
-                .as_ref()
-                .and_then(|output| output.models.as_ref().map(Vec::len))
-        })
-        .unwrap_or_default();
+        .and_then(|output| output.models.as_ref().map(Vec::len));
+    let inventory_size = data_rows.or(rich_rows).or(output_rows).unwrap_or_default();
+    let rows_read: usize = [data_rows, rich_rows, output_rows]
+        .into_iter()
+        .flatten()
+        .sum();
+    if rows_read > remaining_rows
+        || output_pagination.is_some_and(|page| page.total > MAX_MODEL_RESPONSE_ROWS as u64)
+    {
+        return Err(format!(
+            "Model fetch response exceeds the maximum supported model count ({MAX_MODEL_RESPONSE_ROWS})"
+        ));
+    }
     // DashScope output paging is completed by the caller. Independently
     // advertised truncation in any other envelope still fails closed.
     if response.incomplete_inventory(inventory_size) {
@@ -831,26 +946,26 @@ fn parse_model_inventory(
             "Model fetch response is incomplete; pagination must be resolved first".to_string(),
         );
     }
-    let data = response.data;
-    let rich_models = response.models;
-    let output_models = response.output.and_then(|output| output.models);
+    let data = response.data.take();
+    let rich_models = response.models.take();
+    let output_models = response.output.take().and_then(|output| output.models);
     let entries = match (data, rich_models, output_models) {
         (Some(mut data), Some(rich), None) => {
             let rich = normalize_rich_model_entries(rich, native_google_models)?;
-            validate_rich_model_entries(&rich)?;
+            let descriptors = RichModelDescriptors::new(&rich)?;
             if data.is_empty() && !rich.is_empty() {
                 return Err(
                     "Model fetch response contained contradictory data and models inventories"
                         .to_string(),
                 );
             }
-            enrich_data_model_entries(&mut data, &rich)?;
+            descriptors.enrich_data(&mut data)?;
             data
         }
         (Some(data), None, None) => data,
         (None, Some(rich), None) => {
             let rich = normalize_rich_model_entries(rich, native_google_models)?;
-            validate_rich_model_entries(&rich)?;
+            RichModelDescriptors::new(&rich)?;
             rich
         }
         (None, None, Some(output)) => output,
@@ -859,10 +974,20 @@ fn parse_model_inventory(
                 "Model fetch response contained contradictory model inventories".to_string(),
             )
         }
-        (None, None, None) => return Err(format!("Model fetch failed: {error_detail}")),
+        (None, None, None) => {
+            let detail = response
+                .error_message()
+                .map(|message| crate::redact_known_secrets(message, known_secrets))
+                .unwrap_or_else(|| redact_model_fetch_error_body(body, known_secrets));
+            return Err(format!("Model fetch failed: {detail}"));
+        }
     };
     validate_model_entries(&entries)?;
-    Ok((entries, output_pagination))
+    Ok(ParsedModelInventory {
+        entries,
+        pagination: output_pagination,
+        rows_read,
+    })
 }
 
 fn fetched_model_from_entry(
@@ -1014,70 +1139,72 @@ fn rich_model_count(value: &serde_json::Value) -> usize {
     }
 }
 
-fn validate_rich_model_entries(entries: &[ModelEntry]) -> Result<(), String> {
-    for (index, entry) in entries.iter().enumerate() {
-        let identities = model_entry_identity_values(entry);
-        for other in entries.iter().skip(index + 1) {
-            if model_entry_identity_values(other)
-                .iter()
-                .any(|identity| identities.iter().any(|candidate| identity == candidate))
-            {
-                return Err(
-                    "Model fetch response contained ambiguous model descriptors".to_string()
-                );
-            }
-        }
-    }
-    Ok(())
+const AMBIGUOUS_MODEL_DESCRIPTORS: &str =
+    "Model fetch response contained ambiguous model descriptors";
+
+struct RichModelDescriptors<'a> {
+    entries: &'a [ModelEntry],
+    exact_ids: HashMap<String, usize>,
+    identities: HashMap<String, usize>,
 }
 
-fn enrich_data_model_entries(data: &mut [ModelEntry], rich: &[ModelEntry]) -> Result<(), String> {
-    let mut descriptor_matches = Vec::with_capacity(data.len());
-    let mut used_descriptors = HashSet::new();
-    for entry in data.iter() {
-        let data_id = normalize_model_identity(&entry.id);
-        let exact = rich
-            .iter()
-            .position(|candidate| normalize_model_identity(&candidate.id) == data_id);
-        let descriptor_index = if exact.is_some() {
-            exact
-        } else {
-            let identities = model_entry_identity_values(entry);
-            let mut candidates = rich.iter().enumerate().filter_map(|(index, candidate)| {
-                model_entry_identity_values(candidate)
-                    .iter()
-                    .any(|identity| identities.contains(identity))
-                    .then_some(index)
-            });
-            let candidate = candidates.next();
-            if candidates.next().is_some() {
-                return Err(
-                    "Model fetch response contained ambiguous model descriptors".to_string()
-                );
+impl<'a> RichModelDescriptors<'a> {
+    fn new(entries: &'a [ModelEntry]) -> Result<Self, String> {
+        let mut exact_ids = HashMap::with_capacity(entries.len());
+        let mut identities = HashMap::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            let id = normalize_model_identity(&entry.id);
+            for identity in model_entry_identity_values(entry, id.clone()) {
+                if identities.insert(identity, index).is_some() {
+                    return Err(AMBIGUOUS_MODEL_DESCRIPTORS.to_string());
+                }
             }
-            candidate
-        };
-        if let Some(index) = descriptor_index {
+            exact_ids.insert(id, index);
+        }
+        Ok(Self {
+            entries,
+            exact_ids,
+            identities,
+        })
+    }
+
+    fn descriptor_for(&self, entry: &ModelEntry) -> Result<Option<usize>, String> {
+        let id = normalize_model_identity(&entry.id);
+        if let Some(&index) = self.exact_ids.get(&id) {
+            return Ok(Some(index));
+        }
+        let mut matched = None;
+        for identity in model_entry_identity_values(entry, id) {
+            let Some(&index) = self.identities.get(&identity) else {
+                continue;
+            };
+            if matched.is_some_and(|previous| previous != index) {
+                return Err(AMBIGUOUS_MODEL_DESCRIPTORS.to_string());
+            }
+            matched = Some(index);
+        }
+        Ok(matched)
+    }
+
+    fn enrich_data(&self, data: &mut [ModelEntry]) -> Result<(), String> {
+        let mut used_descriptors = HashSet::new();
+        for entry in data {
+            let Some(index) = self.descriptor_for(entry)? else {
+                continue;
+            };
             if !used_descriptors.insert(index) {
-                return Err(
-                    "Model fetch response contained ambiguous model descriptors".to_string()
-                );
+                return Err(AMBIGUOUS_MODEL_DESCRIPTORS.to_string());
+            }
+            let descriptor = &self.entries[index];
+            let mut owned_fields = HashSet::new();
+            collect_declared_model_metadata_fields(&entry.extra, &mut owned_fields);
+            merge_missing_model_metadata(&mut entry.extra, &descriptor.extra, &owned_fields);
+            if entry.owned_by.is_none() {
+                entry.owned_by = descriptor.owned_by.clone();
             }
         }
-        descriptor_matches.push(descriptor_index);
+        Ok(())
     }
-    for (entry, descriptor_index) in data.iter_mut().zip(descriptor_matches) {
-        let Some(descriptor) = descriptor_index.map(|index| &rich[index]) else {
-            continue;
-        };
-        let mut owned_fields = HashSet::new();
-        collect_declared_model_metadata_fields(&entry.extra, &mut owned_fields);
-        merge_missing_model_metadata(&mut entry.extra, &descriptor.extra, &owned_fields);
-        if entry.owned_by.is_none() {
-            entry.owned_by = descriptor.owned_by.clone();
-        }
-    }
-    Ok(())
 }
 
 fn model_metadata_field(key: &str) -> Option<&'static str> {
@@ -1339,9 +1466,18 @@ fn reasoning_metadata_field(key: &str) -> Option<&'static str> {
     }
 }
 
-fn model_entry_identity_values(entry: &ModelEntry) -> Vec<String> {
-    let mut values = Vec::new();
-    push_model_identity(&mut values, &entry.id);
+#[cfg(test)]
+thread_local! {
+    static MODEL_IDENTITY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn model_entry_identity_values(entry: &ModelEntry, id: String) -> HashSet<String> {
+    #[cfg(test)]
+    MODEL_IDENTITY_SCANS.with(|count| count.set(count.get() + 1));
+    let mut values = HashSet::new();
+    if !id.is_empty() {
+        values.insert(id);
+    }
     let mut scopes = Vec::new();
     collect_model_metadata_scopes(&entry.extra, &mut scopes, 0);
     for object in std::iter::once(&entry.extra).chain(scopes) {
@@ -1371,14 +1507,14 @@ fn normalize_model_identity(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
-fn push_model_identity(values: &mut Vec<String>, value: &str) {
+fn push_model_identity(values: &mut HashSet<String>, value: &str) {
     let normalized = normalize_model_identity(value);
-    if !normalized.is_empty() && !values.iter().any(|item| item == &normalized) {
-        values.push(normalized);
+    if !normalized.is_empty() {
+        values.insert(normalized);
     }
 }
 
-fn push_alias_identities(values: &mut Vec<String>, value: &serde_json::Value) {
+fn push_alias_identities(values: &mut HashSet<String>, value: &serde_json::Value) {
     match value {
         serde_json::Value::Array(items) => {
             for item in items {
@@ -1442,9 +1578,11 @@ fn pagination_object_signals(
     .iter()
     .filter_map(|key| object.get(*key))
     .any(|value| value.as_str().is_some_and(|value| !value.trim().is_empty()));
+    // A smaller total cannot override evidence of omitted inventory.
     let total = ["total", "total_count", "totalCount"]
         .iter()
-        .find_map(|key| object.get(*key).and_then(parse_nonnegative_u64));
+        .filter_map(|key| object.get(*key).and_then(parse_nonnegative_u64))
+        .max();
     let page = ["page", "current_page", "currentPage"]
         .iter()
         .find_map(|key| object.get(*key).and_then(parse_nonnegative_u64));
@@ -1463,7 +1601,7 @@ fn pagination_object_signals(
             |(left_incomplete, left_total), (right_incomplete, right_total)| {
                 (
                     left_incomplete || right_incomplete,
-                    left_total.or(right_total),
+                    left_total.max(right_total),
                 )
             },
         );
@@ -1475,7 +1613,7 @@ fn pagination_object_signals(
             || object.get("next").is_some_and(|value| {
                 !value.is_null() && (!value.as_str().is_some_and(|value| value.trim().is_empty()))
             }),
-        total.or(nested.1),
+        total.max(nested.1),
     )
 }
 
@@ -2121,8 +2259,8 @@ fn classify_decimal_text(value: &str) -> PriceSign {
     }
 }
 
-fn redact_model_fetch_error_body(body: String, known_secrets: &[String]) -> String {
-    truncate_body(crate::redact_known_secrets_strict(&body, known_secrets))
+fn redact_model_fetch_error_body(body: &str, known_secrets: &[String]) -> String {
+    truncate_body(crate::redact_known_secrets_strict(body, known_secrets))
 }
 
 fn build_model_fetch_headers(
@@ -2502,7 +2640,7 @@ pub(crate) fn extract_supports_image(
 ///
 /// 官方文档示例是 `Result.Datas[].ModelID`；这里额外兼容少量常见字段名，
 /// 以便 OpenAPI 后续扩展字段时不破坏已有模型列表刷新。
-fn parse_volcengine_plan_models(body: &serde_json::Value) -> Vec<FetchedModel> {
+fn parse_volcengine_plan_models(body: &serde_json::Value) -> Result<Vec<FetchedModel>, String> {
     let candidates = [
         body.pointer("/Result/Datas"),
         body.pointer("/Result/Models"),
@@ -2517,8 +2655,13 @@ fn parse_volcengine_plan_models(body: &serde_json::Value) -> Vec<FetchedModel> {
         .flatten()
         .find_map(|value| value.as_array())
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    if entries.len() > MAX_MODEL_RESPONSE_ROWS {
+        return Err(format!(
+            "Volcengine model response exceeds the maximum supported model count ({MAX_MODEL_RESPONSE_ROWS})"
+        ));
+    }
 
     let mut models = entries
         .iter()
@@ -2526,7 +2669,7 @@ fn parse_volcengine_plan_models(body: &serde_json::Value) -> Vec<FetchedModel> {
         .collect::<Vec<_>>();
     models.sort_by(|left, right| left.id.cmp(&right.id));
     models.dedup_by(|left, right| left.id == right.id);
-    models
+    Ok(models)
 }
 
 /// 解析火山模型列表中的单个模型条目。
@@ -2701,7 +2844,10 @@ async fn enrich_zhipu_context_windows(
     }
 
     let mut metadata = fetch_zhipu_model_overview_metadata(client).await;
-    enrich_missing_zhipu_detail_contexts(client, models, &mut metadata).await;
+    enrich_missing_zhipu_detail_contexts(models, &mut metadata, |slug| async move {
+        fetch_zhipu_detail_metadata(client, &slug).await
+    })
+    .await;
 
     for model in models.iter_mut().filter(|model| is_glm_model_id(&model.id)) {
         let key = normalize_zhipu_model_id(&model.id);
@@ -2743,16 +2889,20 @@ async fn enrich_models_dev_context_windows(
         return;
     }
 
+    let Some(endpoint) = reqwest::Url::parse(endpoint_url.trim())
+        .ok()
+        .filter(is_safe_known_gateway_url)
+    else {
+        return;
+    };
     let Some(catalog) = fetch_models_dev_catalog(client).await else {
         return;
     };
-    let Some(provider_models) = find_models_dev_provider_models(&catalog, endpoint_url) else {
+    let Some(provider_models) = catalog.provider_models(&endpoint) else {
         return;
     };
 
-    apply_missing_context_windows(models, |model_id| {
-        lookup_models_dev_context(provider_models, model_id)
-    });
+    apply_missing_context_windows(models, |model_id| provider_models.lookup(model_id));
 }
 
 /// 将外部来源查到的上下文窗口应用到模型列表。
@@ -2770,37 +2920,145 @@ where
     }
 }
 
-/// 拉取 models.dev 目录；失败时返回 `None`，不影响 `/models` 主流程。
-async fn fetch_models_dev_catalog(client: &reqwest::Client) -> Option<serde_json::Value> {
-    let response = client
-        .get(MODELS_DEV_API_URL)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    response.json::<serde_json::Value>().await.ok()
+#[derive(Default)]
+struct ModelsDevCatalogCache {
+    catalog: Option<Arc<ModelsDevCatalog>>,
+    etag: Option<HeaderValue>,
+    fresh_until: Option<Instant>,
+    retry_at: Option<Instant>,
 }
 
-/// 从 models.dev 目录中找到与当前 endpoint 匹配的 provider models 对象。
-fn find_models_dev_provider_models<'a>(
-    catalog: &'a serde_json::Value,
-    endpoint_url: &str,
-) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
-    catalog
-        .as_object()?
-        .values()
-        .filter_map(|provider| provider.as_object())
-        .find(|provider| {
-            provider
+enum ModelsDevCatalogResponse {
+    Downloaded(Vec<u8>, Option<HeaderValue>),
+    NotModified,
+}
+
+impl ModelsDevCatalogCache {
+    async fn get<F, Fut>(&mut self, fetch: F) -> Option<Arc<ModelsDevCatalog>>
+    where
+        F: FnOnce(Option<HeaderValue>) -> Fut,
+        Fut: std::future::Future<Output = Option<ModelsDevCatalogResponse>>,
+    {
+        let now = Instant::now();
+        if self.fresh_until.is_some_and(|expiry| now < expiry) {
+            return self.catalog.clone();
+        }
+        if self.retry_at.is_some_and(|retry_at| now < retry_at) {
+            return None;
+        }
+
+        let refreshed = match fetch(self.etag.clone()).await {
+            Some(ModelsDevCatalogResponse::Downloaded(bytes, etag)) => {
+                let parsed = serde_json::from_slice(&bytes)
+                    .ok()
+                    .and_then(|value| ModelsDevCatalog::from_json(&value));
+                if let Some(catalog) = parsed {
+                    self.catalog = Some(Arc::new(catalog));
+                    self.etag = etag;
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(ModelsDevCatalogResponse::NotModified) => {
+                self.catalog.is_some() && self.etag.is_some()
+            }
+            None => false,
+        };
+        let now = Instant::now();
+        if refreshed {
+            self.fresh_until = Some(now + MODELS_DEV_CACHE_TTL);
+            self.retry_at = None;
+            self.catalog.clone()
+        } else {
+            // Keep the validator for the next retry. Expired facts cannot enrich a model.
+            self.retry_at = Some(now + MODELS_DEV_RETRY_DELAY);
+            None
+        }
+    }
+}
+
+/// Only the public supplemental catalog is shared. Each authenticated model list is fetched anew.
+async fn fetch_models_dev_catalog(client: &reqwest::Client) -> Option<Arc<ModelsDevCatalog>> {
+    static CACHE: std::sync::LazyLock<Mutex<ModelsDevCatalogCache>> =
+        std::sync::LazyLock::new(|| Mutex::new(ModelsDevCatalogCache::default()));
+    // Concurrent Sync Models operations share one download and one index.
+    CACHE
+        .lock()
+        .await
+        .get(|etag| request_models_dev_catalog(client, etag))
+        .await
+}
+
+async fn request_models_dev_catalog(
+    client: &reqwest::Client,
+    etag: Option<HeaderValue>,
+) -> Option<ModelsDevCatalogResponse> {
+    let mut request = client
+        .get(MODELS_DEV_API_URL)
+        .timeout(Duration::from_secs(5));
+    if let Some(etag) = etag {
+        request = request.header(IF_NONE_MATCH, etag);
+    }
+    let response = request.send().await.ok()?;
+    if response.status() == StatusCode::NOT_MODIFIED {
+        return Some(ModelsDevCatalogResponse::NotModified);
+    }
+    if response.status() != StatusCode::OK {
+        return None;
+    }
+    let etag = response.headers().get(ETAG).cloned();
+    let body = read_bounded_model_body(response.bytes_stream(), MAX_MODEL_RESPONSE_BYTES)
+        .await
+        .ok()?;
+    Some(ModelsDevCatalogResponse::Downloaded(body, etag))
+}
+
+#[derive(Default)]
+struct ModelsDevCatalog {
+    providers_by_host: HashMap<String, Vec<ModelsDevProvider>>,
+}
+
+struct ModelsDevProvider {
+    api: reqwest::Url,
+    models: Option<ModelsDevContexts>,
+}
+
+impl ModelsDevCatalog {
+    fn from_json(catalog: &serde_json::Value) -> Option<Self> {
+        let mut indexed = Self::default();
+        for provider in catalog.as_object()?.values() {
+            let Some(api) = provider
                 .get("api")
                 .and_then(|value| value.as_str())
-                .is_some_and(|api| endpoint_matches_provider_api(endpoint_url, api))
-        })
-        .and_then(|provider| provider.get("models"))
-        .and_then(|models| models.as_object())
+                .and_then(|api| reqwest::Url::parse(api.trim()).ok())
+                .filter(is_safe_known_gateway_url)
+            else {
+                continue;
+            };
+            let Some(host) = api.host_str() else {
+                continue;
+            };
+            let models = provider
+                .get("models")
+                .and_then(|models| models.as_object())
+                .map(ModelsDevContexts::from_models);
+            indexed
+                .providers_by_host
+                .entry(host.to_owned())
+                .or_default()
+                .push(ModelsDevProvider { api, models });
+        }
+        Some(indexed)
+    }
+
+    fn provider_models(&self, endpoint: &reqwest::Url) -> Option<&ModelsDevContexts> {
+        self.providers_by_host
+            .get(endpoint.host_str()?)?
+            .iter()
+            .find(|provider| parsed_endpoint_matches_provider_api(endpoint, &provider.api))
+            .and_then(|provider| provider.models.as_ref())
+    }
 }
 
 /// 判断 `/models` endpoint 是否属于 models.dev provider.api。
@@ -2811,8 +3069,12 @@ pub(crate) fn endpoint_matches_provider_api(endpoint_url: &str, provider_api: &s
     let Ok(api) = reqwest::Url::parse(provider_api.trim()) else {
         return false;
     };
-    if !is_safe_known_gateway_url(&endpoint)
-        || !is_safe_known_gateway_url(&api)
+    parsed_endpoint_matches_provider_api(&endpoint, &api)
+}
+
+fn parsed_endpoint_matches_provider_api(endpoint: &reqwest::Url, api: &reqwest::Url) -> bool {
+    if !is_safe_known_gateway_url(endpoint)
+        || !is_safe_known_gateway_url(api)
         || endpoint.scheme() != api.scheme()
         || !endpoint
             .host_str()
@@ -2852,92 +3114,68 @@ fn is_safe_known_gateway_url(url: &reqwest::Url) -> bool {
         && url.fragment().is_none()
 }
 
-/// 在已匹配 provider 的 models.dev 模型表里查找 context window。
-fn lookup_models_dev_context(
-    provider_models: &serde_json::Map<String, serde_json::Value>,
-    model_id: &str,
-) -> Option<u64> {
-    let fetched = normalize_models_dev_model_id(model_id);
-    let mut suffix_matches = Vec::new();
-    let mut exact_identity_without_context = false;
+#[derive(Default)]
+struct ModelsDevContexts {
+    exact: HashMap<String, Option<u64>>,
+    unique_suffix: HashMap<String, Option<u64>>,
+}
 
-    for (key, value) in provider_models {
-        let Some(model_obj) = value.as_object() else {
-            continue;
-        };
-        let catalog_id = model_obj.get("id").and_then(|id| id.as_str());
-        if models_dev_model_id_matches_exact(&fetched, key, catalog_id) {
-            if let Some(context) = extract_models_dev_entry_context(model_obj) {
-                return Some(context);
+impl ModelsDevContexts {
+    fn from_models<'a>(
+        models: impl IntoIterator<Item = (&'a String, &'a serde_json::Value)>,
+    ) -> Self {
+        let mut indexed = Self::default();
+        for (key, model) in models {
+            if !model.is_object() {
+                continue;
             }
-            exact_identity_without_context = true;
-            continue;
+            let context = entry_context_window(model);
+            let key = normalize_models_dev_model_id(key);
+            let id = model
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(normalize_models_dev_model_id);
+            let key_suffix = key.rsplit('/').next();
+            let id_suffix = id.as_deref().and_then(|id| id.rsplit('/').next());
+
+            if let Some(context) = context {
+                let id_suffix = id_suffix.filter(|suffix| Some(*suffix) != key_suffix);
+                for suffix in key_suffix.into_iter().chain(id_suffix) {
+                    indexed
+                        .unique_suffix
+                        .entry(suffix.to_owned())
+                        .and_modify(|existing| *existing = None)
+                        .or_insert(Some(context));
+                }
+            }
+
+            for exact in std::iter::once(key).chain(id) {
+                let existing = indexed.exact.entry(exact).or_default();
+                // Select the first positive limit and keep identities without a limit.
+                *existing = existing.or(context);
+            }
         }
-        if exact_identity_without_context {
-            continue;
-        }
-        let Some(context) = extract_models_dev_entry_context(model_obj) else {
-            continue;
-        };
-        if models_dev_model_id_matches_suffix(&fetched, key, catalog_id) {
-            suffix_matches.push(context);
-        }
+        indexed
     }
 
-    if !exact_identity_without_context && suffix_matches.len() == 1 {
-        suffix_matches.into_iter().next()
-    } else {
-        None
+    fn lookup(&self, model_id: &str) -> Option<u64> {
+        let id = normalize_models_dev_model_id(model_id);
+        // An exact identity with no limit still takes precedence over a suffix match.
+        self.exact
+            .get(&id)
+            .or_else(|| self.unique_suffix.get(&id))
+            .copied()
+            .flatten()
     }
-}
-
-/// 从 models.dev 单个模型条目中提取正数 `limit.context`。
-fn extract_models_dev_entry_context(
-    model_obj: &serde_json::Map<String, serde_json::Value>,
-) -> Option<u64> {
-    model_obj
-        .get("limit")
-        .and_then(|limit| limit.as_object())
-        .and_then(|limit| limit.get("context"))
-        .and_then(parse_positive_u64)
-        .filter(|context| *context > 0)
-}
-
-/// 判断 `/models` 返回的模型 id 是否精确匹配 models.dev 的 key 或 `id` 字段。
-fn models_dev_model_id_matches_exact(
-    fetched_model_id: &str,
-    catalog_key: &str,
-    catalog_id: Option<&str>,
-) -> bool {
-    let key = normalize_models_dev_model_id(catalog_key);
-    let id = catalog_id.map(normalize_models_dev_model_id);
-
-    fetched_model_id == key || id.as_deref() == Some(fetched_model_id)
-}
-
-/// 判断 `/models` 返回的模型 id 是否唯一后缀匹配 models.dev 的 key 或 `id` 字段。
-fn models_dev_model_id_matches_suffix(
-    fetched_model_id: &str,
-    catalog_key: &str,
-    catalog_id: Option<&str>,
-) -> bool {
-    let key = normalize_models_dev_model_id(catalog_key);
-    let id = catalog_id.map(normalize_models_dev_model_id);
-
-    key.rsplit('/').next() == Some(fetched_model_id)
-        || id.as_deref().and_then(|value| value.rsplit('/').next()) == Some(fetched_model_id)
 }
 
 /// 归一化 models.dev 模型 id，去掉大小写、`:free` 等后缀和 `[1m]` 标记差异。
 fn normalize_models_dev_model_id(value: &str) -> String {
-    let mut normalized = value.trim().to_ascii_lowercase();
-    if let Some(before_colon) = normalized.split(':').next() {
-        normalized = before_colon.to_string();
-    }
-    if normalized.ends_with("[1m]") {
-        normalized = normalized[..normalized.len() - "[1m]".len()]
-            .trim()
-            .to_string();
+    let value = value.trim();
+    let normalized = value.split_once(':').map_or(value, |(id, _)| id);
+    let normalized = normalized.to_ascii_lowercase();
+    if let Some(normalized) = normalized.strip_suffix("[1m]") {
+        return normalized.trim().to_owned();
     }
     normalized
 }
@@ -2964,18 +3202,21 @@ fn is_glm_model_id(model_id: &str) -> bool {
 async fn fetch_zhipu_model_overview_metadata(
     client: &reqwest::Client,
 ) -> HashMap<String, ZhipuModelMetadata> {
-    let text = match client
+    let body = match client
         .get(ZHIPU_MODEL_OVERVIEW_MD_URL)
         .timeout(Duration::from_secs(5))
         .send()
         .await
     {
-        Ok(response) if response.status().is_success() => response.text().await.ok(),
+        Ok(response) if response.status().is_success() => {
+            read_bounded_model_body(response.bytes_stream(), MAX_ZHIPU_DOC_BYTES)
+                .await
+                .ok()
+        }
         _ => None,
     };
 
-    text.as_deref()
-        .map(parse_zhipu_model_overview_metadata)
+    body.map(|body| parse_zhipu_model_overview_metadata(&String::from_utf8_lossy(&body)))
         .unwrap_or_default()
 }
 
@@ -2983,24 +3224,53 @@ async fn fetch_zhipu_model_overview_metadata(
 ///
 /// 例如 `glm-4.5` 的规格在 `glm-4.5.md` 概览卡片中，而概览表当前只列出
 /// `GLM-4.5-Air`；补查可以让真实 `/models` 返回的 `glm-4.5` 也得到 128K。
-async fn enrich_missing_zhipu_detail_contexts(
-    client: &reqwest::Client,
+async fn enrich_missing_zhipu_detail_contexts<F, Fut>(
     models: &[FetchedModel],
     metadata: &mut HashMap<String, ZhipuModelMetadata>,
-) {
+    mut fetch: F,
+) where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Option<ZhipuModelMetadata>>,
+{
+    let mut keys_by_slug = indexmap::IndexMap::<String, HashSet<String>>::new();
     for model in models {
         if model.context_window.is_some() && model.max_output_tokens.is_some() {
             continue;
         }
         let key = normalize_zhipu_model_id(&model.id);
-        let existing = metadata.get(&key).cloned().unwrap_or_default();
-        if existing.context_window.is_some() && existing.max_output_tokens.is_some() {
+        if metadata.get(&key).is_some_and(|existing| {
+            existing.context_window.is_some() && existing.max_output_tokens.is_some()
+        }) {
             continue;
         }
-        let Some(slug) = zhipu_docs_slug_for_model_id(&model.id) else {
+        let Some(slug) = zhipu_docs_slug(&key) else {
             continue;
         };
-        if let Some(facts) = fetch_zhipu_detail_metadata(client, &slug).await {
+        // Admission bounds total requests even when every detail responds quickly.
+        // Rows for an admitted slug still share its result after the limit.
+        if let Some(keys) = keys_by_slug.get_mut(slug) {
+            keys.insert(key);
+        } else if keys_by_slug.len() < MAX_ZHIPU_DETAIL_REQUESTS {
+            keys_by_slug.insert(slug.to_owned(), HashSet::from([key]));
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(FETCH_TIMEOUT_SECS);
+    let mut details = futures::stream::iter(keys_by_slug)
+        .map(|(slug, keys)| {
+            let detail = fetch(slug);
+            async move { (keys, detail.await) }
+        })
+        .buffer_unordered(ZHIPU_DETAIL_CONCURRENCY);
+    while Instant::now() < deadline {
+        let Ok(Some((keys, facts))) = tokio::time::timeout_at(deadline, details.next()).await
+        else {
+            break;
+        };
+        let Some(facts) = facts else {
+            continue;
+        };
+        for key in keys {
             let merged = metadata.entry(key).or_default();
             if merged.context_window.is_none() {
                 merged.context_window = facts.context_window;
@@ -3009,23 +3279,24 @@ async fn enrich_missing_zhipu_detail_contexts(
                 merged.max_output_tokens = facts.max_output_tokens;
             }
             if merged.input_modalities.is_none() {
-                merged.input_modalities = facts.input_modalities;
+                merged.input_modalities.clone_from(&facts.input_modalities);
             }
             if merged.output_modalities.is_none() {
-                merged.output_modalities = facts.output_modalities;
+                merged
+                    .output_modalities
+                    .clone_from(&facts.output_modalities);
             }
         }
     }
 }
 
-/// 将 GLM 模型 id 映射到智谱文档 markdown slug。
-fn zhipu_docs_slug_for_model_id(model_id: &str) -> Option<String> {
-    let normalized = normalize_zhipu_model_id(model_id);
+/// 将归一化后的 GLM 模型 id 映射到智谱文档 markdown slug。
+fn zhipu_docs_slug(normalized: &str) -> Option<&str> {
     if !normalized.starts_with("glm-") {
         return None;
     }
     if normalized.starts_with("glm-4.5") {
-        return Some("glm-4.5".to_string());
+        return Some("glm-4.5");
     }
     Some(normalized)
 }
@@ -3035,6 +3306,9 @@ async fn fetch_zhipu_detail_metadata(
     client: &reqwest::Client,
     slug: &str,
 ) -> Option<ZhipuModelMetadata> {
+    // Multiple key-group or provider syncs share the same documentation service.
+    static REQUESTS: Semaphore = Semaphore::const_new(ZHIPU_DETAIL_CONCURRENCY);
+    let _permit = REQUESTS.acquire().await.ok()?;
     let url = format!("https://docs.bigmodel.cn/cn/guide/models/text/{slug}.md");
     let response = client
         .get(url)
@@ -3045,8 +3319,10 @@ async fn fetch_zhipu_detail_metadata(
     if !response.status().is_success() {
         return None;
     }
-    let text = response.text().await.ok()?;
-    Some(parse_zhipu_detail_metadata(&text))
+    let body = read_bounded_model_body(response.bytes_stream(), MAX_ZHIPU_DOC_BYTES)
+        .await
+        .ok()?;
+    Some(parse_zhipu_detail_metadata(&String::from_utf8_lossy(&body)))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -3530,6 +3806,281 @@ mod tests {
             "total": total,
             "page_no": page_no,
         }})
+    }
+
+    #[tokio::test]
+    async fn model_list_byte_budget_stops_polling_at_first_oversized_chunk() {
+        let chunks_polled = std::cell::Cell::new(0);
+        let chunks = futures::stream::iter([b"123", b"456", b"789"]).map(|chunk| {
+            chunks_polled.set(chunks_polled.get() + 1);
+            Ok(bytes::Bytes::from_static(chunk))
+        });
+        let error = read_bounded_model_body(chunks, 5).await.unwrap_err();
+        assert!(matches!(error, ModelBodyError::TooLarge(5)));
+        assert_eq!(chunks_polled.get(), 2);
+
+        let chunks = futures::stream::iter([b"123".as_slice(), b"45"])
+            .map(|chunk| Ok(bytes::Bytes::from_static(chunk)));
+        let body = read_bounded_model_body(chunks, 5).await.unwrap();
+        assert_eq!(body, b"12345");
+        assert_eq!(body.capacity(), 5);
+    }
+
+    #[tokio::test]
+    async fn model_list_page_byte_and_row_budgets_are_shared_and_fail_closed() {
+        let first = upstream_metadata_page(3, 1, &["a", "b"]).to_string();
+        let second = upstream_metadata_page(3, 2, &["b", "c"]).to_string();
+        let mut remaining_bytes = first.len() + second.len();
+        let mut remaining_rows = 3;
+        let parsed = read_model_list_page(
+            futures::stream::iter([Ok(bytes::Bytes::from(first))]),
+            &mut remaining_bytes,
+            &mut remaining_rows,
+            &[],
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(parsed.models.len(), 2);
+        assert_eq!(remaining_rows, 1);
+        assert_eq!(remaining_bytes, second.len());
+
+        for (byte_budget, row_budget, message) in [
+            (remaining_bytes - 1, 2, "size limit"),
+            (remaining_bytes, remaining_rows, "model count"),
+        ] {
+            let mut remaining_bytes = byte_budget;
+            let mut remaining_rows = row_budget;
+            let result = read_model_list_page(
+                futures::stream::iter([Ok(bytes::Bytes::from(second.clone()))]),
+                &mut remaining_bytes,
+                &mut remaining_rows,
+                &[],
+                "",
+                "",
+            )
+            .await;
+            assert!(matches!(result, Err(error) if error.contains(message)));
+            assert_eq!(remaining_bytes, byte_budget);
+            assert_eq!(remaining_rows, row_budget);
+        }
+    }
+
+    #[test]
+    fn model_list_row_budget_counts_descriptors_and_rejects_excess_pagination() {
+        let result = parse_model_inventory(
+            r#"{"data":[{"id":"a"}],"models":[{"id":"a"},{"id":"b"}]}"#,
+            &[],
+            false,
+            2,
+        );
+        assert!(matches!(result, Err(error) if error.contains("model count")));
+        let body = upstream_metadata_page(MAX_MODEL_RESPONSE_ROWS as u64 + 1, 1, &["a"]);
+        let result = parse_model_inventory(&body.to_string(), &[], false, MAX_MODEL_RESPONSE_ROWS);
+        assert!(matches!(result, Err(error) if error.contains("model count")));
+    }
+
+    #[test]
+    fn rich_descriptor_identity_validation_rejects_duplicate_aliases() {
+        let first: ModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "provider/model-a",
+            "slug": "shared-alias",
+        }))
+        .unwrap();
+        let second: ModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "provider/model-b",
+            "aliases": ["shared-alias"],
+        }))
+        .unwrap();
+        assert!(RichModelDescriptors::new(&[first, second]).is_err());
+    }
+
+    #[test]
+    fn data_descriptor_enrichment_preserves_exact_precedence_and_rejects_ambiguous_aliases() {
+        let models = [
+            serde_json::json!({"id":"provider/model-a","aliases":["alias-a"],"context_window":100}),
+            serde_json::json!({"id":"provider/model-b","aliases":["alias-b"],"context_window":200}),
+        ];
+        let parse = |data: serde_json::Value| {
+            parse_models_response(
+                &serde_json::json!({ "data": data, "models": models }).to_string(),
+                &[],
+            )
+        };
+        let exact =
+            parse(serde_json::json!([{"id":" Provider/Model-A ","aliases":["alias-b"]}])).unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].context_window, Some(100));
+        for data in [
+            serde_json::json!([{"id":"unmatched","aliases":["alias-a","alias-b"]}]),
+            serde_json::json!([{"id":"provider/model-a"},{"id":"alias-a"}]),
+        ] {
+            assert_eq!(parse(data).unwrap_err(), AMBIGUOUS_MODEL_DESCRIPTORS);
+        }
+    }
+
+    #[test]
+    fn rich_descriptor_join_scans_each_descriptor_and_alias_matched_row_once() {
+        for count in [4, 512] {
+            let models = (0..count)
+                .map(|index| {
+                    serde_json::json!({
+                        "id": format!("provider/model-{index}"),
+                        "aliases": [format!("alias-{index}"), format!("ALIAS-{index}")],
+                        "context_window": 100,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let data = (0..count)
+                .map(|index| serde_json::json!({"id": format!("alias-{index}")}))
+                .collect::<Vec<_>>();
+            let body = serde_json::json!({"models": models, "data": data}).to_string();
+            MODEL_IDENTITY_SCANS.with(|scans| scans.set(0));
+            let parsed = parse_model_inventory(&body, &[], false, 2 * count).unwrap();
+            assert_eq!(parsed.entries.len(), count);
+            assert_eq!(MODEL_IDENTITY_SCANS.with(|scans| scans.get()), 2 * count);
+        }
+    }
+
+    #[tokio::test]
+    async fn zhipu_detail_enrichment_reuses_one_slug_result_for_all_matching_models() {
+        let models = ["glm-4.5", "glm-4.5-air"]
+            .into_iter()
+            .map(|id| FetchedModel {
+                id: id.to_owned(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let mut metadata = HashMap::from([(
+            "glm-4.5-air".to_owned(),
+            ZhipuModelMetadata {
+                context_window: Some(50),
+                ..Default::default()
+            },
+        )]);
+        let mut requested = Vec::new();
+        enrich_missing_zhipu_detail_contexts(&models, &mut metadata, |slug| {
+            requested.push(slug);
+            std::future::ready(Some(ZhipuModelMetadata {
+                context_window: Some(100),
+                max_output_tokens: Some(20),
+                ..Default::default()
+            }))
+        })
+        .await;
+        assert_eq!(requested, vec!["glm-4.5"]);
+        assert_eq!(metadata["glm-4.5"].context_window, Some(100));
+        assert_eq!(metadata["glm-4.5-air"].context_window, Some(50));
+        assert_eq!(metadata["glm-4.5-air"].max_output_tokens, Some(20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zhipu_detail_enrichment_bounds_concurrency_and_deduplicates_requests() {
+        use std::cell::{Cell, RefCell};
+
+        let models = [
+            "glm-4.5",
+            "glm-4.5-air",
+            "glm-4.6",
+            "glm-4.7",
+            "glm-5",
+            "glm-5.1",
+            "glm-5.2",
+            "glm-failed",
+            "glm-failed",
+        ]
+        .map(|id| FetchedModel {
+            id: id.to_owned(),
+            ..Default::default()
+        });
+        let mut metadata = HashMap::new();
+        let requested = RefCell::new(Vec::new());
+        let active = Cell::new(0);
+        let peak = Cell::new(0);
+        enrich_missing_zhipu_detail_contexts(&models, &mut metadata, |slug| {
+            let active = &active;
+            let peak = &peak;
+            let requested = &requested;
+            async move {
+                active.set(active.get() + 1);
+                peak.set(peak.get().max(active.get()));
+                let found = slug != "glm-failed";
+                requested.borrow_mut().push(slug);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                active.set(active.get() - 1);
+                found.then_some(ZhipuModelMetadata {
+                    context_window: Some(100),
+                    ..Default::default()
+                })
+            }
+        })
+        .await;
+
+        let requested = requested.into_inner();
+        assert_eq!(requested.len(), 7);
+        assert_eq!(requested.iter().collect::<HashSet<_>>().len(), 7);
+        assert_eq!(active.get(), 0);
+        assert_eq!(peak.get(), ZHIPU_DETAIL_CONCURRENCY);
+        assert_eq!(metadata.len(), 7);
+        assert_eq!(metadata["glm-4.5-air"].context_window, Some(100));
+        assert!(!metadata.contains_key("glm-failed"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zhipu_detail_enrichment_stops_scheduling_after_the_batch_deadline() {
+        let models = (0..20)
+            .map(|index| FetchedModel {
+                id: format!("glm-{index}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let mut metadata = HashMap::new();
+        let mut requested = 0;
+        enrich_missing_zhipu_detail_contexts(&models, &mut metadata, |_| {
+            requested += 1;
+            async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Some(ZhipuModelMetadata {
+                    context_window: Some(100),
+                    ..Default::default()
+                })
+            }
+        })
+        .await;
+
+        assert_eq!(requested, ZHIPU_DETAIL_CONCURRENCY);
+        assert!(metadata.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zhipu_detail_enrichment_caps_fast_requests_and_preserves_admitted_aliases() {
+        for distinct_slugs in [8, 2_048] {
+            let models = std::iter::once("glm-4.5".to_owned())
+                .chain((1..distinct_slugs).map(|index| format!("glm-extra-{index}")))
+                .chain(std::iter::once("glm-4.5-air".to_owned()))
+                .map(|id| FetchedModel {
+                    id,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            let mut metadata = HashMap::new();
+            let mut requested = Vec::new();
+            enrich_missing_zhipu_detail_contexts(&models, &mut metadata, |slug| {
+                requested.push(slug);
+                std::future::ready(Some(ZhipuModelMetadata {
+                    context_window: Some(100),
+                    ..Default::default()
+                }))
+            })
+            .await;
+
+            let admitted = distinct_slugs.min(MAX_ZHIPU_DETAIL_REQUESTS);
+            assert_eq!(requested.len(), admitted);
+            assert_eq!(metadata.len(), admitted + 1);
+            assert_eq!(metadata["glm-4.5-air"].context_window, Some(100));
+            assert!(!metadata.contains_key(&format!("glm-extra-{admitted}")));
+        }
     }
 
     struct UpstreamMetadataServer {
@@ -4345,6 +4896,7 @@ mod tests {
                     &[],
                     "",
                     "",
+                    MAX_MODEL_RESPONSE_ROWS,
                 )
                 .is_err(),
                 "invalid paging must not look complete: {output}"
@@ -4354,9 +4906,14 @@ mod tests {
             "output": {"models": [upstream_metadata_card("a")], "total": 1, "page_no": 1},
             "has_more": true,
         });
-        assert!(
-            parse_provider_models_response_with_pagination(&body.to_string(), &[], "", "").is_err()
-        );
+        assert!(parse_provider_models_response_with_pagination(
+            &body.to_string(),
+            &[],
+            "",
+            "",
+            MAX_MODEL_RESPONSE_ROWS,
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -4750,10 +5307,8 @@ mod tests {
             "short".to_string(),
             "Bearer literal-header-secret".to_string(),
         ];
-        let body = redact_model_fetch_error_body(
-            "invalid short / Bearer literal-header-secret".to_string(),
-            &secrets,
-        );
+        let body =
+            redact_model_fetch_error_body("invalid short / Bearer literal-header-secret", &secrets);
         assert_eq!(body, "invalid [REDACTED] / [REDACTED]");
     }
 
@@ -5073,6 +5628,7 @@ mod tests {
             &[],
             "https://dashscope.aliyuncs.com",
             "https://dashscope.aliyuncs.com/v1/models",
+            MAX_MODEL_RESPONSE_ROWS,
         )
         .expect("parse DashScope output.models envelope");
 
@@ -5742,6 +6298,9 @@ mod tests {
             serde_json::json!({"nextPageToken": "opaque-cursor"}),
             serde_json::json!({"total": 2}),
             serde_json::json!({"pagination": {"total": 2}}),
+            serde_json::json!({"pagination": {"total": 1, "total_count": "2"}}),
+            serde_json::json!({"pagination": {"total": 1, "links": {"totalCount": 2}}}),
+            serde_json::json!({"pagination": {"meta": {"total": 1}, "links": {"totalCount": 2}}}),
             serde_json::json!({"pagination": {"page": 1, "total_pages": 2}}),
             serde_json::json!({"links": {"next": "https://provider.test/models?page=2"}}),
         ] {
@@ -6956,7 +7515,7 @@ mod tests {
             }
         });
 
-        let models = parse_volcengine_plan_models(&body);
+        let models = parse_volcengine_plan_models(&body).unwrap();
 
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "ark-code-latest");
@@ -6977,7 +7536,7 @@ mod tests {
             }
         });
 
-        let models = parse_volcengine_plan_models(&body);
+        let models = parse_volcengine_plan_models(&body).unwrap();
 
         assert_eq!(
             models
@@ -6986,6 +7545,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["ark-code-latest", "doubao-seed-1.6"]
         );
+    }
+
+    #[test]
+    fn volcengine_model_list_rejects_excess_raw_rows_before_deduplication() {
+        let mut rows = vec![serde_json::Value::Null; MAX_MODEL_RESPONSE_ROWS];
+        rows[0] = serde_json::json!("one-model");
+        let mut body = serde_json::json!({"Result": {"Datas": rows}});
+        assert_eq!(parse_volcengine_plan_models(&body).unwrap().len(), 1);
+
+        body["Result"]["Datas"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("one-model"));
+        let error = parse_volcengine_plan_models(&body).unwrap_err();
+        assert!(error.contains("maximum supported model count"));
     }
 
     #[test]
@@ -7100,18 +7674,12 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 "limit": { "context": 0 }
             }
         });
-        let models = provider_models.as_object().unwrap();
+        let models = ModelsDevContexts::from_models(provider_models.as_object().unwrap());
 
-        assert_eq!(
-            lookup_models_dev_context(models, "gpt-5.2-chat"),
-            Some(128_000)
-        );
-        assert_eq!(
-            lookup_models_dev_context(models, "xai/grok-4-fast:free"),
-            Some(2_000_000)
-        );
-        assert_eq!(lookup_models_dev_context(models, "image-model"), None);
-        assert_eq!(lookup_models_dev_context(models, "missing-model"), None);
+        assert_eq!(models.lookup("gpt-5.2-chat"), Some(128_000));
+        assert_eq!(models.lookup("xai/grok-4-fast:free"), Some(2_000_000));
+        assert_eq!(models.lookup("image-model"), None);
+        assert_eq!(models.lookup("missing-model"), None);
     }
 
     #[test]
@@ -7126,12 +7694,128 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 "limit": { "context": 200000 }
             }
         });
-        let models = provider_models.as_object().unwrap();
+        let models = ModelsDevContexts::from_models(provider_models.as_object().unwrap());
 
-        assert_eq!(lookup_models_dev_context(models, "shared-model"), None);
+        assert_eq!(models.lookup("shared-model"), None);
+        assert_eq!(models.lookup("provider-b/shared-model"), Some(200_000));
+    }
+
+    #[test]
+    fn models_dev_indexes_small_and_large_catalogs_in_one_pass() {
+        use std::cell::Cell;
+
+        for size in [8, 2_048] {
+            let rows = (0..size)
+                .map(|i| {
+                    (
+                        format!("owner/model-{i}"),
+                        serde_json::json!({
+                            "id": format!("alias/model-{i}"),
+                            "limit": {"context": 100 + i}
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let indexed_rows = Cell::new(0);
+            let models = ModelsDevContexts::from_models(
+                rows.iter()
+                    .inspect(|_| indexed_rows.set(indexed_rows.get() + 1)),
+            );
+            drop(rows);
+
+            for _ in 0..6 {
+                for i in 0..size {
+                    let context = Some(100 + i as u64);
+                    assert_eq!(models.lookup(&format!("alias/model-{i}")), context);
+                    assert_eq!(models.lookup(&format!("model-{i}")), context);
+                    assert_eq!(models.lookup(&format!("missing-{i}")), None);
+                }
+            }
+            assert_eq!(indexed_rows.get(), size);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn models_dev_cache_reuses_the_index_and_revalidates_expired_facts() {
+        use std::cell::Cell;
+
+        let cache = Mutex::new(ModelsDevCatalogCache::default());
+        let requested = Cell::new(0);
+        let validator = HeaderValue::from_static(r#""generation-1""#);
+        let load = |etag: Option<HeaderValue>| {
+            assert!(etag.is_none());
+            requested.set(requested.get() + 1);
+            let etag = validator.clone();
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Some(ModelsDevCatalogResponse::Downloaded(
+                    br#"{"provider":{"api":"https://example.test/v1","models":{"model":{"limit":{"context":128000}}}}}"#.to_vec(),
+                    Some(etag),
+                ))
+            }
+        };
+        let (first, concurrent) = tokio::join!(
+            async { cache.lock().await.get(load).await.unwrap() },
+            async { cache.lock().await.get(load).await.unwrap() },
+        );
+        assert!(Arc::ptr_eq(&first, &concurrent));
+        let endpoint = reqwest::Url::parse("https://example.test/v1/models").unwrap();
         assert_eq!(
-            lookup_models_dev_context(models, "provider-b/shared-model"),
-            Some(200_000)
+            first.provider_models(&endpoint).unwrap().lookup("model"),
+            Some(128_000)
+        );
+        for _ in 0..20 {
+            let cached = cache.lock().await.get(load).await.unwrap();
+            assert!(Arc::ptr_eq(&first, &cached));
+        }
+        assert_eq!(requested.get(), 1);
+
+        tokio::time::advance(MODELS_DEV_CACHE_TTL).await;
+        let unchanged = cache
+            .lock()
+            .await
+            .get(|etag| {
+                assert_eq!(etag.as_ref(), Some(&validator));
+                std::future::ready(Some(ModelsDevCatalogResponse::NotModified))
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &unchanged));
+
+        tokio::time::advance(MODELS_DEV_CACHE_TTL).await;
+        let invalid = cache
+            .lock()
+            .await
+            .get(|_| {
+                std::future::ready(Some(ModelsDevCatalogResponse::Downloaded(
+                    b"[]".to_vec(),
+                    None,
+                )))
+            })
+            .await;
+        assert!(invalid.is_none());
+        for _ in 0..20 {
+            assert!(cache.lock().await.get(load).await.is_none());
+        }
+        assert_eq!(requested.get(), 1);
+
+        tokio::time::advance(MODELS_DEV_RETRY_DELAY).await;
+        let replaced = cache
+            .lock()
+            .await
+            .get(|etag| {
+                assert_eq!(etag.as_ref(), Some(&validator));
+                std::future::ready(Some(ModelsDevCatalogResponse::Downloaded(
+                    br#"{"provider":{"api":"https://example.test/v1","models":{}}}"#.to_vec(),
+                    None,
+                )))
+            })
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &replaced));
+        assert_eq!(
+            replaced.provider_models(&endpoint).unwrap().lookup("model"),
+            None
         );
     }
 
@@ -7144,10 +7828,8 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 "limit": {"context": 200_000}
             }
         });
-        assert_eq!(
-            lookup_models_dev_context(provider_models.as_object().unwrap(), "shared-model"),
-            None,
-        );
+        let models = ModelsDevContexts::from_models(provider_models.as_object().unwrap());
+        assert_eq!(models.lookup("shared-model"), None);
     }
 
     #[test]
@@ -7159,10 +7841,11 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
             },
             "shared-model": {"id": "shared-model"}
         });
+        let models = ModelsDevContexts::from_models(provider_models.as_object().unwrap());
         assert_eq!(
-            lookup_models_dev_context(provider_models.as_object().unwrap(), "shared-model"),
+            models.lookup("shared-model"),
             None,
-            "exact identity must win independently of inventory order"
+            "exact identity must win"
         );
     }
 
@@ -7193,10 +7876,9 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 "models": {"model": {"limit": {"context": 200_000}}}
             }
         });
-        assert!(
-            find_models_dev_provider_models(&catalog, "https://opencode.ai/unknown/models")
-                .is_none()
-        );
+        let catalog = ModelsDevCatalog::from_json(&catalog).unwrap();
+        let endpoint = reqwest::Url::parse("https://opencode.ai/unknown/models").unwrap();
+        assert!(catalog.provider_models(&endpoint).is_none());
     }
 
     #[test]
@@ -7216,13 +7898,10 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
             }
         });
 
-        let models =
-            find_models_dev_provider_models(&catalog, "https://router.requesty.ai/v1/models")
-                .unwrap();
-        assert_eq!(
-            lookup_models_dev_context(models, "xai/grok-4-fast"),
-            Some(2_000_000)
-        );
+        let catalog = ModelsDevCatalog::from_json(&catalog).unwrap();
+        let endpoint = reqwest::Url::parse("https://router.requesty.ai/v1/models").unwrap();
+        let models = catalog.provider_models(&endpoint).unwrap();
+        assert_eq!(models.lookup("xai/grok-4-fast"), Some(2_000_000));
     }
 
     #[test]
@@ -7263,6 +7942,7 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
                 "models": {"shared-model": {"limit": {"context": 128_000}}}
             }
         });
+        let catalog = ModelsDevCatalog::from_json(&catalog).unwrap();
         for (endpoint, context) in [
             ("https://opencode.ai/zen/v1/models", 64_000),
             ("https://opencode.ai/inference/v1/models", 64_000),
@@ -7273,13 +7953,10 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
             ("https://opencode.ai/inference/go/openai/v1/models", 128_000),
             ("https://opencode.ai/inference/go/anthropic/v1", 128_000),
         ] {
-            let models = find_models_dev_provider_models(&catalog, endpoint)
+            let models = catalog
+                .provider_models(&reqwest::Url::parse(endpoint).unwrap())
                 .unwrap_or_else(|| panic!("missing same-provider alias: {endpoint}"));
-            assert_eq!(
-                lookup_models_dev_context(models, "shared-model"),
-                Some(context),
-                "{endpoint}",
-            );
+            assert_eq!(models.lookup("shared-model"), Some(context), "{endpoint}");
             assert_eq!(
                 endpoint_matches_provider_api(endpoint, zen_api),
                 context == 64_000,
@@ -7401,14 +8078,8 @@ Coding 能力开源 SOTA，从代码生成走向工程交付 | 1M | 128K |
     #[test]
     fn test_zhipu_model_id_normalization_and_slug() {
         assert_eq!(normalize_zhipu_model_id("ZhipuAI/GLM-5.2[1m]"), "glm-5.2");
-        assert_eq!(
-            zhipu_docs_slug_for_model_id("glm-4.5-air").as_deref(),
-            Some("glm-4.5")
-        );
-        assert_eq!(
-            zhipu_docs_slug_for_model_id("glm-5-turbo").as_deref(),
-            Some("glm-5-turbo")
-        );
+        assert_eq!(zhipu_docs_slug("glm-4.5-air"), Some("glm-4.5"));
+        assert_eq!(zhipu_docs_slug("glm-5-turbo"), Some("glm-5-turbo"));
     }
 
     #[test]

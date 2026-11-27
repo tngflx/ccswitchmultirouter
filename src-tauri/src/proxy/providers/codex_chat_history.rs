@@ -1,5 +1,5 @@
 use super::codex_chat_common::{is_empty_value, response_item_call_id};
-use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
+use crate::proxy::sse::{strip_sse_field, TextSseFrames};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
@@ -8,26 +8,61 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 const MAX_CACHED_RESPONSES: usize = 512;
+const MAX_CACHED_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 struct CachedResponse {
-    prefix_items: Vec<Value>,
-    exchange_items: Vec<Value>,
-    calls_by_id: HashMap<String, Value>,
-    call_order: Vec<String>,
+    prefix: Arc<CachedItems>,
+    exchange: Arc<CachedItems>,
+    calls_by_id: HashMap<String, CachedCall>,
+    sequence: u64,
+    byte_size: usize,
+}
+
+#[derive(Debug, Default)]
+struct CachedItems {
+    items: Vec<Value>,
+    byte_size: usize,
+}
+
+impl CachedItems {
+    fn new(items: Vec<Value>) -> Self {
+        let byte_size = items.iter().map(value_size).sum();
+        Self { items, byte_size }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedCall {
+    item: Arc<Value>,
+    position: usize,
+    byte_size: usize,
+}
+
+impl CachedCall {
+    fn new(item: Value) -> Self {
+        let byte_size = value_size(&item);
+        Self {
+            item: Arc::new(item),
+            position: 0,
+            byte_size,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct CodexChatHistoryInner {
-    responses: HashMap<String, CachedResponse>,
-    response_order: VecDeque<String>,
-    call_index: HashMap<String, VecDeque<String>>,
+    responses: HashMap<Arc<str>, Arc<CachedResponse>>,
+    response_order: VecDeque<Arc<str>>,
+    call_index: HashMap<String, HashSet<Arc<str>>>,
+    next_sequence: u64,
+    cached_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default)]
 struct CachedLookup {
-    previous: Option<CachedResponse>,
-    fallback: CachedResponse,
+    previous: Option<Arc<CachedResponse>>,
+    fallback: HashMap<String, (u64, CachedCall)>,
 }
 
 /// Cross-request history needed when Codex Responses is bridged to Chat
@@ -62,35 +97,35 @@ impl CodexChatHistoryStore {
 
         let response_output_items = response
             .get("output")
-            .and_then(|value| value.as_array())
-            .cloned()
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
             .unwrap_or_default();
         let calls = response_output_items
             .iter()
             .filter_map(cached_call_item)
             .collect::<Vec<_>>();
         let prefix_items = cached_prefix_items(request);
-        let exchange_items = cached_exchange_items(&prefix_items, &response_output_items);
+        let exchange_items = cached_exchange_items(&prefix_items, response_output_items);
 
         if calls.is_empty() && exchange_items.is_empty() {
             return 0;
         }
 
+        let prefix = CachedItems::new(prefix_items);
+        let exchange = CachedItems::new(exchange_items);
         let mut inner = self.inner.write().await;
-        inner.insert_exchange(response_id, prefix_items, exchange_items, calls)
+        inner.insert_exchange(response_id, prefix, exchange, calls)
     }
 
     async fn record_call_item(&self, response_id: Option<&str>, item: &Value) -> bool {
+        let Some(response_id) = response_id.filter(|value| !value.is_empty()) else {
+            return false;
+        };
         let Some(call) = cached_call_item(item) else {
             return false;
         };
-
         let mut inner = self.inner.write().await;
-        if let Some(response_id) = response_id.filter(|value| !value.is_empty()) {
-            inner.insert_calls(response_id, vec![call]) > 0
-        } else {
-            false
-        }
+        inner.insert_calls(response_id, vec![call]) > 0
     }
 
     pub async fn enrich_request(&self, body: &mut Value) -> usize {
@@ -147,16 +182,6 @@ impl CodexChatHistoryStore {
             .await;
 
         let restore_group = lookup.restore_group(&output_call_ids, &existing_call_ids);
-        let restore_prefix = if has_context_items {
-            Vec::new()
-        } else {
-            lookup.restore_prefix()
-        };
-
-        let restore_group_ids = restore_group
-            .iter()
-            .map(|(call_id, _)| call_id.clone())
-            .collect::<HashSet<_>>();
         let mut restore_group = Some(restore_group);
         let mut seen_call_ids = HashSet::new();
         let mut restored = 0usize;
@@ -186,8 +211,8 @@ impl CodexChatHistoryStore {
                 }
                 Some(item_type) if is_call_output_item_type(item_type) => {
                     if let Some(group) = restore_group.take().filter(|group| !group.is_empty()) {
-                        if !restore_prefix.is_empty() {
-                            new_items.extend(restore_prefix.iter().cloned());
+                        if !has_context_items {
+                            new_items.extend(lookup.restore_prefix());
                         }
                         for (call_id, cached_item) in group {
                             seen_call_ids.insert(call_id);
@@ -197,9 +222,7 @@ impl CodexChatHistoryStore {
                     }
 
                     if let Some(call_id) = response_item_call_id(&item) {
-                        if !seen_call_ids.contains(&call_id)
-                            && !restore_group_ids.contains(&call_id)
-                        {
+                        if !seen_call_ids.contains(&call_id) {
                             if let Some(cached) = lookup.call(&call_id).cloned() {
                                 seen_call_ids.insert(call_id);
                                 new_items.push(cached);
@@ -229,150 +252,215 @@ impl CodexChatHistoryStore {
     ) -> CachedLookup {
         let inner = self.inner.read().await;
         let previous = previous_response_id.and_then(|id| inner.responses.get(id).cloned());
-        let fallback = inner.unique_fallback_calls(requested_call_ids, previous.as_ref());
+        let fallback = inner.unique_fallback_calls(requested_call_ids, previous.as_deref());
         CachedLookup { previous, fallback }
     }
 }
 
 impl CodexChatHistoryInner {
-    fn insert_calls(&mut self, response_id: &str, calls: Vec<(String, Value)>) -> usize {
-        self.insert_exchange(response_id, Vec::new(), Vec::new(), calls)
+    fn insert_calls(&mut self, response_id: &str, calls: Vec<(String, CachedCall)>) -> usize {
+        self.insert_exchange(
+            response_id,
+            CachedItems::default(),
+            CachedItems::default(),
+            calls,
+        )
     }
 
     fn insert_exchange(
         &mut self,
         response_id: &str,
-        prefix_items: Vec<Value>,
-        exchange_items: Vec<Value>,
-        calls: Vec<(String, Value)>,
+        prefix: CachedItems,
+        exchange: CachedItems,
+        calls: Vec<(String, CachedCall)>,
     ) -> usize {
-        if !self.responses.contains_key(response_id) {
-            self.response_order.push_back(response_id.to_string());
-        }
+        let (response_id, previous_size) =
+            if let Some((id, response)) = self.responses.get_key_value(response_id) {
+                (Arc::clone(id), response.byte_size)
+            } else {
+                let id: Arc<str> = Arc::from(response_id);
+                self.response_order.push_back(Arc::clone(&id));
+                self.responses.insert(
+                    Arc::clone(&id),
+                    Arc::new(CachedResponse {
+                        sequence: self.next_sequence,
+                        byte_size: response_id.len() + std::mem::size_of::<CachedResponse>(),
+                        ..CachedResponse::default()
+                    }),
+                );
+                self.next_sequence += 1;
+                (id, 0)
+            };
 
-        let cached_response = self.responses.entry(response_id.to_string()).or_default();
-        if !prefix_items.is_empty() {
-            cached_response.prefix_items = prefix_items;
+        let cached_response = self
+            .responses
+            .get_mut(&response_id)
+            .expect("response was inserted");
+        let cached_response = Arc::make_mut(cached_response);
+        if !prefix.items.is_empty() {
+            cached_response.byte_size -= cached_response.prefix.byte_size;
+            cached_response.byte_size += prefix.byte_size;
+            cached_response.prefix = Arc::new(prefix);
         }
-        if !exchange_items.is_empty() {
-            cached_response.exchange_items = exchange_items;
+        if !exchange.items.is_empty() {
+            cached_response.byte_size -= cached_response.exchange.byte_size;
+            cached_response.byte_size += exchange.byte_size;
+            cached_response.exchange = Arc::new(exchange);
         }
-        let mut inserted_or_updated = 0usize;
-        let mut indexed_call_ids = Vec::new();
-        for (call_id, item) in calls {
-            if !cached_response.calls_by_id.contains_key(&call_id) {
-                cached_response.call_order.push(call_id.clone());
+        let inserted_or_updated = calls.len();
+        for (call_id, mut call) in calls {
+            let next_position = cached_response.calls_by_id.len();
+            match cached_response.calls_by_id.entry(call_id) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    call.position = entry.get().position;
+                    cached_response.byte_size -= entry.get().byte_size;
+                    cached_response.byte_size += call.byte_size;
+                    entry.insert(call);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    call.position = next_position;
+                    cached_response.byte_size += call.byte_size
+                        + 2 * entry.key().len()
+                        + std::mem::size_of::<CachedCall>()
+                        + std::mem::size_of::<Arc<str>>();
+                    self.call_index
+                        .entry(entry.key().clone())
+                        .or_default()
+                        .insert(Arc::clone(&response_id));
+                    entry.insert(call);
+                }
             }
-            cached_response.calls_by_id.insert(call_id.clone(), item);
-            indexed_call_ids.push(call_id);
-            inserted_or_updated += 1;
-        }
-        for call_id in indexed_call_ids {
-            self.index_call(&call_id, response_id);
         }
 
+        self.cached_bytes = self.cached_bytes - previous_size + cached_response.byte_size;
+        if cached_response.byte_size > MAX_CACHED_BYTES {
+            // Drop this entry directly so an oversized exchange cannot flush unrelated history.
+            self.response_order.retain(|id| id != &response_id);
+            self.remove_response(&response_id);
+            return 0;
+        }
         self.prune();
         inserted_or_updated
     }
 
     fn prune(&mut self) {
-        while self.response_order.len() > MAX_CACHED_RESPONSES {
+        while self.response_order.len() > MAX_CACHED_RESPONSES
+            || self.cached_bytes > MAX_CACHED_BYTES
+        {
             let Some(response_id) = self.response_order.pop_front() else {
                 break;
             };
-            self.responses.remove(&response_id);
-            self.remove_response_from_call_index(&response_id);
+            self.remove_response(&response_id);
         }
     }
 
-    fn index_call(&mut self, call_id: &str, response_id: &str) {
-        let response_ids = self.call_index.entry(call_id.to_string()).or_default();
-        if !response_ids
-            .iter()
-            .any(|cached_id| cached_id == response_id)
-        {
-            response_ids.push_back(response_id.to_string());
+    fn remove_response(&mut self, response_id: &str) {
+        let Some(response) = self.responses.remove(response_id) else {
+            return;
+        };
+        self.cached_bytes -= response.byte_size;
+        for call_id in response.calls_by_id.keys() {
+            let should_remove = self
+                .call_index
+                .get_mut(call_id)
+                .map(|response_ids| {
+                    response_ids.remove(response_id);
+                    response_ids.is_empty()
+                })
+                .unwrap_or(false);
+            if should_remove {
+                self.call_index.remove(call_id);
+            }
         }
-    }
-
-    fn remove_response_from_call_index(&mut self, response_id: &str) {
-        for response_ids in self.call_index.values_mut() {
-            response_ids.retain(|cached_id| cached_id != response_id);
-        }
-        self.call_index
-            .retain(|_, response_ids| !response_ids.is_empty());
     }
 
     fn unique_fallback_calls(
         &self,
         requested_call_ids: &HashSet<String>,
         previous: Option<&CachedResponse>,
-    ) -> CachedResponse {
-        let mut selected = HashMap::new();
-        for call_id in requested_call_ids {
-            if previous.is_some_and(|response| response.calls_by_id.contains_key(call_id)) {
-                continue;
-            }
-            if let Some(item) = self.unique_call(call_id) {
-                selected.insert(call_id.clone(), item.clone());
-            }
-        }
-
-        let mut fallback = CachedResponse::default();
-        for response_id in &self.response_order {
-            let Some(response) = self.responses.get(response_id) else {
-                continue;
-            };
-            for call_id in &response.call_order {
-                if let Some(item) = selected.remove(call_id) {
-                    fallback.call_order.push(call_id.clone());
-                    fallback.calls_by_id.insert(call_id.clone(), item);
-                }
-            }
-        }
-        fallback
+    ) -> HashMap<String, (u64, CachedCall)> {
+        requested_call_ids
+            .iter()
+            .filter(|call_id| {
+                !previous.is_some_and(|response| response.calls_by_id.contains_key(*call_id))
+            })
+            .filter_map(|call_id| {
+                self.unique_call(call_id)
+                    .map(|(sequence, call)| (call_id.clone(), (sequence, call.clone())))
+            })
+            .collect()
     }
 
-    fn unique_call(&self, call_id: &str) -> Option<&Value> {
+    fn unique_call(&self, call_id: &str) -> Option<(u64, &CachedCall)> {
         let response_ids = self.call_index.get(call_id)?;
-        let mut found = None;
-        for response_id in response_ids {
-            let Some(item) = self
-                .responses
-                .get(response_id)
-                .and_then(|response| response.calls_by_id.get(call_id))
-            else {
-                continue;
-            };
-            if found.is_some() {
-                return None;
-            }
-            found = Some(item);
+        if response_ids.len() != 1 {
+            return None;
         }
-        found
+        let response = self.responses.get(response_ids.iter().next()?)?;
+        let call = response.calls_by_id.get(call_id)?;
+        Some((response.sequence, call))
     }
+}
+
+fn value_size(value: &Value) -> usize {
+    #[cfg(test)]
+    VALUE_SIZE_VISITS.with(|visits| visits.set(visits.get() + 1));
+
+    let children = match value {
+        Value::String(text) => text.capacity(),
+        Value::Array(values) => {
+            let unused_slots = values.capacity() - values.len();
+            unused_slots * std::mem::size_of::<Value>()
+                + values.iter().map(value_size).sum::<usize>()
+        }
+        Value::Object(object) => object
+            .iter()
+            .map(|(key, value)| std::mem::size_of::<String>() + key.capacity() + value_size(value))
+            .sum(),
+        _ => 0,
+    };
+    std::mem::size_of::<Value>() + children
+}
+
+#[cfg(test)]
+thread_local! {
+    static VALUE_SIZE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl CachedLookup {
     fn restore_exchange(&self) -> Vec<Value> {
         self.previous
             .as_ref()
-            .map(|previous| previous.exchange_items.clone())
+            .map(|previous| previous.exchange.items.clone())
             .unwrap_or_default()
     }
 
     fn restore_prefix(&self) -> Vec<Value> {
         self.previous
             .as_ref()
-            .map(|previous| previous.prefix_items.clone())
+            .map(|previous| previous.prefix.items.clone())
             .unwrap_or_default()
     }
 
     fn call(&self, call_id: &str) -> Option<&Value> {
+        self.ordered_call(call_id)
+            .map(|(_, _, call)| call.item.as_ref())
+    }
+
+    fn ordered_call(&self, call_id: &str) -> Option<(bool, u64, &CachedCall)> {
         self.previous
             .as_ref()
-            .and_then(|previous| previous.calls_by_id.get(call_id))
-            .or_else(|| self.fallback.calls_by_id.get(call_id))
+            .and_then(|previous| {
+                previous
+                    .calls_by_id
+                    .get(call_id)
+                    .map(|call| (false, previous.sequence, call))
+            })
+            .or_else(|| {
+                self.fallback
+                    .get(call_id)
+                    .map(|(sequence, call)| (true, *sequence, call))
+            })
     }
 
     fn restore_group(
@@ -380,25 +468,24 @@ impl CachedLookup {
         output_call_ids: &HashSet<String>,
         existing_call_ids: &HashSet<String>,
     ) -> Vec<(String, Value)> {
-        let mut group = Vec::new();
-        let mut grouped_call_ids = HashSet::new();
-        if let Some(previous) = &self.previous {
-            append_restore_group(
-                previous,
-                output_call_ids,
-                existing_call_ids,
-                &mut grouped_call_ids,
-                &mut group,
-            );
-        }
-        append_restore_group(
-            &self.fallback,
-            output_call_ids,
-            existing_call_ids,
-            &mut grouped_call_ids,
-            &mut group,
-        );
+        let mut group = output_call_ids
+            .difference(existing_call_ids)
+            .filter_map(|call_id| {
+                self.ordered_call(call_id)
+                    .map(|(fallback, sequence, call)| {
+                        (
+                            (fallback, sequence, call.position),
+                            call_id,
+                            call.item.as_ref(),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        group.sort_unstable_by_key(|(order, _, _)| *order);
         group
+            .into_iter()
+            .map(|(_, id, item)| (id.clone(), item.clone()))
+            .collect()
     }
 }
 
@@ -407,18 +494,19 @@ fn cached_prefix_items(request: &Value) -> Vec<Value> {
         return Vec::new();
     };
     let items = match input {
-        Value::Array(items) => items.clone(),
-        Value::Object(_) => vec![input.clone()],
-        _ => Vec::new(),
+        Value::Array(items) => items.as_slice(),
+        Value::Object(_) => std::slice::from_ref(input),
+        _ => return Vec::new(),
     };
 
     items
-        .into_iter()
+        .iter()
         .filter(|item| {
             item.get("type")
                 .and_then(|value| value.as_str())
                 .is_none_or(|item_type| !is_call_output_item_type(item_type))
         })
+        .cloned()
         .collect()
 }
 
@@ -427,27 +515,6 @@ fn cached_exchange_items(prefix_items: &[Value], response_output_items: &[Value]
     items.extend(prefix_items.iter().cloned());
     items.extend(response_output_items.iter().cloned());
     items
-}
-
-fn append_restore_group(
-    response: &CachedResponse,
-    output_call_ids: &HashSet<String>,
-    existing_call_ids: &HashSet<String>,
-    grouped_call_ids: &mut HashSet<String>,
-    group: &mut Vec<(String, Value)>,
-) {
-    for call_id in &response.call_order {
-        if !output_call_ids.contains(call_id)
-            || existing_call_ids.contains(call_id)
-            || grouped_call_ids.contains(call_id)
-        {
-            continue;
-        }
-        if let Some(item) = response.calls_by_id.get(call_id).cloned() {
-            grouped_call_ids.insert(call_id.clone());
-            group.push((call_id.clone(), item));
-        }
-    }
 }
 
 pub fn record_responses_sse_stream(
@@ -463,8 +530,7 @@ pub fn record_responses_sse_stream_with_request(
     request: Value,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
-        let mut buffer = String::new();
-        let mut utf8_remainder = Vec::new();
+        let mut frames = TextSseFrames::default();
         let mut current_response_id: Option<String> = None;
 
         tokio::pin!(stream);
@@ -472,8 +538,8 @@ pub fn record_responses_sse_stream_with_request(
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
-                    while let Some(block) = take_sse_block(&mut buffer) {
+                    frames.push(&bytes);
+                    while let Some(block) = frames.next_block() {
                         inspect_sse_block(
                             &block,
                             &mut current_response_id,
@@ -516,6 +582,15 @@ async fn inspect_sse_block(
         return;
     };
 
+    record_responses_sse_event(&value, current_response_id, history, request).await;
+}
+
+pub(crate) async fn record_responses_sse_event(
+    value: &Value,
+    current_response_id: &mut Option<String>,
+    history: &CodexChatHistoryStore,
+    request: &Value,
+) {
     if let Some(response_id) = value
         .pointer("/response/id")
         .and_then(|value| value.as_str())
@@ -545,7 +620,7 @@ async fn inspect_sse_block(
     }
 }
 
-fn cached_call_item(item: &Value) -> Option<(String, Value)> {
+fn cached_call_item(item: &Value) -> Option<(String, CachedCall)> {
     if !item
         .get("type")
         .and_then(|value| value.as_str())
@@ -554,7 +629,7 @@ fn cached_call_item(item: &Value) -> Option<(String, Value)> {
         return None;
     }
     let call_id = response_item_call_id(item)?;
-    Some((call_id, item.clone()))
+    Some((call_id, CachedCall::new(item.clone())))
 }
 
 fn is_call_item_type(item_type: &str) -> bool {
@@ -880,6 +955,123 @@ mod tests {
         assert_eq!(input[1]["call_id"], "call_2");
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input[3]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn cache_prunes_by_retained_bytes_without_flushing_on_oversized_updates() {
+        let mut inner = CodexChatHistoryInner::default();
+        let call = |id: &str, bytes: usize| {
+            (
+                id.to_string(),
+                CachedCall::new(Value::String("x".repeat(bytes))),
+            )
+        };
+        inner.insert_calls("resp_1", vec![call("first", MAX_CACHED_BYTES / 2)]);
+        inner.insert_calls("resp_2", vec![call("second", MAX_CACHED_BYTES / 2)]);
+        assert!(inner.cached_bytes <= MAX_CACHED_BYTES);
+        assert!(!inner.responses.contains_key("resp_1"));
+        assert!(!inner.call_index.contains_key("first"));
+        let retained_bytes = inner.cached_bytes;
+
+        inner.insert_calls("resp_3", vec![call("third", 0)]);
+        assert_eq!(
+            inner.insert_calls("resp_3", vec![call("third", MAX_CACHED_BYTES)]),
+            0
+        );
+        assert_eq!(inner.responses.len(), 1);
+        assert_eq!(inner.response_order.len(), 1);
+        assert!(!inner.call_index.contains_key("third"));
+        assert!(inner.unique_call("second").is_some());
+        assert_eq!(inner.cached_bytes, retained_bytes);
+    }
+
+    #[test]
+    fn count_eviction_recovers_unique_calls_without_reordering_updates() {
+        let mut inner = CodexChatHistoryInner::default();
+        let call = |id: &str, text: &str| (id.to_string(), CachedCall::new(json!(text)));
+        inner.insert_calls("old", vec![call("shared", "old")]);
+        inner.insert_calls(
+            "new",
+            vec![
+                call("first-in-new", "initial"),
+                call("shared", "replacement"),
+            ],
+        );
+        inner.insert_calls("new", vec![call("first-in-new", "updated")]);
+        assert!(inner.unique_call("shared").is_none());
+        let new_response = inner.responses.get("new").unwrap();
+        assert_eq!(new_response.calls_by_id["first-in-new"].position, 0);
+        assert_eq!(new_response.calls_by_id["shared"].position, 1);
+        for index in 0..MAX_CACHED_RESPONSES - 1 {
+            inner.insert_calls(
+                &format!("response-{index}"),
+                vec![call("unrelated", "value")],
+            );
+        }
+        assert_eq!(inner.responses.len(), MAX_CACHED_RESPONSES);
+        assert_eq!(inner.call_index["shared"].len(), 1);
+        assert_eq!(
+            inner.unique_call("shared").unwrap().1.item.as_ref(),
+            &json!("replacement")
+        );
+    }
+
+    #[test]
+    fn repeated_call_updates_size_only_new_items() {
+        for history_size in [1, 1024] {
+            let mut inner = CodexChatHistoryInner::default();
+            let items = CachedItems::new(vec![json!({"text": "history"}); history_size]);
+            inner.insert_exchange("response", CachedItems::default(), items, Vec::new());
+            VALUE_SIZE_VISITS.with(|visits| visits.set(0));
+            for index in 0..32 {
+                let call = CachedCall::new(json!({"nested": [index, "argument"]}));
+                inner.insert_calls("response", vec![("call".into(), call)]);
+            }
+            assert_eq!(VALUE_SIZE_VISITS.with(std::cell::Cell::get), 32 * 4);
+            assert_eq!(
+                inner
+                    .responses
+                    .get("response")
+                    .unwrap()
+                    .exchange
+                    .items
+                    .len(),
+                history_size
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_group_keeps_response_and_call_order_with_previous_first() {
+        let mut inner = CodexChatHistoryInner::default();
+        for (response_id, calls) in [
+            ("older", vec!["b", "a"]),
+            ("previous", vec!["d", "c"]),
+            ("newest", vec!["f", "e"]),
+        ] {
+            inner.insert_calls(
+                response_id,
+                calls
+                    .into_iter()
+                    .map(|id| (id.to_string(), CachedCall::new(json!(id))))
+                    .collect(),
+            );
+        }
+        let lookup_ids = ["a", "b", "c", "d", "e", "f"]
+            .map(String::from)
+            .into_iter()
+            .collect();
+        let previous = inner.responses.get("previous").cloned();
+        let lookup = CachedLookup {
+            fallback: inner.unique_fallback_calls(&lookup_ids, previous.as_deref()),
+            previous,
+        };
+        let order = lookup
+            .restore_group(&lookup_ids, &HashSet::new())
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["d", "c", "b", "a", "f", "e"]);
     }
 
     #[tokio::test]

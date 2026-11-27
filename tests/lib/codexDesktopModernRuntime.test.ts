@@ -377,154 +377,227 @@ const nativeVisible = (
     )
     .map((level) => level.reasoningEffort);
 describe("Codex Desktop current numeric-bundle runtime integration", () => {
-  it("observes active turns at startup without installing picker patches", async () => {
-    const queryClient = new QueryClient();
-    const picker = createPicker(queryClient);
-    const native = createNativeVisibilityFixture(queryClient);
-    const atomScope = {};
-    const statusAtom = {
-      scope: atomScope,
-      kind: "signal-family",
-      read() {},
-      resolve() {},
-    };
-    const managerToken = { scope: atomScope, cache: "signal", resolve() {} };
-    const managerFactory = new Function(
-      'return function manager(e,t,n){var o=n("status-module"); return function(scope,host){const status=scope.get(o.M4,host); if(status.client)return status.client.rpc; throw Error("AppServerManager RPC is unavailable for hostId:");}}',
-    )();
-    native.webpack.cache.manager = {
-      id: "manager",
-      loaded: true,
-      exports: {
-        V: managerFactory(undefined, undefined, () => ({ M4: statusAtom })),
-        p: managerToken,
-      },
-    };
-    native.webpack.cache["status-module"] = {
-      id: "status-module",
-      loaded: true,
-      exports: { M4: statusAtom },
-    };
-    Object.assign(native.webpack.requireModule, {
-      m: { manager: managerFactory },
-    });
-    let running = true;
-    const sendRequest = vi.fn(
-      async (method: string, _params?: object, _options?: unknown) => {
-        if (method === "thread/loaded/list")
-          return { data: ["fixture-thread"], nextCursor: null };
-        if (method === "thread/read")
-          return {
-            thread: {
-              id: "fixture-thread",
-              status: running
-                ? { type: "active", activeFlags: [] }
-                : { type: "systemError" },
-              model: "sol",
-              modelProvider: provider,
-              turns: [],
-            },
-          };
-        if (method === "thread/turns/list")
-          return {
-            data: [
-              {
-                id: "fixture-turn",
-                status: running ? "inProgress" : "failed",
-                items: [],
-                itemsView: "notLoaded",
-                error: running
-                  ? null
-                  : {
-                      message: "You've hit your usage limit. Try again later.",
-                      codexErrorInfo: "usageLimitExceeded",
-                    },
+  it.each([
+    { helper: null, acknowledgedStatus: null, reinject: false, expected: true },
+    {
+      helper: "startTurn",
+      acknowledgedStatus: "inProgress",
+      reinject: false,
+      expected: true,
+    },
+    {
+      helper: "startTurn",
+      acknowledgedStatus: "inProgress",
+      reinject: true,
+      expected: true,
+    },
+    {
+      helper: "startTurn",
+      acknowledgedStatus: "completed",
+      reinject: false,
+      expected: false,
+    },
+    {
+      helper: "steerTurn",
+      acknowledgedStatus: "inProgress",
+      reinject: false,
+      expected: false,
+    },
+  ] as const)(
+    "observes running turns with picker patches disabled ($helper, $acknowledgedStatus, reinject=$reinject)",
+    async ({ helper, acknowledgedStatus, reinject, expected }) => {
+      const queryClient = new QueryClient();
+      const picker = createPicker(queryClient);
+      const native = createNativeVisibilityFixture(queryClient);
+      const atomScope = {};
+      const statusAtom = {
+        scope: atomScope,
+        kind: "signal-family",
+        read() {},
+        resolve() {},
+      };
+      const managerToken = { scope: atomScope, cache: "signal", resolve() {} };
+      const managerFactory = new Function(
+        'return function manager(e,t,n){var o=n("status-module"); return function(scope,host){const status=scope.get(o.M4,host); if(status.client)return status.client.rpc; throw Error("AppServerManager RPC is unavailable for hostId:");}}',
+      )();
+      native.webpack.cache.manager = {
+        id: "manager",
+        loaded: true,
+        exports: {
+          V: managerFactory(undefined, undefined, () => ({ M4: statusAtom })),
+          p: managerToken,
+        },
+      };
+      native.webpack.cache["status-module"] = {
+        id: "status-module",
+        loaded: true,
+        exports: { M4: statusAtom },
+      };
+      Object.assign(native.webpack.requireModule, {
+        m: { manager: managerFactory },
+      });
+      let turnStatus = helper ? "idle" : "inProgress";
+      const acknowledgement = Promise.resolve({
+        turn: { id: "fixture-turn", status: acknowledgedStatus, model: "sol" },
+      });
+      const namedRequest = vi.fn(
+        (_params: { threadId: string; model: string }) => {
+          turnStatus = "failed";
+          return acknowledgement;
+        },
+      );
+      const sendRequest = vi.fn(
+        async (method: string, _params?: object, _options?: unknown) => {
+          if (method === "thread/loaded/list")
+            return { data: ["fixture-thread"], nextCursor: null };
+          if (method === "thread/read")
+            return {
+              thread: {
+                id: "fixture-thread",
+                status:
+                  turnStatus === "inProgress"
+                    ? { type: "active", activeFlags: [] }
+                    : { type: turnStatus === "idle" ? "idle" : "systemError" },
+                model: "sol",
+                modelProvider: provider,
+                turns: [],
               },
-            ],
-            nextCursor: null,
-          };
-        if (method === "model/list") return rawModels;
-        throw new Error("Unexpected app-server request");
-      },
-    );
-    const rpc = Object.assign(function rpc() {}, {
-      sendRequest,
-      getCompatibleThreadSortKey() {},
-      supportsPaginatedThreadHistory() {},
-    });
-    Object.setPrototypeOf(rpc, {
-      dup() {},
-      onRpcBroken() {},
-      map() {},
-      toString: () => "[object RpcStub]",
-    });
-    const rpcClient = { hostId: "local", rpc };
-    const managerProvider = { forHost: (_host: string) => rpc };
-    Object.assign(native.scope, {
-      scope: atomScope,
-      get: (token: object) => {
-        if (token === statusAtom) return { status: "ready", client: rpcClient };
-        if (token === managerToken) return managerProvider;
-        return native.get(token);
-      },
-    });
-    const harness = createHarness(native.webpack.namespace, {
-      reactScope: native.scope,
-      recoveryOnly: true,
-    });
-    try {
-      expect(await harness.execute()).toMatchObject({ recoveryOnly: true });
-      expect(harness.state.appServerClients).toHaveLength(1);
-      expect(sendRequest).toHaveBeenCalledWith("thread/loaded/list", {
-        cursor: null,
-        limit: 32,
+            };
+          if (method === "thread/turns/list")
+            return {
+              data: [
+                {
+                  id: "fixture-turn",
+                  status: turnStatus,
+                  items: [],
+                  itemsView: "notLoaded",
+                  error:
+                    turnStatus === "inProgress"
+                      ? null
+                      : {
+                          message:
+                            "You've hit your usage limit. Try again later.",
+                          codexErrorInfo: "usageLimitExceeded",
+                        },
+                },
+              ],
+              nextCursor: null,
+            };
+          if (method === "model/list") return rawModels;
+          throw new Error("Unexpected app-server request");
+        },
+      );
+      const rpc = Object.assign(function rpc() {}, {
+        sendRequest,
+        startTurn: namedRequest,
+        steerTurn: namedRequest,
+        getCompatibleThreadSortKey() {},
+        supportsPaginatedThreadHistory() {},
       });
-      const loadedListCalls = () =>
-        sendRequest.mock.calls.filter(
-          ([method]) => method === "thread/loaded/list",
-        ).length;
-      const requestCalls = (method: string) =>
-        sendRequest.mock.calls.filter(
-          ([calledMethod]) => calledMethod === method,
-        ).length;
-      expect(loadedListCalls()).toBe(1);
-      expect(requestCalls("thread/read")).toBe(1);
-      expect(requestCalls("thread/turns/list")).toBe(1);
-      await harness.tick();
-      expect(loadedListCalls()).toBe(1);
-      const hook = managerProvider.forHost("local");
-      const modelListParams = { limit: 5 };
-      expect(await hook.sendRequest("model/list", modelListParams)).toBe(
-        rawModels,
-      );
-      expect(sendRequest).toHaveBeenLastCalledWith(
-        "model/list",
-        modelListParams,
-        undefined,
-      );
-      expect(picker.efforts()).toEqual(nativeVisibleEfforts);
-      expect(harness.state.reasoningQueryCaches?.size ?? 0).toBe(0);
-      expect(harness.window.addEventListener).not.toHaveBeenCalled();
+      Object.setPrototypeOf(rpc, {
+        dup() {},
+        onRpcBroken() {},
+        map() {},
+        toString: () => "[object RpcStub]",
+      });
+      const rpcClient = { hostId: "local", rpc };
+      const managerProvider = { forHost: (_host: string) => rpc };
+      Object.assign(native.scope, {
+        scope: atomScope,
+        get: (token: object) => {
+          if (token === statusAtom)
+            return { status: "ready", client: rpcClient };
+          if (token === managerToken) return managerProvider;
+          return native.get(token);
+        },
+      });
+      const harness = createHarness(native.webpack.namespace, {
+        reactScope: native.scope,
+        recoveryOnly: true,
+      });
+      let upgraded: ReturnType<typeof createHarness> | undefined;
+      try {
+        expect(await harness.execute()).toMatchObject({ recoveryOnly: true });
+        expect(harness.state.appServerClients).toHaveLength(1);
+        expect(sendRequest).toHaveBeenCalledWith("thread/loaded/list", {
+          cursor: null,
+          limit: 32,
+        });
+        const loadedListCalls = () =>
+          sendRequest.mock.calls.filter(
+            ([method]) => method === "thread/loaded/list",
+          ).length;
+        const requestCalls = (method: string) =>
+          sendRequest.mock.calls.filter(
+            ([calledMethod]) => calledMethod === method,
+          ).length;
+        expect(loadedListCalls()).toBe(1);
+        expect(requestCalls("thread/read")).toBe(1);
+        expect(requestCalls("thread/turns/list")).toBe(helper ? 0 : 1);
+        await harness.tick();
+        expect(loadedListCalls()).toBe(1);
+        let hook = managerProvider.forHost("local");
+        const modelListParams = { limit: 5 };
+        expect(await hook.sendRequest("model/list", modelListParams)).toBe(
+          rawModels,
+        );
+        expect(sendRequest).toHaveBeenLastCalledWith(
+          "model/list",
+          modelListParams,
+          undefined,
+        );
+        expect(picker.efforts()).toEqual(nativeVisibleEfforts);
+        expect(harness.state.reasoningQueryCaches?.size ?? 0).toBe(0);
+        expect(harness.window.addEventListener).not.toHaveBeenCalled();
 
-      running = false;
-      expect(harness.setInterval).toHaveBeenCalledTimes(1);
-      expect(
-        await harness.state.collectCodexNativeUsageLimitCandidates?.(),
-      ).toEqual({
-        candidates: [
-          expect.objectContaining({
-            threadId: "fixture-thread",
-            turnId: "fixture-turn",
-          }),
-        ],
-        complete: true,
-      });
-    } finally {
-      harness.dispose();
-      picker.dispose();
-      queryClient.clear();
-    }
-  });
+        if (reinject) {
+          upgraded = createHarness(native.webpack.namespace, {
+            reactScope: native.scope,
+            recoveryOnly: true,
+            runtimeFingerprint: "modern-runtime-upgrade",
+            state: harness.state,
+          });
+          expect(await upgraded.execute()).toMatchObject({
+            recoveryOnly: true,
+          });
+          const previousHook = hook;
+          hook = managerProvider.forHost("local");
+          expect(hook).not.toBe(previousHook);
+        }
+        if (helper) {
+          const params = { threadId: "fixture-thread", model: "sol" };
+          const result = hook[helper](params);
+          expect(result).toBe(acknowledgement);
+          await result;
+          expect(namedRequest.mock.calls).toEqual([[params]]);
+          expect(harness.state.codexUserTurnActions).toMatchObject({
+            "fixture-thread": { method: "turn/start" },
+          });
+        } else {
+          turnStatus = "failed";
+        }
+        expect(harness.setInterval).toHaveBeenCalledTimes(1);
+        expect(
+          await harness.state.collectCodexNativeUsageLimitCandidates?.(),
+        ).toEqual({
+          candidates: expected
+            ? [
+                expect.objectContaining({
+                  threadId: "fixture-thread",
+                  turnId: "fixture-turn",
+                }),
+              ]
+            : [],
+          complete: true,
+        });
+      } finally {
+        upgraded?.dispose();
+        harness.dispose();
+        picker.dispose();
+        queryClient.clear();
+      }
+    },
+  );
 
   it("keeps the installed picker and its catalog when recovery attaches to a full runtime", async () => {
     const queryClient = new QueryClient();

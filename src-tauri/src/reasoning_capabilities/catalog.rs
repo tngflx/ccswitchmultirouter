@@ -6,7 +6,7 @@
 use crate::proxy::providers::codex_reasoning::CodexModelReasoningCapability;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// 能力库文件路径的环境变量覆盖（测试/开发用）。
 pub const LIBRARY_PATH_ENV: &str = "CCSM_REASONING_LIBRARY";
@@ -195,15 +195,33 @@ pub fn resolve_packaged_library_path() -> Option<PathBuf> {
 }
 
 /// 全局懒加载能力库（请求路径共享；加载失败保持 None 并降级到内置/unknown）。
-static LIBRARY: OnceLock<Mutex<Option<CapabilityLibrary>>> = OnceLock::new();
+static LIBRARY: OnceLock<Mutex<Option<Arc<CapabilityLibrary>>>> = OnceLock::new();
 
-pub fn global_library() -> Option<CapabilityLibrary> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LibraryRevision {
+    Loaded,
+    Unavailable,
+}
+
+pub(crate) fn library_revision() -> Option<LibraryRevision> {
+    let loaded = LIBRARY.get_or_init(|| Mutex::new(None)).lock().ok()?;
+    if loaded.is_some() {
+        return Some(LibraryRevision::Loaded);
+    }
+    // An available resource can still become usable after a transient read
+    // error. Leave its existing lazy loader in charge of the retry.
+    resolve_packaged_library_path()
+        .is_none()
+        .then_some(LibraryRevision::Unavailable)
+}
+
+pub fn global_library() -> Option<Arc<CapabilityLibrary>> {
     let guard = LIBRARY.get_or_init(|| Mutex::new(None));
     let mut lock = guard.lock().expect("capability library poisoned");
     if lock.is_none() {
         match resolve_packaged_library_path() {
             Some(path) => match load_library_from_path(&path) {
-                Ok(library) => *lock = Some(library),
+                Ok(library) => *lock = Some(Arc::new(library)),
                 Err(error) => log::warn!("reasoning capability library load failed: {error}"),
             },
             None => log::debug!(
@@ -232,6 +250,13 @@ pub fn lookup_library_capability(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_library_reads_share_the_loaded_registry() {
+        let first = global_library().expect("packaged reasoning capabilities");
+        let second = global_library().expect("cached reasoning capabilities");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
     use serde_json::json;
 
     fn entry(platform: &str, model: &str, efforts: &[&str]) -> LibraryEntry {

@@ -1,7 +1,7 @@
 use serde_json::Value;
 use url::Url;
 
-use super::catalog::catalog_models;
+use super::catalog::provider_catalog_models;
 use crate::{
     protocol_compatibility::TransportKind,
     provider::Provider,
@@ -47,7 +47,7 @@ pub(crate) fn provider_api_transport_declaration_for_model(
     provider: &Provider,
     public_model: &str,
 ) -> ProviderApiTransportDeclaration {
-    let Some(models) = catalog_models(&provider.settings_config) else {
+    let Some(models) = provider_catalog_models(provider) else {
         return ProviderApiTransportDeclaration::Unavailable;
     };
     let Some(model) = models

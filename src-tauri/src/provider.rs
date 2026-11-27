@@ -633,6 +633,11 @@ pub struct CodexTrafficPolicy {
 /// 供应商元数据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderMeta {
+    /// Shared canonical catalog for an in-memory schema-v2 route target.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub runtime_codex_catalog:
+        Option<std::sync::Arc<crate::codex_multirouter::catalog::SharedCodexCatalog>>,
     /// 自定义端点列表（按 URL 去重存储）
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_endpoints: HashMap<String, crate::settings::CustomEndpoint>,

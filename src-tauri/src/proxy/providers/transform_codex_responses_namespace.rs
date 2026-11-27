@@ -37,7 +37,7 @@ use serde_json::{json, Value};
 use super::transform_codex_chat::flatten_namespace_tool_name;
 use crate::proxy::error::ProxyError;
 #[cfg(test)]
-use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
+use crate::proxy::sse::{strip_sse_field, TextSseFrames};
 
 /// Reverse map entry: a flattened tool name resolves back to its original
 /// namespace and bare child name.
@@ -351,16 +351,15 @@ where
     E: std::error::Error + Send + 'static,
 {
     async_stream::stream! {
-        let mut buffer = String::new();
-        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut frames = TextSseFrames::default();
 
         tokio::pin!(stream);
 
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
-                    while let Some(block) = take_sse_block(&mut buffer) {
+                    frames.push(&bytes);
+                    while let Some(block) = frames.next_block() {
                         if block.trim().is_empty() {
                             continue;
                         }
@@ -376,10 +375,7 @@ where
 
         // Flush any trailing partial block (streams normally end on a delimiter,
         // but be defensive so no bytes are dropped).
-        if !utf8_remainder.is_empty() {
-            buffer.push_str(&String::from_utf8_lossy(&utf8_remainder));
-        }
-        let tail = std::mem::take(&mut buffer);
+        let tail = frames.tail();
         if !tail.trim().is_empty() {
             yield Ok(restore_sse_block(&tail, &map));
         }

@@ -48,13 +48,14 @@ use crate::config::get_app_config_dir;
 use crate::error::AppError;
 use rusqlite::{hooks::Action, Connection, OpenFlags};
 use serde::Serialize;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 // DAO 方法通过 impl Database 提供，无需额外导出
 
 /// 当前 Schema 版本号
 /// 每次修改表结构时递增，并在 schema.rs 中添加相应的迁移逻辑
-pub(crate) const SCHEMA_VERSION: i32 = 26;
+pub(crate) const SCHEMA_VERSION: i32 = 27;
 
 /// 安全地序列化 JSON，避免 unwrap panic
 pub(crate) fn to_json_string<T: Serialize>(value: &T) -> Result<String, AppError> {
@@ -80,12 +81,22 @@ pub(crate) use lock_conn;
 /// rusqlite::Connection 本身不是 Sync 的，因此需要这层包装。
 pub struct Database {
     pub(crate) conn: Mutex<Connection>,
+    provider_changes: Arc<AtomicU64>,
 }
 
-fn register_db_change_hook(conn: &Connection) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderRevision {
+    local: u64,
+    external: i64,
+}
+
+fn register_db_change_hook(conn: &Connection, provider_changes: Arc<AtomicU64>) {
     conn.update_hook(Some(
-        |action: Action, _database: &str, table: &str, _row_id: i64| match action {
+        move |action: Action, database: &str, table: &str, _row_id: i64| match action {
             Action::SQLITE_INSERT | Action::SQLITE_UPDATE | Action::SQLITE_DELETE => {
+                if database == "main" && table == "providers" {
+                    provider_changes.fetch_add(1, Ordering::Relaxed);
+                }
                 crate::services::webdav_auto_sync::notify_db_changed(table);
                 crate::services::s3_auto_sync::notify_db_changed(table);
             }
@@ -95,6 +106,29 @@ fn register_db_change_hook(conn: &Connection) {
 }
 
 impl Database {
+    pub(crate) fn from_connection(conn: Connection) -> Self {
+        let provider_changes = Arc::new(AtomicU64::new(0));
+        register_db_change_hook(&conn, provider_changes.clone());
+        Self {
+            conn: Mutex::new(conn),
+            provider_changes,
+        }
+    }
+
+    /// Sample under the connection lock so a row update cannot be observed
+    /// halfway through its transaction. Rollbacks may invalidate conservatively.
+    pub(crate) fn provider_revision(&self) -> Result<ProviderRevision, AppError> {
+        let conn = lock_conn!(self.conn);
+        let external = conn
+            .prepare_cached("PRAGMA main.data_version")
+            .and_then(|mut statement| statement.query_row([], |row| row.get(0)))
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        Ok(ProviderRevision {
+            local: self.provider_changes.load(Ordering::Relaxed),
+            external,
+        })
+    }
+
     /// 初始化数据库连接并创建表
     ///
     /// 数据库文件位于 `~/.cc-switch/cc-switch.db`
@@ -118,11 +152,7 @@ impl Database {
             conn.execute("PRAGMA auto_vacuum = INCREMENTAL;", [])
                 .map_err(|e| AppError::Database(e.to_string()))?;
         }
-        register_db_change_hook(&conn);
-
-        let db = Self {
-            conn: Mutex::new(conn),
-        };
+        let db = Self::from_connection(conn);
         db.create_tables()?;
 
         // Pre-migration backup: only when upgrading from an existing database
@@ -190,10 +220,7 @@ impl Database {
             .map_err(|e| AppError::Database(e.to_string()))?;
         conn.execute("PRAGMA foreign_keys = ON;", [])
             .map_err(|e| AppError::Database(e.to_string()))?;
-        register_db_change_hook(&conn);
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        Ok(Self::from_connection(conn))
     }
 
     /// 读取磁盘上数据库的 `user_version`；仅当它比应用支持的 [`SCHEMA_VERSION`]
@@ -221,11 +248,7 @@ impl Database {
             .map_err(|e| AppError::Database(e.to_string()))?;
         conn.execute("PRAGMA auto_vacuum = INCREMENTAL;", [])
             .map_err(|e| AppError::Database(e.to_string()))?;
-        register_db_change_hook(&conn);
-
-        let db = Self {
-            conn: Mutex::new(conn),
-        };
+        let db = Self::from_connection(conn);
         db.create_tables()?;
         db.ensure_model_pricing_seeded()?;
 

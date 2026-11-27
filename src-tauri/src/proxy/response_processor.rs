@@ -8,6 +8,7 @@ use super::{
     handler_config::{StreamUsageEventFilter, UsageParserConfig},
     handler_context::{RequestContext, StreamingTimeoutConfig},
     hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES},
+    providers::codex_chat_history::CodexChatHistoryStore,
     server::ProxyState,
     sse::{strip_sse_field, BoundedSseFrames, SseFrame},
     usage::parser::TokenUsage,
@@ -179,22 +180,38 @@ pub async fn handle_streaming(
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> Response {
     let status = response.status();
-    log::debug!(
-        "[{}] 已接收上游流式响应: status={}, headers={}",
+    let response_headers = response.headers().clone();
+    let stream = response.bytes_stream();
+    let usage_collector = create_usage_collector(ctx, state, status.as_u16(), parser_config);
+    let logged_stream = create_logged_passthrough_stream(
+        stream,
         ctx.tag,
+        usage_collector,
+        ctx.streaming_timeout_config(),
+        connection_guard,
+    );
+    build_streaming_response(status, response_headers, ctx.tag, logged_stream)
+}
+
+pub(crate) fn build_streaming_response(
+    status: axum::http::StatusCode,
+    mut response_headers: HeaderMap,
+    tag: &'static str,
+    stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+) -> Response {
+    log::debug!(
+        "[{tag}] 已接收上游流式响应: status={}, headers={}",
         status.as_u16(),
-        format_headers(response.headers())
+        format_headers(&response_headers)
     );
     // 检查流式响应是否被压缩（SSE 通常不压缩，如果压缩则 SSE 解析会失败）
-    if let Some(encoding) = get_content_encoding(response.headers()) {
+    if let Some(encoding) = get_content_encoding(&response_headers) {
         log::warn!(
-            "[{}] 流式响应含 content-encoding={encoding}，SSE 解析可能失败。\
-             上游在 accept-encoding 透传后压缩了 SSE 流。",
-            ctx.tag
+            "[{tag}] 流式响应含 content-encoding={encoding}，SSE 解析可能失败。\
+             上游在 accept-encoding 透传后压缩了 SSE 流。"
         );
     }
 
-    let mut response_headers = response.headers().clone();
     strip_hop_by_hop_response_headers(&mut response_headers);
     // SSE keepalives can change the byte count, so upstream length cannot frame this body.
     response_headers.remove(axum::http::header::CONTENT_LENGTH);
@@ -206,29 +223,11 @@ pub async fn handle_streaming(
         builder = builder.header(key, value);
     }
 
-    // 创建字节流
-    let stream = response.bytes_stream();
-
-    // 创建使用量收集器；关闭 usage logging 时不要在流式热路径上解析每个 SSE event。
-    let usage_collector = create_usage_collector(ctx, state, status.as_u16(), parser_config);
-
-    // 获取流式超时配置
-    let timeout_config = ctx.streaming_timeout_config();
-
-    // 创建带日志和超时的透传流
-    let logged_stream = create_logged_passthrough_stream(
-        stream,
-        ctx.tag,
-        usage_collector,
-        timeout_config,
-        connection_guard,
-    );
-
-    let body = axum::body::Body::from_stream(logged_stream);
+    let body = axum::body::Body::from_stream(stream);
     match builder.body(body) {
         Ok(resp) => resp,
         Err(e) => {
-            log::error!("[{}] 构建流式响应失败: {e}", ctx.tag);
+            log::error!("[{tag}] 构建流式响应失败: {e}");
             ProxyError::Internal(format!("Failed to build streaming response: {e}")).into_response()
         }
     }
@@ -240,16 +239,29 @@ pub async fn handle_non_streaming(
     ctx: &RequestContext,
     state: &ProxyState,
     parser_config: &UsageParserConfig,
-    // guard 在函数 scope 内持有，整包响应读取完成后随函数返回一并 drop
+    connection_guard: Option<ActiveConnectionGuard>,
+) -> Result<Response, ProxyError> {
+    handle_non_streaming_with_history(response, ctx, state, parser_config, connection_guard, None)
+        .await
+}
+
+pub(crate) async fn handle_non_streaming_with_history(
+    response: ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    parser_config: &UsageParserConfig,
     _connection_guard: Option<ActiveConnectionGuard>,
+    history: Option<(&CodexChatHistoryStore, &Value)>,
 ) -> Result<Response, ProxyError> {
     // 整包超时：仅在故障转移开启且配置值非零时生效
-    let body_timeout =
-        if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
-            Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
-        } else {
-            Duration::ZERO
-        };
+    let body_timeout = if history.is_none()
+        && ctx.app_config.auto_failover_enabled
+        && ctx.app_config.non_streaming_timeout > 0
+    {
+        Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+    } else {
+        Duration::ZERO
+    };
     let (mut response_headers, status, body_bytes) =
         read_decoded_body(response, ctx.tag, body_timeout).await?;
     strip_hop_by_hop_response_headers(&mut response_headers);
@@ -260,11 +272,17 @@ pub async fn handle_non_streaming(
         body_bytes.len()
     );
 
-    // 解析并记录使用量。关闭 usage logging 时直接跳过，避免非流式响应整包 JSON parse。
-    if usage_logging_enabled(state) {
-        if let Ok(json_value) = serde_json::from_slice::<Value>(&body_bytes) {
+    let logging_enabled = usage_logging_enabled(state);
+    let parsed = (logging_enabled || history.is_some())
+        .then(|| serde_json::from_slice::<Value>(&body_bytes).ok())
+        .flatten();
+    if let (Some((store, request)), Some(value)) = (history, parsed.as_ref()) {
+        store.record_exchange(request, value).await;
+    }
+    if logging_enabled {
+        if let Some(json_value) = parsed.as_ref() {
             // 解析使用量
-            if let Some(usage) = (parser_config.response_parser)(&json_value) {
+            if let Some(usage) = (parser_config.response_parser)(json_value) {
                 if ctx.app_type_str == "codex" {
                     crate::proxy::request_health::record_usage(
                         &ctx.request_health_trace,
@@ -876,12 +894,50 @@ pub fn create_logged_passthrough_stream_with_options(
     connection_guard: Option<ActiveConnectionGuard>,
     emit_sse_keepalive: bool,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_logged_stream(
+        stream,
+        tag,
+        usage_collector,
+        timeout_config,
+        connection_guard,
+        emit_sse_keepalive,
+        true,
+    )
+}
+
+pub(crate) fn create_logged_preparsed_sse_stream(
+    stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    tag: &'static str,
+    usage_collector: Option<SseUsageCollector>,
+    timeout_config: StreamingTimeoutConfig,
+    connection_guard: Option<ActiveConnectionGuard>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_logged_stream(
+        stream,
+        tag,
+        usage_collector,
+        timeout_config,
+        connection_guard,
+        true,
+        false,
+    )
+}
+
+fn create_logged_stream(
+    stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    tag: &'static str,
+    usage_collector: Option<SseUsageCollector>,
+    timeout_config: StreamingTimeoutConfig,
+    connection_guard: Option<ActiveConnectionGuard>,
+    emit_sse_keepalive: bool,
+    parse_usage: bool,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let _conn_guard = connection_guard;
         let mut frames = BoundedSseFrames::default();
         let mut collector = usage_collector;
         let mut finish_guard = collector.clone().map(SseUsageFinishGuard::new);
-        let inspect_sse_events = collector.is_some();
+        let inspect_sse_events = parse_usage && collector.is_some();
         let mut is_first_chunk = true;
 
         // 超时配置

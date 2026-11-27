@@ -104,6 +104,12 @@ import {
 } from "@/lib/hostedTools";
 import type { WorkspaceTab } from "@/components/codex/CodexRouterWorkspacePage";
 import { codexCatalogOnlyPlanModelFetchMessage } from "@/utils/codexPlanModelFetch";
+import {
+  findModelSource,
+  readUnknownReasoningBlocker,
+  unknownReasoningBlockerDetail,
+  type UnknownReasoningBlocker,
+} from "@/utils/codexSubagentReasoningBlocker";
 import { useCodexOauth } from "@/components/providers/forms/hooks/useCodexOauth";
 import { CodexProtocolProbeProgressDialog } from "@/components/providers/forms/CodexProtocolProbeProgressDialog";
 import { CodexProviderSetPreviewDialog } from "@/components/providers/forms/CodexProviderSetPreviewDialog";
@@ -1095,6 +1101,11 @@ export function CodexMultiRouterWizard({
   const [isRestoringEvidence, setIsRestoringEvidence] = useState(false);
   const [excludedProbeModels, setExcludedProbeModels] = useState<string[]>([]);
   const [wizardIssues, setWizardIssues] = useState<WizardIssue[]>([]);
+  const [reasoningBlocker, setReasoningBlocker] =
+    useState<UnknownReasoningBlocker | null>(null);
+  const [disabledReasoningModels, setDisabledReasoningModels] = useState<
+    string[]
+  >([]);
   const [modelFetchCards, setModelFetchCards] = useState<
     Record<string, ModelFetchCardState>
   >({});
@@ -1554,6 +1565,8 @@ export function CodexMultiRouterWizard({
     }
     setProbeDialogOpen(false);
     setWizardIssues([]);
+    setReasoningBlocker(null);
+    setDisabledReasoningModels([]);
     setModelFetchCards(
       Object.fromEntries(
         providerModelSources.map((provider) => [
@@ -1764,6 +1777,29 @@ export function CodexMultiRouterWizard({
     );
   };
 
+  const recordSaveFailure = (message: string): "reasoning" | "generic" => {
+    const blocker = readUnknownReasoningBlocker(message);
+    if (blocker) {
+      setReasoningBlocker(blocker);
+      recordWizardIssue({
+        stage: "save-enable",
+        severity: "error",
+        title: "Sub-Agent reasoning capability is undeclared",
+        detail: unknownReasoningBlockerDetail(blocker.models),
+        canContinue: false,
+      });
+      return "reasoning";
+    }
+    recordWizardIssue({
+      stage: "save-enable",
+      severity: "error",
+      title: "MultiRouter save failed",
+      detail: message,
+      canContinue: false,
+    });
+    return "generic";
+  };
+
   useEffect(() => {
     if (
       batchProtocolLab.state.phase !== "failed" &&
@@ -1815,15 +1851,14 @@ export function CodexMultiRouterWizard({
     }
 
     dispatchFlow({ type: "SAVE_ERROR", error: message });
-    recordWizardIssue({
-      stage: "save-enable",
-      severity: "error",
-      title: "MultiRouter save failed",
-      detail: message,
-      canContinue: false,
-    });
+    const failure = recordSaveFailure(message);
     if (batchProtocolLab.state.phase === "failed") {
-      toast.error(`MultiRouter save failed: ${message}`, { closeButton: true });
+      toast.error(
+        failure === "reasoning"
+          ? "MultiRouter save failed because a Sub-Agent model has no declared reasoning capability."
+          : `MultiRouter save failed: ${message}`,
+        { closeButton: true },
+      );
       // This page owns the save error and offers a new Save action, not the
       // protocol dialog's retry action. Settle the failed operation so its
       // pending promise cannot hold saveInFlightRef after the user fixes it.
@@ -2430,7 +2465,11 @@ export function CodexMultiRouterWizard({
 
   const buildBatchDraft = (
     reuseReceipts: boolean,
+    excludedSubagentModels: string[] = [],
   ): CodexProviderSetBatchDraft => {
+    const disabledSubagentModels = Array.from(
+      new Set([...disabledReasoningModels, ...excludedSubagentModels]),
+    );
     const result = buildCodexMultiRouterWizardPlan(
       providers,
       routeReadySources,
@@ -2448,6 +2487,9 @@ export function CodexMultiRouterWizard({
           webSearch: { enabled: webSearchEnabled },
           imageGeneration: { enabled: imageGenerationEnabled },
         },
+        ...(disabledSubagentModels.length > 0
+          ? { disabledSubagentModels }
+          : {}),
       },
     );
     const currentInputSources = new Map(
@@ -2626,24 +2668,18 @@ export function CodexMultiRouterWizard({
 
   // 保存只调用统一 batch workflow：自动 Single/Split 都由后端规划并以 accept_auto
   // 原子提交；Blocked 保留草稿和预览，不再进入第二套 Split 确认状态。
-  const saveMultiRouterPlan = () => {
+  const saveMultiRouterPlan = (excludedSubagentModels: string[] = []) => {
     if (saveInFlightRef.current) return;
     const targetGeneration = targetGenerationRef.current;
     dispatchFlow({ type: "SAVE_START" });
     clearWizardIssuesForStage("save-enable");
     let draft: CodexProviderSetBatchDraft;
     try {
-      draft = buildBatchDraft(true);
+      draft = buildBatchDraft(true, excludedSubagentModels);
     } catch (error) {
       const message = formatWizardError(error);
       dispatchFlow({ type: "SAVE_ERROR", error: message });
-      recordWizardIssue({
-        stage: "save-enable",
-        severity: "error",
-        title: "MultiRouter save failed",
-        detail: message,
-        canContinue: false,
-      });
+      recordSaveFailure(message);
       return;
     }
     const saveOperation = (async () => {
@@ -2677,6 +2713,7 @@ export function CodexMultiRouterWizard({
           ...(outcome.consumedReceiptIds ?? []),
         ].forEach((id) => consumedReceiptIdsRef.current.add(id));
         if (targetGeneration !== targetGenerationRef.current) return;
+        setReasoningBlocker(null);
         setSavedPlan(outcome.editorRouter);
         // A successful atomic commit validates the backend's normalized source
         // snapshots. Keep that evidence applicable to the committed draft, but
@@ -2754,10 +2791,22 @@ export function CodexMultiRouterWizard({
         if (error instanceof ProtocolLabCancelled) return;
         const message = formatWizardError(error);
         dispatchFlow({ type: "SAVE_ERROR", error: message });
+        recordSaveFailure(message);
       });
     saveInFlightRef.current = saveOperation.finally(() => {
       saveInFlightRef.current = null;
     });
+  };
+
+  const disableBlockedReasoningProfilesAndSave = () => {
+    const models = reasoningBlocker?.models ?? [];
+    if (models.length === 0) return;
+    setDisabledReasoningModels((current) => [
+      ...new Set([...current, ...models]),
+    ]);
+    setReasoningBlocker(null);
+    clearWizardIssuesForStage("save-enable");
+    saveMultiRouterPlan(models);
   };
 
   const returnFromBlockedBatch = () => {
@@ -3035,6 +3084,81 @@ export function CodexMultiRouterWizard({
                 </div>
               </div>
             )}
+            {reasoningBlocker ? (
+              <div
+                role="alert"
+                className="mb-4 rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-sm"
+              >
+                <div className="font-medium text-destructive">
+                  Sub-Agent reasoning capability is undeclared
+                </div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                  Enabled Sub-Agent roles reference these models, but their
+                  reasoning capability is not declared. Declare the capability
+                  in the matching provider or disable those roles before saving.
+                </div>
+                {reasoningBlocker.models.length > 0 ? (
+                  <ul className="mt-3 space-y-2">
+                    {reasoningBlocker.models.map((model) => {
+                      const source = findModelSource(routeReadySources, model);
+                      return (
+                        <li
+                          key={model}
+                          className="flex flex-wrap items-center justify-between gap-2 rounded-md border bg-background/80 px-3 py-2"
+                        >
+                          <span className="font-medium">{model}</span>
+                          {source && onOpenProviderConfig ? (
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              onClick={() => onOpenProviderConfig(source)}
+                            >
+                              Open {source.name} model settings
+                            </Button>
+                          ) : null}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                ) : null}
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={
+                      isSavingPlan || reasoningBlocker.models.length === 0
+                    }
+                    onClick={disableBlockedReasoningProfilesAndSave}
+                  >
+                    Disable these Sub-Agent roles and save
+                  </Button>
+                  {activePlan ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => onOpenWorkspace(activePlan, "subagents")}
+                    >
+                      Open Sub-Agent workspace
+                    </Button>
+                  ) : null}
+                </div>
+                <div className="mt-2 text-xs leading-5 text-muted-foreground">
+                  Disabling a role preserves its questionnaire, overrides, and
+                  input modalities. Re-enable it after declaring the model
+                  capability in the Sub-Agent workspace.
+                </div>
+              </div>
+            ) : null}
+            {disabledReasoningModels.length > 0 ? (
+              <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs leading-5 text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-100">
+                This draft will disable these Sub-Agent roles while saving:
+                <span className="ml-1 font-medium">
+                  {disabledReasoningModels.join(", ")}
+                </span>
+              </div>
+            ) : null}
             {currentStepPrerequisite && (
               <div
                 role="status"
@@ -3999,7 +4123,7 @@ export function CodexMultiRouterWizard({
                       </div>
                     ) : null}
                     <Button
-                      onClick={saveMultiRouterPlan}
+                      onClick={() => saveMultiRouterPlan()}
                       disabled={
                         isSavingPlan ||
                         isRestoringEvidence ||

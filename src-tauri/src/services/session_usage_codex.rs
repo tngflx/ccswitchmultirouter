@@ -27,6 +27,7 @@ mod fork_replay_tests;
 use crate::codex_config::get_codex_config_dir;
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
+use crate::file_revision::{FileIdentity, FileRevision};
 use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
@@ -42,17 +43,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{
-    FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
-};
 
 const CODEX_THREAD_REQUEST_ID_PREFIX: &str = "codex_session:thread-v1";
 const CODEX_FINGERPRINT_BYTES: usize = 4096;
@@ -226,80 +219,21 @@ struct TimestampedTokenSignature {
 struct ParentFileStamp {
     modified_nanos: i64,
     size: u64,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(windows)]
-    volume_serial: u64,
-    #[cfg(windows)]
-    file_id: [u8; 16],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ParentFileIdentity {
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(windows)]
-    volume_serial: u64,
-    #[cfg(windows)]
-    file_id: [u8; 16],
-}
-
-impl ParentFileIdentity {
-    fn from_file(file: &fs::File) -> Option<Self> {
-        #[cfg(unix)]
-        let metadata = file.metadata().ok()?;
-        #[cfg(windows)]
-        let (volume_serial, file_id) = windows_file_identity(file)?;
-        Some(Self {
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(windows)]
-            volume_serial,
-            #[cfg(windows)]
-            file_id,
-        })
-    }
+    identity: FileIdentity,
 }
 
 impl ParentFileStamp {
     fn from_file(file: &fs::File) -> Option<Self> {
         let metadata = file.metadata().ok()?;
-        let identity = ParentFileIdentity::from_file(file)?;
         Some(Self {
             modified_nanos: metadata_modified_nanos(&metadata),
             size: metadata.len(),
-            #[cfg(unix)]
-            device: identity.device,
-            #[cfg(unix)]
-            inode: identity.inode,
-            #[cfg(windows)]
-            volume_serial: identity.volume_serial,
-            #[cfg(windows)]
-            file_id: identity.file_id,
+            identity: FileIdentity::from_file(file, &metadata)?,
         })
     }
 
-    fn identity(&self) -> ParentFileIdentity {
-        ParentFileIdentity {
-            #[cfg(unix)]
-            device: self.device,
-            #[cfg(unix)]
-            inode: self.inode,
-            #[cfg(windows)]
-            volume_serial: self.volume_serial,
-            #[cfg(windows)]
-            file_id: self.file_id,
-        }
-    }
-
     pub(super) fn same_identity(&self, other: &Self) -> bool {
-        self.identity() == other.identity()
+        self.identity == other.identity
     }
 
     /// Compare a stamp captured before a bounded read with a later stamp.
@@ -312,25 +246,6 @@ impl ParentFileStamp {
             && other.size >= self.size
             && (other.size > self.size || other.modified_nanos == self.modified_nanos)
     }
-}
-
-#[cfg(windows)]
-fn windows_file_identity(file: &fs::File) -> Option<(u64, [u8; 16])> {
-    let mut information = FILE_ID_INFO::default();
-    // SAFETY: `file` owns a live handle for this call, and `information` is a
-    // valid writable FILE_ID_INFO buffer of the size passed to Windows.
-    let succeeded = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            FileIdInfo,
-            std::ptr::addr_of_mut!(information).cast(),
-            std::mem::size_of::<FILE_ID_INFO>() as u32,
-        )
-    } != 0;
-    succeeded.then_some((
-        information.VolumeSerialNumber,
-        information.FileId.Identifier,
-    ))
 }
 
 #[derive(Debug)]
@@ -373,6 +288,7 @@ impl ParentTokenTimeline {
 #[derive(Debug)]
 struct CachedParentTimeline {
     stamp: ParentFileStamp,
+    revision: Option<FileRevision>,
     content_digest: [u8; 32],
     timeline: Arc<ParentTokenTimeline>,
     retained_order: u64,
@@ -427,8 +343,7 @@ enum CodexReplayVerification {
 }
 
 /// Persisted semantic parser state for append-only Codex JSONL files.  This is
-/// deliberately a bounded state machine, never an event cache: a restart can
-/// resume at a byte cursor without re-reading the historical rollout.
+/// deliberately a bounded state machine, never an event cache.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CodexParserState {
     version: u8,
@@ -448,6 +363,8 @@ struct CodexParserState {
     total_high_water: Option<CumulativeTokens>,
     #[serde(default)]
     continuation_reset_pending: bool,
+    #[serde(skip)]
+    saw_total_without_last: bool,
     // JSON object keys cannot be Option<String>; the empty string is the
     // exact on-disk representation of the parser's None rate-limit lane.
     last_signature_by_source: HashMap<String, TokenUsageSignature>,
@@ -456,6 +373,16 @@ struct CodexParserState {
     has_billable_tokens: bool,
     first_activity_at: Option<i64>,
     last_activity_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_proof: Option<CodexCheckpointProof>,
+}
+
+/// The digest covers only complete records through the committed byte cursor.
+/// The revision describes the entire file, including any uncommitted tail.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct CodexCheckpointProof {
+    revision: Option<i64>,
+    prefix_digest: [u8; 32],
 }
 
 impl CodexParserState {
@@ -474,12 +401,14 @@ impl CodexParserState {
             current_model: "unknown".to_string(),
             total_high_water: None,
             continuation_reset_pending: false,
+            saw_total_without_last: false,
             last_signature_by_source: HashMap::new(),
             previous_token_signature: None,
             event_index: 0,
             has_billable_tokens: false,
             first_activity_at: None,
             last_activity_at: None,
+            checkpoint_proof: None,
         }
     }
 
@@ -536,15 +465,18 @@ struct CodexParseSnapshot {
     head_fingerprint: i64,
     tail_fingerprint: i64,
     content_digest: [u8; 32],
+    complete_digest: [u8; 32],
     missing_continuation_base_prefix: Option<fork_proof::RejectedChildPrefix>,
+    continuation_error: Option<PendingReason>,
     file_stamp: Option<ParentFileStamp>,
+    verified_revision: Option<FileRevision>,
     // A child-local classification, reusable only after exact byte validation.
     // This is not a parent proof or a cached deferred decision.
     copied_inspection_unavailable: bool,
 }
 
 impl CodexParseSnapshot {
-    fn verify_reusable_content(&self, file_path: &Path) -> Result<(), AppError> {
+    fn verify_reusable_content(&mut self, file_path: &Path) -> Result<(), AppError> {
         let changed =
             || AppError::Config("Codex rollout 在读取 snapshot 期间变化；下轮重试".to_string());
         let open_matching_file = || {
@@ -563,9 +495,16 @@ impl CodexParseSnapshot {
             Ok(file)
         };
 
-        // The same file identity, length and mtime can survive an in-place
-        // rewrite. Verify all bytes, including the middle of a large rollout.
-        let mut file = open_matching_file()?.take(self.file_size.max(0) as u64);
+        let file = open_matching_file()?;
+        let revision = FileRevision::from_file(&file);
+        if revision.is_some() && revision == self.verified_revision {
+            validated_rollout_revision(&file, file_path, revision).map_err(AppError::Config)?;
+            return Ok(());
+        }
+
+        // Certify the snapshot before retaining a revision. Without matching
+        // revision metadata, identity, length and mtime can survive a rewrite.
+        let mut file = file.take(self.file_size.max(0) as u64);
         let mut digest = Sha256::new();
         let mut buffer = [0; 8192];
         loop {
@@ -590,6 +529,8 @@ impl CodexParseSnapshot {
         {
             return Err(changed());
         }
+        self.verified_revision = validated_rollout_revision(file.get_ref(), file_path, revision)
+            .map_err(AppError::Config)?;
         Ok(())
     }
 
@@ -670,6 +611,11 @@ enum PendingReason {
     MissingParent(String),
     MissingParentPrefix(fork_proof::RejectedChildPrefix),
     MissingContinuationBase(fork_proof::RejectedChildPrefix),
+    CheckpointRewrite {
+        revision: FileRevision,
+        offset: i64,
+        expected: [u8; 32],
+    },
     Stable(String),
     Retryable(String),
 }
@@ -681,8 +627,8 @@ struct PendingEntry {
     reason: PendingReason,
 }
 
-// Disposable parser derivatives, never parent/defer/checkpoint authority. Exact
-// bytes are still verified on every hit: this saves JSON parsing, not O(1) I/O.
+// Disposable parser derivatives. Reuse requires a verified file revision or
+// exact byte verification. Parent readiness is evaluated separately.
 const MAX_RETRYABLE_SNAPSHOTS: usize = 256;
 const MAX_RETRYABLE_SNAPSHOT_RECORDS: usize = 512;
 const MAX_RETRYABLE_TOTAL_RECORDS: usize = 4096;
@@ -849,6 +795,7 @@ impl CodexReplayCaches {
         &mut self,
         path: &Path,
         stamp: ParentFileStamp,
+        revision: Option<FileRevision>,
         content_digest: [u8; 32],
         timeline: &Arc<ParentTokenTimeline>,
     ) {
@@ -912,6 +859,7 @@ impl CodexReplayCaches {
             path,
             CachedParentTimeline {
                 stamp,
+                revision,
                 content_digest,
                 timeline: Arc::clone(timeline),
                 retained_order,
@@ -950,7 +898,8 @@ static CODEX_REPLAY_CACHES: OnceLock<Mutex<CodexReplayCaches>> = OnceLock::new()
 fn should_warn_for_pending(previous: Option<&PendingEntry>, next: &PendingEntry) -> bool {
     previous.is_none_or(|previous| match (&previous.reason, &next.reason) {
         (PendingReason::MissingParentPrefix(_), PendingReason::MissingParentPrefix(_))
-        | (PendingReason::MissingContinuationBase(_), PendingReason::MissingContinuationBase(_)) => {
+        | (PendingReason::MissingContinuationBase(_), PendingReason::MissingContinuationBase(_))
+        | (PendingReason::CheckpointRewrite { .. }, PendingReason::CheckpointRewrite { .. }) => {
             false
         }
         (before, after) => before != after,
@@ -1282,6 +1231,7 @@ struct CodexSyncPass {
     checkpoints: HashMap<String, CodexCheckpointRow>,
     checkpoint_names: HashMap<String, BTreeSet<(i64, std::cmp::Reverse<i64>, String)>>,
     pricing: HashMap<String, Option<ModelPricing>>,
+    continuation_sources: ContinuationSources,
 }
 
 #[cfg(test)]
@@ -1376,6 +1326,7 @@ impl CodexSyncPass {
             checkpoints: HashMap::new(),
             checkpoint_names: HashMap::new(),
             pricing: HashMap::new(),
+            continuation_sources: ContinuationSources::default(),
         };
         let mut stmt = conn
             .prepare("SELECT file_path, last_modified, last_line_offset FROM session_log_sync")
@@ -2155,11 +2106,13 @@ fn parse_codex_incremental_line(
     let is_event_msg = line.contains("\"event_msg\"");
     let is_turn_context = line.contains("\"turn_context\"");
     let is_session_meta = line.contains("\"session_meta\"");
-    if (!is_event_msg && !is_turn_context && !is_session_meta)
+    let skips_literal_types = (!is_event_msg && !is_turn_context && !is_session_meta)
         || (is_event_msg
             && !line.contains("\"token_count\"")
-            && !line.contains("\"thread_settings_applied\""))
-    {
+            && !line.contains("\"thread_settings_applied\""));
+    // JSON may escape letters inside a discriminator. A raw miss cannot
+    // exclude those records from continuation accounting.
+    if skips_literal_types && !line.contains("\\u") {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -2281,6 +2234,7 @@ fn parse_codex_incremental_line(
             let last = info
                 .get("last_token_usage")
                 .and_then(parse_cumulative_tokens);
+            state.saw_total_without_last |= total.is_some() && last.is_none();
             if total.is_none() && last.is_none() {
                 return None;
             }
@@ -2409,9 +2363,11 @@ thread_local! {
     static BEFORE_CODEX_PARENT_BYTES_VALIDATION_FINISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static CODEX_SNAPSHOT_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CODEX_SNAPSHOT_VERIFY_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static CODEX_CURRENT_PAGE_SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CODEX_CONTINUATION_SOURCE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CODEX_CONTINUATION_VERIFY_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CODEX_CHECKPOINT_ROOT_RECORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static CODEX_CHECKPOINT_ROOT_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CODEX_CHECKPOINT_PREFIX_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BEFORE_CODEX_SNAPSHOT_REUSE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -2419,9 +2375,19 @@ thread_local! {
 /// boundary and this reader is capped at that size, so a concurrent append is
 /// deliberately left for the next pass rather than being accidentally
 /// checkpointed.
+#[cfg(test)]
 fn parse_codex_snapshot(
     file_path: &Path,
+    continuation_context: Option<(&RolloutIndex, &mut ContinuationSources)>,
+) -> Result<CodexParseSnapshot, AppError> {
+    parse_codex_snapshot_with_baseline(file_path, continuation_context, None, None)
+}
+
+fn parse_codex_snapshot_with_baseline(
+    file_path: &Path,
+    mut continuation_context: Option<(&RolloutIndex, &mut ContinuationSources)>,
     baseline: Option<CumulativeTokens>,
+    checkpoint_prefix: Option<(i64, [u8; 32])>,
 ) -> Result<CodexParseSnapshot, AppError> {
     #[cfg(test)]
     CODEX_SNAPSHOT_PARSE_COUNT.with(|count| count.set(count.get() + 1));
@@ -2448,26 +2414,83 @@ fn parse_codex_snapshot(
     let mut buffer = Vec::new();
     let mut digest = Sha256::new();
     let mut missing_continuation_base_prefix = None;
+    let mut continuation_error = None;
+    let mut baseline_after_token_events = None;
     let mut complete_bytes = 0i64;
     let mut line_offset = 0i64;
+    let complete_digest;
+    let mut unmatched_prefix = checkpoint_prefix.filter(|(offset, _)| *offset > 0);
+    let changed_prefix =
+        || AppError::Config("Codex checkpoint prefix 在重放期间变化；下轮重试".to_string());
     loop {
         buffer.clear();
         let read = reader
             .read_until(b'\n', &mut buffer)
             .map_err(|e| AppError::Config(format!("读取 Codex snapshot 失败: {e}")))?;
-        digest.update(&buffer);
         #[cfg(test)]
         CODEX_SNAPSHOT_BYTES_READ.with(|bytes| bytes.set(bytes.get() + read as u64));
         if read == 0 || !buffer.ends_with(b"\n") {
+            if unmatched_prefix.is_some() {
+                return Err(changed_prefix());
+            }
+            complete_digest = digest.clone().finalize().into();
+            digest.update(&buffer);
             break;
         }
+        digest.update(&buffer);
         complete_bytes += read as i64;
+        if let Some((offset, expected)) = unmatched_prefix {
+            if complete_bytes >= offset {
+                if complete_bytes != offset
+                    || <[u8; 32]>::from(digest.clone().finalize()) != expected
+                {
+                    return Err(changed_prefix());
+                }
+                unmatched_prefix = None;
+            }
+        }
         line_offset += 1;
         if let Ok(line) = std::str::from_utf8(&buffer) {
+            let root_meta_seen = state.root_meta_seen;
             if let Some(event) =
                 parse_codex_incremental_line(file_path, &mut state, line, line_offset)
             {
                 events.push(event);
+            }
+            if let (false, true, Some((rollout_index, sources)), Some(link), Some(logical_id)) = (
+                root_meta_seen,
+                state.root_meta_seen,
+                continuation_context.as_mut(),
+                state
+                    .continuation
+                    .as_ref()
+                    .and_then(|page| page.history_base.as_ref()),
+                state.meta_thread_id.as_deref(),
+            ) {
+                match resolve_continuation_baseline(
+                    file_path,
+                    logical_id,
+                    link,
+                    state.root_timestamp,
+                    rollout_index,
+                    sources,
+                ) {
+                    Ok(value) if events.is_empty() => {
+                        state.total_high_water = Some(value);
+                        state.continuation_reset_pending = true;
+                    }
+                    // Older histories may have token records ahead of the root
+                    // metadata. Preserve their original baseline accounting.
+                    Ok(value) => baseline_after_token_events = Some(value),
+                    Err(reason) => {
+                        continuation_error =
+                            Some(if rollout_index.contains_key(&link.physical_id) {
+                                PendingReason::Retryable(reason)
+                            } else {
+                                PendingReason::MissingParent(link.physical_id.clone())
+                            });
+                    }
+                }
             }
         }
         // The first accepted paginated metadata and a billable token record
@@ -2532,6 +2555,22 @@ fn parse_codex_snapshot(
         ));
     }
     let tail_fingerprint = codex_tail_before(&mut fingerprint_file, complete_bytes)?;
+    if continuation_error.is_some()
+        && !state.saw_total_without_last
+        && !incomplete_codex_record_requires_baseline(&buffer)
+    {
+        continuation_error = None;
+    }
+    if let Some(baseline) = baseline_after_token_events {
+        let reparsed =
+            parse_codex_snapshot_with_baseline(file_path, None, Some(baseline), checkpoint_prefix)?;
+        if reparsed.content_digest != <[u8; 32]>::from(digest.finalize()) {
+            return Err(AppError::Config(
+                "Codex rollout 在读取 snapshot 期间变化；下轮重试".to_string(),
+            ));
+        }
+        return Ok(reparsed);
+    }
     Ok(CodexParseSnapshot {
         parsed,
         state,
@@ -2542,68 +2581,152 @@ fn parse_codex_snapshot(
         head_fingerprint,
         tail_fingerprint,
         content_digest: digest.finalize().into(),
+        complete_digest,
         missing_continuation_base_prefix,
+        continuation_error,
         file_stamp: fingerprint_stamp.or(file_stamp),
+        verified_revision: None,
         copied_inspection_unavailable: false,
     })
 }
 
-#[derive(Debug)]
+fn incomplete_codex_record_requires_baseline(record: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(record) else {
+        return false;
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("event_msg")
+        || value
+            .pointer("/payload/type")
+            .and_then(serde_json::Value::as_str)
+            != Some("token_count")
+    {
+        return false;
+    }
+    value
+        .pointer("/payload/info/total_token_usage")
+        .and_then(parse_cumulative_tokens)
+        .is_some()
+        && value
+            .pointer("/payload/info/last_token_usage")
+            .and_then(parse_cumulative_tokens)
+            .is_none()
+}
+
+#[derive(Debug, Clone)]
 struct ContinuationSource {
     meta_id: String,
     timestamp: Option<DateTime<Utc>>,
     history_base: Option<ContinuationLink>,
     continuation: bool,
     latest_total: Option<CumulativeTokens>,
-    has_total_without_last: bool,
     has_usage: bool,
 }
 
-fn read_continuation_source(
-    path: &Path,
-    cutoff: Option<&ContinuationLink>,
-) -> Result<ContinuationSource, String> {
-    #[cfg(test)]
-    if cutoff.is_none() {
-        CODEX_CURRENT_PAGE_SOURCE_READS.with(|count| count.set(count.get() + 1));
+#[derive(Default)]
+struct ContinuationSources {
+    entries: HashMap<(PathBuf, u64, u64), CachedContinuationSource>,
+}
+
+struct CachedContinuationSource {
+    source: ContinuationSource,
+    digest: [u8; 32],
+    revision: Option<FileRevision>,
+}
+
+impl ContinuationSources {
+    fn read(
+        &mut self,
+        path: &Path,
+        cutoff: &ContinuationLink,
+    ) -> Result<ContinuationSource, String> {
+        let key = (
+            path.to_path_buf(),
+            cutoff.end_byte_offset,
+            cutoff.end_ordinal_exclusive,
+        );
+        let mut file = fs::File::open(path)
+            .map_err(|error| format!("cannot open predecessor {}: {error}", path.display()))?;
+        let revision = FileRevision::from_file(&file);
+        let stamp = ParentFileStamp::from_file(&file);
+        if let (Some(cached), Some(stamp)) = (self.entries.get_mut(&key), stamp) {
+            if let Some(revision) = revision.filter(|revision| Some(*revision) == cached.revision) {
+                validated_rollout_revision(&file, path, Some(revision))?;
+                return Ok(cached.source.clone());
+            }
+            // A changed file can still have the same declared prefix after an
+            // append. Reuse the summary only after checking the exact cutoff.
+            if stamp.size >= cutoff.end_byte_offset
+                && validate_parent_bytes(&mut file, path, stamp, cutoff.end_byte_offset, false)?
+                    == cached.digest
+            {
+                cached.revision = validated_rollout_revision(&file, path, revision)?;
+                return Ok(cached.source.clone());
+            }
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("cannot seek predecessor {}: {error}", path.display()))?;
+        let (source, digest) = read_continuation_source(&mut file, path, cutoff, stamp)?;
+        let revision = validated_rollout_revision(&file, path, revision)?;
+        if stamp.is_some() && (self.entries.len() < 64 || self.entries.contains_key(&key)) {
+            self.entries.insert(
+                key,
+                CachedContinuationSource {
+                    source: source.clone(),
+                    digest,
+                    revision,
+                },
+            );
+        }
+        Ok(source)
     }
-    let file = fs::File::open(path)
-        .map_err(|error| format!("cannot open predecessor {}: {error}", path.display()))?;
+}
+
+fn read_continuation_source(
+    file: &mut fs::File,
+    path: &Path,
+    cutoff: &ContinuationLink,
+    stamp: Option<ParentFileStamp>,
+) -> Result<(ContinuationSource, [u8; 32]), String> {
     let file_len = file
         .metadata()
         .map_err(|error| format!("cannot stat predecessor {}: {error}", path.display()))?
         .len();
-    let read_limit = if let Some(cutoff) = cutoff {
-        if cutoff.end_ordinal_exclusive == 0 || cutoff.end_byte_offset > file_len {
-            return Err(format!(
-                "invalid history_base cutoff: ordinal={}, offset={}, predecessor length={file_len}",
-                cutoff.end_ordinal_exclusive, cutoff.end_byte_offset
-            ));
-        }
-        if !crate::codex_runtime_refresh::paginated_history::history_base_cutoff_is_consistent(
-            path,
-            cutoff.end_byte_offset,
-            cutoff.end_ordinal_exclusive,
-        )? {
-            return Err(format!(
-                "history_base cutoff for {} is not consistent",
-                cutoff.physical_id
-            ));
-        }
-        cutoff.end_byte_offset
-    } else {
-        file_len
-    };
+    if cutoff.end_ordinal_exclusive == 0 || cutoff.end_byte_offset > file_len {
+        return Err(format!(
+            "invalid history_base cutoff: ordinal={}, offset={}, predecessor length={file_len}",
+            cutoff.end_ordinal_exclusive, cutoff.end_byte_offset
+        ));
+    }
+    if !crate::codex_runtime_refresh::paginated_history::history_base_cutoff_is_consistent(
+        path,
+        cutoff.end_byte_offset,
+        cutoff.end_ordinal_exclusive,
+    )? {
+        return Err(format!(
+            "history_base cutoff for {} is not consistent",
+            cutoff.physical_id
+        ));
+    }
     let mut meta_id = None;
     let mut timestamp = None;
     let mut history_base = None;
     let mut continuation = false;
     let mut latest_total = None;
-    let mut has_total_without_last = false;
     let mut has_usage = false;
-    for line in BufReader::new(file.take(read_limit)).lines() {
-        let line =
-            line.map_err(|error| format!("cannot read predecessor {}: {error}", path.display()))?;
+    let mut reader = BufReader::new(file.take(cutoff.end_byte_offset));
+    let mut digest = Sha256::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("cannot read predecessor {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(line.as_bytes());
+        #[cfg(test)]
+        CODEX_CONTINUATION_SOURCE_BYTES.with(|count| count.set(count.get() + read));
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -2643,9 +2766,6 @@ fn read_continuation_source(
                 if total.is_some() || last.is_some() {
                     has_usage = true;
                 }
-                if total.is_some() && last.is_none() {
-                    has_total_without_last = true;
-                }
                 if total.is_none() && last.is_some() {
                     latest_total = None;
                 }
@@ -2660,16 +2780,46 @@ fn read_continuation_source(
             _ => {}
         }
     }
-    Ok(ContinuationSource {
+    let source = ContinuationSource {
         meta_id: meta_id
             .ok_or_else(|| format!("predecessor {} has no session_meta", path.display()))?,
         timestamp,
         history_base,
         continuation,
         latest_total,
-        has_total_without_last,
         has_usage,
-    })
+    };
+    if reader.get_ref().limit() != 0 {
+        return Err(format!("incomplete predecessor prefix {}", path.display()));
+    }
+    let digest = digest.finalize().into();
+    if let Some(stamp) = stamp {
+        let file = reader.into_inner().into_inner();
+        if validate_parent_bytes(file, path, stamp, cutoff.end_byte_offset, false)? != digest {
+            return Err(format!(
+                "predecessor {} changed during parsing",
+                path.display()
+            ));
+        }
+    }
+    Ok((source, digest))
+}
+
+fn validated_rollout_revision(
+    file: &fs::File,
+    path: &Path,
+    revision: Option<FileRevision>,
+) -> Result<Option<FileRevision>, String> {
+    if revision.is_some_and(|revision| {
+        FileRevision::read(path) != Some(revision)
+            || FileRevision::from_file(file) != Some(revision)
+    }) {
+        return Err(format!(
+            "rollout {} changed during validation",
+            path.display()
+        ));
+    }
+    Ok(revision)
 }
 
 fn resolve_continuation_baseline(
@@ -2678,6 +2828,7 @@ fn resolve_continuation_baseline(
     initial_link: &ContinuationLink,
     current_timestamp: Option<DateTime<Utc>>,
     rollout_index: &RolloutIndex,
+    sources: &mut ContinuationSources,
 ) -> Result<CumulativeTokens, String> {
     let current_id = thread_id_from_filename(file_path)
         .ok_or_else(|| "continuation filename has no physical UUID".to_string())?;
@@ -2703,7 +2854,7 @@ fn resolve_continuation_baseline(
                 candidates.len()
             ));
         }
-        let source = read_continuation_source(&candidates[0], Some(&next_link))?;
+        let source = sources.read(&candidates[0], &next_link)?;
         if source.meta_id != logical_id {
             return Err(format!(
                 "history_base predecessor {base_id} belongs to logical thread {}, expected {logical_id}",
@@ -2744,12 +2895,22 @@ fn validate_parent_timeline_bytes(
     path: &Path,
     expected: ParentFileStamp,
 ) -> Result<[u8; 32], String> {
+    validate_parent_bytes(file, path, expected, expected.size, true)
+}
+
+fn validate_parent_bytes(
+    file: &mut fs::File,
+    path: &Path,
+    expected: ParentFileStamp,
+    limit: u64,
+    _is_parent_timeline: bool,
+) -> Result<[u8; 32], String> {
     let changed = || format!("父 rollout {} 在验证期间变化；下轮重试", path.display());
     if ParentFileStamp::from_file(file) != Some(expected) {
         return Err(changed());
     }
     file.seek(SeekFrom::Start(0)).map_err(|_| changed())?;
-    let mut bounded = file.take(expected.size);
+    let mut bounded = file.take(limit);
     let mut digest = Sha256::new();
     let mut buffer = [0; 8192];
     loop {
@@ -2759,11 +2920,17 @@ fn validate_parent_timeline_bytes(
         }
         digest.update(&buffer[..read]);
         #[cfg(test)]
-        CODEX_PARENT_TIMELINE_VERIFY_BYTES.with(|bytes| bytes.set(bytes.get() + read as u64));
+        if _is_parent_timeline {
+            CODEX_PARENT_TIMELINE_VERIFY_BYTES.with(|bytes| bytes.set(bytes.get() + read as u64));
+        } else {
+            CODEX_CONTINUATION_VERIFY_BYTES.with(|bytes| bytes.set(bytes.get() + read as u64));
+        }
     }
     #[cfg(test)]
-    if let Some(change) = BEFORE_CODEX_PARENT_BYTES_VALIDATION_FINISH.with(|hook| hook.take()) {
-        change();
+    if _is_parent_timeline {
+        if let Some(change) = BEFORE_CODEX_PARENT_BYTES_VALIDATION_FINISH.with(|hook| hook.take()) {
+            change();
+        }
     }
     if bounded.limit() != 0
         || ParentFileStamp::from_file(bounded.get_ref()) != Some(expected)
@@ -2795,6 +2962,7 @@ fn parent_signatures_before(
 fn load_parent_timeline(parent_path: &Path) -> Result<Arc<ParentTokenTimeline>, String> {
     let mut file = fs::File::open(parent_path)
         .map_err(|error| format!("无法打开父 rollout {}: {error}", parent_path.display()))?;
+    let revision = FileRevision::from_file(&file);
     let stamp = ParentFileStamp::from_file(&file)
         .ok_or_else(|| format!("无法验证父 rollout {} 的文件身份", parent_path.display()))?;
     let cached_timeline = replay_caches().lock().ok().and_then(|mut caches| {
@@ -2805,15 +2973,34 @@ fn load_parent_timeline(parent_path: &Path) -> Result<Arc<ParentTokenTimeline>, 
         {
             caches.parent_timelines.remove(parent_path);
         }
-        caches
-            .parent_timelines
-            .get(parent_path)
-            .map(|entry| (Arc::clone(&entry.timeline), entry.content_digest))
+        caches.parent_timelines.get(parent_path).map(|entry| {
+            (
+                Arc::clone(&entry.timeline),
+                entry.content_digest,
+                entry.revision,
+            )
+        })
     });
-    if let Some((timeline, content_digest)) = cached_timeline {
-        // Identity/size/mtime alone cannot exclude an in-place restored-mtime
-        // rewrite. Hash current bytes once, but do not parse unchanged JSON.
+    if let Some((timeline, content_digest, cached_revision)) = cached_timeline {
+        if let Some(revision) = revision.filter(|revision| Some(*revision) == cached_revision) {
+            #[cfg(test)]
+            if let Some(change) =
+                BEFORE_CODEX_PARENT_BYTES_VALIDATION_FINISH.with(|hook| hook.take())
+            {
+                change();
+            }
+            validated_rollout_revision(&file, parent_path, Some(revision))?;
+            return Ok(timeline);
+        }
         if validate_parent_timeline_bytes(&mut file, parent_path, stamp)? == content_digest {
+            let verified_revision = validated_rollout_revision(&file, parent_path, revision)?;
+            if let Ok(mut caches) = replay_caches().lock() {
+                if let Some(entry) = caches.parent_timelines.get_mut(parent_path) {
+                    if Arc::ptr_eq(&entry.timeline, &timeline) {
+                        entry.revision = verified_revision;
+                    }
+                }
+            }
             return Ok(timeline);
         }
         if let Ok(mut caches) = replay_caches().lock() {
@@ -2904,13 +3091,14 @@ fn load_parent_timeline(parent_path: &Path) -> Result<Arc<ParentTokenTimeline>, 
             parent_path.display()
         ));
     }
+    let revision = validated_rollout_revision(&file, parent_path, revision)?;
     let timeline = Arc::new(ParentTokenTimeline {
         events,
         max_timestamp,
         has_token_without_timestamp,
     });
     if let Ok(mut caches) = replay_caches().lock() {
-        caches.retain_parent_timeline(parent_path, stamp, content_digest, &timeline);
+        caches.retain_parent_timeline(parent_path, stamp, revision, content_digest, &timeline);
     }
     Ok(timeline)
 }
@@ -3086,6 +3274,9 @@ thread_local! {
     static CODEX_PENDING_WARNING_PATHS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+const CODEX_CHECKPOINT_REWRITE_REASON: &str =
+    "rollout 非追加式重写/截断；保留已验证账本，需受控 Codex 重建";
+
 fn mark_deferred(
     file_path: &Path,
     modified: i64,
@@ -3114,6 +3305,7 @@ fn mark_deferred(
             PendingReason::MissingContinuationBase(_) => {
                 "paginated continuation has no explicit history_base".to_string()
             }
+            PendingReason::CheckpointRewrite { .. } => CODEX_CHECKPOINT_REWRITE_REASON.to_string(),
             PendingReason::Stable(reason) | PendingReason::Retryable(reason) => reason.clone(),
         };
         #[cfg(test)]
@@ -3166,28 +3358,82 @@ fn save_codex_session_metadata_on_conn(
     Ok(())
 }
 
+struct CodexCheckpointFile {
+    file: fs::File,
+    file_modified: i64,
+    file_size: i64,
+    revision: Option<FileRevision>,
+}
+
+impl CodexCheckpointFile {
+    fn open(path: &Path) -> Result<Self, AppError> {
+        let file = fs::File::open(path)
+            .map_err(|e| AppError::Config(format!("无法打开 Codex checkpoint 文件: {e}")))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| AppError::Config(format!("无法读取 Codex checkpoint 文件元数据: {e}")))?;
+        Ok(Self {
+            revision: FileRevision::from_file_metadata(&file, &metadata),
+            file_modified: metadata_modified_nanos(&metadata),
+            file_size: metadata.len() as i64,
+            file,
+        })
+    }
+
+    fn verify_digest(&self, path: &Path, offset: i64, digest: [u8; 32]) -> Result<(), AppError> {
+        if let Some(revision) = self.revision {
+            validated_rollout_revision(&self.file, path, Some(revision))
+                .map_err(AppError::Config)?;
+        } else {
+            let mut current = Self::open(path)?;
+            let current_digest: [u8; 32] = read_codex_checkpoint_prefix(&mut current.file, offset)?
+                .finalize()
+                .into();
+            if current_digest != digest {
+                return Err(AppError::Config(
+                    "Codex checkpoint 内容在读取期间变化；下轮重试".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn read_codex_checkpoint_prefix(file: &mut fs::File, offset: i64) -> Result<Sha256, AppError> {
+    let error = |e| AppError::Config(format!("读取 Codex checkpoint prefix 失败: {e}"));
+    file.seek(SeekFrom::Start(0)).map_err(error)?;
+    let mut reader = file.take(offset as u64);
+    let mut buffer = [0; 8192];
+    let mut digest = Sha256::new();
+    loop {
+        let read = reader.read(&mut buffer).map_err(error)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        #[cfg(test)]
+        CODEX_CHECKPOINT_PREFIX_BYTES_READ.with(|bytes| bytes.set(bytes.get() + read as u64));
+    }
+    if reader.limit() != 0 {
+        return Err(AppError::Config(
+            "Codex checkpoint 文件在读取时缩小；下轮重试".to_string(),
+        ));
+    }
+    Ok(digest)
+}
+
 fn sync_codex_append(
     db: &Database,
     file_path: &Path,
     checkpoint: CodexCheckpoint,
-    file_modified: i64,
-    file_size: i64,
+    mut input: CodexCheckpointFile,
+    mut digest: Sha256,
     head_fingerprint: i64,
     pass: &mut CodexSyncPass,
 ) -> Result<CodexFileSyncResult, AppError> {
-    let mut file = fs::File::open(file_path)
-        .map_err(|e| AppError::Config(format!("无法打开 Codex append 文件: {e}")))?;
-    let initial_stamp = ParentFileStamp::from_file(&file);
-    let target_size = file_size.max(0) as u64;
-    if initial_stamp.is_some_and(|stamp| stamp.size < target_size) {
-        return Err(AppError::Config(
-            "Codex append 文件在读取前尚未达到目标 snapshot 大小；下轮重试".to_string(),
-        ));
-    }
-    file.seek(SeekFrom::Start(checkpoint.last_byte_offset.max(0) as u64))
-        .map_err(|e| AppError::Config(format!("定位 Codex append cursor 失败: {e}")))?;
-    let remaining = file_size.saturating_sub(checkpoint.last_byte_offset).max(0) as u64;
-    let mut reader = BufReader::new(file.take(remaining));
+    // Prefix verification leaves the handle at the committed cursor.
+    let remaining = (input.file_size - checkpoint.last_byte_offset) as u64;
+    let mut reader = BufReader::new((&mut input.file).take(remaining));
     if !checkpoint.state.append_authorized() {
         return Err(AppError::Config(
             "Codex append 缺少已验证的 parent replay authority".to_string(),
@@ -3212,6 +3458,7 @@ fn sync_codex_append(
         if !buffer.ends_with(b"\n") {
             break;
         }
+        digest.update(&buffer);
         offset += read as i64;
         line_offset += 1;
         let Ok(line) = std::str::from_utf8(&buffer) else {
@@ -3222,11 +3469,16 @@ fn sync_codex_append(
             events.push(event);
         }
     }
+    if reader.get_ref().limit() != 0 {
+        return Err(AppError::Config(
+            "Codex append 文件在读取时缩小；下轮重试".to_string(),
+        ));
+    }
     if let ParentResolution::Deferred(reason) = &state.parent {
         return Ok(mark_deferred(
             file_path,
-            file_modified,
-            file_size as u64,
+            input.file_modified,
+            input.file_size as u64,
             PendingReason::Retryable(reason.clone()),
         ));
     }
@@ -3235,34 +3487,16 @@ fn sync_codex_append(
             "Codex parser state exceeded bounded lane limit; requires full rebuild".to_string(),
         ));
     }
-    let mut committed_fingerprint_file = fs::File::open(file_path)
-        .map_err(|e| AppError::Config(format!("打开 Codex append prefix 指纹失败: {e}")))?;
-    let current_stamp = ParentFileStamp::from_file(&committed_fingerprint_file);
-    if let (Some(initial), Some(current)) = (initial_stamp, current_stamp) {
-        if !initial.same_identity_and_not_shrunk(&current) || current.size < target_size {
-            return Err(AppError::Config(
-                "Codex append 在读取期间变化；下轮重试".to_string(),
-            ));
-        }
-    }
-    let current_head_fingerprint =
-        codex_head_before(&mut committed_fingerprint_file, head_window_len)?;
-    if current_head_fingerprint != head_fingerprint {
-        return Err(AppError::Config(
-            "Codex append 的固定前缀在读取期间被改写；下轮重试".to_string(),
-        ));
-    }
-    let old_checkpoint_tail =
-        codex_tail_before(&mut committed_fingerprint_file, checkpoint.last_byte_offset)?;
-    if checkpoint.tail_fingerprint != Some(old_checkpoint_tail) {
-        return Err(AppError::Config(
-            "Codex append 的历史前缀在读取期间被改写；下轮重试".to_string(),
-        ));
-    }
-    let committed_tail_fingerprint = codex_tail_before(&mut committed_fingerprint_file, offset)?;
+    let committed_tail_fingerprint = codex_tail_before(&mut input.file, offset)?;
+    let prefix_digest = digest.finalize().into();
+    input.verify_digest(file_path, offset, prefix_digest)?;
+    state.checkpoint_proof = Some(CodexCheckpointProof {
+        revision: input.revision.map(|revision| revision.fingerprint()),
+        prefix_digest,
+    });
     let checkpoint_facts = CodexCheckpointFacts {
-        file_size,
-        file_modified,
+        file_size: input.file_size,
+        file_modified: input.file_modified,
         head_window_len,
         head_fingerprint,
         tail_fingerprint: committed_tail_fingerprint,
@@ -3273,58 +3507,37 @@ fn sync_codex_append(
         .ok_or_else(|| AppError::Config("Codex append parser 缺少 root thread id".to_string()))?;
     let session_id = state.meta_thread_id.as_deref().unwrap_or(root_thread_id);
     let mut result = CodexFileSyncResult::default();
-    let batches = events.chunks(CODEX_INSERT_BATCH_SIZE).collect::<Vec<_>>();
-    for (batch_index, batch) in batches.iter().enumerate() {
-        let last = batch_index + 1 == batches.len();
-        let conn = lock_conn!(db.conn);
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| AppError::Database(format!("开启 Codex append 事务失败: {e}")))?;
-        let mut suspected = 0;
-        for event in *batch {
-            let Some(event_index) = event.event_index else {
-                continue;
-            };
-            let request_id =
-                format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{root_thread_id}:{event_index}");
-            match insert_codex_session_entry_on_conn(
-                &tx,
-                &request_id,
-                &event.delta,
-                &event.model,
-                Some(session_id),
-                event.timestamp.as_deref(),
-                &mut suspected,
-                &mut pass.pricing,
-            ) {
-                Ok(true) => result.imported = result.imported.saturating_add(1),
-                Ok(false) => result.skipped = result.skipped.saturating_add(1),
-                Err(error) => return Err(error),
-            }
+    // Commit usage and its prefix proof together. An insert failure must leave
+    // the suffix available for retry, including if its bytes change meanwhile.
+    let conn = lock_conn!(db.conn);
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| AppError::Database(format!("开启 Codex append 事务失败: {e}")))?;
+    for event in events {
+        let Some(event_index) = event.event_index else {
+            continue;
+        };
+        let request_id = format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{root_thread_id}:{event_index}");
+        if insert_codex_session_entry_on_conn(
+            &tx,
+            &request_id,
+            &event.delta,
+            &event.model,
+            Some(session_id),
+            event.timestamp.as_deref(),
+            &mut result.suspected_duplicates,
+            &mut pass.pricing,
+        )? {
+            result.imported = result.imported.saturating_add(1);
+        } else {
+            result.skipped = result.skipped.saturating_add(1);
         }
-        if last {
-            save_codex_session_metadata_on_conn(&tx, file_path, &state)?;
-            save_codex_checkpoint_on_conn(&tx, file_path, &state, offset, &checkpoint_facts)?;
-        }
-        tx.commit()
-            .map_err(|e| AppError::Database(format!("提交 Codex append 事务失败: {e}")))?;
-        if last {
-            pass.refresh_checkpoint_on_conn(&conn, file_path)?;
-        }
-        result.suspected_duplicates = result.suspected_duplicates.saturating_add(suspected);
     }
-    if batches.is_empty() {
-        let conn = lock_conn!(db.conn);
-        let tx = conn.unchecked_transaction().map_err(|e| {
-            AppError::Database(format!("开启 Codex append checkpoint 事务失败: {e}"))
-        })?;
-        save_codex_session_metadata_on_conn(&tx, file_path, &state)?;
-        save_codex_checkpoint_on_conn(&tx, file_path, &state, offset, &checkpoint_facts)?;
-        tx.commit().map_err(|e| {
-            AppError::Database(format!("提交 Codex append checkpoint 事务失败: {e}"))
-        })?;
-        pass.refresh_checkpoint_on_conn(&conn, file_path)?;
-    }
+    save_codex_session_metadata_on_conn(&tx, file_path, &state)?;
+    save_codex_checkpoint_on_conn(&tx, file_path, &state, offset, &checkpoint_facts)?;
+    tx.commit()
+        .map_err(|e| AppError::Database(format!("提交 Codex append 事务失败: {e}")))?;
+    pass.refresh_checkpoint_on_conn(&conn, file_path)?;
     Ok(result)
 }
 
@@ -3400,15 +3613,6 @@ fn sync_single_codex_file(
     let mut file_modified = metadata_modified_nanos(&metadata);
     let mut file_size = metadata.len();
 
-    // A checkpoint is authoritative only when the physical prefix still
-    // matches. A same-size file whose head/tail fingerprints no longer match
-    // is a rewrite: the verified ledger is kept and the file is deferred to a
-    // controlled rebuild. A strictly growing file may use the append path
-    // after checking the old EOF tail and immutable head. mtime is
-    // deliberately not a criterion because rewrites can preserve it; a prefix
-    // modified *and* appended cannot be proven without a full hash, so this
-    // collector never claims absolute detection for that adversarial race and
-    // exposes no compensating full-hash scan here.
     let mut checkpoint = pass.checkpoint(db, file_path)?;
     if checkpoint.is_some() {
         if let Ok(mut caches) = replay_caches().lock() {
@@ -3497,7 +3701,8 @@ fn sync_single_codex_file(
             }
         }
     }
-    if let Some(checkpoint) = checkpoint {
+    let mut checkpoint_prefix = None;
+    if let Some(mut checkpoint) = checkpoint {
         let Some(head_window_len) = checkpoint.head_window_len else {
             return Ok(mark_deferred(
                 file_path,
@@ -3508,43 +3713,121 @@ fn sync_single_codex_file(
                 ),
             ));
         };
-        let mut fingerprint_file = fs::File::open(file_path)
-            .map_err(|e| AppError::Config(format!("无法打开 Codex checkpoint 文件: {e}")))?;
-        let head_fingerprint = codex_head_before(&mut fingerprint_file, head_window_len)?;
-        let old_tail = codex_tail_before(&mut fingerprint_file, checkpoint.last_byte_offset)?;
-        let prefix_matches = checkpoint.head_fingerprint == Some(head_fingerprint)
-            && checkpoint.tail_fingerprint == Some(old_tail);
-        if file_size as i64 == checkpoint.file_size
-            && prefix_matches
-            && checkpoint.state.replay_contract_current()
+        let mut input = CodexCheckpointFile::open(file_path)?;
+        let same_size = input.file_size == checkpoint.file_size;
+        let current_contract = checkpoint.state.replay_contract_current();
+        let proof = checkpoint.state.checkpoint_proof;
+        let revision = input.revision.map(|revision| revision.fingerprint());
+        if same_size
+            && current_contract
+            && revision.is_some()
+            && proof.is_some_and(|proof| proof.revision == revision)
         {
             return Ok(CodexFileSyncResult::default());
         }
-        let append_safe = file_size as i64 > checkpoint.file_size && prefix_matches;
-        if append_safe && checkpoint.state.append_authorized() {
+        if let (Some(revision), Some(proof)) = (input.revision, proof) {
+            let reason = PendingReason::CheckpointRewrite {
+                revision,
+                offset: checkpoint.last_byte_offset,
+                expected: proof.prefix_digest,
+            };
+            if replay_caches().lock().ok().is_some_and(|caches| {
+                caches
+                    .pending
+                    .get(file_path)
+                    .is_some_and(|entry| entry.reason == reason)
+            }) {
+                return Ok(CodexFileSyncResult {
+                    deferred: true,
+                    ..CodexFileSyncResult::default()
+                });
+            }
+        }
+        let rewritten = |reason| {
+            mark_deferred(
+                file_path,
+                input.file_modified,
+                input.file_size as u64,
+                reason,
+            )
+        };
+        if input.file_size < checkpoint.file_size
+            || checkpoint.last_byte_offset < 0
+            || checkpoint.last_byte_offset > checkpoint.file_size
+        {
+            return Ok(rewritten(PendingReason::Stable(
+                CODEX_CHECKPOINT_REWRITE_REASON.to_string(),
+            )));
+        }
+        // Legacy checkpoints have only these two samples. Apply their existing
+        // boundary check before establishing an exact proof for future edits.
+        let head_fingerprint = codex_head_before(&mut input.file, head_window_len)?;
+        let old_tail = codex_tail_before(&mut input.file, checkpoint.last_byte_offset)?;
+        if proof.is_none()
+            && (checkpoint.head_fingerprint != Some(head_fingerprint)
+                || checkpoint.tail_fingerprint != Some(old_tail))
+        {
+            return Ok(rewritten(PendingReason::Stable(
+                CODEX_CHECKPOINT_REWRITE_REASON.to_string(),
+            )));
+        }
+        let digest = read_codex_checkpoint_prefix(&mut input.file, checkpoint.last_byte_offset)?;
+        let prefix_digest: [u8; 32] = digest.clone().finalize().into();
+        if let Some(proof) = proof.filter(|proof| proof.prefix_digest != prefix_digest) {
+            let reason = if let Some(revision) = input.revision {
+                input.verify_digest(file_path, checkpoint.last_byte_offset, prefix_digest)?;
+                PendingReason::CheckpointRewrite {
+                    revision,
+                    offset: checkpoint.last_byte_offset,
+                    expected: proof.prefix_digest,
+                }
+            } else {
+                PendingReason::Stable(CODEX_CHECKPOINT_REWRITE_REASON.to_string())
+            };
+            return Ok(rewritten(reason));
+        }
+        // A same-size edit can finish a previously incomplete trailing record.
+        if input.file_size > checkpoint.last_byte_offset && checkpoint.state.append_authorized() {
             return sync_codex_append(
                 db,
                 file_path,
                 checkpoint,
-                file_modified,
-                file_size as i64,
+                input,
+                digest,
                 head_fingerprint,
                 pass,
             );
         }
-        if !prefix_matches || (file_size as i64) < checkpoint.file_size {
-            return Ok(mark_deferred(
-                file_path,
-                file_modified,
-                file_size,
-                PendingReason::Stable(
-                    "rollout 非追加式重写/截断；保留已验证账本，需受控 Codex 重建".to_string(),
-                ),
-            ));
+        input.verify_digest(file_path, checkpoint.last_byte_offset, prefix_digest)?;
+        if same_size && current_contract {
+            if checkpoint.source_path == file_path_str && (revision.is_some() || proof.is_none()) {
+                checkpoint.state.checkpoint_proof = Some(CodexCheckpointProof {
+                    revision,
+                    prefix_digest,
+                });
+                let facts = CodexCheckpointFacts {
+                    file_size: input.file_size,
+                    file_modified: input.file_modified,
+                    head_window_len,
+                    head_fingerprint,
+                    tail_fingerprint: old_tail,
+                };
+                let conn = lock_conn!(db.conn);
+                save_codex_checkpoint_on_conn(
+                    &conn,
+                    file_path,
+                    &checkpoint.state,
+                    checkpoint.last_byte_offset,
+                    &facts,
+                )?;
+                pass.refresh_checkpoint_on_conn(&conn, file_path)?;
+            }
+            return Ok(CodexFileSyncResult::default());
         }
         // Legacy parented checkpoints (including metadata-only v1 states)
         // cannot authorize appends. Reparse the same verified physical prefix
         // and certify it without deleting facts or renumbering event IDs.
+        checkpoint_prefix = Some((checkpoint.last_byte_offset, prefix_digest));
     }
 
     // 检查同步状态
@@ -3591,11 +3874,23 @@ fn sync_single_codex_file(
         }
     }
 
-    let cached_snapshot = replay_caches()
-        .lock()
-        .ok()
-        .and_then(|mut caches| caches.take_retryable_snapshot(file_path));
-    let (preliminary, content_already_verified) = if let Some(snapshot) = cached_snapshot {
+    let cached_snapshot = if checkpoint_prefix.is_none() {
+        replay_caches()
+            .lock()
+            .ok()
+            .and_then(|mut caches| caches.take_retryable_snapshot(file_path))
+    } else {
+        None
+    };
+    let mut parse_snapshot = || {
+        parse_codex_snapshot_with_baseline(
+            file_path,
+            Some((rollout_index, &mut pass.continuation_sources)),
+            None,
+            checkpoint_prefix,
+        )
+    };
+    let (preliminary, content_already_verified) = if let Some(mut snapshot) = cached_snapshot {
         #[cfg(test)]
         if let Some(rewrite) = BEFORE_CODEX_SNAPSHOT_REUSE.with(|hook| hook.take()) {
             rewrite();
@@ -3605,92 +3900,52 @@ fn sync_single_codex_file(
         } else {
             // Content, identity or boundary changed. This derivative owns no
             // authority: discard it and recover through the normal parser.
-            (parse_codex_snapshot(file_path, None)?, false)
+            (parse_snapshot()?, false)
         }
     } else {
-        (parse_codex_snapshot(file_path, None)?, false)
+        (parse_snapshot()?, false)
     };
     file_modified = preliminary.file_modified;
     file_size = preliminary.file_size.max(0) as u64;
-    let continuation_baseline = if let Some(continuation) = preliminary.parsed.continuation.as_ref()
+    if let Some(reason) = preliminary.continuation_error {
+        return Ok(mark_deferred(file_path, file_modified, file_size, reason));
+    }
+    if preliminary.parsed.has_billable_tokens
+        && preliminary
+            .parsed
+            .continuation
+            .as_ref()
+            .is_some_and(|page| page.history_base.is_none())
     {
-        match continuation.history_base.as_ref() {
-            Some(link) => {
-                let logical_id = preliminary
-                    .parsed
-                    .meta_thread_id
-                    .as_deref()
-                    .ok_or_else(|| {
-                        AppError::Config("paginated continuation has no logical id".to_string())
-                    })?;
-                match resolve_continuation_baseline(
-                    file_path,
-                    logical_id,
-                    link,
-                    preliminary.parsed.root_timestamp,
-                    rollout_index,
-                ) {
-                    Ok(value) => Some(value),
-                    Err(_)
-                        if read_continuation_source(file_path, None)
-                            .is_ok_and(|value| !value.has_total_without_last) =>
-                    {
-                        None
-                    }
-                    Err(reason) => {
-                        return Ok(mark_deferred(
-                            file_path,
-                            file_modified,
-                            file_size,
-                            if rollout_index.contains_key(&link.physical_id) {
-                                PendingReason::Retryable(reason)
-                            } else {
-                                PendingReason::MissingParent(link.physical_id.clone())
-                            },
-                        ))
-                    }
-                }
-            }
-            None if preliminary.parsed.has_billable_tokens => {
-                return Ok(mark_deferred(
-                    file_path,
-                    file_modified,
-                    file_size,
-                    preliminary
-                        .missing_continuation_base_prefix
-                        .clone()
-                        .map(PendingReason::MissingContinuationBase)
-                        .unwrap_or_else(|| {
-                            PendingReason::Retryable(
-                                "paginated continuation has no explicit history_base".to_string(),
-                            )
-                        }),
-                ))
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
-    let mut snapshot = if continuation_baseline.is_some() {
-        parse_codex_snapshot(file_path, continuation_baseline)?
-    } else {
+        return Ok(mark_deferred(
+            file_path,
+            file_modified,
+            file_size,
+            preliminary
+                .missing_continuation_base_prefix
+                .map(PendingReason::MissingContinuationBase)
+                .unwrap_or_else(|| {
+                    PendingReason::Retryable(
+                        "paginated continuation has no explicit history_base".to_string(),
+                    )
+                }),
+        ));
+    }
+    let mut snapshot = preliminary;
+    if !content_already_verified {
         #[cfg(test)]
         if let Some(rewrite) = BEFORE_CODEX_SNAPSHOT_REUSE.with(|hook| hook.take()) {
             rewrite();
         }
-
-        if !content_already_verified {
-            preliminary.verify_reusable_content(file_path)?;
-        }
-        preliminary
-    };
-    if snapshot.file_size != file_size as i64 || snapshot.file_modified != file_modified {
-        return Err(AppError::Config(
-            "Codex rollout 在读取 snapshot 期间变化；下轮重试".to_string(),
-        ));
+        snapshot.verify_reusable_content(file_path)?;
     }
     let checkpoint_facts = snapshot.checkpoint_facts();
+    snapshot.state.checkpoint_proof = Some(CodexCheckpointProof {
+        revision: snapshot
+            .verified_revision
+            .map(|revision| revision.fingerprint()),
+        prefix_digest: snapshot.complete_digest,
+    });
     // Parent ownership must be resolved even for a metadata-only initial
     // snapshot. Otherwise its checkpoint could later bill inherited appends.
     let (replay_prefix, verification) = match resolve_codex_replay(
@@ -4548,6 +4803,11 @@ mod tests {
             assert!(sync_test_file(&db, &child, &[&parent, &child])?.deferred);
             assert_retryable_snapshot_waits_for_parent(&child);
             let size = fs::metadata(&child).unwrap().len();
+            let fallback_verify_bytes = if FileRevision::read(&child).is_some() {
+                0
+            } else {
+                size
+            };
             {
                 let caches = replay_caches().lock().unwrap();
                 assert_eq!(caches.retryable_snapshots.len(), 1);
@@ -4571,7 +4831,8 @@ mod tests {
             }
             CODEX_SNAPSHOT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 0));
             CODEX_SNAPSHOT_BYTES_READ.with(|bytes| assert_eq!(bytes.get(), 0));
-            CODEX_SNAPSHOT_VERIFY_BYTES_READ.with(|bytes| assert_eq!(bytes.get(), 3 * size));
+            CODEX_SNAPSHOT_VERIFY_BYTES_READ
+                .with(|bytes| assert_eq!(bytes.get(), 3 * fallback_verify_bytes));
             CODEX_COPIED_CHILD_INSPECTION_CALLS.with(|count| assert_eq!(count.get(), 0));
             assert_eq!(get_sync_state(&db, &child.to_string_lossy())?, (0, 0));
             finish_retryable_snapshot_parent(&parent);
@@ -4581,7 +4842,8 @@ mod tests {
                 (1, 1, false)
             );
             CODEX_SNAPSHOT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 0));
-            CODEX_SNAPSHOT_VERIFY_BYTES_READ.with(|bytes| assert_eq!(bytes.get(), 4 * size));
+            CODEX_SNAPSHOT_VERIFY_BYTES_READ
+                .with(|bytes| assert_eq!(bytes.get(), 4 * fallback_verify_bytes));
             CODEX_COPIED_CHILD_INSPECTION_CALLS.with(|count| assert_eq!(count.get(), 0));
             assert!(replay_caches()
                 .lock()
@@ -4631,8 +4893,9 @@ mod tests {
         CODEX_SNAPSHOT_BYTES_READ.with(|bytes| bytes.set(0));
         CODEX_SNAPSHOT_VERIFY_BYTES_READ.with(|bytes| bytes.set(0));
         CODEX_COPIED_CHILD_INSPECTION_CALLS.with(|count| count.set(0));
-        let total_bytes: u64 = children
+        let fallback_verify_bytes: u64 = children
             .iter()
+            .filter(|path| FileRevision::read(path).is_none())
             .map(|path| fs::metadata(path).unwrap().len())
             .sum();
         for _ in 0..2 {
@@ -4642,7 +4905,8 @@ mod tests {
         }
         CODEX_SNAPSHOT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 0));
         CODEX_SNAPSHOT_BYTES_READ.with(|bytes| assert_eq!(bytes.get(), 0));
-        CODEX_SNAPSHOT_VERIFY_BYTES_READ.with(|bytes| assert_eq!(bytes.get(), 2 * total_bytes));
+        CODEX_SNAPSHOT_VERIFY_BYTES_READ
+            .with(|bytes| assert_eq!(bytes.get(), 2 * fallback_verify_bytes));
         CODEX_COPIED_CHILD_INSPECTION_CALLS.with(|count| assert_eq!(count.get(), 0));
         assert_eq!(
             replay_caches().lock().unwrap().retryable_snapshots.len(),
@@ -4677,6 +4941,11 @@ mod tests {
             let size = fs::metadata(&parent).unwrap().len();
             let modified = fs::metadata(&parent).unwrap().modified().unwrap();
             let stamp = ParentFileStamp::from_file(&fs::File::open(&parent).unwrap());
+            let fallback_verify_bytes = if FileRevision::read(&parent).is_some() {
+                0
+            } else {
+                size
+            };
             CODEX_PARENT_TIMELINE_PARSES.with(|count| count.set(0));
             CODEX_PARENT_TIMELINE_PARSE_BYTES.with(|bytes| bytes.set(0));
             CODEX_PARENT_TIMELINE_VERIFY_BYTES.with(|bytes| bytes.set(0));
@@ -4686,7 +4955,8 @@ mod tests {
             }
             CODEX_PARENT_TIMELINE_PARSES.with(|count| assert_eq!(count.get(), 0));
             CODEX_PARENT_TIMELINE_PARSE_BYTES.with(|bytes| assert_eq!(bytes.get(), 0));
-            CODEX_PARENT_TIMELINE_VERIFY_BYTES.with(|bytes| assert_eq!(bytes.get(), 3 * size));
+            CODEX_PARENT_TIMELINE_VERIFY_BYTES
+                .with(|bytes| assert_eq!(bytes.get(), 3 * fallback_verify_bytes));
             parent_records[2] = turn_context_at("2026-07-10T03:00:09Z");
             write_jsonl(&parent, &parent_records);
             fs::OpenOptions::new()
@@ -4707,7 +4977,8 @@ mod tests {
             );
             CODEX_PARENT_TIMELINE_PARSES.with(|count| assert_eq!(count.get(), 1));
             CODEX_PARENT_TIMELINE_PARSE_BYTES.with(|bytes| assert_eq!(bytes.get(), size));
-            CODEX_PARENT_TIMELINE_VERIFY_BYTES.with(|bytes| assert_eq!(bytes.get(), 5 * size));
+            CODEX_PARENT_TIMELINE_VERIFY_BYTES
+                .with(|bytes| assert_eq!(bytes.get(), 3 * fallback_verify_bytes + 2 * size));
             CODEX_SNAPSHOT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 0));
             assert_eq!(sync_test_file(&db, &child, &[&parent, &child])?.imported, 0);
         }
@@ -5470,19 +5741,25 @@ mod tests {
             page2.as_path(),
         ];
         let db = Database::memory()?;
-        CODEX_CURRENT_PAGE_SOURCE_READS.with(|count| count.set(0));
         for file in [
             parent.as_path(),
             root.as_path(),
             page1.as_path(),
             page2.as_path(),
         ] {
+            CODEX_SNAPSHOT_PARSE_COUNT.with(|count| count.set(0));
+            CODEX_SNAPSHOT_BYTES_READ.with(|bytes| bytes.set(0));
             let result = sync_test_file(&db, file, &files)?;
             assert!(!result.deferred, "{} deferred: {result:?}", file.display());
+            CODEX_SNAPSHOT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
+            CODEX_SNAPSHOT_BYTES_READ.with(|bytes| {
+                assert_eq!(bytes.get(), fs::metadata(file).unwrap().len());
+            });
         }
+        CODEX_SNAPSHOT_PARSE_COUNT.with(|count| count.set(0));
         assert_eq!(sync_test_file(&db, &page1, &files)?.imported, 0);
         assert_eq!(sync_test_file(&db, &page2, &files)?.imported, 0);
-        CODEX_CURRENT_PAGE_SOURCE_READS.with(|count| assert_eq!(count.get(), 0));
+        CODEX_SNAPSHOT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 0));
         let conn = lock_conn!(db.conn);
         let (rows, input): (i64, i64) = conn.query_row("SELECT COUNT(*), COALESCE(SUM(input_tokens),0) FROM proxy_request_logs WHERE data_source='codex_session'", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
         assert_eq!(rows, 4);
@@ -5513,14 +5790,12 @@ mod tests {
             ],
         );
         let db = Database::memory()?;
-        CODEX_CURRENT_PAGE_SOURCE_READS.with(|count| count.set(0));
         CODEX_SNAPSHOT_PARSE_COUNT.with(|count| count.set(0));
         for _ in 0..2 {
             let result = sync_test_file(&db, &page, &[&page])?;
             assert!(result.deferred);
             assert_eq!(result.imported, 0);
         }
-        CODEX_CURRENT_PAGE_SOURCE_READS.with(|count| assert_eq!(count.get(), 0));
         CODEX_SNAPSHOT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
         Ok(())
     }
@@ -5778,6 +6053,99 @@ mod tests {
         )?;
         assert_eq!(rows, 0);
         Ok(())
+    }
+
+    #[test]
+    fn upstream_4_paginated_shared_predecessor_reuses_parse_and_checks_same_stamp_edits() {
+        use std::io::Write;
+
+        for padding in [0, 256 * 1024] {
+            let dir = tempdir().unwrap();
+            let root = rollout_path(dir.path(), CHILD_A_ID);
+            let write = |path: &Path, input| {
+                write_paginated_jsonl(
+                    path,
+                    &[
+                        session_meta(CHILD_A_ID),
+                        token_count_at(input, 20, 10, "2026-07-10T03:00:01Z"),
+                        json!({"type": "response_item", "payload": {"text": "x".repeat(padding)}}),
+                    ],
+                );
+            };
+            write(&root, 100);
+            let before = fs::metadata(&root).unwrap();
+            let cutoff = ContinuationLink {
+                physical_id: CHILD_A_ID.to_string(),
+                end_ordinal_exclusive: 3,
+                end_byte_offset: before.len(),
+            };
+            let mut sources = ContinuationSources::default();
+            CODEX_CONTINUATION_SOURCE_BYTES.with(|count| count.set(0));
+            CODEX_CONTINUATION_VERIFY_BYTES.with(|count| count.set(0));
+            for _ in 0..4 {
+                let source = sources.read(&root, &cutoff).unwrap();
+                assert_eq!(source.latest_total.unwrap().input, 100);
+            }
+            let can_verify = !sources.entries.is_empty();
+            let has_revision = FileRevision::read(&root).is_some();
+            let parses = if can_verify { 1 } else { 4 };
+            let verifications = match (can_verify, has_revision) {
+                (true, true) => 1,
+                (true, false) => 4,
+                _ => 0,
+            };
+            assert_eq!(
+                CODEX_CONTINUATION_SOURCE_BYTES.with(std::cell::Cell::get),
+                before.len() as usize * parses
+            );
+            CODEX_CONTINUATION_VERIFY_BYTES
+                .with(|bytes| assert_eq!(bytes.get(), before.len() * verifications));
+            write(&root, 150);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&root)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
+                .unwrap();
+            assert_eq!(fs::metadata(&root).unwrap().len(), before.len());
+            let updated = sources.read(&root, &cutoff).unwrap();
+            assert_eq!(updated.latest_total.unwrap().input, 150);
+
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&root)
+                .unwrap()
+                .write_all(b"{\"ordinal\":3}\n")
+                .unwrap();
+            CODEX_CONTINUATION_SOURCE_BYTES.with(|count| count.set(0));
+            CODEX_CONTINUATION_VERIFY_BYTES.with(|count| count.set(0));
+            for _ in 0..3 {
+                let source = sources.read(&root, &cutoff).unwrap();
+                assert_eq!(source.latest_total.unwrap().input, 150);
+            }
+            let (parses, verifications) = match (can_verify, has_revision) {
+                (true, true) => (0, 1),
+                (true, false) => (0, 3),
+                _ => (3, 0),
+            };
+            CODEX_CONTINUATION_SOURCE_BYTES
+                .with(|bytes| assert_eq!(bytes.get(), before.len() as usize * parses));
+            CODEX_CONTINUATION_VERIFY_BYTES
+                .with(|bytes| assert_eq!(bytes.get(), before.len() * verifications));
+
+            let replacement = dir.path().join("replacement.jsonl");
+            write(&replacement, 175);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&replacement)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
+                .unwrap();
+            fs::remove_file(&root).unwrap();
+            fs::rename(replacement, &root).unwrap();
+            let replaced = sources.read(&root, &cutoff).unwrap();
+            assert_eq!(replaced.latest_total.unwrap().input, 175);
+        }
     }
 
     #[test]
@@ -6460,44 +6828,62 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn incremental_sync_appends_small_rollout_across_restart_without_rereading_history(
-    ) -> Result<(), AppError> {
-        let dir = tempdir().unwrap();
-        let file = rollout_path(dir.path(), PARENT_ID);
-        write_jsonl(
-            &file,
-            &[
-                session_meta(PARENT_ID),
-                turn_context(),
-                token_count_at(10, 2, 3, "2026-09-14T00:00:01Z"),
-            ],
-        );
-        assert!(fs::metadata(&file).unwrap().len() < CODEX_FINGERPRINT_BYTES as u64);
-        let db = Database::memory()?;
-        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
-        assert_eq!(take_codex_append_bytes_read(&file), 0);
-
-        let appended = token_count_at(20, 4, 7, "2026-09-14T00:00:02Z").to_string() + "\n";
+    fn incremental_sync_hashes_committed_prefix_once_on_append() -> Result<(), AppError> {
         use std::io::Write;
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&file)
-            .unwrap()
-            .write_all(appended.as_bytes())
-            .unwrap();
-        // A new pass emulates process restart: only persisted checkpoint state
-        // may carry the model/high-water/signature/event-index semantics.
-        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
-        assert_eq!(take_codex_append_bytes_read(&file), appended.len() as u64);
-        let conn = lock_conn!(db.conn);
-        let rows: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source='codex_session'",
-            [],
-            |row| row.get(0),
-        )?;
-        let checkpoint: (i64, i64) = conn.query_row("SELECT last_byte_offset, file_size FROM codex_usage_file_checkpoints WHERE file_path=?1", [file.to_string_lossy().to_string()], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        assert_eq!(rows, 2);
-        assert_eq!(checkpoint.0, checkpoint.1);
+
+        for padding in [0, 64 * 1024] {
+            let dir = tempdir().unwrap();
+            let file = rollout_path(dir.path(), PARENT_ID);
+            write_jsonl(
+                &file,
+                &[
+                    session_meta(PARENT_ID),
+                    turn_context(),
+                    json!({"type": "fixture", "payload": "x".repeat(padding)}),
+                    token_count_at(10, 2, 3, "2026-09-14T00:00:01Z"),
+                ],
+            );
+            let size = fs::metadata(&file).unwrap().len();
+            let db = Database::memory()?;
+            assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+            assert_eq!(take_codex_append_bytes_read(&file), 0);
+
+            let appended = token_count_at(20, 4, 7, "2026-09-14T00:00:02Z").to_string() + "\n";
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&file)
+                .unwrap()
+                .write_all(appended.as_bytes())
+                .unwrap();
+            clear_codex_replay_caches();
+            CODEX_CHECKPOINT_PREFIX_BYTES_READ.with(|bytes| bytes.set(0));
+            CODEX_SNAPSHOT_PARSE_COUNT.with(|count| count.set(0));
+            assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+            assert_eq!(take_codex_append_bytes_read(&file), appended.len() as u64);
+            let current_size = size + appended.len() as u64;
+            let has_revision = FileRevision::read(&file).is_some();
+            let fallback_verify_bytes = if has_revision { 0 } else { current_size };
+            CODEX_CHECKPOINT_PREFIX_BYTES_READ
+                .with(|bytes| assert_eq!(bytes.get(), size + fallback_verify_bytes));
+            CODEX_CHECKPOINT_PREFIX_BYTES_READ.with(|bytes| bytes.set(0));
+            for _ in 0..3 {
+                let unchanged = sync_test_file(&db, &file, &[&file])?;
+                assert_eq!((unchanged.imported, unchanged.deferred), (0, false));
+            }
+            CODEX_SNAPSHOT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 0));
+            CODEX_CHECKPOINT_PREFIX_BYTES_READ.with(|bytes| {
+                assert_eq!(bytes.get(), 6 * fallback_verify_bytes);
+            });
+            let conn = lock_conn!(db.conn);
+            let rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source='codex_session'",
+                [],
+                |row| row.get(0),
+            )?;
+            let checkpoint: (i64, i64) = conn.query_row("SELECT last_byte_offset, file_size FROM codex_usage_file_checkpoints WHERE file_path=?1", [file.to_string_lossy().to_string()], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            assert_eq!(rows, 2);
+            assert_eq!(checkpoint.0, checkpoint.1);
+        }
         Ok(())
     }
 
@@ -6568,8 +6954,87 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn incremental_sync_same_size_rewrite_fails_closed_even_when_mtime_is_unchanged(
+    fn incremental_sync_rejects_middle_rewrites_without_reparsing_committed_prefix(
     ) -> Result<(), AppError> {
+        for (replace, append) in [(false, false), (true, false), (false, true)] {
+            let dir = tempdir().unwrap();
+            let file = rollout_path(dir.path(), PARENT_ID);
+            let padding =
+                json!({"type": "fixture", "payload": "x".repeat(2 * CODEX_FINGERPRINT_BYTES)});
+            write_jsonl(
+                &file,
+                &[
+                    session_meta(PARENT_ID),
+                    turn_context(),
+                    padding.clone(),
+                    token_count_at(10, 2, 3, "2026-09-14T00:00:01Z"),
+                    padding,
+                ],
+            );
+            let db = Database::memory()?;
+            assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+            let metadata = fs::metadata(&file).unwrap();
+            let before = fs::read(&file).unwrap();
+            let mut rewritten = before.clone();
+            let index = rewritten.len() / 2;
+            assert!(
+                (CODEX_FINGERPRINT_BYTES..rewritten.len() - CODEX_FINGERPRINT_BYTES)
+                    .contains(&index)
+            );
+            rewritten[index] ^= 1;
+            if append {
+                let appended = token_count_at(20, 4, 7, "2026-09-14T00:00:02Z").to_string() + "\n";
+                rewritten.extend(appended.as_bytes());
+            }
+            let replacement = dir.path().join("replacement.jsonl");
+            let path = if replace { &replacement } else { &file };
+            fs::write(path, rewritten).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+                .unwrap();
+            if replace {
+                fs::remove_file(&file).unwrap();
+                fs::rename(path, &file).unwrap();
+            }
+            clear_codex_replay_caches();
+            CODEX_CHECKPOINT_PREFIX_BYTES_READ.with(|bytes| bytes.set(0));
+            CODEX_SNAPSHOT_PARSE_COUNT.with(|count| count.set(0));
+            let result = sync_test_file(&db, &file, &[&file])?;
+            assert!(result.deferred);
+            CODEX_CHECKPOINT_PREFIX_BYTES_READ
+                .with(|bytes| assert_eq!(bytes.get(), metadata.len()));
+            CODEX_SNAPSHOT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 0));
+            assert_eq!(take_codex_append_bytes_read(&file), 0);
+            if FileRevision::read(&file).is_some() {
+                CODEX_CHECKPOINT_PREFIX_BYTES_READ.with(|bytes| bytes.set(0));
+                for _ in 0..3 {
+                    assert!(sync_test_file(&db, &file, &[&file])?.deferred);
+                }
+                CODEX_CHECKPOINT_PREFIX_BYTES_READ.with(|bytes| assert_eq!(bytes.get(), 0));
+            }
+            assert_eq!(
+                load_codex_checkpoint(&db, &file)?.unwrap().last_byte_offset,
+                metadata.len() as i64
+            );
+            let conn = lock_conn!(db.conn);
+            let rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source='codex_session'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(rows, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn incremental_sync_accepts_same_size_completion_of_uncommitted_tail() -> Result<(), AppError> {
+        use std::io::Write;
+
         let dir = tempdir().unwrap();
         let file = rollout_path(dir.path(), PARENT_ID);
         write_jsonl(
@@ -6577,28 +7042,33 @@ mod tests {
             &[
                 session_meta(PARENT_ID),
                 turn_context(),
-                token_count_at(10, 2, 3, "2026-09-14T00:00:01Z"),
+                token_count(10, 2, 3),
             ],
         );
+        let partial = token_count_at(20, 4, 7, "2026-09-14T00:00:02Z").to_string() + " ";
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(partial.as_bytes())
+            .unwrap();
         let db = Database::memory()?;
         assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
-        let before = fs::read(&file).unwrap();
-        let mut rewritten = before.clone();
-        let index = rewritten
-            .iter()
-            .position(|byte| *byte == b'3')
-            .expect("fixture token digit");
-        rewritten[index] = b'9';
-        fs::write(&file, rewritten).unwrap();
-        let result = sync_test_file(&db, &file, &[&file])?;
-        assert!(result.deferred);
-        let conn = lock_conn!(db.conn);
-        let rows: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source='codex_session'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(rows, 1);
+        let before = fs::metadata(&file).unwrap();
+        let mut writer = fs::OpenOptions::new().write(true).open(&file).unwrap();
+        writer.seek(SeekFrom::End(-1)).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer
+            .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
+            .unwrap();
+        drop(writer);
+        assert_eq!(fs::metadata(&file).unwrap().len(), before.len());
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 0);
+        assert_eq!(
+            load_codex_checkpoint(&db, &file)?.unwrap().last_byte_offset,
+            before.len() as i64
+        );
         Ok(())
     }
 
@@ -6661,6 +7131,163 @@ mod tests {
             |row| row.get(0),
         )?;
         assert!(offset_after > offset_before);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_codex_checkpoint_replay_rejects_a_changed_verified_prefix() -> Result<(), AppError> {
+        use std::io::Write;
+
+        let dir = tempdir().unwrap();
+        let parent = rollout_path(dir.path(), PARENT_ID);
+        let child = rollout_path(dir.path(), CHILD_A_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+                turn_context_at("2026-07-10T03:00:10Z"),
+            ],
+        );
+        let padding =
+            json!({"type": "fixture", "payload": "x".repeat(2 * CODEX_FINGERPRINT_BYTES)});
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, Some(PARENT_ID), None, "2026-07-10T03:00:05Z"),
+                padding.clone(),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:06Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:07Z"),
+                padding,
+            ],
+        );
+        let db = Database::memory()?;
+        let files = [parent.as_path(), child.as_path()];
+        assert_eq!(sync_test_file(&db, &child, &files)?.imported, 1);
+        let mut checkpoint = load_codex_checkpoint(&db, &child)?.unwrap();
+        assert!(matches!(
+            checkpoint.state.parent,
+            ParentResolution::Parent(_)
+        ));
+        checkpoint.state.replay_verification = None;
+        checkpoint.state.checkpoint_proof = None;
+        lock_conn!(db.conn).execute(
+            "UPDATE codex_usage_file_checkpoints SET parser_state=?1 WHERE file_path=?2",
+            rusqlite::params![
+                serde_json::to_string(&checkpoint.state).unwrap(),
+                child.to_str().unwrap()
+            ],
+        )?;
+
+        let original = fs::read(&child).unwrap();
+        let offset = original.len() / 2;
+        assert!(
+            (CODEX_FINGERPRINT_BYTES..original.len() - CODEX_FINGERPRINT_BYTES).contains(&offset)
+        );
+        let changed_byte = original[offset] ^ 1;
+        let mtime = fs::metadata(&child).unwrap().modified().unwrap();
+        CODEX_SNAPSHOT_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                let mut opened = fs::OpenOptions::new().write(true).open(path).unwrap();
+                opened.seek(SeekFrom::Start(offset as u64)).unwrap();
+                opened.write_all(&[changed_byte]).unwrap();
+                opened
+                    .set_times(fs::FileTimes::new().set_modified(mtime))
+                    .unwrap();
+            }));
+        });
+        let error = sync_test_file(&db, &child, &files).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("checkpoint prefix 在重放期间变化"));
+        assert!(load_codex_checkpoint(&db, &child)?
+            .unwrap()
+            .state
+            .checkpoint_proof
+            .is_none());
+
+        fs::write(&child, original).unwrap();
+        assert_eq!(sync_test_file(&db, &child, &files)?.imported, 0);
+        assert!(load_codex_checkpoint(&db, &child)?
+            .unwrap()
+            .state
+            .checkpoint_proof
+            .is_some());
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn incremental_sync_append_failure_rolls_back_all_usage_and_prefix_proof(
+    ) -> Result<(), AppError> {
+        use std::io::Write;
+
+        let dir = tempdir().unwrap();
+        let file = rollout_path(dir.path(), PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count(10, 2, 3),
+            ],
+        );
+        let db = Database::memory()?;
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+        let original_checkpoint = load_codex_checkpoint(&db, &file)?.unwrap();
+        {
+            let mut writer = fs::OpenOptions::new().append(true).open(&file).unwrap();
+            for index in 0..=CODEX_INSERT_BATCH_SIZE {
+                writeln!(
+                    writer,
+                    "{}",
+                    token_count_at(20 + index as u64, 4, 7, "2026-09-14T00:00:02Z")
+                )
+                .unwrap();
+            }
+        }
+        {
+            let conn = lock_conn!(db.conn);
+            let final_request_id = format!(
+                "{CODEX_THREAD_REQUEST_ID_PREFIX}:{PARENT_ID}:{}",
+                CODEX_INSERT_BATCH_SIZE + 2
+            );
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER fail_final_codex_append BEFORE INSERT ON proxy_request_logs
+                 WHEN NEW.request_id = '{final_request_id}'
+                 BEGIN SELECT RAISE(ABORT, 'fixture append failure'); END;"
+            ))?;
+        }
+        let error = sync_test_file(&db, &file, &[&file]).unwrap_err();
+        assert!(error.to_string().contains("fixture append failure"));
+        let current = load_codex_checkpoint(&db, &file)?.unwrap();
+        assert_eq!(
+            current.last_byte_offset,
+            original_checkpoint.last_byte_offset
+        );
+        assert_eq!(
+            current.state.checkpoint_proof.unwrap().prefix_digest,
+            original_checkpoint
+                .state
+                .checkpoint_proof
+                .unwrap()
+                .prefix_digest
+        );
+        {
+            let conn = lock_conn!(db.conn);
+            let rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source='codex_session'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(rows, 1);
+            conn.execute_batch("DROP TRIGGER fail_final_codex_append")?;
+        }
+        assert_eq!(
+            sync_test_file(&db, &file, &[&file])?.imported as usize,
+            CODEX_INSERT_BATCH_SIZE + 1
+        );
         Ok(())
     }
 
@@ -6775,7 +7402,6 @@ mod tests {
                 CODEX_SNAPSHOT_PARSE_COUNT.with(|count| count.set(0));
                 CODEX_SNAPSHOT_BYTES_READ.with(|bytes| bytes.set(0));
                 CODEX_SNAPSHOT_VERIFY_BYTES_READ.with(|bytes| bytes.set(0));
-                CODEX_CURRENT_PAGE_SOURCE_READS.with(|count| count.set(0));
 
                 let initial = sync_test_file(&db, &file, &[&file])?;
                 assert!(
@@ -6786,7 +7412,6 @@ mod tests {
                 CODEX_SNAPSHOT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
                 CODEX_SNAPSHOT_BYTES_READ.with(|bytes| assert_eq!(bytes.get(), size));
                 CODEX_SNAPSHOT_VERIFY_BYTES_READ.with(|bytes| assert_eq!(bytes.get(), size));
-                CODEX_CURRENT_PAGE_SOURCE_READS.with(|count| assert_eq!(count.get(), 0));
 
                 CODEX_SNAPSHOT_PARSE_COUNT.with(|count| count.set(0));
                 CODEX_SNAPSHOT_BYTES_READ.with(|bytes| bytes.set(0));
@@ -7563,7 +8188,13 @@ mod tests {
         );
         CODEX_PARENT_TIMELINE_PARSES.with(|count| assert_eq!(count.get(), 0));
         CODEX_PARENT_TIMELINE_PARSE_BYTES.with(|bytes| assert_eq!(bytes.get(), 0));
-        CODEX_PARENT_TIMELINE_VERIFY_BYTES.with(|bytes| assert_eq!(bytes.get(), admitted_size));
+        let fallback_verify_bytes = if FileRevision::read(&admitted).is_some() {
+            0
+        } else {
+            admitted_size
+        };
+        CODEX_PARENT_TIMELINE_VERIFY_BYTES
+            .with(|bytes| assert_eq!(bytes.get(), fallback_verify_bytes));
         let evicted = dir.path().join("parent-0.jsonl");
         assert_eq!(parent_signatures_before(&evicted, cutoff).unwrap().len(), 1);
         CODEX_PARENT_TIMELINE_PARSES.with(|count| assert_eq!(count.get(), 1));
@@ -7601,14 +8232,20 @@ mod tests {
         let mut caches = CodexReplayCaches::default();
         let oversized = parent_timeline_with_capacity(MAX_PARENT_TIMELINE_EVENT_CAPACITY + 1);
         assert_eq!(oversized.events.len(), 1);
-        caches.retain_parent_timeline(Path::new("oversized-capacity"), stamp, digest, &oversized);
+        caches.retain_parent_timeline(
+            Path::new("oversized-capacity"),
+            stamp,
+            None,
+            digest,
+            &oversized,
+        );
         assert!(
             caches.parent_timelines.is_empty(),
             "capacity, not len, controls admission"
         );
         let empty = parent_timeline_with_capacity(0);
         let oversized_path = PathBuf::from("x".repeat(MAX_PARENT_TIMELINE_BYTES + 1));
-        caches.retain_parent_timeline(&oversized_path, stamp, digest, &empty);
+        caches.retain_parent_timeline(&oversized_path, stamp, None, digest, &empty);
         assert!(
             caches.parent_timelines.is_empty(),
             "path allocation must not bypass per-entry budget"
@@ -7619,6 +8256,7 @@ mod tests {
             caches.retain_parent_timeline(
                 Path::new(&format!("capacity-{ordinal}")),
                 stamp,
+                None,
                 digest,
                 &timeline,
             );
@@ -7644,7 +8282,7 @@ mod tests {
             // This is an in-memory admission key, never a physical filesystem
             // path: exercise byte pressure without Windows path-length issues.
             let path = PathBuf::from(format!("{}-{ordinal}", "x".repeat(512 * 1024)));
-            caches.retain_parent_timeline(&path, stamp, digest, &empty);
+            caches.retain_parent_timeline(&path, stamp, None, digest, &empty);
             assert!(
                 caches.parent_timeline_retained_allocation_estimate() <= MAX_PARENT_TOTAL_BYTES
             );
@@ -7656,7 +8294,13 @@ mod tests {
             "byte budget must evict independently of entry/record limits"
         );
         caches.next_parent_timeline_order = u64::MAX;
-        caches.retain_parent_timeline(Path::new("after-sequence-wrap"), stamp, digest, &empty);
+        caches.retain_parent_timeline(
+            Path::new("after-sequence-wrap"),
+            stamp,
+            None,
+            digest,
+            &empty,
+        );
         assert_eq!(caches.parent_timelines.len(), 1);
         assert_eq!(caches.next_parent_timeline_order, 1);
     }

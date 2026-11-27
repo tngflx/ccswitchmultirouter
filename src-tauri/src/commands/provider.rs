@@ -2,7 +2,7 @@ use indexmap::IndexMap;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::app_config::AppType;
-use crate::codex_multirouter::catalog::catalog_models;
+use crate::codex_multirouter::catalog::provider_catalog_models;
 use crate::commands::copilot::CopilotAuthState;
 use crate::commands::run_app_state_blocking;
 use crate::commands::xai_oauth::XaiOAuthState;
@@ -843,7 +843,7 @@ fn list_codex_provider_adaptation_summaries_internal(
 }
 
 fn codex_adaptation_catalog_models(provider: &Provider) -> Vec<(String, String)> {
-    catalog_models(&provider.settings_config)
+    provider_catalog_models(provider)
         .into_iter()
         .flatten()
         .filter(|model| model.get("enabled").and_then(serde_json::Value::as_bool) != Some(false))
@@ -865,7 +865,7 @@ fn codex_adaptation_catalog_models(provider: &Provider) -> Vec<(String, String)>
 }
 
 fn catalog_contains_legacy_codex_protocols(provider: &Provider) -> bool {
-    catalog_models(&provider.settings_config).is_some_and(|models| {
+    provider_catalog_models(provider).is_some_and(|models| {
         models.iter().any(|model| {
             ["apiFormat", "api_format", "wireApi", "wire_api"]
                 .into_iter()

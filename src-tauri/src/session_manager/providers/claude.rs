@@ -1,6 +1,7 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use serde_json::Value;
 
@@ -8,25 +9,20 @@ use crate::config::get_claude_config_dir;
 use crate::session_manager::{SessionMessage, SessionMeta};
 
 use super::utils::{
-    extract_text, parse_timestamp_to_ms, path_basename, read_head_tail_lines, truncate_summary,
-    TITLE_MAX_CHARS,
+    extract_text, parse_timestamp_to_ms, path_basename, read_open_file_head_tail_lines,
+    truncate_summary, FileCache, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "claude";
 
+static SESSION_LISTING: LazyLock<Mutex<SessionListing>> = LazyLock::new(Mutex::default);
+
 pub fn scan_sessions() -> Vec<SessionMeta> {
     let root = get_claude_config_dir().join("projects");
-    let mut files = Vec::new();
-    collect_jsonl_files(&root, &mut files);
-
-    let mut sessions = Vec::new();
-    for path in files {
-        if let Some(meta) = parse_session(&path) {
-            sessions.push(meta);
-        }
-    }
-
-    sessions
+    SESSION_LISTING
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .scan(&root)
 }
 
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
@@ -120,12 +116,41 @@ pub fn delete_session(_root: &Path, path: &Path, session_id: &str) -> Result<boo
     Ok(true)
 }
 
+#[derive(Default)]
+struct SessionListing {
+    sessions: FileCache<Option<SessionMeta>>,
+}
+
+impl SessionListing {
+    fn scan(&mut self, root: &Path) -> Vec<SessionMeta> {
+        let mut files = Vec::new();
+        collect_jsonl_files(root, &mut files);
+        files.sort();
+
+        self.sessions.refresh(|cache| {
+            files
+                .into_iter()
+                .filter_map(|path| {
+                    cache
+                        .read(&path, |file| parse_open_session(&path, file))
+                        .flatten()
+                })
+                .collect()
+        })
+    }
+}
+
 fn parse_session(path: &Path) -> Option<SessionMeta> {
+    let mut file = File::open(path).ok()?;
+    parse_open_session(path, &mut file).ok().flatten()
+}
+
+fn parse_open_session(path: &Path, file: &mut File) -> io::Result<Option<SessionMeta>> {
     if is_agent_session(path) {
-        return None;
+        return Ok(None);
     }
 
-    let (head, tail) = read_head_tail_lines(path, 10, 30).ok()?;
+    let (head, tail) = read_open_file_head_tail_lines(file, 10, 30)?;
 
     let mut session_id: Option<String> = None;
     let mut project_dir: Option<String> = None;
@@ -224,7 +249,9 @@ fn parse_session(path: &Path) -> Option<SessionMeta> {
     }
 
     let session_id = session_id.or_else(|| infer_session_id_from_filename(path));
-    let session_id = session_id?;
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
 
     // Title priority: custom-title > first user message > directory basename
     let title = custom_title
@@ -239,7 +266,7 @@ fn parse_session(path: &Path) -> Option<SessionMeta> {
 
     let summary = summary.map(|text| truncate_summary(&text, 160));
 
-    Some(SessionMeta {
+    Ok(Some(SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
         session_id: session_id.clone(),
         title,
@@ -249,7 +276,7 @@ fn parse_session(path: &Path) -> Option<SessionMeta> {
         last_active_at,
         source_path: Some(path.to_string_lossy().to_string()),
         resume_command: Some(format!("claude --resume {session_id}")),
-    })
+    }))
 }
 
 fn is_agent_session(path: &Path) -> bool {
@@ -314,6 +341,36 @@ mod tests {
         std::fs::write(&session, body).unwrap();
         assert!(parse_session(&journal).is_none());
         assert!(parse_session(&session).is_some());
+    }
+
+    #[test]
+    fn session_listing_reuses_unchanged_files_and_reloads_changed_revision() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("projects");
+        std::fs::create_dir(&root).expect("create projects directory");
+        let path = root.join("session.jsonl");
+
+        let write_session = |title: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"sessionId\":\"session-123\",\"cwd\":\"/tmp/project\",\"timestamp\":\"2026-03-06T10:00:00Z\"}}\n{{\"type\":\"custom-title\",\"customTitle\":\"{title}\"}}\n"
+                ),
+            )
+            .expect("write session");
+        };
+        write_session("Initial title");
+
+        let mut listing = SessionListing::default();
+        for _ in 0..5 {
+            assert_eq!(listing.scan(&root).len(), 1);
+        }
+        assert_eq!(listing.sessions.loads, 1);
+
+        write_session("Updated title");
+        let sessions = listing.scan(&root);
+        assert_eq!(sessions[0].title.as_deref(), Some("Updated title"));
+        assert_eq!(listing.sessions.loads, 2);
     }
 
     #[test]

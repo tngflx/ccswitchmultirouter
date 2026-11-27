@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::future::Future;
 
 use crate::app_config::AppType;
-use crate::codex_multirouter::catalog::catalog_models;
+use crate::codex_multirouter::catalog::provider_catalog_models;
 use crate::codex_multirouter::mutation::CodexProviderMutationOutcome;
 use crate::database::{
     validate_cost_multiplier, validate_pricing_source, ProviderSetDatabaseMutation,
@@ -93,12 +93,11 @@ fn validate_codex_manual_protocol_settings(provider: &Provider) -> Result<(), Ap
     if !has_model_overrides && !matches!(api_format, "openai_chat" | "openai_responses") {
         return Err(invalid("上游协议必须是 Responses 或 Chat Completions"));
     }
-    let has_model_level_protocol =
-        catalog_models(&provider.settings_config).is_some_and(|models| {
-            models
-                .iter()
-                .any(|model| model.get("apiFormat").is_some() || model.get("api_format").is_some())
-        });
+    let has_model_level_protocol = provider_catalog_models(provider).is_some_and(|models| {
+        models
+            .iter()
+            .any(|model| model.get("apiFormat").is_some() || model.get("api_format").is_some())
+    });
     if has_model_level_protocol {
         return Err(invalid(
             "手动模式不能保存模型级协议；请只设置整个 Provider 的协议",

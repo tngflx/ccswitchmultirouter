@@ -3,6 +3,8 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 
+pub(super) const NATIVE_FILENAME: &str = "thread_history_1.sqlite";
+
 // Codex rust-v0.171.0-alpha.13, state/thread_history_migrations. The schema below
 // represents the result of migrations 1 through 9 on an empty database. SQLx
 // verifies the SHA-384 of each original migration, including its whitespace.

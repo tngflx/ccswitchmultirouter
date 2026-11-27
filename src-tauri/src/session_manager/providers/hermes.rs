@@ -1,18 +1,36 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 use rusqlite::Connection;
 use serde_json::Value;
 
+use crate::file_revision::FileRevision;
 use crate::hermes_config::get_hermes_dir;
 use crate::session_manager::{SessionMessage, SessionMeta};
 
 use super::utils::{
-    extract_text, parse_timestamp_to_ms, read_head_tail_lines, truncate_summary, TITLE_MAX_CHARS,
+    extract_text, parse_timestamp_to_ms, read_open_file_head_tail_lines, truncate_summary,
+    FileCache, TITLE_MAX_CHARS,
 };
 
 const PROVIDER_ID: &str = "hermes";
+
+static JSONL_SESSIONS: LazyLock<Mutex<FileCache<Option<SessionMeta>>>> =
+    LazyLock::new(Mutex::default);
+
+#[derive(Default)]
+struct SqliteSessionCache {
+    path: Option<PathBuf>,
+    revision: Option<FileRevision>,
+    sessions: Vec<SessionMeta>,
+    #[cfg(test)]
+    loads: usize,
+}
+
+static SQLITE_SESSIONS: LazyLock<Mutex<SqliteSessionCache>> = LazyLock::new(Mutex::default);
 
 fn get_hermes_db_path() -> PathBuf {
     get_hermes_dir().join("state.db")
@@ -53,20 +71,66 @@ pub fn scan_sessions() -> Vec<SessionMeta> {
 
 fn scan_sessions_sqlite() -> Vec<SessionMeta> {
     let db_path = get_hermes_db_path();
-    if !db_path.exists() {
-        return Vec::new();
+    let mut cache = SQLITE_SESSIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    scan_sessions_sqlite_with_cache(&db_path, &mut cache)
+}
+
+fn scan_sessions_sqlite_with_cache(
+    db_path: &Path,
+    cache: &mut SqliteSessionCache,
+) -> Vec<SessionMeta> {
+    let revision = FileRevision::read(db_path);
+    if revision.is_some() && cache.path.as_deref() == Some(db_path) && revision == cache.revision {
+        return cache.sessions.clone();
     }
 
-    let conn = match Connection::open_with_flags(
-        &db_path,
+    let mut conn = match Connection::open_with_flags(
+        db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            cache.path = None;
+            cache.revision = None;
+            cache.sessions.clear();
+            return Vec::new();
+        }
     };
 
+    if conn.busy_timeout(Duration::from_secs(2)).is_err() {
+        cache.path = None;
+        cache.revision = None;
+        cache.sessions.clear();
+        return Vec::new();
+    }
+
+    let snapshot = match conn.transaction() {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            cache.path = None;
+            cache.revision = None;
+            cache.sessions.clear();
+            return Vec::new();
+        }
+    };
+    if snapshot
+        .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+        .is_err()
+    {
+        cache.path = None;
+        cache.revision = None;
+        cache.sessions.clear();
+        return Vec::new();
+    }
+
+    let journal_mode = snapshot
+        .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+        .unwrap_or_default();
+
     // Check if sessions table exists
-    let has_sessions: bool = conn
+    let has_sessions: bool = snapshot
         .query_row(
             "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='sessions'",
             [],
@@ -75,32 +139,82 @@ fn scan_sessions_sqlite() -> Vec<SessionMeta> {
         .unwrap_or(false);
 
     if !has_sessions {
+        let rollback_journal = journal_mode.eq_ignore_ascii_case("delete")
+            || journal_mode.eq_ignore_ascii_case("truncate")
+            || journal_mode.eq_ignore_ascii_case("persist");
+        let stable_revision = rollback_journal
+            .then_some(revision)
+            .flatten()
+            .filter(|saved| FileRevision::read(db_path).as_ref() == Some(saved));
+        cache.path = stable_revision.as_ref().map(|_| db_path.to_path_buf());
+        cache.revision = stable_revision;
+        cache.sessions.clear();
         return Vec::new();
     }
 
     // Query sessions — use flexible column access via pragma
-    let columns = get_table_columns(&conn, "sessions");
+    let columns = get_table_columns(&snapshot, "sessions");
 
     let query = "SELECT * FROM sessions ORDER BY rowid DESC LIMIT 500";
-    let mut stmt = match conn.prepare(query) {
+    let mut stmt = match snapshot.prepare(query) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            cache.path = None;
+            cache.revision = None;
+            cache.sessions.clear();
+            return Vec::new();
+        }
     };
 
     let mut sessions = Vec::new();
     let rows = match stmt.query_map([], |row| Ok(row_to_json(row, &columns))) {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            cache.path = None;
+            cache.revision = None;
+            cache.sessions.clear();
+            return Vec::new();
+        }
     };
 
     let db_source = format!("sqlite:{}", db_path.display());
 
-    for row_result in rows.flatten() {
-        if let Some(meta) = sqlite_row_to_session_meta(&row_result, &db_source) {
-            sessions.push(meta);
+    for row_result in rows {
+        match row_result {
+            Ok(row) => {
+                if let Some(meta) = sqlite_row_to_session_meta(&row, &db_source) {
+                    sessions.push(meta);
+                }
+            }
+            Err(_) => {
+                cache.path = None;
+                cache.revision = None;
+                cache.sessions.clear();
+                return Vec::new();
+            }
         }
     }
+    drop(stmt);
+    drop(snapshot);
 
+    let rollback_journal = journal_mode.eq_ignore_ascii_case("delete")
+        || journal_mode.eq_ignore_ascii_case("truncate")
+        || journal_mode.eq_ignore_ascii_case("persist");
+    let stable_revision = rollback_journal
+        .then_some(revision)
+        .flatten()
+        .filter(|saved| FileRevision::read(db_path).as_ref() == Some(saved));
+    cache.path = stable_revision.as_ref().map(|_| db_path.to_path_buf());
+    cache.revision = stable_revision;
+    cache.sessions = if cache.revision.is_some() {
+        sessions.clone()
+    } else {
+        Vec::new()
+    };
+    #[cfg(test)]
+    {
+        cache.loads += 1;
+    }
     sessions
 }
 
@@ -284,11 +398,21 @@ fn parse_sqlite_source(source: &str) -> Option<(PathBuf, String)> {
 
 fn scan_sessions_jsonl() -> Vec<SessionMeta> {
     let sessions_dir = get_hermes_sessions_dir();
+    let mut cache = JSONL_SESSIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    cache.refresh(|cache| scan_sessions_jsonl_in_dir(&sessions_dir, cache))
+}
+
+fn scan_sessions_jsonl_in_dir(
+    sessions_dir: &Path,
+    cache: &mut FileCache<Option<SessionMeta>>,
+) -> Vec<SessionMeta> {
     if !sessions_dir.exists() {
         return Vec::new();
     }
 
-    let entries = match std::fs::read_dir(&sessions_dir) {
+    let entries = match std::fs::read_dir(sessions_dir) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
@@ -300,16 +424,27 @@ fn scan_sessions_jsonl() -> Vec<SessionMeta> {
         if ext != Some("jsonl") && ext != Some("json") {
             continue;
         }
-        if let Some(meta) = parse_jsonl_session(&path) {
+        if let Some(meta) = cache
+            .read(&path, |file| {
+                Ok::<_, std::io::Error>(parse_jsonl_session_from_file(&path, file))
+            })
+            .flatten()
+        {
             sessions.push(meta);
         }
     }
     sessions
 }
 
+#[cfg(test)]
 fn parse_jsonl_session(path: &Path) -> Option<SessionMeta> {
+    let mut file = File::open(path).ok()?;
+    parse_jsonl_session_from_file(path, &mut file)
+}
+
+fn parse_jsonl_session_from_file(file_path: &Path, file: &mut File) -> Option<SessionMeta> {
     // Read head (metadata + first user message) and tail (last timestamp)
-    let (head, tail) = read_head_tail_lines(path, 30, 10).ok()?;
+    let (head, tail) = read_open_file_head_tail_lines(file, 30, 10).ok()?;
 
     let mut first_user_msg: Option<String> = None;
     let mut first_ts: Option<i64> = None;
@@ -407,13 +542,14 @@ fn parse_jsonl_session(path: &Path) -> Option<SessionMeta> {
 
     // Fall back to filename as session ID
     let session_id = session_id.unwrap_or_else(|| {
-        path.file_stem()
+        file_path
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
             .to_string()
     });
 
-    let source_path = path.to_string_lossy().to_string();
+    let source_path = file_path.to_string_lossy().to_string();
 
     Some(SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
@@ -549,6 +685,72 @@ mod tests {
         let meta = parse_jsonl_session(&path).expect("should parse");
         assert_eq!(meta.session_id, "my-session");
         assert!(meta.title.is_some()); // Falls back to first user message
+    }
+
+    #[test]
+    fn jsonl_listing_reuses_unchanged_metadata_and_reloads_revisions() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("cached-session.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"id\":\"s1\",\"title\":\"First\"}\n",
+        )
+        .expect("write session");
+
+        let mut cache = FileCache::default();
+        for _ in 0..5 {
+            let sessions = cache.refresh(|cache| scan_sessions_jsonl_in_dir(dir.path(), cache));
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].title.as_deref(), Some("First"));
+        }
+        assert_eq!(cache.loads, 1);
+
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"id\":\"s1\",\"title\":\"Second\"}\n",
+        )
+        .expect("rewrite session");
+        let sessions = cache.refresh(|cache| scan_sessions_jsonl_in_dir(dir.path(), cache));
+        assert_eq!(sessions[0].title.as_deref(), Some("Second"));
+        assert_eq!(cache.loads, 2);
+    }
+
+    #[test]
+    fn sqlite_listing_reuses_unchanged_rollback_snapshot() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).expect("open database");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                cwd TEXT,
+                started_at TEXT,
+                ended_at TEXT
+            );
+            INSERT INTO sessions VALUES (
+                's1', 'First', '/tmp/project',
+                '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z'
+            );",
+        )
+        .expect("seed database");
+        drop(conn);
+
+        let mut cache = SqliteSessionCache::default();
+        for _ in 0..5 {
+            let sessions = scan_sessions_sqlite_with_cache(&path, &mut cache);
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].title.as_deref(), Some("First"));
+        }
+        assert_eq!(cache.loads, 1);
+
+        let conn = Connection::open(&path).expect("reopen database");
+        conn.execute("UPDATE sessions SET title = 'Second'", [])
+            .expect("rewrite database");
+        drop(conn);
+        let sessions = scan_sessions_sqlite_with_cache(&path, &mut cache);
+        assert_eq!(sessions[0].title.as_deref(), Some("Second"));
+        assert_eq!(cache.loads, 2);
     }
 
     #[test]

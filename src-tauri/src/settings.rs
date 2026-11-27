@@ -754,7 +754,7 @@ pub struct AppSettings {
     /// Auto-backup interval in hours (default 24, 0 = disabled)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_interval_hours: Option<u32>,
-    /// Maximum number of backup files to retain (default 10)
+    /// Maximum number of backup files to retain (hard capped at 2)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_retain_count: Option<u32>,
 
@@ -1084,6 +1084,13 @@ pub fn get_settings() -> AppSettings {
             e.into_inner()
         })
         .clone()
+}
+
+#[cfg(not(test))]
+pub(crate) fn codex_recovery_budget_for_provider(provider_id: &str) -> Option<u32> {
+    let settings = settings_store().read().ok()?;
+    (settings.current_provider_codex.as_deref() == Some(provider_id))
+        .then(|| settings.stream_recovery_budget())
 }
 
 pub fn get_settings_for_frontend() -> AppSettings {
@@ -1679,7 +1686,7 @@ pub fn effective_backup_interval_hours() -> u32 {
         .unwrap_or(24)
 }
 
-/// Get the effective backup retain count (default 10, minimum 1)
+/// Get the effective backup retain count (default 2, bounded to two files)
 pub fn effective_backup_retain_count() -> usize {
     settings_store()
         .read()
@@ -1688,8 +1695,8 @@ pub fn effective_backup_retain_count() -> usize {
             e.into_inner()
         })
         .backup_retain_count
-        .map(|n| (n as usize).max(1))
-        .unwrap_or(10)
+        .map(|n| (n as usize).clamp(1, 2))
+        .unwrap_or(2)
 }
 
 // ===== 终端设置管理函数 =====

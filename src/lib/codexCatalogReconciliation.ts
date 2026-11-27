@@ -4,7 +4,10 @@ import type {
   CodexReasoningEffort,
 } from "@/types";
 import { normalizeCodexReasoning } from "@/lib/codexCatalogSchema";
-import { resolveFetchedCodexModelContextWindow } from "@/utils/codexModelContext";
+import {
+  indexExistingCodexContextModels,
+  resolveFetchedCodexModelContextWindow,
+} from "@/utils/codexModelContext";
 import {
   modelBindingIdentityValues,
   modelIdentityValues,
@@ -73,6 +76,61 @@ export function isCompleteCodexCatalogFetch(apiKeyGroups: unknown): boolean {
 
 function nonEmptyString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+// Catalogs and provider snapshots are plain JSON data. Compare the shared
+// branches by identity and leave object property order out of the comparison.
+export function jsonValuesEqual(
+  left: unknown,
+  right: unknown,
+  ignoredProperty?: string,
+): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right)) return false;
+    if (left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index += 1) {
+      if (
+        !jsonValuesEqual(
+          left[index] ?? null,
+          right[index] ?? null,
+          ignoredProperty,
+        )
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (
+    left === null ||
+    right === null ||
+    typeof left !== "object" ||
+    typeof right !== "object"
+  ) {
+    return false;
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  let propertyCount = 0;
+  for (const key of Object.keys(leftRecord)) {
+    if (key === ignoredProperty) continue;
+    const value = leftRecord[key];
+    if (value === undefined) continue;
+    if (
+      !Object.prototype.hasOwnProperty.call(rightRecord, key) ||
+      !jsonValuesEqual(value, rightRecord[key], ignoredProperty)
+    ) {
+      return false;
+    }
+    propertyCount += 1;
+  }
+  for (const key of Object.keys(rightRecord)) {
+    if (key !== ignoredProperty && rightRecord[key] !== undefined) {
+      propertyCount -= 1;
+    }
+  }
+  return propertyCount === 0;
 }
 
 function rowExplicitUpstreamModel(row: CodexCatalogRowLike): string {
@@ -494,13 +552,10 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
   const updatedIndices = new Set<number>();
   const protocolDeclarationIndices = new Set<number>();
   const refresh = options.existingMetadataMode === "refresh";
-  const resolveContextWindow = (fetched: FetchedCodexCatalogModel) =>
+  const contextSource =
     options.inferContextWindow === false
-      ? (fetched.contextWindow ?? undefined)
-      : resolveFetchedCodexModelContextWindow(fetched, {
-          ...source,
-          existingModels: rows,
-        });
+      ? undefined
+      : { ...source, existingModels: indexExistingCodexContextModels(rows) };
 
   for (const [fetchedIndex, fetched] of fetchedModels.entries()) {
     const wireModel =
@@ -511,12 +566,15 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
     const fetchedIdentities = modelIdentityValues(fetched);
     if (!wireModel || !model || fetchedIdentities.length === 0) continue;
     const existingIndices = existingIndicesByFetchedIndex.get(fetchedIndex);
+    if (!existingIndices && !options.appendNew) continue;
+    const contextWindow = contextSource
+      ? resolveFetchedCodexModelContextWindow(fetched, contextSource)
+      : fetched.contextWindow;
     for (const existingIndex of existingIndices ?? []) {
       const row = next[existingIndex];
       if (fetched.protocolCapability) {
         protocolDeclarationIndices.add(existingIndex);
       }
-      const contextWindow = resolveContextWindow(fetched);
       const patch: Partial<CodexCatalogRowLike> = {};
       const currentUpstream = rowExplicitUpstreamModel(row);
       if (
@@ -555,8 +613,7 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       const patchRecord = patch as Record<string, unknown>;
       const rowRecord = row as Record<string, unknown>;
       for (const [key, value] of Object.entries(patchRecord)) {
-        if (JSON.stringify(rowRecord[key]) === JSON.stringify(value))
-          delete patchRecord[key];
+        if (jsonValuesEqual(rowRecord[key], value)) delete patchRecord[key];
       }
       if (Object.keys(patch).length > 0) {
         const updatedRow = { ...row, ...patch } as T;
@@ -573,8 +630,6 @@ export function reconcileFetchedCodexCatalogRows<T extends CodexCatalogRowLike>(
       }
     }
     if (existingIndices?.length) continue;
-    if (!options.appendNew) continue;
-    const contextWindow = resolveContextWindow(fetched);
     const seed: CodexCatalogRowSeed = {
       model,
       upstreamModel: wireModel,

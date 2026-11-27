@@ -6,7 +6,8 @@
 use crate::proxy::providers::CODEX_OAUTH_ORIGINATOR;
 use crate::services::model_fetch::{
     explicit_positive_model_limit, extract_model_identity_fields, extract_output_modalities,
-    FetchedModel,
+    read_bounded_model_body, read_model_fetch_error_body, FetchedModel, ModelBodyError,
+    MAX_MODEL_RESPONSE_BYTES, MAX_MODEL_RESPONSE_ROWS,
 };
 use once_cell::sync::Lazy;
 use serde::Serialize;
@@ -22,12 +23,11 @@ const CODEX_PUBLIC_MODELS_URL: &str =
     "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json";
 const CODEX_OAUTH_FETCH_TIMEOUT_SECS: u64 = 15;
 const CODEX_PUBLIC_MODELS_FETCH_TIMEOUT_SECS: u64 = 10;
-const CODEX_PUBLIC_MODELS_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const CODEX_PUBLIC_MODELS_MAX_BYTES: usize = 8 * 1024 * 1024;
 // A failed public GitHub fetch must not turn every synchronous config projection
 // into another 10-second network wait. It is deliberately short: this is only
 // an in-process outage backoff, not a replacement for the six-hour cache TTL.
 const CODEX_PUBLIC_MODELS_FAILURE_COOLDOWN_SECS: u64 = 60;
-const ERROR_BODY_MAX_CHARS: usize = 512;
 const CODEX_OAUTH_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static CODEX_PUBLIC_CATALOG_REFRESH_GATE: Lazy<Mutex<CatalogRefreshGate>> =
@@ -47,17 +47,26 @@ const AUTHENTICATED_MODEL_LIMITS_MAX_ID_BYTES: usize = 256;
 #[derive(Default)]
 struct AuthenticatedModelLimitsCache {
     accounts: HashMap<String, (Instant, Vec<FetchedModel>)>,
+    revision: u64,
 }
 
 impl AuthenticatedModelLimitsCache {
+    fn prune_expired(&mut self, now: Instant) {
+        let previous = self.accounts.len();
+        self.accounts.retain(|_, (fetched_at, _)| {
+            now.saturating_duration_since(*fetched_at) < AUTHENTICATED_MODEL_LIMITS_TTL
+        });
+        if self.accounts.len() != previous {
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
     fn record(&mut self, account_id: &str, models: &[FetchedModel], now: Instant) {
         let account_id = account_id.trim();
         if account_id.is_empty() || account_id.len() > AUTHENTICATED_MODEL_LIMITS_MAX_ID_BYTES {
             return;
         }
-        self.accounts.retain(|_, (fetched_at, _)| {
-            now.saturating_duration_since(*fetched_at) < AUTHENTICATED_MODEL_LIMITS_TTL
-        });
+        self.prune_expired(now);
         if !self.accounts.contains_key(account_id)
             && self.accounts.len() >= AUTHENTICATED_MODEL_LIMITS_MAX_ACCOUNTS
         {
@@ -87,12 +96,11 @@ impl AuthenticatedModelLimitsCache {
             })
             .collect();
         self.accounts.insert(account_id.to_string(), (now, limits));
+        self.revision = self.revision.wrapping_add(1);
     }
 
     fn get(&mut self, account_id: &str, now: Instant) -> Vec<FetchedModel> {
-        self.accounts.retain(|_, (fetched_at, _)| {
-            now.saturating_duration_since(*fetched_at) < AUTHENTICATED_MODEL_LIMITS_TTL
-        });
+        self.prune_expired(now);
         self.accounts
             .get(account_id.trim())
             .map(|(_, models)| models.clone())
@@ -114,6 +122,12 @@ pub(crate) fn authenticated_model_limits(account_id: &str) -> Vec<FetchedModel> 
         .lock()
         .map(|mut cache| cache.get(account_id, Instant::now()))
         .unwrap_or_default()
+}
+
+pub(crate) fn authenticated_model_limits_revision() -> Option<u64> {
+    let mut cache = AUTHENTICATED_MODEL_LIMITS.lock().ok()?;
+    cache.prune_expired(Instant::now());
+    Some(cache.revision)
 }
 
 pub(crate) fn register_public_catalog_app_handle(app_handle: tauri::AppHandle) {
@@ -239,15 +253,25 @@ pub async fn fetch_models_with_token(
 
     let status = response.status();
     if !status.is_success() {
-        let body = truncate_body(response.text().await.unwrap_or_default());
+        let body =
+            read_model_fetch_error_body(response, &[token.to_owned(), workspace_id.to_owned()])
+                .await;
         return Err(format!("HTTP {status}: {body}"));
     }
 
-    let value: Value = response
-        .json()
+    let body = read_bounded_model_body(response.bytes_stream(), MAX_MODEL_RESPONSE_BYTES)
         .await
-        .map_err(|e| format!("Failed to parse response: {e}"))?;
+        .map_err(|error| format!("Failed to read response: {error}"))?;
+    let value: Value = serde_json::from_slice(&body)
+        .map_err(|error| format!("Failed to parse response: {error}"))?;
 
+    validate_codex_model_row_budget(
+        model_array(&value).map_or(0, <[Value]>::len),
+        value
+            .get("models")
+            .and_then(Value::as_object)
+            .map_or(0, serde_json::Map::len),
+    )?;
     Ok(parse_models(value))
 }
 
@@ -484,41 +508,47 @@ async fn fetch_public_official_catalog_from_url(url: &str) -> Result<Vec<Value>,
 
     let status = response.status();
     if !status.is_success() {
-        let body = truncate_body(response.text().await.unwrap_or_default());
+        let body = read_model_fetch_error_body(response, &[]).await;
         return Err(format!("HTTP {status}: {body}"));
     }
     if response
         .content_length()
-        .is_some_and(|length| length > CODEX_PUBLIC_MODELS_MAX_BYTES)
+        .is_some_and(|length| length > CODEX_PUBLIC_MODELS_MAX_BYTES as u64)
     {
         return Err("OpenAI public Codex model catalog exceeds 8 MiB".to_string());
     }
 
-    let body = response
-        .bytes()
+    let body = read_bounded_model_body(response.bytes_stream(), CODEX_PUBLIC_MODELS_MAX_BYTES)
         .await
-        .map_err(|error| format!("Failed to read public model catalog: {error}"))?;
-    if body.len() as u64 > CODEX_PUBLIC_MODELS_MAX_BYTES {
-        return Err("OpenAI public Codex model catalog exceeds 8 MiB".to_string());
-    }
-    let value: Value = serde_json::from_slice(&body)
+        .map_err(|error| match error {
+            ModelBodyError::TooLarge(_) => {
+                "OpenAI public Codex model catalog exceeds 8 MiB".to_string()
+            }
+            ModelBodyError::Transport(error) => {
+                format!("Failed to read public model catalog: {error}")
+            }
+        })?;
+    let mut value: Value = serde_json::from_slice(&body)
         .map_err(|error| format!("Failed to parse public model catalog: {error}"))?;
-    let models = value
-        .get("models")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "OpenAI public Codex model catalog has no models array".to_string())?;
+    let Some(Value::Array(models)) = value.get_mut("models").map(Value::take) else {
+        return Err("OpenAI public Codex model catalog has no models array".to_string());
+    };
+    validate_codex_model_row_budget(models.len(), 0)?;
     let sanitized = models
-        .iter()
+        .into_iter()
         .filter_map(sanitize_public_official_model)
         .collect::<Vec<_>>();
-    if parse_cached_models(serde_json::json!({ "models": sanitized })).is_empty() {
+    if !sanitized
+        .iter()
+        .any(|entry| parse_model_entry(entry, None).is_some())
+    {
         return Err("OpenAI public Codex model catalog has no usable models".to_string());
     }
     Ok(sanitized)
 }
 
-fn sanitize_public_official_model(model: &Value) -> Option<Value> {
-    let mut model = model.as_object()?.clone();
+fn sanitize_public_official_model(mut model: Value) -> Option<Value> {
+    let fields = model.as_object_mut()?;
     for field in [
         "model_messages",
         "modelMessages",
@@ -528,9 +558,9 @@ fn sanitize_public_official_model(model: &Value) -> Option<Value> {
         "instructions_template",
         "instructionsTemplate",
     ] {
-        model.remove(field);
+        fields.remove(field);
     }
-    Some(Value::Object(model))
+    Some(model)
 }
 
 pub(crate) fn public_catalog_models_changed(previous: &[Value], next: &[Value]) -> bool {
@@ -554,27 +584,43 @@ fn parse_cached_models(value: Value) -> Vec<FetchedModel> {
     parse_models(value)
 }
 
-/// 解析 ChatGPT Codex 模型列表响应，兼容数组、`data`、`items` 和 map 形态。
-fn parse_models(value: Value) -> Vec<FetchedModel> {
-    let entries = value
+fn model_array(value: &Value) -> Option<&[Value]> {
+    value
         .get("data")
         .and_then(Value::as_array)
         .or_else(|| value.get("models").and_then(Value::as_array))
         .or_else(|| value.get("items").and_then(Value::as_array))
-        .or_else(|| value.as_array());
+        .or_else(|| value.as_array())
+        .map(Vec::as_slice)
+}
 
+fn validate_codex_model_row_budget(array_rows: usize, map_rows: usize) -> Result<(), String> {
+    if array_rows.saturating_add(map_rows) > MAX_MODEL_RESPONSE_ROWS {
+        return Err(format!(
+            "Codex model catalog exceeds the maximum supported model count ({MAX_MODEL_RESPONSE_ROWS})"
+        ));
+    }
+    Ok(())
+}
+
+/// 解析 ChatGPT Codex 模型列表响应，兼容数组、`data`、`items` 和 map 形态。
+fn parse_models(value: Value) -> Vec<FetchedModel> {
     let mut models = Vec::new();
 
-    if let Some(entries) = entries {
-        for entry in entries {
-            push_model_entry(&mut models, entry, None);
-        }
+    if let Some(entries) = model_array(&value) {
+        models.extend(
+            entries
+                .iter()
+                .filter_map(|entry| parse_model_entry(entry, None)),
+        );
     }
 
     if let Some(model_map) = value.get("models").and_then(Value::as_object) {
-        for (key, entry) in model_map {
-            push_model_entry(&mut models, entry, Some(key));
-        }
+        models.extend(
+            model_map
+                .iter()
+                .filter_map(|(key, entry)| parse_model_entry(entry, Some(key))),
+        );
     }
 
     models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -582,55 +628,31 @@ fn parse_models(value: Value) -> Vec<FetchedModel> {
     models
 }
 
-/// 将单个响应条目追加到模型列表。
+/// 解析单个响应条目。
 ///
 /// 条目可能只是字符串模型名，也可能是包含 `slug/id/model/name` 的对象；
 /// `fallback_id` 仅用于 map 形态，避免对象里没有显式 id 时丢失 key。
-fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: Option<&str>) {
-    if let Some(id) = entry.as_str().map(str::trim).filter(|id| !id.is_empty()) {
-        models.push(FetchedModel {
-            context_window: None,
+fn parse_model_entry(entry: &Value, fallback_id: Option<&str>) -> Option<FetchedModel> {
+    let fallback_id = fallback_id.map(str::trim).filter(|id| !id.is_empty());
+    let Some(obj) = entry.as_object() else {
+        let id = entry
+            .as_str()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .or(fallback_id)?;
+        return Some(FetchedModel {
             id: id.to_string(),
-            input_modalities: None,
             owned_by: Some("Codex".to_string()),
-            supports_image: None,
-            reasoning: None,
-            protocol_capability: None,
-            is_free: None,
             ..Default::default()
         });
-        return;
-    }
-
-    let Some(obj) = entry.as_object() else {
-        if let Some(id) = fallback_id.map(str::trim).filter(|id| !id.is_empty()) {
-            models.push(FetchedModel {
-                context_window: None,
-                id: id.to_string(),
-                input_modalities: None,
-                owned_by: Some("Codex".to_string()),
-                supports_image: None,
-                reasoning: None,
-                protocol_capability: None,
-                is_free: None,
-                ..Default::default()
-            });
-        }
-        return;
     };
 
     if model_entry_is_explicitly_unavailable(obj) {
-        return;
+        return None;
     }
 
-    let Some(id) = string_field(obj, &["slug", "id", "model", "name"]).or_else(|| {
-        fallback_id
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-    }) else {
-        return;
-    };
+    let id = string_field(obj, &["slug", "id", "model", "name"])
+        .or_else(|| fallback_id.map(str::to_string))?;
     let owned_by = string_field(
         obj,
         &[
@@ -650,7 +672,7 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
         )
         .and_then(|capability| serde_json::to_value(capability).ok());
 
-    models.push(FetchedModel {
+    Some(FetchedModel {
         context_window,
         max_context_window: explicit_positive_model_limit(
             obj,
@@ -680,7 +702,7 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
         effort: None,
         protocol_capability: None,
         is_free: None,
-    });
+    })
 }
 
 /// 判断官方 Codex 模型条目是否显式标为不可调用。
@@ -793,18 +815,28 @@ fn extract_supports_image(
     })
 }
 
-fn truncate_body(body: String) -> String {
-    if body.chars().count() <= ERROR_BODY_MAX_CHARS {
-        body
-    } else {
-        let mut s: String = body.chars().take(ERROR_BODY_MAX_CHARS).collect();
-        s.push_str("...");
-        s
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn authenticated_model_limits_revision_changes_on_refresh_and_at_expiration() {
+        let mut cache = AuthenticatedModelLimitsCache::default();
+        let now = Instant::now();
+        let initial = cache.revision;
+        cache.record("account", &[], now);
+        assert_ne!(cache.revision, initial);
+        let first = cache.revision;
+        cache.record("account", &[], now + Duration::from_secs(10));
+        assert_ne!(cache.revision, first);
+        let current = cache.revision;
+        cache.prune_expired(now + AUTHENTICATED_MODEL_LIMITS_TTL);
+        assert_eq!(cache.revision, current);
+        cache.prune_expired(now + AUTHENTICATED_MODEL_LIMITS_TTL + Duration::from_secs(10));
+        assert_ne!(cache.revision, current);
+        let expired = cache.revision;
+        cache.prune_expired(now + AUTHENTICATED_MODEL_LIMITS_TTL + Duration::from_secs(11));
+        assert_eq!(cache.revision, expired);
+    }
+
     #[test]
     fn official_context_account_cache_is_scoped_bounded_and_redacts_extra_metadata() {
         let mut cache = super::AuthenticatedModelLimitsCache::default();
@@ -878,7 +910,7 @@ mod tests {
     }
 
     use super::*;
-    use axum::{routing::get, Json, Router};
+    use axum::{body::Body, routing::get, Json, Router};
     use serde_json::json;
 
     #[test]
@@ -916,18 +948,11 @@ mod tests {
         );
     }
 
-    async fn spawn_public_catalog_server(body: Value) -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_public_catalog_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind public catalog fixture");
         let address = listener.local_addr().expect("fixture address");
-        let app = Router::new().route(
-            "/models.json",
-            get(move || {
-                let body = body.clone();
-                async move { Json(body) }
-            }),
-        );
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
@@ -1240,7 +1265,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_official_catalog_supports_future_names_without_importing_instructions() {
-        let (url, server) = spawn_public_catalog_server(json!({
+        let response = json!({
             "models": [{
                 "slug": "aurora-code",
                 "display_name": "Aurora Code",
@@ -1248,8 +1273,9 @@ mod tests {
                 "model_messages": {"instructions_template": "remote instructions"},
                 "base_instructions": "remote base instructions"
             }]
-        }))
-        .await;
+        });
+        let app = Router::new().route("/models.json", get(move || async move { Json(response) }));
+        let (url, server) = spawn_public_catalog_server(app).await;
 
         let models = fetch_public_official_catalog_from_url(&url)
             .await
@@ -1263,11 +1289,45 @@ mod tests {
 
     #[tokio::test]
     async fn public_official_catalog_rejects_a_response_without_a_models_array() {
-        let (url, server) = spawn_public_catalog_server(json!({"data": []})).await;
+        let app = Router::new().route("/models.json", get(|| async { Json(json!({"data": []})) }));
+        let (url, server) = spawn_public_catalog_server(app).await;
         let error = fetch_public_official_catalog_from_url(&url)
             .await
             .expect_err("malformed catalog must not replace a trusted cache");
         server.abort();
         assert!(error.contains("no models array"));
+    }
+
+    #[tokio::test]
+    async fn public_official_catalog_rejects_oversized_chunked_body_before_eof() {
+        let app = Router::new().route(
+            "/models.json",
+            get(|| async {
+                use futures::StreamExt;
+
+                const CHUNK_BYTES: usize = 64 * 1024;
+                let chunk = bytes::Bytes::from_static(&[b' '; CHUNK_BYTES]);
+                let chunks = futures::stream::iter(
+                    (0..=(CODEX_PUBLIC_MODELS_MAX_BYTES / CHUNK_BYTES))
+                        .map(move |_| Ok::<_, std::convert::Infallible>(chunk.clone())),
+                )
+                .chain(futures::stream::pending());
+                Body::from_stream(chunks)
+            }),
+        );
+        let (url, server) = spawn_public_catalog_server(app).await;
+
+        let result = fetch_public_official_catalog_from_url(&url).await;
+        server.abort();
+        assert_eq!(
+            result.unwrap_err(),
+            "OpenAI public Codex model catalog exceeds 8 MiB"
+        );
+    }
+
+    #[test]
+    fn codex_remote_model_row_budget_combines_array_and_map_rows() {
+        assert!(validate_codex_model_row_budget(MAX_MODEL_RESPONSE_ROWS - 1, 1).is_ok());
+        assert!(validate_codex_model_row_budget(MAX_MODEL_RESPONSE_ROWS, 1).is_err());
     }
 }

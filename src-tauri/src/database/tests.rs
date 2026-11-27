@@ -1922,6 +1922,116 @@ fn model_pricing_repairs_known_upstream_prices_without_overwriting_custom_rows()
 }
 
 #[test]
+fn provider_revision_tracks_committed_local_writes_and_preserves_rollback_visibility() {
+    let db = Database::memory().unwrap();
+    let initial = db.provider_revision().unwrap();
+    db.set_setting("test-unrelated-provider-revision", "updated")
+        .unwrap();
+    assert_eq!(db.provider_revision().unwrap(), initial);
+
+    let mut provider = Provider::with_id(
+        "provider-revision-local".to_string(),
+        "Local provider".to_string(),
+        json!({"fixture": "original"}),
+        None,
+    );
+    db.save_provider("codex", &provider).unwrap();
+    let inserted = db.provider_revision().unwrap();
+    assert_ne!(inserted, initial);
+
+    {
+        let mut conn = db.conn.lock().unwrap();
+        let transaction = conn.transaction().unwrap();
+        assert_eq!(
+            transaction
+                .execute(
+                    "UPDATE providers SET settings_config = ?1 WHERE id = ?2 AND app_type = 'codex'",
+                    params![json!({"fixture": "uncommitted"}).to_string(), provider.id],
+                )
+                .unwrap(),
+            1
+        );
+        transaction.rollback().unwrap();
+    }
+    // The update hook may advance the revision for a rolled-back write.
+    let after_rollback = db.provider_revision().unwrap();
+    let rows = db
+        .get_providers_by_id("codex", [provider.id.as_str()])
+        .unwrap();
+    assert_eq!(rows[&provider.id].settings_config, provider.settings_config);
+    assert_eq!(db.provider_revision().unwrap(), after_rollback);
+
+    provider.settings_config["fixture"] = json!("committed");
+    db.save_provider("codex", &provider).unwrap();
+    let updated = db.provider_revision().unwrap();
+    assert_ne!(updated, after_rollback);
+    let rows = db
+        .get_providers_by_id("codex", [provider.id.as_str()])
+        .unwrap();
+    assert_eq!(rows[&provider.id].settings_config, provider.settings_config);
+
+    db.delete_provider("codex", &provider.id).unwrap();
+    assert_ne!(db.provider_revision().unwrap(), updated);
+    assert!(db
+        .get_providers_by_id("codex", [provider.id.as_str()])
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn provider_revision_tracks_external_commits_and_batch_reads_share_one_snapshot() {
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join("provider-snapshot.sqlite");
+    let conn = Connection::open(&path).unwrap();
+    let journal_mode: String = conn
+        .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode, "wal");
+    let db = Database::from_connection(conn);
+    db.create_tables().unwrap();
+    for id in ["first", "second"] {
+        let provider = Provider::with_id(id.to_string(), id.to_string(), json!({}), None);
+        db.save_provider("codex", &provider).unwrap();
+    }
+
+    let before = db.provider_revision().unwrap();
+    let mut external = Connection::open(path).unwrap();
+    let transaction = external.transaction().unwrap();
+    assert_eq!(
+        transaction
+            .execute(
+                "UPDATE providers SET name = 'updated' WHERE app_type = 'codex'",
+                [],
+            )
+            .unwrap(),
+        2
+    );
+    assert_eq!(db.provider_revision().unwrap(), before);
+    transaction.rollback().unwrap();
+    assert_eq!(db.provider_revision().unwrap(), before);
+
+    // Commit between the two ID reads while WAL allows the snapshot to stay open.
+    let ids = std::iter::once("first").chain(std::iter::once_with(|| {
+        external
+            .execute(
+                "UPDATE providers SET name = 'committed' WHERE app_type = 'codex'",
+                [],
+            )
+            .unwrap();
+        "second"
+    }));
+    let snapshot = db.get_providers_by_id("codex", ids).unwrap();
+    assert_eq!(snapshot["first"].name, "first");
+    assert_eq!(snapshot["second"].name, "second");
+    assert_ne!(db.provider_revision().unwrap(), before);
+    let changed = db
+        .get_providers_by_id("codex", ["first", "second"])
+        .unwrap();
+    assert_eq!(changed["first"].name, "committed");
+    assert_eq!(changed["second"].name, "committed");
+}
+
+#[test]
 fn ensure_incremental_auto_vacuum_rebuilds_existing_file_db() {
     let temp = NamedTempFile::new().expect("create temp db file");
     let path = temp.path().to_path_buf();

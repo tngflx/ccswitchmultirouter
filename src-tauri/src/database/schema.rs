@@ -317,8 +317,8 @@ impl Database {
 
         // 18. Session Log Sync 表 (会话日志同步状态)
         //
-        // last_byte_offset / last_tail_fingerprint 只由 Claude 增量扫描使用；
-        // NULL 保留旧行号游标和其他会话解析器的既有语义。
+        // Claude and Grok Build use the optional byte boundary and fingerprint
+        // to verify the committed prefix. Older rows have these fields unset.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS session_log_sync (
                 file_path TEXT PRIMARY KEY,
@@ -326,7 +326,9 @@ impl Database {
                 last_line_offset INTEGER NOT NULL DEFAULT 0,
                 last_synced_at INTEGER NOT NULL,
                 last_byte_offset INTEGER,
-                last_tail_fingerprint INTEGER
+                last_tail_fingerprint INTEGER,
+                last_source_revision INTEGER,
+                deferred_until INTEGER
             )",
             [],
         )
@@ -621,6 +623,10 @@ impl Database {
                     25 => {
                         Self::create_orchestration_tables(conn)?;
                         Self::set_user_version(conn, 26)?;
+                    }
+                    26 => {
+                        Self::migrate_v26_to_v27(conn)?;
+                        Self::set_user_version(conn, 27)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1361,6 +1367,20 @@ impl Database {
         }
 
         log::info!("v7 -> v8 迁移完成：data_source 列、session_log_sync 表、修正 13 个模型定价");
+        Ok(())
+    }
+
+    /// v26 -> v27: persist source revisions alongside the existing import cursors.
+    fn migrate_v26_to_v27(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "session_log_sync")? {
+            Self::add_column_if_missing(
+                conn,
+                "session_log_sync",
+                "last_source_revision",
+                "INTEGER",
+            )?;
+            Self::add_column_if_missing(conn, "session_log_sync", "deferred_until", "INTEGER")?;
+        }
         Ok(())
     }
 
@@ -4424,6 +4444,43 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         assert_eq!(cursor, (3, None, None));
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_session_cursor_v26_upgrade_preserves_committed_progress() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE session_log_sync (
+                file_path TEXT PRIMARY KEY,
+                last_modified INTEGER NOT NULL,
+                last_line_offset INTEGER NOT NULL DEFAULT 0,
+                last_synced_at INTEGER NOT NULL,
+                last_byte_offset INTEGER,
+                last_tail_fingerprint INTEGER
+             );
+             INSERT INTO session_log_sync VALUES ('session.jsonl', 5, 3, 1, 248, 42);",
+        )?;
+        Database::set_user_version(&conn, 26)?;
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        let cursor: (i64, i64, i64, Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT last_line_offset, last_byte_offset, last_tail_fingerprint,
+                    last_source_revision, deferred_until
+             FROM session_log_sync WHERE file_path = 'session.jsonl'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(cursor, (3, 248, 42, None, None));
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
         Ok(())
     }
 

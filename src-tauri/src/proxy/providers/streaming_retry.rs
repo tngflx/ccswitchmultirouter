@@ -38,7 +38,7 @@ use crate::proxy::forwarder::{
     parse_retry_after_delay, CODEX_RATE_LIMIT_MAX_SINGLE_DELAY, CODEX_RATE_LIMIT_TOTAL_DELAY_BUDGET,
 };
 use crate::proxy::hyper_client::ProxyResponse;
-use crate::proxy::sse::{strip_sse_field, take_sse_block, BoundedSseFrames, SseFrame};
+use crate::proxy::sse::{strip_sse_field, BoundedSseFrames, SseBlocks, SseFrame};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -127,12 +127,16 @@ impl ReconnectTerminal {
         error
     }
 
+    #[cfg(test)]
     fn native(self, response_id: Option<&str>) -> Bytes {
+        self.native_frame(response_id).bytes
+    }
+
+    fn native_frame(self, response_id: Option<&str>) -> NativeResponsesFrame {
         let payload = json!({"type":"error","error":self.error()});
-        native_responses_client_failure(
-            Bytes::from(format!("event: error\ndata: {payload}\n\n")),
+        normalize_native_responses_failure(
+            NativeResponsesFrame::new(Bytes::new(), Some(payload), true),
             Some("error"),
-            Some(&payload),
             response_id,
         )
     }
@@ -1131,8 +1135,16 @@ fn parse_raw_responses_sse_payload(data: &str) -> Option<Value> {
 }
 
 fn raw_responses_sse_event_and_payload(block: &[u8]) -> (Option<String>, Option<Value>) {
+    let (event, payload, _) = inspect_raw_responses_sse_block(block, false);
+    (event, payload)
+}
+
+fn inspect_raw_responses_sse_block(
+    block: &[u8],
+    track_usage: bool,
+) -> (Option<String>, Option<Value>, bool) {
     let Ok(text) = std::str::from_utf8(block) else {
-        return (None, None);
+        return (None, None, false);
     };
     let mut event_name = None;
     let mut data = None::<Cow<'_, str>>;
@@ -1155,8 +1167,12 @@ fn raw_responses_sse_event_and_payload(block: &[u8]) -> (Option<String>, Option<
     }
 
     let payload = data.as_deref().and_then(parse_raw_responses_sse_payload);
+    let collect_usage = track_usage
+        && data
+            .as_deref()
+            .is_some_and(super::super::handler_config::codex_stream_usage_event_filter);
     if multiline && data_before_event {
-        return (raw_responses_sse_event_name(block), payload);
+        return (raw_responses_sse_event_name(block), payload, collect_usage);
     }
     if data_before_event {
         event_name = payload
@@ -1165,7 +1181,7 @@ fn raw_responses_sse_event_and_payload(block: &[u8]) -> (Option<String>, Option<
             .and_then(Value::as_str)
             .or(event_name);
     }
-    (event_name.map(str::to_string), payload)
+    (event_name.map(str::to_string), payload, collect_usage)
 }
 
 #[cfg(test)]
@@ -1486,24 +1502,23 @@ fn log_native_responses_sse_error(
     );
 }
 
-fn native_responses_client_failure(
-    block: Bytes,
+fn normalize_native_responses_failure(
+    frame: NativeResponsesFrame,
     event_name: Option<&str>,
-    payload: Option<&Value>,
     response_id: Option<&str>,
-) -> Bytes {
+) -> NativeResponsesFrame {
     if !matches!(event_name, Some("error" | "response.error")) {
-        return block;
+        return frame;
     }
-    let Some(payload) = payload else {
-        return block;
+    let Some(payload) = frame.payload.as_ref() else {
+        return frame;
     };
     let original = payload
         .pointer("/response/error")
         .or_else(|| payload.get("error"))
         .unwrap_or(payload);
     if !original.is_object() {
-        return block;
+        return frame;
     }
     let mut error = serde_json::Map::new();
     for field in ["type", "code", "message", "param"] {
@@ -1534,7 +1549,22 @@ fn native_responses_client_failure(
     if let Some(sequence) = payload.get("sequence_number") {
         failure["sequence_number"] = sequence.clone();
     }
-    Bytes::from(format!("event: response.failed\ndata: {failure}\n\n"))
+    NativeResponsesFrame::failure(failure)
+}
+
+#[cfg(test)]
+fn native_responses_client_failure(
+    block: Bytes,
+    event_name: Option<&str>,
+    payload: Option<&Value>,
+    response_id: Option<&str>,
+) -> Bytes {
+    normalize_native_responses_failure(
+        NativeResponsesFrame::new(block, payload.cloned(), true),
+        event_name,
+        response_id,
+    )
+    .bytes
 }
 
 pub(crate) fn raw_sse_block_is_comment(block: &[u8]) -> bool {
@@ -1578,7 +1608,7 @@ fn native_responses_failed_terminal_sse(
     response_id: Option<&str>,
     code: &str,
     message: &str,
-) -> Bytes {
+) -> NativeResponsesFrame {
     let mut response = json!({
         "status": "failed",
         "error": {
@@ -1593,7 +1623,32 @@ fn native_responses_failed_terminal_sse(
         "type": "response.failed",
         "response": response,
     });
-    Bytes::from(format!("event: response.failed\ndata: {payload}\n\n"))
+    NativeResponsesFrame::failure(payload)
+}
+
+pub(crate) struct NativeResponsesFrame {
+    pub(crate) bytes: Bytes,
+    pub(crate) payload: Option<Value>,
+    pub(crate) collect_usage: bool,
+}
+
+impl NativeResponsesFrame {
+    fn new(bytes: Bytes, payload: Option<Value>, collect_usage: bool) -> Self {
+        Self {
+            bytes,
+            payload,
+            collect_usage,
+        }
+    }
+
+    fn unparsed(bytes: Bytes) -> Self {
+        Self::new(bytes, None, false)
+    }
+
+    fn failure(payload: Value) -> Self {
+        let bytes = Bytes::from(format!("event: response.failed\ndata: {payload}\n\n"));
+        Self::new(bytes, Some(payload), true)
+    }
 }
 
 /// 原生 Codex Responses 的安全 SSE 重连。
@@ -1617,6 +1672,23 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
     log_context: Option<StreamLogContext>,
     capacity_retry_enabled: bool,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_resilient_responses_sse_frames(
+        initial,
+        reconnector,
+        log_context,
+        capacity_retry_enabled,
+        false,
+    )
+    .map(|frame| frame.map(|frame| frame.bytes))
+}
+
+pub(crate) fn create_resilient_responses_sse_frames(
+    initial: ByteStream,
+    reconnector: Option<StreamReconnector>,
+    log_context: Option<StreamLogContext>,
+    capacity_retry_enabled: bool,
+    track_usage: bool,
+) -> impl Stream<Item = Result<NativeResponsesFrame, std::io::Error>> + Send {
     let mut stream_outcome = NativeStreamOutcomeGuard::new(log_context.as_ref());
     async_stream::stream! {
         stream_outcome.started = true;
@@ -1647,7 +1719,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                         silence += KEEPALIVE_INTERVAL;
                         if (created_forwarded || retry_attempt > 0)
                             && silence <= UPSTREAM_SILENCE_KEEPALIVE_LIMIT {
-                            yield Ok(Bytes::from_static(b": ping\n\n"));
+                            yield Ok(NativeResponsesFrame::unparsed(Bytes::from_static(b": ping\n\n")));
                         }
                         continue;
                     }
@@ -1658,7 +1730,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     if !pending.is_empty() {
                         // 不能验证残块是否只是脚手架；原样发出并关闭重放通道。
                         semantic_output_forwarded = true;
-                        yield Ok(pending);
+                        yield Ok(NativeResponsesFrame::unparsed(pending));
                     }
                     if semantic_output_forwarded {
                         let message = "Upstream Responses SSE ended without a terminal event after semantic output";
@@ -1701,10 +1773,11 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     let SseFrame::Complete(block) = frame else {
                         retry_activity.finish();
                         stream_outcome.finish(NativeStreamOutcome::ProtocolError);
-                        yield Ok(ReconnectTerminal::new("upstream_sse_frame_too_large").native(response_id.as_deref()));
+                        yield Ok(ReconnectTerminal::new("upstream_sse_frame_too_large").native_frame(response_id.as_deref()));
                         break 'attempts;
                     };
-                    let (event_name, payload) = raw_responses_sse_event_and_payload(&block);
+                    let (event_name, payload, collect_usage) =
+                        inspect_raw_responses_sse_block(&block, track_usage);
                     let terminal_disposition =
                         if let (Some(event_name), Some(payload)) =
                             (event_name.as_deref(), payload.as_ref())
@@ -1730,10 +1803,10 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                         (Some("response.created"), _) if verified_created => {
                             created_forwarded = true;
                             response_id = payload.as_ref().and_then(|value| value.pointer("/response/id")).and_then(Value::as_str).map(str::to_string);
-                            yield Ok(block);
+                            yield Ok(NativeResponsesFrame::new(block, payload, collect_usage));
                         }
                         (None, _) if raw_sse_block_is_comment(&block) => {
-                            yield Ok(block);
+                            yield Ok(NativeResponsesFrame::unparsed(block));
                         }
                         (Some(_), Some(disposition)) => {
                             if let Some(context) = log_context.as_ref() {
@@ -1748,12 +1821,12 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                                 NativeResponsesTerminalDisposition::Completed => {
                                     retry_activity.finish();
                                     stream_outcome.finish(NativeStreamOutcome::Completed);
-                                    yield Ok(block);
+                                    yield Ok(NativeResponsesFrame::new(block, payload, collect_usage));
                                 }
                                 NativeResponsesTerminalDisposition::Incomplete => {
                                     retry_activity.finish();
                                     stream_outcome.finish(NativeStreamOutcome::Incomplete);
-                                    yield Ok(block);
+                                    yield Ok(NativeResponsesFrame::new(block, payload, collect_usage));
                                 }
                                 NativeResponsesTerminalDisposition::Failed => {
                                     let capacity_failure = payload.as_ref().is_some_and(|payload| {
@@ -1804,10 +1877,9 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                                     }
                                     retry_activity.finish();
                                     stream_outcome.finish(NativeStreamOutcome::UpstreamFailed);
-                                    yield Ok(native_responses_client_failure(
-                                        block,
+                                    yield Ok(normalize_native_responses_failure(
+                                        NativeResponsesFrame::new(block, payload, collect_usage),
                                         event_name.as_deref(),
-                                        payload.as_ref(),
                                         response_id.as_deref(),
                                     ));
                                 }
@@ -1837,7 +1909,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                                 payload.as_ref(),
                             );
                             semantic_output_forwarded = true;
-                            yield Ok(block);
+                            yield Ok(NativeResponsesFrame::new(block, payload, collect_usage));
                         }
                     }
                 }
@@ -1923,7 +1995,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                     futures::pin_mut!(progress);
                     loop {
                         match progress.next().await.expect("reconnect attempt reports its result") {
-                            ReconnectProgress::Heartbeat => yield Ok(Bytes::from_static(b": ping\n\n")),
+                            ReconnectProgress::Heartbeat => yield Ok(NativeResponsesFrame::unparsed(Bytes::from_static(b": ping\n\n"))),
                             ReconnectProgress::Finished(result) => break result,
                         }
                     }
@@ -1942,7 +2014,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                             } else {
                                 NativeStreamOutcome::UpstreamFailed
                             });
-                            yield Ok(terminal.native(response_id.as_deref()));
+                            yield Ok(terminal.native_frame(response_id.as_deref()));
                             break 'attempts;
                         }
                         if retrying_capacity && !failure.capacity_retryable {
@@ -1953,7 +2025,7 @@ pub(crate) fn create_resilient_responses_sse_stream_with_context(
                             );
                             retry_activity.finish();
                             stream_outcome.finish(NativeStreamOutcome::UpstreamFailed);
-                            yield Ok(terminal.native(response_id.as_deref()));
+                            yield Ok(terminal.native_frame(response_id.as_deref()));
                             break 'attempts;
                         }
                     }
@@ -2431,9 +2503,9 @@ struct ScannedEvent {
 /// 转换器产出的块都是本进程自己构造的 `event: X\ndata: {...}\n\n` 文本；
 /// 这里做一次浅解析以便分类。解析失败的片段按"实质内容"保守处理。
 fn scan_chunk(chunk: &str) -> Vec<ScannedEvent> {
-    let mut buffer = chunk.to_string();
+    let mut blocks = SseBlocks::new(chunk);
     let mut events = Vec::new();
-    while let Some(block) = take_sse_block(&mut buffer) {
+    for block in blocks.by_ref() {
         if block.trim().is_empty() {
             continue;
         }
@@ -2470,11 +2542,11 @@ fn scan_chunk(chunk: &str) -> Vec<ScannedEvent> {
         });
     }
     // 转换器只产出完整块；万一出现残块，按实质内容原样转发，绝不吞字节。
-    if !buffer.is_empty() {
+    if !blocks.remaining().is_empty() {
         events.push(ScannedEvent {
             name: "",
             data: None,
-            raw: buffer,
+            raw: blocks.remaining().to_owned(),
         });
     }
     events
@@ -5793,6 +5865,67 @@ mod tests {
         NATIVE_SSE_JSON_PARSES.with(|count| assert_eq!(count.get(), 1));
         assert!(output.contains("event: response.failed"));
         assert!(output.contains("invalid_api_key"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn messages_stream_reuses_accepted_payloads_across_capacity_replay() {
+        for size in [1, 32 * 1024] {
+            let first_created = created();
+            let first_failure = capacity_failed("model_at_capacity", "Model is at capacity");
+            let delta = text_delta(&"x".repeat(size));
+            let terminal = sse(
+                "response.error",
+                json!({
+                    "type": "response.error",
+                    "response": {"usage": {"input_tokens": 10}},
+                    "error": {"code": "invalid_api_key", "message": "fixture rejection"}
+                }),
+            );
+            let (reconnector, calls) = scripted_reconnector(vec![Ok(streamed_response(&[
+                &first_created,
+                &delta,
+                &terminal,
+            ]))]);
+            let initial = format!("{first_created}{first_failure}");
+            let chunks = initial
+                .as_bytes()
+                .chunks(1)
+                .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>();
+            NATIVE_SSE_JSON_PARSES.with(|count| count.set(0));
+            let frames = create_resilient_responses_sse_frames(
+                Box::pin(stream::iter(chunks)),
+                Some(reconnector.with_capacity_retry(true)),
+                None,
+                true,
+                true,
+            )
+            .collect::<Vec<_>>()
+            .await;
+            NATIVE_SSE_JSON_PARSES.with(|count| assert_eq!(count.get(), 5));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let frames = frames.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+            let payloads = frames
+                .iter()
+                .filter_map(|frame| frame.payload.as_ref())
+                .collect::<Vec<_>>();
+            assert_eq!(payloads.len(), 3);
+            assert_eq!(payloads[0]["type"], "response.created");
+            assert_eq!(payloads[1]["delta"].as_str().unwrap().len(), size);
+            assert_eq!(payloads[2]["type"], "response.failed");
+            assert_eq!(payloads[2]["response"]["error"]["code"], "invalid_api_key");
+            assert_eq!(payloads[2]["response"]["usage"]["input_tokens"], 10);
+            let usage_frames = frames
+                .iter()
+                .filter(|frame| frame.collect_usage)
+                .collect::<Vec<_>>();
+            assert_eq!(usage_frames.len(), 1);
+            assert_eq!(
+                raw_responses_sse_payload(&usage_frames[0].bytes).as_ref(),
+                Some(payloads[2])
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

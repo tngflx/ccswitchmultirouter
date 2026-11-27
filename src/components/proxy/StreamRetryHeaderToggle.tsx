@@ -47,6 +47,7 @@ interface CodexUsageLimitResumeResult {
   deferred: number;
   skipped: number;
   uncertain: number;
+  desktopUnavailable?: number;
 }
 
 interface CodexUsageLimitResumeButtonProps {
@@ -74,20 +75,33 @@ export function CodexUsageLimitResumeButton({
   const submitting = useRef(false);
   const [pendingCount, setPendingCount] =
     useState<CodexUsageLimitResumeCount | null>(null);
+  const [isSending, setIsSending] = useState(false);
+  const [lastSubmission, setLastSubmission] = useState<
+    CodexUsageLimitResumeResult | "failed" | null
+  >(null);
   if (!visible) return null;
 
   const hasResult = !countQuery.isError && countQuery.data !== undefined;
   const availableCount = hasResult ? countQuery.data : null;
   const canResume = availableCount !== null && availableCount.count > 0;
-  const displayedCount = pendingCount ?? availableCount;
+  const displayedCount =
+    pendingCount ?? (countQuery.isFetching ? null : availableCount);
+  const isIncompleteEmpty =
+    displayedCount?.complete === false && displayedCount.count === 0;
   const isChecking = countQuery.isFetching && !hasResult;
   const isRefreshing = countQuery.isFetching && hasResult;
-  const busy = pendingCount !== null || isChecking;
+  const busy = pendingCount !== null || isChecking || isRefreshing;
+  const lastResult = lastSubmission === "failed" ? null : lastSubmission;
+  const desktopUnavailable = lastResult?.desktopUnavailable ?? 0;
+  const submissionSummary = (result: CodexUsageLimitResumeResult) =>
+    t("streamRetry.usageLimitResume.result", { ...result });
+  const desktopUnavailableDetails = (count: number) =>
+    t("streamRetry.usageLimitResume.desktopUnavailableDetails", { count });
 
   let label: string;
   let description: string;
   let status: string;
-  if (!hasResult && isChecking) {
+  if (isChecking || isRefreshing) {
     label = t("streamRetry.usageLimitResume.checking");
     description = t("streamRetry.usageLimitResume.description");
     status = t("streamRetry.usageLimitResume.checkingStatus");
@@ -114,24 +128,36 @@ export function CodexUsageLimitResumeButton({
     description = t("streamRetry.usageLimitResume.emptyDescription");
     status = t("streamRetry.usageLimitResume.emptyStatus");
   } else {
-    label = t("streamRetry.usageLimitResume.emptyAction");
+    label = t("streamRetry.usageLimitResume.partialEmptyAction");
     description = t("streamRetry.usageLimitResume.partialDescription");
     status = t("streamRetry.usageLimitResume.partialEmptyStatus");
   }
 
   const resume = async () => {
-    if (submitting.current || !canResume) return;
+    if (submitting.current || busy || !canResume) return;
 
     submitting.current = true;
     setPendingCount(availableCount);
+    setIsSending(true);
     try {
       const result = await invoke<CodexUsageLimitResumeResult>(
         "resume_codex_usage_limited_turns",
       );
-      toast.info(t("streamRetry.usageLimitResume.result", { ...result }));
+      setLastSubmission(result);
+      const summary = submissionSummary(result);
+      const unavailableCount = result.desktopUnavailable ?? 0;
+      if (unavailableCount > 0) {
+        toast.info(summary, {
+          description: desktopUnavailableDetails(unavailableCount),
+        });
+      } else {
+        toast.info(summary);
+      }
     } catch {
+      setLastSubmission("failed");
       toast.error(t("streamRetry.usageLimitResume.failed"));
     } finally {
+      setIsSending(false);
       try {
         await countQuery.refetch();
       } finally {
@@ -142,42 +168,45 @@ export function CodexUsageLimitResumeButton({
   };
 
   const unavailable = busy || !canResume;
-  const countValue = displayedCount?.count ?? null;
-  const countLabel =
-    countValue === null
+  const countValue = isIncompleteEmpty ? null : (displayedCount?.count ?? null);
+  const countLabel = isIncompleteEmpty
+    ? t("streamRetry.usageLimitResume.countIncomplete")
+    : countValue === null
       ? t("streamRetry.usageLimitResume.countChecking")
       : t("streamRetry.usageLimitResume.countLabel", { count: countValue });
   const scanState = countQuery.isError
     ? t("streamRetry.usageLimitResume.unavailableStatus")
-    : isChecking
+    : isChecking || isRefreshing
       ? t("streamRetry.usageLimitResume.checkingStatus")
       : displayedCount?.complete
         ? t("streamRetry.usageLimitResume.scanComplete")
         : t("streamRetry.usageLimitResume.scanPartial");
-  const details =
-    countValue === 0
-      ? displayedCount?.complete
-        ? t("streamRetry.usageLimitResume.zeroDetails")
-        : t("streamRetry.usageLimitResume.partialZeroDetails")
+  const details = isIncompleteEmpty
+    ? t("streamRetry.usageLimitResume.partialZeroDetails")
+    : countValue === 0
+      ? t("streamRetry.usageLimitResume.zeroDetails")
       : description;
-  const statusIcon = isChecking ? (
-    <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-  ) : countQuery.isError ? (
-    <CircleAlert className="h-3.5 w-3.5 text-amber-500" aria-hidden="true" />
-  ) : canResume ? (
-    <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" aria-hidden="true" />
-  ) : (
-    <CircleAlert
-      className="h-3.5 w-3.5 text-muted-foreground"
-      aria-hidden="true"
-    />
-  );
+  const statusIcon =
+    isSending || isChecking || isRefreshing ? (
+      <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+    ) : countQuery.isError ? (
+      <CircleAlert className="h-3.5 w-3.5 text-amber-500" aria-hidden="true" />
+    ) : canResume ? (
+      <CheckCircle2
+        className="h-3.5 w-3.5 text-emerald-500"
+        aria-hidden="true"
+      />
+    ) : (
+      <CircleAlert
+        className="h-3.5 w-3.5 text-muted-foreground"
+        aria-hidden="true"
+      />
+    );
 
   return (
     <div
       data-testid="codex-usage-limit-resume-control"
       className={cn("flex min-w-0 items-center gap-2", className)}
-      aria-busy={busy || isRefreshing}
     >
       <div
         data-testid="codex-usage-limit-resume-status"
@@ -190,7 +219,7 @@ export function CodexUsageLimitResumeButton({
           className="truncate"
           data-testid="codex-usage-limit-resume-status-text"
         >
-          {status}
+          {isSending ? t("streamRetry.usageLimitResume.sendingStatus") : status}
         </span>
         {isRefreshing && !busy && (
           <Loader2
@@ -278,6 +307,23 @@ export function CodexUsageLimitResumeButton({
               <p className="text-[11px] leading-4 text-muted-foreground">
                 {details}
               </p>
+              {lastSubmission !== null && (
+                <div className="space-y-1 border-t pt-2 text-xs leading-4">
+                  <p className="font-medium">
+                    {lastSubmission === "failed"
+                      ? t("streamRetry.usageLimitResume.failed")
+                      : submissionSummary(lastSubmission)}
+                  </p>
+                  {desktopUnavailable > 0 && (
+                    <>
+                      <p>{desktopUnavailableDetails(desktopUnavailable)}</p>
+                      <p className="text-muted-foreground">
+                        {t("streamRetry.usageLimitResume.desktopReconnectHelp")}
+                      </p>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           </PopoverContent>
         </Popover>

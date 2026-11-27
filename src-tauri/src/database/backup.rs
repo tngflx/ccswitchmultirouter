@@ -5,7 +5,7 @@
 use super::{lock_conn, Database};
 use crate::config::get_app_config_dir;
 use crate::error::AppError;
-use chrono::{Local, Utc};
+use chrono::{Local, NaiveDateTime, Utc};
 use rusqlite::backup::{Backup, StepResult};
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection};
@@ -17,6 +17,7 @@ use tempfile::{Builder, NamedTempFile};
 
 const CC_SWITCH_SQL_EXPORT_HEADER: &str = "-- CC Switch SQLite 导出";
 const PORTABLE_HOME_TOKEN: &str = "${CC_SWITCH_HOME}";
+const DB_BACKUP_TIMESTAMP_FORMAT: &str = "%Y%m%d_%H%M%S";
 
 /// Serialize every operation that observes or mutates the backup directory.
 /// Acquire this guard before the database connection lock.
@@ -235,6 +236,9 @@ impl Database {
             let backup = Backup::new(&temp_conn, &mut main_conn)
                 .map_err(|e| AppError::Database(e.to_string()))?;
             Self::complete_backup(&backup, "替换主数据库")?;
+            // The online backup API replaces pages without provider row hooks.
+            self.provider_changes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         let backup_id = backup_path
@@ -549,7 +553,7 @@ impl Database {
                 let latest = fs::read_dir(&backup_dir).ok().and_then(|entries| {
                     entries
                         .filter_map(|e| e.ok())
-                        .filter(|e| e.path().extension().map(|ext| ext == "db").unwrap_or(false))
+                        .filter(Self::is_rotating_db_backup)
                         .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok()))
                         .max()
                 });
@@ -650,7 +654,10 @@ impl Database {
 
         fs::create_dir_all(&backup_dir).map_err(|e| AppError::io(&backup_dir, e))?;
 
-        let base_id = format!("db_backup_{}", Local::now().format("%Y%m%d_%H%M%S"));
+        let base_id = format!(
+            "db_backup_{}",
+            Local::now().format(DB_BACKUP_TIMESTAMP_FORMAT)
+        );
         let mut next_suffix = 0;
         let mut backup_path =
             Self::next_available_backup_path(&backup_dir, &base_id, &mut next_suffix);
@@ -719,19 +726,36 @@ impl Database {
         }
     }
 
+    fn is_rotating_db_backup(entry: &fs::DirEntry) -> bool {
+        let filename = entry.file_name();
+        let Some(stem) = filename
+            .to_str()
+            .and_then(|name| name.strip_prefix("db_backup_")?.strip_suffix(".db"))
+        else {
+            return false;
+        };
+        let Some(timestamp) = stem.get(..15) else {
+            return false;
+        };
+        let suffix = &stem[15..];
+        let valid_suffix = suffix.is_empty()
+            || suffix.strip_prefix('_').is_some_and(|sequence| {
+                !sequence.starts_with('0')
+                    && sequence.bytes().all(|byte| byte.is_ascii_digit())
+                    && sequence.parse::<usize>().is_ok()
+            });
+        valid_suffix
+            && NaiveDateTime::parse_from_str(timestamp, DB_BACKUP_TIMESTAMP_FORMAT).is_ok()
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+    }
+
     /// 清理旧的数据库备份，保留最新的 N 个
     fn cleanup_db_backups(dir: &Path, protected_paths: &[&Path]) -> Result<(), AppError> {
         let retain = crate::settings::effective_backup_retain_count();
         let entries = match fs::read_dir(dir) {
             Ok(iter) => iter
                 .filter_map(|entry| entry.ok())
-                .filter(|entry| {
-                    entry
-                        .path()
-                        .extension()
-                        .map(|ext| ext == "db")
-                        .unwrap_or(false)
-                })
+                .filter(Self::is_rotating_db_backup)
                 .collect::<Vec<_>>(),
             Err(_) => return Ok(()),
         };
@@ -1178,6 +1202,8 @@ impl Database {
             let backup = Backup::new(&staging_conn, &mut main_conn)
                 .map_err(|e| AppError::Database(e.to_string()))?;
             Self::complete_backup(&backup, "恢复主数据库")?;
+            self.provider_changes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             safety_backup
         };
         let safety_id = safety_backup
@@ -1875,7 +1901,7 @@ mod tests {
         let backup_dir = crate::config::get_app_config_dir().join("backups");
         let existing_backup = db.backup_database_file()?.expect("create valid backup");
         // Exceed retention so an early cleanup would remove a valid backup.
-        let second_backup = backup_dir.join("previous-backup.db");
+        let second_backup = backup_dir.join("db_backup_20000101_000000.db");
         std::fs::copy(&existing_backup, &second_backup)
             .map_err(|e| AppError::io(&second_backup, e))?;
         let mut files_before = std::fs::read_dir(&backup_dir)
@@ -1910,6 +1936,65 @@ mod tests {
             .collect::<Vec<_>>();
         files_after.sort();
         assert_eq!(files_after, files_before);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn backup_retention_hard_caps_at_two_files() -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        // Older settings can contain values above the new policy. The effective
+        // value must still cap retention at two files when a backup is created.
+        let _settings = SettingsGuard::with_backup_retain_count(50);
+        let db = Database::init()?;
+        let backup_dir = crate::config::get_app_config_dir().join("backups");
+        std::fs::create_dir_all(&backup_dir).map_err(|e| AppError::io(&backup_dir, e))?;
+        let manual = backup_dir.join("manual-backup.db");
+        let renamed = backup_dir.join("db_backup_keep-this.db");
+        let directory = backup_dir.join("db_backup_20000101_000000.db");
+        for path in [&manual, &renamed] {
+            std::fs::write(path, b"fixture").map_err(|e| AppError::io(path, e))?;
+        }
+        std::fs::create_dir(&directory).map_err(|e| AppError::io(&directory, e))?;
+
+        for _ in 0..3 {
+            db.backup_database_file()?.expect("create valid backup");
+        }
+
+        let backups = std::fs::read_dir(&backup_dir)
+            .map_err(|e| AppError::io(&backup_dir, e))?
+            .filter_map(|entry| entry.ok())
+            .filter(Database::is_rotating_db_backup)
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 2, "keep two rotating database backups");
+        assert!(manual.is_file());
+        assert!(renamed.is_file());
+        assert!(directory.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn periodic_backup_ignores_recent_manually_named_snapshot() -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        let _settings = SettingsGuard::with_settings(|settings| {
+            settings.backup_interval_hours = Some(24);
+        });
+        let db = Database::init()?;
+        let backup_dir = crate::config::get_app_config_dir().join("backups");
+        std::fs::create_dir_all(&backup_dir).map_err(|e| AppError::io(&backup_dir, e))?;
+        let manual = backup_dir.join("manual-backup.db");
+        std::fs::write(&manual, b"fixture").map_err(|e| AppError::io(&manual, e))?;
+
+        db.create_periodic_backup_if_due()?;
+
+        let backups = std::fs::read_dir(&backup_dir)
+            .map_err(|e| AppError::io(&backup_dir, e))?
+            .filter_map(|entry| entry.ok())
+            .filter(Database::is_rotating_db_backup)
+            .count();
+        assert_eq!(backups, 1);
+        assert!(manual.is_file());
         Ok(())
     }
 
@@ -2035,6 +2120,39 @@ mod tests {
 
     #[test]
     #[serial]
+    fn successful_backup_restore_invalidates_provider_revision() -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        let db = Database::init()?;
+        let backup_provider = crate::provider::Provider::with_id(
+            "restore-provider".to_string(),
+            "Restore Provider".to_string(),
+            serde_json::json!({"config": "model = \"backup-model\"\n"}),
+            None,
+        );
+        db.save_provider("codex", &backup_provider)?;
+        let backup = db.backup_database_file()?.expect("create provider backup");
+
+        let mut live_provider = backup_provider.clone();
+        live_provider.settings_config = serde_json::json!({"config": "model = \"live-model\"\n"});
+        db.save_provider("codex", &live_provider)?;
+        let previous_revision = db.provider_revision()?;
+
+        let filename = backup
+            .file_name()
+            .expect("backup filename")
+            .to_string_lossy();
+        db.restore_from_backup(&filename)?;
+
+        assert_ne!(db.provider_revision()?, previous_revision);
+        let restored = db
+            .get_provider_by_id(&backup_provider.id, "codex")?
+            .expect("restored provider");
+        assert_eq!(restored.settings_config, backup_provider.settings_config);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
     fn sql_file_api_round_trips_existing_export_behavior() -> Result<(), AppError> {
         let test_home = TestHomeGuard::new();
         let source = Database::memory()?;
@@ -2063,7 +2181,9 @@ mod tests {
                 [],
             )?;
         }
+        let previous_revision = target.provider_revision()?;
         target.import_sql(&backup_path)?;
+        assert_ne!(target.provider_revision()?, previous_revision);
 
         let conn = crate::database::lock_conn!(target.conn);
         let providers = conn

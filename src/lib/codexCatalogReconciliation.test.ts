@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   codexCatalogRowHasReasoningEffort,
   isCompleteCodexCatalogFetch,
+  jsonValuesEqual,
   pruneMissingRemoteCodexCatalogRows,
   reconcileFetchedCodexCatalogRows,
   selectOnlyCodexCatalogRowsWithReasoningEffort,
@@ -17,6 +18,46 @@ const createRow = (seed: Record<string, unknown>): CodexCatalogRowLike =>
     enabled: seed.enabled !== false,
     ...seed,
   }) as CodexCatalogRowLike;
+
+describe("jsonValuesEqual", () => {
+  it("preserves array order and compares JSON object data independent of property order", () => {
+    const left = { models: ["one", "two"], options: { a: 1, b: 2 } };
+    const right = {
+      options: { b: 2, a: 1, optional: undefined },
+      models: ["one", "two"],
+    };
+    expect(jsonValuesEqual(left, right)).toBe(true);
+    expect(jsonValuesEqual(left, { ...right, models: ["two", "one"] })).toBe(
+      false,
+    );
+    expect(jsonValuesEqual([undefined], [null])).toBe(true);
+    expect(jsonValuesEqual({ a: null }, {})).toBe(false);
+  });
+
+  it.each([2, 128])(
+    "skips nested property reads across %i shared catalog rows",
+    (rowCount) => {
+      let nestedReads = 0;
+      const rows = Array.from({ length: rowCount }, (_, index) => ({
+        model: `shared-model-${index}`,
+        get baseInstructions() {
+          nestedReads += 1;
+          return "i".repeat(1024);
+        },
+      }));
+      const before = { models: [...rows, { model: "before" }] };
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        expect(jsonValuesEqual(before, { models: [...before.models] })).toBe(
+          true,
+        );
+        expect(
+          jsonValuesEqual(before, { models: [...rows, { model: "after" }] }),
+        ).toBe(false);
+      }
+      expect(nestedReads).toBe(0);
+    },
+  );
+});
 
 describe("selectOnlyCodexCatalogRowsWithReasoningEffort", () => {
   it("enables rows with a non-none effort and preserves excluded inventory", () => {
@@ -222,6 +263,77 @@ describe("selectOnlyCodexCatalogRowsWithReasoningEffort", () => {
 });
 
 describe("reconcileFetchedCodexCatalogRows", () => {
+  it.each([16, 256])(
+    "bounds draft model reads while resolving context for %i rows",
+    (size) => {
+      let draftModelReads = 0;
+      const rows: CodexCatalogRowLike[] = Array.from(
+        { length: size },
+        (_, index) => ({
+          get model() {
+            draftModelReads += 1;
+            return `catalog-test-model-${index}`;
+          },
+          contextWindow: String(100_000 + index),
+        }),
+      );
+      const fetched = Array.from({ length: size }, (_, index) => ({
+        id: `catalog-test-model-${index}`,
+      }));
+      const result = reconcileFetchedCodexCatalogRows(
+        rows,
+        fetched,
+        {},
+        {
+          appendNew: true,
+          createRow,
+          existingMetadataMode: "refresh",
+        },
+      );
+
+      expect(draftModelReads).toBeLessThanOrEqual(size * 4);
+      expect(result.rows).toEqual(rows);
+      expect(result.added).toBe(0);
+    },
+  );
+
+  it("uses remote, exact draft, and preset context in order for matched aliases", () => {
+    const rows = [
+      createRow({ model: " deepseek-chat ", context_window: "123000 tokens" }),
+      createRow({ model: "deepseek-chat", contextWindow: "456000" }),
+      createRow({ model: "chat alias", upstreamModel: "deepseek-chat" }),
+      createRow({
+        model: "reasoner alias",
+        canonicalSlug: "deepseek-reasoner",
+      }),
+      createRow({
+        model: "explicit alias",
+        upstreamModel: "other-remote-model",
+      }),
+      createRow({ model: "other-remote-model", contextWindow: "8000" }),
+    ];
+    const result = reconcileFetchedCodexCatalogRows(
+      rows,
+      [
+        { id: "deepseek-chat" },
+        { id: "deepseek-reasoner" },
+        { id: "other-remote-model", contextWindow: 32000 },
+      ],
+      {},
+      { appendNew: true, createRow, existingMetadataMode: "refresh" },
+    );
+
+    expect(result.rows.map((row) => row.contextWindow)).toEqual([
+      "123000",
+      "123000",
+      "123000",
+      "1000000",
+      "32000",
+      "32000",
+    ]);
+    expect(result.added).toBe(0);
+  });
+
   it("keeps input/output token budgets separate from total context during refresh", () => {
     const fetched: FetchedModel[] = [
       {

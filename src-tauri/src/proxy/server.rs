@@ -9,6 +9,7 @@
 //! a direct (non-proxied) CLI request.
 
 use super::{
+    content_encoding::MAX_REQUEST_BODY_BYTES,
     failover_switch::FailoverSwitchManager,
     handlers,
     log_codes::srv as log_srv,
@@ -582,7 +583,7 @@ impl ProxyServer {
             // Gemini 的 GA 版本也叫 /v1，给原 SDK 留一条出口
             .route("/gemini/v1/{*path}", any(handlers::handle_gemini))
             // 提高默认请求体大小限制（避免 413 Payload Too Large）
-            .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
             .fallback(handlers::handle_unregistered_proxy_endpoint)
             .with_state(self.state.clone())
     }
@@ -603,7 +604,7 @@ impl ProxyServer {
                 "/v1/images/generations",
                 post(handlers::handle_external_image_generations),
             )
-            .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
             .fallback(handlers::handle_unregistered_proxy_endpoint)
             .with_state(self.state.clone())
     }

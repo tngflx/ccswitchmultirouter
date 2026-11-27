@@ -279,6 +279,58 @@ This optional custom-hostname path is not live-verified. The pinned origin and
 WebAuthn relying-party binding must not silently switch between `.ts.net` and a
 custom domain; changing it requires an explicit reset and re-enrollment.
 
+### Optional full Cloudflare transport (not enabled by this build)
+
+If browser-only access without a Tailscale client is a hard requirement, the
+same owner website can be placed behind a dedicated Cloudflare Tunnel and
+Cloudflare Access application. The intended topology is:
+
+```text
+remote browser
+  -> Cloudflare Access policy (your identity + MFA)
+  -> dedicated Cloudflare Tunnel connector on the host
+  -> 127.0.0.1:15723 owner website
+  -> CCSwitch WebAuthn/session checks
+  -> exact selected Codex conversation
+```
+
+This must be a separate transport mode, not a second owner API. The connector
+must be outbound-only and its ingress must map one dedicated hostname to
+`http://127.0.0.1:15723`; do not publish `15721`, `15722`, `9229`, Tauri IPC,
+SQLite, or a wildcard service. Keep CCSwitch's exact-origin pin and passkey
+check even when Access is enabled, so a Cloudflare policy mistake cannot become
+an app-level owner session.
+
+For portability, setup should open the official Cloudflare dashboard or
+`cloudflared` installer and ask the user to complete tunnel/Access setup outside
+CCSwitch. Do not place Cloudflare API tokens, tunnel tokens, or IdP secrets in
+CCSwitch settings, invites, URLs, logs, or the synced database. A future
+wizard may verify the final HTTPS origin and display a copyable ingress snippet,
+but it must not silently create a public tunnel or store a long-lived token.
+Cloudflare is then in the traffic and identity path: a Cloudflare outage or
+Access-policy/IdP failure can block remote access even while the host and local
+Codex continue to work. Tailscale remains the safer default for the owner's own
+devices because it avoids public hostname exposure and does not require a
+Cloudflare account on every device.
+
+### Optional TeamViewer desktop fallback
+
+TeamViewer is useful only as a clearly labelled **Open host desktop (break
+ glass)** fallback. With unattended/Easy Access, an owner can use the TeamViewer
+web client or mobile app to see the actual Codex window when the bounded owner
+snapshot is insufficient. It is not the CCSwitch transport and it must not be
+used to automate Continue by clicking the desktop: TeamViewer grants broad
+keyboard/mouse and screen access, exposes every host window, and has separate
+licensing and account controls.
+
+If enabled by the user, keep TeamViewer configuration entirely outside CCSwitch:
+use a separate TeamViewer account with 2FA and an allowlist, disable random or
+personal passwords where the plan permits, prefer view-only for diagnosis, and
+open the vendor web client as an external link. CCSwitch should never store
+TeamViewer credentials/API tokens or claim that a TeamViewer screen view proves
+the owner website's selected-thread capability. Continue remains the signed,
+idempotent owner-website operation.
+
 The adjacent **Crash recovery** card uses the existing device-local
 `watchdogEnabled` setting. Its **Auto-recover from crashes (watchdog)** switch is
 independent of remote access; enabling one never enables the other. Recovery

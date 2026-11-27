@@ -275,6 +275,74 @@ describe("StreamRetryHeaderToggle", () => {
     ).toBeEnabled();
   });
 
+  it("withholds a cached count while a visible recovery scan refreshes", async () => {
+    let resolveRefresh!: (value: { count: number; complete: boolean }) => void;
+    const refresh = new Promise<{ count: number; complete: boolean }>(
+      (resolve) => {
+        resolveRefresh = resolve;
+      },
+    );
+    invoke
+      .mockResolvedValueOnce({ count: 2, complete: true })
+      .mockReturnValueOnce(refresh);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <CodexUsageLimitResumeButton visible />
+      </QueryClientProvider>,
+    );
+
+    try {
+      const button = await screen.findByTestId(
+        "codex-usage-limit-resume-button",
+      );
+      await waitFor(() => expect(button).toBeEnabled());
+      expect(
+        screen.getByTestId("codex-usage-limit-resume-count"),
+      ).toHaveTextContent("2");
+
+      view.rerender(
+        <QueryClientProvider client={client}>
+          <CodexUsageLimitResumeButton visible={false} />
+        </QueryClientProvider>,
+      );
+      view.rerender(
+        <QueryClientProvider client={client}>
+          <CodexUsageLimitResumeButton visible />
+        </QueryClientProvider>,
+      );
+
+      await waitFor(() => expect(invoke).toHaveBeenCalledTimes(2));
+      const refreshedButton = screen.getByTestId(
+        "codex-usage-limit-resume-button",
+      );
+      await waitFor(() => expect(refreshedButton).toBeDisabled());
+      expect(refreshedButton).toHaveAccessibleName(
+        "streamRetry.usageLimitResume.checking",
+      );
+      expect(
+        screen.getByTestId("codex-usage-limit-resume-count"),
+      ).toHaveTextContent("…");
+      fireEvent.click(refreshedButton);
+      expect(invoke).not.toHaveBeenCalledWith(
+        "resume_codex_usage_limited_turns",
+      );
+
+      resolveRefresh({ count: 0, complete: true });
+      await waitFor(() =>
+        expect(refreshedButton).toHaveAccessibleName(
+          "streamRetry.usageLimitResume.emptyAction",
+        ),
+      );
+      expect(refreshedButton).toBeDisabled();
+    } finally {
+      view.unmount();
+      client.clear();
+    }
+  });
+
   it("exposes the live ready count and explains why an empty scan is safe", async () => {
     invoke.mockResolvedValue({ count: 0, complete: true });
     const user = userEvent.setup();
@@ -308,6 +376,7 @@ describe("StreamRetryHeaderToggle", () => {
     invoke.mockImplementation(async () => eligibility);
     const client = renderCodexHeader();
     const button = screen.getByTestId("codex-usage-limit-resume-button");
+    const count = screen.getByTestId("codex-usage-limit-resume-count");
     const advance = (milliseconds: number) =>
       act(async () => {
         await vi.advanceTimersByTimeAsync(milliseconds);
@@ -320,7 +389,12 @@ describe("StreamRetryHeaderToggle", () => {
       expect(button).toBeDisabled();
       await advance(20);
       expect(button).toHaveAccessibleName(
-        "streamRetry.usageLimitResume.emptyAction",
+        "streamRetry.usageLimitResume.partialEmptyAction",
+      );
+      expect(count).toHaveTextContent(/^…$/);
+      expect(count).toHaveAttribute(
+        "aria-label",
+        "streamRetry.usageLimitResume.countIncomplete",
       );
       expect(button).toHaveAttribute(
         "title",
@@ -338,6 +412,7 @@ describe("StreamRetryHeaderToggle", () => {
 
       eligibility = { count: 0, complete: true };
       await advance(5_000);
+      expect(count).toHaveTextContent(/^0$/);
       expect(button).toHaveAccessibleName(
         "streamRetry.usageLimitResume.emptyAction",
       );
@@ -359,6 +434,7 @@ describe("StreamRetryHeaderToggle", () => {
 
       eligibility = { count: 2, complete: false };
       await advance(5_000);
+      expect(count).toHaveTextContent(/^2$/);
       expect(button).toHaveAccessibleName(
         "streamRetry.usageLimitResume.action",
       );
@@ -378,8 +454,9 @@ describe("StreamRetryHeaderToggle", () => {
       eligibility = { count: 0, complete: false };
       await advance(5_000);
       expect(button).toHaveAccessibleName(
-        "streamRetry.usageLimitResume.emptyAction",
+        "streamRetry.usageLimitResume.partialEmptyAction",
       );
+      expect(count).toHaveTextContent(/^…$/);
       expect(
         screen.getByTestId("codex-usage-limit-resume-status-text"),
       ).toHaveTextContent("streamRetry.usageLimitResume.partialEmptyStatus");
@@ -387,6 +464,7 @@ describe("StreamRetryHeaderToggle", () => {
 
       eligibility = { count: 0, complete: true };
       await advance(5_000);
+      expect(count).toHaveTextContent(/^0$/);
       expect(button).toHaveAccessibleName(
         "streamRetry.usageLimitResume.emptyAction",
       );
@@ -607,6 +685,16 @@ describe("StreamRetryHeaderToggle", () => {
         count: 1,
       },
     );
+    await userEvent.click(
+      screen.getByTestId("codex-usage-limit-details-button"),
+    );
+    expect(await screen.findByRole("dialog")).toBeVisible();
+    expect(
+      screen.getByText("streamRetry.usageLimitResume.result"),
+    ).toBeVisible();
+    expect(
+      screen.queryByText("streamRetry.usageLimitResume.desktopReconnectHelp"),
+    ).not.toBeInTheDocument();
   });
 
   it("reports a failed recovery submission without exposing the backend error", async () => {
@@ -630,6 +718,74 @@ describe("StreamRetryHeaderToggle", () => {
     expect(showInfo).not.toHaveBeenCalled();
     expect(invoke).toHaveBeenLastCalledWith(
       "get_codex_usage_limit_resume_count",
+    );
+    await user.click(screen.getByTestId("codex-usage-limit-details-button"));
+    expect(
+      await screen.findByText("streamRetry.usageLimitResume.failed"),
+    ).toBeVisible();
+    expect(screen.queryByText("resume failed")).not.toBeInTheDocument();
+  });
+
+  it("announces a pending send and keeps Desktop deferrals in recovery details", async () => {
+    const result = {
+      submitted: 1,
+      deferred: 2,
+      skipped: 1,
+      uncertain: 1,
+      desktopUnavailable: 1,
+    };
+    let finishResume!: (value: typeof result) => void;
+    const resume = new Promise<typeof result>((resolve) => {
+      finishResume = resolve;
+    });
+    invoke
+      .mockResolvedValueOnce({ count: 5, complete: false })
+      .mockReturnValueOnce(resume)
+      .mockResolvedValueOnce({ count: 2, complete: true });
+    const user = userEvent.setup();
+    renderCodexHeader();
+
+    const button = await screen.findByRole("button", {
+      name: "streamRetry.usageLimitResume.action",
+    });
+    await user.click(button);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "streamRetry.usageLimitResume.sendingStatus",
+    );
+    expect(button).toBeDisabled();
+
+    await act(async () => finishResume(result));
+
+    await waitFor(() => expect(button).toBeEnabled());
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "streamRetry.usageLimitResume.readyStatus",
+    );
+    expect(
+      screen.getByTestId("codex-usage-limit-resume-count"),
+    ).toHaveTextContent(/^2$/);
+    expect(translate).toHaveBeenCalledWith(
+      "streamRetry.usageLimitResume.result",
+      result,
+    );
+    expect(showInfo).toHaveBeenCalledWith(
+      "streamRetry.usageLimitResume.result",
+      {
+        description: "streamRetry.usageLimitResume.desktopUnavailableDetails",
+      },
+    );
+
+    await user.click(screen.getByTestId("codex-usage-limit-details-button"));
+    expect(
+      await screen.findByText(
+        "streamRetry.usageLimitResume.desktopUnavailableDetails",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByText("streamRetry.usageLimitResume.desktopReconnectHelp"),
+    ).toBeVisible();
+    expect(translate).toHaveBeenCalledWith(
+      "streamRetry.usageLimitResume.desktopUnavailableDetails",
+      { count: result.desktopUnavailable },
     );
   });
 

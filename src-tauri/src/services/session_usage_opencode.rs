@@ -13,15 +13,18 @@
 
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
+use crate::file_revision::FileRevision;
+use crate::json_projection::JsonProjection as UsageProjection;
 use crate::opencode_config::get_opencode_db_path;
 use crate::proxy::usage::calculator::CostCalculator;
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
-    get_sync_state, metadata_modified_nanos, update_sync_state, SessionSyncResult,
+    load_session_sync_cursors, write_session_sync_cursor, SessionSyncCursor, SessionSyncResult,
 };
 use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
 use rust_decimal::Decimal;
-use std::fs;
+use sha2::{Digest, Sha256};
+use std::path::Path;
 use std::time::SystemTime;
 
 /// 从 opencode message.data JSON 中提取的 token 和费用数据
@@ -38,15 +41,34 @@ struct OpenCodeMessageData {
     latency_ms: i64,
 }
 
-struct OpenCodeMessageQueryResult {
-    messages: Vec<(String, OpenCodeMessageData)>,
-    has_incomplete_usage: bool,
-}
+const OPENCODE_CACHE: UsageProjection = UsageProjection::Object(&[
+    ("read", UsageProjection::Scalar),
+    ("write", UsageProjection::Scalar),
+]);
+const OPENCODE_TOKENS: UsageProjection = UsageProjection::Object(&[
+    ("input", UsageProjection::Scalar),
+    ("output", UsageProjection::Scalar),
+    ("reasoning", UsageProjection::Scalar),
+    ("cache", OPENCODE_CACHE),
+]);
+const OPENCODE_TIME: UsageProjection = UsageProjection::Object(&[
+    ("created", UsageProjection::Scalar),
+    ("completed", UsageProjection::Scalar),
+]);
+const OPENCODE_MESSAGE: UsageProjection = UsageProjection::Object(&[
+    ("role", UsageProjection::Scalar),
+    ("tokens", OPENCODE_TOKENS),
+    ("cost", UsageProjection::Scalar),
+    ("modelID", UsageProjection::Scalar),
+    ("time", OPENCODE_TIME),
+]);
 
 /// 同步 OpenCode 使用数据
 pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
-    let db_path = get_opencode_db_path();
+    sync_opencode_database(db, &get_opencode_db_path())
+}
 
+fn sync_opencode_database(db: &Database, db_path: &Path) -> Result<SessionSyncResult, AppError> {
     if !db_path.exists() {
         return Ok(SessionSyncResult {
             imported: 0,
@@ -58,39 +80,26 @@ pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError>
         });
     }
 
-    let db_path_str = db_path.to_string_lossy().to_string();
-
-    // 检查文件修改时间。
-    // opencode 的数据库运行在 WAL 模式：新提交先落在 -wal 文件里，
-    // 主库文件只有在 checkpoint 时才更新。因此必须同时考虑 -wal 的
-    // mtime，否则会在 checkpoint 之前漏掉刚写入的会话。
-    let metadata = fs::metadata(&db_path)
-        .map_err(|e| AppError::Config(format!("无法读取 opencode.db 元数据: {e}")))?;
-    let mut file_modified = metadata_modified_nanos(&metadata);
-
-    let wal_path = db_path.with_extension("db-wal");
-    if let Ok(wal_meta) = fs::metadata(&wal_path) {
-        file_modified = file_modified.max(metadata_modified_nanos(&wal_meta));
-    }
-
-    let (last_modified, _last_offset) = get_sync_state(db, &db_path_str)?;
-
-    // 文件未变化则跳过
-    if file_modified <= last_modified {
-        return Ok(SessionSyncResult {
-            imported: 0,
-            skipped: 0,
-            files_scanned: 1,
-            suspected_duplicates: 0,
-            deferred_files: 0,
-            errors: vec![],
-        });
-    }
-
-    // 打开 opencode 的 SQLite 数据库（只读）
-    let opencode_conn =
-        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let db_path_str = db_path.to_string_lossy();
+    let revision_before_open = FileRevision::read(db_path);
+    let mut opencode_conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| AppError::Database(format!("无法打开 opencode.db: {e}")))?;
+    let snapshot = opencode_conn.transaction()?;
+    // Pin the SQLite snapshot before checking the file revision. A rollback
+    // reader holds a shared database lock. WAL commits publish independently
+    // of filesystem timestamps. PRAGMA data_version is connection-local, and
+    // retaining this connection between polls can block Windows replacement,
+    // so WAL checks message fingerprints inside each new snapshot.
+    snapshot.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
+    let journal_mode: String =
+        snapshot.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    let rollback_revision = revision_before_open
+        .filter(|revision| {
+            matches!(journal_mode.as_str(), "delete" | "truncate" | "persist")
+                && FileRevision::read(db_path).as_ref() == Some(revision)
+        })
+        .map(|revision| revision.fingerprint());
 
     let mut result = SessionSyncResult {
         imported: 0,
@@ -100,71 +109,52 @@ pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError>
         deferred_files: 0,
         errors: vec![],
     };
-    let mut has_sync_errors = false;
-
-    // 查询所有会话
-    let sessions = query_sessions(&opencode_conn)?;
-
-    for (session_id, time_updated) in &sessions {
-        // 检查会话是否需要重新同步
-        let sync_key = format!("{db_path_str}:{session_id}");
-        let (sess_last_modified, _) = get_sync_state(db, &sync_key)?;
-        if *time_updated <= sess_last_modified {
-            continue; // 会话未更新，跳过
-        }
-
-        let mut session_had_error = false;
-
-        // 查询该会话的所有 assistant 消息
-        let mut session_has_incomplete_usage = false;
-        match query_assistant_messages(&opencode_conn, session_id) {
-            Ok(query_result) => {
-                session_has_incomplete_usage = query_result.has_incomplete_usage;
-                for (message_id, msg_data) in &query_result.messages {
-                    let request_id = format!("opencode_session:{session_id}:{message_id}");
-
-                    match insert_opencode_message(db, &request_id, msg_data, session_id) {
-                        Ok(true) => result.imported += 1,
-                        Ok(false) => result.skipped += 1,
-                        Err(e) => {
-                            let msg = format!("OpenCode 消息插入失败 {request_id}: {e}");
-                            log::warn!("[OPENCODE-SYNC] {msg}");
-                            result.errors.push(msg);
-                            result.skipped += 1;
-                            session_had_error = true;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                let msg = format!("OpenCode 会话消息查询失败 {session_id}: {e}");
-                log::warn!("[OPENCODE-SYNC] {msg}");
-                result.errors.push(msg);
-                session_had_error = true;
-            }
-        }
-
-        if session_had_error {
-            has_sync_errors = true;
-            continue;
-        }
-
-        if session_has_incomplete_usage {
-            continue;
-        }
-
-        // 更新会话级同步状态。失败时不要推进文件级状态，确保下次可重试。
-        if let Err(e) = update_sync_state(db, &sync_key, *time_updated, 0) {
-            let msg = format!("OpenCode 会话同步状态更新失败 {session_id}: {e}");
-            log::warn!("[OPENCODE-SYNC] {msg}");
-            result.errors.push(msg);
-            has_sync_errors = true;
+    if let Some(revision) = rollback_revision {
+        let cursor = load_session_sync_cursors(db, [db_path_str.to_string()])?;
+        if cursor
+            .get(db_path_str.as_ref())
+            .and_then(|cursor| cursor.last_source_revision)
+            == Some(revision)
+        {
+            return Ok(result);
         }
     }
 
-    // 仅在本轮完全成功时推进文件级状态；否则保留下次重试入口。
-    if !has_sync_errors {
-        update_sync_state(db, &db_path_str, file_modified, 0)?;
+    let sessions = query_session_ids(&snapshot)?;
+    let keys = sessions
+        .iter()
+        .map(|session_id| format!("{db_path_str}:{session_id}"));
+    let cursors = load_session_sync_cursors(db, keys)?;
+    for session_id in &sessions {
+        let key = format!("{db_path_str}:{session_id}");
+        let previous = cursors
+            .get(&key)
+            .and_then(|cursor| cursor.last_tail_fingerprint);
+        match sync_opencode_session(db, &snapshot, &key, session_id, previous) {
+            Ok((imported, skipped)) => {
+                result.imported += imported;
+                result.skipped += skipped;
+            }
+            Err(error) => {
+                let msg = format!("OpenCode 会话同步失败 {session_id}: {error}");
+                log::warn!("[OPENCODE-SYNC] {msg}");
+                result.errors.push(msg);
+            }
+        }
+    }
+
+    if result.errors.is_empty() {
+        if let Some(revision) = rollback_revision {
+            let conn = lock_conn!(db.conn);
+            write_session_sync_cursor(
+                &conn,
+                &db_path_str,
+                SessionSyncCursor {
+                    last_source_revision: Some(revision),
+                    ..Default::default()
+                },
+            )?;
+        }
     }
 
     if result.imported > 0 {
@@ -179,23 +169,13 @@ pub fn sync_opencode_usage(db: &Database) -> Result<SessionSyncResult, AppError>
     Ok(result)
 }
 
-/// 查询所有会话的 (id, sync_watermark)
-fn query_sessions(conn: &rusqlite::Connection) -> Result<Vec<(String, i64)>, AppError> {
+fn query_session_ids(conn: &rusqlite::Connection) -> Result<Vec<String>, AppError> {
     let mut stmt = conn
-        .prepare(
-            "SELECT s.id,
-                    MAX(s.time_updated, COALESCE(MAX(m.time_updated), s.time_updated)) AS sync_watermark
-             FROM session s
-             LEFT JOIN message m ON m.session_id = s.id
-             GROUP BY s.id
-             ORDER BY sync_watermark",
-        )
+        .prepare("SELECT id FROM session ORDER BY time_updated, id")
         .map_err(|e| AppError::Database(format!("准备会话查询失败: {e}")))?;
 
     let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
+        .query_map([], |row| row.get(0))
         .map_err(|e| AppError::Database(format!("查询会话失败: {e}")))?;
 
     let mut sessions = Vec::new();
@@ -206,29 +186,107 @@ fn query_sessions(conn: &rusqlite::Connection) -> Result<Vec<(String, i64)>, App
     Ok(sessions)
 }
 
-/// 查询某会话的已完成 assistant 消息，并标记是否还有未完成 usage 消息。
+const SESSION_MESSAGES: &str =
+    "SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created, id";
+
+#[cfg(test)]
+thread_local! {
+    static OPENCODE_FINGERPRINTED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static OPENCODE_FINGERPRINTED_SESSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn message_fingerprint(conn: &rusqlite::Connection, session_id: &str) -> Result<i64, AppError> {
+    let mut digest = Sha256::new();
+    digest.update(b"opencode-session-messages-v1");
+    let mut stmt = conn.prepare_cached(SESSION_MESSAGES)?;
+    let mut rows = stmt.query([session_id])?;
+    #[cfg(test)]
+    OPENCODE_FINGERPRINTED_SESSIONS.with(|sessions| sessions.set(sessions.get() + 1));
+    while let Some(row) = rows.next()? {
+        let id = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
+        let value = row.get_ref(1)?;
+        let rusqlite::types::ValueRef::Text(data) = value else {
+            return Err(
+                rusqlite::Error::InvalidColumnType(1, "data".into(), value.data_type()).into(),
+            );
+        };
+        #[cfg(test)]
+        OPENCODE_FINGERPRINTED_BYTES.with(|bytes| bytes.set(bytes.get() + data.len()));
+        for field in [id.as_bytes(), data] {
+            digest.update((field.len() as u64).to_le_bytes());
+            digest.update(field);
+        }
+    }
+    let digest = digest.finalize();
+    Ok(i64::from_le_bytes(
+        digest[..8].try_into().expect("SHA-256 has 32 bytes"),
+    ))
+}
+
+fn sync_opencode_session(
+    db: &Database,
+    snapshot: &rusqlite::Connection,
+    key: &str,
+    session_id: &str,
+    previous: Option<i64>,
+) -> Result<(u32, u32), AppError> {
+    let fingerprint = message_fingerprint(snapshot, session_id)?;
+    if previous == Some(fingerprint) {
+        return Ok((0, 0));
+    }
+
+    let messages = query_assistant_messages(snapshot, session_id)?;
+    let mut conn = lock_conn!(db.conn);
+    let transaction = conn.transaction()?;
+    let mut imported = 0;
+    let mut skipped = 0;
+    for (message_id, msg_data) in &messages {
+        let request_id = format!("opencode_session:{session_id}:{message_id}");
+        if insert_opencode_message(&transaction, &request_id, msg_data, session_id)? {
+            imported += 1;
+        } else {
+            skipped += 1;
+        }
+    }
+
+    // Pending messages are part of the fingerprint and will be retried when
+    // they change, even when OpenCode keeps their update timestamps.
+    write_session_sync_cursor(
+        &transaction,
+        key,
+        SessionSyncCursor {
+            last_tail_fingerprint: Some(fingerprint),
+            ..Default::default()
+        },
+    )?;
+    transaction.commit()?;
+    Ok((imported, skipped))
+}
+
+/// 查询某会话的已完成 assistant 消息
 fn query_assistant_messages(
     conn: &rusqlite::Connection,
     session_id: &str,
-) -> Result<OpenCodeMessageQueryResult, AppError> {
+) -> Result<Vec<(String, OpenCodeMessageData)>, AppError> {
     let mut stmt = conn
-        .prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created")
+        .prepare_cached(SESSION_MESSAGES)
         .map_err(|e| AppError::Database(format!("准备消息查询失败: {e}")))?;
 
     let rows = stmt
         .query_map([session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            let id = row.get::<_, String>(0)?;
+            let data = row.get_ref(1)?.as_str()?;
+            Ok((id, OPENCODE_MESSAGE.parse(data)))
         })
         .map_err(|e| AppError::Database(format!("查询消息失败: {e}")))?;
 
     let mut messages = Vec::new();
-    let mut has_incomplete_usage = false;
     for row in rows {
-        let (message_id, data_json) =
+        let (message_id, projected) =
             row.map_err(|e| AppError::Database(format!("读取消息行失败: {e}")))?;
 
         // 只处理 assistant 消息
-        let value: serde_json::Value = match serde_json::from_str(&data_json) {
+        let value = match projected {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -244,7 +302,6 @@ fn query_assistant_messages(
 
         // 跳过未完成的消息：进行中只有半截 token，且因 INSERT OR IGNORE 无法回填
         if value.get("time").and_then(|t| t.get("completed")).is_none() {
-            has_incomplete_usage = true;
             continue;
         }
 
@@ -253,10 +310,7 @@ fn query_assistant_messages(
         }
     }
 
-    Ok(OpenCodeMessageQueryResult {
-        messages,
-        has_incomplete_usage,
-    })
+    Ok(messages)
 }
 
 /// 解析 opencode message.data JSON 为结构化数据
@@ -342,13 +396,11 @@ fn derive_latency_ms(value: &serde_json::Value, created_ms: i64) -> i64 {
 
 /// 插入单条 OpenCode 消息记录到 proxy_request_logs
 fn insert_opencode_message(
-    db: &Database,
+    conn: &rusqlite::Connection,
     request_id: &str,
     msg: &OpenCodeMessageData,
     session_id: &str,
 ) -> Result<bool, AppError> {
-    let conn = lock_conn!(db.conn);
-
     let created_at = if msg.timestamp_ms > 0 {
         msg.timestamp_ms / 1000
     } else {
@@ -371,7 +423,7 @@ fn insert_opencode_message(
         cache_creation_tokens: msg.cache_write_tokens,
         created_at,
     };
-    if should_skip_session_insert(&conn, request_id, &dedup_key)? {
+    if should_skip_session_insert(conn, request_id, &dedup_key)? {
         return Ok(false);
     }
 
@@ -398,7 +450,7 @@ fn insert_opencode_message(
                 message_id: None,
             };
 
-            match find_model_pricing(&conn, &msg.model_id) {
+            match find_model_pricing(conn, &msg.model_id) {
                 Some(pricing) => {
                     let cost = CostCalculator::calculate_for_app(
                         "opencode",
@@ -467,6 +519,29 @@ fn insert_opencode_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::json_projection::take_usage_projected_bytes;
+    use crate::services::session_usage::update_sync_state;
+    use std::fs;
+
+    fn take_fingerprint_work() -> (usize, usize) {
+        (
+            OPENCODE_FINGERPRINTED_SESSIONS.with(|sessions| sessions.replace(0)),
+            OPENCODE_FINGERPRINTED_BYTES.with(|bytes| bytes.replace(0)),
+        )
+    }
+
+    fn create_opencode_source(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
+        let source = rusqlite::Connection::open(path)?;
+        source.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, time_updated INTEGER);
+             CREATE TABLE message (
+                 id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+                 time_updated INTEGER, data TEXT
+             );
+             CREATE INDEX message_session ON message (session_id, time_created, id);",
+        )?;
+        Ok(source)
+    }
 
     #[test]
     fn test_parse_message_data_full() {
@@ -557,9 +632,9 @@ mod tests {
         });
         let msg = parse_message_data(&value).unwrap();
         let request_id = "opencode_session:timing:message";
-        assert!(insert_opencode_message(&db, request_id, &msg, "timing").unwrap());
-        assert!(!insert_opencode_message(&db, request_id, &msg, "timing").unwrap());
         let conn = lock_conn!(db.conn);
+        assert!(insert_opencode_message(&conn, request_id, &msg, "timing").unwrap());
+        assert!(!insert_opencode_message(&conn, request_id, &msg, "timing").unwrap());
         let row = conn
             .query_row(
                 "SELECT latency_ms, first_token_ms, input_tokens, output_tokens, total_cost_usd, COUNT(*)
@@ -657,29 +732,224 @@ mod tests {
 
         let result = query_assistant_messages(&conn, "s1").unwrap();
         // 只返回已完成（带 time.completed）的消息，半截的被跳过
-        assert_eq!(result.messages.len(), 1);
-        assert_eq!(result.messages[0].0, "done");
-        assert!(result.has_incomplete_usage);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "done");
     }
 
     #[test]
-    fn test_query_sessions_uses_message_update_watermark() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE session (id TEXT, time_updated INTEGER);
-             CREATE TABLE message (
-                 id TEXT,
-                 session_id TEXT,
-                 time_created INTEGER,
-                 time_updated INTEGER,
-                 data TEXT
-             );
-             INSERT INTO session VALUES ('s1', 100);
-             INSERT INTO message VALUES ('m1', 's1', 90, 200, '{}');",
-        )
-        .unwrap();
+    fn opencode_usage_projection_retains_fixed_fields_for_large_messages() {
+        for content_bytes in [16, 256 * 1024] {
+            let content = "x".repeat(content_bytes);
+            let data = format!(
+                r#"{{"role":"assistant","tokens":false,"tokens":{{"input":4,"cache":{{"read":2,"unknown":[0]}}}},
+                    "modelID":"model","content":"{content}","time":{{"created":1000,"completed":2000}},
+                    "extra":{{"payload":"{content}"}}}}"#,
+            );
+            let result = OPENCODE_MESSAGE.parse(&data).unwrap();
+            assert_eq!(
+                result,
+                serde_json::json!({
+                    "role": "assistant",
+                    "tokens": {"input": 4, "cache": {"read": 2}},
+                    "modelID": "model",
+                    "time": {"created": 1000, "completed": 2000}
+                })
+            );
+            let usage = parse_message_data(&result).unwrap();
+            assert_eq!(usage.input_tokens, 4);
+            assert_eq!(usage.cache_read_tokens, 2);
+            assert_eq!(usage.latency_ms, 1000);
+        }
+        for invalid in [
+            r#"{"role":"assistant","ignored":[,]}"#,
+            r#"{"role":"assistant","ignored":"\uD800"}"#,
+        ] {
+            assert!(OPENCODE_MESSAGE.parse(invalid).is_err());
+        }
+    }
 
-        let sessions = query_sessions(&conn).unwrap();
-        assert_eq!(sessions, vec![("s1".to_string(), 200)]);
+    #[test]
+    fn opencode_usage_unchanged_sessions_do_not_replay_json() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().unwrap();
+        for padding in [16, 256 * 1024] {
+            let db = Database::memory()?;
+            let path = temp.path().join(format!("opencode-{padding}.db"));
+            let source = create_opencode_source(&path)?;
+            source
+                .execute_batch("INSERT INTO session VALUES ('stable', 100), ('pending', 100);")?;
+            let ignored = "x".repeat(padding);
+            let stable = format!(
+                r#"{{"role":"assistant","tokens":{{"input":4}},"time":{{"created":100,"completed":200}},"content":"{ignored}"}}"#
+            );
+            let completed = r#"{"role":"assistant","tokens":{"input":8},"time":{"created":100,"completed":201}}"#;
+            let pending = format!(
+                "{:width$}",
+                r#"{"role":"assistant","tokens":{"input":8},"time":{"created":100}}"#,
+                width = completed.len()
+            );
+            source.execute(
+                "INSERT INTO message VALUES
+                 ('a', 'stable', 100, 200, ?1), ('b', 'pending', 100, 200, ?2)",
+                rusqlite::params![stable, pending],
+            )?;
+            drop(source);
+            let before = fs::metadata(&path).unwrap();
+            take_usage_projected_bytes();
+            take_fingerprint_work();
+            assert_eq!(sync_opencode_database(&db, &path)?.imported, 1);
+            assert_eq!(take_usage_projected_bytes(), stable.len() + pending.len());
+            assert_eq!(take_fingerprint_work(), (2, stable.len() + pending.len()));
+            for _ in 0..8 {
+                assert_eq!(sync_opencode_database(&db, &path)?.imported, 0);
+            }
+            assert_eq!(take_usage_projected_bytes(), 0);
+            assert_eq!(take_fingerprint_work(), (0, 0));
+
+            let source = rusqlite::Connection::open(&path)?;
+            source.execute("UPDATE message SET data = ?1 WHERE id = 'b'", [completed])?;
+            drop(source);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
+                .unwrap();
+            let after = fs::metadata(&path).unwrap();
+            assert_eq!(before.len(), after.len());
+            assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+            assert_eq!(sync_opencode_database(&db, &path)?.imported, 1);
+            assert_eq!(take_usage_projected_bytes(), completed.len());
+            assert_eq!(take_fingerprint_work(), (2, stable.len() + completed.len()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn opencode_usage_wal_imports_committed_same_timestamp_edits() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let db = Database::memory()?;
+        let mut source = create_opencode_source(&path)?;
+        source.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA wal_autocheckpoint = 0;
+             INSERT INTO session VALUES ('s1', 100), ('s2', 100);",
+        )?;
+        let complete =
+            r#"{"role":"assistant","tokens":{"input":8},"time":{"created":100,"completed":200}}"#;
+        // Preparing the same row for import can leave its ID, timestamps,
+        // payload length and session message count unchanged.
+        let pending = format!(
+            "{:width$}",
+            r#"{"role":"assistant","tokens":{"input":8},"time":{"created":100}}"#,
+            width = complete.len()
+        );
+        assert_eq!(pending.len(), complete.len());
+        let stable = format!(
+            r#"{{"role":"assistant","tokens":{{"input":4}},"time":{{"created":100,"completed":200}},"content":"{}"}}"#,
+            "x".repeat(256 * 1024)
+        );
+        source.execute(
+            "INSERT INTO message VALUES ('pending', 's1', 100, 200, ?1),
+                                        ('stable', 's2', 100, 200, ?2)",
+            rusqlite::params![pending, stable],
+        )?;
+        // Legacy cursors stored only a high timestamp.
+        let path_str = path.to_string_lossy();
+        for key in [path_str.to_string(), format!("{path_str}:s1")] {
+            update_sync_state(&db, &key, i64::MAX, 0)?;
+        }
+        take_usage_projected_bytes();
+        take_fingerprint_work();
+        assert_eq!(sync_opencode_database(&db, &path)?.imported, 1);
+        assert_eq!(take_usage_projected_bytes(), stable.len() + pending.len());
+        assert_eq!(take_fingerprint_work(), (2, stable.len() + pending.len()));
+
+        let writer = source.transaction()?;
+        writer.execute(
+            "UPDATE message SET data = ?1 WHERE id = 'pending'",
+            [complete],
+        )?;
+        for _ in 0..3 {
+            assert_eq!(sync_opencode_database(&db, &path)?.imported, 0);
+        }
+        assert_eq!(take_usage_projected_bytes(), 0);
+        assert_eq!(
+            take_fingerprint_work(),
+            (6, 3 * (stable.len() + pending.len()))
+        );
+
+        writer.commit()?;
+        assert_eq!(sync_opencode_database(&db, &path)?.imported, 1);
+        assert_eq!(take_usage_projected_bytes(), complete.len());
+        assert_eq!(take_fingerprint_work(), (2, stable.len() + complete.len()));
+        Ok(())
+    }
+
+    #[test]
+    fn opencode_usage_detects_replacement_with_same_size_and_timestamp() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let replacement = temp.path().join("replacement.db");
+        let db = Database::memory()?;
+        let message =
+            r#"{"role":"assistant","tokens":{"input":8},"time":{"created":100,"completed":200}}"#;
+        for (source_path, message_id) in [(&path, "old"), (&replacement, "new")] {
+            let source = create_opencode_source(source_path)?;
+            source.execute("INSERT INTO session VALUES ('s1', 100)", [])?;
+            source.execute(
+                "INSERT INTO message VALUES (?1, 's1', 100, 200, ?2)",
+                rusqlite::params![message_id, message],
+            )?;
+        }
+        let before = fs::metadata(&path).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
+            .unwrap();
+        let after = fs::metadata(&replacement).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+
+        assert_eq!(sync_opencode_database(&db, &path)?.imported, 1);
+        fs::remove_file(&path).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert_eq!(sync_opencode_database(&db, &path)?.imported, 1);
+        assert_eq!(sync_opencode_database(&db, &path)?.imported, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn opencode_usage_rolls_back_import_when_cursor_write_fails() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let db = Database::memory()?;
+        let source = create_opencode_source(&path)?;
+        source.execute_batch(
+            "INSERT INTO session VALUES ('s1', 100);
+             INSERT INTO message VALUES (
+                 'm1', 's1', 100, 200,
+                 '{\"role\":\"assistant\",\"tokens\":{\"input\":8},\"time\":{\"created\":100,\"completed\":200}}'
+             );",
+        )?;
+        lock_conn!(db.conn).execute_batch(
+            "CREATE TRIGGER fail_sync BEFORE INSERT ON session_log_sync
+             BEGIN SELECT RAISE(ABORT, 'fixture cursor error'); END;",
+        )?;
+        let failed = sync_opencode_database(&db, &path)?;
+        assert_eq!(failed.imported, 0);
+        assert_eq!(failed.errors.len(), 1);
+        let rows = lock_conn!(db.conn).query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'opencode_session'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(rows, 0);
+        lock_conn!(db.conn).execute_batch("DROP TRIGGER fail_sync")?;
+        assert_eq!(sync_opencode_database(&db, &path)?.imported, 1);
+        assert_eq!(sync_opencode_database(&db, &path)?.imported, 0);
+        Ok(())
     }
 }

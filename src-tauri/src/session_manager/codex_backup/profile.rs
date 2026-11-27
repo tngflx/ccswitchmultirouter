@@ -7,6 +7,7 @@ use chrono::{DateTime, Datelike, SecondsFormat};
 use serde::{Deserialize, Serialize};
 
 use super::archive::{rollout_name_parts, SessionEntry};
+use super::history_db::NATIVE_FILENAME;
 use super::io_error;
 use crate::codex_config::{get_codex_config_dir, read_codex_config_text};
 use crate::codex_state_db::resolve_active_codex_state_db_path;
@@ -36,11 +37,8 @@ impl Profile {
         if let Some(path) = &state_db {
             checked_file(path)?;
         }
-        let sqlite_dir = state_db.as_deref().and_then(Path::parent);
-        let history_db = sqlite_dir
-            .filter(|path| *path != home)
-            .and_then(latest_history_db)
-            .or_else(|| latest_history_db(&home));
+        let sqlite_dir = state_db.as_deref().and_then(Path::parent).unwrap_or(&home);
+        let history_db = latest_history_db(sqlite_dir);
         Ok(Self {
             home,
             state_db,
@@ -88,10 +86,17 @@ impl Profile {
         Ok(canonical)
     }
 
-    pub(super) fn history_path_for_restore(&self) -> PathBuf {
-        self.history_db
-            .clone()
-            .unwrap_or_else(|| self.home.join("thread_history.sqlite"))
+    pub(super) fn history_path_for_restore(&self) -> Result<PathBuf, String> {
+        // Codex opens the history and state databases in the same SQLite home.
+        let sqlite_dir = self
+            .state_db
+            .as_deref()
+            .and_then(Path::parent)
+            .ok_or("The destination Codex chat catalog is missing.")?;
+        if !checked_directory(sqlite_dir, false)? {
+            return Err("The destination Codex SQLite directory is missing.".into());
+        }
+        Ok(latest_history_db(sqlite_dir).unwrap_or_else(|| sqlite_dir.join(NATIVE_FILENAME)))
     }
 
     pub(super) fn occupied_rollout_ids(
@@ -301,7 +306,7 @@ fn checked_directory(path: &Path, create: bool) -> Result<bool, String> {
     }
 }
 
-fn checked_file(path: &Path) -> Result<bool, String> {
+pub(super) fn checked_file(path: &Path) -> Result<bool, String> {
     match metadata(path)? {
         Some(metadata) if metadata.is_file() && !is_link(&metadata) => Ok(true),
         Some(_) => Err("A Codex profile file is a link or is not a regular file.".into()),

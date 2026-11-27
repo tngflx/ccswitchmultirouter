@@ -1509,7 +1509,8 @@ pub fn reasoning_capability_from_provider_model_entry(
     capability.validate().ok().map(|_| capability)
 }
 
-pub fn resolve_reasoning_capability_from_settings(
+#[cfg(test)]
+fn resolve_reasoning_capability_from_settings(
     settings: &Value,
     model: &str,
 ) -> Option<CodexModelReasoningCapability> {

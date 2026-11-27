@@ -45,22 +45,30 @@ export function CodexCatalogSyncReview({
   const canChangeMissing =
     fetchedCount > 0 && coverage === "complete" && missingModels.length > 0;
   const canDisableMissing = canChangeMissing && enabledMissingCount > 0;
+  const canReplaceConflicts =
+    fetchedCount > 0 &&
+    coverage === "complete" &&
+    conflictingModels.some(({ canReplace }) => canReplace);
   const hasOtherChanges = addedModels.length > 0 || hasMetadataChanges;
   const canApplyMode: Record<CodexCatalogSyncMode, boolean> = {
     keep: hasOtherChanges,
     disable: hasOtherChanges || canDisableMissing,
-    replace: canChangeMissing,
+    replace: canChangeMissing || canReplaceConflicts,
   };
-  const hasChanges = fetchedCount > 0 && (hasOtherChanges || canChangeMissing);
+  const hasChanges =
+    fetchedCount > 0 &&
+    (hasOtherChanges || canChangeMissing || canReplaceConflicts);
   const defaultMode: CodexCatalogSyncMode = canDisableMissing
     ? "disable"
-    : canChangeMissing && !hasOtherChanges
+    : (canChangeMissing || canReplaceConflicts) && !hasOtherChanges
       ? "replace"
       : "keep";
   const [mode, setMode] = useState(defaultMode);
   const [includeNewModels, setIncludeNewModels] = useState(false);
   const appliedMode =
-    canChangeMissing && canApplyMode[mode] ? mode : defaultMode;
+    (canChangeMissing || canReplaceConflicts) && canApplyMode[mode]
+      ? mode
+      : defaultMode;
   const newModels = [...addedModels];
   const blockedModels: string[] = [];
   for (const { model, canReplace } of conflictingModels) {
@@ -215,12 +223,19 @@ export function CodexCatalogSyncReview({
               </p>
             )}
 
-            {canChangeMissing && (
+            {(canChangeMissing || canReplaceConflicts) && (
               <fieldset className="space-y-2">
                 <legend className="mb-2 text-sm font-medium">
-                  {t("codexConfig.modelSync.missingChoice", {
-                    defaultValue: "How should sync handle missing models?",
-                  })}
+                  {t(
+                    canChangeMissing
+                      ? "codexConfig.modelSync.missingChoice"
+                      : "codexConfig.modelSync.syncChoice",
+                    {
+                      defaultValue: canChangeMissing
+                        ? "How should sync handle missing models?"
+                        : "How should sync apply these catalog changes?",
+                    },
+                  )}
                 </legend>
                 {options.map(({ value, label, description }) => (
                   <label

@@ -6,7 +6,7 @@ export interface CodexContextInferenceSource {
   providerName?: string;
   baseUrl?: string;
   websiteUrl?: string;
-  existingModels?: ExistingModelLike[];
+  existingModels?: ExistingModelLike[] | ReadonlyMap<string, ExistingModelLike>;
 }
 
 interface FetchedModelLike {
@@ -86,15 +86,29 @@ function providerMatchesPreset(
 }
 
 // 优先从当前 provider 已有目录读取，避免获取模型列表时覆盖用户手工修正过的上下文。
+export function indexExistingCodexContextModels(
+  models: readonly ExistingModelLike[],
+): ReadonlyMap<string, ExistingModelLike> {
+  const byModel = new Map<string, ExistingModelLike>();
+  for (const model of models) {
+    const id = (model.model ?? "").trim();
+    // Match the single-model resolver's first exact match, even without context.
+    if (id && !byModel.has(id)) byModel.set(id, model);
+  }
+  return byModel;
+}
+
 function existingCatalogContextWindow(
   modelId: string,
-  existingModels: ExistingModelLike[] = [],
+  existingModels: CodexContextInferenceSource["existingModels"],
 ): number | undefined {
   const normalizedModel = modelId.trim();
   if (!normalizedModel) return undefined;
-  const existing = existingModels.find(
-    (model) => (model.model ?? "").trim() === normalizedModel,
-  );
+  const existing = Array.isArray(existingModels)
+    ? existingModels.find(
+        (model) => (model.model ?? "").trim() === normalizedModel,
+      )
+    : existingModels?.get(normalizedModel);
   return parsePositiveContextWindow(
     existing?.contextWindow ?? existing?.context_window,
   );

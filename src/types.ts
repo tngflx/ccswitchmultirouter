@@ -921,7 +921,7 @@ export interface Settings {
   // ===== 备份策略设置 =====
   // Auto-backup interval in hours (0=disabled, default 24)
   backupIntervalHours?: number;
-  // Maximum backup files to retain (default 10)
+  // Maximum backup files to retain (hard capped at 2)
   backupRetainCount?: number;
 
   // ===== 终端设置 =====

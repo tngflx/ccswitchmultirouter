@@ -68,6 +68,12 @@ export interface WizardPlanBuildOptions {
   spawnAgentModels?: string[];
   subagentVersion?: CodexSubagentVersion;
   hostedTools?: HostedToolsConfig;
+  /**
+   * Models whose Sub-Agent V2 roles should be disabled for this unsaved draft.
+   * The profile remains intact so it can be re-enabled after its capability is
+   * declared in the provider catalog.
+   */
+  disabledSubagentModels?: string[];
 }
 
 export interface WizardConfigIssue {
@@ -1556,6 +1562,29 @@ function buildSubagentNameRedirector(
   return { redirectVisibleName, isCurrentVisibleName, remapSubagentV2 };
 }
 
+function disableSubagentModels(
+  config: CodexRoutingConfigV2["subagentV2"],
+  models: string[] | undefined,
+): CodexRoutingConfigV2["subagentV2"] {
+  if (!config?.profiles || !models?.length) return config;
+  const disabled = new Set(
+    models.map((model) => model.trim().toLowerCase()).filter(Boolean),
+  );
+  if (!disabled.size) return config;
+  let changed = false;
+  const profiles = Object.fromEntries(
+    Object.entries(config.profiles).map(([key, profile]) => {
+      const model = profile.model?.trim().toLowerCase() || key.toLowerCase();
+      if (!disabled.has(model) || profile.enabled === false) {
+        return [key, profile];
+      }
+      changed = true;
+      return [key, { ...profile, enabled: false }];
+    }),
+  );
+  return changed ? { ...config, profiles } : config;
+}
+
 // 创建或更新 MultiRouter provider；草稿只在用户点击保存发布时写入数据库。
 export function buildCodexMultiRouterWizardPlan(
   allProviders: Provider[],
@@ -1650,6 +1679,10 @@ export function buildCodexMultiRouterWizardPlan(
     resolvedSources,
     sourceModelId,
   );
+  const subagentV2 = disableSubagentModels(
+    subagentNameRedirector.remapSubagentV2(existingRouting?.subagentV2),
+    options.disabledSubagentModels,
+  );
   const routing: CodexRoutingConfigV2 = {
     ...(existingRoutingV2 ?? {}),
     schemaVersion: 2,
@@ -1661,9 +1694,7 @@ export function buildCodexMultiRouterWizardPlan(
       existingRouting?.subagentReasoningEffort === undefined
         ? "high"
         : existingRouting.subagentReasoningEffort,
-    subagentV2: subagentNameRedirector.remapSubagentV2(
-      existingRouting?.subagentV2,
-    ),
+    subagentV2,
     spawnAgentModels: requestedSpawnAgentModels
       .map((model) => {
         const redirected = subagentNameRedirector.redirectVisibleName(model);

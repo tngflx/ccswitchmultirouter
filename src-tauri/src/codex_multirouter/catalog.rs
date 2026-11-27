@@ -1,6 +1,8 @@
 //! Internal catalogue normalization. Native provider/Codex descriptor adapters stay at the edges.
+use crate::provider::Provider;
 use serde_json::Value;
-use std::sync::OnceLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 fn contract() -> &'static Value {
     static CONTRACT: OnceLock<Value> = OnceLock::new();
@@ -193,10 +195,83 @@ pub(crate) fn read_catalog_mut(
 }
 
 pub(crate) fn catalog_models(settings: &Value) -> Option<&[Value]> {
-    read_catalog(settings)?
-        .get("models")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
+    models_in_catalog(read_catalog(settings)?)
+}
+
+fn models_in_catalog(catalog: &Value) -> Option<&[Value]> {
+    catalog.get("models")?.as_array().map(Vec::as_slice)
+}
+
+fn shared_provider_catalog(provider: &Provider) -> Option<&SharedCodexCatalog> {
+    provider.meta.as_ref()?.runtime_codex_catalog.as_deref()
+}
+
+pub(crate) fn read_provider_catalog(provider: &Provider) -> Option<&Value> {
+    shared_provider_catalog(provider)
+        .map(|catalog| &catalog.value)
+        .or_else(|| read_catalog(&provider.settings_config))
+}
+
+pub(crate) fn provider_catalog_models(provider: &Provider) -> Option<&[Value]> {
+    models_in_catalog(read_provider_catalog(provider)?)
+}
+
+/// Resolve whether a provider's catalog should be projected into Codex live
+/// settings. Runtime route providers keep the catalog in the materialized
+/// shared snapshot, so the legacy metadata fallback must consult the same
+/// provider-aware reader after the settings field has been moved out.
+pub(crate) fn provider_catalog_projection_enabled(provider: &Provider) -> bool {
+    let Some(meta) = provider.meta.as_ref() else {
+        return read_provider_catalog(provider).is_some();
+    };
+    if meta.codex_model_catalog_projection_enabled(&provider.settings_config) {
+        return true;
+    }
+    meta.codex_local_model_mapping.is_none() && read_provider_catalog(provider).is_some()
+}
+
+pub(crate) fn lookup_provider_catalog_model<'a>(
+    provider: &'a Provider,
+    model: &str,
+) -> CatalogModelLookup<'a> {
+    if let Some(catalog) = shared_provider_catalog(provider) {
+        catalog.index.lookup(catalog.models(), model)
+    } else {
+        lookup_catalog_model(&provider.settings_config, model)
+    }
+}
+
+/// The canonical inventory captured by a compiled route snapshot.
+#[derive(Debug)]
+pub struct SharedCodexCatalog {
+    value: Value,
+    index: Arc<CatalogIdentityIndex>,
+}
+
+impl SharedCodexCatalog {
+    fn models(&self) -> &[Value] {
+        models_in_catalog(&self.value).unwrap_or_default()
+    }
+}
+
+/// Move the canonical catalog out of a target loaded for the runtime plan.
+/// Called only after compilation has consumed the original provider settings.
+pub(crate) fn share_provider_catalog(provider: &mut Provider) {
+    let Some(settings) = provider.settings_config.as_object_mut() else {
+        return;
+    };
+    let catalog = read_catalog_mut(settings).map(std::mem::take);
+    settings.remove("modelCatalog");
+    settings.remove("model_catalog");
+    if let Some(value) = catalog {
+        let index = Arc::new(CatalogIdentityIndex::new(
+            models_in_catalog(&value).unwrap_or_default(),
+        ));
+        provider
+            .meta
+            .get_or_insert_with(Default::default)
+            .runtime_codex_catalog = Some(Arc::new(SharedCodexCatalog { value, index }));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -204,6 +279,124 @@ pub(crate) enum CatalogModelLookup<'a> {
     Missing,
     Found(&'a Value),
     Ambiguous,
+}
+
+/// Borrow the canonical inventory for consumers doing multiple lookups.
+/// The exact and fallback tiers have the same ownership rules as a scan.
+#[derive(Default)]
+pub(crate) struct CatalogModelIndex<'a> {
+    rows: &'a [Value],
+    index: Arc<CatalogIdentityIndex>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogRowOwner {
+    Unique(usize),
+    Ambiguous,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CatalogIdentityIndex {
+    exact: HashMap<String, CatalogRowOwner>,
+    fallback: HashMap<String, CatalogRowOwner>,
+    public_models: HashSet<String>,
+}
+
+impl<'a> CatalogModelIndex<'a> {
+    pub(crate) fn new(settings: &'a Value) -> Self {
+        let rows = catalog_models(settings).unwrap_or_default();
+        Self {
+            rows,
+            index: Arc::new(CatalogIdentityIndex::new(rows)),
+        }
+    }
+
+    pub(crate) fn for_provider(provider: &'a Provider) -> Self {
+        if let Some(catalog) = shared_provider_catalog(provider) {
+            return Self {
+                rows: catalog.models(),
+                index: Arc::clone(&catalog.index),
+            };
+        }
+        let rows = provider_catalog_models(provider).unwrap_or_default();
+        Self {
+            rows,
+            index: Arc::new(CatalogIdentityIndex::new(rows)),
+        }
+    }
+
+    pub(crate) fn lookup(&self, model: &str) -> CatalogModelLookup<'a> {
+        self.index.lookup(self.rows, model)
+    }
+
+    pub(crate) fn has_public_model(&self, model: &str) -> bool {
+        !model.trim().is_empty()
+            && self
+                .index
+                .public_models
+                .contains(&model.trim().to_ascii_lowercase())
+    }
+}
+
+impl CatalogIdentityIndex {
+    fn new(rows: &[Value]) -> Self {
+        let mut index = Self::default();
+        for (position, row) in rows.iter().enumerate() {
+            #[cfg(test)]
+            track_catalog_row_visit();
+            for identity in model_identities(row, &["model", "id"]) {
+                Self::insert(&mut index.exact, identity, position);
+            }
+            if let Some(model) = row.get("model").and_then(Value::as_str) {
+                index
+                    .public_models
+                    .insert(model.trim().to_ascii_lowercase());
+            }
+            if !is_generated_api_key_group_model(row) {
+                for identity in fallback_model_identities(row) {
+                    Self::insert(&mut index.fallback, identity, position);
+                }
+            }
+        }
+        index
+    }
+
+    fn insert(index: &mut HashMap<String, CatalogRowOwner>, identity: &str, position: usize) {
+        let identity = identity.trim();
+        if identity.is_empty() {
+            return;
+        }
+        let owner = index
+            .entry(identity.to_ascii_lowercase())
+            .or_insert(CatalogRowOwner::Unique(position));
+        if *owner != CatalogRowOwner::Unique(position) {
+            *owner = CatalogRowOwner::Ambiguous;
+        }
+    }
+
+    fn lookup<'a>(&self, rows: &'a [Value], model: &str) -> CatalogModelLookup<'a> {
+        let key = model.trim().to_ascii_lowercase();
+        match self.exact.get(&key).or_else(|| self.fallback.get(&key)) {
+            Some(CatalogRowOwner::Unique(position)) => CatalogModelLookup::Found(&rows[*position]),
+            Some(CatalogRowOwner::Ambiguous) => CatalogModelLookup::Ambiguous,
+            None => CatalogModelLookup::Missing,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CATALOG_ROW_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn track_catalog_row_visit() {
+    CATALOG_ROW_VISITS.with(|visits| visits.set(visits.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn take_catalog_row_visits() -> usize {
+    CATALOG_ROW_VISITS.with(|visits| visits.replace(0))
 }
 
 /// Select the same catalog row for exclusion, capability, and product settings.
@@ -217,16 +410,21 @@ pub(crate) fn lookup_catalog_model<'a>(settings: &'a Value, model: &str) -> Cata
     let Some(models) = catalog_models(settings) else {
         return CatalogModelLookup::Missing;
     };
-    let exact = unique_model_match(
-        models
-            .iter()
-            .filter(|entry| model_identity_matches(entry, model, &["model", "id"])),
-    );
+    let exact = unique_model_match(models.iter().filter(|entry| {
+        #[cfg(test)]
+        track_catalog_row_visit();
+        model_identities(entry, &["model", "id"])
+            .any(|identity| identity.trim().eq_ignore_ascii_case(model))
+    }));
     if !matches!(exact, CatalogModelLookup::Missing) {
         return exact;
     }
     unique_model_match(models.iter().filter(|entry| {
-        !is_generated_api_key_group_model(entry) && fallback_model_identity_matches(entry, model)
+        #[cfg(test)]
+        track_catalog_row_visit();
+        !is_generated_api_key_group_model(entry)
+            && fallback_model_identities(entry)
+                .any(|identity| identity.trim().eq_ignore_ascii_case(model))
     }))
 }
 
@@ -241,11 +439,13 @@ fn unique_model_match<'a>(mut entries: impl Iterator<Item = &'a Value>) -> Catal
     }
 }
 
-fn model_identity_matches(entry: &Value, model: &str, fields: &[&str]) -> bool {
+fn model_identities<'a>(
+    entry: &'a Value,
+    fields: &'static [&'static str],
+) -> impl Iterator<Item = &'a str> {
     fields
         .iter()
-        .filter_map(|field| entry.get(*field).and_then(Value::as_str))
-        .any(|candidate| candidate.trim().eq_ignore_ascii_case(model))
+        .filter_map(move |field| entry.get(*field).and_then(Value::as_str))
 }
 
 /// Generated picker rows inherit their base model's metadata but cannot claim
@@ -264,10 +464,9 @@ fn is_generated_api_key_group_model(entry: &Value) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|model| model.to_ascii_lowercase().contains("--ccg-"))
 }
-fn fallback_model_identity_matches(entry: &Value, model: &str) -> bool {
-    model_identity_matches(
+fn fallback_model_identities(entry: &Value) -> impl Iterator<Item = &str> {
+    model_identities(
         entry,
-        model,
         &[
             "slug",
             "canonicalSlug",
@@ -276,20 +475,22 @@ fn fallback_model_identity_matches(entry: &Value, model: &str) -> bool {
             "upstream_model",
             "name",
         ],
-    ) || ["aliases", "alias"]
-        .iter()
-        .any(|field| match entry.get(*field) {
-            Some(Value::Array(values)) => values
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|candidate| candidate.trim().eq_ignore_ascii_case(model)),
-            Some(Value::Object(values)) => values
-                .keys()
-                .map(String::as_str)
-                .chain(values.values().filter_map(Value::as_str))
-                .any(|candidate| candidate.trim().eq_ignore_ascii_case(model)),
-            _ => false,
-        })
+    )
+    .chain(["aliases", "alias"].into_iter().flat_map(move |field| {
+        let value = entry.get(field);
+        value
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .chain(
+                value
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|(key, value)| std::iter::once(key.as_str()).chain(value.as_str())),
+            )
+    }))
 }
 
 pub(crate) fn normalize_settings(settings: &mut Value) {
@@ -360,6 +561,47 @@ mod tests {
 
         let models = catalog_models(&settings).expect("legacy models");
         assert_eq!(models[0]["model"], "legacy-model");
+    }
+
+    #[test]
+    fn materialized_provider_reuses_shared_catalog_for_projection_and_index() {
+        let _ = take_catalog_row_visits();
+        let mut provider = Provider::with_id(
+            "runtime-provider".into(),
+            "Runtime provider".into(),
+            json!({
+                "modelCatalog": {
+                    "models": [{"model": "runtime-model", "upstreamModel": "wire-model"}]
+                }
+            }),
+            None,
+        );
+
+        share_provider_catalog(&mut provider);
+        assert!(provider.settings_config.get("modelCatalog").is_none());
+        assert!(provider_catalog_projection_enabled(&provider));
+
+        let built_rows = take_catalog_row_visits();
+        assert_eq!(built_rows, 1);
+        let index = CatalogModelIndex::for_provider(&provider);
+        let shared_index = &provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.runtime_codex_catalog.as_ref())
+            .expect("materialized catalog")
+            .index;
+        assert!(
+            Arc::ptr_eq(&index.index, shared_index),
+            "runtime provider projections must share the materialized identity index"
+        );
+        match index.lookup("wire-model") {
+            CatalogModelLookup::Found(row) => assert_eq!(row["model"], "runtime-model"),
+            other => panic!("unexpected catalog lookup result: {other:?}"),
+        }
+        assert_eq!(take_catalog_row_visits(), 0);
+
+        provider.meta.as_mut().unwrap().codex_local_model_mapping = Some(false);
+        assert!(!provider_catalog_projection_enabled(&provider));
     }
 
     #[test]
@@ -444,6 +686,37 @@ mod tests {
                 lookup_catalog_model(&settings, "shared"),
                 CatalogModelLookup::Ambiguous
             );
+        }
+    }
+
+    #[test]
+    fn indexed_catalog_lookup_uses_the_same_owners_as_a_scan() {
+        let settings = serde_json::json!({
+            "modelCatalog":{"models":[
+                {"model":"Exact", "enabled":false},
+                {"model":"mapped", "upstreamModel":"exact", "alias":{"alias-key":"alias-value"}},
+                {"model":"repeated", "id":"Repeated", "aliases":["Repeated alias","repeated alias"]},
+                {"model":"first", "aliases":["ambiguous"]},
+                {"model":"second", "upstreamModel":"Ambiguous"},
+                {"model":"base--ccg-key", "upstreamModel":"inherited", "apiKeyGroupGenerated":true}
+            ]},
+            "model_catalog":{"models":[{"model":"stale"}]}
+        });
+        let index = CatalogModelIndex::new(&settings);
+        for model in [
+            " EXACT ",
+            "mapped",
+            "alias-key",
+            "alias-value",
+            "repeated",
+            "repeated alias",
+            "Ambiguous",
+            "base--ccg-key",
+            "inherited",
+            "stale",
+            " ",
+        ] {
+            assert_eq!(index.lookup(model), lookup_catalog_model(&settings, model));
         }
     }
 

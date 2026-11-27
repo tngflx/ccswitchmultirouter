@@ -621,6 +621,7 @@ const installCodexRpcMutation = (mutation) => {
 const codexScopedRpcFacade = (binding) => {
   const sourceClient = binding.client;
   const originalRpc = binding.rpc;
+  const generation = state.runtimeGeneration;
   let marker;
   try {
     marker = Object.getOwnPropertyDescriptor(
@@ -631,6 +632,7 @@ const codexScopedRpcFacade = (binding) => {
   if (
     marker?.source === sourceClient &&
     marker.wrappedRpc === sourceClient.rpc &&
+    marker.generation === generation &&
     marker.facade &&
     marker.originalRpc
   )
@@ -688,6 +690,8 @@ const codexScopedRpcFacade = (binding) => {
         Object.prototype.hasOwnProperty.call(activityMethods, key)
       )
         return (...args) => {
+          const invoke = Reflect.get(target, key, target);
+          if (state.runtimeGeneration !== generation) return invoke(...args);
           const first = args[0];
           const threadId =
             typeof first === "string"
@@ -697,7 +701,29 @@ const codexScopedRpcFacade = (binding) => {
                 : undefined;
           if (typeof rememberCodexUserTurnAction === "function")
             rememberCodexUserTurnAction(activityMethods[key], { threadId });
-          return Reflect.get(target, key, target)(...args);
+          const acknowledgeTurnStart =
+            (key === "startTurn" ||
+              key === "startTurnWithOutcome" ||
+              key === "startEmptyTurn") &&
+            typeof captureCodexNativeUsageLimitTurnStart === "function"
+              ? captureCodexNativeUsageLimitTurnStart(
+                  facade,
+                  "turn/start",
+                  typeof first === "string" ? { threadId } : first,
+                )
+              : undefined;
+          const result = invoke(...args);
+          if (acknowledgeTurnStart) {
+            try {
+              const then = result?.then;
+              if (typeof then === "function")
+                Reflect.apply(then, result, [acknowledgeTurnStart, () => {}]);
+              else acknowledgeTurnStart(result);
+            } catch {
+              // Observation must preserve the original RPC result.
+            }
+          }
+          return result;
         };
       return Reflect.get(target, key, target);
     },
@@ -708,7 +734,13 @@ const codexScopedRpcFacade = (binding) => {
     markerKey: "__ccSwitchRpcBinding",
     slot,
     value: wrappedRpc,
-    marker: { source: sourceClient, originalRpc: baseRpc, wrappedRpc, facade },
+    marker: {
+      source: sourceClient,
+      originalRpc: baseRpc,
+      wrappedRpc,
+      facade,
+      generation,
+    },
   };
   if (!installCodexRpcMutation(mutation)) return null;
   return { facade, wrappedRpc, originalRpc: baseRpc, mutation };

@@ -1,13 +1,134 @@
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 use rusqlite::Connection;
 use serde_json::Value;
 
+use crate::file_revision::FileRevision;
 use crate::session_manager::{SessionMessage, SessionMeta};
 
-use super::utils::{parse_timestamp_to_ms, path_basename, truncate_summary};
+use super::utils::{
+    parse_timestamp_to_ms, path_basename, read_open_file_head_tail_lines, truncate_summary,
+    FileCache,
+};
 
 const PROVIDER_ID: &str = "opencode";
+
+static JSON_SESSIONS: LazyLock<Mutex<FileCache<Option<CachedJsonSession>>>> =
+    LazyLock::new(Mutex::default);
+static JSON_SUMMARIES: LazyLock<Mutex<SummaryCache>> = LazyLock::new(Mutex::default);
+static SQLITE_SESSIONS: LazyLock<Mutex<SqliteSessionCache>> = LazyLock::new(Mutex::default);
+
+#[derive(Clone)]
+struct CachedJsonSession {
+    meta: SessionMeta,
+    has_title: bool,
+}
+
+#[derive(Default)]
+struct SummaryCache {
+    entries: HashMap<PathBuf, CachedSummary>,
+    scan: u64,
+    #[cfg(test)]
+    loads: usize,
+}
+
+struct CachedSummary {
+    message_files: Vec<(PathBuf, FileRevision)>,
+    part_dir: Option<PathBuf>,
+    part_files: Vec<(PathBuf, FileRevision)>,
+    summary: Option<String>,
+    scan: u64,
+}
+
+impl SummaryCache {
+    fn refresh<R>(&mut self, scan: impl FnOnce(&mut Self) -> R) -> R {
+        self.scan = self.scan.wrapping_add(1);
+        let result = scan(self);
+        self.entries.retain(|_, entry| entry.scan == self.scan);
+        result
+    }
+
+    fn read(&mut self, storage: &Path, session_id: &str) -> Option<String> {
+        let msg_dir = storage.join("message").join(session_id);
+        let mut message_paths = Vec::new();
+        collect_json_files(&msg_dir, &mut message_paths);
+        message_paths.sort_unstable();
+        let message_files = collect_file_revisions(&message_paths);
+        let cache_key = msg_dir.clone();
+
+        if let Some(message_files) = &message_files {
+            if let Some(entry) = self.entries.get_mut(&cache_key) {
+                if entry.message_files.as_slice() == message_files.as_slice() {
+                    if let Some(part_files) = entry.part_dir.as_ref().map_or_else(
+                        || Some(Vec::new()),
+                        |part_dir| {
+                            let mut paths = Vec::new();
+                            collect_json_files(part_dir, &mut paths);
+                            paths.sort_unstable();
+                            collect_file_revisions(&paths)
+                        },
+                    ) {
+                        if entry.part_files == part_files {
+                            entry.scan = self.scan;
+                            return entry.summary.clone();
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(test)]
+        {
+            self.loads += 1;
+        }
+        let (summary, part_dir) = read_first_user_summary(storage, &message_paths);
+
+        let stable_message_files = collect_file_revisions(&message_paths);
+        let Some(stable_part_files) = part_dir.as_ref().map_or_else(
+            || Some(Vec::new()),
+            |part_dir| {
+                let mut paths = Vec::new();
+                collect_json_files(part_dir, &mut paths);
+                paths.sort_unstable();
+                collect_file_revisions(&paths)
+            },
+        ) else {
+            return summary;
+        };
+        if let (Some(message_files), Some(stable_message_files)) =
+            (message_files, stable_message_files)
+        {
+            if message_files == stable_message_files {
+                self.entries.insert(
+                    cache_key,
+                    CachedSummary {
+                        message_files,
+                        part_dir,
+                        part_files: stable_part_files,
+                        summary: summary.clone(),
+                        scan: self.scan,
+                    },
+                );
+            }
+        }
+        summary
+    }
+}
+
+#[derive(Default)]
+struct SqliteSessionCache {
+    path: Option<PathBuf>,
+    revision: Option<FileRevision>,
+    sessions: Vec<SessionMeta>,
+    rollback_journal: bool,
+    #[cfg(test)]
+    loads: usize,
+}
 
 /// Return the OpenCode base directory (`$XDG_DATA_HOME/opencode`).
 ///
@@ -71,13 +192,32 @@ fn scan_sessions_json() -> Vec<SessionMeta> {
     let mut json_files = Vec::new();
     collect_json_files(&session_dir, &mut json_files);
 
-    let mut sessions = Vec::new();
-    for path in json_files {
-        if let Some(meta) = parse_session(&storage, &path) {
-            sessions.push(meta);
-        }
-    }
-    sessions
+    let mut summaries = JSON_SUMMARIES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut cache = JSON_SESSIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    summaries.refresh(|summaries| {
+        cache.refresh(|cache| {
+            let mut sessions = Vec::new();
+            for path in json_files {
+                let Some(cached) = cache
+                    .read(&path, |file| parse_session_from_file(&storage, file))
+                    .flatten()
+                else {
+                    continue;
+                };
+
+                let mut meta = cached.meta;
+                if !cached.has_title {
+                    meta.summary = summaries.read(&storage, &meta.session_id);
+                }
+                sessions.push(meta);
+            }
+            sessions
+        })
+    })
 }
 
 /// Parse a SQLite source reference in the format `sqlite:<db_path>:<session_id>`.
@@ -95,23 +235,84 @@ fn parse_sqlite_source(source: &str) -> Option<(PathBuf, String)> {
 
 fn scan_sessions_sqlite() -> Vec<SessionMeta> {
     let db_path = get_opencode_db_path();
-    if !db_path.exists() {
+    let revision = FileRevision::read(&db_path);
+    let mut cache = SQLITE_SESSIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if revision.is_none() {
+        cache.path = None;
+        cache.revision = None;
+        cache.rollback_journal = false;
+        cache.sessions.clear();
         return Vec::new();
     }
+    if cache.rollback_journal
+        && cache.path.as_deref() == Some(db_path.as_path())
+        && cache.revision == revision
+    {
+        return cache.sessions.clone();
+    }
 
-    let conn = match Connection::open_with_flags(
+    let mut conn = match Connection::open_with_flags(
         &db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            cache.path = None;
+            cache.revision = None;
+            cache.rollback_journal = false;
+            cache.sessions.clear();
+            return Vec::new();
+        }
     };
+    if conn.busy_timeout(Duration::from_secs(2)).is_err() {
+        cache.path = None;
+        cache.revision = None;
+        cache.rollback_journal = false;
+        cache.sessions.clear();
+        return Vec::new();
+    }
 
-    let mut stmt = match conn.prepare(
+    let snapshot = match conn.transaction() {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            cache.path = None;
+            cache.revision = None;
+            cache.rollback_journal = false;
+            cache.sessions.clear();
+            return Vec::new();
+        }
+    };
+    if snapshot
+        .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+        .is_err()
+    {
+        cache.path = None;
+        cache.revision = None;
+        cache.rollback_journal = false;
+        cache.sessions.clear();
+        return Vec::new();
+    }
+
+    let journal_mode = snapshot
+        .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+        .unwrap_or_default();
+    let rollback_journal = journal_mode.eq_ignore_ascii_case("delete")
+        || journal_mode.eq_ignore_ascii_case("truncate")
+        || journal_mode.eq_ignore_ascii_case("persist");
+
+    let mut stmt = match snapshot.prepare(
         "SELECT id, title, directory, time_created, time_updated FROM session ORDER BY time_updated DESC",
     ) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            cache.path = None;
+            cache.revision = None;
+            cache.rollback_journal = false;
+            cache.sessions.clear();
+            return Vec::new();
+        }
     };
 
     let db_display = db_path.display().to_string();
@@ -125,12 +326,27 @@ fn scan_sessions_sqlite() -> Vec<SessionMeta> {
         Ok((session_id, title, directory, created, updated))
     }) {
         Ok(rows) => rows,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            cache.path = None;
+            cache.revision = None;
+            cache.rollback_journal = false;
+            cache.sessions.clear();
+            return Vec::new();
+        }
     };
 
     let mut sessions = Vec::new();
-    for row in iter.flatten() {
-        let (session_id, title, directory, created, updated) = row;
+    for row in iter {
+        let (session_id, title, directory, created, updated) = match row {
+            Ok(row) => row,
+            Err(_) => {
+                cache.path = None;
+                cache.revision = None;
+                cache.rollback_journal = false;
+                cache.sessions.clear();
+                return Vec::new();
+            }
+        };
         let display_title = if title.is_empty() {
             path_basename(&directory)
         } else {
@@ -151,6 +367,29 @@ fn scan_sessions_sqlite() -> Vec<SessionMeta> {
             source_path: Some(format!("sqlite:{db_display}:{session_id}")),
             resume_command: Some(format!("opencode -s {session_id}")),
         });
+    }
+    drop(stmt);
+    drop(snapshot);
+    // The database may be updated while the query is running. Publish a
+    // reusable snapshot only for rollback-journal databases whose main file
+    // still matches the revision observed before opening the connection.
+    // WAL metadata can remain unchanged while a commit reuses an existing
+    // frame, so WAL snapshots are deliberately reloaded on every poll.
+    let stable_revision = rollback_journal
+        .then_some(revision)
+        .flatten()
+        .filter(|before| FileRevision::read(&db_path).as_ref() == Some(before));
+    cache.path = stable_revision.as_ref().map(|_| db_path.clone());
+    cache.revision = stable_revision;
+    cache.rollback_journal = cache.revision.is_some();
+    cache.sessions = if cache.rollback_journal {
+        sessions.clone()
+    } else {
+        Vec::new()
+    };
+    #[cfg(test)]
+    {
+        cache.loads += 1;
     }
     sessions
 }
@@ -420,11 +659,18 @@ pub fn delete_session_sqlite(session_id: &str, source: &str) -> Result<bool, Str
     Ok(deleted > 0)
 }
 
-fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
-    let data = std::fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&data).ok()?;
+fn parse_session_from_file(
+    storage: &Path,
+    file: &mut File,
+) -> io::Result<Option<CachedJsonSession>> {
+    let Some(value) = read_json_value(file)? else {
+        return Ok(None);
+    };
 
-    let session_id = value.get("id").and_then(Value::as_str)?.to_string();
+    let Some(session_id) = value.get("id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let session_id = session_id.to_string();
     let title = value
         .get("title")
         .and_then(Value::as_str)
@@ -457,39 +703,48 @@ fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
     let msg_dir = storage.join("message").join(&session_id);
     let source_path = msg_dir.to_string_lossy().to_string();
 
-    // Skip expensive I/O if title already available from session JSON
-    let summary = if has_title {
-        display_title.clone()
-    } else {
-        get_first_user_summary(storage, &session_id)
-    };
-
-    Some(SessionMeta {
+    let meta = SessionMeta {
         provider_id: PROVIDER_ID.to_string(),
         session_id: session_id.clone(),
-        title: display_title,
-        summary,
+        title: display_title.clone(),
+        summary: if has_title {
+            display_title.clone()
+        } else {
+            None
+        },
         project_dir: directory,
         created_at,
         last_active_at: updated_at.or(created_at),
         source_path: Some(source_path),
         resume_command: Some(format!("opencode -s {session_id}")),
-    })
+    };
+
+    Ok(Some(CachedJsonSession { meta, has_title }))
+}
+
+fn read_json_value(file: &mut File) -> io::Result<Option<Value>> {
+    let small_file = file.metadata()?.len() < 16_384;
+    let (head, _) = read_open_file_head_tail_lines(file, 30, 0)?;
+    if small_file || head.len() == 1 {
+        if let Ok(value) = serde_json::from_str::<Value>(&head.join("\n")) {
+            return Ok(Some(value));
+        }
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut data = String::new();
+    file.read_to_string(&mut data)?;
+    Ok(serde_json::from_str(&data).ok())
 }
 
 /// Read the first user message's first text part to use as summary.
-fn get_first_user_summary(storage: &Path, session_id: &str) -> Option<String> {
-    let msg_dir = storage.join("message").join(session_id);
-    if !msg_dir.is_dir() {
-        return None;
-    }
-
-    let mut msg_files = Vec::new();
-    collect_json_files(&msg_dir, &mut msg_files);
-
+fn read_first_user_summary(
+    storage: &Path,
+    msg_files: &[PathBuf],
+) -> (Option<String>, Option<PathBuf>) {
     // Collect user messages with timestamps for ordering
     let mut user_msgs: Vec<(i64, String)> = Vec::new();
-    for msg_path in &msg_files {
+    for msg_path in msg_files {
         let data = match std::fs::read_to_string(msg_path) {
             Ok(d) => d,
             Err(_) => continue,
@@ -520,13 +775,15 @@ fn get_first_user_summary(storage: &Path, session_id: &str) -> Option<String> {
     user_msgs.sort_by_key(|(ts, _)| *ts);
 
     // Take first user message and get its parts
-    let (_, first_id) = user_msgs.first()?;
+    let Some((_, first_id)) = user_msgs.first() else {
+        return (None, None);
+    };
     let part_dir = storage.join("part").join(first_id);
     let text = collect_parts_text(&part_dir);
     if text.trim().is_empty() {
-        return None;
+        return (None, Some(part_dir));
     }
-    Some(truncate_summary(&text, 160))
+    (Some(truncate_summary(&text, 160)), Some(part_dir))
 }
 
 /// Collect text content from all parts in a part directory.
@@ -593,6 +850,13 @@ fn collect_json_files(root: &Path, files: &mut Vec<PathBuf>) {
             files.push(path);
         }
     }
+}
+
+fn collect_file_revisions(paths: &[PathBuf]) -> Option<Vec<(PathBuf, FileRevision)>> {
+    paths
+        .iter()
+        .map(|path| Some((path.clone(), FileRevision::read(path)?)))
+        .collect()
 }
 
 fn find_session_file(storage: &Path, session_id: &str) -> Option<PathBuf> {
@@ -829,6 +1093,242 @@ mod tests {
             sessions[1].resume_command.as_deref(),
             Some("opencode -s ses_1")
         );
+    }
+
+    #[test]
+    #[allow(deprecated)] // set_var/remove_var deprecated since Rust 1.81; safe here under mutex
+    fn scan_sessions_json_reloads_replacements_and_malformed_files() {
+        let _guard = opencode_env_lock().lock().expect("lock");
+        let temp = tempdir().expect("tempdir");
+        let original_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", temp.path());
+
+        let session_dir = temp.path().join("opencode/storage/session/project");
+        std::fs::create_dir_all(&session_dir).expect("create session dir");
+        let session_path = session_dir.join("ses_1.json");
+        std::fs::write(&session_path, "{malformed").expect("write malformed session");
+        assert!(scan_sessions_json().is_empty());
+
+        std::fs::write(
+            &session_path,
+            r#"{"id":"ses_1","title":"One","directory":"/tmp/project","time":{"created":1}}"#,
+        )
+        .expect("repair session");
+        let sessions = scan_sessions_json();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title.as_deref(), Some("One"));
+        let loads = JSON_SESSIONS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .loads;
+        assert_eq!(scan_sessions_json()[0].title.as_deref(), Some("One"));
+        assert_eq!(
+            JSON_SESSIONS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .loads,
+            loads
+        );
+
+        // Keep the byte length stable to exercise revision fields beyond size.
+        std::fs::write(
+            &session_path,
+            r#"{"id":"ses_1","title":"Two","directory":"/tmp/project","time":{"created":1}}"#,
+        )
+        .expect("rewrite session");
+        let sessions = scan_sessions_json();
+        assert_eq!(sessions[0].title.as_deref(), Some("Two"));
+
+        if let Some(value) = original_xdg {
+            std::env::set_var("XDG_DATA_HOME", value);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)] // set_var/remove_var deprecated since Rust 1.81; safe here under mutex
+    fn scan_sessions_json_reuses_unchanged_message_summary() {
+        let _guard = opencode_env_lock().lock().expect("lock");
+        let temp = tempdir().expect("tempdir");
+        let original_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", temp.path());
+
+        let storage = temp.path().join("opencode/storage");
+        let session_dir = storage.join("session/project");
+        let message_dir = storage.join("message/ses_1");
+        let part_dir = storage.join("part/msg_1");
+        std::fs::create_dir_all(&session_dir).expect("create session dir");
+        std::fs::create_dir_all(&message_dir).expect("create message dir");
+        std::fs::create_dir_all(&part_dir).expect("create part dir");
+
+        std::fs::write(
+            session_dir.join("ses_1.json"),
+            r#"{"id":"ses_1","directory":"/tmp/project","time":{"created":1}}"#,
+        )
+        .expect("write session");
+        std::fs::write(
+            message_dir.join("msg_1.json"),
+            r#"{"id":"msg_1","role":"user","time":{"created":1}}"#,
+        )
+        .expect("write message");
+        let part_path = part_dir.join("part_1.json");
+        std::fs::write(&part_path, r#"{"type":"text","text":"Hello"}"#).expect("write part");
+
+        let before = JSON_SUMMARIES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .loads;
+        assert_eq!(scan_sessions_json()[0].summary.as_deref(), Some("Hello"));
+        let after_first = JSON_SUMMARIES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .loads;
+        assert_eq!(after_first, before + 1);
+        assert_eq!(scan_sessions_json()[0].summary.as_deref(), Some("Hello"));
+        assert_eq!(
+            JSON_SUMMARIES
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .loads,
+            after_first
+        );
+
+        // Keep the byte length stable to exercise the revision fields beyond size.
+        std::fs::write(&part_path, r#"{"type":"text","text":"World"}"#).expect("rewrite part");
+        assert_eq!(scan_sessions_json()[0].summary.as_deref(), Some("World"));
+        assert_eq!(
+            JSON_SUMMARIES
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .loads,
+            after_first + 1
+        );
+
+        if let Some(value) = original_xdg {
+            std::env::set_var("XDG_DATA_HOME", value);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)] // set_var/remove_var deprecated since Rust 1.81; safe here under mutex
+    fn scan_sessions_sqlite_reloads_wal_snapshots() {
+        let _guard = opencode_env_lock().lock().expect("lock");
+        let temp = tempdir().expect("tempdir");
+        let original_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", temp.path());
+
+        let base_dir = temp.path().join("opencode");
+        std::fs::create_dir_all(&base_dir).expect("create base dir");
+        let db_path = base_dir.join("opencode.db");
+        let conn = Connection::open(&db_path).expect("open sqlite db");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("enable wal");
+        conn.pragma_update(None, "wal_autocheckpoint", 0_i64)
+            .expect("disable checkpoint");
+        create_sqlite_schema(&conn);
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            ("ses_1", "One", "/tmp/project", 1_i64, 1_i64),
+        )
+        .expect("insert first session");
+        drop(conn);
+
+        assert_eq!(scan_sessions_sqlite().len(), 1);
+        let loads = SQLITE_SESSIONS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .loads;
+        assert_eq!(scan_sessions_sqlite().len(), 1);
+        assert_eq!(
+            SQLITE_SESSIONS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .loads,
+            loads + 1
+        );
+
+        let conn = Connection::open(&db_path).expect("re-open sqlite db");
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            ("ses_2", "Two", "/tmp/project", 2_i64, 2_i64),
+        )
+        .expect("insert second session");
+        drop(conn);
+
+        let sessions = scan_sessions_sqlite();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().any(|session| session.session_id == "ses_2"));
+        assert_eq!(
+            SQLITE_SESSIONS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .loads,
+            loads + 2
+        );
+
+        if let Some(value) = original_xdg {
+            std::env::set_var("XDG_DATA_HOME", value);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)] // set_var/remove_var deprecated since Rust 1.81; safe here under mutex
+    fn scan_sessions_sqlite_reuses_unchanged_rollback_revision() {
+        let _guard = opencode_env_lock().lock().expect("lock");
+        let temp = tempdir().expect("tempdir");
+        let original_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", temp.path());
+
+        let base_dir = temp.path().join("opencode");
+        std::fs::create_dir_all(&base_dir).expect("create base dir");
+        let db_path = base_dir.join("opencode.db");
+        let conn = Connection::open(&db_path).expect("open sqlite db");
+        create_sqlite_schema(&conn);
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            ("ses_1", "One", "/tmp/project", 1_i64, 1_i64),
+        )
+        .expect("insert first session");
+        drop(conn);
+
+        assert_eq!(scan_sessions_sqlite().len(), 1);
+        let loads = SQLITE_SESSIONS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .loads;
+        assert_eq!(scan_sessions_sqlite().len(), 1);
+        assert_eq!(
+            SQLITE_SESSIONS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .loads,
+            loads
+        );
+
+        let conn = Connection::open(&db_path).expect("re-open sqlite db");
+        conn.execute("UPDATE session SET title = 'Two'", [])
+            .expect("rewrite session");
+        drop(conn);
+        let sessions = scan_sessions_sqlite();
+        assert_eq!(sessions[0].title.as_deref(), Some("Two"));
+        assert_eq!(
+            SQLITE_SESSIONS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .loads,
+            loads + 1
+        );
+
+        if let Some(value) = original_xdg {
+            std::env::set_var("XDG_DATA_HOME", value);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
     }
 
     #[test]

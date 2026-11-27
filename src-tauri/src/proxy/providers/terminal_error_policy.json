@@ -65,6 +65,31 @@
       "payment required",
       "credit",
       "balance"
+    ],
+    "periodLimitMarkers": {
+      "daily": [
+        "daily usage limit",
+        "daily limit exceeded",
+        "daily limit reached"
+      ],
+      "weekly": [
+        "weekly usage limit",
+        "weekly limit exceeded",
+        "weekly limit reached"
+      ],
+      "monthly": [
+        "monthly usage limit",
+        "monthly limit exceeded",
+        "monthly limit reached"
+      ]
+    },
+    "periodLimitBlockingMarkers": [
+      "billing",
+      "payment required",
+      "insufficient credit",
+      "insufficient balance",
+      "credit balance",
+      "usage not included"
     ]
   },
   "categories": [

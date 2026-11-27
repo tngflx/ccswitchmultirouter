@@ -132,6 +132,18 @@ export const codexSubagentV2Api = {
     });
   },
 
+  resolveModelReasoningCapabilities(
+    settingsConfig: Record<string, unknown>,
+    providerId: string,
+    models: string[],
+  ): Promise<CodexModelReasoningResolution[]> {
+    return invoke("resolve_codex_model_reasoning_capabilities", {
+      settingsConfig,
+      providerId,
+      models,
+    });
+  },
+
   /**
    * P3：触发单模型只读检测（异步）。仅 Found 会写入 TTL 检测缓存；
    * NotAdvertised / Unavailable / Invalid 不写缓存（缺失证据不是不存在的证据）。

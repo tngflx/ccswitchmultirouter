@@ -24,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 use tempfile::{NamedTempFile, TempDir};
 
 use self::archive::{rollout_name_parts, Manifest, MemberDigest, SessionEntry, PROJECTION_FILE};
-use self::profile::Profile;
+use self::profile::{checked_file, Profile};
 use self::projection::ProjectionScope;
 use self::rollout::{is_session_id, HistoryBase, RolloutSnapshot};
 use self::state::{ThreadCatalog, ThreadMetadata};
@@ -124,11 +124,16 @@ fn export_from(
             archive::MAX_SESSIONS
         ));
     }
-    let wanted = items.iter().map(|item| item.session_id.as_str()).collect::<HashSet<_>>();
+    let wanted = items
+        .iter()
+        .map(|item| item.session_id.as_str())
+        .collect::<HashSet<_>>();
     if wanted.len() != items.len() || wanted.iter().any(|id| !is_session_id(id)) {
         return Err("Select each valid Codex chat only once.".into());
     }
-    let parent = target.parent().filter(|parent| target.is_absolute() && parent.is_dir());
+    let parent = target
+        .parent()
+        .filter(|parent| target.is_absolute() && parent.is_dir());
     let Some(parent) = parent else {
         return Err("Choose a file in an existing backup folder.".into());
     };
@@ -153,7 +158,8 @@ fn export_from(
         }
         let mut file = File::open(&source)
             .map_err(|error| io_error("Could not open the selected Codex chat", error))?;
-        let size = file.metadata()
+        let size = file
+            .metadata()
             .map_err(|error| io_error("Could not read the selected chat size", error))?
             .len();
         total = total.saturating_add(size);
@@ -161,32 +167,60 @@ fn export_from(
             return Err("The selected Codex chats exceed the backup size limit.".into());
         }
         let staged_path = directory.path().join(name);
-        let mut staged = BufWriter::new(File::create(&staged_path)
-            .map_err(|error| io_error("Could not stage a Codex rollout", error))?);
-        let mut snapshot = rollout::copy_rollout(&mut file, &mut staged, size, &item.session_id, true)?;
-        staged.flush().map_err(|error| io_error("Could not save the staged Codex rollout", error))?;
+        let mut staged = BufWriter::new(
+            File::create(&staged_path)
+                .map_err(|error| io_error("Could not stage a Codex rollout", error))?,
+        );
+        let mut snapshot =
+            rollout::copy_rollout(&mut file, &mut staged, size, &item.session_id, true)?;
+        staged
+            .flush()
+            .map_err(|error| io_error("Could not save the staged Codex rollout", error))?;
 
         let paginated = snapshot.header.paginated;
-        let registered = catalog.as_ref().map(|(conn, schema)| {
-            schema.read_active(conn, &item.session_id, &source, paginated)
-        }).transpose()?.flatten();
+        let registered = catalog
+            .as_ref()
+            .map(|(conn, schema)| schema.read_active(conn, &item.session_id, &source, paginated))
+            .transpose()?
+            .flatten();
         if paginated && registered.is_none() {
-            return Err(format!("Chat {} is missing its Codex catalog row. Open the chat in Codex and retry.", item.session_id));
+            return Err(format!(
+                "Chat {} is missing its Codex catalog row. Open the chat in Codex and retry.",
+                item.session_id
+            ));
         }
-        let project_path = registered.as_ref()
+        let project_path = registered
+            .as_ref()
             .map(ThreadMetadata::cwd)
             .filter(|cwd| !cwd.is_empty())
-            .or_else(|| snapshot.header.payload.get("cwd").and_then(serde_json::Value::as_str))
-            .filter(|cwd| !cwd.is_empty()).map(str::to_string);
-        let title = registered.as_ref().map(ThreadMetadata::title)
+            .or_else(|| {
+                snapshot
+                    .header
+                    .payload
+                    .get("cwd")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .filter(|cwd| !cwd.is_empty())
+            .map(str::to_string);
+        let title = registered
+            .as_ref()
+            .map(ThreadMetadata::title)
             .filter(|title| !title.is_empty())
             .or_else(|| titles.get(&item.session_id).map(String::as_str))
-            .unwrap_or(&item.session_id).to_owned();
-        let updated_at_ms = registered.as_ref().map(ThreadMetadata::updated_at_ms)
+            .unwrap_or(&item.session_id)
+            .to_owned();
+        let updated_at_ms = registered
+            .as_ref()
+            .map(ThreadMetadata::updated_at_ms)
             .filter(|time| *time != 0)
-            .or_else(|| snapshot.header.timestamp.as_deref()
-                .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
-                .map(|time| time.timestamp_millis()))
+            .or_else(|| {
+                snapshot
+                    .header
+                    .timestamp
+                    .as_deref()
+                    .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+                    .map(|time| time.timestamp_millis())
+            })
             .unwrap_or_else(|| date.and_utc().timestamp_millis());
         let metadata = registered.unwrap_or_else(|| {
             ThreadMetadata::legacy_from_rollout(&snapshot.header, &title, updated_at_ms)
@@ -199,7 +233,10 @@ fn export_from(
             updated_at_ms,
             paginated,
             metadata,
-            digest: MemberDigest { size: snapshot.size, sha256: snapshot.sha256.clone() },
+            digest: MemberDigest {
+                size: snapshot.size,
+                sha256: snapshot.sha256.clone(),
+            },
         });
         // The lineage and checksums are enough once native metadata has been picked.
         snapshot.header.payload = serde_json::Value::Null;
@@ -212,54 +249,83 @@ fn export_from(
     let projection_digest = if scopes.is_empty() {
         None
     } else {
-        let path = profile.history_db.as_deref()
+        let path = profile
+            .history_db
+            .as_deref()
             .ok_or("Codex has no paginated history database for the selected chats.")?;
         let staged_path = directory.path().join(PROJECTION_FILE);
-        let mut staged = BufWriter::new(File::create(&staged_path)
-            .map_err(|error| io_error("Could not stage Codex paginated history", error))?);
+        let mut staged = BufWriter::new(
+            File::create(&staged_path)
+                .map_err(|error| io_error("Could not stage Codex paginated history", error))?,
+        );
         projection::export_projection(path, &scopes, &mut staged)?;
-        staged.flush().map_err(|error| io_error("Could not save staged Codex paginated history", error))?;
+        staged
+            .flush()
+            .map_err(|error| io_error("Could not save staged Codex paginated history", error))?;
         let size = fs::metadata(&staged_path)
-            .map_err(|error| io_error("Could not read the staged history size", error))?.len();
-        if size > archive::MAX_MEMBER_BYTES || total.saturating_add(size) > archive::MAX_TOTAL_BYTES {
+            .map_err(|error| io_error("Could not read the staged history size", error))?
+            .len();
+        if size > archive::MAX_MEMBER_BYTES || total.saturating_add(size) > archive::MAX_TOTAL_BYTES
+        {
             return Err("The selected Codex chats exceed the backup size limit.".into());
         }
-        Some(MemberDigest { size, sha256: hash_prefix(&staged_path, size)? })
+        Some(MemberDigest {
+            size,
+            sha256: hash_prefix(&staged_path, size)?,
+        })
     };
     let manifest = Manifest::new(sessions, projection_digest);
     let mut packaged = NamedTempFile::new_in(parent)
         .map_err(|error| io_error("Could not create the Codex backup", error))?;
     archive::write_package(packaged.as_file_mut(), &manifest, directory.path())?;
-    packaged.as_file().sync_all().map_err(|error| io_error("Could not sync the Codex backup", error))?;
+    packaged
+        .as_file()
+        .sync_all()
+        .map_err(|error| io_error("Could not sync the Codex backup", error))?;
 
     // Codex can append during export. Recheck the saved bytes and both sources of
     // archival status before exposing the package at the chosen filename.
     for (entry, source) in manifest.sessions.iter().zip(&sources) {
         if hash_prefix(source, entry.digest.size)? != entry.digest.sha256 {
-            return Err(format!("Chat {} changed during backup. Refresh the list and retry.", entry.session_id));
+            return Err(format!(
+                "Chat {} changed during backup. Refresh the list and retry.",
+                entry.session_id
+            ));
         }
     }
     let mut archive_ids = wanted;
     archive_ids.extend(plan.rollout_ids.iter().map(String::as_str));
     if !profile.occupied_rollout_ids(&archive_ids, true)?.is_empty() {
-        return Err("A selected chat was archived. Refresh the list and select its active chats again.".into());
+        return Err(
+            "A selected chat was archived. Refresh the list and select its active chats again."
+                .into(),
+        );
     }
     for (entry, source) in manifest.sessions.iter().zip(&sources) {
         profile.active_path(source)?;
         if let Some((conn, schema)) = &catalog {
             let current = schema.read_active(conn, &entry.session_id, source, entry.paginated)?;
             if entry.paginated && current.is_none() {
-                return Err("A selected chat changed during backup. Refresh the list and retry.".into());
+                return Err(
+                    "A selected chat changed during backup. Refresh the list and retry.".into(),
+                );
             }
         }
     }
-    packaged.persist_noclobber(target)
-        .map_err(|error| io_error("Could not publish the backup. Choose a new filename if it already exists", error.error))?;
-    Ok(ExportOutcome { count: manifest.sessions.len() })
+    packaged.persist_noclobber(target).map_err(|error| {
+        io_error(
+            "Could not publish the backup. Choose a new filename if it already exists",
+            error.error,
+        )
+    })?;
+    Ok(ExportOutcome {
+        count: manifest.sessions.len(),
+    })
 }
 
 fn hash_prefix(path: &Path, size: u64) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| io_error("Could not open saved Codex data for verification", error))?;
+    let mut file = File::open(path)
+        .map_err(|error| io_error("Could not open saved Codex data for verification", error))?;
     let mut hash = Sha256::new();
     let mut remaining = size;
     let mut buffer = [0u8; 64 * 1024];
@@ -289,11 +355,19 @@ struct Lineage {
 }
 
 impl Lineage {
-    fn verify(entries: &[SessionEntry], snapshots: &[RolloutSnapshot], stage: &Path) -> Result<Self, String> {
-        let rollout_ids = entries.iter().map(|entry| {
-            rollout_name_parts(&entry.rollout_name).map(|(_, id)| id.to_owned())
-        }).collect::<Result<Vec<_>, _>>()?;
-        let indices = rollout_ids.iter().enumerate().map(|(index, id)| (id.as_str(), index))
+    fn verify(
+        entries: &[SessionEntry],
+        snapshots: &[RolloutSnapshot],
+        stage: &Path,
+    ) -> Result<Self, String> {
+        let rollout_ids = entries
+            .iter()
+            .map(|entry| rollout_name_parts(&entry.rollout_name).map(|(_, id)| id.to_owned()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let indices = rollout_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (id.as_str(), index))
             .collect::<HashMap<_, _>>();
         let mut parents = vec![None; entries.len()];
         let mut children = vec![Vec::new(); entries.len()];
@@ -305,7 +379,10 @@ impl Lineage {
                     format!("Chat {} needs the saved parent rollout {}. Include its unarchived parent in the backup.", entries[index].session_id, base.thread_id)
                 })?;
                 if !entries[parent].paginated {
-                    return Err("A Codex fork references a parent with an incompatible history format.".into());
+                    return Err(
+                        "A Codex fork references a parent with an incompatible history format."
+                            .into(),
+                    );
                 }
                 parents[index] = Some(parent);
                 children[parent].push(index);
@@ -323,11 +400,17 @@ impl Lineage {
             return Err("The Codex backup contains circular inherited chat history.".into());
         }
         for (parent, cutoffs) in cutoffs {
-            let mut file = File::open(stage.join(&entries[parent].rollout_name))
-                .map_err(|error| io_error("Could not open the staged Codex parent rollout", error))?;
+            let mut file =
+                File::open(stage.join(&entries[parent].rollout_name)).map_err(|error| {
+                    io_error("Could not open the staged Codex parent rollout", error)
+                })?;
             rollout::validate_history_boundaries(&mut file, snapshots[parent].size, &cutoffs)?;
         }
-        Ok(Self { rollout_ids, parents, order })
+        Ok(Self {
+            rollout_ids,
+            parents,
+            order,
+        })
     }
 
     fn projection_scopes<'a>(
@@ -335,14 +418,21 @@ impl Lineage {
         entries: &[SessionEntry],
         snapshots: &[RolloutSnapshot],
     ) -> Result<Vec<ProjectionScope<'a>>, String> {
-        entries.iter().zip(snapshots).zip(&self.rollout_ids)
+        entries
+            .iter()
+            .zip(snapshots)
+            .zip(&self.rollout_ids)
             .filter(|((entry, _), _)| entry.paginated)
-            .map(|((_, snapshot), id)| Ok(ProjectionScope {
-                rollout_id: id,
-                size: snapshot.size,
-                end_ordinal_exclusive: snapshot.end_ordinal_exclusive
-                    .ok_or("A paginated chat lacks a complete Codex history ordinal.")?,
-            })).collect()
+            .map(|((_, snapshot), id)| {
+                Ok(ProjectionScope {
+                    rollout_id: id,
+                    size: snapshot.size,
+                    end_ordinal_exclusive: snapshot
+                        .end_ordinal_exclusive
+                        .ok_or("A paginated chat lacks a complete Codex history ordinal.")?,
+                })
+            })
+            .collect()
     }
 }
 
@@ -356,9 +446,12 @@ struct StagedBackup {
 
 impl StagedBackup {
     fn open(source: &Path, expected_hash: Option<&str>) -> Result<Self, String> {
-        let file = File::open(source).map_err(|error| io_error("Could not open the Codex backup", error))?;
-        let directory = TempDir::new().map_err(|error| io_error("Could not stage the selected backup", error))?;
-        let (manifest, hash, snapshots) = archive::read_package(file, directory.path(), expected_hash)?;
+        let file = File::open(source)
+            .map_err(|error| io_error("Could not open the Codex backup", error))?;
+        let directory = TempDir::new()
+            .map_err(|error| io_error("Could not stage the selected backup", error))?;
+        let (manifest, hash, snapshots) =
+            archive::read_package(file, directory.path(), expected_hash)?;
         let lineage = Lineage::verify(&manifest.sessions, &snapshots, directory.path())?;
         let scopes = lineage.projection_scopes(&manifest.sessions, &snapshots)?;
         match (manifest.projection.is_some(), scopes.is_empty()) {
@@ -368,7 +461,13 @@ impl StagedBackup {
             (false, true) => {}
             _ => return Err("The Codex backup has inconsistent paginated history.".into()),
         }
-        Ok(Self { directory, manifest, hash, snapshots, lineage })
+        Ok(Self {
+            directory,
+            manifest,
+            hash,
+            snapshots,
+            lineage,
+        })
     }
 
     fn conflicts(
@@ -377,7 +476,10 @@ impl StagedBackup {
         catalog: Option<(&Connection, &ThreadCatalog)>,
     ) -> Result<Vec<bool>, String> {
         let sessions = &self.manifest.sessions;
-        let mut wanted = sessions.iter().map(|entry| entry.session_id.as_str()).collect::<HashSet<_>>();
+        let mut wanted = sessions
+            .iter()
+            .map(|entry| entry.session_id.as_str())
+            .collect::<HashSet<_>>();
         wanted.extend(self.lineage.rollout_ids.iter().map(String::as_str));
         let occupied_files = profile.occupied_rollout_ids(&wanted, false)?;
         let occupied_threads = if let Some((conn, schema)) = catalog {
@@ -401,92 +503,170 @@ impl StagedBackup {
 }
 
 fn open_projection(directory: &Path) -> Result<BufReader<File>, String> {
-    File::open(directory.join(PROJECTION_FILE)).map(BufReader::new)
+    File::open(directory.join(PROJECTION_FILE))
+        .map(BufReader::new)
         .map_err(|error| io_error("Could not open the verified Codex paginated history", error))
 }
 
 fn inspect_for(profile: &Profile, source: &Path) -> Result<BackupPreview, String> {
     let staged = StagedBackup::open(source, None)?;
     let catalog = open_catalog(profile, false)?;
-    let conflicts = staged.conflicts(profile, catalog.as_ref().map(|(conn, schema)| (conn, schema)))?;
-    let sessions = staged.manifest.sessions.into_iter().zip(conflicts).map(|(entry, conflict)| PreviewSession {
-        session_id: entry.session_id,
-        title: entry.title,
-        project_path: entry.project_path,
-        conflict,
-    }).collect();
-    Ok(BackupPreview { manifest_hash: staged.hash, sessions })
+    let conflicts = staged.conflicts(
+        profile,
+        catalog.as_ref().map(|(conn, schema)| (conn, schema)),
+    )?;
+    let sessions = staged
+        .manifest
+        .sessions
+        .into_iter()
+        .zip(conflicts)
+        .map(|(entry, conflict)| PreviewSession {
+            session_id: entry.session_id,
+            title: entry.title,
+            project_path: entry.project_path,
+            conflict,
+        })
+        .collect();
+    Ok(BackupPreview {
+        manifest_hash: staged.hash,
+        sessions,
+    })
 }
 
 fn attach_history(conn: &Connection, profile: &Profile) -> Result<(), String> {
-    let path = profile.history_path_for_restore();
-    if !path.exists() {
+    let path = profile.history_path_for_restore()?;
+    if !checked_file(&path)? {
         let parent = path.parent().ok_or("Invalid Codex history directory.")?;
-        let stage = NamedTempFile::new_in(parent)
-            .map_err(|error| io_error("Could not stage the destination Codex history database", error))?;
+        let stage = NamedTempFile::new_in(parent).map_err(|error| {
+            io_error(
+                "Could not stage the destination Codex history database",
+                error,
+            )
+        })?;
         history_db::initialize(stage.path())?;
         match stage.persist_noclobber(&path) {
             Ok(_) => {}
             Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(io_error("Could not install the Codex history database", error.error)),
+            Err(error) => {
+                return Err(io_error(
+                    "Could not install the Codex history database",
+                    error.error,
+                ))
+            }
         }
     }
-    // Codex may initialize its database while the backup is being verified.
-    let path = profile.history_path_for_restore();
-    let path = path.to_str().ok_or("Invalid path for the Codex history database.")?;
+    // Codex may create the file between the existence check and the no-clobber install.
+    if !checked_file(&path)? {
+        return Err("The destination Codex history database disappeared during restore.".into());
+    }
+    let path = path
+        .to_str()
+        .ok_or("Invalid path for the Codex history database.")?;
     conn.execute("ATTACH DATABASE ?1 AS backup_history", [path])
-        .map_err(|error| format!("Could not open the destination Codex paginated history: {error}"))?;
+        .map_err(|error| {
+            format!("Could not open the destination Codex paginated history: {error}")
+        })?;
     Ok(())
 }
 
-fn import_into(profile: &Profile, source: &Path, expected_hash: &str) -> Result<ImportOutcome, String> {
+fn import_into(
+    profile: &Profile,
+    source: &Path,
+    expected_hash: &str,
+) -> Result<ImportOutcome, String> {
     let staged = StagedBackup::open(source, Some(expected_hash))?;
     let mut catalog = open_catalog(profile, true)?;
     let mut files = InstalledRollouts::default();
     let restored = match catalog.as_mut() {
         Some((conn, schema)) => {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|error| format!("Could not reserve the Codex chat catalog for restore: {error}"))?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    format!("Could not reserve the Codex chat catalog for restore: {error}")
+                })?;
             let conflicts = staged.conflicts(profile, Some((&tx, schema)))?;
-            let selected = staged.lineage.order.iter().copied().filter(|&i| !conflicts[i]).collect::<Vec<_>>();
-            let projection_ids = selected.iter().filter(|&&i| staged.manifest.sessions[i].paginated)
-                .map(|&i| staged.lineage.rollout_ids[i].clone()).collect::<HashSet<_>>();
+            let selected = staged
+                .lineage
+                .order
+                .iter()
+                .copied()
+                .filter(|&i| !conflicts[i])
+                .collect::<Vec<_>>();
+            let projection_ids = selected
+                .iter()
+                .filter(|&&i| staged.manifest.sessions[i].paginated)
+                .map(|&i| staged.lineage.rollout_ids[i].clone())
+                .collect::<HashSet<_>>();
             if !projection_ids.is_empty() {
                 attach_history(&tx, profile)?;
-                let scopes = staged.lineage.projection_scopes(&staged.manifest.sessions, &staged.snapshots)?;
-                projection::restore_projection(&tx, &mut open_projection(staged.directory.path())?, &scopes, &projection_ids)?;
+                let scopes = staged
+                    .lineage
+                    .projection_scopes(&staged.manifest.sessions, &staged.snapshots)?;
+                projection::restore_projection(
+                    &tx,
+                    &mut open_projection(staged.directory.path())?,
+                    &scopes,
+                    &projection_ids,
+                )?;
             }
             for &index in &selected {
                 let entry = &staged.manifest.sessions[index];
                 let destination = profile.destination_path(&entry.rollout_name, true)?;
-                schema.insert_thread(&tx, &entry.session_id, &destination, &entry.metadata, entry.paginated)?;
-                files.install(&staged.directory.path().join(&entry.rollout_name), &destination)?;
+                schema.insert_thread(
+                    &tx,
+                    &entry.session_id,
+                    &destination,
+                    &entry.metadata,
+                    entry.paginated,
+                )?;
+                files.install(
+                    &staged.directory.path().join(&entry.rollout_name),
+                    &destination,
+                )?;
             }
-            tx.commit().map_err(|error| format!("Could not commit the restored Codex chats: {error}"))?;
+            tx.commit()
+                .map_err(|error| format!("Could not commit the restored Codex chats: {error}"))?;
             selected
         }
         None => {
             let conflicts = staged.conflicts(profile, None)?;
-            let selected = staged.lineage.order.iter().copied().filter(|&i| !conflicts[i]).collect::<Vec<_>>();
-            if selected.iter().any(|&i| staged.manifest.sessions[i].paginated) {
+            let selected = staged
+                .lineage
+                .order
+                .iter()
+                .copied()
+                .filter(|&i| !conflicts[i])
+                .collect::<Vec<_>>();
+            if selected
+                .iter()
+                .any(|&i| staged.manifest.sessions[i].paginated)
+            {
                 return Err("Open Codex once to initialize its chat catalog before restoring paginated chats.".into());
             }
             for &index in &selected {
                 let entry = &staged.manifest.sessions[index];
                 let destination = profile.destination_path(&entry.rollout_name, true)?;
-                files.install(&staged.directory.path().join(&entry.rollout_name), &destination)?;
+                files.install(
+                    &staged.directory.path().join(&entry.rollout_name),
+                    &destination,
+                )?;
             }
             selected
         }
     };
     files.commit();
     if !restored.is_empty() {
-        if let Err(error) = profile.append_index(restored.iter().map(|&i| &staged.manifest.sessions[i])) {
+        if let Err(error) =
+            profile.append_index(restored.iter().map(|&i| &staged.manifest.sessions[i]))
+        {
             // The native DB and rollouts are canonical. The name index is a fallback.
             log::warn!("Could not update the Codex session name index after restore: {error}");
         }
     }
-    Ok(ImportOutcome { restored: restored.len(), skipped: staged.manifest.sessions.len() - restored.len() })
+    Ok(ImportOutcome {
+        restored: restored.len(),
+        skipped: staged.manifest.sessions.len() - restored.len(),
+    })
 }
 
 #[derive(Default)]
@@ -499,19 +679,31 @@ impl InstalledRollouts {
         match fs::hard_link(staged, destination) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err("A Codex rollout appeared during restore. Review the backup again.".into());
+                return Err(
+                    "A Codex rollout appeared during restore. Review the backup again.".into(),
+                );
             }
             Err(_) => {
                 let mut source = File::open(staged)
                     .map_err(|error| io_error("Could not open the staged Codex rollout", error))?;
-                let parent = destination.parent().ok_or("Invalid Codex rollout directory.")?;
-                let mut local = NamedTempFile::new_in(parent)
-                    .map_err(|error| io_error("Could not stage the rollout in the destination profile", error))?;
-                io::copy(&mut source, local.as_file_mut())
-                    .map_err(|error| io_error("Could not copy the verified Codex rollout", error))?;
-                local.as_file().sync_all().map_err(|error| io_error("Could not sync the restored Codex rollout", error))?;
-                local.persist_noclobber(destination)
-                    .map_err(|error| io_error("Could not install the Codex rollout", error.error))?;
+                let parent = destination
+                    .parent()
+                    .ok_or("Invalid Codex rollout directory.")?;
+                let mut local = NamedTempFile::new_in(parent).map_err(|error| {
+                    io_error(
+                        "Could not stage the rollout in the destination profile",
+                        error,
+                    )
+                })?;
+                io::copy(&mut source, local.as_file_mut()).map_err(|error| {
+                    io_error("Could not copy the verified Codex rollout", error)
+                })?;
+                local.as_file().sync_all().map_err(|error| {
+                    io_error("Could not sync the restored Codex rollout", error)
+                })?;
+                local.persist_noclobber(destination).map_err(|error| {
+                    io_error("Could not install the Codex rollout", error.error)
+                })?;
             }
         }
         self.paths.push(destination.to_path_buf());

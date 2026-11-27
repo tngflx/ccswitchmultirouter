@@ -300,6 +300,16 @@ struct CodexOAuthStore {
 
 pub const NATIVE_CODEX_ACCOUNT_ID: &str = "native_codex_auth";
 
+fn codex_oauth_store_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("codex_oauth_auth.json")
+}
+
+pub(crate) fn codex_oauth_store_revision() -> Option<Option<crate::file_revision::FileRevision>> {
+    crate::file_revision::FileRevision::read_optional(&codex_oauth_store_path(
+        &crate::config::get_app_config_dir(),
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexAccountPoolEntry {
@@ -374,7 +384,7 @@ fn apply_desktop_account_dedupe(
 pub fn read_persisted_account_pool_policy(
     data_dir: &Path,
 ) -> Result<Option<CodexAccountPoolPolicy>, CodexOAuthError> {
-    let storage_path = data_dir.join("codex_oauth_auth.json");
+    let storage_path = codex_oauth_store_path(data_dir);
     if !storage_path.exists() {
         return Ok(None);
     }
@@ -477,7 +487,7 @@ impl CodexOAuthManager {
     /// 生产代码通过 `new` 使用官方端点；测试代码用本地 HTTP 服务精确模拟
     /// refresh token 失效、轮换和临时网络错误，避免依赖真实 OpenAI。
     fn new_with_oauth_token_url(data_dir: PathBuf, oauth_token_url: String) -> Self {
-        let storage_path = data_dir.join("codex_oauth_auth.json");
+        let storage_path = codex_oauth_store_path(&data_dir);
 
         let manager = Self {
             accounts: Arc::new(RwLock::new(HashMap::new())),

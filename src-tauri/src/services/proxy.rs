@@ -5076,13 +5076,8 @@ impl ProxyService {
             return;
         };
 
-        let should_project = provider
-            .meta
-            .as_ref()
-            .map(|meta| meta.codex_model_catalog_projection_enabled(&provider.settings_config))
-            .unwrap_or_else(|| {
-                crate::codex_multirouter::catalog::read_catalog(&provider.settings_config).is_some()
-            });
+        let should_project =
+            crate::codex_multirouter::catalog::provider_catalog_projection_enabled(provider);
 
         if !should_project {
             if let Some(root) = live_config.as_object_mut() {
@@ -5091,10 +5086,9 @@ impl ProxyService {
             return;
         }
 
-        let model_catalog =
-            crate::codex_multirouter::catalog::read_catalog(&provider.settings_config)
-                .cloned()
-                .unwrap_or_else(|| json!({ "models": [] }));
+        let model_catalog = crate::codex_multirouter::catalog::read_provider_catalog(provider)
+            .cloned()
+            .unwrap_or_else(|| json!({ "models": [] }));
 
         if let Some(root) = live_config.as_object_mut() {
             root.insert("modelCatalog".to_string(), model_catalog);
@@ -5357,7 +5351,7 @@ impl ProxyService {
             );
         } else if let (Some(provider), Some(root)) = (provider, live_config.as_object_mut()) {
             if let Some(model_catalog) =
-                crate::codex_multirouter::catalog::read_catalog(&provider.settings_config).cloned()
+                crate::codex_multirouter::catalog::read_provider_catalog(provider).cloned()
             {
                 root.insert("modelCatalog".to_string(), model_catalog);
             }
@@ -5479,13 +5473,8 @@ impl ProxyService {
         let Some(provider) = provider else {
             return config.clone();
         };
-        let should_project = provider
-            .meta
-            .as_ref()
-            .map(|meta| meta.codex_model_catalog_projection_enabled(&provider.settings_config))
-            .unwrap_or_else(|| {
-                crate::codex_multirouter::catalog::read_catalog(&provider.settings_config).is_some()
-            });
+        let should_project =
+            crate::codex_multirouter::catalog::provider_catalog_projection_enabled(provider);
 
         let mut next = config.clone();
         if should_project {
@@ -5493,9 +5482,7 @@ impl ProxyService {
                 for key in ["modelCatalog", "codexRouting", "codexRoutingProjection"] {
                     if !root.contains_key(key) {
                         let value = if key == "modelCatalog" {
-                            crate::codex_multirouter::catalog::read_catalog(
-                                &provider.settings_config,
-                            )
+                            crate::codex_multirouter::catalog::read_provider_catalog(provider)
                         } else {
                             provider.settings_config.get(key)
                         };
@@ -5556,6 +5543,17 @@ impl ProxyService {
         let mut lifecycle = self.codex_guardian.lock().await;
         lifecycle.retain_observation = true;
         self.ensure_codex_guardian_started(&mut lifecycle, false);
+    }
+
+    pub(crate) async fn request_codex_usage_limit_refresh(&self) -> Result<(), String> {
+        let mut lifecycle = self.codex_guardian.lock().await;
+        lifecycle.retain_observation = true;
+        self.ensure_codex_guardian_started(&mut lifecycle, false);
+        let handle = lifecycle
+            .handle
+            .as_ref()
+            .ok_or_else(|| "Codex recovery observer is unavailable".to_string())?;
+        handle.request_native_usage_scan().await
     }
 
     fn ensure_codex_guardian_started(

@@ -18,15 +18,17 @@
 pub mod catalog;
 pub mod provider_metadata;
 
+use crate::codex_multirouter::catalog::{
+    lookup_catalog_model, lookup_provider_catalog_model, CatalogModelIndex, CatalogModelLookup,
+};
 use crate::provider::Provider;
 pub use crate::proxy::providers::codex_reasoning::ReasoningEvidenceScope;
 use crate::proxy::providers::codex_reasoning::{
     builtin_reasoning_capability_for_model, capability_fingerprint,
     normalize_sublyx_reasoning_capability_for_model, official_reasoning_capability_for_model,
     reasoning_capability_from_model_entry, reasoning_capability_from_provider_model_entry,
-    resolve_reasoning_capability_from_settings, sublyx_reasoning_capability_for_model,
-    CapabilityConfidence, CodexModelReasoningCapability, CodexModelReasoningUpstream,
-    ReasoningControlKind, ReasoningSupportStatus,
+    sublyx_reasoning_capability_for_model, CapabilityConfidence, CodexModelReasoningCapability,
+    CodexModelReasoningUpstream, ReasoningControlKind, ReasoningSupportStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -167,6 +169,8 @@ pub const DETECTION_TTL: Duration = Duration::from_secs(60 * 60);
 #[derive(Default)]
 pub struct DetectionCache {
     entries: HashMap<String, (ProviderCapabilitySnapshot, Instant)>,
+    revision: u64,
+    next_expiration: Option<Instant>,
 }
 
 impl DetectionCache {
@@ -183,15 +187,46 @@ impl DetectionCache {
     }
 
     pub fn insert(&mut self, snapshot: ProviderCapabilitySnapshot) {
+        self.insert_at(snapshot, Instant::now());
+    }
+
+    fn insert_at(&mut self, snapshot: ProviderCapabilitySnapshot, now: Instant) {
+        self.prune_expired_at(now);
         self.entries.insert(
             Self::key(&snapshot.provider_key, &snapshot.model),
-            (snapshot, Instant::now()),
+            (snapshot, now),
         );
+        let expiration = now + DETECTION_TTL;
+        self.next_expiration = Some(
+            self.next_expiration
+                .map_or(expiration, |old| old.min(expiration)),
+        );
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn prune_expired(&mut self) {
-        self.entries
-            .retain(|_, (_, inserted_at)| inserted_at.elapsed() < DETECTION_TTL);
+        self.prune_expired_at(Instant::now());
+    }
+
+    fn prune_expired_at(&mut self, now: Instant) {
+        if self
+            .next_expiration
+            .is_none_or(|expiration| now < expiration)
+        {
+            return;
+        }
+        let previous = self.entries.len();
+        self.entries.retain(|_, (_, inserted_at)| {
+            now.saturating_duration_since(*inserted_at) < DETECTION_TTL
+        });
+        self.next_expiration = self
+            .entries
+            .values()
+            .map(|(_, inserted_at)| *inserted_at + DETECTION_TTL)
+            .min();
+        if self.entries.len() != previous {
+            self.revision = self.revision.wrapping_add(1);
+        }
     }
 }
 
@@ -200,6 +235,12 @@ static DETECTION_CACHE: OnceLock<Mutex<DetectionCache>> = OnceLock::new();
 
 pub fn detection_cache() -> &'static Mutex<DetectionCache> {
     DETECTION_CACHE.get_or_init(|| Mutex::new(DetectionCache::default()))
+}
+
+pub(crate) fn detection_revision() -> Option<u64> {
+    let mut cache = detection_cache().lock().ok()?;
+    cache.prune_expired();
+    Some(cache.revision)
 }
 
 /// 读取当前 provider+model 的 TTL 候选快照（无或过期返回 None）。
@@ -229,11 +270,52 @@ pub(crate) fn reasoning_evidence_scope(
     })
 }
 
-/// Resolve a public/catalog alias to its current enabled canonical wire model.
-/// Ambiguous and excluded rows cannot supply evidence or revive via the cache.
-pub(crate) fn reasoning_wire_model_for_settings(settings: &Value, model: &str) -> Option<String> {
-    use crate::codex_multirouter::catalog::{lookup_catalog_model, CatalogModelLookup};
-    let wire_model = match lookup_catalog_model(settings, model) {
+pub(crate) fn reasoning_wire_model_for_provider(
+    provider: &Provider,
+    model: &str,
+) -> Option<String> {
+    reasoning_wire_model_for_catalog(ModelCatalog::for_provider(provider), model)
+}
+
+#[derive(Clone, Copy)]
+struct ModelCatalog<'a> {
+    settings: &'a Value,
+    index: Option<&'a CatalogModelIndex<'a>>,
+    provider: Option<&'a Provider>,
+}
+
+impl<'a> ModelCatalog<'a> {
+    fn new(settings: &'a Value) -> Self {
+        Self {
+            settings,
+            index: None,
+            provider: None,
+        }
+    }
+
+    fn for_provider(provider: &'a Provider) -> Self {
+        Self {
+            settings: &provider.settings_config,
+            index: None,
+            provider: Some(provider),
+        }
+    }
+
+    fn lookup(self, model: &str) -> CatalogModelLookup<'a> {
+        self.provider.map_or_else(
+            || {
+                self.index.map_or_else(
+                    || lookup_catalog_model(self.settings, model),
+                    |index| index.lookup(model),
+                )
+            },
+            |provider| lookup_provider_catalog_model(provider, model),
+        )
+    }
+}
+
+fn reasoning_wire_model_for_catalog(catalog: ModelCatalog<'_>, model: &str) -> Option<String> {
+    let wire_model = match catalog.lookup(model) {
         CatalogModelLookup::Ambiguous => return None,
         CatalogModelLookup::Found(entry) => {
             if entry.get("enabled").and_then(Value::as_bool) == Some(false) {
@@ -256,33 +338,47 @@ pub(crate) fn reasoning_evidence_scope_for_settings(
     settings: &Value,
     model: &str,
 ) -> Option<ReasoningEvidenceScope> {
-    let base_url = provider_metadata::base_url_from_settings(settings)?;
-    let wire_model = reasoning_wire_model_for_settings(settings, model)?;
+    reasoning_evidence_scope_for_catalog(ModelCatalog::new(settings), model)
+}
+
+pub(crate) fn reasoning_evidence_scope_for_provider(
+    provider: &Provider,
+    model: &str,
+) -> Option<ReasoningEvidenceScope> {
+    reasoning_evidence_scope_for_catalog(ModelCatalog::for_provider(provider), model)
+}
+
+fn reasoning_evidence_scope_for_catalog(
+    catalog: ModelCatalog<'_>,
+    model: &str,
+) -> Option<ReasoningEvidenceScope> {
+    let base_url = provider_metadata::base_url_from_settings(catalog.settings)?;
+    let wire_model = reasoning_wire_model_for_catalog(catalog, model)?;
     reasoning_evidence_scope(&base_url, &wire_model)
 }
 
 fn evidence_scope_matches(
-    settings: &Value,
+    catalog: ModelCatalog<'_>,
     model: &str,
     scope: Option<&ReasoningEvidenceScope>,
 ) -> bool {
     scope.is_some_and(|scope| {
-        reasoning_evidence_scope_for_settings(settings, model).as_ref() == Some(scope)
+        reasoning_evidence_scope_for_catalog(catalog, model).as_ref() == Some(scope)
     })
 }
 
 fn snapshot_matches_context(
-    settings: &Value,
+    catalog: ModelCatalog<'_>,
     platform: Option<&str>,
     model: &str,
     snapshot: &ProviderCapabilitySnapshot,
 ) -> bool {
-    if !evidence_scope_matches(settings, model, snapshot.evidence_scope.as_ref()) {
+    if !evidence_scope_matches(catalog, model, snapshot.evidence_scope.as_ref()) {
         return false;
     }
     if !snapshot.evidence_scope.as_ref().is_some_and(|scope| {
         scope.model.eq_ignore_ascii_case(snapshot.model.trim())
-            || reasoning_wire_model_for_settings(settings, &snapshot.model)
+            || reasoning_wire_model_for_catalog(catalog, &snapshot.model)
                 .is_some_and(|wire| scope.model.eq_ignore_ascii_case(wire.trim()))
     }) {
         return false;
@@ -302,15 +398,26 @@ pub(crate) fn current_detection_for_settings(
     provider_key: &str,
     model: &str,
 ) -> Option<ProviderCapabilitySnapshot> {
-    let wire_model = reasoning_wire_model_for_settings(settings, model)?;
-    let platform = provider_metadata::detect_platform_from_settings(settings);
+    current_detection_for_catalog(ModelCatalog::new(settings), provider_key, model)
+}
+
+fn current_detection_for_catalog(
+    catalog: ModelCatalog<'_>,
+    provider_key: &str,
+    model: &str,
+) -> Option<ProviderCapabilitySnapshot> {
+    let wire_model = reasoning_wire_model_for_catalog(catalog, model)?;
+    let validate_snapshot = |snapshot: &ProviderCapabilitySnapshot| {
+        let platform = provider_metadata::detect_platform_from_settings(catalog.settings);
+        snapshot_matches_context(catalog, platform, model, snapshot)
+    };
     current_detection(provider_key, model)
-        .filter(|snapshot| snapshot_matches_context(settings, platform, model, snapshot))
+        .filter(validate_snapshot)
         .or_else(|| {
             (!model.trim().eq_ignore_ascii_case(&wire_model))
                 .then(|| current_detection(provider_key, &wire_model))
                 .flatten()
-                .filter(|snapshot| snapshot_matches_context(settings, platform, model, snapshot))
+                .filter(validate_snapshot)
         })
 }
 
@@ -318,15 +425,15 @@ pub(crate) fn current_detection_for_provider(
     provider: &Provider,
     model: &str,
 ) -> Option<ProviderCapabilitySnapshot> {
-    current_detection_for_settings(
-        &provider.settings_config,
+    current_detection_for_catalog(
+        ModelCatalog::for_provider(provider),
         reasoning_provider_key(provider),
         model,
     )
 }
 
 fn capability_matches_context(
-    settings: &Value,
+    catalog: ModelCatalog<'_>,
     platform: Option<&str>,
     model: &str,
     capability: &CodexModelReasoningCapability,
@@ -334,7 +441,7 @@ fn capability_matches_context(
     if is_explicit_reasoning_declaration(capability) {
         return true;
     }
-    if !evidence_scope_matches(settings, model, capability.evidence_scope.as_ref()) {
+    if !evidence_scope_matches(catalog, model, capability.evidence_scope.as_ref()) {
         return false;
     }
     let source_platform = match capability.source.as_deref() {
@@ -387,14 +494,17 @@ pub fn resolve_codex_model_capability(
     detection: Option<&ProviderCapabilitySnapshot>,
 ) -> ResolvedModelCapability {
     let platform = provider_metadata::detect_platform(provider);
-    let official_models = crate::codex_config::codex_official_models_cache().unwrap_or_default();
-    resolve_codex_model_capability_for_settings(
-        &provider.settings_config,
+    let official_models = platform
+        .is_none()
+        .then(crate::codex_config::codex_official_models_snapshot)
+        .flatten();
+    resolve_codex_model_capability_for_provider(
+        provider,
         platform,
         Some(reasoning_provider_key(provider)),
         model,
-        catalog::global_library().as_ref(),
-        &official_models,
+        catalog::global_library().as_deref(),
+        official_models.as_deref().unwrap_or_default(),
         |candidate| {
             if candidate.eq_ignore_ascii_case(model) {
                 detection
@@ -418,7 +528,7 @@ pub(crate) fn resolve_codex_model_capability_for_model_source(
     source: &Value,
 ) -> ResolvedModelCapability {
     let adapted_provider =
-        if crate::codex_multirouter::catalog::read_catalog(&provider.settings_config).is_none() {
+        if crate::codex_multirouter::catalog::read_provider_catalog(provider).is_none() {
             let mut adapted = provider.clone();
             let mut row = source.as_object().cloned().unwrap_or_default();
             row.insert("model".to_string(), Value::String(model.to_string()));
@@ -447,8 +557,8 @@ pub fn resolve_codex_model_capability_with_library(
     library: Option<&catalog::CapabilityLibrary>,
 ) -> ResolvedModelCapability {
     let platform = provider_metadata::detect_platform(provider);
-    resolve_codex_model_capability_for_settings(
-        &provider.settings_config,
+    resolve_codex_model_capability_for_provider(
+        provider,
         platform,
         Some(reasoning_provider_key(provider)),
         model,
@@ -483,9 +593,72 @@ pub(crate) fn resolve_codex_model_capability_for_settings(
     official_models: &[Value],
     detection_for_model: impl Fn(&str) -> Option<ProviderCapabilitySnapshot>,
 ) -> ResolvedModelCapability {
-    use crate::codex_multirouter::catalog::{lookup_catalog_model, CatalogModelLookup};
+    resolve_codex_model_capability_for_catalog(
+        ModelCatalog::new(settings),
+        platform,
+        provider_key,
+        model,
+        library,
+        official_models,
+        detection_for_model,
+    )
+}
 
-    let lookup = lookup_catalog_model(settings, model);
+fn resolve_codex_model_capability_for_provider(
+    provider: &Provider,
+    platform: Option<&str>,
+    provider_key: Option<&str>,
+    model: &str,
+    library: Option<&catalog::CapabilityLibrary>,
+    official_models: &[Value],
+    detection_for_model: impl Fn(&str) -> Option<ProviderCapabilitySnapshot>,
+) -> ResolvedModelCapability {
+    resolve_codex_model_capability_for_catalog(
+        ModelCatalog::for_provider(provider),
+        platform,
+        provider_key,
+        model,
+        library,
+        official_models,
+        detection_for_model,
+    )
+}
+
+pub(crate) fn resolve_codex_model_capability_for_indexed_provider(
+    provider: &Provider,
+    index: &CatalogModelIndex<'_>,
+    platform: Option<&str>,
+    model: &str,
+    library: Option<&catalog::CapabilityLibrary>,
+    official_models: &[Value],
+) -> ResolvedModelCapability {
+    let catalog = ModelCatalog {
+        settings: &provider.settings_config,
+        index: Some(index),
+        provider: None,
+    };
+    let provider_key = reasoning_provider_key(provider);
+    resolve_codex_model_capability_for_catalog(
+        catalog,
+        platform,
+        Some(provider_key),
+        model,
+        library,
+        official_models,
+        |model| current_detection_for_catalog(catalog, provider_key, model),
+    )
+}
+
+fn resolve_codex_model_capability_for_catalog(
+    catalog: ModelCatalog<'_>,
+    platform: Option<&str>,
+    provider_key: Option<&str>,
+    model: &str,
+    library: Option<&catalog::CapabilityLibrary>,
+    official_models: &[Value],
+    detection_for_model: impl Fn(&str) -> Option<ProviderCapabilitySnapshot>,
+) -> ResolvedModelCapability {
+    let lookup = catalog.lookup(model);
     if matches!(lookup, CatalogModelLookup::Ambiguous)
         || matches!(lookup, CatalogModelLookup::Found(entry)
             if entry.get("enabled").and_then(Value::as_bool) == Some(false))
@@ -553,8 +726,8 @@ pub(crate) fn resolve_codex_model_capability_for_settings(
             .then(|| detection_for_model(canonical_model))
             .flatten()
     });
-    let mut resolved = resolve_codex_model_capability_core(
-        settings,
+    let mut resolved = resolve_codex_model_capability_core_for_catalog(
+        catalog,
         platform,
         canonical_model,
         detection.as_ref(),
@@ -563,8 +736,8 @@ pub(crate) fn resolve_codex_model_capability_for_settings(
     );
     if resolved.capability.is_none() && !canonical_model.eq_ignore_ascii_case(upstream_model) {
         let detection = detection_for_model(upstream_model);
-        resolved = resolve_codex_model_capability_core(
-            settings,
+        resolved = resolve_codex_model_capability_core_for_catalog(
+            catalog,
             platform,
             upstream_model,
             detection.as_ref(),
@@ -576,7 +749,7 @@ pub(crate) fn resolve_codex_model_capability_for_settings(
         // The public row owns product-level settings even when its
         // reasoning evidence came from the wire identity.
         return resolved_with_catalog_ultra_setting(
-            settings,
+            catalog,
             canonical_model,
             resolved.source,
             normalize_selected_capability(capability),
@@ -584,18 +757,18 @@ pub(crate) fn resolve_codex_model_capability_for_settings(
     }
     let provider_reasoning = ["reasoning", "codexChatReasoning", "codex_chat_reasoning"]
         .iter()
-        .find_map(|key| settings.get(*key))
+        .find_map(|key| catalog.settings.get(*key))
         .and_then(|reasoning| {
             reasoning_capability_from_model_entry(&serde_json::json!({
                 "reasoning": reasoning,
             }))
         })
         .filter(|capability| {
-            capability_matches_context(settings, platform, canonical_model, capability)
+            capability_matches_context(catalog, platform, canonical_model, capability)
         });
     provider_reasoning.map_or(resolved, |capability| {
         resolved_with_catalog_ultra_setting(
-            settings,
+            catalog,
             canonical_model,
             CapabilitySource::ProviderFallback,
             normalize_selected_capability(capability),
@@ -619,13 +792,11 @@ fn normalize_provider_reasoning_capability(
 /// has been resolved. This deliberately does not change the source or
 /// Provider-native capability declaration.
 fn apply_catalog_ultra_setting(
-    settings: &Value,
+    catalog: ModelCatalog<'_>,
     model: &str,
     capability: CodexModelReasoningCapability,
 ) -> CodexModelReasoningCapability {
-    let crate::codex_multirouter::catalog::CatalogModelLookup::Found(entry) =
-        crate::codex_multirouter::catalog::lookup_catalog_model(settings, model)
-    else {
+    let CatalogModelLookup::Found(entry) = catalog.lookup(model) else {
         return capability;
     };
     let setting = entry.get("codexUltra").and_then(Value::as_object);
@@ -700,14 +871,14 @@ fn apply_catalog_ultra_setting(
 }
 
 fn resolved_with_catalog_ultra_setting(
-    settings: &Value,
+    catalog: ModelCatalog<'_>,
     model: &str,
     source: CapabilitySource,
     capability: CodexModelReasoningCapability,
 ) -> ResolvedModelCapability {
-    let mut capability = apply_catalog_ultra_setting(settings, model, capability);
+    let mut capability = apply_catalog_ultra_setting(catalog, model, capability);
     if !is_explicit_reasoning_declaration(&capability) {
-        capability.evidence_scope = reasoning_evidence_scope_for_settings(settings, model);
+        capability.evidence_scope = reasoning_evidence_scope_for_catalog(catalog, model);
     }
     ResolvedModelCapability {
         fingerprint: capability_fingerprint(&capability),
@@ -782,18 +953,36 @@ pub fn resolve_codex_model_capability_core(
     library: Option<&catalog::CapabilityLibrary>,
     official_models: &[Value],
 ) -> ResolvedModelCapability {
+    resolve_codex_model_capability_core_for_catalog(
+        ModelCatalog::new(settings),
+        platform,
+        model,
+        detection,
+        library,
+        official_models,
+    )
+}
+
+fn resolve_codex_model_capability_core_for_catalog(
+    catalog: ModelCatalog<'_>,
+    platform: Option<&str>,
+    model: &str,
+    detection: Option<&ProviderCapabilitySnapshot>,
+    library: Option<&catalog::CapabilityLibrary>,
+    official_models: &[Value],
+) -> ResolvedModelCapability {
+    let settings = catalog.settings;
     // Catalog row selection precedes exclusion or capability parsing, so an
     // exact public model is never replaced by a sibling's upstream alias.
     // An excluded or ambiguous identity cannot be revived by lower sources.
-    let catalog_model = crate::codex_multirouter::catalog::lookup_catalog_model(settings, model);
-    if matches!(
-        catalog_model,
-        crate::codex_multirouter::catalog::CatalogModelLookup::Ambiguous
-    ) || matches!(
-        catalog_model,
-        crate::codex_multirouter::catalog::CatalogModelLookup::Found(entry)
-            if entry.get("enabled").and_then(Value::as_bool) == Some(false)
-    ) {
+    let catalog_model = catalog.lookup(model);
+    if matches!(catalog_model, CatalogModelLookup::Ambiguous)
+        || matches!(
+            catalog_model,
+            CatalogModelLookup::Found(entry)
+                if entry.get("enabled").and_then(Value::as_bool) == Some(false)
+        )
+    {
         return ResolvedModelCapability {
             capability: None,
             source: CapabilitySource::Unknown,
@@ -806,34 +995,36 @@ pub fn resolve_codex_model_capability_core(
     // public alias, while keeping the same row authoritative for exclusion
     // and product-level settings.
     let wire_model = match catalog_model {
-        crate::codex_multirouter::catalog::CatalogModelLookup::Found(entry) => {
-            ["upstreamModel", "upstream_model"]
-                .iter()
-                .find_map(|key| entry.get(*key))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|wire| !wire.is_empty())
-                .or_else(|| {
-                    ["model", "id", "slug"]
-                        .iter()
-                        .find_map(|key| entry.get(*key))
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|canonical| !canonical.is_empty())
-                })
-                .unwrap_or(model)
-        }
+        CatalogModelLookup::Found(entry) => ["upstreamModel", "upstream_model"]
+            .iter()
+            .find_map(|key| entry.get(*key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|wire| !wire.is_empty())
+            .or_else(|| {
+                ["model", "id", "slug"]
+                    .iter()
+                    .find_map(|key| entry.get(*key))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|canonical| !canonical.is_empty())
+            })
+            .unwrap_or(model),
         _ => model,
     };
     let normalize_platform_capability =
         |capability| normalize_provider_reasoning_capability(platform, wire_model, capability);
 
     // 1. 用户模型级声明（始终最高优先级）
-    if let Some(capability) = resolve_reasoning_capability_from_settings(settings, model)
-        .filter(|capability| capability_matches_context(settings, platform, model, capability))
+    let declared = match catalog_model {
+        CatalogModelLookup::Found(entry) => reasoning_capability_from_model_entry(entry),
+        _ => None,
+    };
+    if let Some(capability) = declared
+        .filter(|capability| capability_matches_context(catalog, platform, model, capability))
     {
         return resolved_with_catalog_ultra_setting(
-            settings,
+            catalog,
             model,
             CapabilitySource::UserConfig,
             normalize_platform_capability(capability),
@@ -846,7 +1037,7 @@ pub fn resolve_codex_model_capability_core(
     // catalog/provider-wide source=provider_config still requires provenance.
     if let Some(capability) = resolve_reasoning_capability_from_provider_config(settings, model) {
         return resolved_with_catalog_ultra_setting(
-            settings,
+            catalog,
             model,
             CapabilitySource::ProviderConfig,
             normalize_platform_capability(capability),
@@ -855,11 +1046,11 @@ pub fn resolve_codex_model_capability_core(
 
     // 3. 动态检测候选（只读元数据，TTL）
     if let Some(snapshot) =
-        detection.filter(|snapshot| snapshot_matches_context(settings, platform, model, snapshot))
+        detection.filter(|snapshot| snapshot_matches_context(catalog, platform, model, snapshot))
     {
         if let Some(capability) = snapshot_to_capability(snapshot) {
             return resolved_with_catalog_ultra_setting(
-                settings,
+                catalog,
                 model,
                 CapabilitySource::Detection,
                 normalize_platform_capability(capability),
@@ -871,7 +1062,7 @@ pub fn resolve_codex_model_capability_core(
     if let Some(library) = library {
         if let Some(capability) = catalog::lookup_library_capability(library, platform, model) {
             return resolved_with_catalog_ultra_setting(
-                settings,
+                catalog,
                 model,
                 CapabilitySource::Library,
                 normalize_platform_capability(capability),
@@ -894,7 +1085,7 @@ pub fn resolve_codex_model_capability_core(
     {
         if let Some(capability) = builtin_reasoning_capability_for_model(wire_model) {
             return resolved_with_catalog_ultra_setting(
-                settings,
+                catalog,
                 model,
                 CapabilitySource::Builtin,
                 normalize_platform_capability(capability),
@@ -910,7 +1101,7 @@ pub fn resolve_codex_model_capability_core(
             official_reasoning_capability_for_model(wire_model, official_models)
         {
             return resolved_with_catalog_ultra_setting(
-                settings,
+                catalog,
                 model,
                 CapabilitySource::Official,
                 normalize_platform_capability(capability),
@@ -924,7 +1115,7 @@ pub fn resolve_codex_model_capability_core(
     if platform == Some("sublyx") {
         if let Some(capability) = sublyx_reasoning_capability_for_model(wire_model) {
             return resolved_with_catalog_ultra_setting(
-                settings,
+                catalog,
                 model,
                 CapabilitySource::ProviderFallback,
                 normalize_platform_capability(capability),
@@ -1125,6 +1316,40 @@ mod tests {
     use crate::proxy::providers::codex_reasoning::ReasoningControlKind;
     use serde_json::json;
 
+    #[test]
+    fn detection_revision_changes_on_replacement_and_each_ttl_boundary() {
+        let mut cache = DetectionCache::default();
+        let start = Instant::now();
+        let next = start + Duration::from_secs(10);
+        let snapshot = |model: &str| ProviderCapabilitySnapshot {
+            provider_key: "provider".into(),
+            model: model.into(),
+            ..Default::default()
+        };
+
+        cache.insert_at(snapshot("first"), start);
+        let first_revision = cache.revision;
+        cache.insert_at(snapshot("second"), next);
+        assert_ne!(cache.revision, first_revision);
+        let before_expiry = cache.revision;
+        cache.prune_expired_at(start + DETECTION_TTL - Duration::from_millis(1));
+        assert_eq!(cache.revision, before_expiry);
+        cache.prune_expired_at(start + DETECTION_TTL);
+        assert_ne!(cache.revision, before_expiry);
+        assert_eq!(cache.entries.len(), 1);
+
+        let after_expiry = cache.revision;
+        cache.insert_at(snapshot("second"), start + DETECTION_TTL);
+        assert_ne!(cache.revision, after_expiry);
+        let replacement_revision = cache.revision;
+        cache.prune_expired_at(next + DETECTION_TTL);
+        assert_eq!(cache.revision, replacement_revision);
+        assert_eq!(cache.entries.len(), 1);
+        cache.prune_expired_at(start + DETECTION_TTL * 2);
+        assert_ne!(cache.revision, replacement_revision);
+        assert!(cache.entries.is_empty());
+    }
+
     fn provider_with_catalog(model: &str, reasoning: Option<serde_json::Value>) -> Provider {
         let mut entry = json!({ "model": model });
         if let Some(reasoning) = reasoning {
@@ -1144,6 +1369,21 @@ mod tests {
             icon_color: None,
             in_failover_queue: false,
         }
+    }
+
+    #[test]
+    fn materialized_provider_does_not_reintroduce_ephemeral_source_catalog() {
+        let mut provider = provider_with_catalog("canonical-model", None);
+        crate::codex_multirouter::catalog::share_provider_catalog(&mut provider);
+
+        let resolved = resolve_codex_model_capability_for_model_source(
+            &provider,
+            "missing-model",
+            &json!({ "reasoning": user_declared_reasoning() }),
+        );
+
+        assert_eq!(resolved.source, CapabilitySource::Unknown);
+        assert!(resolved.capability.is_none());
     }
 
     fn plain_provider(name: &str, base_url: &str) -> Provider {

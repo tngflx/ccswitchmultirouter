@@ -20,6 +20,16 @@ struct TerminalErrorCategory {
     serialized_markers: Option<Vec<String>>,
 }
 
+impl TerminalErrorCategory {
+    fn matches(&self, summary: &[String], details: &[String]) -> bool {
+        contains_marker(summary, &self.markers)
+            || contains_marker(
+                details,
+                self.serialized_markers.as_deref().unwrap_or(&self.markers),
+            )
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TemporaryUsageLimitPolicy {
@@ -29,6 +39,47 @@ struct TemporaryUsageLimitPolicy {
     retry_markers: Vec<String>,
     retry_denial_markers: Vec<String>,
     hard_limit_markers: Vec<String>,
+    period_limit_markers: PeriodLimitMarkers,
+    period_limit_blocking_markers: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeriodLimitMarkers {
+    daily: Vec<String>,
+    weekly: Vec<String>,
+    monthly: Vec<String>,
+}
+
+impl PeriodLimitMarkers {
+    fn periods(&self) -> [(&'static str, &[String]); 3] {
+        [
+            ("Daily", self.daily.as_slice()),
+            ("Weekly", self.weekly.as_slice()),
+            ("Monthly", self.monthly.as_slice()),
+        ]
+    }
+
+    fn classify(&self, summary: &[String]) -> Option<&'static str> {
+        self.periods()
+            .into_iter()
+            .find_map(|(period, markers)| contains_marker(summary, markers).then_some(period))
+    }
+
+    fn classify_notice(&self, statement: &str) -> Option<&'static str> {
+        let limit = ["reached", "exceeded", "exhausted"]
+            .into_iter()
+            .find_map(|ending| statement.strip_suffix(ending))?;
+        if !limit.ends_with("limit") {
+            return None;
+        }
+        self.periods().into_iter().find_map(|(period, markers)| {
+            markers
+                .iter()
+                .any(|marker| marker == statement || marker == limit)
+                .then_some(period)
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -60,6 +111,29 @@ impl TerminalErrorPolicy {
             .map(|ch| ch.to_ascii_lowercase())
             .collect()
     }
+
+    fn summary(&self, payload: &Value) -> Vec<String> {
+        self.summary_paths
+            .iter()
+            .filter_map(|pointer| payload.pointer(pointer))
+            .filter_map(Value::as_str)
+            .map(|value| self.normalize(value))
+            .collect()
+    }
+
+    fn details(&self, payload: &Value) -> Vec<String> {
+        self.serialized_paths
+            .iter()
+            .filter_map(|pointer| payload.pointer(pointer))
+            .map(|value| self.normalize(&value.to_string()))
+            .collect()
+    }
+}
+
+fn contains_marker(values: &[String], markers: &[String]) -> bool {
+    values
+        .iter()
+        .any(|value| markers.iter().any(|marker| value.contains(marker)))
 }
 
 fn terminal_error_policy() -> &'static TerminalErrorPolicy {
@@ -136,6 +210,11 @@ fn terminal_error_policy() -> &'static TerminalErrorPolicy {
         normalize_markers(&mut policy.temporary_usage_limit.retry_markers);
         normalize_markers(&mut policy.temporary_usage_limit.retry_denial_markers);
         normalize_markers(&mut policy.temporary_usage_limit.hard_limit_markers);
+        let period_markers = &mut policy.temporary_usage_limit.period_limit_markers;
+        normalize_markers(&mut period_markers.daily);
+        normalize_markers(&mut period_markers.weekly);
+        normalize_markers(&mut period_markers.monthly);
+        normalize_markers(&mut policy.temporary_usage_limit.period_limit_blocking_markers);
         policy
     })
 }
@@ -194,19 +273,8 @@ fn temporary_usage_limit_matches(policy: &TerminalErrorPolicy, payload: &Value) 
         return false;
     }
     let rule = &policy.temporary_usage_limit;
-    let summary: Vec<_> = policy
-        .summary_paths
-        .iter()
-        .filter_map(|pointer| payload.pointer(pointer))
-        .filter_map(Value::as_str)
-        .map(|value| policy.normalize(value))
-        .collect();
-    let serialized: Vec<_> = policy
-        .serialized_paths
-        .iter()
-        .filter_map(|pointer| payload.pointer(pointer))
-        .map(|value| policy.normalize(&value.to_string()))
-        .collect();
+    let summary = policy.summary(payload);
+    let serialized = policy.details(payload);
     // Explicit refusal always wins over a positive substring such as `retry`
     // or `reset`, including a denial in a structured code or nested detail.
     if summary.iter().chain(serialized.iter()).any(|value| {
@@ -254,21 +322,10 @@ pub(crate) fn terminal_error_code(event_name: &str, payload: &Value) -> Option<&
     }
     // Keep fields separate: joining an unrelated code and message must not
     // manufacture a permanent marker across their boundary.
-    let summary: Vec<_> = policy
-        .summary_paths
-        .iter()
-        .filter_map(|pointer| payload.pointer(pointer))
-        .filter_map(Value::as_str)
-        .map(|value| policy.normalize(value))
-        .collect();
+    let summary = policy.summary(payload);
     // Preserve the renderer's conservative guards for nested error details and
     // keys. JSON punctuation keeps separate fields from forming new markers.
-    let serialized: Vec<_> = policy
-        .serialized_paths
-        .iter()
-        .filter_map(|pointer| payload.pointer(pointer))
-        .map(|value| policy.normalize(&value.to_string()))
-        .collect();
+    let serialized = policy.details(payload);
     let temporary_usage_limit = temporary_usage_limit_matches(policy, payload);
     let category = policy.categories.iter().find_map(|category| {
         // Skip only the ambiguous usage category. Continue checking every
@@ -277,19 +334,9 @@ pub(crate) fn terminal_error_code(event_name: &str, payload: &Value) -> Option<&
         if temporary_usage_limit && category.code == policy.temporary_usage_limit.category_code {
             return None;
         }
-        let serialized_markers = category
-            .serialized_markers
-            .as_ref()
-            .unwrap_or(&category.markers);
-        (summary
-            .iter()
-            .any(|value| category.markers.iter().any(|marker| value.contains(marker)))
-            || serialized.iter().any(|value| {
-                serialized_markers
-                    .iter()
-                    .any(|marker| value.contains(marker))
-            }))
-        .then_some(category.code.as_str())
+        category
+            .matches(&summary, &serialized)
+            .then_some(category.code.as_str())
     });
     // Preserve the established auth/quota/cancellation reason priority while
     // still stopping unrecognized server errors that explicitly forbid retry.
@@ -306,13 +353,181 @@ pub(crate) fn is_retryable_usage_limit_payload(payload: &Value) -> bool {
         && terminal_error_code("response.failed", payload).is_none()
 }
 
+/// A hard daily/weekly/monthly usage limit cannot be replayed automatically,
+/// but it still identifies a failed Desktop turn that the user may continue
+/// after switching providers or waiting for the quota reset. Keep this
+/// predicate alongside the terminal policy so the manual continuation path
+/// uses the same marker vocabulary and precedence as retry classification.
+pub(crate) fn deferred_usage_limit_period(
+    event_name: &str,
+    payload: &Value,
+) -> Option<&'static str> {
+    let policy = terminal_error_policy();
+    if policy
+        .cancelled_events
+        .iter()
+        .any(|event| event == event_name)
+    {
+        return None;
+    }
+    deferred_usage_limit_period_for_payload(policy, payload)
+        .or_else(|| deferred_usage_limit_period_in_output(policy, event_name, payload))
+}
+
+/// A provider may return its exact usage-limit code without a reset hint.
+/// This is enough for manual recovery when the request already has an exact
+/// Desktop binding. Keep the automatic retry policy separate.
+pub(crate) fn is_deferred_usage_limit(event_name: &str, payload: &Value) -> bool {
+    if deferred_usage_limit_period(event_name, payload).is_some() {
+        return true;
+    }
+    let typed_error = ["/response/error", "/error", ""]
+        .into_iter()
+        .filter_map(|path| payload.pointer(path))
+        .any(|error| match (error.get("code"), error.get("type")) {
+            (Some(code), Some(kind)) => is_usage_limit_code(code) && is_usage_limit_code(kind),
+            (Some(field), None) | (None, Some(field)) => is_usage_limit_code(field),
+            (None, None) => false,
+        });
+    let exact_usage_limit_code = ["/response/error", "/error", ""]
+        .into_iter()
+        .filter_map(|path| payload.pointer(path))
+        .any(|error| {
+            ["code", "type"]
+                .into_iter()
+                .filter_map(|field| error.get(field))
+                .any(is_exact_usage_limit_code)
+        });
+    if !typed_error && !exact_usage_limit_code {
+        return false;
+    }
+    let policy = terminal_error_policy();
+    let rule = &policy.temporary_usage_limit;
+    let terminal_code = terminal_error_code(event_name, payload);
+    let safe_typed_code = terminal_code == Some(rule.category_code.as_str());
+    let safe_exact_code = exact_usage_limit_code
+        && terminal_code.is_none_or(|code| code == rule.category_code.as_str());
+    (safe_typed_code || safe_exact_code)
+        && !explicit_retry_denial_matches(policy, payload)
+        && [policy.summary(payload), policy.details(payload)]
+            .iter()
+            .all(|values| {
+                !contains_marker(values, &rule.hard_limit_markers)
+                    && !contains_marker(values, &rule.retry_denial_markers)
+                    && !contains_marker(values, &rule.period_limit_blocking_markers)
+                    && !policy.categories.iter().any(|category| {
+                        category.code != rule.category_code && category.matches(values, values)
+                    })
+            })
+}
+
+fn is_usage_limit_code(value: &Value) -> bool {
+    matches!(
+        value.as_str(),
+        Some("usage_limit_reached" | "USAGE_LIMIT_EXCEEDED")
+    )
+}
+
+fn is_exact_usage_limit_code(value: &Value) -> bool {
+    value.as_str() == Some("USAGE_LIMIT_EXCEEDED")
+}
+
+fn deferred_usage_limit_period_in_output(
+    policy: &TerminalErrorPolicy,
+    event_name: &str,
+    payload: &Value,
+) -> Option<&'static str> {
+    let status = payload.pointer("/response/status").and_then(Value::as_str);
+    if !matches!(
+        (event_name, status),
+        ("response.completed", Some("completed")) | ("response.failed", Some("failed") | None)
+    ) {
+        return None;
+    }
+    // Some gateways place the quota notice in a single final assistant
+    // message. A structured error takes precedence, even if its code is new.
+    let [message] = payload.pointer("/response/output")?.as_array()?.as_slice() else {
+        return None;
+    };
+    if message.get("type").and_then(Value::as_str) != Some("message")
+        || message
+            .get("role")
+            .is_some_and(|role| role.as_str() != Some("assistant"))
+    {
+        return None;
+    }
+    let [part] = message.get("content")?.as_array()?.as_slice() else {
+        return None;
+    };
+    let text = match part.get("type").and_then(Value::as_str)? {
+        "output_text" => part.get("text"),
+        "refusal" => part.get("refusal"),
+        _ => None,
+    }?
+    .as_str()?;
+    // The supported notices fit in two short clauses. Skip long replies
+    // without scanning or normalizing them as error text.
+    if text.len() > 256 {
+        return None;
+    }
+    let text = text.trim();
+    let (statement, suffix) = text.split_once(['.', ';']).unwrap_or((text, ""));
+    let period = policy
+        .temporary_usage_limit
+        .period_limit_markers
+        .classify_notice(&policy.normalize(statement))?;
+    let suffix = suffix.trim().trim_end_matches('.');
+    let is_notice = ["", "Please try again later", "Please retry later"]
+        .iter()
+        .any(|notice| suffix.eq_ignore_ascii_case(notice))
+        || suffix.eq_ignore_ascii_case(&format!(
+            "The upstream provider's {period} Codex allowance is exhausted"
+        ));
+    (is_notice
+        && ![
+            "/response/error",
+            "/response/incomplete_details",
+            "/error",
+            "/code",
+            "/message",
+        ]
+        .iter()
+        .filter_map(|pointer| payload.pointer(pointer))
+        .any(|field| !field.is_null())
+        && !explicit_retry_denial_matches(policy, payload))
+    .then_some(period)
+}
+
+fn deferred_usage_limit_period_for_payload(
+    policy: &TerminalErrorPolicy,
+    payload: &Value,
+) -> Option<&'static str> {
+    let rule = &policy.temporary_usage_limit;
+    let summary = policy.summary(payload);
+    let period = rule.period_limit_markers.classify(&summary)?;
+    if contains_marker(&summary, &rule.period_limit_blocking_markers)
+        || explicit_retry_denial_matches(policy, payload)
+    {
+        return None;
+    }
+    let details = policy.details(payload);
+    (!contains_marker(&details, &rule.period_limit_blocking_markers)
+        && !contains_marker(&details, &rule.retry_denial_markers)
+        && !policy.categories.iter().any(|category| {
+            category.code != rule.category_code && category.matches(&summary, &details)
+        }))
+    .then_some(period)
+}
+
 /// Apply the same terminal policy to structured provider errors and plaintext
 /// gateway responses. HTTP 429/5xx must not turn a quota or authentication
 /// rejection into a transient failure merely because its body is not JSON.
 pub(crate) fn terminal_error_code_from_body(body: &str) -> Option<&'static str> {
-    let payload =
-        serde_json::from_str::<Value>(body).unwrap_or_else(|_| Value::String(body.to_string()));
-    terminal_error_code("response.failed", &payload)
+    terminal_error_code("response.failed", &terminal_error_payload(body))
+}
+
+pub(crate) fn terminal_error_payload(body: &str) -> Value {
+    serde_json::from_str(body).unwrap_or_else(|_| Value::String(body.to_owned()))
 }
 
 /// Shared transient HTTP statuses for stream reconnection and a new Desktop
@@ -639,6 +854,99 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn embedded_period_limit_requires_a_standalone_quota_notice() {
+        let completed = |content| {
+            json!({"response": {
+                "status": "completed",
+                "output": [{"type": "message", "role": "assistant", "content": content}]
+            }})
+        };
+        for (text, expected) in [
+            (
+                "Daily usage limit reached. Please try again later.",
+                Some("Daily"),
+            ),
+            (
+                "Daily usage limit exceeded. The upstream provider's daily Codex allowance is exhausted.",
+                Some("Daily"),
+            ),
+            ("Weekly limit exceeded.", Some("Weekly")),
+            ("Monthly usage limit reached; please retry later", Some("Monthly")),
+            ("The code emits 'Daily usage limit reached.'", None),
+            ("\"Daily usage limit reached.\"", None),
+            ("Daily usage limit reached. I updated the error message.", None),
+            ("Daily usage limit reached is the text of the banner.", None),
+            ("Daily usage limit reached? Here's what you can do.", None),
+            ("Daily usage limit was never reached.", None),
+        ] {
+            let response = completed(json!([{"type": "output_text", "text": text}]));
+            assert_eq!(
+                deferred_usage_limit_period("response.completed", &response),
+                expected,
+                "{text}"
+            );
+        }
+
+        let response = completed(json!([
+            {"type": "output_text", "text": "Daily usage limit reached."},
+            {"type": "output_text", "text": "I updated the banner."}
+        ]));
+        assert_eq!(
+            deferred_usage_limit_period("response.completed", &response),
+            None
+        );
+
+        let response = completed(json!([{
+            "type": "output_text",
+            "text": format!("{}Daily usage limit reached.", " ".repeat(256))
+        }]));
+        assert_eq!(
+            deferred_usage_limit_period("response.completed", &response),
+            None
+        );
+    }
+
+    #[test]
+    fn embedded_period_limit_yields_to_authoritative_terminal_errors() {
+        let failed = json!({"response": {
+            "status": "failed",
+            "error": null,
+            "output": [{
+                "type": "message",
+                "content": [{"type": "refusal", "refusal": "Monthly usage limit exceeded."}]
+            }]
+        }});
+        assert_eq!(
+            deferred_usage_limit_period("response.failed", &failed),
+            Some("Monthly")
+        );
+
+        for error in [
+            json!({"code": "invalid_api_key"}),
+            json!({"code": "upstream_validation_failed"}),
+            json!({"message": "Daily usage limit reached", "retryable": false}),
+        ] {
+            let mut response = failed.clone();
+            response["response"]["error"] = error;
+            assert_eq!(
+                deferred_usage_limit_period("response.failed", &response),
+                None
+            );
+        }
+
+        let mut response = failed.clone();
+        response["retryable"] = json!(false);
+        assert_eq!(
+            deferred_usage_limit_period("response.failed", &response),
+            None
+        );
+        assert_eq!(
+            deferred_usage_limit_period("response.cancelled", &failed),
+            None
+        );
+    }
+
+    #[test]
     fn retryable_http_statuses_are_shared_by_reconnect_and_continuation() {
         for status in [408, 425, 429, 500, 502, 503, 504, 599] {
             assert!(http_error_status_is_retryable(status), "HTTP {status}");
@@ -715,6 +1023,43 @@ mod tests {
             terminal_error_code("response.failed", &payload),
             Some("insufficient_quota")
         );
+    }
+
+    #[test]
+    fn exact_uppercase_usage_limit_code_allows_manual_continuation_without_reset_text() {
+        let payload = json!({
+            "error": {
+                "code": "USAGE_LIMIT_EXCEEDED",
+                "type": "upstream_error"
+            }
+        });
+        assert!(is_deferred_usage_limit("response.failed", &payload));
+
+        for payload in [
+            json!({
+                "error": {
+                    "code": "USAGE_LIMIT_EXCEEDED",
+                    "message": "Permission denied by the provider"
+                }
+            }),
+            json!({
+                "error": {
+                    "code": "USAGE_LIMIT_EXCEEDED",
+                    "retryable": false
+                }
+            }),
+            json!({
+                "error": {
+                    "code": "USAGE_LIMIT_EXCEEDED",
+                    "message": "Quota exhausted"
+                }
+            }),
+        ] {
+            assert!(
+                !is_deferred_usage_limit("response.failed", &payload),
+                "{payload}"
+            );
+        }
     }
 
     #[test]

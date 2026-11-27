@@ -34,17 +34,21 @@
 
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
+use crate::file_revision::FileRevision;
 use crate::proxy::usage::calculator::CostCalculator;
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
-    get_sync_state, metadata_modified_nanos, update_sync_state, SessionSyncResult,
+    load_session_sync_cursors, metadata_modified_nanos, write_session_sync_cursor,
+    SessionSyncCursor, SessionSyncResult,
 };
 use crate::services::sql_helpers::INPUT_TOKEN_SEMANTICS_TOTAL;
 use crate::services::usage_stats::{
     find_model_pricing, has_recent_grokbuild_proxy_activity, SESSION_PROXY_DEDUP_WINDOW_SECONDS,
 };
 use rust_decimal::Decimal;
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -95,6 +99,11 @@ struct GrokUsageEvent {
 /// 同步 Grok Build 使用数据（从 updates.jsonl 会话日志）
 pub fn sync_grokbuild_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
     let files = collect_grok_updates_files();
+    let cursors = load_session_sync_cursors(
+        db,
+        files.iter().map(|path| path.to_string_lossy().into_owned()),
+    )?;
+    let now = grok_sync_now();
 
     let mut result = SessionSyncResult {
         files_scanned: files.len() as u32,
@@ -102,7 +111,8 @@ pub fn sync_grokbuild_usage(db: &Database) -> Result<SessionSyncResult, AppError
     };
 
     for file_path in &files {
-        match sync_single_grok_file(db, file_path) {
+        let saved = cursors.get(file_path.to_string_lossy().as_ref()).copied();
+        match sync_grok_file_from_cursor(db, file_path, saved, now) {
             Ok(file_result) => result.merge(file_result),
             Err(e) => {
                 let msg = format!("Grok Build 会话文件解析失败 {}: {e}", file_path.display());
@@ -174,11 +184,43 @@ fn collect_files_named(root: &Path, name: &str, files: &mut Vec<PathBuf>, depth:
     }
 }
 
-/// 同步单个 updates.jsonl 文件
+fn grok_sync_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
 fn sync_single_grok_file(db: &Database, file_path: &Path) -> Result<SessionSyncResult, AppError> {
+    sync_single_grok_file_at(db, file_path, grok_sync_now())
+}
+
+#[cfg(test)]
+fn sync_single_grok_file_at(
+    db: &Database,
+    file_path: &Path,
+    now: i64,
+) -> Result<SessionSyncResult, AppError> {
+    let key = file_path.to_string_lossy();
+    let saved = load_session_sync_cursors(db, [key.to_string()])?
+        .get(key.as_ref())
+        .copied();
+    sync_grok_file_from_cursor(db, file_path, saved, now)
+}
+
+fn sync_grok_file_from_cursor(
+    db: &Database,
+    file_path: &Path,
+    saved: Option<SessionSyncCursor>,
+    now: i64,
+) -> Result<SessionSyncResult, AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    let metadata = fs::metadata(file_path)
+    let file =
+        fs::File::open(file_path).map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
+    let metadata = file
+        .metadata()
         .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
     let file_modified = metadata_modified_nanos(&metadata);
 
@@ -192,18 +234,40 @@ fn sync_single_grok_file(db: &Database, file_path: &Path) -> Result<SessionSyncR
         return Ok(SessionSyncResult::default());
     }
 
-    let (last_modified, _last_offset) = get_sync_state(db, &file_path_str)?;
-    if file_modified <= last_modified {
-        return Ok(SessionSyncResult::default());
+    let revision = FileRevision::from_file_metadata(&file, &metadata);
+    let revision_fingerprint = revision.map(|revision| revision.fingerprint());
+    if let Some(saved) = saved.filter(|saved| {
+        saved.matches_source_revision(revision_fingerprint, file_modified)
+            && saved.deferred_until.is_none_or(|until| now < until)
+    }) {
+        return Ok(SessionSyncResult {
+            deferred_files: u32::from(saved.deferred_until.is_some()),
+            ..Default::default()
+        });
     }
 
-    // 文件变更时全量重读：UPSERT 幂等使重读无害，且沉降窗延后的事件本就
-    // 依赖下一轮重读补入。事件已是逐轮独立值，改 offset 增量读在正确性上
-    // 可行（无差分基线依赖），但需另行处理延后事件的 offset 回退，收益
-    // （活跃会话每周期省一次 O(N) 解析）暂不值得该复杂度。
-    let content = fs::read_to_string(file_path)
+    let mut content = Vec::with_capacity(metadata.len() as usize + 1);
+    (&file)
+        .take(MAX_GROK_FILE_BYTES + 1)
+        .read_to_end(&mut content)
         .map_err(|e| AppError::Config(format!("无法读取文件: {e}")))?;
-    let events = parse_grok_usage_events(&content);
+    #[cfg(test)]
+    GROK_READ_BYTES.with(|count| count.set(count.get() + content.len()));
+    // A writer can extend the log after the metadata check.
+    if content.len() as u64 > MAX_GROK_FILE_BYTES {
+        log::warn!(
+            "Grok session log grew beyond the read limit: {}",
+            file_path.display()
+        );
+        return Ok(SessionSyncResult::default());
+    }
+    let content =
+        String::from_utf8(content).map_err(|e| AppError::Config(format!("无法读取文件: {e}")))?;
+    if revision.is_some() && FileRevision::read(file_path) != revision {
+        return Err(AppError::Config(
+            "Grok session log changed during read".into(),
+        ));
+    }
 
     // 会话 ID = 会话目录名（与 summary.json 的 info.id 一致）。request_id
     // 唯一性押在该 UUIDv7 全局唯一上：同 ID 的归档/活跃副本经 UPSERT 幂等
@@ -215,21 +279,35 @@ fn sync_single_grok_file(db: &Database, file_path: &Path) -> Result<SessionSyncR
         .unwrap_or("unknown")
         .to_string();
 
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
     let mut result = SessionSyncResult::default();
-    let mut deferred = false;
-
-    for (idx, event) in events.iter().enumerate() {
+    let (start, mut event_count, mut digest) =
+        saved
+            .and_then(|cursor| {
+                let offset = usize::try_from(cursor.last_byte_offset?).ok()?;
+                let prefix = content.get(..offset)?;
+                if cursor.last_line_offset < 0 || (offset != 0 && !prefix.ends_with('\n')) {
+                    return None;
+                }
+                let mut digest = Sha256::new();
+                digest.update(prefix);
+                (cursor.last_tail_fingerprint == Some(grok_prefix_fingerprint(&digest)))
+                    .then_some((offset, cursor.last_line_offset, digest))
+            })
+            .unwrap_or_default();
+    let mut committed = start;
+    let mut deferred_until = None;
+    for line in content[start..].split_inclusive('\n') {
+        let Some(event) = parse_grok_usage_event(line) else {
+            if line.ends_with('\n') {
+                committed += line.len();
+            }
+            continue;
+        };
         // 沉降窗：事件按 append 顺序时间单调，遇到第一条未沉降的事件即停，
         // 后续事件与它一起等下一轮（保持"文件前缀已导入"的简单不变量）。
-        // 已知局限：未来时间戳（时钟误设）会让该文件持续延后并整文件重扫，
-        // 墙钟越过 事件时刻+窗口 后自愈；活跃会话每周期全量重读为设计代价。
         if now.saturating_sub(event.created_at) < SETTLE_WINDOW_SECONDS {
-            deferred = true;
+            result.deferred_files += 1;
+            deferred_until = Some(event.created_at.saturating_add(SETTLE_WINDOW_SECONDS));
             break;
         }
 
@@ -261,12 +339,12 @@ fn sync_single_grok_file(db: &Database, file_path: &Path) -> Result<SessionSyncR
             // 方向是少记不双算。prompt_id 缺失时回退 "idx{N}"（UUID 形态的
             // prompt_id 不可能与之撞名）。
             let turn_key = if event.prompt_id.is_empty() {
-                format!("idx{idx}")
+                format!("idx{event_count}")
             } else {
                 event.prompt_id.clone()
             };
             let request_id = format!("grok_session:{session_id}:{turn_key}:{model}");
-            match insert_grok_session_entry(
+            if insert_grok_session_entry(
                 db,
                 &request_id,
                 turn,
@@ -274,99 +352,110 @@ fn sync_single_grok_file(db: &Database, file_path: &Path) -> Result<SessionSyncR
                 model,
                 &session_id,
                 event.created_at,
-            ) {
-                Ok(true) => result.imported += 1,
-                Ok(false) => result.skipped += 1,
-                Err(e) => {
-                    log::warn!("[GROK-SYNC] 插入失败 ({request_id}): {e}");
-                    result.skipped += 1;
-                }
+            )? {
+                result.imported += 1;
+            } else {
+                result.skipped += 1;
             }
+        }
+        if line.ends_with('\n') {
+            committed += line.len();
+            event_count += 1;
         }
     }
 
-    if deferred {
-        // 不落同步状态：下一轮重读整个文件，把沉降后的事件补入。
-        result.deferred_files += 1;
-    } else {
-        update_sync_state(db, &file_path_str, file_modified, events.len() as i64)?;
+    digest.update(&content[start..committed]);
+    let cursor = SessionSyncCursor {
+        last_modified: file_modified,
+        last_line_offset: event_count,
+        last_byte_offset: Some(committed as i64),
+        last_tail_fingerprint: Some(grok_prefix_fingerprint(&digest)),
+        last_source_revision: revision_fingerprint,
+        deferred_until,
+    };
+    if saved != Some(cursor) {
+        let conn = lock_conn!(db.conn);
+        write_session_sync_cursor(&conn, &file_path_str, cursor)?;
     }
-
     Ok(result)
 }
 
-/// 从 updates.jsonl 内容解析出全部逐轮用量事件（保持文件顺序）
-fn parse_grok_usage_events(content: &str) -> Vec<GrokUsageEvent> {
-    let mut events = Vec::new();
+fn grok_prefix_fingerprint(digest: &Sha256) -> i64 {
+    let digest = digest.clone().finalize();
+    i64::from_le_bytes(digest[..8].try_into().expect("SHA-256 has 32 bytes"))
+}
 
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if record.get("method").and_then(|v| v.as_str()) != Some("_x.ai/session/update") {
-            continue;
-        }
-        let update = record.get("params").and_then(|p| p.get("update"));
-        // 只认 turn_completed（实测全体带 usage 的事件均为此类；判别字段是
-        // sessionUpdate，serde internally-tagged）。字段缺失时向后兼容放行，
-        // 但显式标为其它类型的事件即使带 usage 也不导入——中途快照若与轮末
-        // 事件并存，双导会双算。
-        let kind = update
-            .and_then(|u| u.get("sessionUpdate"))
-            .and_then(|v| v.as_str());
-        if kind.is_some() && kind != Some("turn_completed") {
-            continue;
-        }
-        let Some(usage) = update
-            .and_then(|u| u.get("usage"))
-            .filter(|u| u.is_object())
-        else {
-            continue;
-        };
-        // 沉降窗与接管守卫都依赖事件时刻，没有时间戳的事件无法安全导入。
-        let Some(created_at) = parse_event_timestamp(record.get("timestamp")) else {
-            continue;
-        };
+#[cfg(test)]
+thread_local! {
+    static GROK_READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GROK_PARSED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-        let prompt_id = update
-            .and_then(|u| u.get("prompt_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+#[cfg(test)]
+fn parse_grok_usage_events(content: &str) -> impl Iterator<Item = GrokUsageEvent> + '_ {
+    content.lines().filter_map(parse_grok_usage_event)
+}
 
-        let mut per_model: Vec<(String, GrokCounters)> = usage
-            .get("modelUsage")
-            .and_then(|m| m.as_object())
-            .map(|map| {
-                map.iter()
-                    .map(|(model, counters)| (model.clone(), parse_grok_counters(counters)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if per_model.is_empty() {
-            // 缺 modelUsage 时退回顶层逐轮值；模型名未知，交由查价层兜底。
-            per_model.push(("unknown".to_string(), parse_grok_counters(usage)));
-        }
-        // modelUsage 是 JSON object，遍历序不保证稳定；排序保证插入顺序
-        // 与日志在多次重扫间确定。
-        per_model.sort_by(|a, b| a.0.cmp(&b.0));
-
-        events.push(GrokUsageEvent {
-            created_at,
-            prompt_id,
-            cost_is_partial: usage
-                .get("costIsPartial")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            per_model,
-        });
+fn parse_grok_usage_event(line: &str) -> Option<GrokUsageEvent> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
     }
+    #[cfg(test)]
+    GROK_PARSED_BYTES.with(|count| count.set(count.get() + line.len()));
+    let record = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if record.get("method").and_then(|v| v.as_str()) != Some("_x.ai/session/update") {
+        return None;
+    }
+    let update = record.get("params").and_then(|p| p.get("update"));
+    // 只认 turn_completed（实测全体带 usage 的事件均为此类；判别字段是
+    // sessionUpdate，serde internally-tagged）。字段缺失时向后兼容放行，
+    // 但显式标为其它类型的事件即使带 usage 也不导入——中途快照若与轮末
+    // 事件并存，双导会双算。
+    let kind = update
+        .and_then(|u| u.get("sessionUpdate"))
+        .and_then(|v| v.as_str());
+    if kind.is_some() && kind != Some("turn_completed") {
+        return None;
+    }
+    let usage = update
+        .and_then(|u| u.get("usage"))
+        .filter(|u| u.is_object())?;
+    // 沉降窗与接管守卫都依赖事件时刻，没有时间戳的事件无法安全导入。
+    let created_at = parse_event_timestamp(record.get("timestamp"))?;
 
-    events
+    let prompt_id = update
+        .and_then(|u| u.get("prompt_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut per_model: Vec<(String, GrokCounters)> = usage
+        .get("modelUsage")
+        .and_then(|m| m.as_object())
+        .map(|map| {
+            map.iter()
+                .map(|(model, counters)| (model.clone(), parse_grok_counters(counters)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if per_model.is_empty() {
+        // 缺 modelUsage 时退回顶层逐轮值；模型名未知，交由查价层兜底。
+        per_model.push(("unknown".to_string(), parse_grok_counters(usage)));
+    }
+    // modelUsage 是 JSON object，遍历序不保证稳定；排序保证插入顺序
+    // 与日志在多次重扫间确定。
+    per_model.sort_by(|a, b| a.0.cmp(&b.0));
+
+    Some(GrokUsageEvent {
+        created_at,
+        prompt_id,
+        cost_is_partial: usage
+            .get("costIsPartial")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        per_model,
+    })
 }
 
 fn parse_grok_counters(value: &serde_json::Value) -> GrokCounters {
@@ -680,7 +769,7 @@ mod tests {
             "{\"timestamp\":\"2026-07-20T13:26:20Z\",\"method\":\"_x.ai/session/update\",\"params\":{\"update\":{\"sessionUpdate\":\"usage_snapshot\",\"prompt_id\":\"px\",\"usage\":{\"inputTokens\":9999,\"outputTokens\":9,\"cachedReadTokens\":0}}}}\n",
             "{\"timestamp\":\"2026-07-20T13:26:24Z\",\"method\":\"_x.ai/session/update\",\"params\":{\"update\":{\"sessionUpdate\":\"turn_completed\",\"prompt_id\":\"p1\",\"usage\":{\"inputTokens\":16632,\"outputTokens\":104,\"cachedReadTokens\":0,\"modelUsage\":{\"grok-4.5-build\":{\"inputTokens\":16632,\"outputTokens\":104,\"cachedReadTokens\":0,\"apiDurationMs\":5342,\"costUsdTicks\":338880000}}}}}}\n",
         );
-        let events = parse_grok_usage_events(content);
+        let events: Vec<_> = parse_grok_usage_events(content).collect();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].prompt_id, "p1");
         assert_eq!(events[0].per_model.len(), 1);
@@ -706,7 +795,7 @@ mod tests {
             r#"{{"timestamp":"{}","method":"_x.ai/session/update","params":{{"update":{{"prompt_id":"p1","usage":{{"inputTokens":100,"outputTokens":10,"cachedReadTokens":5}}}}}}}}"#,
             epoch_to_rfc3339(OLD_EPOCH)
         );
-        let events = parse_grok_usage_events(&line);
+        let events: Vec<_> = parse_grok_usage_events(&line).collect();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].per_model[0].0, "unknown");
         assert_eq!(events[0].per_model[0].1.input, 100);
@@ -847,7 +936,7 @@ mod tests {
                 "p1",
                 &model_counters("grok-4.5-build", 100, 10, 0, 1),
             ),
-            // 未沉降的新事件：本轮延后，且不落同步状态以便下一轮重读
+            // Leave the recent event outside the committed prefix.
             usage_event_line(now, "p2", &model_counters("grok-4.5-build", 250, 30, 0, 1)),
         ];
         let path = write_session_file(temp.path(), "sess-settle", &lines);
@@ -857,15 +946,244 @@ mod tests {
         assert_eq!(result.deferred_files, 1);
         assert_eq!(query_rows(&db)?.len(), 1);
 
-        let (last_modified, _) = get_sync_state(&db, &path.to_string_lossy())?;
-        assert_eq!(last_modified, 0, "延后时不得记录同步状态");
+        let key = path.to_string_lossy().into_owned();
+        let cursor = load_session_sync_cursors(&db, [key.clone()])?[&key];
+        assert_eq!(cursor.last_line_offset, 1);
+        assert_eq!(cursor.last_byte_offset, Some(lines[0].len() as i64 + 1));
+        assert_eq!(cursor.deferred_until, Some(now + SETTLE_WINDOW_SECONDS));
 
-        // 下一轮重读：旧事件 UPSERT 无变化，新事件仍未沉降继续延后
         let rerun = sync_single_grok_file(&db, &path)?;
         assert_eq!(rerun.imported, 0);
-        assert_eq!(rerun.skipped, 1);
+        assert_eq!(rerun.skipped, 0);
         assert_eq!(rerun.deferred_files, 1);
         assert_eq!(query_rows(&db)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_deferred_polls_parse_only_through_first_unsettled_turn() -> Result<(), AppError> {
+        let now = OLD_EPOCH + 2 * SETTLE_WINDOW_SECONDS;
+        for suffix_lines in [2, 4096] {
+            let db = Database::memory()?;
+            let temp = tempdir().expect("tempdir");
+            let counters = model_counters("grok-4.5-build", 100, 10, 0, 1);
+            let settled = usage_event_line(OLD_EPOCH, "p1", &counters);
+            let unsettled = usage_event_line(now, "p2", &counters);
+            let initial_parsed_bytes = settled.len() + unsettled.len();
+            let unsettled_bytes = unsettled.len();
+            let mut lines = vec![settled, unsettled];
+            lines.extend(std::iter::repeat_n("{}".to_string(), suffix_lines));
+            let path = write_session_file(temp.path(), "sess-deferred-work", &lines);
+
+            let unchanged_bytes = if FileRevision::read(&path).is_some() {
+                0
+            } else {
+                unsettled_bytes
+            };
+            for (expected_imports, expected_parsed_bytes) in [
+                (1, initial_parsed_bytes),
+                (0, unchanged_bytes),
+                (0, unchanged_bytes),
+            ] {
+                GROK_READ_BYTES.with(|count| count.set(0));
+                GROK_PARSED_BYTES.with(|count| count.set(0));
+                let result = sync_single_grok_file_at(&db, &path, now)?;
+                assert_eq!(result.imported, expected_imports);
+                assert_eq!(result.deferred_files, 1);
+                assert_eq!(
+                    GROK_PARSED_BYTES.with(std::cell::Cell::get),
+                    expected_parsed_bytes
+                );
+                if expected_parsed_bytes == 0 {
+                    assert_eq!(GROK_READ_BYTES.with(std::cell::Cell::get), 0);
+                }
+            }
+
+            let settled = sync_single_grok_file_at(&db, &path, now + SETTLE_WINDOW_SECONDS)?;
+            assert_eq!(settled.imported, 1);
+            assert_eq!(settled.deferred_files, 0);
+            assert_eq!(query_rows(&db)?.len(), 2);
+
+            GROK_PARSED_BYTES.with(|count| count.set(0));
+            let idle = sync_single_grok_file_at(&db, &path, now + SETTLE_WINDOW_SECONDS)?;
+            assert_eq!(idle.imported + idle.skipped, 0);
+            assert_eq!(GROK_PARSED_BYTES.with(std::cell::Cell::get), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_same_size_same_timestamp_rewrite_updates_settled_prefix() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let temp = tempdir().expect("tempdir");
+        let now = OLD_EPOCH + 2 * SETTLE_WINDOW_SECONDS;
+        let original = usage_event_line(
+            OLD_EPOCH,
+            "",
+            &model_counters("grok-4.5-build", 100, 10, 0, 1),
+        );
+        let pending = usage_event_line(now, "", &model_counters("grok-4.5-build", 200, 20, 0, 1));
+        let ignored = r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"tool_call"}}}"#.to_string();
+        let path = write_session_file(
+            temp.path(),
+            "sess-rewrite",
+            &[ignored.clone(), original, pending.clone()],
+        );
+        let before = fs::metadata(&path).expect("file metadata");
+        assert_eq!(sync_single_grok_file_at(&db, &path, now)?.imported, 1);
+
+        let corrected = usage_event_line(
+            OLD_EPOCH,
+            "",
+            &model_counters("grok-4.5-build", 150, 10, 0, 1),
+        );
+        let rewritten =
+            write_session_file(temp.path(), "sess-rewrite", &[ignored, corrected, pending]);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&rewritten)
+            .expect("open rewritten log")
+            .set_times(fs::FileTimes::new().set_modified(before.modified().expect("mtime")))
+            .expect("restore mtime");
+        let after = fs::metadata(&rewritten).expect("rewritten metadata");
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            after.modified().expect("mtime"),
+            before.modified().expect("mtime")
+        );
+
+        let rerun = sync_single_grok_file_at(&db, &path, now)?;
+        assert_eq!(rerun.imported, 1);
+        assert_eq!(rerun.deferred_files, 1);
+        assert_eq!(query_rows(&db)?[0].1, 150);
+
+        let settled = sync_single_grok_file_at(&db, &path, now + SETTLE_WINDOW_SECONDS)?;
+        assert_eq!(settled.imported, 1);
+        let rows = query_rows(&db)?;
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].0.contains(":idx0:"));
+        assert!(rows[1].0.contains(":idx1:"));
+        Ok(())
+    }
+
+    #[test]
+    fn append_preserves_imported_grok_fallback_ids() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let temp = tempdir().expect("tempdir");
+        let now = OLD_EPOCH + 2 * SETTLE_WINDOW_SECONDS;
+        let counters = model_counters("grok-4.5-build", 100, 10, 0, 1);
+        let first = usage_event_line(OLD_EPOCH, "", &counters);
+        let path = write_session_file(temp.path(), "sess-append", &[first]);
+        assert_eq!(sync_single_grok_file_at(&db, &path, now)?.imported, 1);
+
+        let modified = fs::metadata(&path)
+            .expect("file metadata")
+            .modified()
+            .expect("mtime");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open log for append");
+        writeln!(file, "{{}}").expect("append non-usage record");
+        let appended = usage_event_line(OLD_EPOCH + 1, "", &counters);
+        writeln!(file, "{appended}").expect("append usage record");
+        drop(file);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open updated log")
+            .set_times(
+                fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(2)),
+            )
+            .expect("advance log mtime");
+
+        GROK_PARSED_BYTES.with(|counter| counter.set(0));
+        let appended_result = sync_single_grok_file_at(&db, &path, now)?;
+        assert_eq!(appended_result.imported, 1);
+        assert_eq!(appended_result.skipped, 0);
+        GROK_PARSED_BYTES.with(|counter| assert_eq!(counter.get(), appended.len() + 2));
+        let rows = query_rows(&db)?;
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].0.contains(":idx0:"));
+        assert!(rows[1].0.contains(":idx1:"));
+        Ok(())
+    }
+
+    #[test]
+    fn settled_same_size_same_timestamp_rewrite_rechecks_grok_prefix() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let temp = tempdir().expect("tempdir");
+        let lines = |input| {
+            [
+                "{}".to_string(),
+                usage_event_line(
+                    OLD_EPOCH,
+                    "p1",
+                    &model_counters("grok-4.5-build", input, 10, 0, 1),
+                ),
+                "{}".to_string(),
+            ]
+        };
+        let path = write_session_file(temp.path(), "settled-rewrite", &lines(100));
+        assert_eq!(sync_single_grok_file(&db, &path)?.imported, 1);
+        let before = fs::metadata(&path).unwrap();
+
+        write_session_file(temp.path(), "settled-rewrite", &lines(150));
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
+            .unwrap();
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_eq!(sync_single_grok_file(&db, &path)?.imported, 1);
+        assert_eq!(query_rows(&db)?[0].1, 150);
+        Ok(())
+    }
+
+    #[test]
+    fn newer_longer_replacement_corrects_previously_imported_turn() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let temp = tempdir().expect("tempdir");
+        let mut lines = vec![usage_event_line(
+            OLD_EPOCH,
+            "p1",
+            &model_counters("grok-4.5-build", 100, 10, 0, 1),
+        )];
+        let path = write_session_file(temp.path(), "sess-replace", &lines);
+        assert_eq!(sync_single_grok_file(&db, &path)?.imported, 1);
+        let modified = fs::metadata(&path)
+            .expect("file metadata")
+            .modified()
+            .expect("mtime");
+
+        lines[0] = usage_event_line(
+            OLD_EPOCH,
+            "p1",
+            &model_counters("grok-4.5-build", 150, 10, 0, 1),
+        );
+        lines.push(usage_event_line(
+            OLD_EPOCH + 1,
+            "p2",
+            &model_counters("grok-4.5-build", 200, 20, 0, 1),
+        ));
+        let replacement = write_session_file(temp.path(), "replacement", &lines);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .expect("open replacement log")
+            .set_times(
+                fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(2)),
+            )
+            .expect("advance replacement mtime");
+        fs::rename(replacement, &path).expect("replace session log");
+
+        assert_eq!(sync_single_grok_file(&db, &path)?.imported, 2);
+        let rows = query_rows(&db)?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].1, rows[1].1), (150, 200));
         Ok(())
     }
 

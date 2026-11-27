@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::{
-    codex_multirouter::catalog::catalog_models,
+    codex_multirouter::catalog::provider_catalog_models,
     codex_multirouter::{compiler::compile_v2, schema::CodexRoutingDocument},
     provider::Provider,
     proxy::providers::{
@@ -27,7 +27,7 @@ pub fn compile_provider_probe_candidate(provider: &Provider) -> Result<ProbeCand
 pub fn compile_provider_probe_candidates(
     provider: &Provider,
 ) -> Result<Vec<ProbeCandidate>, String> {
-    let Some(catalog_models) = catalog_models(&provider.settings_config) else {
+    let Some(catalog_models) = provider_catalog_models(provider) else {
         return compile_provider_probe_candidate(provider).map(|candidate| vec![candidate]);
     };
 
@@ -132,7 +132,7 @@ pub fn compile_codex_router_probe_candidates(
 }
 
 fn resolve_primary_model(provider: &Provider, configured_model: &str) -> (String, String) {
-    let models = catalog_models(&provider.settings_config);
+    let models = provider_catalog_models(provider);
     if let Some(models) = models {
         for model in models {
             let Some(public_model) = string_field(model, &["model", "id", "slug"]) else {

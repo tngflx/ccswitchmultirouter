@@ -1,13 +1,17 @@
 use super::env_checker::EnvConflict;
-use chrono::Utc;
+use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 #[cfg(target_os = "windows")]
 use winreg::enums::*;
 #[cfg(target_os = "windows")]
 use winreg::RegKey;
+
+const ENV_BACKUP_TIME_FORMAT: &str = "%Y%m%d_%H%M%S";
+static ENV_BACKUP_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,18 +45,27 @@ pub fn delete_env_vars(conflicts: Vec<EnvConflict>) -> Result<BackupInfo, String
 
 /// Create backup file before deletion
 fn create_backup(conflicts: &[EnvConflict]) -> Result<BackupInfo, String> {
-    // Get backup directory
+    let _lock = ENV_BACKUP_LOCK
+        .lock()
+        .map_err(|_| "环境变量备份无法使用".to_string())?;
     let backup_dir = get_backup_dir()?;
     fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
 
-    // Generate backup file name with timestamp
-    let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
-    let backup_file = backup_dir.join(format!("env-backup-{timestamp}.json"));
+    let timestamp = Utc::now().format(ENV_BACKUP_TIME_FORMAT).to_string();
+    let mut backup_file = backup_dir.join(format!("env-backup-{timestamp}.json"));
+    let mut sequence = 1;
+    while backup_file
+        .try_exists()
+        .map_err(|e| format!("检查环境变量备份失败: {e}"))?
+    {
+        backup_file = backup_dir.join(format!("env-backup-{timestamp}_{sequence}.json"));
+        sequence += 1;
+    }
 
     // Create backup data
     let backup_info = BackupInfo {
         backup_path: backup_file.to_string_lossy().to_string(),
-        timestamp: timestamp.clone(),
+        timestamp,
         conflicts: conflicts.to_vec(),
     };
 
@@ -60,9 +73,53 @@ fn create_backup(conflicts: &[EnvConflict]) -> Result<BackupInfo, String> {
     let json = serde_json::to_string_pretty(&backup_info)
         .map_err(|e| format!("序列化备份数据失败: {e}"))?;
 
-    fs::write(&backup_file, json).map_err(|e| format!("写入备份文件失败: {e}"))?;
+    crate::config::atomic_write_private(&backup_file, json.as_bytes())
+        .map_err(|e| format!("写入备份文件失败: {e}"))?;
+
+    let retain = crate::settings::effective_backup_retain_count();
+    if let Err(error) = cleanup_env_backups(&backup_dir, &backup_file, retain) {
+        log::warn!("清理旧环境变量备份失败: {error}");
+    }
 
     Ok(backup_info)
+}
+
+fn env_backup_order(name: &str) -> Option<(NaiveDateTime, u32)> {
+    let id = name.strip_prefix("env-backup-")?.strip_suffix(".json")?;
+    let timestamp = NaiveDateTime::parse_from_str(id.get(..15)?, ENV_BACKUP_TIME_FORMAT).ok()?;
+    let sequence = match id.get(15..)? {
+        "" => 0,
+        suffix => {
+            let number = suffix.strip_prefix('_')?;
+            if number.starts_with('0') || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            number.parse().ok()?
+        }
+    };
+    Some((timestamp, sequence))
+}
+
+fn cleanup_env_backups(dir: &Path, current: &Path, retain: usize) -> std::io::Result<()> {
+    let mut entries = fs::read_dir(dir)?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            let order = env_backup_order(name.to_str()?)?;
+            let path = entry.path();
+            (path != current && entry.file_type().ok()?.is_file()).then_some((order, path))
+        })
+        .collect::<Vec<_>>();
+
+    entries.sort_unstable_by_key(|(order, _)| std::cmp::Reverse(*order));
+    // Reserve a slot for the backup just written, even if the clock moved backwards.
+    for (_, path) in entries.into_iter().skip(retain - 1) {
+        if let Err(error) = fs::remove_file(&path) {
+            log::warn!("删除旧环境变量备份 {} 失败: {error}", path.display());
+        }
+    }
+
+    Ok(())
 }
 
 /// Get backup directory path
@@ -236,5 +293,28 @@ mod tests {
     fn test_backup_dir_creation() {
         let backup_dir = get_backup_dir();
         assert!(backup_dir.is_ok());
+    }
+
+    #[test]
+    fn cleanup_env_backups_keeps_current_and_latest_previous_snapshot() {
+        let temp = tempfile::tempdir().expect("temporary backup directory");
+        let current = "env-backup-20240101_000000.json";
+        let newest_previous = "env-backup-20240102_000000_10.json";
+        let older = "env-backup-20240102_000000_9.json";
+        let other_json = "env-backup-manual.json";
+        let other_dir = "env-backup-20230101_000000.json";
+        for name in [newest_previous, older, current, other_json] {
+            fs::write(temp.path().join(name), "{}").expect("write backup fixture");
+        }
+        fs::create_dir(temp.path().join(other_dir)).expect("create unrelated directory");
+
+        cleanup_env_backups(temp.path(), &temp.path().join(current), 2)
+            .expect("cleanup environment backups");
+
+        assert!(temp.path().join(current).is_file());
+        assert!(temp.path().join(newest_previous).is_file());
+        assert!(!temp.path().join(older).exists());
+        assert!(temp.path().join(other_json).is_file());
+        assert!(temp.path().join(other_dir).is_dir());
     }
 }

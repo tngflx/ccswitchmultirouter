@@ -287,21 +287,19 @@ pub fn validate_v2(
                     "include selection contains duplicate or empty models",
                 );
             }
+            if route.aliases.is_empty() {
+                continue;
+            }
+            let allowed = providers
+                .get(route.target_provider_id.trim())
+                .map(|provider| allowed_alias_targets(provider, &selected));
             for target in route.aliases.values() {
-                let Some(provider) = providers.get(route.target_provider_id.trim()) else {
-                    if !selected.contains(target.trim()) {
-                        push_issue(
-                            &mut issues,
-                            "alias_target_not_selected",
-                            Some(route.id.clone()),
-                            "alias target is outside the include selection",
-                        );
-                    }
-                    continue;
+                let target = target.trim();
+                let is_selected = match &allowed {
+                    Some(allowed) => allowed.contains(&target.to_ascii_lowercase()),
+                    None => selected.contains(target),
                 };
-                if !selected.iter().any(|selected_model| {
-                    provider_models_equivalent(provider, selected_model, target)
-                }) {
+                if !is_selected {
                     push_issue(
                         &mut issues,
                         "alias_target_not_selected",
@@ -335,28 +333,30 @@ pub fn validate_v2(
     }
 }
 
-fn provider_models_equivalent(provider: &Provider, left: &str, right: &str) -> bool {
-    let left = left.trim().to_ascii_lowercase();
-    let right = right.trim().to_ascii_lowercase();
-    if left.is_empty() || right.is_empty() {
-        return false;
+fn allowed_alias_targets(provider: &Provider, selected: &HashSet<&str>) -> HashSet<String> {
+    let selected = selected
+        .iter()
+        .map(|model| model.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut allowed = selected.clone();
+    for model in catalog_models(&provider.settings_config).unwrap_or_default() {
+        let identities = ["model", "upstreamModel", "upstream_model"].map(|field| {
+            model
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_ascii_lowercase)
+        });
+        if identities
+            .iter()
+            .flatten()
+            .any(|identity| selected.contains(identity))
+        {
+            allowed.extend(identities.into_iter().flatten());
+        }
     }
-    if left == right {
-        return true;
-    }
-    let Some(models) = catalog_models(&provider.settings_config) else {
-        return false;
-    };
-    models.iter().any(|model| {
-        let identities = ["model", "upstreamModel", "upstream_model"]
-            .into_iter()
-            .filter_map(|field| model.get(field).and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_ascii_lowercase)
-            .collect::<HashSet<_>>();
-        identities.contains(&left) && identities.contains(&right)
-    })
+    allowed
 }
 
 fn push_issue(

@@ -1,4 +1,5 @@
 use bytes::{Buf, Bytes, BytesMut};
+use std::borrow::Cow;
 
 // Count wire bytes, including the blank-line delimiter. A stream may deliver
 // arbitrarily many frames, but the decoder never retains more than one frame.
@@ -11,11 +12,27 @@ pub(crate) enum SseFrame {
 
 pub(crate) struct BoundedSseFrames {
     pending: BytesMut,
-    tail: u32,
+    delimiter: SseDelimiter,
     discarding: bool,
     limit: usize,
     #[cfg(test)]
     scanned_bytes: usize,
+}
+
+#[derive(Default)]
+struct SseDelimiter(u32);
+
+impl SseDelimiter {
+    fn push(&mut self, byte: u8) -> Option<usize> {
+        self.0 = (self.0 << 8) | u32::from(byte);
+        if self.0 & 0xffff == 0x0a0a {
+            Some(2)
+        } else if self.0 == 0x0d0a0d0a {
+            Some(4)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,7 +168,7 @@ impl BoundedSseFrames {
     fn new(limit: usize) -> Self {
         Self {
             pending: BytesMut::new(),
-            tail: 0,
+            delimiter: SseDelimiter::default(),
             discarding: false,
             limit,
             #[cfg(test)]
@@ -169,11 +186,10 @@ impl BoundedSseFrames {
             {
                 self.scanned_bytes += 1;
             }
-            self.tail = (self.tail << 8) | u32::from(byte);
-            let end_of_frame = self.tail & 0xffff == 0x0a0a || self.tail == 0x0d0a0d0a;
+            let end_of_frame = self.delimiter.push(byte).is_some();
             if self.discarding {
                 if end_of_frame {
-                    self.tail = 0;
+                    self.delimiter = SseDelimiter::default();
                     self.discarding = false;
                     start = index + 1;
                 }
@@ -184,7 +200,7 @@ impl BoundedSseFrames {
                 self.pending = BytesMut::new();
                 self.discarding = !end_of_frame;
                 if end_of_frame {
-                    self.tail = 0;
+                    self.delimiter = SseDelimiter::default();
                 }
                 *input = &bytes[index + 1..];
                 return Some(SseFrame::Oversized);
@@ -192,7 +208,7 @@ impl BoundedSseFrames {
 
             if end_of_frame {
                 self.pending.extend_from_slice(&bytes[start..=index]);
-                self.tail = 0;
+                self.delimiter = SseDelimiter::default();
                 *input = &bytes[index + 1..];
                 return Some(SseFrame::Complete(self.take_pending()));
             }
@@ -215,22 +231,96 @@ pub(crate) fn strip_sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str>
     Some(value.strip_prefix(' ').unwrap_or(value))
 }
 
-#[inline]
-pub(crate) fn take_sse_block(buffer: &mut String) -> Option<String> {
-    let mut best: Option<(usize, usize)> = None;
+/// Frames live SSE text without rescanning an unfinished event on each chunk.
+/// Delimiters are ASCII, so UTF-8 decoding can wait until the full block arrives.
+#[derive(Default)]
+pub(crate) struct TextSseFrames {
+    buffer: BytesMut,
+    block_start: usize,
+    scan_offset: usize,
+    delimiter: SseDelimiter,
+    #[cfg(test)]
+    scanned_bytes: usize,
+}
 
-    for (delimiter, len) in [("\r\n\r\n", 4usize), ("\n\n", 2usize)] {
-        if let Some(pos) = buffer.find(delimiter) {
-            if best.is_none_or(|(best_pos, _)| pos < best_pos) {
-                best = Some((pos, len));
+impl TextSseFrames {
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        self.buffer.advance(self.block_start);
+        self.scan_offset -= self.block_start;
+        self.block_start = 0;
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    pub(crate) fn next_block(&mut self) -> Option<Cow<'_, str>> {
+        for &byte in &self.buffer[self.scan_offset..] {
+            self.scan_offset += 1;
+            #[cfg(test)]
+            {
+                self.scanned_bytes += 1;
             }
+            if let Some(delimiter_len) = self.delimiter.push(byte) {
+                let block = &self.buffer[self.block_start..self.scan_offset - delimiter_len];
+                self.block_start = self.scan_offset;
+                self.delimiter = SseDelimiter::default();
+                return Some(String::from_utf8_lossy(block));
+            }
+        }
+        None
+    }
+
+    pub(crate) fn tail(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.buffer[self.block_start..])
+    }
+}
+
+/// Splits a complete SSE body into borrowed blocks and preserves any unterminated tail.
+pub(crate) struct SseBlocks<'a> {
+    remaining: &'a str,
+    finished: bool,
+    #[cfg(test)]
+    scanned_bytes: usize,
+}
+
+impl<'a> SseBlocks<'a> {
+    pub(crate) fn new(body: &'a str) -> Self {
+        Self {
+            remaining: body,
+            finished: false,
+            #[cfg(test)]
+            scanned_bytes: 0,
         }
     }
 
-    let (pos, len) = best?;
-    let block = buffer[..pos].to_string();
-    buffer.drain(..pos + len);
-    Some(block)
+    pub(crate) fn remaining(&self) -> &'a str {
+        self.remaining
+    }
+}
+
+impl<'a> Iterator for SseBlocks<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let bytes = self.remaining.as_bytes();
+        for (index, &byte) in bytes.iter().enumerate() {
+            #[cfg(test)]
+            {
+                self.scanned_bytes += 1;
+            }
+            let delimiter_len = match byte {
+                b'\n' if bytes[index..].starts_with(b"\n\n") => 2,
+                b'\r' if bytes[index..].starts_with(b"\r\n\r\n") => 4,
+                _ => continue,
+            };
+            let block = &self.remaining[..index];
+            self.remaining = &self.remaining[index + delimiter_len..];
+            return Some(block);
+        }
+        self.finished = true;
+        None
+    }
 }
 
 /// Append raw bytes to a UTF-8 `String` buffer, correctly handling multi-byte
@@ -299,8 +389,8 @@ pub(crate) fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, new
 #[cfg(test)]
 mod tests {
     use super::{
-        append_utf8_safe, strip_sse_field, take_sse_block, BoundedSseFrames, SseFrame,
-        SseOrJsonFrames, SseOrJsonItem,
+        append_utf8_safe, strip_sse_field, BoundedSseFrames, SseBlocks, SseFrame, SseOrJsonFrames,
+        SseOrJsonItem, TextSseFrames,
     };
 
     #[test]
@@ -434,25 +524,83 @@ mod tests {
     }
 
     #[test]
-    fn take_sse_block_supports_lf_delimiters() {
-        let mut buffer = "data: {\"ok\":true}\n\nrest".to_string();
-
-        assert_eq!(
-            take_sse_block(&mut buffer),
-            Some("data: {\"ok\":true}".to_string())
-        );
-        assert_eq!(buffer, "rest");
+    fn text_sse_frames_keep_unconsumed_blocks_between_pushes() {
+        let mut frames = TextSseFrames::default();
+        frames.push(b"data: first\r\n\r\ndata: \xe2\x82\n\n");
+        assert_eq!(frames.next_block().as_deref(), Some("data: first"));
+        frames.push(b"data: third\r\n\r");
+        assert_eq!(frames.next_block().as_deref(), Some("data: \u{fffd}"));
+        assert!(frames.next_block().is_none());
+        frames.push(b"\nrest\xf0\x9f");
+        assert_eq!(frames.next_block().as_deref(), Some("data: third"));
+        assert!(frames.next_block().is_none());
+        assert_eq!(frames.tail(), "rest\u{fffd}");
     }
 
     #[test]
-    fn take_sse_block_supports_crlf_delimiters() {
-        let mut buffer = "data: {\"ok\":true}\r\n\r\nrest".to_string();
+    fn text_sse_frames_scan_each_wire_byte_once_across_fragment_sizes() {
+        let frame = "data: café";
+        let tail = "data: unterminated";
+        for (frame_count, large_frame_size) in [(2, 32), (10_000, 64 * 1024)] {
+            let large_frame = format!("data: {}🙂", "x".repeat(large_frame_size));
+            let mut wire = format!("{large_frame}\r\n\r\n");
+            for index in 0..frame_count {
+                wire.push_str(frame);
+                wire.push_str(if index % 2 == 0 { "\n\n" } else { "\r\n\r\n" });
+            }
+            wire.push_str(tail);
 
-        assert_eq!(
-            take_sse_block(&mut buffer),
-            Some("data: {\"ok\":true}".to_string())
-        );
-        assert_eq!(buffer, "rest");
+            for chunk_size in [1, 63, wire.len()] {
+                let mut reader = TextSseFrames::default();
+                let mut seen = 0;
+                for chunk in wire.as_bytes().chunks(chunk_size) {
+                    reader.push(chunk);
+                    while let Some(block) = reader.next_block() {
+                        let expected = if seen == 0 {
+                            large_frame.as_str()
+                        } else {
+                            frame
+                        };
+                        assert_eq!(block, expected);
+                        seen += 1;
+                    }
+                    let scanned_bytes = reader.scanned_bytes;
+                    for _ in 0..3 {
+                        assert!(reader.next_block().is_none());
+                    }
+                    assert_eq!(reader.scanned_bytes, scanned_bytes);
+                }
+                assert_eq!(seen, frame_count + 1);
+                assert_eq!(reader.scanned_bytes, wire.len());
+                assert_eq!(reader.tail(), tail);
+            }
+        }
+    }
+
+    #[test]
+    fn complete_sse_blocks_scan_each_frame_once() {
+        let frame = "data: café";
+        let tail = "data: unterminated";
+        for frame_count in [2, 10_000] {
+            let mut body = String::new();
+            for index in 0..frame_count {
+                body.push_str(frame);
+                body.push_str(if index % 2 == 0 { "\n\n" } else { "\r\n\r\n" });
+            }
+            body.push_str(tail);
+            let mut blocks = SseBlocks::new(&body);
+            for _ in 0..frame_count {
+                assert_eq!(blocks.next(), Some(frame));
+            }
+            for _ in 0..3 {
+                assert_eq!(blocks.next(), None);
+                assert_eq!(blocks.remaining(), tail);
+                assert_eq!(
+                    blocks.scanned_bytes,
+                    frame_count * (frame.len() + 1) + tail.len()
+                );
+            }
+        }
     }
 
     // ------------------------------------------------------------------

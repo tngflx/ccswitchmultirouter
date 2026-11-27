@@ -294,20 +294,16 @@ const codexOwnerRemoteTurnSignature = (turn) =>
         codexOwnerRemoteFailureCategory(turn)?.category || "none",
       ])
     : "empty";
-const codexOwnerRemoteReadPage = (response, key, limit) => {
+const codexOwnerRemoteReadPage = (
+  response,
+  key,
+  limit,
+  { allowMissingCursor = false } = {},
+) => {
   const values = codexOwnerRemoteOwnData(response, key);
   const length = codexOwnerRemoteArrayLength(values);
-  const nextCursor = codexOwnerRemoteOwnData(response, "nextCursor");
-  if (
-    length === null ||
-    length > limit ||
-    (nextCursor !== null &&
-      !(
-        typeof nextCursor === "string" &&
-        nextCursor.length > 0 &&
-        nextCursor.length <= 4096
-      ))
-  )
+  const nextCursor = codexContinuationPageCursor(response, allowMissingCursor);
+  if (length === null || length > limit || nextCursor === undefined)
     throw new Error("owner_remote_unbounded_history");
   return { values, length, truncated: nextCursor !== null };
 };

@@ -979,38 +979,49 @@ describe("Model order real drag sensors", () => {
       },
     );
 
-    it("does not repeat full mutation-context serialization for drag or unrelated parent renders", async () => {
-      const { plan, initialElement, rendered } = renderModelOrder();
-      await waitFor(() =>
-        expect(
-          codexSubagentV2Api.resolveModelReasoningCapability,
-        ).toHaveBeenCalled(),
-      );
-      const serialization = vi.spyOn(JSON, "stringify");
-      try {
-        await userEvent.click(
-          screen.getByRole("button", {
-            name: "Make order-b the favorite model",
-          }),
+    it.each([0, 32_768])(
+      "preserves the draft across equivalent provider refreshes without serializing %i extra catalog bytes",
+      async (extraBytes) => {
+        const { source, plan, elementFor, rendered } = renderModelOrder({
+          sourceSettings: { extra: "x".repeat(extraBytes) },
+        });
+        await waitFor(() =>
+          expect(
+            codexSubagentV2Api.resolveModelReasoningCapability,
+          ).toHaveBeenCalled(),
         );
-        rendered.rerenderWorkspace(
-          React.cloneElement(initialElement, { isProxyRunning: false }),
-        );
-        const fullContexts = serialization.mock.calls.filter(
-          ([value]) =>
-            Array.isArray(value) &&
-            value.length === 3 &&
-            value[0]?.id === plan.id &&
-            Array.isArray(value[1]?.models) &&
-            Array.isArray(value[2]) &&
-            Array.isArray(value[2][0]) &&
-            value[2][0][0]?.targetProviderId,
-        );
-        expect(fullContexts).toHaveLength(0);
-      } finally {
-        serialization.mockRestore();
-      }
-    });
+        const serialization = vi.spyOn(JSON, "stringify");
+        try {
+          await userEvent.click(
+            screen.getByRole("button", {
+              name: "Make order-b the favorite model",
+            }),
+          );
+          for (let index = 0; index < 3; index += 1) {
+            rendered.rerenderWorkspace(
+              elementFor([
+                { ...source, settingsConfig: { ...source.settingsConfig } },
+                { ...plan, settingsConfig: { ...plan.settingsConfig } },
+              ]),
+            );
+          }
+          const serializedSnapshots = serialization.mock.calls.filter(
+            ([value]) =>
+              value?.id === plan.id ||
+              value?.id === source.id ||
+              (typeof value?.model === "string" &&
+                value.model.startsWith("order-")) ||
+              (Array.isArray(value) &&
+                value[0]?.id === plan.id &&
+                Array.isArray(value[1]?.models)),
+          );
+          expect(serializedSnapshots).toHaveLength(0);
+          expect(modelOrder()).toEqual(["order-b", "order-a", "order-c"]);
+        } finally {
+          serialization.mockRestore();
+        }
+      },
+    );
 
     it("uses the canonical provider snapshot as a compare-and-set precondition", async () => {
       const { plan } = renderModelOrder();
@@ -1077,6 +1088,15 @@ describe("Model order real drag sensors", () => {
 
       const [[submitted]] = vi.mocked(providersApi.update).mock.calls;
       expect(submitted.name).toBe("Renamed order plan");
+      const { settingsConfig, ...providerFields } = plan;
+      const samePlanWithReorderedFields = { settingsConfig, ...providerFields };
+      rendered.rerenderWorkspace(
+        elementFor([source, samePlanWithReorderedFields]),
+      );
+      expect(
+        screen.getByText("Renamed order plan", { selector: "div" }),
+      ).toBeInTheDocument();
+
       const persisted: Provider = {
         ...submitted,
         settingsConfig: {

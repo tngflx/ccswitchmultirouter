@@ -166,6 +166,7 @@ import {
 import {
   isCompleteCodexCatalogFetch,
   isExplicitCodexReasoningCapability,
+  jsonValuesEqual,
   reconcileFetchedCodexCatalogRows,
 } from "@/lib/codexCatalogReconciliation";
 import {
@@ -3384,19 +3385,21 @@ export function CodexRouterWorkspacePage({
     }
   }
 
+  const persistedProvidersById = useMemo(
+    () => new Map(providers.map((provider) => [provider.id, provider])),
+    [providers],
+  );
   const optimisticRoutingPlan = useMemo(() => {
     if (!routingPlanOverlay) return null;
     const { provider, baseline } = routingPlanOverlay;
-    const persisted =
-      providers.find((entry) => entry.id === provider.id) ?? null;
+    const persisted = persistedProvidersById.get(provider.id) ?? null;
     // Never let an optimistic edit mask a newer persisted router, including
     // a normalized readback that differs from the submitted provider.
-    const snapshot = JSON.stringify(persisted);
-    return snapshot === JSON.stringify(baseline) &&
-      snapshot !== JSON.stringify(provider)
+    return jsonValuesEqual(persisted, baseline) &&
+      !jsonValuesEqual(persisted, provider)
       ? provider
       : null;
-  }, [providers, routingPlanOverlay]);
+  }, [persistedProvidersById, routingPlanOverlay]);
 
   const effectiveProviders = useMemo(() => {
     const optimisticSourceEntries = Object.entries(optimisticModelSourcesById);
@@ -3410,19 +3413,21 @@ export function CodexRouterWorkspacePage({
       // This is a projection over the parent snapshot, not another source of
       // truth. A newer saved provider must win immediately, including the render
       // before the cleanup effect removes this temporary overlay.
-      return optimistic &&
-        JSON.stringify(provider) === JSON.stringify(optimistic.baseline)
+      return optimistic && jsonValuesEqual(provider, optimistic.baseline)
         ? optimistic.provider
         : provider;
     });
     if (!optimisticRoutingPlan) return replaced;
-    const withRoutingPlan = providers.some(
-      (provider) => provider.id === optimisticRoutingPlan.id,
-    )
+    const withRoutingPlan = persistedProvidersById.has(optimisticRoutingPlan.id)
       ? replaced
       : [...providers, optimisticRoutingPlan];
     return withRoutingPlan;
-  }, [optimisticModelSourcesById, optimisticRoutingPlan, providers]);
+  }, [
+    optimisticModelSourcesById,
+    optimisticRoutingPlan,
+    persistedProvidersById,
+    providers,
+  ]);
   const routingPlans = useMemo(
     () => effectiveProviders.filter(isRoutingPlan),
     [effectiveProviders],
@@ -3440,16 +3445,12 @@ export function CodexRouterWorkspacePage({
       new Map(effectiveProviders.map((provider) => [provider.id, provider])),
     [effectiveProviders],
   );
-  const committedModelSourceProvidersRef = useRef(
-    new Map(providers.map((provider) => [provider.id, provider])),
-  );
+  const committedModelSourceProvidersRef = useRef(persistedProvidersById);
   useLayoutEffect(() => {
     // Promise handlers may finish after a same-key edit has been committed.
     // Read canonical parent state at completion instead of the launch closure.
-    committedModelSourceProvidersRef.current = new Map(
-      providers.map((provider) => [provider.id, provider]),
-    );
-  }, [providers]);
+    committedModelSourceProvidersRef.current = persistedProvidersById;
+  }, [persistedProvidersById]);
   // 模型刷新目标必须来自当前方案的启用 route；旧 inline route 仅做语义定位，
   // 不能因缺少 targetProviderId 退回到刷新全部候选 Provider。
   const selectedPlanForModelRefresh =
@@ -3607,10 +3608,8 @@ export function CodexRouterWorkspacePage({
           );
           if (
             !currentProvider ||
-            (JSON.stringify(currentProvider) !==
-              JSON.stringify(result.baselineProvider) &&
-              JSON.stringify(currentProvider) !==
-                JSON.stringify(result.nextProvider))
+            (!jsonValuesEqual(currentProvider, result.baselineProvider) &&
+              !jsonValuesEqual(currentProvider, result.nextProvider))
           ) {
             // A later canonical save already superseded this completed write.
             setProviderModelRefreshStates((current) => ({
@@ -3780,19 +3779,10 @@ export function CodexRouterWorkspacePage({
       let changed = false;
       const next = { ...current };
       for (const [providerId, optimistic] of Object.entries(current)) {
-        const persistedProvider = providers.find(
-          (provider) => provider.id === providerId,
-        );
-        if (!persistedProvider) {
-          delete next[providerId];
-          changed = true;
-          continue;
-        }
-
-        const persistedSnapshot = JSON.stringify(persistedProvider);
+        const persistedProvider = persistedProvidersById.get(providerId);
         if (
-          persistedSnapshot !== JSON.stringify(optimistic.baseline) ||
-          persistedSnapshot === JSON.stringify(optimistic.provider)
+          !jsonValuesEqual(persistedProvider, optimistic.baseline) ||
+          jsonValuesEqual(persistedProvider, optimistic.provider)
         ) {
           delete next[providerId];
           changed = true;
@@ -3800,7 +3790,7 @@ export function CodexRouterWorkspacePage({
       }
       return changed ? next : current;
     });
-  }, [providers]);
+  }, [persistedProvidersById]);
 
   /// 新建 MultiRouter 直接创建带 codexRouting 的工作台 provider，不再打开普通供应商表单。
   async function handleCreatePlan() {
@@ -5336,19 +5326,22 @@ export function ModelOrderTab({
     setMessage(null);
     setError(null);
   }, []);
-  const operationContextKey = useMemo(
-    () =>
-      JSON.stringify([
-        selectedPlan,
-        catalog,
-        selectedRoutes.map(({ route }) => [
-          route,
-          providersById.get(routeTargetProviderId(route) ?? ""),
-        ]),
+  const operationContext = useMemo(
+    () => [
+      selectedPlan,
+      catalog,
+      selectedRoutes.map(({ route }) => [
+        route,
+        providersById.get(routeTargetProviderId(route) ?? ""),
       ]),
+    ],
     [selectedPlan, catalog, selectedRoutes, providersById],
   );
+  const previousOperationContext = useRef<typeof operationContext>();
   useLayoutEffect(() => {
+    const previous = previousOperationContext.current;
+    previousOperationContext.current = operationContext;
+    if (jsonValuesEqual(previous, operationContext)) return;
     // Invalidate in-flight work on any snapshot change. Feedback about a
     // completed write stays visible when its own router is refreshed.
     operationGenerationRef.current += 1;
@@ -5356,7 +5349,7 @@ export function ModelOrderTab({
     setIsSaving(false);
     setPendingRank(null);
     if (savedOrderFeedbackRouter.current !== selectedPlanId) clearFeedback();
-  }, [operationContextKey, selectedPlanId, clearFeedback]);
+  }, [operationContext, selectedPlanId, clearFeedback]);
   useLayoutEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -5401,10 +5394,6 @@ export function ModelOrderTab({
       coordinateGetter: sortableKeyboardCoordinates,
     }),
   );
-  const catalogKey = [
-    catalog.displayNameStyle ?? "",
-    ...catalog.models.map((model) => JSON.stringify(model)),
-  ].join("\n");
   const persistedModelOrder = useMemo<string[]>(() => {
     const order = selectedPlan?.settingsConfig?.codexRouting?.modelOrder;
     return Array.isArray(order)
@@ -5414,19 +5403,24 @@ export function ModelOrderTab({
         )
       : [];
   }, [selectedPlan?.settingsConfig?.codexRouting?.modelOrder]);
-  const defaultModels = useMemo(
+  const unorderedRouteModels = useMemo(
     () =>
       selectedPlan
-        ? defaultCodexCatalogModelOrder(
-            buildModelCatalogForRoutes(
-              selectedPlan,
-              selectedRoutes.map(({ route }) => route),
-              providersById,
-              { ignorePersistedModelOrder: true },
-            ).models,
-          )
-        : [],
+        ? buildModelCatalogForRoutes(
+            selectedPlan,
+            selectedRoutes.map(({ route }) => route),
+            providersById,
+            { ignorePersistedModelOrder: true },
+          ).models
+        : undefined,
     [selectedPlan, selectedRoutes, providersById],
+  );
+  const defaultModels = useMemo(
+    () =>
+      unorderedRouteModels
+        ? defaultCodexCatalogModelOrder(unorderedRouteModels)
+        : [],
+    [unorderedRouteModels],
   );
   const providerNamesByModel = useMemo(() => {
     const names = new Map<string, string>();
@@ -5447,18 +5441,7 @@ export function ModelOrderTab({
     }
     return names;
   }, [selectedRoutes, providersById]);
-  const providerGroupReference = useMemo(
-    () =>
-      selectedPlan
-        ? buildModelCatalogForRoutes(
-            selectedPlan,
-            selectedRoutes.map(({ route }) => route),
-            providersById,
-            { ignorePersistedModelOrder: true },
-          ).models
-        : catalog.models,
-    [selectedPlan, selectedRoutes, providersById, catalogKey],
-  );
+  const providerGroupReference = unorderedRouteModels ?? catalog.models;
   const orderedDraftModels = useMemo(
     () =>
       groupCodexCatalogModelsByProvider(
@@ -5583,19 +5566,41 @@ export function ModelOrderTab({
   const hasChanges =
     styleDirty ||
     effortDirty ||
-    modelsWithPendingRank.map((model) => model.model).join("\n") !==
-      catalog.models.map((model) => model.model).join("\n");
+    modelsWithPendingRank.length !== catalog.models.length ||
+    modelsWithPendingRank.some(
+      (model, index) => model.model !== catalog.models[index].model,
+    );
 
+  const modelOrderDraftContext = useMemo(
+    () => ({
+      planId: selectedPlanId,
+      displayNameStyle: catalog.displayNameStyle,
+      models: catalog.models,
+      defaultReasoningEffort: configuredDefaultReasoningEffort,
+    }),
+    [
+      selectedPlanId,
+      catalog.displayNameStyle,
+      catalog.models,
+      configuredDefaultReasoningEffort,
+    ],
+  );
+  const previousModelOrderDraftContext =
+    useRef<typeof modelOrderDraftContext>();
   useEffect(() => {
+    const previous = previousModelOrderDraftContext.current;
+    previousModelOrderDraftContext.current = modelOrderDraftContext;
+    if (jsonValuesEqual(previous, modelOrderDraftContext)) return;
     recommendationRequest.current += 1;
     setIsRecommending(false);
     setRecommendationUsage(undefined);
     setSortMode("custom");
     setDisplayStyle(
-      catalog.displayNameStyle ?? DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
+      modelOrderDraftContext.displayNameStyle ??
+        DEFAULT_CODEX_MODEL_DISPLAY_STYLE,
     );
     setDraftModels(
-      catalog.models
+      modelOrderDraftContext.models
         .slice()
         .sort(
           (left, right) =>
@@ -5603,8 +5608,8 @@ export function ModelOrderTab({
             (right.sortIndex ?? Number.MAX_SAFE_INTEGER),
         ),
     );
-    setDefaultReasoningEffort(configuredDefaultReasoningEffort);
-  }, [selectedPlan?.id, catalogKey, configuredDefaultReasoningEffort]);
+    setDefaultReasoningEffort(modelOrderDraftContext.defaultReasoningEffort);
+  }, [modelOrderDraftContext]);
 
   useEffect(
     () => () => {
@@ -8173,16 +8178,20 @@ function SpawnAgentCandidatesPanel({
   const mountedRef = useRef(true);
   const operationTokenRef = useRef<symbol | null>(null);
   const operationGenerationRef = useRef(0);
-  const operationContextKey = useMemo(
-    () => JSON.stringify([selectedPlan?.settingsConfig, catalog]),
-    [selectedPlan?.settingsConfig, catalog],
+  const operationContext = useMemo(
+    () => [selectedPlan?.id, selectedPlan?.settingsConfig, catalog],
+    [selectedPlan?.id, selectedPlan?.settingsConfig, catalog],
   );
+  const previousOperationContext = useRef<typeof operationContext>();
   useLayoutEffect(() => {
+    const previous = previousOperationContext.current;
+    previousOperationContext.current = operationContext;
+    if (jsonValuesEqual(previous, operationContext)) return;
     // External updates to the same plan also invalidate diagnostics and UI
     // completions based on an older canonical snapshot.
     operationGenerationRef.current += 1;
     setDiagnostics(null);
-  }, [operationContextKey]);
+  }, [operationContext]);
   const [activeOperation, setActiveOperation] = useState<
     "candidates" | "protocol" | "reasoning" | "profiles" | "validation" | null
   >(null);

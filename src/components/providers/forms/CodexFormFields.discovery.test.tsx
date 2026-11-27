@@ -10,7 +10,6 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import type { CodexCatalogModel } from "@/types";
-import type { CodexModelReasoningResolution } from "@/types/codexSubagentV2";
 import { codexProviderPresets } from "@/config/codexProviderPresets";
 import { providersApi } from "@/lib/api/providers";
 import {
@@ -21,10 +20,8 @@ import {
   showFetchModelsError,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
-import {
-  CodexFormFields,
-  resolveCodexReasoningCapabilities,
-} from "./CodexFormFields";
+import { CodexFormFields } from "./CodexFormFields";
+import { CodexCatalogSyncReview } from "./CodexCatalogSyncReview";
 import type { CodexProviderReadinessSection } from "./CodexProviderReadinessSection";
 
 type ReadinessProps = ComponentProps<typeof CodexProviderReadinessSection>;
@@ -152,37 +149,6 @@ describe("Codex form discovery request ownership", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     view.readiness = null;
-  });
-
-  it("limits visible reasoning lookups to six concurrent requests", async () => {
-    const pending = new Map<string, () => void>();
-    let active = 0;
-    let maximumActive = 0;
-    const lookup = vi.fn((model: string) => {
-      active += 1;
-      maximumActive = Math.max(maximumActive, active);
-      return new Promise<CodexModelReasoningResolution>((resolve) => {
-        pending.set(model, () => {
-          active -= 1;
-          resolve({ model } as CodexModelReasoningResolution);
-        });
-      });
-    });
-    const models = Array.from({ length: 10 }, (_, index) => `model-${index}`);
-    const resolving = resolveCodexReasoningCapabilities(models, lookup);
-
-    await vi.waitFor(() => expect(lookup).toHaveBeenCalledTimes(6));
-    expect(maximumActive).toBe(6);
-    for (let index = 0; index < 6; index += 1) {
-      pending.get(`model-${index}`)?.();
-    }
-    await vi.waitFor(() => expect(lookup).toHaveBeenCalledTimes(10));
-    expect(maximumActive).toBe(6);
-    for (let index = 6; index < 10; index += 1) {
-      pending.get(`model-${index}`)?.();
-    }
-    await resolving;
-    expect(lookup).toHaveBeenCalledTimes(10);
   });
 
   it.each([
@@ -453,6 +419,74 @@ describe("Codex form discovery lifecycle", () => {
 
 describe("Codex API-key model sync review", () => {
   beforeEach(() => vi.resetAllMocks());
+
+  it("keeps Apply to draft enabled for a replaceable conflict without missing rows", () => {
+    const onApply = vi.fn();
+    render(
+      <CodexCatalogSyncReview
+        fetchedCount={1}
+        addedModels={[]}
+        conflictingModels={[{ model: "model-alias", canReplace: true }]}
+        missingModels={[]}
+        enabledMissingCount={0}
+        hasMetadataChanges={false}
+        coverage="complete"
+        onApply={onApply}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    const apply = screen.getByRole("button", { name: "Apply to draft" });
+    expect(apply).toBeEnabled();
+
+    fireEvent.click(apply);
+    expect(onApply).toHaveBeenCalledWith("replace", false);
+  });
+
+  it("keeps Replace selectable when a replaceable conflict has another sync change", () => {
+    const onApply = vi.fn();
+    render(
+      <CodexCatalogSyncReview
+        fetchedCount={2}
+        addedModels={["new-model"]}
+        conflictingModels={[{ model: "model-alias", canReplace: true }]}
+        missingModels={[]}
+        enabledMissingCount={0}
+        hasMetadataChanges={false}
+        coverage="complete"
+        onApply={onApply}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    const replace = screen.getByRole("radio", { name: /replace catalog/i });
+    fireEvent.click(replace);
+    expect(replace).toBeChecked();
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply to draft" }));
+    expect(onApply).toHaveBeenCalledWith("replace", false);
+  });
+
+  it("does not offer replacement for a partial key-group sync", () => {
+    render(
+      <CodexCatalogSyncReview
+        fetchedCount={1}
+        addedModels={[]}
+        conflictingModels={[{ model: "model-alias", canReplace: true }]}
+        missingModels={[]}
+        enabledMissingCount={0}
+        hasMetadataChanges={false}
+        coverage="key-groups"
+        onApply={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("radio", { name: /replace catalog/i }),
+    ).toBeNull();
+    expect(screen.queryByRole("button", { name: "Apply to draft" })).toBeNull();
+  });
 
   it("previews new and missing rows before replacing the catalog", async () => {
     vi.mocked(fetchModelsForConfig).mockResolvedValue([
@@ -770,6 +804,76 @@ describe("Codex API-key model sync review", () => {
     ).toBeNull();
     expect(props.onCatalogModelsChange).not.toHaveBeenCalled();
     expect(catalogModelIds()).toEqual(["wire-old"]);
+  });
+
+  it.each([2, 512])(
+    "reuses the emitted draft rows when the parent echoes a %i-model catalog",
+    async (modelCount) => {
+      const catalogModels = Array.from({ length: modelCount }, (_, index) => ({
+        model: `existing-${index}`,
+      }));
+      vi.mocked(fetchModelsForConfig).mockResolvedValue([
+        ...catalogModels.map(({ model }) => ({ id: model, ownedBy: null })),
+        ...response,
+      ]);
+      const onCatalogModelsChange =
+        vi.fn<(models: CodexCatalogModel[]) => void>();
+      const props = formProps({ catalogModels, onCatalogModelsChange });
+      const { rerender } = render(<CodexFormFields {...props} />);
+      act(() => readiness().onSyncModels());
+      const review = await findModelSyncReview();
+      fireEvent.click(review.getByRole("button", { name: "Apply to draft" }));
+      expect(onCatalogModelsChange).toHaveBeenCalledOnce();
+      const [emittedModels] = onCatalogModelsChange.mock.calls[0];
+      expect(emittedModels).toHaveLength(modelCount + 1);
+
+      const createRowId = vi.spyOn(crypto, "randomUUID");
+      rerender(<CodexFormFields {...props} catalogModels={emittedModels} />);
+
+      expect(createRowId).not.toHaveBeenCalled();
+      expect(onCatalogModelsChange).toHaveBeenCalledOnce();
+      expect(catalogModelIds()).toContain("wire-new");
+    },
+  );
+
+  it("applies replacement to newer draft rows while the review is open", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue([
+      { id: "wire-shared", ownedBy: null },
+      ...response,
+    ]);
+    const props = formProps({
+      catalogModels: [{ model: "wire-old" }, { model: "wire-shared" }],
+    });
+    const { rerender } = render(<CodexFormFields {...props} />);
+    act(() => readiness().onSyncModels());
+    const review = await findModelSyncReview();
+    fireEvent.click(review.getByRole("radio", { name: /replace catalog/i }));
+
+    rerender(
+      <CodexFormFields
+        {...props}
+        catalogModels={[
+          { model: "wire-old" },
+          { model: "wire-shared", displayName: "Edited during review" },
+          { model: "wire-new", displayName: "Added during review" },
+        ]}
+      />,
+    );
+
+    const apply = review.getByRole("button", { name: "Apply to draft" });
+    expect(apply).toBeEnabled();
+    fireEvent.click(apply);
+    expect(props.onCatalogModelsChange).toHaveBeenCalledOnce();
+    expect(props.onCatalogModelsChange).toHaveBeenCalledWith([
+      expect.objectContaining({
+        model: "wire-shared",
+        displayName: "Edited during review",
+      }),
+      expect.objectContaining({
+        model: "wire-new",
+        displayName: "Added during review",
+      }),
+    ]);
   });
 
   it("clears pending choices when credentials change and never revives them", async () => {

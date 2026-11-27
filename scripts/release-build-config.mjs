@@ -155,6 +155,14 @@ export function localReleaseCargoTargetRoot(repoRoot) {
   return path.resolve(repoRoot, ".tmp", "local-release-cargo");
 }
 
+export function localReleaseCargoTargetOwnerPid(name) {
+  const runName =
+    /^run-([1-9]\d*)-[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/;
+  const match = runName.exec(name);
+  const pid = Number(match?.[1]);
+  return Number.isInteger(pid) && pid <= 0x7fffffff ? pid : null;
+}
+
 export function createLocalReleaseCargoTarget(repoRoot) {
   const root = localReleaseCargoTargetRoot(repoRoot);
   assertUnlinkedDirectories(root);
@@ -173,7 +181,7 @@ export function cleanupLocalReleaseCargoTarget(
   const root = localReleaseCargoTargetRoot(repoRoot);
   if (
     !samePath(path.dirname(target), root) ||
-    !/^run-\d+-[\da-f-]+$/i.test(path.basename(target))
+    localReleaseCargoTargetOwnerPid(path.basename(target)) === null
   ) {
     throw new Error(
       "local release Cargo target is outside the repository-owned local release Cargo cache root",

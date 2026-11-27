@@ -673,6 +673,16 @@ pub async fn get_codex_guardian_status(
 }
 
 #[tauri::command]
+pub async fn refresh_codex_usage_limit_resume_count(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<(), String> {
+    state
+        .proxy_service
+        .request_codex_usage_limit_refresh()
+        .await
+}
+
+#[tauri::command]
 pub async fn unlock_codex_model_picker(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<CodexModelPickerUnlockResult, String> {

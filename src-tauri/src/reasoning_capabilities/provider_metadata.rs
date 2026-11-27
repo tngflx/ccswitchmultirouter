@@ -11,10 +11,11 @@ use crate::proxy::providers::codex_reasoning::{
     ReasoningControlKind, ReasoningSupportStatus,
 };
 use crate::reasoning_capabilities::{
-    reasoning_evidence_scope_for_settings, reasoning_provider_key,
-    reasoning_wire_model_for_settings, DiscoveryOutcome, ProviderCapabilitySnapshot,
+    reasoning_evidence_scope_for_provider, reasoning_provider_key,
+    reasoning_wire_model_for_provider, DiscoveryOutcome, ProviderCapabilitySnapshot,
     ReasoningCapabilitySnapshot,
 };
+use crate::services::model_fetch::{read_bounded_model_body, MAX_MODEL_RESPONSE_BYTES};
 use reqwest::StatusCode;
 use serde_json::Value;
 use std::time::Duration;
@@ -213,13 +214,10 @@ fn discovery_snapshot(
 ) -> Option<ProviderCapabilitySnapshot> {
     Some(ProviderCapabilitySnapshot {
         provider_key: provider_key(provider),
-        model: reasoning_wire_model_for_settings(&provider.settings_config, model)?,
+        model: reasoning_wire_model_for_provider(provider, model)?,
         fetched_at: now_millis(),
         source: source.to_string(),
-        evidence_scope: Some(reasoning_evidence_scope_for_settings(
-            &provider.settings_config,
-            model,
-        )?),
+        evidence_scope: Some(reasoning_evidence_scope_for_provider(provider, model)?),
         reasoning,
     })
 }
@@ -305,8 +303,7 @@ fn discovery_error_class(error: &reqwest::Error) -> &'static str {
 /// `supported_efforts` / `default_effort` / `mandatory` / `default_enabled` /
 /// `supports_max_tokens`。
 pub async fn discover_openrouter(provider: &Provider, model: &str) -> DiscoveryOutcome {
-    let Some(wire_model) = reasoning_wire_model_for_settings(&provider.settings_config, model)
-    else {
+    let Some(wire_model) = reasoning_wire_model_for_provider(provider, model) else {
         return DiscoveryOutcome::NotAdvertised;
     };
     let Some(base) = base_url(provider) else {
@@ -339,7 +336,8 @@ pub async fn discover_openrouter(provider: &Provider, model: &str) -> DiscoveryO
     }
 
     let final_url = response.url().clone();
-    let Ok(body) = response.bytes().await else {
+    let Ok(body) = read_bounded_model_body(response.bytes_stream(), MAX_MODEL_RESPONSE_BYTES).await
+    else {
         return DiscoveryOutcome::Invalid;
     };
     let Ok(body) = std::str::from_utf8(&body) else {
@@ -1204,8 +1202,7 @@ fn openrouter_models_url(base: &str) -> Option<String> {
 /// `/server_info` 是开发端点（`VLLM_SERVER_DEV_MODE` 开启才暴露），生产部署
 /// 通常 404——按 `Unavailable` 降级，不是错误。
 pub async fn discover_vllm(provider: &Provider, model: &str) -> DiscoveryOutcome {
-    let Some(wire_model) = reasoning_wire_model_for_settings(&provider.settings_config, model)
-    else {
+    let Some(wire_model) = reasoning_wire_model_for_provider(provider, model) else {
         return DiscoveryOutcome::NotAdvertised;
     };
     let Some(base) = base_url(provider) else {
@@ -1799,7 +1796,10 @@ mod tests {
         assert_eq!(snapshot.model, "Provider/Native-Model");
         assert_eq!(
             snapshot.evidence_scope,
-            reasoning_evidence_scope_for_settings(&routed.settings_config, "public-model")
+            crate::reasoning_capabilities::reasoning_evidence_scope_for_settings(
+                &routed.settings_config,
+                "public-model",
+            )
         );
         let encoded = serde_json::to_string(&snapshot.evidence_scope).unwrap();
         assert!(
@@ -1932,7 +1932,10 @@ base_url = "https://api.sublyx.org/v1""#,
                 Some("sublyx")
             );
             assert_eq!(
-                reasoning_evidence_scope_for_settings(&saved.settings_config, "wire-model"),
+                crate::reasoning_capabilities::reasoning_evidence_scope_for_settings(
+                    &saved.settings_config,
+                    "wire-model",
+                ),
                 crate::reasoning_capabilities::reasoning_evidence_scope(expected, "wire-model"),
                 "root TOML must not discard valid persisted/API evidence"
             );
@@ -1966,7 +1969,13 @@ baseUrl = "https://api.sublyx.org/v1""#,
                 Some("https://api.sublyx.org/v1")
             );
             assert_eq!(detect_platform_from_settings(&settings), Some("sublyx"));
-            assert!(reasoning_evidence_scope_for_settings(&settings, "wire-model").is_some());
+            assert!(
+                crate::reasoning_capabilities::reasoning_evidence_scope_for_settings(
+                    &settings,
+                    "wire-model",
+                )
+                .is_some()
+            );
         }
     }
 

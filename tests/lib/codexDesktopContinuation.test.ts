@@ -38,6 +38,7 @@ type Job = {
   submitted?: boolean;
   mutationAttempted?: boolean;
   usageLimitDeferred?: boolean;
+  usageLimitReadUnavailable?: boolean;
   reason?: string;
 };
 type ContinuationState = {
@@ -93,9 +94,11 @@ const createHarness = (
     requestHook?: "verified" | "unverified" | "stale-version";
     pauseCommitRead?: boolean;
     readError?: Error;
+    failOnThreadRead?: number;
     boundedHistoryUnavailable?: boolean;
     boundedHistoryPage?: unknown;
     noCrypto?: boolean;
+    captureNativeAcknowledgement?: () => (response: unknown) => void;
   } = {},
 ) => {
   const state = { runtimeGeneration: 1 } as ContinuationState;
@@ -192,6 +195,8 @@ const createHarness = (
         await new Promise<void>((resolve) => {
           releaseCommitRead = resolve;
         });
+      if (reads === discoveryOptions.failOnThreadRead)
+        throw new Error("Codex thread read failed (private response detail)");
       if ((params as { includeTurns?: boolean }).includeTurns === false) {
         const metadata: Record<string, unknown> = { turns: [] };
         for (const [key, descriptor] of Object.entries(
@@ -214,6 +219,7 @@ const createHarness = (
     "resolveCodexOwnerRemoteViewReference",
     "codexOwnerRemoteViewReferenceIsCurrent",
     "crypto",
+    "captureCodexNativeUsageLimitAcknowledgement",
     `${discovery}\n${continuation}\nreturn { rememberCodexUserTurnAction, readCodexContinuationMarkers, codexContinuationTerminalErrorCode, classifyCodexContinuationThread, captureCodexOwnerUserActionEvidence, codexOwnerUserActionEvidenceIsCurrent };`,
   )(
     state,
@@ -252,6 +258,7 @@ const createHarness = (
       binding.runtimeGeneration === state.runtimeGeneration &&
       Number(binding.expiresAtMs) > Date.now(),
     crypto,
+    discoveryOptions.captureNativeAcknowledgement,
   ) as {
     rememberCodexUserTurnAction: (method: string, params: unknown) => void;
     captureCodexOwnerUserActionEvidence: (thread: string) => object | null;
@@ -2461,6 +2468,11 @@ it.each([
 );
 
 describe("Codex usage-limit continuation", () => {
+  const genericDesktopError = {
+    message: "An error occurred.",
+    codexErrorInfo: "other",
+    additionalDetails: null,
+  };
   const usageError = {
     message: "You've hit your usage limit. Try again later.",
     codexErrorInfo: "usageLimitExceeded",
@@ -2470,6 +2482,82 @@ describe("Codex usage-limit continuation", () => {
       "You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at 7:45 PM.",
     codexErrorInfo: "usageLimitExceeded",
     additionalDetails: null,
+  };
+  const dailyUsageMessage =
+    "Daily usage limit exceeded. The upstream provider's daily Codex allowance is exhausted.";
+  it("submits literal continue when the bounded turn page omits its optional cursor", async () => {
+    const harness = createHarness(false, usageError, "failed", {
+      boundedHistoryPage: {
+        data: [
+          {
+            id: "failed-turn",
+            status: "failed",
+            error: usageError,
+            itemsView: "notLoaded",
+            items: [],
+          },
+        ],
+      },
+    });
+    harness.failedThread.status = { type: "idle" };
+    const observation = nativeObservation();
+    harness.failedThread.modelProvider = observation.modelProvider;
+    harness.state.getCodexNativeUsageLimitCandidate = () => observation;
+    prepareUsageLimit(
+      harness,
+      true,
+      observation.model,
+      observation.observedAtMs,
+    );
+    await flushJobs();
+    expect(harness.job().status).toBe("prepared");
+    harness.state.confirmCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.job().status).toBe("confirmed");
+    harness.state.commitCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      submitted: true,
+      mutationAttempted: true,
+      turnId: "continued-turn",
+    });
+    expect(harness.startTurn).toHaveBeenCalledTimes(1);
+    expect(harness.startTurn).toHaveBeenCalledWith({
+      threadId: "exact-thread",
+      input: [{ type: "text", text: "continue" }],
+    });
+  });
+  const dailyUsageError = {
+    code: "usage_limit_reached",
+    type: "usage_limit_reached",
+    upstream_reason: "DAILY_LIMIT_EXCEEDED",
+    message: dailyUsageMessage,
+  };
+  const dailyUsageTransportError = {
+    codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 403 } },
+    message: dailyUsageMessage,
+  };
+  const dailyUsageNativeWrapper = {
+    codexErrorInfo: "other",
+    message: `unexpected status 403 Forbidden: ${JSON.stringify({
+      error: { type: "upstream_error", message: "daily usage limit exceeded" },
+    })}, url: http://localhost/responses`,
+  };
+  const dailyUsagePlainWrapper = {
+    codexErrorInfo: "other",
+    message:
+      "unexpected status 403 Forbidden: daily usage limit exceeded, url: http://localhost/responses",
+  };
+  const dailyUsageTypedWrapper = {
+    codexErrorInfo: "other",
+    message: `unexpected status 429 Too Many Requests: ${JSON.stringify({
+      error: dailyUsageError,
+    })}, url: http://localhost/responses`,
+  };
+  const retryLimitTransportError = {
+    codexErrorInfo: "other",
+    message: "exceeded retry limit, last status: 429 Too Many Requests",
   };
   const prepareUsageLimit = (
     harness: ReturnType<typeof createHarness>,
@@ -2491,7 +2579,102 @@ describe("Codex usage-limit continuation", () => {
     observedAtMs: Date.now() - 1_000,
   });
 
-  it.each([usageError, planUsageError])(
+  it.each(["submitted marker write", "native observer callback"])(
+    "retains a validated submission when the %s fails",
+    async (failure) => {
+      const observeStart = vi.fn(() => {
+        if (failure === "native observer callback")
+          throw new Error("Native observation unavailable");
+      });
+      const harness = createHarness(false, usageError, "failed", {
+        captureNativeAcknowledgement: () => observeStart,
+      });
+      harness.failedThread.status = { type: "idle" };
+      const observation = nativeObservation();
+      harness.failedThread.modelProvider = observation.modelProvider;
+      harness.state.getCodexNativeUsageLimitCandidate = () => observation;
+      const acknowledgement = { turn: { id: "continued-turn" } };
+      harness.startTurn.mockImplementationOnce(() => {
+        expect(harness.api.readCodexContinuationMarkers()).toMatchObject({
+          "exact-thread:failed-turn": { status: "attempted" },
+        });
+        if (failure === "submitted marker write") harness.refuseMarkerWrites();
+        return acknowledgement;
+      });
+
+      prepareUsageLimit(
+        harness,
+        true,
+        observation.model,
+        observation.observedAtMs,
+      );
+      await flushJobs();
+      harness.state.confirmCodexContinuation("recovery-id");
+      await flushJobs();
+      harness.state.commitCodexContinuation("recovery-id");
+      await flushJobs();
+
+      expect(harness.job()).toMatchObject({
+        status: "completed",
+        submitted: true,
+        mutationAttempted: true,
+        turnId: "continued-turn",
+      });
+      expect(observeStart.mock.calls).toEqual([[acknowledgement]]);
+      expect(harness.api.readCodexContinuationMarkers()).toMatchObject({
+        "exact-thread:failed-turn":
+          failure === "submitted marker write"
+            ? { status: "attempted" }
+            : { status: "submitted", turnId: "continued-turn" },
+      });
+
+      harness.state.startCodexUsageLimitContinuation(
+        "exact-thread",
+        "duplicate-recovery-id",
+        observation.model,
+        observation.observedAtMs,
+        "failed-turn",
+        true,
+      );
+      await flushJobs();
+      harness.state.confirmCodexContinuation("duplicate-recovery-id");
+      await flushJobs();
+      expect(
+        harness.state.commitCodexContinuation("duplicate-recovery-id"),
+      ).toMatchObject({ started: true });
+      await flushJobs();
+      expect(harness.startTurn).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    usageError,
+    planUsageError,
+    dailyUsageError,
+    {
+      code: "USAGE_LIMIT_EXCEEDED",
+      type: "upstream_error",
+      message: "Provider returned a usage limit code",
+    },
+    dailyUsageTransportError,
+    dailyUsageNativeWrapper,
+    dailyUsagePlainWrapper,
+    retryLimitTransportError,
+    {
+      codexErrorInfo: "other",
+      message: `unexpected status 429 Too Many Requests: ${JSON.stringify({
+        response: { error: dailyUsageError },
+      })}, url: http://localhost/responses`,
+    },
+    ...["weekly", "monthly"].map((period) => ({
+      codexErrorInfo: "usageLimitExceeded",
+      message: `The upstream provider's ${period} usage limit was exceeded.`,
+    })),
+    ...["weekly", "monthly"].map((period) => ({
+      codexErrorInfo: "other",
+      message: `The upstream provider's ${period} usage limit was exceeded.`,
+    })),
+  ])(
     "submits literal continue only after confirming the exact usage-limited turn: %j",
     async (error) => {
       const harness = createHarness(false, error);
@@ -2517,6 +2700,110 @@ describe("Codex usage-limit continuation", () => {
     },
   );
 
+  it("does not treat retry-limit transport text as native proof without exact proxy evidence", async () => {
+    const harness = createHarness(false, retryLimitTransportError);
+    harness.failedThread.status = { type: "systemError" };
+    prepareUsageLimit(harness, true);
+    await flushJobs();
+    expect(harness.job()).toBeNull();
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it("continues an exact proxy-confirmed failed turn with a generic Desktop error", async () => {
+    const harness = createHarness(false, genericDesktopError);
+    harness.failedThread.status = { type: "systemError" };
+    prepareUsageLimit(harness);
+    await flushJobs();
+    expect(harness.job().status).toBe("prepared");
+    harness.state.confirmCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.job().status).toBe("confirmed");
+    harness.state.commitCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.startTurn).toHaveBeenCalledOnce();
+    expect(harness.startTurn).toHaveBeenCalledWith({
+      threadId: "exact-thread",
+      input: [{ type: "text", text: "continue" }],
+    });
+  });
+
+  it.each([
+    { turnStatus: "interrupted", error: genericDesktopError },
+    { turnStatus: "failed", error: null },
+    { turnStatus: "failed", error: { message: "" } },
+    {
+      turnStatus: "failed",
+      error: { ...genericDesktopError, code: "model_not_found" },
+    },
+    {
+      turnStatus: "failed",
+      error: { ...genericDesktopError, additionalDetails: "Access denied" },
+    },
+    {
+      turnStatus: "failed",
+      error: Object.defineProperty(
+        { message: genericDesktopError.message },
+        "codexErrorInfo",
+        { get: () => "other" },
+      ),
+    },
+  ])(
+    "rejects a generic failure with ambiguous or conflicting evidence %#",
+    async ({ turnStatus, error }) => {
+      const harness = createHarness(false, undefined, turnStatus);
+      harness.failedThread.status = { type: "systemError" };
+      harness.failedThread.turns[0].error = error;
+      prepareUsageLimit(harness);
+      await flushJobs();
+      expect(harness.job()).toMatchObject({
+        status: "completed",
+        mutationAttempted: false,
+      });
+      expect(harness.startTurn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("requires a current native usage-limit error for a native-only continuation", async () => {
+    const harness = createHarness(false, genericDesktopError);
+    const observation = nativeObservation();
+    Object.assign(harness.failedThread, {
+      status: { type: "systemError" },
+      modelProvider: observation.modelProvider,
+    });
+    harness.state.getCodexNativeUsageLimitCandidate = () => observation;
+    prepareUsageLimit(
+      harness,
+      true,
+      observation.model,
+      observation.observedAtMs,
+    );
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      mutationAttempted: false,
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it("revalidates the generic Desktop error immediately before submission", async () => {
+    const error = { ...genericDesktopError };
+    const harness = createHarness(false, error);
+    harness.failedThread.status = { type: "systemError" };
+    prepareUsageLimit(harness);
+    await flushJobs();
+    harness.state.confirmCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.job().status).toBe("confirmed");
+    error.message = "Access denied";
+    harness.state.commitCodexContinuation("recovery-id");
+    await flushJobs();
+    expect(harness.job()).toMatchObject({
+      status: "completed",
+      mutationAttempted: false,
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
   it("keeps the automatic continuation policy for plan limits with a credit suggestion", () => {
     const harness = createHarness();
     expect(
@@ -2525,6 +2812,26 @@ describe("Codex usage-limit continuation", () => {
       }),
     ).toBe("insufficient_quota");
   });
+
+  it.each([
+    dailyUsageError,
+    dailyUsageTransportError,
+    dailyUsageNativeWrapper,
+    dailyUsagePlainWrapper,
+    dailyUsageTypedWrapper,
+  ])(
+    "keeps automatic continuation blocked for a recurring allowance error: %j",
+    async (error) => {
+      const harness = createHarness(false, error);
+      harness.start();
+      await flushJobs();
+      expect(harness.job()).toMatchObject({
+        status: "completed",
+        mutationAttempted: false,
+      });
+      expect(harness.startTurn).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     ["a different turn", { id: "newer-turn" }],
@@ -2562,6 +2869,97 @@ describe("Codex usage-limit continuation", () => {
       "a plan limit reporting hard quota in its details",
       { error: { ...planUsageError, additionalDetails: "Quota exhausted." } },
     ],
+    [
+      "a period limit with explicit retry denial",
+      { error: { ...dailyUsageError, retryable: false } },
+    ],
+    [
+      "a period limit with a permission denial",
+      {
+        error: {
+          ...dailyUsageError,
+          additionalDetails: "This request was denied by content policy.",
+        },
+      },
+    ],
+    [
+      "a period limit with a user cancellation",
+      {
+        error: {
+          ...dailyUsageError,
+          additionalDetails: "The user canceled the turn.",
+        },
+      },
+    ],
+    [
+      "a period limit with a billing failure",
+      { error: { ...dailyUsageError, additionalDetails: "Billing failed." } },
+    ],
+    [
+      "an ordinary 403 denial with period wording in the endpoint URL",
+      {
+        error: {
+          ...dailyUsageNativeWrapper,
+          message:
+            "unexpected status 403 Forbidden: Access denied, url: http://localhost/daily_usage_limit",
+        },
+      },
+    ],
+    [
+      "a wrapped period limit with explicit retry denial",
+      {
+        error: {
+          ...dailyUsageNativeWrapper,
+          message: `unexpected status 403 Forbidden: ${JSON.stringify({ error: { ...dailyUsageError, retryable: false } })}, url: http://localhost/responses`,
+        },
+      },
+    ],
+    [
+      "a wrapped period limit accompanied by an envelope permission code",
+      {
+        error: {
+          ...dailyUsageNativeWrapper,
+          message: `unexpected status 403 Forbidden: ${JSON.stringify({
+            code: "access_denied",
+            error: dailyUsageError,
+          })}, url: http://localhost/responses`,
+        },
+      },
+    ],
+    [
+      "a wrapped period limit accompanied by an envelope cancellation status",
+      {
+        error: {
+          ...dailyUsageNativeWrapper,
+          message: `unexpected status 403 Forbidden: ${JSON.stringify({
+            status: "canceled",
+            error: dailyUsageError,
+          })}, url: http://localhost/responses`,
+        },
+      },
+    ],
+    [
+      "a wrapped period limit with a retry denial in the nested response",
+      {
+        error: {
+          ...dailyUsageNativeWrapper,
+          message: `unexpected status 403 Forbidden: ${JSON.stringify({
+            error: dailyUsageError,
+            response: { error: { retryable: false } },
+          })}, url: http://localhost/responses`,
+        },
+      },
+    ],
+    [
+      "a wrapped period limit with conflicting permission details",
+      {
+        error: {
+          ...dailyUsageNativeWrapper,
+          message:
+            "unexpected status 403 Forbidden: daily usage limit exceeded. Access denied, url: http://localhost/responses",
+        },
+      },
+    ],
   ])("skips %s", async (_label, changedTurn) => {
     const harness = createHarness(false, usageError);
     harness.failedThread.status = { type: "idle" };
@@ -2589,56 +2987,194 @@ describe("Codex usage-limit continuation", () => {
       mutationAttempted: false,
       usageLimitDeferred: true,
     });
-    expect(harness.job()).not.toHaveProperty(
-      "usageLimitInitialReadUnavailable",
-    );
+    expect(harness.job()).not.toHaveProperty("usageLimitReadUnavailable");
     expect(harness.startTurn).not.toHaveBeenCalled();
   });
 
-  it("reports an unavailable initial read so another renderer can verify the interruption", async () => {
+  it.each([true, false])(
+    "reports an unavailable initial read so another renderer can verify the interruption (native evidence: %s)",
+    async (requireNativeObservation) => {
+      const harness = createHarness(false, usageError, "failed", {
+        readError: new Error("thread not found"),
+      });
+      const observation = nativeObservation();
+      if (requireNativeObservation)
+        harness.state.getCodexNativeUsageLimitCandidate = () => observation;
+      expect(
+        prepareUsageLimit(
+          harness,
+          requireNativeObservation,
+          observation.model,
+          observation.observedAtMs,
+        ),
+      ).toMatchObject({ started: true });
+      await flushJobs();
+      expect(harness.job()).toMatchObject({
+        status: "completed",
+        submitted: false,
+        mutationAttempted: false,
+        usageLimitDeferred: true,
+        usageLimitReadUnavailable: true,
+      });
+      expect(harness.requestCalls).toEqual([
+        ["thread/read", { threadId: "exact-thread", includeTurns: false }],
+      ]);
+      expect(harness.startTurn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { read: 2, native: false, tryAnotherRenderer: true },
+    { read: 3, native: false, tryAnotherRenderer: true },
+    { read: 2, native: true, tryAnotherRenderer: false },
+    { read: 3, native: true, tryAnotherRenderer: false },
+  ])(
+    "handles an unavailable exact read $read during recovery (native evidence: $native)",
+    async ({ read, native, tryAnotherRenderer }) => {
+      const harness = createHarness(false, usageError, "failed", {
+        failOnThreadRead: read,
+      });
+      const observation = nativeObservation();
+      Object.assign(harness.failedThread, {
+        status: { type: "idle" },
+        modelProvider: observation.modelProvider,
+      });
+      if (native)
+        harness.state.getCodexNativeUsageLimitCandidate = () => observation;
+      expect(
+        prepareUsageLimit(
+          harness,
+          native,
+          observation.model,
+          observation.observedAtMs,
+        ),
+      ).toMatchObject({ started: true });
+      await flushJobs();
+      if (read === 3) {
+        expect(harness.job().status).toBe("prepared");
+        harness.state.confirmCodexContinuation("recovery-id");
+        await flushJobs();
+      }
+      expect(harness.readCount()).toBe(read);
+      expect(harness.job()).toMatchObject({
+        status: "completed",
+        submitted: false,
+        mutationAttempted: false,
+        usageLimitDeferred: true,
+      });
+      expect(harness.job().usageLimitReadUnavailable === true).toBe(
+        tryAnotherRenderer,
+      );
+      expect(harness.job().reason).not.toContain("private response detail");
+      expect(harness.startTurn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves a user stop while an exact confirmation read fails", async () => {
     const harness = createHarness(false, usageError, "failed", {
-      readError: new Error("Codex thread/read timed out"),
+      failOnThreadRead: 3,
+      pauseCommitRead: true,
     });
-    const observation = nativeObservation();
-    harness.state.getCodexNativeUsageLimitCandidate = () => observation;
-    expect(
-      prepareUsageLimit(
-        harness,
-        true,
-        observation.model,
-        observation.observedAtMs,
-      ),
-    ).toMatchObject({ started: true });
+    harness.failedThread.status = { type: "idle" };
+    prepareUsageLimit(harness);
+    await flushJobs();
+    expect(harness.job().status).toBe("prepared");
+    harness.state.confirmCodexContinuation("recovery-id");
+    await flushJobs();
+    harness.api.rememberCodexUserTurnAction("turn/interrupt", {
+      threadId: "exact-thread",
+      turnId: "failed-turn",
+    });
+    harness.releaseCommitRead();
     await flushJobs();
     expect(harness.job()).toMatchObject({
       status: "completed",
       submitted: false,
       mutationAttempted: false,
-      usageLimitDeferred: true,
-      usageLimitInitialReadUnavailable: true,
+      reason:
+        "The user changed or stopped the Codex thread before continuation",
     });
-    expect(harness.requestCalls).toEqual([
-      ["thread/read", { threadId: "exact-thread", includeTurns: false }],
-    ]);
+    expect(harness.job().usageLimitDeferred).not.toBe(true);
+    expect(harness.job()).not.toHaveProperty("usageLimitReadUnavailable");
     expect(harness.startTurn).not.toHaveBeenCalled();
   });
 
-  it("revalidates the usage limit before releasing the confirmed sender", async () => {
+  it("withholds fallback when an exact confirmation returns a different thread", async () => {
     const harness = createHarness(false, usageError);
     harness.failedThread.status = { type: "idle" };
     prepareUsageLimit(harness);
     await flushJobs();
     expect(harness.job().status).toBe("prepared");
-    harness.failedThread.turns[0].error = { message: "Connection closed" };
+    harness.failedThread.id = "different-thread";
     harness.state.confirmCodexContinuation("recovery-id");
     await flushJobs();
     expect(harness.job()).toMatchObject({
       status: "completed",
+      submitted: false,
       mutationAttempted: false,
+      reason: "Codex returned a different thread",
     });
-    expect(harness.job().usageLimitDeferred).not.toBe(true);
+    expect(harness.job()).not.toHaveProperty("usageLimitReadUnavailable");
     expect(harness.startTurn).not.toHaveBeenCalled();
   });
+
+  it.each([
+    usageError,
+    dailyUsageError,
+    dailyUsageNativeWrapper,
+    genericDesktopError,
+  ])(
+    "revalidates the usage limit before releasing the confirmed sender: %j",
+    async (error) => {
+      const harness = createHarness(false, error);
+      harness.failedThread.status = { type: "idle" };
+      prepareUsageLimit(harness);
+      await flushJobs();
+      expect(harness.job().status).toBe("prepared");
+      harness.failedThread.turns[0].error = { message: "Connection closed" };
+      harness.state.confirmCodexContinuation("recovery-id");
+      await flushJobs();
+      expect(harness.job()).toMatchObject({
+        status: "completed",
+        mutationAttempted: false,
+      });
+      expect(harness.job().usageLimitDeferred).not.toBe(true);
+      expect(harness.startTurn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([dailyUsageError, dailyUsageTypedWrapper])(
+    "confirms a native-only period limit for the same observed provider and turn: %j",
+    async (error) => {
+      const harness = createHarness(false, error);
+      const observation = nativeObservation();
+      Object.assign(harness.failedThread, {
+        status: { type: "idle" },
+        modelProvider: observation.modelProvider,
+      });
+      harness.state.getCodexNativeUsageLimitCandidate = () => observation;
+      expect(
+        prepareUsageLimit(
+          harness,
+          true,
+          observation.model,
+          observation.observedAtMs,
+        ),
+      ).toMatchObject({ started: true });
+      await flushJobs();
+      expect(harness.job().status).toBe("prepared");
+      harness.state.confirmCodexContinuation("recovery-id");
+      await flushJobs();
+      expect(harness.job().status).toBe("confirmed");
+      harness.state.commitCodexContinuation("recovery-id");
+      await flushJobs();
+      expect(harness.startTurn).toHaveBeenCalledOnce();
+      expect(harness.startTurn).toHaveBeenCalledWith({
+        threadId: "exact-thread",
+        input: [{ type: "text", text: "continue" }],
+      });
+    },
+  );
 
   it.each([false, true])(
     "resumes a verified native thread with no model field only while its provider is current (changed: %s)",

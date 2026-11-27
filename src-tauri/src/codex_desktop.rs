@@ -12,8 +12,8 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::proxy::codex_turn_recovery::{
     valid_continuation_identifier, ObservedUsageLimitTurn, ProxyUsageLimitTurn,
@@ -29,6 +29,8 @@ pub(crate) const DEFAULT_CODEX_DEBUG_PORT: u16 = 9229;
 pub(crate) const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
+const CODEX_CONTINUATION_PREPARATION_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const CODEX_CONTINUATION_ACK_TIMEOUT: Duration = Duration::from_secs(20);
 // Native process/listener probes share the configured monitor's eight-second budget.
 #[cfg(any(target_os = "windows", test))]
 pub(crate) const CODEX_NATIVE_QUERY_TIMEOUT: Duration = Duration::from_secs(8);
@@ -1762,33 +1764,25 @@ async fn evaluate_cdp_expression_with_options(
     if !authorize(false) {
         return Ok(None);
     }
+    let mut session = connect_cdp_runtime(websocket_url).await?;
+    // Recheck canonical authorization immediately before evaluating an expression
+    // that could mutate the renderer.
+    if !authorize(true) {
+        return Ok(None);
+    }
+    session.evaluate(expression, await_promise).await.map(Some)
+}
+
+async fn connect_cdp_runtime(
+    websocket_url: &str,
+) -> Result<CdpSession<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>, String> {
     let (socket, _) = tokio::time::timeout(CDP_CONNECT_TIMEOUT, connect_async(websocket_url))
         .await
         .map_err(|_| "timed out connecting CDP websocket".to_string())?
         .map_err(|error| format!("failed to connect CDP websocket: {error}"))?;
     let mut session = CdpSession::new(socket);
     session.send_command(1, "Runtime.enable", json!({})).await?;
-    // Connection/Runtime.enable can wait while the user disables recovery or
-    // changes providers. Recheck canonical authorization immediately before
-    // sending the renderer expression that commits a prepared continuation.
-    // Only this final check transitions the backend reservation to committing;
-    // connection preflight must not consume a continuation attempt.
-    if !authorize(true) {
-        return Ok(None);
-    }
-    session
-        .send_command(
-            2,
-            "Runtime.evaluate",
-            json!({
-                "expression": expression,
-                "awaitPromise": await_promise,
-                "returnByValue": true,
-                "allowUnsafeEvalBlockedByCSP": true
-            }),
-        )
-        .await
-        .map(Some)
+    Ok(session)
 }
 
 /// Read the timezone from a currently running Codex renderer. This verifies the
@@ -1852,6 +1846,20 @@ where
             socket,
             responses: HashMap::new(),
         }
+    }
+
+    async fn evaluate(&mut self, expression: &str, await_promise: bool) -> Result<Value, String> {
+        self.send_command(
+            2,
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "awaitPromise": await_promise,
+                "returnByValue": true,
+                "allowUnsafeEvalBlockedByCSP": true
+            }),
+        )
+        .await
     }
 
     /// 发送 CDP 命令并等待对应 id 的响应。
@@ -2539,6 +2547,102 @@ async fn abandon_codex_continuation_preparation(
     None
 }
 
+/// Recover an explicit result after a post-authorization CDP acknowledgement
+/// is lost. This reads the same renderer job through the same target only. It
+/// never invokes commit again or advances to another renderer.
+async fn reconcile_committed_continuation_job(
+    websocket_url: &str,
+    poll_script: &str,
+    deadline: tokio::time::Instant,
+    port: u16,
+    target_id: &str,
+) -> Option<CodexContinuationResult> {
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        let evaluation = match tokio::time::timeout_at(
+            deadline,
+            evaluate_cdp_expression(websocket_url, poll_script),
+        )
+        .await
+        {
+            Ok(Ok(value)) => value,
+            Ok(Err(_)) | Err(_) => {
+                tokio::time::sleep_until(
+                    (tokio::time::Instant::now() + Duration::from_millis(100)).min(deadline),
+                )
+                .await;
+                continue;
+            }
+        };
+        if evaluation.pointer("/result/exceptionDetails").is_some() {
+            tokio::time::sleep_until(
+                (tokio::time::Instant::now() + Duration::from_millis(100)).min(deadline),
+            )
+            .await;
+            continue;
+        }
+        let value = evaluation
+            .pointer("/result/result/value")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let status = value.get("status").and_then(Value::as_str);
+        let submitted = value.get("submitted").and_then(Value::as_bool);
+        let mutation_attempted = value.get("mutationAttempted").and_then(Value::as_bool);
+        if status == Some("completed")
+            && submitted == Some(true)
+            && mutation_attempted == Some(true)
+        {
+            let Some(turn_id) = value
+                .get("turnId")
+                .and_then(Value::as_str)
+                .filter(|turn_id| !turn_id.trim().is_empty())
+            else {
+                continue;
+            };
+            return Some(CodexContinuationResult {
+                submitted: true,
+                mutation_attempted: true,
+                usage_limit_deferred: false,
+                turn_id: Some(turn_id.to_owned()),
+                debug_port: Some(port),
+                target_id: Some(target_id.to_owned()),
+                message: value
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Continuation submitted to the interrupted Codex thread")
+                    .to_string(),
+            });
+        }
+        if status == Some("completed")
+            && submitted == Some(false)
+            && mutation_attempted == Some(false)
+        {
+            return Some(CodexContinuationResult {
+                submitted: false,
+                mutation_attempted: false,
+                usage_limit_deferred: value
+                    .get("usageLimitDeferred")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                turn_id: None,
+                debug_port: Some(port),
+                target_id: Some(target_id.to_owned()),
+                message: value
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex continuation was not submitted")
+                    .to_string(),
+            });
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + Duration::from_millis(100)).min(deadline),
+        )
+        .await;
+    }
+}
+
 async fn submit_codex_continuation_to_targets(
     targets: Vec<CdpTarget>,
     port: u16,
@@ -2558,6 +2662,12 @@ async fn submit_codex_continuation_to_targets(
     'targets: for target in targets {
         let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
             continue;
+        };
+        let pending_diagnostic = || {
+            format!(
+                "target {}: continuation is still pending; no second submission was attempted",
+                target.id
+            )
         };
         let diagnostic = 'preparation: {
             // Only these read-only operations can abandon this renderer.
@@ -2587,24 +2697,61 @@ async fn submit_codex_continuation_to_targets(
                 ));
                 continue 'targets;
             }
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let preparation_deadline =
+                tokio::time::Instant::now() + CODEX_CONTINUATION_PREPARATION_TIMEOUT;
+            let mut deadline = preparation_deadline;
             let mut confirmation_requested = false;
             let mut commit_requested = false;
             loop {
-                let evaluation = match evaluate_cdp_expression(websocket_url, &poll_script).await {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let diagnostic = format!("target {}: {error}", target.id);
-                        if commit_requested {
-                            return Err(diagnostic);
-                        }
-                        break 'preparation diagnostic;
-                    }
+                let evaluation = match tokio::time::timeout_at(
+                    deadline,
+                    evaluate_cdp_expression(websocket_url, &poll_script),
+                )
+                .await
+                {
+                    Ok(Ok(value)) => Ok(value),
+                    Ok(Err(error)) => Err(format!("target {}: {error}", target.id)),
+                    Err(_) => Err(pending_diagnostic()),
                 };
+                let evaluation = match evaluation {
+                    Ok(value) => value,
+                    Err(diagnostic) if commit_requested => {
+                        if let Some(result) = reconcile_committed_continuation_job(
+                            websocket_url,
+                            &poll_script,
+                            deadline,
+                            port,
+                            &target.id,
+                        )
+                        .await
+                        {
+                            return Ok(Some(result));
+                        }
+                        return Err(diagnostic);
+                    }
+                    Err(diagnostic) => break 'preparation diagnostic,
+                };
+                if tokio::time::Instant::now() >= deadline {
+                    if commit_requested {
+                        return Err(pending_diagnostic());
+                    }
+                    break 'preparation pending_diagnostic();
+                }
                 if let Some(exception) = evaluation.pointer("/result/exceptionDetails") {
                     let diagnostic =
                         format!("target {}: CDP evaluation failed: {exception}", target.id);
                     if commit_requested {
+                        if let Some(result) = reconcile_committed_continuation_job(
+                            websocket_url,
+                            &poll_script,
+                            deadline,
+                            port,
+                            &target.id,
+                        )
+                        .await
+                        {
+                            return Ok(Some(result));
+                        }
                         return Err(diagnostic);
                     }
                     break 'preparation diagnostic;
@@ -2617,21 +2764,30 @@ async fn submit_codex_continuation_to_targets(
                 let submitted = value.get("submitted").and_then(Value::as_bool) == Some(true);
                 let attempted =
                     value.get("mutationAttempted").and_then(Value::as_bool) == Some(true);
+                let turn_id = value
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .filter(|turn_id| !turn_id.trim().is_empty())
+                    .map(str::to_owned);
+                let completed_submission =
+                    status == Some("completed") && submitted && attempted && turn_id.is_some();
                 // start can reattach to a previous job. Its mutation evidence
                 // takes precedence over this invocation's local commit flag.
-                if submitted
-                    || (!commit_requested && (attempted || status == Some("submitting")))
+                if (commit_requested && completed_submission)
+                    || (!commit_requested
+                        && (submitted || attempted || status == Some("submitting")))
                     || (status == Some("completed") && attempted)
                 {
+                    let result_submitted = if commit_requested {
+                        completed_submission
+                    } else {
+                        submitted
+                    };
                     return Ok(Some(CodexContinuationResult {
-                        submitted,
+                        submitted: result_submitted,
                         mutation_attempted: true,
                         usage_limit_deferred: false,
-                        turn_id: value
-                            .get("turnId")
-                            .and_then(Value::as_str)
-                            .filter(|_| submitted)
-                            .map(str::to_owned),
+                        turn_id: turn_id.filter(|_| result_submitted),
                         debug_port: Some(port),
                         target_id: Some(target.id),
                         message: value
@@ -2656,20 +2812,19 @@ async fn submit_codex_continuation_to_targets(
                             .get("reason")
                             .and_then(Value::as_str)
                             .unwrap_or("Codex did not confirm the targeted continuation");
-                        let initial_usage_limit_read_unavailable = !confirmation_requested
-                            && value.get("intent").and_then(Value::as_str)
-                                == Some("UsageLimitResume")
-                            && value
-                                .get("usageLimitInitialReadUnavailable")
-                                .and_then(Value::as_bool)
-                                == Some(true)
-                            && value.get("usageLimitDeferred").and_then(Value::as_bool)
-                                == Some(true);
+                        let usage_limit_read_unavailable =
+                            value.get("intent").and_then(Value::as_str) == Some("UsageLimitResume")
+                                && value
+                                    .get("usageLimitReadUnavailable")
+                                    .and_then(Value::as_bool)
+                                    == Some(true)
+                                && value.get("usageLimitDeferred").and_then(Value::as_bool)
+                                    == Some(true);
                         if !commit_requested
                             && value.get("submitted").and_then(Value::as_bool) == Some(false)
                             && value.get("mutationAttempted").and_then(Value::as_bool)
                                 == Some(false)
-                            && (initial_usage_limit_read_unavailable
+                            && (usage_limit_read_unavailable
                                 || reason.starts_with("Codex Desktop request client was not found"))
                         {
                             break 'preparation format!("target {}: {reason}", target.id);
@@ -2694,13 +2849,18 @@ async fn submit_codex_continuation_to_targets(
                         // them before native policy and budget authorization;
                         // the confirmed sender has no await before turn/start.
                         confirmation_requested = true;
-                        let confirmed =
-                            match evaluate_cdp_expression(websocket_url, &confirm_script).await {
-                                Ok(value) => value,
-                                Err(error) => {
-                                    break 'preparation format!("target {}: {error}", target.id);
-                                }
-                            };
+                        let confirmed = match tokio::time::timeout_at(
+                            preparation_deadline,
+                            evaluate_cdp_expression(websocket_url, &confirm_script),
+                        )
+                        .await
+                        {
+                            Ok(Ok(value)) => value,
+                            Ok(Err(error)) => {
+                                break 'preparation format!("target {}: {error}", target.id)
+                            }
+                            Err(_) => break 'preparation pending_diagnostic(),
+                        };
                         if let Some(exception) = confirmed.pointer("/result/exceptionDetails") {
                             break 'preparation format!(
                                 "target {}: CDP confirmation failed: {exception}",
@@ -2722,16 +2882,28 @@ async fn submit_codex_continuation_to_targets(
                     Some("confirmed") if confirmation_requested && !commit_requested => {
                         // Only this invocation's completed confirmation can
                         // authorize its send; never reuse an older final read.
-                        // Set before either authorization or dispatch: losing
-                        // any later response must preserve mutation uncertainty.
-                        commit_requested = true;
-                        let committed = evaluate_cdp_expression_if_authorized(
-                            websocket_url,
-                            &commit_script,
-                            authorize,
-                        )
-                        .await?;
-                        let Some(committed) = committed else {
+                        let session = if authorize(false) {
+                            match tokio::time::timeout_at(
+                                preparation_deadline,
+                                connect_cdp_runtime(websocket_url),
+                            )
+                            .await
+                            {
+                                Ok(Ok(session)) => Some(session),
+                                Ok(Err(error)) => {
+                                    break 'preparation format!("target {}: {error}", target.id)
+                                }
+                                Err(_) => break 'preparation pending_diagnostic(),
+                            }
+                        } else {
+                            None
+                        };
+                        if tokio::time::Instant::now() >= preparation_deadline {
+                            break 'preparation pending_diagnostic();
+                        }
+                        // Final authorization follows Runtime.enable so a
+                        // socket opened during a policy change cannot send.
+                        let Some(mut session) = session.filter(|_| authorize(true)) else {
                             if let Some(result) = abandon_codex_continuation_preparation(
                                 &target,
                                 port,
@@ -2758,17 +2930,68 @@ async fn submit_codex_continuation_to_targets(
                                 message: "Continuation authorization was revoked".to_string(),
                             }));
                         };
+                        // The recovery journal now owns the mutation. Keep
+                        // polling this renderer within a fresh deadline.
+                        commit_requested = true;
+                        deadline = tokio::time::Instant::now() + CODEX_CONTINUATION_ACK_TIMEOUT;
+                        let committed = match tokio::time::timeout_at(
+                            deadline,
+                            session.evaluate(&commit_script, false),
+                        )
+                        .await
+                        {
+                            Ok(Ok(value)) => value,
+                            Ok(Err(error)) => {
+                                if let Some(result) = reconcile_committed_continuation_job(
+                                    websocket_url,
+                                    &poll_script,
+                                    deadline,
+                                    port,
+                                    &target.id,
+                                )
+                                .await
+                                {
+                                    return Ok(Some(result));
+                                }
+                                return Err(format!("target {}: {error}", target.id));
+                            }
+                            Err(_) => return Err(pending_diagnostic()),
+                        };
                         if let Some(exception) = committed.pointer("/result/exceptionDetails") {
-                            return Err(format!(
+                            let diagnostic = format!(
                                 "target {}: CDP continuation commit failed: {exception}",
                                 target.id
-                            ));
+                            );
+                            if let Some(result) = reconcile_committed_continuation_job(
+                                websocket_url,
+                                &poll_script,
+                                deadline,
+                                port,
+                                &target.id,
+                            )
+                            .await
+                            {
+                                return Ok(Some(result));
+                            }
+                            return Err(diagnostic);
                         }
                         let started = committed
                             .pointer("/result/result/value/started")
                             .and_then(Value::as_bool);
                         if started.is_none() {
-                            return Err(format!("target {}: CDP continuation commit failed: acknowledgement is incomplete; result is uncertain", target.id));
+                            let diagnostic = format!("target {}: CDP continuation commit failed: acknowledgement is incomplete; result is uncertain", target.id);
+                            if let Some(result) = reconcile_committed_continuation_job(
+                                websocket_url,
+                                &poll_script,
+                                deadline,
+                                port,
+                                &target.id,
+                            )
+                            .await
+                            {
+                                return Ok(Some(result));
+                            }
+                            return Err(diagnostic);
                         }
                         if started == Some(false) {
                             return Ok(Some(CodexContinuationResult {
@@ -2794,6 +3017,17 @@ async fn submit_codex_continuation_to_targets(
                     _ => {
                         let diagnostic = format!("target {}: Codex compatibility layer is not ready: continuation preparation job was not found", target.id);
                         if commit_requested {
+                            if let Some(result) = reconcile_committed_continuation_job(
+                                websocket_url,
+                                &poll_script,
+                                deadline,
+                                port,
+                                &target.id,
+                            )
+                            .await
+                            {
+                                return Ok(Some(result));
+                            }
                             return Err(diagnostic);
                         }
                         break 'preparation diagnostic;
@@ -2806,7 +3040,10 @@ async fn submit_codex_continuation_to_targets(
                     }
                     break 'preparation diagnostic;
                 }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep_until(
+                    (tokio::time::Instant::now() + Duration::from_millis(250)).min(deadline),
+                )
+                .await;
             }
         };
         if let Some(result) = abandon_codex_continuation_preparation(
@@ -5576,6 +5813,17 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                             );
                             break;
                         };
+                        if let Some(millis) = response
+                            .get("advanceTimeMillis")
+                            .and_then(Value::as_u64)
+                            .filter(|millis| *millis > 0)
+                        {
+                            // Advance only during a scripted evaluation. Let the
+                            // clock run normally while loopback I/O is pending.
+                            tokio::time::pause();
+                            tokio::time::advance(Duration::from_millis(millis)).await;
+                            tokio::time::resume();
+                        }
                         if response.get("repeatPending").and_then(Value::as_bool) == Some(true) {
                             if command["params"]["expression"]
                                 .as_str()
@@ -5963,56 +6211,63 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
     }
 
     #[tokio::test]
-    async fn usage_limit_continuation_tries_ready_renderer_after_initial_read_failure() {
-        let (targets, port, expressions, server) = codex_continuation_test_targets(vec![
-            json!({"started": true}),
-            json!({
+    async fn usage_limit_continuation_tries_ready_renderer_after_unavailable_read() {
+        for during_confirmation in [false, true] {
+            let mut replies = vec![json!({"started": true})];
+            if during_confirmation {
+                replies.extend([json!({"status": "prepared"}), json!({"started": true})]);
+            }
+            replies.extend([
+                json!({
                 "status": "completed", "submitted": false, "mutationAttempted": false,
                 "intent": "UsageLimitResume", "usageLimitDeferred": true,
-                "usageLimitInitialReadUnavailable": true,
+                "usageLimitReadUnavailable": true,
                 "reason": "Codex thread/read timed out"
-            }),
-            json!({"cancelled": true, "mutationAttempted": false}),
-            json!({"started": true}),
-            json!({"status": "prepared"}),
-            json!({"started": true}),
-            json!({"status": "confirmed"}),
-            json!({"started": true}),
-            json!({
+                }),
+                json!({"cancelled": true, "mutationAttempted": false}),
+                json!({"started": true}),
+                json!({"status": "prepared"}),
+                json!({"started": true}),
+                json!({"status": "confirmed"}),
+                json!({"started": true}),
+                json!({
                 "status": "completed", "submitted": true, "mutationAttempted": true,
                 "turnId": "continued-turn"
-            }),
-        ])
-        .await;
-        let authorization_stages = Mutex::new(Vec::new());
-        let result = submit_codex_continuation_to_targets(
-            targets,
-            port,
-            "start-exact-usage-limit-continuation",
-            "\"isolated-recovery\"",
-            &|final_commit| {
-                authorization_stages.lock().unwrap().push(final_commit);
-                true
-            },
-            &mut Vec::new(),
-        )
-        .await;
-        server.abort();
-        let result = result.unwrap().expect("a ready renderer must submit");
-        assert!(result.submitted);
-        assert_eq!(result.target_id.as_deref(), Some("ready-renderer"));
-        assert_eq!(result.turn_id.as_deref(), Some("continued-turn"));
-        assert_eq!(*authorization_stages.lock().unwrap(), vec![false, true]);
-        let expressions = expressions.lock().unwrap();
-        assert_eq!(expressions.len(), 9);
-        assert!(expressions[2].contains("cancelCodexContinuation"));
-        assert_eq!(
-            expressions
-                .iter()
-                .filter(|expression| expression.contains("commitCodexContinuation"))
-                .count(),
-            1
-        );
+                }),
+            ]);
+            let (targets, port, expressions, server) =
+                codex_continuation_test_targets(replies).await;
+            let authorization_stages = Mutex::new(Vec::new());
+            let result = submit_codex_continuation_to_targets(
+                targets,
+                port,
+                "start-exact-usage-limit-continuation",
+                "\"isolated-recovery\"",
+                &|final_commit| {
+                    authorization_stages.lock().unwrap().push(final_commit);
+                    true
+                },
+                &mut Vec::new(),
+            )
+            .await;
+            server.abort();
+            let result = result.unwrap().expect("a ready renderer must submit");
+            assert!(result.submitted);
+            assert_eq!(result.target_id.as_deref(), Some("ready-renderer"));
+            assert_eq!(result.turn_id.as_deref(), Some("continued-turn"));
+            assert_eq!(*authorization_stages.lock().unwrap(), vec![false, true]);
+            let expressions = expressions.lock().unwrap();
+            let confirmation_calls = if during_confirmation { 2 } else { 0 };
+            assert_eq!(expressions.len(), 9 + confirmation_calls);
+            assert!(expressions[2 + confirmation_calls].contains("cancelCodexContinuation"));
+            assert_eq!(
+                expressions
+                    .iter()
+                    .filter(|expression| expression.contains("commitCodexContinuation"))
+                    .count(),
+                1
+            );
+        }
     }
 
     #[tokio::test]
@@ -6025,13 +6280,13 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             json!({
                 "status": "completed", "submitted": false, "mutationAttempted": true,
                 "intent": "UsageLimitResume", "usageLimitDeferred": true,
-                "usageLimitInitialReadUnavailable": true,
+                "usageLimitReadUnavailable": true,
                 "reason": "Codex thread/read timed out"
             }),
             json!({
                 "status": "completed", "submitted": false, "mutationAttempted": false,
                 "intent": "AutoRecovery", "usageLimitDeferred": true,
-                "usageLimitInitialReadUnavailable": true,
+                "usageLimitReadUnavailable": true,
                 "reason": "Codex thread/read timed out"
             }),
             json!({
@@ -6160,6 +6415,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                 Some(json!({"result": {"value": {"started": true}}})),
                 Some(json!({"result": {"value": {
                     "status": "completed", "submitted": true, "mutationAttempted": true,
+                    "turnId": "continued-turn",
                     "reason": "Continuation submitted to the interrupted Codex thread"
                 }}})),
             ]);
@@ -6320,7 +6576,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn codex_continuation_never_advances_after_postcommit_transport_or_evaluation_failure() {
         for failure in [
             None,
@@ -6369,6 +6625,69 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
     }
 
     #[tokio::test]
+    async fn codex_continuation_reconciles_a_lost_postcommit_receipt_without_resubmitting() {
+        let (targets, port, expressions, server) =
+            codex_continuation_test_targets_with_evaluations(vec![
+                Some(json!({"result": {"value": {"started": true}}})),
+                Some(json!({"result": {"value": {"status": "prepared"}}})),
+                Some(json!({"result": {"value": {"started": true}}})),
+                Some(json!({"result": {"value": {"status": "confirmed"}}})),
+                Some(json!({"result": {"value": {"started": true}}})),
+                None,
+                Some(json!({
+                    "result": {"value": {
+                        "status": "completed",
+                        "submitted": true,
+                        "mutationAttempted": true,
+                        "turnId": "continued-turn"
+                    }}
+                })),
+            ])
+            .await;
+        let authorization_stages = Mutex::new(Vec::new());
+        let mut diagnostics = Vec::new();
+        let result = submit_codex_continuation_to_targets(
+            targets,
+            port,
+            "start-exact-continuation",
+            "\"isolated-recovery\"",
+            &|final_commit| {
+                authorization_stages.lock().unwrap().push(final_commit);
+                true
+            },
+            &mut diagnostics,
+        )
+        .await
+        .expect("a recovered post-commit receipt must not advance to another target")
+        .expect("the same renderer must report its completed continuation");
+        server
+            .await
+            .expect("the isolated CDP fixture must complete");
+        assert!(result.submitted);
+        assert!(result.mutation_attempted);
+        assert_eq!(result.turn_id.as_deref(), Some("continued-turn"));
+        assert!(diagnostics.is_empty());
+        assert_eq!(*authorization_stages.lock().unwrap(), vec![false, true]);
+        let recorded = expressions.lock().unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|expression| expression.contains("commitCodexContinuation"))
+                .count(),
+            1,
+            "a recovered receipt must never invoke commit twice"
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|expression| expression.contains("readCodexContinuationJob"))
+                .count(),
+            2,
+            "the disconnected status read must be followed by one same-job reconciliation read"
+        );
+    }
+
+    #[tokio::test]
     async fn codex_continuation_reconciles_abandoned_jobs_with_cancellation_evidence() {
         for job in [
             Value::Null,
@@ -6402,7 +6721,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                         Some(json!({"result": {"value": {"started": true}}})),
                         Some(json!({"result": {"value": {"status": "confirmed"}}})),
                         Some(json!({"result": {"value": {"started": true}}})),
-                        Some(json!({"result": {"value": {"status": "completed", "submitted": true, "mutationAttempted": true}}})),
+                        Some(json!({"result": {"value": {"status": "completed", "submitted": true, "mutationAttempted": true, "turnId": "continued-turn"}}})),
                     ]);
                 }
                 let (targets, port, expressions, server) =
@@ -6483,7 +6802,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             json!({"status": "confirmed"}),
             json!({"started": true}),
             json!({"status": "submitting", "mutationAttempted": true}),
-            json!({"status": "completed", "submitted": true, "mutationAttempted": true}),
+            json!({"status": "completed", "submitted": true, "mutationAttempted": true, "turnId": "continued-turn"}),
         ])
         .await;
         let authorizations = Mutex::new(Vec::new());
@@ -6525,7 +6844,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                 Some(json!({"result": {"value": {"started": true}}})),
                 Some(json!({"result": {"value": {"status": "confirmed"}}})),
                 Some(json!({"result": {"value": {"started": true}}})),
-                Some(json!({"result": {"value": {"status": "completed", "submitted": true, "mutationAttempted": true}}})),
+                Some(json!({"result": {"value": {"status": "completed", "submitted": true, "mutationAttempted": true, "turnId": "continued-turn"}}})),
             ]);
         }
         let (targets, port, expressions, server) =
@@ -6598,6 +6917,74 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
     }
 
     #[tokio::test]
+    async fn codex_continuation_waits_for_acknowledgement_after_slow_preparation() {
+        let evaluation = |value, advance_time_millis| {
+            Some(json!({
+                "result": {"value": value},
+                "advanceTimeMillis": advance_time_millis,
+            }))
+        };
+        let (targets, port, expressions, server) =
+            codex_continuation_test_targets_with_evaluations(vec![
+                evaluation(json!({"started": true}), 0),
+                evaluation(json!({"status": "pending"}), 3000),
+                evaluation(json!({"status": "pending"}), 3000),
+                evaluation(json!({"status": "pending"}), 3000),
+                evaluation(json!({"status": "pending"}), 3000),
+                evaluation(json!({"status": "prepared"}), 3000),
+                evaluation(json!({"started": true}), 1000),
+                evaluation(json!({"status": "confirmed"}), 1000),
+                evaluation(json!({"started": true}), 0),
+                evaluation(
+                    json!({"status": "submitting", "mutationAttempted": true}),
+                    3250,
+                ),
+                evaluation(
+                    json!({
+                        "status": "completed",
+                        "submitted": true,
+                        "mutationAttempted": true,
+                        "turnId": "exact-continued-turn",
+                    }),
+                    0,
+                ),
+            ])
+            .await;
+        let authorizations = Mutex::new(Vec::new());
+        let mut diagnostics = Vec::new();
+        let result = submit_codex_continuation_to_targets(
+            targets,
+            port,
+            "start-exact-continuation",
+            "\"isolated-recovery\"",
+            &|final_commit| {
+                authorizations.lock().unwrap().push(final_commit);
+                true
+            },
+            &mut diagnostics,
+        )
+        .await;
+        server.abort();
+        let result = result
+            .unwrap()
+            .expect("acknowledgement after the preparation deadline");
+        assert!(result.submitted);
+        assert!(result.mutation_attempted);
+        assert_eq!(result.turn_id.as_deref(), Some("exact-continued-turn"));
+        assert_eq!(*authorizations.lock().unwrap(), vec![false, true]);
+        assert!(diagnostics.is_empty());
+        let expressions = expressions.lock().unwrap();
+        assert_eq!(
+            expressions
+                .iter()
+                .filter(|script| script.contains("commitCodexContinuation"))
+                .count(),
+            1
+        );
+        assert_eq!(expressions.len(), 11);
+    }
+
+    #[tokio::test]
     async fn codex_continuation_requires_positive_refusal_or_complete_commit_acknowledgement() {
         for (acknowledgement, completion) in [
             (Value::Null, false),
@@ -6605,6 +6992,23 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             (json!({"started": "true"}), false),
             (json!({"status": "completed"}), true),
             (json!({"status": "completed", "submitted": false}), true),
+            (
+                json!({
+                    "status": "completed",
+                    "submitted": true,
+                    "mutationAttempted": false,
+                    "turnId": "continued-turn",
+                }),
+                true,
+            ),
+            (
+                json!({
+                    "status": "completed",
+                    "submitted": true,
+                    "mutationAttempted": true,
+                }),
+                true,
+            ),
         ] {
             let mut responses = vec![
                 json!({"started": true}),

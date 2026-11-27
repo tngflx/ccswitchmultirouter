@@ -19,6 +19,7 @@ import {
   parseRegisteredWorktreeRoots,
   removeCargoTargetDir,
 } from "./cleanup-cargo-targets.mjs";
+import { createLocalReleaseCargoTarget } from "./release-build-config.mjs";
 
 function fixture(t) {
   const root = mkdtempSync(path.join(os.tmpdir(), "ccsm-cache-js-"));
@@ -131,6 +132,80 @@ test("validates supported target boundaries before invoking Cargo", (t) => {
       ),
     /supported release\/SDD Cargo target/,
   );
+});
+
+test("cleans only exact abandoned local release Cargo targets", (t) => {
+  const root = fixture(t);
+  const now = new Date("2026-09-09T18:00:00Z");
+  const old = new Date(now.getTime() - 8 * 60 * 60 * 1000);
+  const releaseRoot = ".tmp/local-release-cargo";
+  const runId = "00000000-0000-4000-8000-000000000001";
+  const exitedPid = 2147483647;
+  const unknownPid = exitedPid - 1;
+  const runName = `run-${exitedPid}-${runId}`;
+  const kill = process.kill;
+  t.mock.method(process, "kill", (pid, signal) => {
+    if (pid === exitedPid || pid === unknownPid) {
+      const code = pid === exitedPid ? "ESRCH" : "EPERM";
+      throw Object.assign(new Error(code), { code });
+    }
+    return kill(pid, signal);
+  });
+
+  const activeTarget = createLocalReleaseCargoTarget(root);
+  utimesSync(activeTarget, old, old);
+  const abandoned = makeDirectory(root, path.join(releaseRoot, runName), { now });
+  makeDirectory(
+    root,
+    path.join(releaseRoot, `run-${unknownPid}-${runId}`),
+    { now },
+  );
+  const recentName = `run-${exitedPid}-00000000-0000-4000-8000-000000000002`;
+  const recent = makeDirectory(root, path.join(releaseRoot, recentName));
+  utimesSync(recent, now, now);
+  makeDirectory(root, path.join(releaseRoot, `run-${exitedPid}-abc`), { now });
+  makeDirectory(root, path.join(releaseRoot, "nested", runName), { now });
+  const output = makeDirectory(root, path.join("output", runName), { now });
+  const linkedName = `run-${exitedPid}-00000000-0000-4000-8000-000000000003`;
+  symlinkSync(
+    output,
+    path.join(root, releaseRoot, linkedName),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  const manifest = path.join(makeDirectory(root, "src-tauri"), "Cargo.toml");
+  writeFileSync(manifest, "[package]\n");
+
+  const { candidates } = cleanupCargoCache({
+    worktreeRoots: [root],
+    dryRun: true,
+    now,
+  });
+  assert.deepEqual(candidates.map(({ fullName }) => fullName), [abandoned]);
+
+  const calls = [];
+  const run = (exe, args, options) => {
+    calls.push({ exe, args, options });
+    return { status: 0 };
+  };
+  assert.throws(
+    () => removeCargoTargetDir(root, activeTarget, { run, now }),
+    /active or recently modified/,
+  );
+  utimesSync(abandoned, now, now);
+  assert.throws(
+    () => removeCargoTargetDir(root, abandoned, { run, now }),
+    /active or recently modified/,
+  );
+  assert.deepEqual(calls, []);
+  utimesSync(abandoned, old, old);
+  removeCargoTargetDir(root, abandoned, { run, now });
+  assert.deepEqual(calls, [
+    {
+      exe: "cargo",
+      args: ["clean", "--manifest-path", manifest, "--target-dir", abandoned],
+      options: { cwd: root, stdio: "inherit", windowsHide: true },
+    },
+  ]);
 });
 
 test("active Cargo or rustc blocks destructive cleanup", (t) => {

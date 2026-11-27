@@ -974,11 +974,15 @@ fn create_backup_retains_only_latest_entries() {
     let backups_dir = config_dir.join("backups");
     fs::create_dir_all(&backups_dir).expect("create backups dir");
     for idx in 0..12 {
-        let manual = backups_dir.join(format!("manual_{idx:02}.json"));
-        fs::write(&manual, format!("{{\"idx\":{idx}}}")).expect("seed manual backup");
+        let backup = backups_dir.join(format!("backup_20000101_0000{idx:02}.json"));
+        fs::write(&backup, format!("{{\"idx\":{idx}}}")).expect("seed config backup");
     }
-
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    let env_backup = backups_dir.join("env-backup-20000101_000000.json");
+    let manual = backups_dir.join("backup_keep-this.json");
+    let directory = backups_dir.join("backup_20000102_000000.json");
+    fs::write(&env_backup, "{}").expect("seed environment backup");
+    fs::write(&manual, "{}").expect("seed manual backup");
+    fs::create_dir(&directory).expect("seed recovery directory");
 
     let latest_backup_id =
         ConfigService::create_backup(&config_path).expect("create backup with cleanup");
@@ -990,11 +994,15 @@ fn create_backup_retains_only_latest_entries() {
     let entries: Vec<_> = fs::read_dir(&backups_dir)
         .expect("read backups dir")
         .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let path = entry.path();
+            path.is_file() && path != env_backup && path != manual
+        })
         .collect();
-    assert!(
-        entries.len() <= 10,
-        "expected backups to be trimmed to at most 10 files, got {}",
-        entries.len()
+    assert_eq!(
+        entries.len(),
+        2,
+        "keep the new config backup and one prior config backup"
     );
 
     let latest_path = backups_dir.join(format!("{latest_backup_id}.json"));
@@ -1004,15 +1012,9 @@ fn create_backup_retains_only_latest_entries() {
         latest_path.display()
     );
 
-    // 进一步确认保留的条目包含一些历史文件，说明清理逻辑仅裁剪多余部分
-    let manual_kept = entries
-        .iter()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .any(|name| name.starts_with("manual_"));
-    assert!(
-        manual_kept,
-        "cleanup should keep part of the older backups to maintain history"
-    );
+    assert!(env_backup.is_file());
+    assert!(manual.is_file());
+    assert!(directory.is_dir());
 }
 
 #[test]

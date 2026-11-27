@@ -15,7 +15,11 @@ use super::transform_responses::{
     web_search_max_uses_exceeded_error, web_search_result_from_annotation,
     web_search_results_from_action, web_search_tool_result_error,
 };
-use crate::proxy::sse::{strip_sse_field, SseOrJsonFrames, SseOrJsonItem};
+use crate::proxy::{
+    error::ProxyError,
+    hyper_client::MAX_RESPONSE_BODY_BYTES,
+    sse::{strip_sse_field, SseOrJsonFrames, SseOrJsonItem},
+};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -27,14 +31,161 @@ fn response_object_from_event(data: &Value) -> &Value {
 }
 
 pub(crate) fn anthropic_sse(event_name: &str, payload: &Value) -> Bytes {
-    Bytes::from(format!(
-        "event: {event_name}\ndata: {}\n\n",
-        serde_json::to_string(payload).unwrap_or_default()
-    ))
+    encode_anthropic_sse(event_name, payload, false)
 }
 
-fn anthropic_ping_sse() -> Bytes {
-    anthropic_sse("ping", &json!({"type":"ping"}))
+fn encode_anthropic_sse(name: &str, payload: &Value, retryable: bool) -> Bytes {
+    let mut bytes = Vec::new();
+    write_anthropic_sse(&mut bytes, name, payload, retryable)
+        .expect("Anthropic event serialization to a buffer is infallible");
+    Bytes::from(bytes)
+}
+
+fn write_anthropic_sse(
+    mut writer: impl std::io::Write,
+    name: &str,
+    payload: &Value,
+    retryable: bool,
+) -> serde_json::Result<()> {
+    if retryable {
+        writeln!(writer, "{RETRYABLE_STREAM_MARKER}").map_err(serde_json::Error::io)?;
+    }
+    write!(writer, "event: {name}\ndata: ").map_err(serde_json::Error::io)?;
+    serde_json::to_writer(&mut writer, payload)?;
+    writer.write_all(b"\n\n").map_err(serde_json::Error::io)
+}
+
+pub(crate) struct AnthropicStreamEvent {
+    name: &'static str,
+    payload: Value,
+    retryable: bool,
+    encoded_len: Option<usize>,
+}
+
+#[derive(Default)]
+struct EncodedLength(usize);
+
+impl std::io::Write for EncodedLength {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn charge_response_bytes(used: &mut usize, bytes: usize, limit: usize) -> Result<(), ProxyError> {
+    let size = used.saturating_add(bytes);
+    if size > limit {
+        return Err(ProxyError::ResponseBodyTooLarge(size));
+    }
+    *used = size;
+    Ok(())
+}
+
+impl AnthropicStreamEvent {
+    fn into_sse(self) -> Bytes {
+        encode_anthropic_sse(self.name, &self.payload, self.retryable)
+    }
+
+    /// Charge the same encoded size as the streaming API without materializing
+    /// those bytes on the non-streaming path.
+    pub(crate) fn into_budgeted_payload(
+        mut self,
+        used: &mut usize,
+        limit: usize,
+    ) -> Result<Value, ProxyError> {
+        self.charge_encoded_size(used, limit)?;
+        Ok(self.payload)
+    }
+
+    fn encoded_size(&mut self) -> usize {
+        *self.encoded_len.get_or_insert_with(|| {
+            let mut size = EncodedLength::default();
+            write_anthropic_sse(&mut size, self.name, &self.payload, self.retryable)
+                .expect("Anthropic event serialization to a byte counter is infallible");
+            size.0
+        })
+    }
+
+    fn charge_encoded_size(&mut self, used: &mut usize, limit: usize) -> Result<(), ProxyError> {
+        charge_response_bytes(used, self.encoded_size(), limit)
+    }
+}
+
+struct PendingWebSearchResult {
+    result_events: [AnthropicStreamEvent; 2],
+    sources: Vec<Value>,
+    source_urls: HashSet<String>,
+    source_bytes: usize,
+    events: Vec<AnthropicStreamEvent>,
+    encoded_size: usize,
+    limit: usize,
+}
+
+impl PendingWebSearchResult {
+    fn new(id: &str, index: u32, limit: usize) -> Result<Self, ProxyError> {
+        let mut result_events = web_search_result_events(index, id, Value::Array(Vec::new()));
+        let mut encoded_size = 0;
+        for event in &mut result_events {
+            event.charge_encoded_size(&mut encoded_size, limit)?;
+        }
+        Ok(Self {
+            result_events,
+            sources: Vec::new(),
+            source_urls: HashSet::new(),
+            source_bytes: 0,
+            events: Vec::new(),
+            encoded_size,
+            limit,
+        })
+    }
+
+    fn push(&mut self, mut event: AnthropicStreamEvent) -> Result<(), ProxyError> {
+        event.charge_encoded_size(&mut self.encoded_size, self.limit)?;
+        self.events.push(event);
+        Ok(())
+    }
+
+    fn append_annotation(&mut self, annotation: &Value) -> Result<(), ProxyError> {
+        let Some(url) = annotation.get("url").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        if self.source_urls.contains(url) {
+            return Ok(());
+        }
+        let Some(result) = web_search_result_from_annotation(annotation) else {
+            return Ok(());
+        };
+        // The empty result already includes the array brackets.
+        let comma_bytes = if self.sources.is_empty() { 0 } else { 1 };
+        let mut size = EncodedLength(comma_bytes);
+        serde_json::to_writer(&mut size, &result)
+            .expect("WebSearch result serialization to a byte counter is infallible");
+        charge_response_bytes(&mut self.encoded_size, size.0, self.limit)?;
+        self.source_bytes += size.0;
+        self.source_urls.insert(url.to_owned());
+        self.sources.push(result);
+        Ok(())
+    }
+
+    fn into_events(self) -> impl Iterator<Item = AnthropicStreamEvent> {
+        let [mut start, stop] = self.result_events;
+        start.encoded_len = Some(start.encoded_size() + self.source_bytes);
+        start.payload["content_block"]["content"] = Value::Array(self.sources);
+        [start, stop].into_iter().chain(self.events)
+    }
+}
+
+fn anthropic_event(name: &'static str, payload: Value) -> AnthropicStreamEvent {
+    AnthropicStreamEvent {
+        name,
+        payload,
+        retryable: false,
+        encoded_len: None,
+    }
 }
 
 fn responses_error_details(data: &Value, fallback: &str) -> (String, String) {
@@ -57,9 +208,13 @@ fn responses_error_details(data: &Value, fallback: &str) -> (String, String) {
 }
 
 pub(crate) fn anthropic_error_sse(message: &str, error_type: &str) -> Bytes {
-    anthropic_sse(
+    anthropic_error_event(message, error_type).into_sse()
+}
+
+fn anthropic_error_event(message: &str, error_type: &str) -> AnthropicStreamEvent {
+    anthropic_event(
         "error",
-        &json!({
+        json!({
             "type": "error",
             "error": {"type": error_type, "message": message}
         }),
@@ -75,24 +230,21 @@ pub(crate) fn anthropic_error_sse(message: &str, error_type: &str) -> Bytes {
 /// SSE 规范规定以冒号开头的行是注释，客户端解析器会忽略。
 pub(crate) const RETRYABLE_STREAM_MARKER: &str = ": cc-switch-retryable-stream-interruption";
 
-/// 带 [`RETRYABLE_STREAM_MARKER`] 注释行的错误事件。
-pub(crate) fn retryable_stream_error_sse(message: &str, error_type: &str) -> Bytes {
-    let event = anthropic_error_sse(message, error_type);
-    let mut bytes = Vec::with_capacity(RETRYABLE_STREAM_MARKER.len() + 1 + event.len());
-    bytes.extend_from_slice(RETRYABLE_STREAM_MARKER.as_bytes());
-    bytes.push(b'\n');
-    bytes.extend_from_slice(&event);
-    Bytes::from(bytes)
+fn retryable_stream_error_event(message: &str, error_type: &str) -> AnthropicStreamEvent {
+    AnthropicStreamEvent {
+        retryable: true,
+        ..anthropic_error_event(message, error_type)
+    }
 }
 
 /// Convert a compatible gateway's non-streaming Responses JSON into a complete
 /// Anthropic SSE lifecycle. This is used when the client requested streaming but
 /// the upstream ignored `stream:true` and returned `application/json`.
-fn responses_json_to_anthropic_sse(
+fn responses_json_to_anthropic_events(
     body: Value,
     hosted_web_search_name: Option<&str>,
     max_web_search_uses: Option<u64>,
-) -> Vec<Bytes> {
+) -> Vec<AnthropicStreamEvent> {
     let message = match super::transform_responses::responses_to_anthropic_with_web_search_options(
         body,
         hosted_web_search_name,
@@ -100,7 +252,7 @@ fn responses_json_to_anthropic_sse(
     ) {
         Ok(message) => message,
         Err(error) => {
-            return vec![anthropic_error_sse(
+            return vec![anthropic_error_event(
                 &error.to_string(),
                 "response_transform_error",
             )]
@@ -110,9 +262,9 @@ fn responses_json_to_anthropic_sse(
     let usage = message.get("usage").cloned().unwrap_or_else(|| json!({}));
     let mut start_usage = usage.clone();
     start_usage["output_tokens"] = json!(0);
-    let mut events = vec![anthropic_sse(
+    let mut events = vec![anthropic_event(
         "message_start",
-        &json!({
+        json!({
             "type": "message_start",
             "message": {
                 "id": message.get("id").cloned().unwrap_or_else(|| json!("")),
@@ -129,27 +281,27 @@ fn responses_json_to_anthropic_sse(
             let index = index as u64;
             match block.get("type").and_then(Value::as_str) {
                 Some("text") => {
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_start",
-                        &json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
+                        json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
                     ));
                     if let Some(text) = block.get("text").and_then(Value::as_str) {
                         if !text.is_empty() {
-                            events.push(anthropic_sse(
+                            events.push(anthropic_event(
                                 "content_block_delta",
-                                &json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
+                                json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
                             ));
                         }
                     }
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_stop",
-                        &json!({"type":"content_block_stop","index":index}),
+                        json!({"type":"content_block_stop","index":index}),
                     ));
                 }
                 Some("tool_use") => {
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_start",
-                        &json!({
+                        json!({
                             "type":"content_block_start",
                             "index":index,
                             "content_block":{
@@ -161,23 +313,23 @@ fn responses_json_to_anthropic_sse(
                         }),
                     ));
                     let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_delta",
-                        &json!({
+                        json!({
                             "type":"content_block_delta",
                             "index":index,
                             "delta":{"type":"input_json_delta","partial_json":serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())}
                         }),
                     ));
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_stop",
-                        &json!({"type":"content_block_stop","index":index}),
+                        json!({"type":"content_block_stop","index":index}),
                     ));
                 }
                 Some("server_tool_use") => {
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_start",
-                        &json!({
+                        json!({
                             "type":"content_block_start","index":index,
                             "content_block":{
                                 "type":"server_tool_use",
@@ -188,62 +340,62 @@ fn responses_json_to_anthropic_sse(
                         }),
                     ));
                     let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_delta",
-                        &json!({
+                        json!({
                             "type":"content_block_delta","index":index,
                             "delta":{"type":"input_json_delta","partial_json":serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())}
                         }),
                     ));
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_stop",
-                        &json!({"type":"content_block_stop","index":index}),
+                        json!({"type":"content_block_stop","index":index}),
                     ));
                 }
                 Some("web_search_tool_result") => {
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_start",
-                        &json!({"type":"content_block_start","index":index,"content_block":block}),
+                        json!({"type":"content_block_start","index":index,"content_block":block}),
                     ));
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_stop",
-                        &json!({"type":"content_block_stop","index":index}),
+                        json!({"type":"content_block_stop","index":index}),
                     ));
                 }
                 Some("thinking") => {
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_start",
-                        &json!({"type":"content_block_start","index":index,"content_block":{"type":"thinking","thinking":""}}),
+                        json!({"type":"content_block_start","index":index,"content_block":{"type":"thinking","thinking":""}}),
                     ));
                     if let Some(thinking) = block.get("thinking").and_then(Value::as_str) {
                         if !thinking.is_empty() {
-                            events.push(anthropic_sse(
+                            events.push(anthropic_event(
                                 "content_block_delta",
-                                &json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":thinking}}),
+                                json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":thinking}}),
                             ));
                         }
                     }
                     if let Some(signature) = block.get("signature").and_then(Value::as_str) {
                         if !signature.is_empty() {
-                            events.push(anthropic_sse(
+                            events.push(anthropic_event(
                                 "content_block_delta",
-                                &json!({"type":"content_block_delta","index":index,"delta":{"type":"signature_delta","signature":signature}}),
+                                json!({"type":"content_block_delta","index":index,"delta":{"type":"signature_delta","signature":signature}}),
                             ));
                         }
                     }
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_stop",
-                        &json!({"type":"content_block_stop","index":index}),
+                        json!({"type":"content_block_stop","index":index}),
                     ));
                 }
                 Some("redacted_thinking") => {
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_start",
-                        &json!({"type":"content_block_start","index":index,"content_block":block}),
+                        json!({"type":"content_block_start","index":index,"content_block":block}),
                     ));
-                    events.push(anthropic_sse(
+                    events.push(anthropic_event(
                         "content_block_stop",
-                        &json!({"type":"content_block_stop","index":index}),
+                        json!({"type":"content_block_stop","index":index}),
                     ));
                 }
                 _ => {}
@@ -251,9 +403,9 @@ fn responses_json_to_anthropic_sse(
         }
     }
 
-    events.push(anthropic_sse(
+    events.push(anthropic_event(
         "message_delta",
-        &json!({
+        json!({
             "type":"message_delta",
             "delta":{
                 "stop_reason":message.get("stop_reason").cloned().unwrap_or(Value::Null),
@@ -262,9 +414,9 @@ fn responses_json_to_anthropic_sse(
             "usage":usage
         }),
     ));
-    events.push(anthropic_sse(
+    events.push(anthropic_event(
         "message_stop",
-        &json!({"type":"message_stop"}),
+        json!({"type":"message_stop"}),
     ));
     events
 }
@@ -355,89 +507,80 @@ fn resolve_content_index(
     }
 }
 
-fn web_search_result_events(index: u32, tool_use_id: &str, content: Value) -> [Bytes; 2] {
+fn web_search_result_events(
+    index: u32,
+    tool_use_id: &str,
+    content: Value,
+) -> [AnthropicStreamEvent; 2] {
+    let mut result = json!({
+        "type":"content_block_start","index":index,
+        "content_block":{
+            "type":"web_search_tool_result","tool_use_id":tool_use_id,
+            "content":null,"caller":{"type":"direct"}
+        }
+    });
+    result["content_block"]["content"] = content;
     [
-        anthropic_sse(
-            "content_block_start",
-            &json!({
-                "type":"content_block_start","index":index,
-                "content_block":{
-                    "type":"web_search_tool_result","tool_use_id":tool_use_id,
-                    "content":content,"caller":{"type":"direct"}
-                }
-            }),
-        ),
-        anthropic_sse(
+        anthropic_event("content_block_start", result),
+        anthropic_event(
             "content_block_stop",
-            &json!({"type":"content_block_stop","index":index}),
+            json!({"type":"content_block_stop","index":index}),
         ),
     ]
 }
 
-fn append_web_search_annotation_results(annotations: &Value, sources: &mut Vec<Value>) {
-    let Some(annotations) = annotations.as_array() else {
-        return;
-    };
-    for annotation in annotations {
-        let Some(result) = web_search_result_from_annotation(annotation) else {
-            continue;
-        };
-        let Some(url) = result.get("url").and_then(Value::as_str) else {
-            continue;
-        };
-        if !sources
-            .iter()
-            .any(|source| source.get("url").and_then(Value::as_str) == Some(url))
-        {
-            sources.push(result);
+impl PendingWebSearchResult {
+    fn append_annotations(&mut self, annotations: Option<&Value>) -> Result<(), ProxyError> {
+        if let Some(annotations) = annotations.and_then(Value::as_array) {
+            for annotation in annotations {
+                self.append_annotation(annotation)?;
+            }
         }
+        Ok(())
     }
-}
 
-fn append_web_search_results_from_output_item(item: &Value, sources: &mut Vec<Value>) {
-    if item.get("type").and_then(Value::as_str) != Some("message") {
-        return;
-    }
-    let Some(content) = item.get("content").and_then(Value::as_array) else {
-        return;
-    };
-    for part in content {
-        if part.get("type").and_then(Value::as_str) == Some("output_text") {
-            if let Some(annotations) = part.get("annotations") {
-                append_web_search_annotation_results(annotations, sources);
-            }
+    fn append_output_item(&mut self, item: &Value) -> Result<(), ProxyError> {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            return Ok(());
         }
-    }
-}
-
-fn append_terminal_web_search_results(event_name: &str, data: &Value, sources: &mut Vec<Value>) {
-    match event_name {
-        "response.output_text.done" => {
-            if let Some(annotations) = data.get("annotations") {
-                append_web_search_annotation_results(annotations, sources);
-            }
-        }
-        "response.content_part.done" => {
-            if let Some(annotations) = data.pointer("/part/annotations") {
-                append_web_search_annotation_results(annotations, sources);
-            }
-        }
-        "response.output_item.done" => {
-            if let Some(item) = data.get("item") {
-                append_web_search_results_from_output_item(item, sources);
-            }
-        }
-        "response.completed" | "response.incomplete" => {
-            if let Some(output) = response_object_from_event(data)
-                .get("output")
-                .and_then(Value::as_array)
-            {
-                for item in output {
-                    append_web_search_results_from_output_item(item, sources);
+        if let Some(content) = item.get("content").and_then(Value::as_array) {
+            for part in content {
+                if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                    self.append_annotations(part.get("annotations"))?;
                 }
             }
         }
-        _ => {}
+        Ok(())
+    }
+
+    fn append_terminal_results(
+        &mut self,
+        event_name: &str,
+        data: &Value,
+    ) -> Result<(), ProxyError> {
+        match event_name {
+            "response.output_text.done" => self.append_annotations(data.get("annotations"))?,
+            "response.content_part.done" => {
+                self.append_annotations(data.pointer("/part/annotations"))?;
+            }
+            "response.output_item.done" => {
+                if let Some(item) = data.get("item") {
+                    self.append_output_item(item)?;
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                if let Some(output) = response_object_from_event(data)
+                    .get("output")
+                    .and_then(Value::as_array)
+                {
+                    for item in output {
+                        self.append_output_item(item)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -445,7 +588,7 @@ fn take_open_web_search_terminal_events(
     open_indices: &mut HashSet<u32>,
     web_search_index_by_id: &HashMap<String, u32>,
     next_content_index: &mut u32,
-) -> Vec<Bytes> {
+) -> Vec<AnthropicStreamEvent> {
     let mut open_searches: Vec<(u32, &str)> = web_search_index_by_id
         .iter()
         .filter_map(|(id, index)| {
@@ -458,9 +601,9 @@ fn take_open_web_search_terminal_events(
     let mut events = Vec::new();
     for (index, id) in open_searches {
         open_indices.remove(&index);
-        events.push(anthropic_sse(
+        events.push(anthropic_event(
             "content_block_stop",
-            &json!({"type":"content_block_stop","index":index}),
+            json!({"type":"content_block_stop","index":index}),
         ));
         let result_index = *next_content_index;
         *next_content_index += 1;
@@ -491,7 +634,29 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
     hosted_web_search_name: Option<String>,
     max_web_search_uses: Option<u64>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
-    async_stream::stream! {
+    create_anthropic_event_stream_from_responses(
+        stream,
+        hosted_web_search_name,
+        max_web_search_uses,
+        MAX_RESPONSE_BODY_BYTES,
+    )
+    .map(|event| {
+        Ok(match event {
+            Ok(event) => event.into_sse(),
+            Err(error) => anthropic_error_sse(&error.to_string(), "response_too_large"),
+        })
+    })
+}
+
+pub(crate) fn create_anthropic_event_stream_from_responses<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    hosted_web_search_name: Option<String>,
+    max_web_search_uses: Option<u64>,
+    max_deferred_bytes: usize,
+) -> impl Stream<Item = Result<AnthropicStreamEvent, ProxyError>> + Send {
+    async_stream::try_stream! {
         let hosted_web_search_name = hosted_web_search_name
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "web_search".to_string());
@@ -518,8 +683,10 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
         let mut completed_web_search_ids = HashSet::new();
         let mut web_search_index_by_id: HashMap<String, u32> = HashMap::new();
         let mut emitted_citations = HashSet::new();
-        let mut pending_web_search_result: Option<(String, u32, Vec<Value>)> = None;
-        let mut deferred_after_web_search: Vec<Bytes> = Vec::new();
+        let mut emitted_citation_bytes = 0;
+        // Text and citations may wait for a hosted search result so that its
+        // block appears first. Meter the retained events before queueing them.
+        let mut pending_web_search_result: Option<PendingWebSearchResult> = None;
         let mut legacy_reasoning_index: Option<u32> = None;
         let mut has_substantive_output = false;
         let mut terminated = false;
@@ -546,29 +713,29 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                 let candidate = text.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}');
                                 match serde_json::from_str::<Value>(candidate) {
                                     Ok(body) => {
-                                        for event in responses_json_to_anthropic_sse(
+                                        for event in responses_json_to_anthropic_events(
                                             body,
                                             Some(&hosted_web_search_name),
                                             max_web_search_uses,
                                         ) {
-                                            yield Ok(event);
+                                            yield event;
                                         }
                                     }
                                     Err(error) => {
-                                        yield Ok(anthropic_error_sse(
+                                        yield anthropic_error_event(
                                             &format!("Invalid JSON response from Responses upstream: {error}"),
                                             "response_parse_error",
-                                        ));
+                                        );
                                     }
                                 }
                                 terminated = true;
                                 break 'stream_loop;
                             }
                             SseOrJsonItem::Oversized => {
-                                yield Ok(anthropic_error_sse(
+                                yield anthropic_error_event(
                                     "Upstream SSE or JSON body exceeded the proxy size limit",
                                     "response_too_large",
-                                ));
+                                );
                                 terminated = true;
                                 break 'stream_loop;
                             }
@@ -620,8 +787,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                             continue;
                         }
 
-                        if let Some((_, _, sources)) = pending_web_search_result.as_mut() {
-                            append_terminal_web_search_results(event_name, &data, sources);
+                        if let Some(pending) = pending_web_search_result.as_mut() {
+                            pending.append_terminal_results(event_name, &data)?;
                         }
 
                         let output_item_may_complete_pending_web_search = event_name
@@ -639,15 +806,10 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                 | "response.completed"
                                 | "response.incomplete"
                         );
-                        if pending_web_search_result.is_some()
-                            && !may_complete_pending_web_search
-                        {
-                            if let Some((id, index, sources)) = pending_web_search_result.take() {
-                                for event in web_search_result_events(index, &id, Value::Array(sources)) {
-                                    yield Ok(event);
-                                }
-                                for event in deferred_after_web_search.drain(..) {
-                                    yield Ok(event);
+                        if !may_complete_pending_web_search {
+                            if let Some(pending) = pending_web_search_result.take() {
+                                for event in pending.into_events() {
+                                    yield event;
                                 }
                             }
                         }
@@ -665,9 +827,9 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                             has_substantive_output = true;
                         }
                         if delta_requires_message_start && !has_sent_message_start {
-                            yield Ok(anthropic_sse(
+                            yield anthropic_event(
                                 "message_start",
-                                &json!({
+                                json!({
                                     "type":"message_start",
                                     "message":{
                                         "id":message_id.clone().unwrap_or_default(),
@@ -677,7 +839,7 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                         "usage":{"input_tokens":0,"output_tokens":0}
                                     }
                                 }),
-                            ));
+                            );
                             has_sent_message_start = true;
                         }
 
@@ -715,10 +877,9 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                         "usage": start_usage
                                     }
                                 });
-                                let sse = format!("event: message_start\ndata: {}\n\n",
-                                    serde_json::to_string(&event).unwrap_or_default());
+                                let packet = anthropic_event("message_start", event);
                                 log::debug!("[Claude/Responses] >>> Anthropic SSE: message_start");
-                                yield Ok(Bytes::from(sse));
+                                yield packet;
                             }
 
                             // ================================================
@@ -737,9 +898,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                             "usage": { "input_tokens": 0, "output_tokens": 0 }
                                         }
                                     });
-                                    let sse = format!("event: message_start\ndata: {}\n\n",
-                                        serde_json::to_string(&start_event).unwrap_or_default());
-                                    yield Ok(Bytes::from(sse));
+                                    let packet = anthropic_event("message_start", start_event);
+                                    yield packet;
                                     has_sent_message_start = true;
                                 }
 
@@ -771,13 +931,12 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                 "text": ""
                                             }
                                         });
-                                        let sse = format!("event: content_block_start\ndata: {}\n\n",
-                                            serde_json::to_string(&event).unwrap_or_default());
-                                        let event = Bytes::from(sse);
-                                        if pending_web_search_result.is_some() {
-                                            deferred_after_web_search.push(event);
+                                        let packet = anthropic_event("content_block_start", event);
+                                        let event = packet;
+                                        if let Some(pending) = pending_web_search_result.as_mut() {
+                                            pending.push(event)?;
                                         } else {
-                                            yield Ok(event);
+                                            yield event;
                                         }
                                         open_indices.insert(index);
                                     }
@@ -811,13 +970,12 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                 "text": ""
                                             }
                                         });
-                                        let start_sse = format!("event: content_block_start\ndata: {}\n\n",
-                                            serde_json::to_string(&start_event).unwrap_or_default());
-                                        let event = Bytes::from(start_sse);
-                                        if pending_web_search_result.is_some() {
-                                            deferred_after_web_search.push(event);
+                                        let start_packet = anthropic_event("content_block_start", start_event);
+                                        let event = start_packet;
+                                        if let Some(pending) = pending_web_search_result.as_mut() {
+                                            pending.push(event)?;
                                         } else {
-                                            yield Ok(event);
+                                            yield event;
                                         }
                                         open_indices.insert(index);
                                     }
@@ -829,14 +987,13 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                             "text": delta
                                         }
                                     });
-                                    let sse = format!("event: content_block_delta\ndata: {}\n\n",
-                                        serde_json::to_string(&event).unwrap_or_default());
-                                    let event = Bytes::from(sse);
-                                    if pending_web_search_result.is_some() {
-                                        deferred_after_web_search.push(event);
-                                        yield Ok(anthropic_ping_sse());
+                                    let packet = anthropic_event("content_block_delta", event);
+                                    let event = packet;
+                                    if let Some(pending) = pending_web_search_result.as_mut() {
+                                        pending.push(event)?;
+                                        yield anthropic_event("ping", json!({"type":"ping"}));
                                     } else {
-                                        yield Ok(event);
+                                        yield event;
                                     }
                                 }
                             }
@@ -868,13 +1025,12 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                 "text": ""
                                             }
                                         });
-                                        let start_sse = format!("event: content_block_start\ndata: {}\n\n",
-                                            serde_json::to_string(&start_event).unwrap_or_default());
-                                        let event = Bytes::from(start_sse);
-                                        if pending_web_search_result.is_some() {
-                                            deferred_after_web_search.push(event);
+                                        let start_packet = anthropic_event("content_block_start", start_event);
+                                        let event = start_packet;
+                                        if let Some(pending) = pending_web_search_result.as_mut() {
+                                            pending.push(event)?;
                                         } else {
-                                            yield Ok(event);
+                                            yield event;
                                         }
                                         open_indices.insert(index);
                                     }
@@ -887,14 +1043,13 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                             "text": delta
                                         }
                                     });
-                                    let sse = format!("event: content_block_delta\ndata: {}\n\n",
-                                        serde_json::to_string(&event).unwrap_or_default());
-                                    let event = Bytes::from(sse);
-                                    if pending_web_search_result.is_some() {
-                                        deferred_after_web_search.push(event);
-                                        yield Ok(anthropic_ping_sse());
+                                    let packet = anthropic_event("content_block_delta", event);
+                                    let event = packet;
+                                    if let Some(pending) = pending_web_search_result.as_mut() {
+                                        pending.push(event)?;
+                                        yield anthropic_event("ping", json!({"type":"ping"}));
                                     } else {
-                                        yield Ok(event);
+                                        yield event;
                                     }
                                 }
                             }
@@ -919,9 +1074,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                     "type": "content_block_stop",
                                                     "index": index
                                                 });
-                                                let stop_sse = format!("event: content_block_stop\ndata: {}\n\n",
-                                                    serde_json::to_string(&stop_event).unwrap_or_default());
-                                                yield Ok(Bytes::from(stop_sse));
+                                                let stop_packet = anthropic_event("content_block_stop", stop_event);
+                                                yield stop_packet;
                                             }
                                             if fallback_open_index == Some(index) {
                                                 fallback_open_index = None;
@@ -939,9 +1093,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                     "usage": { "input_tokens": 0, "output_tokens": 0 }
                                                 }
                                             });
-                                            let sse = format!("event: message_start\ndata: {}\n\n",
-                                                serde_json::to_string(&start_event).unwrap_or_default());
-                                            yield Ok(Bytes::from(sse));
+                                            let packet = anthropic_event("message_start", start_event);
+                                            yield packet;
                                             has_sent_message_start = true;
                                         }
 
@@ -986,9 +1139,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                 "name": name
                                             }
                                         });
-                                        let sse = format!("event: content_block_start\ndata: {}\n\n",
-                                            serde_json::to_string(&event).unwrap_or_default());
-                                        yield Ok(Bytes::from(sse));
+                                        let packet = anthropic_event("content_block_start", event);
+                                        yield packet;
                                         open_indices.insert(index);
                                     } else if item_type == "web_search_call" {
                                         let id = item
@@ -1008,16 +1160,16 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                         has_substantive_output = true;
                                         if let Some(index) = current_text_index.take() {
                                             if open_indices.remove(&index) {
-                                                yield Ok(anthropic_sse(
+                                                yield anthropic_event(
                                                     "content_block_stop",
-                                                    &json!({"type":"content_block_stop","index":index}),
-                                                ));
+                                                    json!({"type":"content_block_stop","index":index}),
+                                                );
                                             }
                                         }
                                         if !has_sent_message_start {
-                                            yield Ok(anthropic_sse(
+                                            yield anthropic_event(
                                                 "message_start",
-                                                &json!({
+                                                json!({
                                                     "type":"message_start",
                                                     "message":{
                                                         "id":message_id.clone().unwrap_or_default(),
@@ -1026,15 +1178,15 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                         "usage":{"input_tokens":0,"output_tokens":0}
                                                     }
                                                 }),
-                                            ));
+                                            );
                                             has_sent_message_start = true;
                                         }
                                         let call_index = next_content_index;
                                         next_content_index += 1;
                                         web_search_index_by_id.insert(id.clone(), call_index);
-                                        yield Ok(anthropic_sse(
+                                        yield anthropic_event(
                                             "content_block_start",
-                                            &json!({
+                                            json!({
                                                 "type":"content_block_start","index":call_index,
                                                 "content_block":{
                                                     "type":"server_tool_use","id":id,
@@ -1043,24 +1195,24 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                     "caller":{"type":"direct"}
                                                 }
                                             }),
-                                        ));
+                                        );
                                         open_indices.insert(call_index);
 
                                         if max_web_search_uses
                                             .is_some_and(|limit| web_search_count >= limit)
                                         {
-                                            yield Ok(anthropic_sse(
+                                            yield anthropic_event(
                                                 "content_block_delta",
-                                                &json!({
+                                                json!({
                                                     "type":"content_block_delta","index":call_index,
                                                     "delta":{"type":"input_json_delta","partial_json":"{}"}
                                                 }),
-                                            ));
+                                            );
                                             open_indices.remove(&call_index);
-                                            yield Ok(anthropic_sse(
+                                            yield anthropic_event(
                                                 "content_block_stop",
-                                                &json!({"type":"content_block_stop","index":call_index}),
-                                            ));
+                                                json!({"type":"content_block_stop","index":call_index}),
+                                            );
                                             let result_index = next_content_index;
                                             next_content_index += 1;
                                             for event in web_search_result_events(
@@ -1068,19 +1220,19 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                 &id,
                                                 web_search_max_uses_exceeded_error(),
                                             ) {
-                                                yield Ok(event);
+                                                yield event;
                                             }
                                             for event in take_open_web_search_terminal_events(
                                                 &mut open_indices,
                                                 &web_search_index_by_id,
                                                 &mut next_content_index,
                                             ) {
-                                                yield Ok(event);
+                                                yield event;
                                             }
                                             if open_indices.is_empty() {
-                                                yield Ok(anthropic_sse(
+                                                yield anthropic_event(
                                                     "message_delta",
-                                                    &json!({
+                                                    json!({
                                                         "type":"message_delta",
                                                         "delta":{
                                                             "stop_reason":if has_tool_use { "tool_use" } else { "end_turn" },
@@ -1091,16 +1243,16 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                             "server_tool_use":{"web_search_requests":web_search_count}
                                                         }
                                                     }),
-                                                ));
-                                                yield Ok(anthropic_sse(
+                                                );
+                                                yield anthropic_event(
                                                     "message_stop",
-                                                    &json!({"type":"message_stop"}),
-                                                ));
+                                                    json!({"type":"message_stop"}),
+                                                );
                                             } else {
-                                                yield Ok(anthropic_error_sse(
+                                                yield anthropic_error_event(
                                                     "Responses upstream started a web search beyond max_uses while another content block was incomplete",
                                                     "stream_truncated",
-                                                ));
+                                                );
                                             }
                                             terminated = true;
                                             break 'stream_loop;
@@ -1118,9 +1270,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                     "usage": { "input_tokens": 0, "output_tokens": 0 }
                                                 }
                                             });
-                                            let sse = format!("event: message_start\ndata: {}\n\n",
-                                                serde_json::to_string(&start_event).unwrap_or_default());
-                                            yield Ok(Bytes::from(sse));
+                                            let packet = anthropic_event("message_start", start_event);
+                                            yield packet;
                                             has_sent_message_start = true;
                                         }
 
@@ -1202,9 +1353,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                     .unwrap_or("")
                                             }
                                         });
-                                        let start_sse = format!("event: content_block_start\ndata: {}\n\n",
-                                            serde_json::to_string(&start_event).unwrap_or_default());
-                                        yield Ok(Bytes::from(start_sse));
+                                        let start_packet = anthropic_event("content_block_start", start_event);
+                                        yield start_packet;
                                         open_indices.insert(index);
                                     }
 
@@ -1226,9 +1376,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                             "partial_json": delta
                                         }
                                     });
-                                    let sse = format!("event: content_block_delta\ndata: {}\n\n",
-                                        serde_json::to_string(&event).unwrap_or_default());
-                                    yield Ok(Bytes::from(sse));
+                                    let packet = anthropic_event("content_block_delta", event);
+                                    yield packet;
                                 }
                             }
 
@@ -1274,9 +1423,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                     "partial_json": sanitized
                                                 }
                                             });
-                                            let sse = format!("event: content_block_delta\ndata: {}\n\n",
-                                                serde_json::to_string(&event).unwrap_or_default());
-                                            yield Ok(Bytes::from(sse));
+                                            let packet = anthropic_event("content_block_delta", event);
+                                            yield packet;
                                         }
                                     } else if !tool_had_delta.contains(&index) {
                                         // Some compatible gateways skip delta events and only
@@ -1295,18 +1443,16 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                     "partial_json": arguments
                                                 }
                                             });
-                                            let sse = format!("event: content_block_delta\ndata: {}\n\n",
-                                                serde_json::to_string(&event).unwrap_or_default());
-                                            yield Ok(Bytes::from(sse));
+                                            let packet = anthropic_event("content_block_delta", event);
+                                            yield packet;
                                         }
                                     }
                                     let event = json!({
                                         "type": "content_block_stop",
                                         "index": index
                                     });
-                                    let sse = format!("event: content_block_stop\ndata: {}\n\n",
-                                        serde_json::to_string(&event).unwrap_or_default());
-                                    yield Ok(Bytes::from(sse));
+                                    let packet = anthropic_event("content_block_stop", event);
+                                    yield packet;
                                     if let Some(item_id) = item_id {
                                         tool_index_by_item_id.remove(item_id);
                                     }
@@ -1336,9 +1482,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                         "type": "content_block_stop",
                                         "index": index
                                     });
-                                    let sse = format!("event: content_block_stop\ndata: {}\n\n",
-                                        serde_json::to_string(&event).unwrap_or_default());
-                                    yield Ok(Bytes::from(sse));
+                                    let packet = anthropic_event("content_block_stop", event);
+                                    yield packet;
                                     if fallback_open_index == Some(index) {
                                         fallback_open_index = None;
                                     }
@@ -1363,9 +1508,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                 "type": "content_block_stop",
                                                 "index": index
                                             });
-                                            let stop_sse = format!("event: content_block_stop\ndata: {}\n\n",
-                                                serde_json::to_string(&stop_event).unwrap_or_default());
-                                            yield Ok(Bytes::from(stop_sse));
+                                            let stop_packet = anthropic_event("content_block_stop", stop_event);
+                                            yield stop_packet;
                                         }
                                         if fallback_open_index == Some(index) {
                                             fallback_open_index = None;
@@ -1410,9 +1554,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                 "thinking": ""
                                             }
                                         });
-                                        let start_sse = format!("event: content_block_start\ndata: {}\n\n",
-                                            serde_json::to_string(&start_event).unwrap_or_default());
-                                        yield Ok(Bytes::from(start_sse));
+                                        let start_packet = anthropic_event("content_block_start", start_event);
+                                        yield start_packet;
                                         open_indices.insert(index);
                                     }
 
@@ -1429,9 +1572,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                             "thinking": delta
                                         }
                                     });
-                                    let sse = format!("event: content_block_delta\ndata: {}\n\n",
-                                        serde_json::to_string(&event).unwrap_or_default());
-                                    yield Ok(Bytes::from(sse));
+                                    let packet = anthropic_event("content_block_delta", event);
+                                    yield packet;
                                 }
                             }
 
@@ -1472,9 +1614,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                     "index": index,
                                                     "content_block": {"type": "thinking", "thinking": ""}
                                                 });
-                                                let start_sse = format!("event: content_block_start\ndata: {}\n\n",
-                                                    serde_json::to_string(&start_event).unwrap_or_default());
-                                                yield Ok(Bytes::from(start_sse));
+                                                let start_packet = anthropic_event("content_block_start", start_event);
+                                                yield start_packet;
                                                 open_indices.insert(index);
                                             }
                                             reasoning_text_by_index
@@ -1486,9 +1627,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                 "index": index,
                                                 "delta": {"type": "thinking_delta", "thinking": text}
                                             });
-                                            let sse = format!("event: content_block_delta\ndata: {}\n\n",
-                                                serde_json::to_string(&event).unwrap_or_default());
-                                            yield Ok(Bytes::from(sse));
+                                            let packet = anthropic_event("content_block_delta", event);
+                                            yield packet;
                                         }
                                     }
                                 }
@@ -1514,9 +1654,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                 if let Some(index) = index {
                                     if open_indices.remove(&index) {
                                         let event = json!({"type": "content_block_stop", "index": index});
-                                        let sse = format!("event: content_block_stop\ndata: {}\n\n",
-                                            serde_json::to_string(&event).unwrap_or_default());
-                                        yield Ok(Bytes::from(sse));
+                                        let packet = anthropic_event("content_block_stop", event);
+                                        yield packet;
                                     }
                                     if legacy_reasoning_index == Some(index) {
                                         legacy_reasoning_index = None;
@@ -1540,7 +1679,7 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                         &data,
                                         "Responses upstream returned a failed terminal response",
                                     );
-                                    yield Ok(anthropic_error_sse(&message, &error_type));
+                                    yield anthropic_error_event(&message, &error_type);
                                     terminated = true;
                                     break 'stream_loop;
                                 }
@@ -1553,9 +1692,9 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                     {
                                         current_model = Some(model.to_string());
                                     }
-                                    yield Ok(anthropic_sse(
+                                    yield anthropic_event(
                                         "message_start",
-                                        &json!({
+                                        json!({
                                             "type":"message_start",
                                             "message":{
                                                 "id":message_id.clone().unwrap_or_default(),
@@ -1565,7 +1704,7 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                 "usage":{"input_tokens":0,"output_tokens":0}
                                             }
                                         }),
-                                    ));
+                                    );
                                     has_sent_message_start = true;
                                 }
                                 let terminal_status = response_obj
@@ -1584,14 +1723,9 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                         .and_then(|r| r.as_str()),
                                 );
 
-                                if let Some((id, index, sources)) = pending_web_search_result.take() {
-                                    for event in
-                                        web_search_result_events(index, &id, Value::Array(sources))
-                                    {
-                                        yield Ok(event);
-                                    }
-                                    for event in deferred_after_web_search.drain(..) {
-                                        yield Ok(event);
+                                if let Some(pending) = pending_web_search_result.take() {
+                                    for event in pending.into_events() {
+                                        yield event;
                                     }
                                 }
 
@@ -1600,7 +1734,7 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                     &web_search_index_by_id,
                                     &mut next_content_index,
                                 ) {
-                                    yield Ok(event);
+                                    yield event;
                                 }
 
                                 // Best effort: close any dangling blocks before message_delta/message_stop.
@@ -1612,9 +1746,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                             "type": "content_block_stop",
                                             "index": index
                                         });
-                                        let stop_sse = format!("event: content_block_stop\ndata: {}\n\n",
-                                            serde_json::to_string(&stop_event).unwrap_or_default());
-                                        yield Ok(Bytes::from(stop_sse));
+                                        let stop_packet = anthropic_event("content_block_stop", stop_event);
+                                        yield stop_packet;
                                         open_indices.remove(&index);
                                     }
                                 }
@@ -1640,17 +1773,15 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                     },
                                     "usage": usage_json
                                 });
-                                let sse = format!("event: message_delta\ndata: {}\n\n",
-                                    serde_json::to_string(&delta_event).unwrap_or_default());
+                                let packet = anthropic_event("message_delta", delta_event);
                                 log::debug!("[Claude/Responses] >>> Anthropic SSE: message_delta");
-                                yield Ok(Bytes::from(sse));
+                                yield packet;
 
                                 // Emit message_stop
                                 let stop_event = json!({"type": "message_stop"});
-                                let stop_sse = format!("event: message_stop\ndata: {}\n\n",
-                                    serde_json::to_string(&stop_event).unwrap_or_default());
+                                let stop_packet = anthropic_event("message_stop", stop_event);
                                 log::debug!("[Claude/Responses] >>> Anthropic SSE: message_stop");
-                                yield Ok(Bytes::from(stop_sse));
+                                yield stop_packet;
                                 terminated = true;
                             }
 
@@ -1667,7 +1798,7 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                         "Responses upstream emitted an error event"
                                     },
                                 );
-                                yield Ok(anthropic_error_sse(&message, &error_type));
+                                yield anthropic_error_event(&message, &error_type);
                                 terminated = true;
                             }
 
@@ -1677,18 +1808,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                 let Some(annotation) = data.get("annotation") else {
                                     continue;
                                 };
-                                if let Some((_, _, sources)) = pending_web_search_result.as_mut() {
-                                    if let Some(result) = web_search_result_from_annotation(annotation) {
-                                        let url = result
-                                            .get("url")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or_default();
-                                        if !sources.iter().any(|source| {
-                                            source.get("url").and_then(Value::as_str) == Some(url)
-                                        }) {
-                                            sources.push(result);
-                                        }
-                                    }
+                                if let Some(pending) = pending_web_search_result.as_mut() {
+                                    pending.append_annotation(annotation)?;
                                 }
                                 let Some(link) = web_search_citation_markdown(annotation) else {
                                     continue;
@@ -1698,23 +1819,29 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                 } else {
                                     ", "
                                 };
-                                if !emitted_citations.insert(link.clone()) {
+                                if emitted_citations.contains(&link) {
                                     continue;
                                 }
+                                charge_response_bytes(
+                                    &mut emitted_citation_bytes,
+                                    link.len(),
+                                    max_deferred_bytes,
+                                )?;
                                 if let Some(index) = current_text_index {
-                                    let event = anthropic_sse(
+                                    let event = anthropic_event(
                                         "content_block_delta",
-                                        &json!({
+                                        json!({
                                             "type":"content_block_delta","index":index,
                                             "delta":{"type":"text_delta","text":format!("{citation_prefix}{link}")}
                                         }),
                                     );
-                                    if pending_web_search_result.is_some() {
-                                        deferred_after_web_search.push(event);
+                                    if let Some(pending) = pending_web_search_result.as_mut() {
+                                        pending.push(event)?;
                                     } else {
-                                        yield Ok(event);
+                                        yield event;
                                     }
                                 }
+                                emitted_citations.insert(link);
                             }
                             "response.output_text.done" => {
                                 if let Some(index) = current_text_index.take() {
@@ -1723,13 +1850,12 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                             "type": "content_block_stop",
                                             "index": index
                                         });
-                                        let stop_sse = format!("event: content_block_stop\ndata: {}\n\n",
-                                            serde_json::to_string(&stop_event).unwrap_or_default());
-                                        let event = Bytes::from(stop_sse);
-                                        if pending_web_search_result.is_some() {
-                                            deferred_after_web_search.push(event);
+                                        let stop_packet = anthropic_event("content_block_stop", stop_event);
+                                        let event = stop_packet;
+                                        if let Some(pending) = pending_web_search_result.as_mut() {
+                                            pending.push(event)?;
                                         } else {
-                                            yield Ok(event);
+                                            yield event;
                                         }
                                     }
                                     if fallback_open_index == Some(index) {
@@ -1786,16 +1912,14 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                             "partial_json": arguments
                                                         }
                                                     });
-                                                    let sse = format!("event: content_block_delta\ndata: {}\n\n",
-                                                        serde_json::to_string(&event).unwrap_or_default());
-                                                    yield Ok(Bytes::from(sse));
+                                                    let packet = anthropic_event("content_block_delta", event);
+                                                    yield packet;
                                                 }
                                             }
                                             open_indices.remove(&index);
                                             let event = json!({"type": "content_block_stop", "index": index});
-                                            let sse = format!("event: content_block_stop\ndata: {}\n\n",
-                                                serde_json::to_string(&event).unwrap_or_default());
-                                            yield Ok(Bytes::from(sse));
+                                            let packet = anthropic_event("content_block_stop", event);
+                                            yield packet;
                                             if let Some(id) = item_id {
                                                 tool_index_by_item_id.remove(id);
                                             }
@@ -1821,9 +1945,9 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                 .is_some_and(|limit| web_search_count >= limit)
                                             {
                                                 if !has_sent_message_start {
-                                                    yield Ok(anthropic_sse(
+                                                    yield anthropic_event(
                                                         "message_start",
-                                                        &json!({
+                                                        json!({
                                                             "type":"message_start",
                                                             "message":{
                                                                 "id":message_id.clone().unwrap_or_default(),
@@ -1832,7 +1956,7 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                                 "usage":{"input_tokens":0,"output_tokens":0}
                                                             }
                                                         }),
-                                                    ));
+                                                    );
                                                     has_sent_message_start = true;
                                                 }
                                                 let call_index = next_content_index;
@@ -1840,9 +1964,9 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                 let input = web_search_action_input(item);
                                                 let partial_json = serde_json::to_string(&input)
                                                     .unwrap_or_else(|_| "{}".to_string());
-                                                yield Ok(anthropic_sse(
+                                                yield anthropic_event(
                                                     "content_block_start",
-                                                    &json!({
+                                                    json!({
                                                         "type":"content_block_start","index":call_index,
                                                         "content_block":{
                                                             "type":"server_tool_use","id":id,
@@ -1850,22 +1974,22 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                             "caller":{"type":"direct"}
                                                         }
                                                     }),
-                                                ));
-                                                yield Ok(anthropic_sse(
+                                                );
+                                                yield anthropic_event(
                                                     "content_block_delta",
-                                                    &json!({
+                                                    json!({
                                                         "type":"content_block_delta","index":call_index,
                                                         "delta":{"type":"input_json_delta","partial_json":partial_json}
                                                     }),
-                                                ));
-                                                yield Ok(anthropic_sse(
+                                                );
+                                                yield anthropic_event(
                                                     "content_block_stop",
-                                                    &json!({"type":"content_block_stop","index":call_index}),
-                                                ));
+                                                    json!({"type":"content_block_stop","index":call_index}),
+                                                );
                                                 let result_index = next_content_index;
-                                                yield Ok(anthropic_sse(
+                                                yield anthropic_event(
                                                     "content_block_start",
-                                                    &json!({
+                                                    json!({
                                                         "type":"content_block_start","index":result_index,
                                                         "content_block":{
                                                             "type":"web_search_tool_result",
@@ -1874,23 +1998,23 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                             "caller":{"type":"direct"}
                                                         }
                                                     }),
-                                                ));
-                                                yield Ok(anthropic_sse(
+                                                );
+                                                yield anthropic_event(
                                                     "content_block_stop",
-                                                    &json!({"type":"content_block_stop","index":result_index}),
-                                                ));
+                                                    json!({"type":"content_block_stop","index":result_index}),
+                                                );
                                                 next_content_index += 1;
                                                 for event in take_open_web_search_terminal_events(
                                                     &mut open_indices,
                                                     &web_search_index_by_id,
                                                     &mut next_content_index,
                                                 ) {
-                                                    yield Ok(event);
+                                                    yield event;
                                                 }
                                                 if open_indices.is_empty() {
-                                                    yield Ok(anthropic_sse(
+                                                    yield anthropic_event(
                                                         "message_delta",
-                                                        &json!({
+                                                        json!({
                                                             "type":"message_delta",
                                                             "delta":{
                                                                 "stop_reason":if has_tool_use { "tool_use" } else { "end_turn" },
@@ -1901,25 +2025,25 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                                 "server_tool_use":{"web_search_requests":web_search_count}
                                                             }
                                                         }),
-                                                    ));
-                                                    yield Ok(anthropic_sse(
+                                                    );
+                                                    yield anthropic_event(
                                                         "message_stop",
-                                                        &json!({"type":"message_stop"}),
-                                                    ));
+                                                        json!({"type":"message_stop"}),
+                                                    );
                                                 } else {
-                                                    yield Ok(anthropic_error_sse(
+                                                    yield anthropic_error_event(
                                                         "Responses upstream started a web search beyond max_uses while another content block was incomplete",
                                                         "stream_truncated",
-                                                    ));
+                                                    );
                                                 }
                                                 terminated = true;
                                                 break 'stream_loop;
                                             }
                                             has_substantive_output = true;
                                             if !has_sent_message_start {
-                                                yield Ok(anthropic_sse(
+                                                yield anthropic_event(
                                                     "message_start",
-                                                    &json!({
+                                                    json!({
                                                         "type":"message_start",
                                                         "message":{
                                                             "id":message_id.clone().unwrap_or_default(),
@@ -1928,7 +2052,7 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                             "usage":{"input_tokens":0,"output_tokens":0}
                                                         }
                                                     }),
-                                                ));
+                                                );
                                                 has_sent_message_start = true;
                                             }
                                             let index = next_content_index;
@@ -1936,9 +2060,9 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                             seen_web_search_ids.insert(id.clone());
                                             web_search_index_by_id.insert(id.clone(), index);
                                             web_search_count += 1;
-                                            yield Ok(anthropic_sse(
+                                            yield anthropic_event(
                                                 "content_block_start",
-                                                &json!({
+                                                json!({
                                                     "type":"content_block_start","index":index,
                                                     "content_block":{
                                                         "type":"server_tool_use","id":id,
@@ -1946,7 +2070,7 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                         "caller":{"type":"direct"}
                                                     }
                                                 }),
-                                            ));
+                                            );
                                             open_indices.insert(index);
                                         }
                                         if !completed_web_search_ids.insert(id.clone()) {
@@ -1962,33 +2086,36 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                         let input = web_search_action_input(item);
                                         let partial_json = serde_json::to_string(&input)
                                             .unwrap_or_else(|_| "{}".to_string());
-                                        yield Ok(anthropic_sse(
+                                        yield anthropic_event(
                                             "content_block_delta",
-                                            &json!({
+                                            json!({
                                                 "type":"content_block_delta","index":call_index,
                                                 "delta":{"type":"input_json_delta","partial_json":partial_json}
                                             }),
-                                        ));
+                                        );
                                         if open_indices.remove(&call_index) {
-                                            yield Ok(anthropic_sse(
+                                            yield anthropic_event(
                                                 "content_block_stop",
-                                                &json!({"type":"content_block_stop","index":call_index}),
-                                            ));
+                                                json!({"type":"content_block_stop","index":call_index}),
+                                            );
                                         }
                                         let result_index = next_content_index;
                                         next_content_index += 1;
                                         let error = web_search_tool_result_error(item);
                                         let results = web_search_results_from_action(item);
                                         if error.is_none() && results.is_empty() {
-                                            pending_web_search_result =
-                                                Some((id, result_index, Vec::new()));
+                                            pending_web_search_result = Some(PendingWebSearchResult::new(
+                                                &id,
+                                                result_index,
+                                                max_deferred_bytes,
+                                            )?);
                                         } else {
                                             let content = error
                                                 .unwrap_or_else(|| Value::Array(results));
                                             for event in
                                                 web_search_result_events(result_index, &id, content)
                                             {
-                                                yield Ok(event);
+                                                yield event;
                                             }
                                         }
                                     }
@@ -2025,18 +2152,16 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                 "index": index,
                                                 "content_block": {"type": "thinking", "thinking": ""}
                                             });
-                                            let start_sse = format!("event: content_block_start\ndata: {}\n\n",
-                                                serde_json::to_string(&start_event).unwrap_or_default());
-                                            yield Ok(Bytes::from(start_sse));
+                                            let start_packet = anthropic_event("content_block_start", start_event);
+                                            yield start_packet;
                                             open_indices.insert(index);
                                             let delta_event = json!({
                                                 "type": "content_block_delta",
                                                 "index": index,
                                                 "delta": {"type": "thinking_delta", "thinking": full_text}
                                             });
-                                            let delta_sse = format!("event: content_block_delta\ndata: {}\n\n",
-                                                serde_json::to_string(&delta_event).unwrap_or_default());
-                                            yield Ok(Bytes::from(delta_sse));
+                                            let delta_packet = anthropic_event("content_block_delta", delta_event);
+                                            yield delta_packet;
                                         }
 
                                         let encrypted = final_item
@@ -2054,9 +2179,8 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                             "signature": envelope
                                                         }
                                                     });
-                                                    let signature_sse = format!("event: content_block_delta\ndata: {}\n\n",
-                                                        serde_json::to_string(&signature_event).unwrap_or_default());
-                                                    yield Ok(Bytes::from(signature_sse));
+                                                    let signature_packet = anthropic_event("content_block_delta", signature_event);
+                                                    yield signature_packet;
                                                 } else {
                                                     let start_event = json!({
                                                         "type": "content_block_start",
@@ -2066,18 +2190,16 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                                             "data": envelope
                                                         }
                                                     });
-                                                    let start_sse = format!("event: content_block_start\ndata: {}\n\n",
-                                                        serde_json::to_string(&start_event).unwrap_or_default());
-                                                    yield Ok(Bytes::from(start_sse));
+                                                    let start_packet = anthropic_event("content_block_start", start_event);
+                                                    yield start_packet;
                                                     open_indices.insert(index);
                                                 }
                                             }
                                         }
                                         if open_indices.remove(&index) {
                                             let stop_event = json!({"type": "content_block_stop", "index": index});
-                                            let stop_sse = format!("event: content_block_stop\ndata: {}\n\n",
-                                                serde_json::to_string(&stop_event).unwrap_or_default());
-                                            yield Ok(Bytes::from(stop_sse));
+                                            let stop_packet = anthropic_event("content_block_stop", stop_event);
+                                            yield stop_packet;
                                         }
                                         if let Some(id) = item_id {
                                             reasoning_index_by_item_id.remove(id);
@@ -2106,10 +2228,10 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                     }
                     let chain = crate::proxy::error::error_chain_message(&e);
                     log::error!("Responses stream error: {chain}");
-                    yield Ok(retryable_stream_error_sse(
+                    yield retryable_stream_error_event(
                         &format!("Stream error: {chain}"),
                         "stream_error",
-                    ));
+                    );
                     terminated = true;
                     break;
                 }
@@ -2117,12 +2239,9 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
         }
 
         if !terminated {
-            if let Some((id, index, sources)) = pending_web_search_result.take() {
-                for event in web_search_result_events(index, &id, Value::Array(sources)) {
-                    yield Ok(event);
-                }
-                for event in deferred_after_web_search.drain(..) {
-                    yield Ok(event);
+            if let Some(pending) = pending_web_search_result.take() {
+                for event in pending.into_events() {
+                    yield event;
                 }
             }
             for event in take_open_web_search_terminal_events(
@@ -2130,7 +2249,7 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                 &web_search_index_by_id,
                 &mut next_content_index,
             ) {
-                yield Ok(event);
+                yield event;
             }
             let has_open_tool = open_indices.iter().any(|index| {
                 tool_name_by_index.contains_key(index) || tool_args_by_index.contains_key(index)
@@ -2147,15 +2266,15 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                 let mut remaining: Vec<u32> = open_indices.iter().copied().collect();
                 remaining.sort_unstable();
                 for index in remaining {
-                    yield Ok(anthropic_sse(
+                    yield anthropic_event(
                         "content_block_stop",
-                        &json!({"type":"content_block_stop","index":index}),
-                    ));
+                        json!({"type":"content_block_stop","index":index}),
+                    );
                 }
                 if !has_sent_message_start {
-                    yield Ok(anthropic_sse(
+                    yield anthropic_event(
                         "message_start",
-                        &json!({
+                        json!({
                             "type":"message_start",
                             "message":{
                                 "id":message_id.clone().unwrap_or_default(),
@@ -2165,11 +2284,11 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                                 "usage":{"input_tokens":0,"output_tokens":0}
                             }
                         }),
-                    ));
+                    );
                 }
-                yield Ok(anthropic_sse(
+                yield anthropic_event(
                     "message_delta",
-                    &json!({
+                    json!({
                         "type":"message_delta",
                         "delta":{"stop_reason":"max_tokens","stop_sequence":null},
                         "usage":{
@@ -2177,15 +2296,15 @@ pub(crate) fn create_anthropic_sse_stream_from_responses_with_web_search_options
                             "server_tool_use":{"web_search_requests":web_search_count}
                         }
                     }),
-                ));
-                yield Ok(anthropic_sse("message_stop", &json!({"type":"message_stop"})));
+                );
+                yield anthropic_event("message_stop", json!({"type":"message_stop"}));
             } else {
                 // A truncated tool/reasoning block cannot be safely finalized: tool
                 // JSON may be partial and thinking may be missing its signature.
-                yield Ok(retryable_stream_error_sse(
+                yield retryable_stream_error_event(
                     "Responses upstream stream ended before a terminal event",
                     "stream_truncated",
-                ));
+                );
             }
         }
     }
@@ -2999,6 +3118,203 @@ mod tests {
         let result = merged.find("web_search_tool_result").unwrap();
         let text = merged.find("Rust has official docs.").unwrap();
         assert!(call < result && result < text);
+    }
+
+    const WEB_SEARCH_WITHOUT_SOURCES: &str = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ws\",\"model\":\"test\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"ws_1\",\"type\":\"web_search_call\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"docs\"}}}\n\n",
+    );
+
+    fn deferred_text_start_size() -> usize {
+        anthropic_sse(
+            "content_block_start",
+            &json!({"type":"content_block_start","index":2,
+                "content_block":{"type":"text","text":""}}),
+        )
+        .len()
+    }
+
+    #[tokio::test]
+    async fn hosted_web_search_deferred_events_stop_at_the_encoded_byte_budget() {
+        let start_size = deferred_text_start_size();
+        let result_size: usize = web_search_result_events(1, "ws_1", json!([]))
+            .into_iter()
+            .map(|event| event.into_sse().len())
+            .sum();
+        for size in [16, 4096] {
+            let delta_text = "é".repeat(size);
+            let delta_size = anthropic_sse(
+                "content_block_delta",
+                &json!({"type":"content_block_delta","index":2,
+                    "delta":{"type":"text_delta","text":delta_text}}),
+            )
+            .len();
+            let delta = Bytes::from(format!(
+                "data: {}\n\n",
+                json!({"type":"response.output_text.delta","output_index":1,
+                    "content_index":0,"delta":delta_text})
+            ));
+            let max_deferred_bytes = result_size + start_size + 3 * delta_size;
+            let polls = Arc::new(AtomicUsize::new(0));
+            let poll_counter = polls.clone();
+            let upstream = stream::poll_fn(move |_| {
+                let poll = poll_counter.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::Ready(match poll {
+                    0 => Some(Ok::<_, std::io::Error>(Bytes::from_static(
+                        WEB_SEARCH_WITHOUT_SOURCES.as_bytes(),
+                    ))),
+                    1..=100 => Some(Ok(delta.clone())),
+                    _ => None,
+                })
+            });
+            let events = create_anthropic_event_stream_from_responses(
+                upstream,
+                None,
+                Some(1),
+                max_deferred_bytes,
+            );
+            let events: Vec<_> = events.collect().await;
+            assert!(matches!(
+                events.last(),
+                Some(Err(ProxyError::ResponseBodyTooLarge(bytes)))
+                    if *bytes == max_deferred_bytes + delta_size
+            ));
+            assert_eq!(polls.load(Ordering::SeqCst), 5);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Ok(event) if event.name == "ping"))
+                    .count(),
+                3,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_web_search_pending_sources_share_budget_and_preserve_first_seen_order() {
+        for size in [16, 4096] {
+            let first = json!({
+                "type":"url_citation", "url":"https://example.test/first",
+                "title":"a\"\\é".repeat(size),
+            });
+            let repeated = json!({
+                "type":"url_citation", "url":"https://example.test/first",
+                "title":"alternate title",
+            });
+            let second = json!({
+                "type":"url_citation", "url":"https://example.test/second",
+                "title":"b".repeat(size),
+            });
+            let sources = json!([
+                web_search_result_from_annotation(&first).unwrap(),
+                web_search_result_from_annotation(&second).unwrap(),
+            ]);
+            let result_size: usize = web_search_result_events(1, "ws_1", sources.clone())
+                .into_iter()
+                .map(|event| event.into_sse().len())
+                .sum();
+            let delta_size = anthropic_sse(
+                "content_block_delta",
+                &json!({"type":"content_block_delta","index":2,
+                    "delta":{"type":"text_delta","text":"answer"}}),
+            )
+            .len();
+            let required_bytes = result_size + deferred_text_start_size() + delta_size;
+            let mut input = WEB_SEARCH_WITHOUT_SOURCES.to_string();
+            for event in [
+                json!({"type":"response.output_text.annotation.added","annotation":first}),
+                json!({"type":"response.output_text.annotation.added","annotation":repeated}),
+                json!({"type":"response.output_text.delta","output_index":1,
+                    "content_index":0,"delta":"answer"}),
+                json!({"type":"response.completed","response":{"output":[
+                    {"type":"message","content":[
+                        {"type":"output_text","annotations":[repeated, second]}
+                    ]}
+                ]}}),
+            ] {
+                input.push_str(&format!("data: {event}\n\n"));
+            }
+            let input = Bytes::from(input);
+            for limit in [required_bytes - 1, required_bytes] {
+                let upstream = stream::iter([Ok::<_, std::io::Error>(input.clone())]);
+                let events =
+                    create_anthropic_event_stream_from_responses(upstream, None, Some(1), limit);
+                let events: Vec<_> = events.collect().await;
+                if limit < required_bytes {
+                    assert!(matches!(
+                        events.last(),
+                        Some(Err(ProxyError::ResponseBodyTooLarge(bytes)))
+                            if *bytes == required_bytes
+                    ));
+                    continue;
+                }
+                let events = events.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+                let result_index = events
+                    .iter()
+                    .position(|event| {
+                        event
+                            .payload
+                            .pointer("/content_block/type")
+                            .and_then(Value::as_str)
+                            == Some("web_search_tool_result")
+                    })
+                    .unwrap();
+                let text_index = events
+                    .iter()
+                    .position(|event| {
+                        event.payload.pointer("/delta/text").and_then(Value::as_str)
+                            == Some("answer")
+                    })
+                    .unwrap();
+                assert!(result_index < text_index);
+                let result = events.into_iter().nth(result_index).unwrap();
+                let wire_size = encode_anthropic_sse(result.name, &result.payload, false).len();
+                let mut used = 0;
+                let result = result.into_budgeted_payload(&mut used, wire_size).unwrap();
+                assert_eq!(used, wire_size);
+                assert_eq!(result.pointer("/content_block/content"), Some(&sources));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_web_search_citation_keys_stop_at_the_byte_budget_without_text() {
+        for size in [128, 4096] {
+            let title = "a".repeat(size);
+            let annotation = move |index: usize| {
+                json!({"type":"url_citation", "url":"https://example.test",
+                    "title":format!("{index:02}{title}")})
+            };
+            let citation_size = web_search_citation_markdown(&annotation(0)).unwrap().len();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let poll_counter = polls.clone();
+            let upstream = stream::poll_fn(move |_| {
+                let poll = poll_counter.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::Ready(match poll {
+                    0 => Some(Ok::<_, std::io::Error>(Bytes::from_static(
+                        WEB_SEARCH_WITHOUT_SOURCES.as_bytes(),
+                    ))),
+                    1..=20 => Some(Ok(Bytes::from(format!(
+                        "data: {}\n\n",
+                        json!({"type":"response.output_text.annotation.added",
+                            "annotation":annotation(poll)})
+                    )))),
+                    _ => None,
+                })
+            });
+            let events = create_anthropic_event_stream_from_responses(
+                upstream,
+                None,
+                Some(1),
+                4 * citation_size,
+            );
+            let events: Vec<_> = events.collect().await;
+            assert!(matches!(
+                events.last(),
+                Some(Err(ProxyError::ResponseBodyTooLarge(bytes))) if *bytes == 5 * citation_size
+            ));
+            assert_eq!(polls.load(Ordering::SeqCst), 6);
+        }
     }
 
     #[tokio::test]

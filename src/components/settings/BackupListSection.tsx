@@ -166,7 +166,7 @@ export function BackupListSection({
   };
 
   const intervalValue = String(backupIntervalHours ?? 24);
-  const retainValue = String(backupRetainCount ?? 10);
+  const retainValue = String(Math.min(Math.max(backupRetainCount ?? 2, 1), 2));
 
   return (
     <div className="space-y-4">
@@ -243,7 +243,7 @@ export function BackupListSection({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {[3, 5, 10, 15, 20, 30, 50].map((n) => (
+              {[1, 2].map((n) => (
                 <SelectItem key={n} value={String(n)}>
                   {n}
                 </SelectItem>

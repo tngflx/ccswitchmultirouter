@@ -44,6 +44,44 @@ subtree, but must not silently weaken these repository invariants.
 - Do not remove, bypass, or weaken an ordinary guard or test to make a change
   pass. If a check cannot run, report the exact command and reason.
 
+## Source-First Verification and Outputs
+
+- Do not run a resource-intensive compile, link, bundle, rebuild, or
+  build-producing test without the user's explicit approval in the current
+  conversation. This includes native Rust or C++ builds, renderer builds,
+  Tauri builds, release builds, and commands that implicitly rebuild a locked
+  or stale target. Delegation, an earlier approval for a different command, a
+  repository-required check, or an existing watcher does not provide approval.
+- Lightweight checks may run without approval when they should finish quickly
+  and do not create substantial artifacts. A small isolated compile is allowed
+  only when its low resource use and short duration are clear in advance and it
+  will not replace or launch a user-owned artifact. Source inspection,
+  `git diff --check`, formatting checks, and metadata-only validation are
+  examples. If resource use, duration, or artifact impact is uncertain, ask
+  the user before running the command and treat it as resource-intensive.
+- Investigate the root cause and finish the fix across all affected layers,
+  including regressions, before asking the user for an app rebuild. During
+  source iteration, use source review, no-emit checks, formatting checks, and
+  tests that can run without recompiling.
+- Defer checks that compile code until the complete source change is ready.
+  The main agent coordinates one final verification pass for the task, using
+  the repository's normal commands and existing cache. Reuse valid results
+  for unchanged sources and count focused tests covered by a broader run.
+  Include these rules in every delegation.
+- Request a single user-owned app rebuild once the complete fix is ready for
+  live verification. Summarize the checks already passed and the behavior
+  that still needs to be verified in the running app.
+- Keep ad hoc intermediates, fixtures, and verification logs in one unique
+  directory under `%TEMP%` per run. Set output paths explicitly, put requested
+  deliverables in their intended location, and remove the run's resolved
+  scratch directory on success or failure. Use the normal cache maintenance
+  tools for shared caches. Preserve release artifacts, project data, and Codex
+  chat and recovery files. Run noninteractive Windows test commands, compilers,
+  and background helpers with hidden console windows.
+- Keep repository changes limited to the implementation, required regressions,
+  and requested deliverables. Use the existing checkout, cache, and output
+  locations.
+
 ## Resource Usage Regression Tests
 
 - Changes to session collection, request forwarding, or stream inspection must
@@ -58,8 +96,9 @@ subtree, but must not silently weaken these repository invariants.
   disabled diagnostics, and streaming delimiters split into tiny fragments.
   Preserve accounting, protocol handling, redaction, and reasoning-effort policy
   while reducing work.
-- Run `pnpm performance:verify` after these changes. It checks deterministic
-  work bounds through scoped library tests, without starting the application.
+- Run `pnpm performance:verify` in the final pass for these changes. It checks
+  deterministic work bounds through scoped library tests without starting
+  the application.
   Keep the runner fail-closed when an expected test is absent or skipped; run
   `pnpm performance:test` and `pnpm scripts:check` when changing the runner.
   This is source regression coverage, not a live CPU or memory audit.
@@ -144,6 +183,10 @@ Treat these as cross-layer invariants, not UI-only behavior:
   complete refresh may disable upstream models that are no longer present.
 
 ## Required Verification
+
+Apply the timing and output rules under Source-First Verification and Outputs
+to these checks. A scoped or broader Rust test run that covers the required
+filters satisfies the corresponding test command.
 
 When changing a catalog, provider form, wizard, routing, protocol probe,
 projection, Sub-Agent behavior, or their shared helpers, run all of these:

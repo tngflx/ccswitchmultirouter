@@ -21,6 +21,7 @@ use crate::config::{
     sanitize_provider_name, write_json_file, write_text_file,
 };
 use crate::error::AppError;
+use crate::file_revision::FileRevision;
 use crate::model_capabilities::{image_input_capability_from_modalities, ImageInputCapability};
 use crate::provider::Provider;
 use crate::proxy::providers::codex_reasoning::{
@@ -36,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::State;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, TableLike};
 
@@ -80,6 +81,7 @@ const CODEX_CONSUMER_FAILURE_RETRY_DELAY: std::time::Duration = std::time::Durat
 struct CodexExecutableStamp {
     length: u64,
     modified: Option<std::time::SystemTime>,
+    revision: Option<FileRevision>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +115,56 @@ struct CachedCodexConsumerProfile {
     bundled_models: Option<Vec<Value>>,
     attempted_at: std::time::Instant,
 }
+
+impl CachedCodexConsumerProfile {
+    fn is_current(&self, key: &CodexConsumerKey, now: std::time::Instant) -> bool {
+        &self.key == key
+            && (self.bundled_models.is_some()
+                || now.saturating_duration_since(self.attempted_at)
+                    < CODEX_CONSUMER_FAILURE_RETRY_DELAY)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(Default))]
+pub(crate) struct OfficialModelsRevision {
+    paths: OfficialModelsPaths,
+    local: Option<FileRevision>,
+    backup: Option<FileRevision>,
+    public: Option<FileRevision>,
+    #[cfg(not(test))]
+    consumer: Option<(CodexConsumerKey, Option<std::time::Instant>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(Default))]
+struct OfficialModelsPaths {
+    codex_home: PathBuf,
+    public: PathBuf,
+}
+
+impl OfficialModelsPaths {
+    fn current() -> Self {
+        Self {
+            codex_home: get_codex_config_dir(),
+            public: codex_public_official_models_cache_path(),
+        }
+    }
+}
+
+type OfficialModelsSnapshot = (OfficialModelsRevision, Option<Arc<[Value]>>);
+const OFFICIAL_MODELS_CACHE_CAPACITY: usize = 4;
+static CODEX_OFFICIAL_MODELS_CACHE: Mutex<Vec<OfficialModelsSnapshot>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+thread_local! {
+    static OFFICIAL_MODELS_MERGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+type CachedCodexRuntimeDeclaration = (PathBuf, Option<FileRevision>, Option<DeclaredCodexRuntime>);
+
+static CODEX_RUNTIME_DECLARATION_CACHE: Mutex<Option<CachedCodexRuntimeDeclaration>> =
+    Mutex::new(None);
 
 /// Top-level `config.toml` key that controls Codex's built-in web-search tool.
 pub(crate) const CODEX_WEB_SEARCH_FIELD: &str = "web_search";
@@ -1789,22 +1841,124 @@ fn sort_codex_catalog_specs_for_picker(
 /// 保持同一选择逻辑：当前 cache 或 backup 带 CCSM 所有权标记时都不能作为官方来源。
 /// 合并顺序为 CCSM 随包基线、OpenAI/Codex 公共目录缓存、本机可信官方 cache/backup、
 /// 当前 Codex CLI bundled；后面的本机运行时来源覆盖同 ID，公共目录仍可补充未来模型。
-/// 任何读取/解析失败都返回 None（静默降级，不阻断投影）。
+/// 单个来源读取或解析失败时，继续使用其余可信来源。
 ///
 /// P2：公开给 reasoning resolver 作为 official 来源（仅未知平台生效）。
 pub fn codex_official_models_cache() -> Option<Vec<Value>> {
-    let cache_path = get_codex_models_cache_path();
-    let backup_path = get_codex_models_cache_backup_path();
-    let existing_cache = read_json_file_if_exists(&cache_path).ok().flatten();
-    let backup_cache = read_json_file_if_exists(&backup_path).ok().flatten();
-    let public_models = load_codex_public_official_models_cache();
-    official_models_with_bundled_fallback(
-        existing_cache.as_ref(),
-        backup_cache.as_ref(),
+    codex_official_models_snapshot().map(|models| models.to_vec())
+}
+
+pub(crate) fn codex_official_models_snapshot() -> Option<Arc<[Value]>> {
+    current_official_models_snapshot().1
+}
+
+pub(crate) fn official_models_revision() -> Option<OfficialModelsRevision> {
+    current_official_models_snapshot().0
+}
+
+fn current_official_models_snapshot() -> (Option<OfficialModelsRevision>, Option<Arc<[Value]>>) {
+    let mut cache = CODEX_OFFICIAL_MODELS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let paths = OfficialModelsPaths::current();
+    let revision = official_models_source_revision(&paths);
+    if let Some((_, models)) = cache
+        .iter()
+        .find(|(cached_revision, _)| revision.as_ref() == Some(cached_revision))
+    {
+        return (revision, models.clone());
+    }
+
+    // File read errors can be transient even when metadata is available.
+    // Malformed JSON still has a stable revision and contributes no models.
+    let local = read_official_model_cache(&paths.codex_home.join(CODEX_MODELS_CACHE_FILENAME));
+    let backup =
+        read_official_model_cache(&paths.codex_home.join(CODEX_MODELS_CACHE_BACKUP_FILENAME));
+    let public = read_official_model_cache(&paths.public);
+    let bundled = load_codex_bundled_models_at(&paths.codex_home);
+    #[cfg(test)]
+    OFFICIAL_MODELS_MERGES.with(|count| count.set(count.get() + 1));
+    let models = official_models_with_bundled_fallback(
+        local.as_ref().ok().and_then(Option::as_ref),
+        backup.as_ref().ok().and_then(Option::as_ref),
         load_codex_packaged_official_models().as_deref(),
-        public_models.as_deref(),
-        load_codex_bundled_models().as_deref(),
+        public
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .and_then(|cache| cache.get("models"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice),
+        bundled.as_deref(),
     )
+    .map(Arc::from);
+
+    let stable_revision = revision.filter(|revision| {
+        local.is_ok()
+            && backup.is_ok()
+            && public.is_ok()
+            && paths == OfficialModelsPaths::current()
+            && official_models_source_revision(&paths).as_ref() == Some(revision)
+    });
+    if let Some(revision) = stable_revision.as_ref() {
+        cache.retain(|(cached_revision, _)| cached_revision.paths != revision.paths);
+        cache.push((revision.clone(), models.clone()));
+        if cache.len() > OFFICIAL_MODELS_CACHE_CAPACITY {
+            cache.remove(0);
+        }
+    }
+    (stable_revision, models)
+}
+
+fn read_official_model_cache(path: &Path) -> std::io::Result<Option<Value>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn official_models_source_revision(paths: &OfficialModelsPaths) -> Option<OfficialModelsRevision> {
+    #[cfg(not(test))]
+    let consumer = {
+        let declared = current_codex_runtime_declaration(&paths.codex_home.join("config.toml"))?;
+        let context = current_codex_consumer_context_for_dir(declared, paths.codex_home.clone());
+        if let Some(key) = context.key {
+            key.executable_stamp.revision?;
+            for (path, stamp) in &key.package_stamps {
+                match stamp {
+                    Some(stamp) => {
+                        stamp.revision?;
+                    }
+                    None => {
+                        if FileRevision::read_optional(path)?.is_some() {
+                            return None;
+                        }
+                    }
+                }
+            }
+            let cache = CODEX_CONSUMER_PROFILE_CACHE.try_lock().ok()?;
+            let now = std::time::Instant::now();
+            let attempted_at = cache
+                .as_ref()
+                .filter(|profile| profile.is_current(&key, now))
+                .map(|profile| profile.attempted_at);
+            Some((key, attempted_at))
+        } else {
+            None
+        }
+    };
+
+    Some(OfficialModelsRevision {
+        paths: paths.clone(),
+        local: FileRevision::read_optional(&paths.codex_home.join(CODEX_MODELS_CACHE_FILENAME))?,
+        backup: FileRevision::read_optional(
+            &paths.codex_home.join(CODEX_MODELS_CACHE_BACKUP_FILENAME),
+        )?,
+        public: FileRevision::read_optional(&paths.public)?,
+        #[cfg(not(test))]
+        consumer,
+    })
 }
 
 pub(crate) fn load_codex_packaged_official_models() -> Option<Vec<Value>> {
@@ -1920,15 +2074,6 @@ fn merge_public_official_model_metadata(existing: &Value, public: &Value) -> Val
 
 fn codex_public_official_models_cache_path() -> PathBuf {
     crate::config::get_app_config_dir().join(CODEX_PUBLIC_OFFICIAL_MODELS_CACHE_FILENAME)
-}
-
-fn load_codex_public_official_models_cache() -> Option<Vec<Value>> {
-    read_json_file_if_exists(&codex_public_official_models_cache_path())
-        .ok()
-        .flatten()?
-        .get("models")?
-        .as_array()
-        .cloned()
 }
 
 /// Read only the observable metadata of the independently owned public
@@ -2155,7 +2300,7 @@ fn codex_catalog_model_specs_with_compiled_reasoning(
     let default_model = extract_codex_top_level_string(config_text, "model");
     let cached_context_windows = codex_cached_model_context_windows();
     let mut specs = Vec::new();
-    let official_models = codex_official_models_cache().unwrap_or_default();
+    let official_models = codex_official_models_snapshot().unwrap_or_default();
     let mut resolver_settings = settings.clone();
     if !config_text.trim().is_empty() {
         resolver_settings["config"] = json!(config_text);
@@ -2301,7 +2446,7 @@ fn codex_catalog_model_specs_with_compiled_reasoning(
                         platform,
                         None,
                         model,
-                        library.as_ref(),
+                        library.as_deref(),
                         &official_models,
                         |_| None,
                     );
@@ -2593,6 +2738,7 @@ fn codex_executable_stamp(path: &Path) -> Option<CodexExecutableStamp> {
     metadata.is_file().then(|| CodexExecutableStamp {
         length: metadata.len(),
         modified: metadata.modified().ok(),
+        revision: FileRevision::read(path),
     })
 }
 
@@ -2750,10 +2896,29 @@ fn codex_consumer_context_from_inputs(
 }
 
 fn codex_consumer_context(config_text: &str) -> CodexConsumerContext {
+    current_codex_consumer_context(declared_codex_runtime(config_text))
+}
+
+fn current_codex_consumer_context(declared: Option<DeclaredCodexRuntime>) -> CodexConsumerContext {
+    current_codex_consumer_context_for_dir(declared, get_codex_config_dir())
+}
+
+fn current_codex_consumer_context_for_dir(
+    declared: Option<DeclaredCodexRuntime>,
+    codex_home: PathBuf,
+) -> CodexConsumerContext {
     let explicit = std::env::var_os("CODEX_CLI_PATH").map(PathBuf::from);
-    let declared = declared_codex_runtime(config_text);
     let candidates = if explicit.is_none() && declared.is_none() {
-        discovered_codex_cli_candidates()
+        // The fixed candidates already lead the discovery list. Check them
+        // first so an ordinary PATH installation does not enumerate fallback
+        // version-manager directories for every routing revision read.
+        match CODEX_CLI_FIXED_CANDIDATES
+            .iter()
+            .find_map(|candidate| resolve_codex_cli_candidate(Path::new(candidate), false))
+        {
+            Some(executable) => vec![executable],
+            None => discovered_codex_cli_candidates(),
+        }
     } else {
         Vec::new()
     };
@@ -2762,13 +2927,32 @@ fn codex_consumer_context(config_text: &str) -> CodexConsumerContext {
         declared,
         &candidates,
         get_home_dir(),
-        get_codex_config_dir(),
+        codex_home,
     );
     if let Some(key) = consumer.key.as_mut() {
         // The CLI inherits this independently of CC Switch's target directory.
         key.environment_codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
     }
     consumer
+}
+
+fn current_codex_runtime_declaration(path: &Path) -> Option<Option<DeclaredCodexRuntime>> {
+    let revision = FileRevision::read_optional(path)?;
+    let mut cache = CODEX_RUNTIME_DECLARATION_CACHE.lock().ok()?;
+    if let Some((cached_path, cached_revision, declared)) = cache.as_ref() {
+        if cached_path == path && *cached_revision == revision {
+            return Some(declared.clone());
+        }
+    }
+    let declared = match revision {
+        Some(_) => declared_codex_runtime(&fs::read_to_string(path).ok()?),
+        None => None,
+    };
+    if FileRevision::read_optional(path)? != revision {
+        return None;
+    }
+    *cache = Some((path.to_owned(), revision, declared.clone()));
+    Some(declared)
 }
 
 fn get_or_load_codex_consumer_profile<F>(
@@ -2783,13 +2967,8 @@ where
     let mut entry = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(cached) = entry.as_ref().filter(|cached| &cached.key == key) {
-        if cached.bundled_models.is_some()
-            || now.saturating_duration_since(cached.attempted_at)
-                < CODEX_CONSUMER_FAILURE_RETRY_DELAY
-        {
-            return Ok(cached.bundled_models.clone());
-        }
+    if let Some(cached) = entry.as_ref().filter(|cached| cached.is_current(key, now)) {
+        return Ok(cached.bundled_models.clone());
     }
     let bundled_models = loader()?.filter(|models| !models.is_empty());
     *entry = Some(CachedCodexConsumerProfile {
@@ -2874,15 +3053,24 @@ fn load_codex_bundled_models_for_consumer(consumer: &CodexConsumerContext) -> Op
     }
 }
 
-fn load_codex_bundled_models() -> Option<Vec<Value>> {
+fn load_codex_bundled_models_at(codex_home: &Path) -> Option<Vec<Value>> {
     #[cfg(test)]
     {
+        let _ = codex_home;
         None
     }
     #[cfg(not(test))]
     {
-        let config = fs::read_to_string(get_codex_config_path()).unwrap_or_default();
-        load_codex_bundled_models_for_consumer(&codex_consumer_context(&config))
+        let path = codex_home.join("config.toml");
+        let declared = current_codex_runtime_declaration(&path).unwrap_or_else(|| {
+            fs::read_to_string(&path)
+                .ok()
+                .and_then(|config| declared_codex_runtime(&config))
+        });
+        load_codex_bundled_models_for_consumer(&current_codex_consumer_context_for_dir(
+            declared,
+            codex_home.to_owned(),
+        ))
     }
 }
 
@@ -3674,7 +3862,9 @@ pub(crate) async fn prewarm_codex_projection_processes() {
     #[cfg(not(test))]
     {
         schedule_codex_public_official_catalog_refresh();
-        let detection = tauri::async_runtime::spawn_blocking(load_codex_bundled_models);
+        let detection = tauri::async_runtime::spawn_blocking(|| {
+            load_codex_bundled_models_at(&get_codex_config_dir())
+        });
         match tokio::time::timeout(std::time::Duration::from_secs(8), detection).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => log::warn!("Codex bundled 模型探测任务失败: {error}"),
@@ -6170,59 +6360,65 @@ pub struct CodexModelReasoningResolution {
     pub detection: Option<crate::reasoning_capabilities::ProviderCapabilitySnapshot>,
 }
 
+fn codex_model_reasoning_resolver<'a>(
+    settings_config: &'a Value,
+    provider_id: &'a str,
+) -> impl Fn(&str) -> CodexModelReasoningResolution + 'a {
+    let library = crate::reasoning_capabilities::catalog::global_library();
+    let official_models = codex_official_models_snapshot().unwrap_or_default();
+    let platform = crate::reasoning_capabilities::provider_metadata::detect_platform_from_settings(
+        settings_config,
+    );
+    move |model| {
+        let model = model.trim();
+        let detection = std::cell::RefCell::new(None);
+        let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_for_settings(
+            settings_config,
+            platform,
+            Some(provider_id),
+            model,
+            library.as_deref(),
+            &official_models,
+            |candidate| {
+                let snapshot = crate::reasoning_capabilities::current_detection_for_settings(
+                    settings_config,
+                    provider_id,
+                    candidate,
+                );
+                if detection.borrow().is_none()
+                    && snapshot
+                        .as_ref()
+                        .and_then(crate::reasoning_capabilities::snapshot_to_capability)
+                        .is_some()
+                {
+                    *detection.borrow_mut() = snapshot.clone();
+                }
+                snapshot
+            },
+        );
+        let detection = detection.into_inner();
+        let resolved_capability =
+            crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(
+                resolved.capability.as_ref(),
+            );
+        CodexModelReasoningResolution {
+            model: model.to_string(),
+            capability: resolved.capability,
+            source: resolved.source.as_str().to_string(),
+            fingerprint: resolved.fingerprint,
+            resolved: resolved_capability,
+            has_detection_candidate: detection.is_some(),
+            detection,
+        }
+    }
+}
+
 fn resolve_codex_model_reasoning_capability_value(
     settings_config: &Value,
     provider_id: &str,
     model: &str,
 ) -> CodexModelReasoningResolution {
-    let model = model.trim().to_string();
-    let detection = std::cell::RefCell::new(None);
-    let library = crate::reasoning_capabilities::catalog::global_library();
-    let official_models = codex_official_models_cache().unwrap_or_default();
-    let platform = crate::reasoning_capabilities::provider_metadata::detect_platform_from_settings(
-        settings_config,
-    );
-    let resolved = crate::reasoning_capabilities::resolve_codex_model_capability_for_settings(
-        settings_config,
-        platform,
-        Some(provider_id),
-        &model,
-        library.as_ref(),
-        &official_models,
-        |candidate| {
-            let snapshot = crate::reasoning_capabilities::current_detection_for_settings(
-                settings_config,
-                provider_id,
-                candidate,
-            );
-            if detection.borrow().is_none()
-                && snapshot
-                    .as_ref()
-                    .and_then(crate::reasoning_capabilities::snapshot_to_capability)
-                    .is_some()
-            {
-                *detection.borrow_mut() = snapshot.clone();
-            }
-            snapshot
-        },
-    );
-    let detection = detection.into_inner();
-    let resolved_capability =
-        crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(
-            resolved.capability.as_ref(),
-        );
-    CodexModelReasoningResolution {
-        model,
-        capability: resolved.capability,
-        source: resolved.source.as_str().to_string(),
-        fingerprint: resolved.fingerprint,
-        resolved: resolved_capability,
-        has_detection_candidate: detection
-            .as_ref()
-            .and_then(crate::reasoning_capabilities::snapshot_to_capability)
-            .is_some(),
-        detection,
-    }
+    codex_model_reasoning_resolver(settings_config, provider_id)(model)
 }
 
 #[tauri::command]
@@ -6233,6 +6429,24 @@ pub fn resolve_codex_model_reasoning_capability(
     model: String,
 ) -> CodexModelReasoningResolution {
     resolve_codex_model_reasoning_capability_value(&settingsConfig, &providerId, &model)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn resolve_codex_model_reasoning_capabilities(
+    settingsConfig: Value,
+    providerId: String,
+    models: Vec<String>,
+) -> Result<Vec<CodexModelReasoningResolution>, String> {
+    if models.is_empty() {
+        return Ok(Vec::new());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let resolve = codex_model_reasoning_resolver(&settingsConfig, &providerId);
+        models.iter().map(|model| resolve(model)).collect()
+    })
+    .await
+    .map_err(|_| "Unable to resolve model reasoning capabilities".to_string())
 }
 
 /// Bind freshly generated maintained preset declarations to their original
@@ -7393,7 +7607,7 @@ fn enrich_codex_catalog_with_official_metadata_and_authority(
     let Some(routed_models) = catalog.get("models").and_then(Value::as_array) else {
         return Ok(catalog.clone());
     };
-    let official_models = codex_official_models_cache().unwrap_or_default();
+    let official_models = codex_official_models_snapshot().unwrap_or_default();
 
     let mut enriched = catalog.clone();
     if let Some(object) = enriched.as_object_mut() {
@@ -7486,7 +7700,7 @@ fn sync_codex_models_cache_with_cc_switch_catalog_and_authority(
     let existing_cache = read_json_file_if_exists(&cache_path)?;
     // 官方同 slug 元数据优先来自接管前 backup；backup 为空时使用 Codex 自带
     // bundled 官方目录，因此新模型不会被旧缓存/空 backup 卡住。
-    let official_models = codex_official_models_cache().unwrap_or_default();
+    let official_models = codex_official_models_snapshot().unwrap_or_default();
     let client_version = existing_cache
         .as_ref()
         .and_then(|cache| cache.get("client_version"))
@@ -7525,7 +7739,7 @@ fn sync_codex_models_cache_with_cc_switch_catalog_and_authority(
             if backup_needs_rebuild && !official_models.is_empty() {
                 let mut restored = backup.unwrap_or_else(|| cache.clone());
                 restored["etag"] = Value::Null;
-                restored["models"] = Value::Array(official_models.clone());
+                restored["models"] = Value::Array(official_models.to_vec());
                 if let Some(object) = restored.as_object_mut() {
                     object.remove("ccSwitchModelProvider");
                     object.remove("ccSwitchRoutingDependencyFingerprint");
@@ -8345,7 +8559,7 @@ fn read_back_codex_multirouter_projection_compiled(
         });
     let expected_cache_models = projected_codex_models_cache_entries(
         &expected_catalog,
-        &codex_official_models_cache().unwrap_or_default(),
+        &codex_official_models_snapshot().unwrap_or_default(),
         &reasoning_authoritative_ids,
     )
     .map(Value::Array);
@@ -13823,11 +14037,9 @@ wire_api = "responses"
     #[serial_test::serial]
     fn codex_subagent_profile_status_propagates_db_errors_and_never_infers_provider_from_model() {
         let _guard = TestHomeGuard::new();
-        let broken_db = crate::database::Database {
-            conn: std::sync::Mutex::new(
-                rusqlite::Connection::open_in_memory().expect("open schema-less database"),
-            ),
-        };
+        let broken_db = crate::database::Database::from_connection(
+            rusqlite::Connection::open_in_memory().expect("open schema-less database"),
+        );
         let error = get_codex_subagent_profile_statuses_from_db(&broken_db, json!({}))
             .expect_err("provider query errors must propagate through the status command");
         assert!(error.contains("no such table: providers"));
@@ -15019,6 +15231,122 @@ trust_level = "trusted"
 
     #[test]
     #[serial]
+    fn official_model_snapshot_reuses_one_merge_per_revision_and_respects_ownership() {
+        let _home = TestHomeGuard::new();
+        let local_path = get_codex_models_cache_path();
+        let backup_path = get_codex_models_cache_backup_path();
+        let local = "snapshot-local-a";
+        let rewritten = "snapshot-local-b";
+        let backup = "snapshot-backup";
+        let public = "snapshot-public";
+        let contains = |models: &[Value], slug: &str| {
+            models
+                .iter()
+                .any(|model| model["slug"].as_str() == Some(slug))
+        };
+        let merges = || OFFICIAL_MODELS_MERGES.with(std::cell::Cell::get);
+
+        seed_codex_models_cache(json!([{ "slug": local }]));
+        let before = merges();
+        let (revision, initial) = current_official_models_snapshot();
+        let initial = initial.expect("initial snapshot");
+        assert!(revision.is_some());
+        assert!(contains(&initial, local));
+        for _ in 0..10 {
+            assert_eq!(official_models_revision(), revision);
+            let snapshot = codex_official_models_snapshot().expect("warm snapshot");
+            assert!(Arc::ptr_eq(&snapshot, &initial));
+        }
+        assert_eq!(merges() - before, 1);
+
+        let last_modified =
+            filetime::FileTime::from_last_modification_time(&local_path.metadata().unwrap());
+        let contents = fs::read_to_string(&local_path).unwrap();
+        let rewritten_contents = contents.replace(local, rewritten);
+        assert_eq!(contents.len(), rewritten_contents.len());
+        fs::write(&local_path, rewritten_contents).unwrap();
+        filetime::set_file_mtime(&local_path, last_modified).unwrap();
+        let (rewritten_revision, updated) = current_official_models_snapshot();
+        let updated = updated.expect("rewritten snapshot");
+        assert_ne!(rewritten_revision, revision);
+        assert!(contains(&updated, rewritten));
+        assert!(!contains(&updated, local));
+        assert_eq!(merges() - before, 2);
+
+        write_json_file(
+            &backup_path,
+            &json!({ "etag": "original", "models": [{ "slug": backup }] }),
+        )
+        .expect("seed trusted backup");
+        write_json_file(
+            &local_path,
+            &json!({
+                "etag": CC_SWITCH_CODEX_MODELS_CACHE_ETAG,
+                "models": [{ "slug": rewritten }],
+            }),
+        )
+        .expect("simulate managed catalog");
+        let (managed_revision, managed) = current_official_models_snapshot();
+        let managed = managed.expect("managed snapshot");
+        assert_ne!(managed_revision, rewritten_revision);
+        assert!(contains(&managed, backup));
+        assert!(!contains(&managed, rewritten));
+        assert_eq!(merges() - before, 3);
+
+        store_codex_public_official_models_cache(&[json!({ "slug": public })])
+            .expect("store public model");
+        let (public_revision, refreshed) = current_official_models_snapshot();
+        let refreshed = refreshed.expect("refreshed snapshot");
+        assert_ne!(public_revision, managed_revision);
+        assert!(contains(&refreshed, public));
+        assert!(contains(&refreshed, backup));
+        assert_eq!(merges() - before, 4);
+
+        let _other_profile = TestHomeGuard::new();
+        let (other_revision, other) = current_official_models_snapshot();
+        let other = other.expect("packaged snapshot for empty profile");
+        assert!(other_revision.is_some());
+        assert_ne!(other_revision, public_revision);
+        for slug in [local, rewritten, backup, public] {
+            assert!(!contains(&other, slug));
+        }
+        assert_eq!(merges() - before, 5);
+    }
+
+    #[test]
+    #[serial]
+    fn official_model_snapshot_reuses_each_isolated_home_after_switching() {
+        let _first_home = TestHomeGuard::new();
+        let first_slug = "snapshot-switch-first";
+        seed_codex_models_cache(json!([{ "slug": first_slug }]));
+        let merges = || OFFICIAL_MODELS_MERGES.with(std::cell::Cell::get);
+        let before = merges();
+        let first_snapshot = codex_official_models_snapshot().expect("first snapshot");
+        assert!(first_snapshot
+            .iter()
+            .any(|model| model["slug"].as_str() == Some(first_slug)));
+        assert_eq!(merges() - before, 1);
+
+        let second_home = TestHomeGuard::new();
+        let second_slug = "snapshot-switch-second";
+        seed_codex_models_cache(json!([{ "slug": second_slug }]));
+        let second_snapshot = codex_official_models_snapshot().expect("second snapshot");
+        assert!(second_snapshot
+            .iter()
+            .any(|model| model["slug"].as_str() == Some(second_slug)));
+        assert_eq!(merges() - before, 2);
+
+        drop(second_home);
+        let first_again = codex_official_models_snapshot().expect("reused first snapshot");
+        assert!(Arc::ptr_eq(&first_snapshot, &first_again));
+        assert!(first_again
+            .iter()
+            .any(|model| model["slug"].as_str() == Some(first_slug)));
+        assert_eq!(merges() - before, 2);
+    }
+
+    #[test]
+    #[serial]
     fn storing_changed_public_official_catalog_reports_change_and_persists_new_metadata() {
         let _home = TestHomeGuard::new();
         let initial = vec![json!({
@@ -15036,8 +15364,10 @@ trust_level = "trusted"
             !store_codex_public_official_models_cache(&updated).expect("store unchanged catalog")
         );
 
-        let persisted = load_codex_public_official_models_cache().expect("read public catalog");
-        assert_eq!(persisted, updated);
+        let persisted = read_official_model_cache(&codex_public_official_models_cache_path())
+            .expect("read public catalog")
+            .expect("public catalog exists");
+        assert_eq!(persisted["models"], json!(updated));
     }
 
     /// 注入一次性的官方 OAuth 模型上下文覆盖值，供缺缓存场景的单测使用。
@@ -19328,7 +19658,7 @@ base_url = "http://127.0.0.1:15721/v1"
             None,
             "deepseek-v4-flash",
             None,
-            library.as_ref(),
+            library.as_deref(),
             &[],
         );
         assert_eq!(spec.reasoning_fingerprint, resolved.fingerprint);
@@ -21693,6 +22023,7 @@ trust_level = "trusted"
             executable_stamp: CodexExecutableStamp {
                 length: 1,
                 modified: Some(std::time::SystemTime::UNIX_EPOCH),
+                revision: None,
             },
             package_stamps: Vec::new(),
             home: PathBuf::from("test-home"),
@@ -21722,6 +22053,43 @@ trust_level = "trusted"
         assert_eq!(first, Some(vec![json!({ "slug": "first" })]));
         assert_eq!(second, first);
         assert_eq!(calls.get(), 1, "unchanged consumer should load only once");
+    }
+
+    #[test]
+    fn consumer_runtime_declaration_tracks_file_creation_replacement_and_removal() {
+        let dir = tempfile::tempdir().expect("test config directory");
+        let path = dir.path().join("config.toml");
+        assert!(current_codex_runtime_declaration(&path).unwrap().is_none());
+
+        let config =
+            |value: &str| format!("[mcp_servers.node_repl.env]\nCODEX_CLI_PATH = '{value}'\n");
+        fs::write(&path, config("first")).expect("first declaration");
+        let first = current_codex_runtime_declaration(&path).unwrap().unwrap();
+        assert_eq!(first.executable, Path::new("first"));
+
+        fs::remove_file(&path).expect("remove first declaration");
+        fs::write(&path, config("other")).expect("replace declaration");
+        let second = current_codex_runtime_declaration(&path).unwrap().unwrap();
+        assert_eq!(second.executable, Path::new("other"));
+
+        fs::remove_file(&path).expect("remove declaration");
+        assert!(current_codex_runtime_declaration(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn consumer_profile_revision_expires_failed_probe_at_its_retry_boundary() {
+        let cache = Mutex::new(None);
+        let key = test_codex_consumer_key("consumer");
+        let now = std::time::Instant::now();
+        assert!(
+            get_or_load_codex_consumer_profile(&cache, &key, now, || Ok(None))
+                .unwrap()
+                .is_none()
+        );
+        let entry = cache.lock().unwrap();
+        let profile = entry.as_ref().unwrap();
+        assert!(profile.is_current(&key, now));
+        assert!(!profile.is_current(&key, now + CODEX_CONSUMER_FAILURE_RETRY_DELAY));
     }
 
     #[test]
