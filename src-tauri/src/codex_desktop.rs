@@ -1027,25 +1027,148 @@ pub(crate) async fn list_cdp_targets(debug_port: u16) -> Result<Vec<CdpTarget>, 
             .await
             .unwrap_or(false)
         },
-        |endpoint| {
-            let client = &client;
-            async move {
-                let address = std::net::SocketAddr::new(endpoint, debug_port);
-                let url = format!("http://{address}/json");
-                client
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|error| format!("{url}: {error}"))?
-                    .error_for_status()
-                    .map_err(|error| format!("{url}: {error}"))?
-                    .json::<Vec<CdpTarget>>()
-                    .await
-                    .map_err(|error| format!("{url}: invalid target JSON: {error}"))
-            }
-        },
+        |endpoint| read_cdp_targets(&client, debug_port, endpoint),
     )
     .await
+}
+
+async fn read_cdp_targets(
+    client: &reqwest::Client,
+    debug_port: u16,
+    endpoint: IpAddr,
+) -> Result<Vec<CdpTarget>, String> {
+    let address = std::net::SocketAddr::new(endpoint, debug_port);
+    let url = format!("http://{address}/json");
+    client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| format!("{url}: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("{url}: {error}"))?
+        .json::<Vec<CdpTarget>>()
+        .await
+        .map_err(|error| format!("{url}: invalid target JSON: {error}"))
+}
+
+pub(crate) struct GuardianCdpDiscovery {
+    pub(crate) pages_by_port: Vec<(u16, Vec<CdpTarget>)>,
+    pub(crate) complete: bool,
+}
+
+pub(crate) async fn discover_codex_page_targets_for_guardian(
+    ports: &[u16],
+) -> GuardianCdpDiscovery {
+    #[cfg(target_os = "windows")]
+    {
+        let Ok(client) = codex_cdp_http_client() else {
+            return GuardianCdpDiscovery {
+                pages_by_port: Vec::new(),
+                complete: false,
+            };
+        };
+        discover_guardian_cdp_targets_with_snapshots(
+            ports,
+            read_windows_cdp_listener_snapshot,
+            |port, endpoint| read_cdp_targets(&client, port, endpoint),
+        )
+        .await
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut pages_by_port = Vec::new();
+        for &port in ports {
+            let Ok(targets) = list_cdp_targets(port).await else {
+                continue;
+            };
+            let Ok(pages) = pick_codex_page_targets_async(&targets, port).await else {
+                continue;
+            };
+            pages_by_port.push((port, pages));
+        }
+        GuardianCdpDiscovery {
+            pages_by_port,
+            complete: true,
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+async fn discover_guardian_cdp_targets_with_snapshots<S, Q, H, R>(
+    ports: &[u16],
+    mut read_snapshot: S,
+    read_targets: H,
+) -> GuardianCdpDiscovery
+where
+    S: FnMut(Vec<u16>) -> Q,
+    Q: std::future::Future<Output = Option<WindowsCdpListenerSnapshot>>,
+    H: Fn(u16, IpAddr) -> R,
+    R: std::future::Future<Output = Result<Vec<CdpTarget>, String>>,
+{
+    let mut discovery = GuardianCdpDiscovery {
+        pages_by_port: Vec::new(),
+        complete: true,
+    };
+    if ports.is_empty() {
+        return discovery;
+    }
+    // Bound native discovery work independently of the number of candidate ports.
+    let Some(before_http) = read_snapshot(ports.to_vec()).await else {
+        discovery.complete = false;
+        return discovery;
+    };
+    let verification = &before_http;
+    let read_targets = &read_targets;
+    let found = futures::future::join_all(ports.iter().copied().map(|port| async move {
+        let mut verified_endpoint = false;
+        let pages = list_cdp_targets_with_endpoint_checks(
+            port,
+            |endpoint| {
+                let verified = verification.verified_owners(port, endpoint).is_some();
+                verified_endpoint |= verified;
+                futures::future::ready(verified)
+            },
+            |endpoint| read_targets(port, endpoint),
+        )
+        .await;
+        (port, pages, verified_endpoint)
+    }))
+    .await;
+    let mut discovered = Vec::new();
+    for (port, pages, verified_endpoint) in found {
+        match pages {
+            Ok(pages) => discovered.push((port, pages)),
+            // A missing listener is a known empty port. A verified listener with no
+            // readable Codex page may still be starting up or have failed discovery.
+            Err(_) if verified_endpoint => discovery.complete = false,
+            Err(_) => {}
+        }
+    }
+    if discovered.is_empty() {
+        return discovery;
+    }
+    let successful_ports = discovered.iter().map(|(port, _)| *port).collect();
+    let Some(after_http) = read_snapshot(successful_ports).await else {
+        discovery.complete = false;
+        return discovery;
+    };
+    discovered.retain(|(port, pages)| {
+        // The shared target picker accepts pages from a single HTTP origin per port.
+        let verified = pages
+            .first()
+            .and_then(|page| page.source_endpoint)
+            .is_some_and(|endpoint| {
+                before_http
+                    .verified_owners(*port, endpoint)
+                    .is_some_and(|owners| {
+                        after_http.verified_owners(*port, endpoint) == Some(owners)
+                    })
+            });
+        discovery.complete &= verified;
+        verified
+    });
+    discovery.pages_by_port = discovered;
+    discovery
 }
 
 async fn list_cdp_targets_with_endpoint_checks<V, F, T, U>(
@@ -1293,33 +1416,131 @@ fn cdp_endpoint_listener_queries_verify_codex_shell(
 }
 
 #[cfg(any(target_os = "windows", test))]
+struct WindowsCdpListenerSnapshot {
+    listeners: HashMap<u16, Vec<(IpAddr, u32)>>,
+    shell_pids: BTreeSet<u32>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl WindowsCdpListenerSnapshot {
+    fn parse(
+        ports: &[u16],
+        listener_output: Option<&str>,
+        processes: Option<&[crate::commands::CodexAppServerProcessDiagnostics]>,
+    ) -> Option<Self> {
+        let mut listeners: HashMap<u16, Vec<(IpAddr, u32)>> = HashMap::new();
+        for line in listener_output?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let (port, owner) = line.split_once('|')?;
+            let (address, pid) = owner.split_once('|')?;
+            let port: u16 = port.parse().ok()?;
+            let address: IpAddr = address.parse().ok()?;
+            let pid: u32 = pid.parse().ok()?;
+            if !ports.contains(&port) || pid == 0 {
+                return None;
+            }
+            listeners.entry(port).or_default().push((address, pid));
+        }
+        let shell_pids = processes?
+            .iter()
+            .filter(|process| !process.is_app_server)
+            .map(|process| process.pid)
+            .collect();
+        Some(Self {
+            listeners,
+            shell_pids,
+        })
+    }
+
+    fn verified_owners(&self, port: u16, endpoint: IpAddr) -> Option<BTreeSet<u32>> {
+        if !endpoint.is_loopback() {
+            return None;
+        }
+        let owners: BTreeSet<u32> = self
+            .listeners
+            .get(&port)?
+            .iter()
+            .filter(|(address, _)| cdp_listener_address_covers_endpoint(*address, endpoint))
+            .map(|(_, pid)| *pid)
+            .collect();
+        (!owners.is_empty() && owners.is_subset(&self.shell_pids)).then_some(owners)
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn codex_cdp_listener_query_script(debug_port: u16) -> String {
+    codex_cdp_listener_query_script_with_output(
+        &format!("-LocalPort {debug_port}"),
+        "$listeners | ForEach-Object { '{0}|{1}' -f $_.LocalAddress, $_.OwningProcess }",
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn codex_cdp_listener_snapshot_query_script(ports: &[u16]) -> String {
+    let ports = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    // Filter after enumeration so missing ports in the batch cannot generate a partial CIM query.
+    let output = format!(
+        "$listeners | Where-Object {{ @({ports}) -contains $_.LocalPort }} | ForEach-Object {{ '{{0}}|{{1}}|{{2}}' -f $_.LocalPort, $_.LocalAddress, $_.OwningProcess }}"
+    );
+    codex_cdp_listener_query_script_with_output("", &output)
+}
+
+#[cfg(target_os = "windows")]
+fn codex_cdp_listener_query_script_with_output(port_argument: &str, output: &str) -> String {
     format!(
         r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $listenerErrors = @()
-$listeners = @(Get-NetTCPConnection -State Listen -LocalPort {debug_port} -ErrorAction SilentlyContinue -ErrorVariable listenerErrors)
+$listeners = @(Get-NetTCPConnection -State Listen {port_argument} -ErrorAction SilentlyContinue -ErrorVariable listenerErrors)
 if (@($listenerErrors | Where-Object {{ $_.CategoryInfo.Category -ne 'ObjectNotFound' }}).Count -gt 0 -or ($listenerErrors.Count -gt 0 -and $listeners.Count -gt 0)) {{ throw 'listener_query_failed' }}
-$listeners | ForEach-Object {{ '{{0}}|{{1}}' -f $_.LocalAddress, $_.OwningProcess }}
+{output}
 "#
     )
 }
 
 #[cfg(target_os = "windows")]
-fn codex_debug_endpoint_has_verified_desktop_listener(debug_port: u16, endpoint: IpAddr) -> bool {
+async fn read_windows_cdp_listener_snapshot(ports: Vec<u16>) -> Option<WindowsCdpListenerSnapshot> {
+    let script = codex_cdp_listener_snapshot_query_script(&ports);
+    let (processes, listeners) = tokio::join!(
+        run_codex_native_query(crate::commands::query_codex_processes),
+        run_codex_native_query(move || run_windows_cdp_listener_query(&script)),
+    );
+    let (processes, process_error) = processes?;
+    let listeners = listeners.flatten()?;
+    WindowsCdpListenerSnapshot::parse(
+        &ports,
+        Some(&listeners),
+        process_error.is_none().then_some(processes.as_slice()),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_cdp_listener_query(script: &str) -> Option<String> {
     use std::os::windows::process::CommandExt;
-    let script = codex_cdp_listener_query_script(debug_port);
-    let (processes, error) = crate::commands::query_codex_processes();
     let mut command = crate::powershell::command();
     command
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .creation_flags(0x08000000);
-    let output = command_output_with_timeout(&mut command, CODEX_NATIVE_QUERY_TIMEOUT);
-    let listener_output = output
-        .as_ref()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout));
+    let output = command_output_with_timeout(&mut command, CODEX_NATIVE_QUERY_TIMEOUT)?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+#[cfg(target_os = "windows")]
+fn codex_debug_endpoint_has_verified_desktop_listener(debug_port: u16, endpoint: IpAddr) -> bool {
+    let (processes, error) = crate::commands::query_codex_processes();
+    let listener_output =
+        run_windows_cdp_listener_query(&codex_cdp_listener_query_script(debug_port));
     cdp_endpoint_listener_queries_verify_codex_shell(
         listener_output.as_deref(),
         error.is_none().then_some(processes.as_slice()),
@@ -2296,14 +2517,13 @@ pub(crate) async fn collect_native_usage_limit_candidates(
     websocket_url: &str,
     proxy_turns_json: &str,
     authorize: &(impl Fn(bool) -> bool + Sync),
-) -> NativeUsageLimitSnapshot {
+) -> Option<NativeUsageLimitSnapshot> {
     let script =
         codex_continuation_bridge_script(NATIVE_USAGE_LIMIT_COLLECT_METHOD, proxy_turns_json);
-    let Ok(Some(evaluation)) =
-        evaluate_cdp_expression_with_options(websocket_url, &script, true, authorize).await
-    else {
-        return NativeUsageLimitSnapshot::default();
-    };
+    let evaluation = evaluate_cdp_expression_with_options(websocket_url, &script, true, authorize)
+        .await
+        .ok()
+        .flatten()?;
     if evaluation
         .pointer("/result/result/value/status")
         .and_then(Value::as_str)
@@ -2319,19 +2539,15 @@ pub(crate) async fn collect_native_usage_limit_candidates(
     native_usage_limit_candidates_from_evaluation(&evaluation)
 }
 
-fn native_usage_limit_candidates_from_evaluation(evaluation: &Value) -> NativeUsageLimitSnapshot {
+fn native_usage_limit_candidates_from_evaluation(
+    evaluation: &Value,
+) -> Option<NativeUsageLimitSnapshot> {
     if evaluation.pointer("/result/exceptionDetails").is_some() {
-        return NativeUsageLimitSnapshot::default();
+        return None;
     }
-    let Some(snapshot) = evaluation.pointer("/result/result/value") else {
-        return NativeUsageLimitSnapshot::default();
-    };
-    let Some(complete) = snapshot.get("complete").and_then(Value::as_bool) else {
-        return NativeUsageLimitSnapshot::default();
-    };
-    let Some(values) = snapshot.get("candidates").and_then(Value::as_array) else {
-        return NativeUsageLimitSnapshot::default();
-    };
+    let snapshot = evaluation.pointer("/result/result/value")?;
+    let complete = snapshot.get("complete").and_then(Value::as_bool)?;
+    let values = snapshot.get("candidates").and_then(Value::as_array)?;
     let candidates: Vec<_> = values
         .iter()
         .filter_map(|value| ObservedUsageLimitTurn::deserialize(value).ok())
@@ -2365,7 +2581,7 @@ fn native_usage_limit_candidates_from_evaluation(evaluation: &Value) -> NativeUs
         }
         Some(_) => false,
     };
-    NativeUsageLimitSnapshot {
+    Some(NativeUsageLimitSnapshot {
         complete: complete
             && candidates.len() == values.len()
             && conflicts_valid
@@ -2373,7 +2589,7 @@ fn native_usage_limit_candidates_from_evaluation(evaluation: &Value) -> NativeUs
         candidates,
         conflicting_thread_ids,
         stale_proxy_turns,
-    }
+    })
 }
 
 /// Submit a literal `continue` to the exact failed Codex thread through the
@@ -3309,6 +3525,8 @@ fn append_codex_debug_args(command: &mut Command, debug_port: u16) {
 /// 包目录的同名进程，避免误把独立 ChatGPT 应用接入 Codex 的 CDP 修复链路。
 #[cfg(target_os = "windows")]
 const DETECT_CODEX_MAIN_PROCESS_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'ChatGPT.exe'" |
   Where-Object {
     if (-not $_.ExecutablePath -or $_.CommandLine -match ' --type=') { return $false }
@@ -3322,12 +3540,24 @@ Get-CimInstance Win32_Process -Filter "Name = 'Codex.exe' OR Name = 'ChatGPT.exe
 
 /// 查找 Codex Desktop 主进程路径；已运行但未开放 CDP 时不能原地注入。
 pub(crate) async fn detect_running_codex_main_process_async() -> Option<PathBuf> {
-    run_codex_native_query(detect_running_codex_main_process)
+    detect_running_codex_main_process_for_guardian()
         .await
+        .ok()
         .flatten()
 }
 
+pub(crate) async fn detect_running_codex_main_process_for_guardian() -> Result<Option<PathBuf>, ()>
+{
+    run_codex_native_query(probe_running_codex_main_process)
+        .await
+        .ok_or(())?
+}
+
 pub(crate) fn detect_running_codex_main_process() -> Option<PathBuf> {
+    probe_running_codex_main_process().ok().flatten()
+}
+
+fn probe_running_codex_main_process() -> Result<Option<PathBuf>, ()> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -3337,32 +3567,40 @@ pub(crate) fn detect_running_codex_main_process() -> Option<PathBuf> {
         command
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .creation_flags(CREATE_NO_WINDOW);
-        let output = command_output_with_timeout(&mut command, CODEX_NATIVE_QUERY_TIMEOUT)?;
-        if !output.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if text.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(text))
-        }
+        let output =
+            command_output_with_timeout(&mut command, CODEX_NATIVE_QUERY_TIMEOUT).ok_or(())?;
+        parse_windows_codex_main_process_output(output.status.success(), &output.stdout)
     }
 
     #[cfg(target_os = "macos")]
     {
-        detect_running_macos_codex_main_process()
+        Ok(detect_running_macos_codex_main_process())
     }
 
     #[cfg(target_os = "linux")]
     {
-        detect_running_linux_codex_main_process()
+        Ok(detect_running_linux_codex_main_process())
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
-        None
+        Ok(None)
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_windows_codex_main_process_output(
+    succeeded: bool,
+    stdout: &[u8],
+) -> Result<Option<PathBuf>, ()> {
+    if !succeeded {
+        return Err(());
+    }
+    let path = std::str::from_utf8(stdout).map_err(|_| ())?.trim();
+    if path.contains(['\r', '\n', '\0']) {
+        return Err(());
+    }
+    Ok((!path.is_empty()).then(|| PathBuf::from(path)))
 }
 
 /// List only verified Codex Desktop shells. CLI/app-server processes are
@@ -5958,7 +6196,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             "complete": true,
             "candidates": [&candidate, invalid_model, invalid_time, invalid_id, {"threadId": "incomplete"}]
         }}}});
-        let observations = native_usage_limit_candidates_from_evaluation(&evaluation);
+        let observations = native_usage_limit_candidates_from_evaluation(&evaluation).unwrap();
         assert!(!observations.complete);
         assert_eq!(
             observations.candidates,
@@ -5969,25 +6207,26 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
     #[test]
     fn native_usage_limit_collection_distinguishes_empty_from_unavailable() {
         let evaluation = |value: Value| json!({"result": {"result": {"value": value}}});
-        assert_eq!(
-            native_usage_limit_candidates_from_evaluation(&evaluation(json!({
-                "complete": true,
-                "candidates": []
-            }))),
-            NativeUsageLimitSnapshot {
-                complete: true,
-                ..Default::default()
-            }
-        );
+        for complete in [true, false] {
+            assert_eq!(
+                native_usage_limit_candidates_from_evaluation(&evaluation(json!({
+                    "complete": complete,
+                    "candidates": []
+                }))),
+                Some(NativeUsageLimitSnapshot {
+                    complete,
+                    ..Default::default()
+                })
+            );
+        }
         for unavailable in [
             Value::Null,
             json!({"status": "unavailable"}),
-            json!({"complete": false, "candidates": []}),
             json!({"candidates": []}),
         ] {
             assert_eq!(
                 native_usage_limit_candidates_from_evaluation(&evaluation(unavailable)),
-                NativeUsageLimitSnapshot::default()
+                None
             );
         }
     }
@@ -6010,7 +6249,8 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             let snapshot = native_usage_limit_candidates_from_evaluation(&evaluation(
                 complete,
                 json!(["shared-thread"]),
-            ));
+            ))
+            .unwrap();
             assert_eq!(snapshot.complete, complete);
             assert_eq!(snapshot.conflicting_thread_ids, vec!["shared-thread"]);
             assert_eq!(snapshot.candidates.len(), 1);
@@ -6026,7 +6266,8 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                 "tab\tid",
                 42
             ]),
-        ));
+        ))
+        .unwrap();
         assert!(!snapshot.complete);
         assert_eq!(snapshot.conflicting_thread_ids, vec!["shared-thread"]);
         assert_eq!(snapshot.candidates.len(), 1);
@@ -6034,7 +6275,8 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
         let snapshot = native_usage_limit_candidates_from_evaluation(&evaluation(
             true,
             json!("shared-thread"),
-        ));
+        ))
+        .unwrap();
         assert!(!snapshot.complete);
         assert!(snapshot.conflicting_thread_ids.is_empty());
         assert_eq!(snapshot.candidates.len(), 1);
@@ -6059,7 +6301,8 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
             let snapshot = native_usage_limit_candidates_from_evaluation(&evaluation(
                 complete,
                 json!([&stale_turn]),
-            ));
+            ))
+            .unwrap();
             assert_eq!(snapshot.complete, complete);
             assert_eq!(snapshot.stale_proxy_turns, vec![expected.clone()]);
         }
@@ -6073,12 +6316,13 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                 {"threadId": "exact-thread", "turnId": "failed-turn", "observedAtMs": 0},
                 {"threadId": "exact-thread", "turnId": "failed-turn"}
             ]),
-        ));
+        ))
+        .unwrap();
         assert!(!snapshot.complete);
         assert_eq!(snapshot.stale_proxy_turns, vec![expected]);
 
         let snapshot = native_usage_limit_candidates_from_evaluation(&evaluation(true, stale_turn));
-        assert_eq!(snapshot, NativeUsageLimitSnapshot::default());
+        assert_eq!(snapshot, None);
     }
 
     #[test]
@@ -6099,7 +6343,7 @@ JSON.stringify({{missing, stale, staleCalls, current, replaced, replacedCalls, i
                 "complete": complete,
                 "candidates": &candidates
             }}}});
-            let observations = native_usage_limit_candidates_from_evaluation(&evaluation);
+            let observations = native_usage_limit_candidates_from_evaluation(&evaluation).unwrap();
             assert_eq!(observations.complete, complete);
             assert_eq!(observations.candidates.len(), 70);
             assert_eq!(observations.candidates.last(), Some(&last));
@@ -10411,6 +10655,10 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
         .is_err());
     }
     fn cdp_endpoint_test_target(endpoint: IpAddr) -> CdpTarget {
+        cdp_endpoint_test_target_on_port(DEFAULT_CODEX_DEBUG_PORT, endpoint)
+    }
+
+    fn cdp_endpoint_test_target_on_port(port: u16, endpoint: IpAddr) -> CdpTarget {
         CdpTarget {
             id: endpoint.to_string(),
             target_type: "page".to_string(),
@@ -10418,7 +10666,7 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
             url: "app://-/index.html".to_string(),
             web_socket_debugger_url: Some(format!(
                 "ws://{}/devtools/page/1",
-                std::net::SocketAddr::new(endpoint, DEFAULT_CODEX_DEBUG_PORT)
+                std::net::SocketAddr::new(endpoint, port)
             )),
             source_endpoint: Some(endpoint),
         }
@@ -10433,6 +10681,131 @@ JSON.stringify({{reloaded, current, changedMetadata, staleVersion, stopped}});
             started_at: None,
             is_app_server: false,
         }]
+    }
+
+    #[tokio::test]
+    async fn guardian_cdp_discovery_bounds_native_snapshots_and_rechecks_endpoint_ownership() {
+        let ports = [9229, 9230, 9231, 9232, 9233, 9234];
+        let ipv4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let ipv6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let mut processes = cdp_endpoint_test_processes();
+        let mut other_shell = processes[0].clone();
+        other_shell.pid = 42;
+        processes.push(other_shell);
+        let mut snapshots = Vec::new();
+        let requests = std::cell::RefCell::new(Vec::new());
+        let discovery = discover_guardian_cdp_targets_with_snapshots(
+            &ports,
+            |requested_ports| {
+                let rows = if snapshots.is_empty() {
+                    "9229|127.0.0.1|41\n9230|::1|41\n9231|127.0.0.1|43\n9232|127.0.0.1|41"
+                } else {
+                    "9229|127.0.0.1|41\n9230|::1|42"
+                };
+                let snapshot = WindowsCdpListenerSnapshot::parse(
+                    &requested_ports,
+                    Some(rows),
+                    Some(&processes),
+                );
+                snapshots.push(requested_ports);
+                futures::future::ready(snapshot)
+            },
+            |port, endpoint| {
+                requests.borrow_mut().push((port, endpoint));
+                futures::future::ready(if port == 9232 {
+                    Err("fixture HTTP timeout".to_string())
+                } else {
+                    Ok(vec![cdp_endpoint_test_target_on_port(port, endpoint)])
+                })
+            },
+        )
+        .await;
+
+        assert_eq!(snapshots, [ports.to_vec(), vec![9229, 9230]]);
+        assert_eq!(
+            requests.into_inner(),
+            [(9229, ipv4), (9230, ipv6), (9232, ipv4)]
+        );
+        assert_eq!(
+            discovery.pages_by_port,
+            [(9229, vec![cdp_endpoint_test_target(ipv4)])]
+        );
+        assert!(!discovery.complete);
+    }
+
+    #[tokio::test]
+    async fn guardian_cdp_discovery_rejects_unavailable_or_malformed_native_snapshots() {
+        let ports = [DEFAULT_CODEX_DEBUG_PORT];
+        let valid = format!("{}|127.0.0.1|41", ports[0]);
+        let foreign = format!("{}|127.0.0.1|41", ports[0] + 1);
+        let processes = cdp_endpoint_test_processes();
+        for (invalid_rows, invalid_processes) in [
+            (None, Some(processes.as_slice())),
+            (Some(valid.as_str()), None),
+            (Some("malformed row"), Some(processes.as_slice())),
+            (Some(foreign.as_str()), Some(processes.as_slice())),
+        ] {
+            for fail_on_snapshot in [1, 2] {
+                let mut snapshots = 0;
+                let requests = std::cell::Cell::new(0);
+                let discovery = discover_guardian_cdp_targets_with_snapshots(
+                    &ports,
+                    |requested_ports| {
+                        snapshots += 1;
+                        let (rows, shells) = if snapshots == fail_on_snapshot {
+                            (invalid_rows, invalid_processes)
+                        } else {
+                            (Some(valid.as_str()), Some(processes.as_slice()))
+                        };
+                        futures::future::ready(WindowsCdpListenerSnapshot::parse(
+                            &requested_ports,
+                            rows,
+                            shells,
+                        ))
+                    },
+                    |_, endpoint| {
+                        requests.set(requests.get() + 1);
+                        futures::future::ready(Ok(vec![cdp_endpoint_test_target(endpoint)]))
+                    },
+                )
+                .await;
+                assert!(discovery.pages_by_port.is_empty());
+                assert!(!discovery.complete);
+                assert_eq!(snapshots, fail_on_snapshot);
+                assert_eq!(requests.get(), fail_on_snapshot - 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn guardian_cdp_discovery_distinguishes_empty_ports_from_a_failed_renderer_read() {
+        let ports = [DEFAULT_CODEX_DEBUG_PORT];
+        let listener = format!("{}|127.0.0.1|41", ports[0]);
+        let processes = cdp_endpoint_test_processes();
+        for (rows, complete) in [("", true), (listener.as_str(), false)] {
+            let mut snapshots = 0;
+            let requests = std::cell::Cell::new(0);
+            let discovery = discover_guardian_cdp_targets_with_snapshots(
+                &ports,
+                |requested_ports| {
+                    snapshots += 1;
+                    futures::future::ready(WindowsCdpListenerSnapshot::parse(
+                        &requested_ports,
+                        Some(rows),
+                        Some(&processes),
+                    ))
+                },
+                |_, _| {
+                    requests.set(requests.get() + 1);
+                    futures::future::ready(Err("fixture HTTP timeout".to_string()))
+                },
+            )
+            .await;
+            assert!(discovery.pages_by_port.is_empty());
+            assert_eq!(discovery.complete, complete);
+            assert_eq!(snapshots, 1);
+            assert_eq!(requests.get(), u32::from(!complete));
+        }
     }
 
     #[test]
@@ -10719,6 +11092,46 @@ function Get-NetTCPConnection {{
         }
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn guardian_cdp_discovery_filters_ports_after_checking_native_query_errors() {
+        use std::os::windows::process::CommandExt;
+        let query = codex_cdp_listener_snapshot_query_script(&[9229, 9230]);
+        for (rows, error, expected) in [
+            ("$matching; $outside", "", Some("9229|::1|41")),
+            (
+                "$outside",
+                "Write-Error -Message 'fixture_query_error' -Category ObjectNotFound",
+                None,
+            ),
+        ] {
+            let mock = format!(
+                r#"
+function Get-NetTCPConnection {{
+    [CmdletBinding()]
+    param([string]$State)
+    if ($State -ne 'Listen') {{ throw 'unexpected_query_scope' }}
+    $matching = [pscustomobject]@{{ LocalPort = 9229; LocalAddress = '::1'; OwningProcess = 41 }}
+    $outside = [pscustomobject]@{{ LocalPort = 12345; LocalAddress = '127.0.0.1'; OwningProcess = 42 }}
+    {rows}
+    {error}
+}}
+{query}
+"#
+            );
+            let output = crate::powershell::command()
+                .args(["-NoProfile", "-NonInteractive", "-Command", &mock])
+                .creation_flags(0x08000000)
+                .output()
+                .expect("run mocked batched listener query");
+            assert_eq!(output.status.success(), expected.is_some());
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                expected.unwrap_or("")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn cdp_endpoint_identity_http_client_does_not_follow_redirects() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10972,10 +11385,37 @@ function Get-NetTCPConnection {{
     #[cfg(target_os = "windows")]
     #[test]
     fn codex_main_process_probe_filters_cli_launcher_name_case() {
+        assert!(DETECT_CODEX_MAIN_PROCESS_SCRIPT.contains("$ErrorActionPreference = 'Stop'"));
         assert!(DETECT_CODEX_MAIN_PROCESS_SCRIPT.contains("$legacyCodex = $leaf -ceq 'Codex.exe'"));
         assert!(DETECT_CODEX_MAIN_PROCESS_SCRIPT.contains("Name = 'ChatGPT.exe'"));
         assert!(DETECT_CODEX_MAIN_PROCESS_SCRIPT.contains("OpenAI\\.Codex"));
         assert!(!DETECT_CODEX_MAIN_PROCESS_SCRIPT.contains(" -ieq 'Codex.exe'"));
+    }
+
+    #[test]
+    fn windows_codex_main_process_probe_distinguishes_absence_from_query_failure() {
+        let executable = r"C:\Codex\Codex.exe";
+        assert_eq!(
+            parse_windows_codex_main_process_output(true, executable.as_bytes()),
+            Ok(Some(PathBuf::from(executable)))
+        );
+        assert_eq!(
+            parse_windows_codex_main_process_output(true, b"\r\n"),
+            Ok(None)
+        );
+        assert_eq!(parse_windows_codex_main_process_output(false, b""), Err(()));
+        assert_eq!(
+            parse_windows_codex_main_process_output(false, executable.as_bytes()),
+            Err(())
+        );
+        assert_eq!(
+            parse_windows_codex_main_process_output(true, b"\xff"),
+            Err(())
+        );
+        assert_eq!(
+            parse_windows_codex_main_process_output(true, b"unexpected\r\nmultiple lines"),
+            Err(())
+        );
     }
 
     /// 验证已确认的 Desktop 路径能写入状态文件并再次读回。

@@ -1819,7 +1819,7 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
   });
 
-  it("keeps new inventory excluded across repeat syncs of an initially empty catalog", async () => {
+  it("enables the initial inventory and reviews repeat syncs", async () => {
     vi.mocked(fetchModelsForConfig)
       .mockResolvedValueOnce([{ id: "new", ownedBy: null }])
       .mockResolvedValueOnce([
@@ -1831,9 +1831,11 @@ describe("CodexFormFields local model routing", () => {
     await waitForReasoningResolution();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
-    await applyModelSyncReview();
     await waitFor(() => expect(latestCatalog()).toHaveLength(1));
-    expect(latestCatalog()[0].enabled).toBe(false);
+    expect(
+      screen.queryByRole("dialog", { name: "Review model sync" }),
+    ).not.toBeInTheDocument();
+    expect(latestCatalog()[0].enabled).toBe(true);
     expect(
       screen.queryByRole("button", {
         name: /Enable only synced models|^Replace catalog/,
@@ -1850,12 +1852,12 @@ describe("CodexFormFields local model routing", () => {
         expect.objectContaining({
           model: "new",
           contextWindow: "256000",
-          enabled: false,
+          enabled: true,
         }),
       ]);
     });
-    expect(latestDefaultModel()).toBe("");
-    expect(screen.getByText("No included models")).toBeVisible();
+    expect(latestDefaultModel()).toBe("new");
+    expect(screen.queryByText("No included models")).not.toBeInTheDocument();
     await waitForReasoningResolution();
   });
 
@@ -2891,17 +2893,19 @@ describe("CodexFormFields local model routing", () => {
     } = renderAutoSplitHarness();
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
-    await applyModelSyncReview();
 
     await waitFor(() => {
       expect(latestCatalog()).toHaveLength(2);
     });
     expect(
+      screen.queryByRole("dialog", { name: "Review model sync" }),
+    ).not.toBeInTheDocument();
+    expect(
       screen.queryByText("different models selected different protocols"),
     ).not.toBeInTheDocument();
     expect(latestCatalog()).toEqual([
-      expect.objectContaining({ model: "gpt-5.5" }),
-      expect.objectContaining({ model: "qwen3.6" }),
+      expect.objectContaining({ model: "gpt-5.5", enabled: true }),
+      expect.objectContaining({ model: "qwen3.6", enabled: true }),
     ]);
     expect(latestCatalog()[0]).not.toHaveProperty("apiFormat");
     expect(latestCatalog()[1]).not.toHaveProperty("apiFormat");
@@ -3799,7 +3803,6 @@ describe("CodexFormFields local model routing", () => {
     });
 
     fireEvent.click(screen.getByRole("button", { name: "Sync models" }));
-    await applyModelSyncReview();
 
     await waitFor(() => {
       expect(latestCatalog()).toEqual([
@@ -3808,10 +3811,13 @@ describe("CodexFormFields local model routing", () => {
           displayName: "gpt-5.5",
           upstreamModel: "gpt-5.5",
           contextWindow: "272000",
-          enabled: false,
+          enabled: true,
         },
       ]);
     });
+    expect(
+      screen.queryByRole("dialog", { name: "Review model sync" }),
+    ).not.toBeInTheDocument();
   });
 
   it("preserves fetched image support and updates existing rows to explicit text-only capabilities", async () => {

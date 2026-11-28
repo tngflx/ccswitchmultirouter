@@ -927,8 +927,12 @@ function mergeFetchedModelsIntoCatalogRows(
   rows: CodexCatalogRow[],
   fetchedModels: FetchedModel[],
   source: CodexCatalogSyncSource,
-  authoritative = false,
+  options: {
+    authoritative?: boolean;
+    newRowEnabled?: boolean;
+  } = {},
 ) {
+  const authoritative = options.authoritative ?? false;
   return reconcileFetchedCodexCatalogRows(rows, fetchedModels, source, {
     appendNew: true,
     createRow: (seed) => createCatalogRow(seed),
@@ -936,6 +940,7 @@ function mergeFetchedModelsIntoCatalogRows(
     removeMissingRemote: authoritative,
     includeUnboundRemoteRows: true,
     markMissingRemoteDisabled: true,
+    newRowEnabled: options.newRowEnabled,
   });
 }
 
@@ -951,12 +956,9 @@ function planCatalogSync(
   source: CodexCatalogSyncSource,
 ) {
   const { rows, missingRows } = review.models.length
-    ? mergeFetchedModelsIntoCatalogRows(
-        currentRows,
-        review.models,
-        source,
-        review.coverage === "complete",
-      )
+    ? mergeFetchedModelsIntoCatalogRows(currentRows, review.models, source, {
+        authoritative: review.coverage === "complete",
+      })
     : { rows: currentRows, missingRows: [] };
   const missingIds = new Set(missingRows.map((row) => row.rowId));
   const existing = currentRows.map((row, index) => ({
@@ -1996,7 +1998,7 @@ export function CodexFormFields({
               catalogRowsRef.current,
               models,
               { providerId, providerName, baseUrl: codexBaseUrl, websiteUrl },
-              true,
+              { authoritative: true },
             );
             commitCatalogRows(() => rows, { repairDefault: true });
           }
@@ -2070,12 +2072,31 @@ export function CodexFormFields({
       .then((models) => {
         if (!request.isCurrent()) return;
         if (onCatalogModelsChange) {
-          request.review(
-            models,
-            isCompleteCodexCatalogFetch(apiKeyGroups)
-              ? "complete"
-              : "key-groups",
+          const coverage = isCompleteCodexCatalogFetch(apiKeyGroups)
+            ? "complete"
+            : "key-groups";
+          const hasCatalogModels = catalogRowsRef.current.some(
+            (row) => row.model.trim() || catalogRowUpstreamModel(row).trim(),
           );
+          if (coverage === "complete" && !hasCatalogModels) {
+            request.setModels(models);
+            if (models.length === 0) {
+              toast.info(t("providerForm.fetchModelsEmpty"));
+              return;
+            }
+            const { rows } = mergeFetchedModelsIntoCatalogRows(
+              catalogRowsRef.current,
+              models,
+              { providerId, providerName, baseUrl: codexBaseUrl, websiteUrl },
+              { authoritative: true, newRowEnabled: true },
+            );
+            commitCatalogRows(() => rows, { repairDefault: true });
+            toast.success(
+              t("providerForm.fetchModelsSuccess", { count: models.length }),
+            );
+            return;
+          }
+          request.review(models, coverage);
           return;
         }
         request.setModels(models);

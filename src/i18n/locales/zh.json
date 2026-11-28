@@ -4113,6 +4113,40 @@
       "partialEmptyAction": "等待检测",
       "checkingStatus": "正在扫描已确认会话…",
       "unavailableStatus": "无法获取已确认会话扫描结果",
+      "errors": {
+        "scanTimedOut": {
+          "status": "会话扫描超时",
+          "description": "请保持 Codex Desktop 打开，再点击刷新按钮重新扫描。"
+        },
+        "observerStopped": {
+          "status": "会话监测已停止",
+          "description": "请点击刷新按钮重试。如果监测反复停止，请重新打开 CC Switch。"
+        },
+        "observerUnavailable": {
+          "status": "无法监测会话",
+          "description": "请打开 Codex Desktop，在 CC Switch 中检查连接后再次点击刷新。"
+        },
+        "desktopNotLinked": {
+          "status": "Codex Desktop 需要连接",
+          "description": "请保存工作并完全退出 Codex Desktop，然后在 CC Switch 中选择 Codex 多模型路由 → Status → Link → Unlock model picker，重新启动并连接。"
+        },
+        "desktopNotRunning": {
+          "status": "Codex Desktop 未运行",
+          "description": "请在 CC Switch 中选择 Codex 多模型路由 → Status → Link → Unlock model picker，启动并连接 Codex Desktop。"
+        },
+        "refreshUnsupported": {
+          "status": "当前版本不支持手动扫描会话",
+          "description": "此版本的 CC Switch 不支持手动扫描待恢复会话。请更新 CC Switch 后再使用刷新按钮。"
+        },
+        "countReadFailed": {
+          "status": "无法读取可继续的会话",
+          "description": "CC Switch 无法读取已确认的会话列表。请点击刷新按钮重试。"
+        },
+        "evidenceStorageUnavailable": {
+          "status": "无法访问会话恢复数据",
+          "description": "CC Switch 无法访问本地会话恢复数据。请检查 CC Switch 数据文件夹的访问权限，重新打开应用后重试。"
+        }
+      },
       "refreshing": "正在刷新会话扫描",
       "refresh": "检查可继续的会话",
       "sendingStatus": "正在发送 Continue…",

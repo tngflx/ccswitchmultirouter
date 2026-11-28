@@ -937,20 +937,41 @@ impl ProxyService {
         {
             return Err("provider_not_cc_switch_router");
         }
-        let provider_id =
-            crate::settings::get_effective_current_provider(&self.db, &AppType::Codex)
-                .map_err(|_| "active_provider_unavailable")?
-                .ok_or("no_active_codex_provider")?;
+        let provider_id = crate::codex_multirouter::active_codex_router_id(&self.db)
+            .map_err(|_| "active_provider_unavailable")?
+            .ok_or("no_active_codex_provider")?;
         let provider = self
             .db
             .get_provider_by_id(&provider_id, AppType::Codex.as_str())
             .map_err(|_| "active_provider_unavailable")?
             .ok_or("no_active_codex_provider")?;
-        if crate::codex_multirouter::provider_set::codex_provider_set_leaf_parent_id(&provider)
-            .is_some()
-        {
-            return Err("active_provider_unavailable");
+
+        let is_schema_v2_router = provider
+            .settings_config
+            .get("codexRouting")
+            .and_then(|routing| {
+                crate::codex_multirouter::schema::CodexRoutingDocument::parse(routing).ok()
+            })
+            .is_some_and(|routing| {
+                matches!(
+                    routing,
+                    crate::codex_multirouter::schema::CodexRoutingDocument::V2(_)
+                )
+            });
+
+        if is_schema_v2_router {
+            let status = crate::codex_multirouter::projection::ensure_codex_multirouter_projection(
+                &self.db,
+                &provider.id,
+                true,
+            )
+            .map_err(|_| "projection_outputs_unconfirmed")?;
+            if status.state != crate::codex_multirouter::projection::ProjectionState::Ready {
+                return Err("projection_outputs_unconfirmed");
+            }
+            return Ok(());
         }
+
         crate::services::provider::build_codex_live_config_for_provider(&self.db, &provider)
             .map_err(|_| "projection_outputs_unconfirmed")?;
         Ok(())
@@ -5545,15 +5566,20 @@ impl ProxyService {
         self.ensure_codex_guardian_started(&mut lifecycle, false);
     }
 
-    pub(crate) async fn request_codex_usage_limit_refresh(&self) -> Result<(), String> {
-        let mut lifecycle = self.codex_guardian.lock().await;
-        lifecycle.retain_observation = true;
-        self.ensure_codex_guardian_started(&mut lifecycle, false);
-        let handle = lifecycle
-            .handle
-            .as_ref()
-            .ok_or_else(|| "Codex recovery observer is unavailable".to_string())?;
-        handle.request_native_usage_scan().await
+    pub(crate) async fn request_codex_usage_limit_refresh(
+        &self,
+    ) -> Result<(), codex_guardian::NativeUsageRefreshError> {
+        let request = {
+            let mut lifecycle = self.codex_guardian.lock().await;
+            lifecycle.retain_observation = true;
+            self.ensure_codex_guardian_started(&mut lifecycle, false);
+            lifecycle
+                .handle
+                .as_ref()
+                .ok_or(codex_guardian::NativeUsageRefreshError::ObserverUnavailable)?
+                .request_native_usage_scan()
+        };
+        request.await
     }
 
     fn ensure_codex_guardian_started(
@@ -7753,9 +7779,9 @@ wire_api = "responses"
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn codex_multirouter_resync_stays_verified_after_takeover_rewrites() {
+    async fn codex_multirouter_resync_stays_verified_after_takeover_rewrites() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload isolated settings");
         let db = Arc::new(Database::memory().expect("memory database"));
@@ -7782,6 +7808,14 @@ wire_api = "responses"
             &json!({"client_version": "0.140.0", "etag": "official-cache", "models": []}),
         )
         .unwrap();
+        let mut proxy_config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("read Codex takeover config");
+        proxy_config.enabled = true;
+        db.update_proxy_config_for_app(proxy_config)
+            .await
+            .expect("enable Codex takeover");
         let mut router = Provider::with_id(
             "router".into(),
             "Router".into(),
@@ -7819,6 +7853,20 @@ wire_api = "responses"
             )
             .expect("manual catalog resync");
             assert!(manual.catalog_verified && manual.config_verified && manual.cache_verified);
+
+            service
+                .reproject_official_codex_catalog_if_owned()
+                .await
+                .expect("official catalog refresh must complete the router projection");
+            let refreshed =
+                crate::codex_multirouter::projection::inspect_codex_multirouter_projection(
+                    &db, &router.id,
+                )
+                .expect("inspect projection after official catalog refresh");
+            assert_eq!(
+                refreshed.state,
+                crate::codex_multirouter::projection::ProjectionState::Ready
+            );
 
             for _ in 0..3 {
                 service

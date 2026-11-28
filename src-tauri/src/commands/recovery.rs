@@ -15,7 +15,14 @@ pub fn acknowledge_recovery_outcomes(generation: u64, ids: Vec<String>) -> Resul
 }
 
 #[tauri::command]
-pub async fn get_codex_usage_limit_resume_count() -> Result<UsageLimitResumeCount, String> {
+pub async fn get_codex_usage_limit_resume_count(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<UsageLimitResumeCount, String> {
+    // The ribbon is also the observer's first consumer after a clean start.
+    // Retain the observer before reading its projection so a fresh runtime does
+    // not report an unverified zero until another lifecycle path happens to
+    // start the guardian.
+    state.proxy_service.retain_codex_recovery_observer().await;
     super::run_command_blocking(codex_turn_recovery::codex_usage_limit_resume_count).await
 }
 
@@ -27,9 +34,7 @@ pub async fn resume_codex_usage_limited_turns(
 
 #[cfg(test)]
 mod read_dispatch_tests {
-    use super::{
-        get_codex_usage_limit_resume_count, get_pending_recovery_outcomes, UsageLimitResumeCount,
-    };
+    use super::{get_pending_recovery_outcomes, UsageLimitResumeCount};
     use std::future::Future;
 
     fn assert_async_command<T, F>(_: impl FnOnce() -> F)
@@ -44,7 +49,20 @@ mod read_dispatch_tests {
     }
 
     #[test]
-    fn usage_limit_resume_count_reports_count_and_completeness() {
-        assert_async_command::<UsageLimitResumeCount, _>(get_codex_usage_limit_resume_count);
+    fn usage_limit_resume_count_command_retains_observer_before_projection_read() {
+        let source = include_str!("recovery.rs");
+        let retain = source
+            .find("state.proxy_service.retain_codex_recovery_observer().await;")
+            .expect("count command retains the observer");
+        let read = source
+            .find(
+                "super::run_command_blocking(codex_turn_recovery::codex_usage_limit_resume_count)",
+            )
+            .expect("count command reads the projection");
+        assert!(
+            retain < read,
+            "the observer must be retained before the count projection is read"
+        );
+        let _ = std::marker::PhantomData::<UsageLimitResumeCount>;
     }
 }

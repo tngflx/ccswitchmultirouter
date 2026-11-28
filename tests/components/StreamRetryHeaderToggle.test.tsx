@@ -13,6 +13,7 @@ import {
   QueryClientProvider,
 } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
+import { useContext } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CodexUsageLimitResumeButton,
@@ -47,10 +48,14 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: translate }),
 }));
 
-vi.mock("@tanstack/react-query", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@tanstack/react-query")>()),
-  useQueryClient: () => ({ cancelQueries, setQueryData }),
-}));
+vi.mock("@tanstack/react-query", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@tanstack/react-query")>();
+  return {
+    ...actual,
+    useQueryClient: () =>
+      useContext(actual.QueryClientContext) ?? { cancelQueries, setQueryData },
+  };
+});
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
@@ -343,6 +348,355 @@ describe("StreamRetryHeaderToggle", () => {
     }
   });
 
+  it("waits for a fresh Desktop scan and count read when Refresh is clicked", async () => {
+    let finishScan!: () => void;
+    const scan = new Promise<void>((resolve) => {
+      finishScan = resolve;
+    });
+    let finishRead!: (value: { count: number; complete: boolean }) => void;
+    const read = new Promise<{ count: number; complete: boolean }>(
+      (resolve) => {
+        finishRead = resolve;
+      },
+    );
+    invoke
+      .mockResolvedValueOnce({ count: 1, complete: true })
+      .mockReturnValueOnce(scan)
+      .mockReturnValueOnce(read);
+    renderCodexHeader();
+
+    const resume = await screen.findByRole("button", {
+      name: "streamRetry.usageLimitResume.action",
+    });
+    const refresh = screen.getByTestId("codex-usage-limit-refresh-button");
+    const count = screen.getByTestId("codex-usage-limit-resume-count");
+    expect(count).toHaveTextContent("1");
+    act(() => {
+      fireEvent.click(refresh);
+      fireEvent.click(refresh);
+      fireEvent.click(resume);
+    });
+    expect(invoke.mock.calls).toEqual([
+      ["get_codex_usage_limit_resume_count"],
+      ["refresh_codex_usage_limit_resume_count"],
+    ]);
+    expect(refresh).toBeDisabled();
+    expect(resume).toBeDisabled();
+    expect(resume).toHaveAccessibleName(
+      "streamRetry.usageLimitResume.checking",
+    );
+    expect(count).toHaveTextContent("…");
+
+    await act(async () => finishScan());
+    expect(invoke.mock.calls).toEqual([
+      ["get_codex_usage_limit_resume_count"],
+      ["refresh_codex_usage_limit_resume_count"],
+      ["get_codex_usage_limit_resume_count"],
+    ]);
+    expect(resume).toBeDisabled();
+    expect(count).toHaveTextContent("…");
+
+    await act(async () => finishRead({ count: 3, complete: true }));
+    await waitFor(() => expect(count).toHaveTextContent("3"));
+    expect(refresh).toBeEnabled();
+    expect(resume).toBeEnabled();
+  });
+
+  it("allows Refresh during a pending count read and ignores its late result", async () => {
+    let finishInitialRead!: (value: {
+      count: number;
+      complete: boolean;
+    }) => void;
+    const initialRead = new Promise<{ count: number; complete: boolean }>(
+      (resolve) => {
+        finishInitialRead = resolve;
+      },
+    );
+    invoke
+      .mockReturnValueOnce(initialRead)
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({ count: 2, complete: true });
+    renderCodexHeader();
+
+    const refresh = screen.getByTestId("codex-usage-limit-refresh-button");
+    expect(refresh).toBeEnabled();
+    await act(async () => fireEvent.click(refresh));
+    const count = screen.getByTestId("codex-usage-limit-resume-count");
+    await waitFor(() => expect(count).toHaveTextContent("2"));
+    await act(async () => finishInitialRead({ count: 0, complete: true }));
+    expect(count).toHaveTextContent("2");
+    expect(invoke.mock.calls).toEqual([
+      ["get_codex_usage_limit_resume_count"],
+      ["refresh_codex_usage_limit_resume_count"],
+      ["get_codex_usage_limit_resume_count"],
+    ]);
+  });
+
+  it("shows an unavailable scan and supports retry after a Refresh failure", async () => {
+    invoke
+      .mockResolvedValueOnce({ count: 2, complete: true })
+      .mockRejectedValueOnce(new Error("internal native scan error"))
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({ count: 1, complete: true });
+    const user = userEvent.setup();
+    renderCodexHeader();
+
+    const resume = await screen.findByRole("button", {
+      name: "streamRetry.usageLimitResume.action",
+    });
+    const refresh = screen.getByTestId("codex-usage-limit-refresh-button");
+    const count = screen.getByTestId("codex-usage-limit-resume-count");
+    await user.click(refresh);
+    await waitFor(() =>
+      expect(resume).toHaveAccessibleName(
+        "streamRetry.usageLimitResume.unavailable",
+      ),
+    );
+    expect(count).toHaveTextContent("…");
+    expect(resume).toBeDisabled();
+    expect(refresh).toBeEnabled();
+    expect(
+      screen.getByTestId("codex-usage-limit-resume-status-text"),
+    ).toHaveTextContent("streamRetry.usageLimitResume.unavailableStatus");
+    expect(invoke.mock.calls).toEqual([
+      ["get_codex_usage_limit_resume_count"],
+      ["refresh_codex_usage_limit_resume_count"],
+    ]);
+    expect(
+      screen.queryByText("internal native scan error"),
+    ).not.toBeInTheDocument();
+
+    await user.click(refresh);
+    await waitFor(() => expect(count).toHaveTextContent("1"));
+    expect(resume).toBeEnabled();
+    expect(invoke.mock.calls).toEqual([
+      ["get_codex_usage_limit_resume_count"],
+      ["refresh_codex_usage_limit_resume_count"],
+      ["refresh_codex_usage_limit_resume_count"],
+      ["get_codex_usage_limit_resume_count"],
+    ]);
+  });
+
+  it.each([
+    ["scanTimedOut", "scanTimedOut"],
+    ["Timed out waiting for the Codex recovery scan", "scanTimedOut"],
+    ["observerStopped", "observerStopped"],
+    ["Codex recovery observer stopped", "observerStopped"],
+    ["observerUnavailable", "observerUnavailable"],
+    ["Codex recovery observer is unavailable", "observerUnavailable"],
+    ["desktopNotLinked", "desktopNotLinked"],
+    ["desktopNotRunning", "desktopNotRunning"],
+    [
+      "Command refresh_codex_usage_limit_resume_count not found",
+      "refreshUnsupported",
+    ],
+  ])(
+    "explains a Refresh error (%s) without exposing the old count",
+    async (error, reason) => {
+      invoke
+        .mockResolvedValueOnce({ count: 2, complete: true })
+        .mockRejectedValueOnce(error);
+      const user = userEvent.setup();
+      renderCodexHeader();
+
+      const resume = await screen.findByRole("button", {
+        name: "streamRetry.usageLimitResume.action",
+      });
+      const refresh = screen.getByTestId("codex-usage-limit-refresh-button");
+      await user.click(refresh);
+      await waitFor(() =>
+        expect(
+          screen.getByTestId("codex-usage-limit-resume-status-text"),
+        ).toHaveTextContent(
+          `streamRetry.usageLimitResume.errors.${reason}.status`,
+        ),
+      );
+      expect(
+        screen.getByTestId("codex-usage-limit-resume-count"),
+      ).toHaveTextContent(/^…$/);
+      expect(
+        screen.getByTestId("codex-usage-limit-resume-status"),
+      ).toHaveAttribute(
+        "title",
+        `streamRetry.usageLimitResume.errors.${reason}.description`,
+      );
+      expect(resume).toBeDisabled();
+      expect(refresh).toBeEnabled();
+      expect(invoke.mock.calls).toEqual([
+        ["get_codex_usage_limit_resume_count"],
+        ["refresh_codex_usage_limit_resume_count"],
+      ]);
+
+      await user.click(screen.getByTestId("codex-usage-limit-details-button"));
+      expect(
+        screen.getByText(
+          `streamRetry.usageLimitResume.errors.${reason}.description`,
+        ),
+      ).toBeVisible();
+      expect(
+        screen.queryByText(error, { exact: true }),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    { reason: "scanTimedOut", complete: true, readyCount: 3 },
+    { reason: "observerStopped", complete: true, readyCount: 3 },
+    { reason: "observerUnavailable", complete: true, readyCount: 3 },
+    { reason: "desktopNotLinked", complete: true, readyCount: 3 },
+    { reason: "desktopNotRunning", complete: true, readyCount: 3 },
+    { reason: "scanTimedOut", complete: false, readyCount: 3 },
+    { reason: "observerUnavailable", complete: false, readyCount: 0 },
+  ])(
+    "recovers from $reason only after a fresh verified background scan (complete=$complete, count=$readyCount)",
+    async ({ reason, complete, readyCount }) => {
+      vi.useFakeTimers();
+      const cachedCount = {
+        count: 2,
+        complete: true,
+        scanVerifiedAtMs: Date.now(),
+      };
+      let finishEarlierRead!: (value: typeof cachedCount) => void;
+      const earlierRead = new Promise<typeof cachedCount>((resolve) => {
+        finishEarlierRead = resolve;
+      });
+      invoke
+        .mockResolvedValueOnce(cachedCount)
+        .mockReturnValueOnce(earlierRead)
+        .mockRejectedValueOnce(reason);
+      const client = renderCodexHeader();
+      const advance = (milliseconds: number) =>
+        act(async () => {
+          await vi.advanceTimersByTimeAsync(milliseconds);
+        });
+      const count = screen.getByTestId("codex-usage-limit-resume-count");
+      const resume = screen.getByTestId("codex-usage-limit-resume-button");
+      const status = screen.getByTestId("codex-usage-limit-resume-status-text");
+      const refresh = screen.getByTestId("codex-usage-limit-refresh-button");
+      const expectFailure = () => {
+        expect(status).toHaveTextContent(
+          `streamRetry.usageLimitResume.errors.${reason}.status`,
+        );
+        expect(count).toHaveTextContent("…");
+        expect(resume).toBeDisabled();
+      };
+
+      try {
+        await advance(20);
+        expect(count).toHaveTextContent("2");
+        await advance(5_000);
+        expect(invoke).toHaveBeenCalledTimes(2);
+
+        await act(async () => fireEvent.click(refresh));
+        expectFailure();
+        expect(refresh).toBeEnabled();
+
+        await advance(20);
+        await act(async () =>
+          finishEarlierRead({
+            count: 9,
+            complete: true,
+            scanVerifiedAtMs: Date.now(),
+          }),
+        );
+        await advance(20);
+        expectFailure();
+
+        invoke.mockResolvedValueOnce(cachedCount);
+        await advance(5_000);
+        expectFailure();
+
+        invoke.mockResolvedValueOnce({
+          ...cachedCount,
+          count: 1,
+          complete: false,
+        });
+        await advance(5_000);
+        expectFailure();
+
+        invoke.mockResolvedValueOnce({ count: 1, complete: false });
+        await advance(5_000);
+        expectFailure();
+
+        invoke.mockResolvedValueOnce({
+          count: readyCount,
+          complete,
+          scanVerifiedAtMs: Date.now(),
+        });
+        await advance(5_000);
+        if (readyCount > 0) {
+          expect(count).toHaveTextContent(String(readyCount));
+          expect(resume).toBeEnabled();
+          expect(status).toHaveTextContent(
+            complete
+              ? "streamRetry.usageLimitResume.readyStatus"
+              : "streamRetry.usageLimitResume.partialStatus",
+          );
+        } else {
+          expect(count).toHaveTextContent(/^…$/);
+          expect(resume).toBeDisabled();
+          expect(status).toHaveTextContent(
+            "streamRetry.usageLimitResume.partialEmptyStatus",
+          );
+        }
+
+        invoke.mockResolvedValueOnce({ count: 1, complete: false });
+        await advance(5_000);
+        expect(count).toHaveTextContent("1");
+        expect(resume).toBeEnabled();
+        expect(
+          invoke.mock.calls.filter(([command]) =>
+            command.startsWith("refresh_"),
+          ),
+        ).toEqual([["refresh_codex_usage_limit_resume_count"]]);
+      } finally {
+        cleanup();
+        client.clear();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("reports unavailable recovery storage if the count read fails after a scan", async () => {
+    const storageError = "Codex continuation evidence storage is unavailable";
+    invoke
+      .mockResolvedValueOnce({ count: 2, complete: true })
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(storageError);
+    const user = userEvent.setup();
+    renderCodexHeader();
+
+    const resume = await screen.findByRole("button", {
+      name: "streamRetry.usageLimitResume.action",
+    });
+    const refresh = screen.getByTestId("codex-usage-limit-refresh-button");
+    await user.click(refresh);
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("codex-usage-limit-resume-status-text"),
+      ).toHaveTextContent(
+        "streamRetry.usageLimitResume.errors.evidenceStorageUnavailable.status",
+      ),
+    );
+    expect(
+      screen.getByTestId("codex-usage-limit-resume-count"),
+    ).toHaveTextContent("…");
+    expect(resume).toBeDisabled();
+    expect(refresh).toBeEnabled();
+    expect(invoke.mock.calls).toEqual([
+      ["get_codex_usage_limit_resume_count"],
+      ["refresh_codex_usage_limit_resume_count"],
+      ["get_codex_usage_limit_resume_count"],
+    ]);
+    await user.click(screen.getByTestId("codex-usage-limit-details-button"));
+    expect(
+      screen.getByText(
+        "streamRetry.usageLimitResume.errors.evidenceStorageUnavailable.description",
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText(storageError)).not.toBeInTheDocument();
+  });
+
   it("exposes the live ready count and explains why an empty scan is safe", async () => {
     invoke.mockResolvedValue({ count: 0, complete: true });
     const user = userEvent.setup();
@@ -608,7 +962,9 @@ describe("StreamRetryHeaderToggle", () => {
       );
       expect(
         screen.getByTestId("codex-usage-limit-resume-status-text"),
-      ).toHaveTextContent("streamRetry.usageLimitResume.unavailableStatus");
+      ).toHaveTextContent(
+        "streamRetry.usageLimitResume.errors.countReadFailed.status",
+      );
       expect(button).toBeDisabled();
 
       await advance(5_000);

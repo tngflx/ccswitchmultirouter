@@ -4114,6 +4114,40 @@
       "partialEmptyAction": "等待偵測",
       "checkingStatus": "正在掃描已確認對話…",
       "unavailableStatus": "無法取得已確認對話掃描結果",
+      "errors": {
+        "scanTimedOut": {
+          "status": "對話掃描逾時",
+          "description": "請維持 Codex Desktop 開啟，再按一下重新整理按鈕重新掃描。"
+        },
+        "observerStopped": {
+          "status": "對話監測已停止",
+          "description": "請按一下重新整理按鈕再試一次。若監測一再停止，請重新開啟 CC Switch。"
+        },
+        "observerUnavailable": {
+          "status": "無法監測對話",
+          "description": "請開啟 Codex Desktop，在 CC Switch 中檢查連線後再按一次重新整理。"
+        },
+        "desktopNotLinked": {
+          "status": "Codex Desktop 需要連線",
+          "description": "請儲存工作並完全結束 Codex Desktop，再到 CC Switch 選擇 Codex 多模型路由 → Status → Link → Unlock model picker，以重新啟動並連線。"
+        },
+        "desktopNotRunning": {
+          "status": "Codex Desktop 未執行",
+          "description": "請在 CC Switch 選擇 Codex 多模型路由 → Status → Link → Unlock model picker，以啟動並連線至 Codex Desktop。"
+        },
+        "refreshUnsupported": {
+          "status": "目前版本不支援手動掃描對話",
+          "description": "此版本的 CC Switch 不支援手動掃描待復原的對話。請更新 CC Switch 以使用重新整理按鈕。"
+        },
+        "countReadFailed": {
+          "status": "無法讀取可繼續的對話",
+          "description": "CC Switch 無法讀取已確認的對話清單。請按一下重新整理按鈕再試一次。"
+        },
+        "evidenceStorageUnavailable": {
+          "status": "無法存取對話復原資料",
+          "description": "CC Switch 無法存取本機的對話復原資料。請檢查 CC Switch 資料夾的存取權限，重新開啟應用程式後再試一次。"
+        }
+      },
       "refreshing": "正在更新對話掃描",
       "refresh": "檢查可繼續的對話",
       "sendingStatus": "正在傳送 Continue…",

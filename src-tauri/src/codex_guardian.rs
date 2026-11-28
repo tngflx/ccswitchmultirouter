@@ -1,19 +1,18 @@
 use futures::future::join_all;
 use serde::Serialize;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{watch, Mutex};
 
 use crate::codex_desktop::{
     candidate_debug_ports, collect_native_usage_limit_candidates, deactivate_codex_model_picker,
-    detect_running_codex_main_process_async, inspect_codex_renderer_compatibility,
-    list_cdp_targets, load_cc_switch_model_catalog_projection_outcome,
-    pick_codex_page_targets_async, try_inject_on_candidate_ports, CdpTarget,
-    CodexModelCatalogLoadOutcome, CodexModelCatalogProjection, CodexModelPickerDiagnosticsCounts,
-    CodexModelPickerReadiness, CodexRendererCompatibilityObservation, NativeUsageLimitSnapshot,
-    DEFAULT_CODEX_DEBUG_PORT,
+    detect_running_codex_main_process_for_guardian, discover_codex_page_targets_for_guardian,
+    inspect_codex_renderer_compatibility, load_cc_switch_model_catalog_projection_outcome,
+    try_inject_on_candidate_ports, CdpTarget, CodexModelCatalogLoadOutcome,
+    CodexModelCatalogProjection, CodexModelPickerDiagnosticsCounts, CodexModelPickerReadiness,
+    CodexRendererCompatibilityObservation, NativeUsageLimitSnapshot, DEFAULT_CODEX_DEBUG_PORT,
 };
 use crate::proxy::codex_turn_recovery::{
     clear_native_usage_limit_candidates, proxy_usage_limit_turns,
@@ -26,7 +25,8 @@ const GUARDIAN_IDLE_MAX_INTERVAL: Duration = Duration::from_secs(12);
 // picker verification at the normal cadence, but bound this heavier observer
 // to one scan per three guardian cycles unless its source set changes.
 const NATIVE_USAGE_SCAN_INTERVAL: Duration = Duration::from_secs(9);
-const NATIVE_USAGE_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+// A refresh may queue behind a running cycle before probing the renderer.
+const NATIVE_USAGE_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GuardianCycleState {
@@ -96,6 +96,7 @@ enum NativeUsageScan {
     Skip,
     Scan,
     Clear,
+    Incomplete,
 }
 
 impl NativeUsageScanCadence {
@@ -108,9 +109,13 @@ impl NativeUsageScanCadence {
     ) -> NativeUsageScan {
         if sources.is_empty() {
             if !source_enumeration_complete {
-                return NativeUsageScan::Skip;
+                return if force {
+                    NativeUsageScan::Incomplete
+                } else {
+                    NativeUsageScan::Skip
+                };
             }
-            if self.source_signature.is_empty() {
+            if self.source_signature.is_empty() && !force {
                 return NativeUsageScan::Skip;
             }
             // Losing every verified destination invalidates its native proof.
@@ -119,7 +124,7 @@ impl NativeUsageScanCadence {
             return NativeUsageScan::Clear;
         }
         if force {
-            self.expedite();
+            self.next_due_at = None;
         }
         if self.should_scan(sources, now) {
             NativeUsageScan::Scan
@@ -185,50 +190,54 @@ enum PickerManagement {
 pub(crate) struct GuardianHandle {
     shutdown_tx: watch::Sender<bool>,
     picker_management: watch::Sender<PickerManagement>,
-    native_usage_refresh: Arc<NativeUsageRefresh>,
+    native_usage_refresh: watch::Sender<Option<NativeUsageRefresh>>,
     pub(crate) status: Arc<Mutex<CodexGuardianStatus>>,
 }
 
-struct NativeUsageRefresh {
-    requested: AtomicU64,
-    completed: AtomicU64,
-    wake: Notify,
-    completion: Notify,
+type NativeUsageRefreshResult = Result<(), NativeUsageRefreshError>;
+type NativeUsageRefresh = watch::Sender<Option<NativeUsageRefreshResult>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NativeUsageRefreshError {
+    ScanTimedOut,
+    ObserverStopped,
+    ObserverUnavailable,
+    DesktopNotRunning,
+    DesktopNotLinked,
 }
 
-impl NativeUsageRefresh {
-    fn new() -> Self {
-        Self {
-            requested: AtomicU64::new(0),
-            completed: AtomicU64::new(0),
-            wake: Notify::new(),
-            completion: Notify::new(),
+fn take_native_usage_refresh(
+    pending: &watch::Sender<Option<NativeUsageRefresh>>,
+) -> Option<NativeUsageRefresh> {
+    let mut refresh = None;
+    pending.send_if_modified(|state| {
+        refresh = state.take();
+        refresh.is_some()
+    });
+    refresh
+}
+
+async fn wait_for_native_usage_refresh(
+    mut refresh: watch::Receiver<Option<NativeUsageRefreshResult>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> NativeUsageRefreshResult {
+    if *shutdown.borrow() {
+        return Err(NativeUsageRefreshError::ObserverStopped);
+    }
+    let completion = async {
+        let result = refresh
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| NativeUsageRefreshError::ObserverStopped)?;
+        (*result).expect("refresh completed")
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown.changed() => Err(NativeUsageRefreshError::ObserverStopped),
+        result = tokio::time::timeout(NATIVE_USAGE_REFRESH_TIMEOUT, completion) => {
+            result.map_err(|_| NativeUsageRefreshError::ScanTimedOut)?
         }
-    }
-
-    fn request(&self) -> u64 {
-        let generation = self.requested.fetch_add(1, Ordering::AcqRel) + 1;
-        self.wake.notify_one();
-        generation
-    }
-
-    async fn wait_for(&self, generation: u64) -> Result<(), String> {
-        tokio::time::timeout(NATIVE_USAGE_REFRESH_TIMEOUT, async {
-            loop {
-                if self.completed.load(Ordering::Acquire) >= generation {
-                    return;
-                }
-                self.completion.notified().await;
-            }
-        })
-        .await
-        .map_err(|_| "Timed out waiting for the Codex recovery scan".to_string())
-    }
-
-    fn complete_pending(&self) {
-        let requested = self.requested.load(Ordering::Acquire);
-        self.completed.store(requested, Ordering::Release);
-        self.completion.notify_waiters();
     }
 }
 
@@ -281,7 +290,7 @@ impl GuardianHandle {
                 } else {
                     PickerManagement::Observe
                 }),
-                native_usage_refresh: Arc::new(NativeUsageRefresh::new()),
+                native_usage_refresh: watch::Sender::new(None),
                 status,
             },
             shutdown_rx,
@@ -308,9 +317,20 @@ impl GuardianHandle {
         });
     }
 
-    pub(crate) async fn request_native_usage_scan(&self) -> Result<(), String> {
-        let generation = self.native_usage_refresh.request();
-        self.native_usage_refresh.wait_for(generation).await
+    pub(crate) fn request_native_usage_scan(
+        &self,
+    ) -> impl Future<Output = Result<(), NativeUsageRefreshError>> + Send + 'static {
+        let mut receiver = None;
+        self.native_usage_refresh.send_if_modified(|pending| {
+            let is_new = pending.is_none();
+            let refresh = pending.get_or_insert_with(|| watch::Sender::new(None));
+            receiver = Some(refresh.subscribe());
+            is_new
+        });
+        wait_for_native_usage_refresh(
+            receiver.expect("refresh subscribed"),
+            self.shutdown_tx.subscribe(),
+        )
     }
 
     pub(crate) fn stop(self) {
@@ -324,23 +344,11 @@ async fn guardian_loop(
     inner: Arc<Mutex<GuardianInner>>,
     mut shutdown: watch::Receiver<bool>,
     picker_management: watch::Sender<PickerManagement>,
-    native_usage_refresh: Arc<NativeUsageRefresh>,
+    native_usage_refresh: watch::Sender<Option<NativeUsageRefresh>>,
 ) {
     let mut cadence = GuardianCadence::default();
-    let mut force_native_usage_scan = false;
-    loop {
-        if *shutdown.borrow() {
-            let mut s = status.lock().await;
-            s.active = false;
-            s.picker_ready_target_count = 0;
-            s.picker_status = CodexModelPickerReadiness::Unverified;
-            s.picker_diagnostics = None;
-            s.picker_verification_issues.clear();
-            s.last_event = "守护已停止".into();
-            s.message = "守护已停止".into();
-            return;
-        }
-
+    let mut refresh_requests = native_usage_refresh.subscribe();
+    while !*shutdown.borrow() {
         let delay = cadence.after_cycle(
             run_guardian_cycle(
                 &status,
@@ -348,35 +356,25 @@ async fn guardian_loop(
                 &shutdown,
                 &picker_management,
                 &native_usage_refresh,
-                force_native_usage_scan,
             )
             .await,
         );
-        if native_usage_refresh.completed.load(Ordering::Acquire)
-            >= native_usage_refresh.requested.load(Ordering::Acquire)
-        {
-            force_native_usage_scan = false;
-        }
 
         tokio::select! {
             _ = tokio::time::sleep(delay) => {},
-            _ = native_usage_refresh.wake.notified() => {
-                force_native_usage_scan = true;
-                inner.lock().await.native_usage_scan.expedite();
-            }
-            _ = shutdown.changed() => {
-                let mut s = status.lock().await;
-                s.active = false;
-                s.picker_ready_target_count = 0;
-                s.picker_status = CodexModelPickerReadiness::Unverified;
-                s.picker_diagnostics = None;
-                s.picker_verification_issues.clear();
-                s.last_event = "守护已停止".into();
-                s.message = "守护已停止".into();
-                return;
-            }
+            _ = refresh_requests.wait_for(Option::is_some) => {},
+            _ = shutdown.changed() => break,
         }
     }
+
+    let mut s = status.lock().await;
+    s.active = false;
+    s.picker_ready_target_count = 0;
+    s.picker_status = CodexModelPickerReadiness::Unverified;
+    s.picker_diagnostics = None;
+    s.picker_verification_issues.clear();
+    s.last_event = "守护已停止".into();
+    s.message = "守护已停止".into();
 }
 
 struct GuardianTargetDestinations<'a> {
@@ -416,15 +414,32 @@ fn collect_guardian_target_destinations(
 
 fn publish_native_usage_limit_candidates(
     shutdown: &watch::Receiver<bool>,
-    snapshot: Option<NativeUsageLimitSnapshot>,
+    scan: Result<NativeUsageLimitSnapshot, NativeUsageRefreshError>,
+    refresh: Option<&NativeUsageRefresh>,
 ) {
-    // Hold the watch read lock through publication so stop can clear the
-    // snapshot without an in-flight cycle republishing it afterward.
+    // Serialize publication and acknowledgement with shutdown. A stopped
+    // observer cannot replace the cleared snapshot or acknowledge a refresh.
     let stopped = shutdown.borrow();
     if !*stopped {
-        match snapshot {
-            Some(snapshot) => replace_native_usage_limit_candidates(snapshot),
-            None => clear_native_usage_limit_candidates(),
+        let result = match scan {
+            Ok(snapshot) => {
+                replace_native_usage_limit_candidates(Some(snapshot));
+                Ok(())
+            }
+            Err(
+                error @ (NativeUsageRefreshError::DesktopNotRunning
+                | NativeUsageRefreshError::DesktopNotLinked),
+            ) => {
+                clear_native_usage_limit_candidates();
+                Err(error)
+            }
+            Err(error) => {
+                replace_native_usage_limit_candidates(None);
+                Err(error)
+            }
+        };
+        if let Some(refresh) = refresh {
+            refresh.send_replace(Some(result));
         }
     }
 }
@@ -435,61 +450,57 @@ async fn scan_native_usage_limit_sources(
     sources: &[&str],
     source_enumeration_complete: bool,
     force: bool,
-    native_usage_refresh: &Arc<NativeUsageRefresh>,
+    refresh: Option<&NativeUsageRefresh>,
 ) {
-    let scan = inner.lock().await.native_usage_scan.next_scan(
-        sources,
-        source_enumeration_complete,
-        force,
-        Instant::now(),
-    );
-    match scan {
-        NativeUsageScan::Skip => return,
-        NativeUsageScan::Clear => {
-            publish_native_usage_limit_candidates(shutdown, None);
-            native_usage_refresh.complete_pending();
-            return;
-        }
-        NativeUsageScan::Scan => {}
-    }
-
-    let proxy_turns_json = serde_json::to_string(&proxy_usage_limit_turns())
-        .expect("serializing proxy usage limit turn identifiers and timestamps cannot fail");
-    let authorize = |_| !*shutdown.borrow();
-    let snapshots = join_all(sources.iter().copied().map(|source| {
-        collect_native_usage_limit_candidates(source, &proxy_turns_json, &authorize)
-    }))
-    .await;
-    let source_set_complete = {
-        let guard = inner.lock().await;
-        !guard.native_usage_scan.source_set_shrank
+    let scan = {
+        let mut guard = inner.lock().await;
+        guard.native_usage_scan.next_scan(
+            sources,
+            source_enumeration_complete,
+            force || refresh.is_some(),
+            Instant::now(),
+        )
     };
-    let combined = combine_native_usage_limit_snapshots(
-        snapshots,
-        source_enumeration_complete,
-        source_set_complete,
-    );
-    let complete = combined.complete;
-    publish_native_usage_limit_candidates(shutdown, Some(combined));
-
-    // A pre-install bridge probe can return an incomplete snapshot while
-    // installing the renderer observer. Give an incomplete scan one expedited
-    // retry. Consecutive partial scans return to the normal sampling cadence.
-    inner.lock().await.native_usage_scan.finish_scan(complete);
-    if force {
-        native_usage_refresh.complete_pending();
-    }
+    let result = match scan {
+        NativeUsageScan::Skip => return,
+        NativeUsageScan::Clear => Err(NativeUsageRefreshError::DesktopNotLinked),
+        NativeUsageScan::Incomplete => Err(NativeUsageRefreshError::ObserverUnavailable),
+        NativeUsageScan::Scan => {
+            let proxy_turns_json = serde_json::to_string(&proxy_usage_limit_turns()).expect(
+                "serializing proxy usage limit turn identifiers and timestamps cannot fail",
+            );
+            let authorize = |_| !*shutdown.borrow();
+            let snapshots = join_all(sources.iter().copied().map(|source| {
+                collect_native_usage_limit_candidates(source, &proxy_turns_json, &authorize)
+            }))
+            .await;
+            let mut guard = inner.lock().await;
+            let combined = combine_native_usage_limit_snapshots(
+                snapshots,
+                source_enumeration_complete,
+                !guard.native_usage_scan.source_set_shrank,
+            );
+            // An incomplete bridge install gets one expedited retry. Consecutive
+            // partial scans return to the normal cadence.
+            guard
+                .native_usage_scan
+                .finish_scan(combined.as_ref().is_some_and(|snapshot| snapshot.complete));
+            combined.ok_or(NativeUsageRefreshError::ObserverUnavailable)
+        }
+    };
+    publish_native_usage_limit_candidates(shutdown, result, refresh);
 }
 
 fn combine_native_usage_limit_snapshots(
-    snapshots: Vec<NativeUsageLimitSnapshot>,
+    snapshots: Vec<Option<NativeUsageLimitSnapshot>>,
     source_enumeration_complete: bool,
     source_set_complete: bool,
-) -> NativeUsageLimitSnapshot {
-    let mut combined = NativeUsageLimitSnapshot {
-        complete: !snapshots.is_empty() && source_enumeration_complete && source_set_complete,
-        ..Default::default()
-    };
+) -> Option<NativeUsageLimitSnapshot> {
+    let all_sources_responded = snapshots.iter().all(Option::is_some);
+    let mut snapshots = snapshots.into_iter().flatten();
+    let mut combined = snapshots.next()?;
+    combined.complete &=
+        all_sources_responded && source_enumeration_complete && source_set_complete;
     for snapshot in snapshots {
         combined.complete &= snapshot.complete;
         combined.candidates.extend(snapshot.candidates);
@@ -500,7 +511,7 @@ fn combine_native_usage_limit_snapshots(
             .stale_proxy_turns
             .extend(snapshot.stale_proxy_turns);
     }
-    combined
+    Some(combined)
 }
 
 fn finish_restored_picker_release(picker_management: &watch::Sender<PickerManagement>) {
@@ -516,15 +527,30 @@ async fn run_guardian_cycle(
     inner: &Arc<Mutex<GuardianInner>>,
     shutdown: &watch::Receiver<bool>,
     picker_management: &watch::Sender<PickerManagement>,
-    native_usage_refresh: &Arc<NativeUsageRefresh>,
-    force_native_usage_scan: bool,
+    native_usage_refresh: &watch::Sender<Option<NativeUsageRefresh>>,
 ) -> GuardianCycleState {
+    // A request can only be fulfilled by discovery that starts after the click.
+    // Callers queued before discovery share that scan's own completion channel.
+    let refresh = take_native_usage_refresh(native_usage_refresh);
+    let refresh = refresh.as_ref();
+
     // 1. 检查 Codex 主进程是否在运行。
-    let running = detect_running_codex_main_process_async().await;
-    if running.is_none() {
-        clear_native_usage_limit_candidates();
+    let running = detect_running_codex_main_process_for_guardian().await;
+    if !matches!(running, Ok(Some(_))) {
+        let confirmed_missing = matches!(running, Ok(None));
+        if confirmed_missing {
+            publish_native_usage_limit_candidates(
+                shutdown,
+                Err(NativeUsageRefreshError::DesktopNotRunning),
+                refresh,
+            );
+        } else {
+            scan_native_usage_limit_sources(inner, shutdown, &[], false, false, refresh).await;
+        }
         let mut s = status.lock().await;
-        s.codex_running = false;
+        if confirmed_missing {
+            s.codex_running = false;
+        }
         s.cdp_available = false;
         s.injected = false;
         s.injected_target_count = 0;
@@ -532,6 +558,11 @@ async fn run_guardian_cycle(
         s.picker_status = CodexModelPickerReadiness::Unverified;
         s.picker_diagnostics = None;
         s.picker_verification_issues.clear();
+        if !confirmed_missing {
+            s.last_event = "Codex 运行状态未核验".into();
+            s.message = "无法核验 Codex Desktop 进程，等待下次检查...".into();
+            return GuardianCycleState::VerifiedRendererUnavailable;
+        }
         s.last_event = "Codex 未运行".into();
         s.message = "Codex Desktop 未运行，等待用户启动...".into();
         // 进程消失时清理已知 target，下次启动不会跳过新 target。
@@ -545,40 +576,34 @@ async fn run_guardian_cycle(
 
     // 2. 保留 websocket 地址，以便同一 target 重载后核验 renderer 状态。
     let ports = candidate_debug_ports(DEFAULT_CODEX_DEBUG_PORT);
+    let discovery = discover_codex_page_targets_for_guardian(&ports).await;
     let mut verified_pages = Vec::new();
     let mut target_ports = Vec::new();
-    let mut cdp_available = false;
-
-    for port in &ports {
-        match list_cdp_targets(*port).await {
-            Ok(targets) => match pick_codex_page_targets_async(&targets, *port).await {
-                Ok(pages) => {
-                    cdp_available = true;
-                    target_ports.push(*port);
-                    verified_pages.extend(pages);
-                }
-                Err(_) => continue,
-            },
-            Err(_) => continue,
-        }
+    for (port, pages) in discovery.pages_by_port {
+        target_ports.push(port);
+        verified_pages.extend(pages);
     }
+    let cdp_available = !target_ports.is_empty();
 
     // The continuation runtime also serves native providers. Its candidates
     // are independent of the model picker catalog's availability or ownership.
     // This observer enumerates every loaded thread, so it has its own bounded
     // cadence; renderer/picker checks below still run on every guardian cycle.
+    let destinations = collect_guardian_target_destinations(&verified_pages);
+    let native_usage_enumeration_complete =
+        discovery.complete && destinations.native_usage_enumeration_complete;
     let GuardianTargetDestinations {
         picker: current_targets,
         native_usage: native_usage_sources,
-        native_usage_enumeration_complete,
-    } = collect_guardian_target_destinations(&verified_pages);
+        ..
+    } = destinations;
     scan_native_usage_limit_sources(
         inner,
         shutdown,
         &native_usage_sources,
         native_usage_enumeration_complete,
-        force_native_usage_scan,
-        native_usage_refresh,
+        false,
+        refresh,
     )
     .await;
 
@@ -592,13 +617,17 @@ async fn run_guardian_cycle(
         s.picker_status = CodexModelPickerReadiness::Unverified;
         s.picker_diagnostics = None;
         s.picker_verification_issues.clear();
-        s.last_event = "Codex 运行中但无 CDP".into();
-        s.message = "Codex Desktop 正在运行但未开放 CDP 调试端口；CCSM 不会静默终止 Codex，请退出后从 CCSM 启动或等待下次 CCSM 启动 Codex 时自动注入。".into();
+        if discovery.complete {
+            s.last_event = "Codex 运行中但无 CDP".into();
+            s.message = "Codex Desktop 正在运行但未开放 CDP 调试端口；CCSM 不会静默终止 Codex，请退出后从 CCSM 启动或等待下次 CCSM 启动 Codex 时自动注入。".into();
+        } else {
+            s.last_event = "Codex CDP 状态未核验".into();
+            s.message = "无法核验 Codex Desktop 调试端口，等待下次检查...".into();
+        }
         let mut guard = inner.lock().await;
         guard.injected_target_ids.clear();
         guard.injected_catalog_fingerprint = None;
         guard.last_picker_readiness_signature = None;
-        guard.native_usage_scan.reset();
         return GuardianCycleState::VerifiedRendererUnavailable;
     }
 
@@ -809,13 +838,15 @@ async fn run_guardian_cycle(
         }
     }
     if injection_succeeded && injected_target_count > 0 {
+        // This rescan reuses the earlier inventory. A newer manual request
+        // must wait for fresh source discovery.
         scan_native_usage_limit_sources(
             inner,
             shutdown,
             &native_usage_sources,
             native_usage_enumeration_complete,
             true,
-            native_usage_refresh,
+            None,
         )
         .await;
     }
@@ -1343,6 +1374,65 @@ mod tests {
     }
 
     #[test]
+    fn forced_native_usage_scan_resolves_empty_inventory() {
+        let now = Instant::now();
+        let mut cadence = NativeUsageScanCadence::default();
+        assert_eq!(
+            cadence.next_scan(&[], true, true, now),
+            NativeUsageScan::Clear
+        );
+
+        let sources = ["ws://127.0.0.1:9229/devtools/page/1"];
+        assert_eq!(
+            cadence.next_scan(&sources, true, false, now),
+            NativeUsageScan::Scan
+        );
+        cadence.finish_scan(true);
+
+        assert_eq!(
+            cadence.next_scan(&[], false, true, now + Duration::from_secs(1)),
+            NativeUsageScan::Incomplete,
+        );
+        assert_eq!(cadence.source_signature, vec![sources[0].to_string()]);
+        assert_eq!(
+            cadence.next_scan(&sources, true, false, now + Duration::from_secs(2)),
+            NativeUsageScan::Skip,
+        );
+    }
+
+    #[test]
+    fn forced_native_usage_scan_bypasses_cadence_for_one_scan() {
+        let now = Instant::now();
+        let sources = ["ws://127.0.0.1:9229/devtools/page/1"];
+        let mut cadence = NativeUsageScanCadence::default();
+        assert_eq!(
+            cadence.next_scan(&sources, true, false, now),
+            NativeUsageScan::Scan
+        );
+        cadence.finish_scan(false);
+        assert_eq!(
+            cadence.next_scan(&sources, true, false, now),
+            NativeUsageScan::Scan
+        );
+        cadence.finish_scan(false);
+
+        let before_due = now + GUARDIAN_CHECK_INTERVAL;
+        assert_eq!(
+            cadence.next_scan(&sources, true, false, before_due),
+            NativeUsageScan::Skip
+        );
+        assert_eq!(
+            cadence.next_scan(&sources, true, true, before_due),
+            NativeUsageScan::Scan
+        );
+        cadence.finish_scan(false);
+        assert_eq!(
+            cadence.next_scan(&sources, true, false, before_due),
+            NativeUsageScan::Skip
+        );
+    }
+
+    #[test]
     fn native_usage_source_set_shrink_marks_the_next_snapshot_partial() {
         let start = Instant::now();
         let first = "ws://127.0.0.1:9229/devtools/page/1";
@@ -1372,17 +1462,40 @@ mod tests {
         }))
         .expect("valid observed usage-limit turn fixture");
         let combined = combine_native_usage_limit_snapshots(
-            vec![NativeUsageLimitSnapshot {
+            vec![Some(NativeUsageLimitSnapshot {
                 candidates: vec![candidate.clone()],
                 complete: true,
                 ..Default::default()
-            }],
+            })],
             false,
             true,
-        );
+        )
+        .unwrap();
 
         assert!(!combined.complete);
         assert_eq!(combined.candidates, vec![candidate]);
+    }
+
+    #[test]
+    fn native_usage_scan_missing_renderer_results_cannot_verify_a_zero_count() {
+        assert_eq!(
+            combine_native_usage_limit_snapshots(vec![None, None], true, true),
+            None
+        );
+        assert_eq!(
+            combine_native_usage_limit_snapshots(
+                vec![
+                    None,
+                    Some(NativeUsageLimitSnapshot {
+                        complete: true,
+                        ..Default::default()
+                    }),
+                ],
+                true,
+                true,
+            ),
+            Some(NativeUsageLimitSnapshot::default())
+        );
     }
 
     #[test]
@@ -1526,18 +1639,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_usage_refresh_completes_waiters_for_the_requested_generation() {
-        let refresh = Arc::new(NativeUsageRefresh::new());
-        let generation = refresh.request();
-        let waiter = {
-            let refresh = refresh.clone();
-            tokio::spawn(async move { refresh.wait_for(generation).await })
-        };
+    async fn native_usage_refresh_batches_requests_before_discovery() {
+        let (handle, _shutdown) = GuardianHandle::new(false);
+        let pending = &handle.native_usage_refresh;
+        let first = handle.request_native_usage_scan();
+        let second = handle.request_native_usage_scan();
+        let scanning = take_native_usage_refresh(pending).unwrap();
+        assert!(pending.borrow().is_none());
 
-        refresh.complete_pending();
+        let later = handle.request_native_usage_scan();
+        tokio::pin!(later);
+        scanning.send_replace(Some(Ok(())));
+        assert_eq!(first.await, Ok(()));
+        assert_eq!(second.await, Ok(()));
+        assert!(futures::poll!(later.as_mut()).is_pending());
 
-        assert_eq!(waiter.await.expect("refresh waiter task"), Ok(()));
-        assert_eq!(refresh.completed.load(Ordering::Acquire), generation);
+        let next = take_native_usage_refresh(pending).unwrap();
+        next.send_replace(Some(Ok(())));
+        assert_eq!(later.await, Ok(()));
+        assert!(pending.borrow().is_none());
+    }
+
+    #[tokio::test]
+    async fn native_usage_refresh_preserves_the_result_of_each_scan_for_delayed_waiters() {
+        let (handle, _shutdown) = GuardianHandle::new(false);
+        let pending = &handle.native_usage_refresh;
+        let first = handle.request_native_usage_scan();
+        let scanning = take_native_usage_refresh(pending).unwrap();
+        let later = handle.request_native_usage_scan();
+        scanning.send_replace(Some(Err(NativeUsageRefreshError::DesktopNotLinked)));
+        drop(scanning);
+        let next = take_native_usage_refresh(pending).unwrap();
+        next.send_replace(Some(Ok(())));
+        drop(next);
+
+        assert_eq!(first.await, Err(NativeUsageRefreshError::DesktopNotLinked));
+        assert_eq!(later.await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn native_usage_refresh_reports_unavailable_when_no_renderer_was_verified() {
+        let (handle, _shutdown) = GuardianHandle::new(false);
+        let request = handle.request_native_usage_scan();
+        let pending = &handle.native_usage_refresh;
+        let failed = take_native_usage_refresh(pending).unwrap();
+        failed.send_replace(Some(Err(NativeUsageRefreshError::ObserverUnavailable)));
+        assert_eq!(
+            request.await,
+            Err(NativeUsageRefreshError::ObserverUnavailable)
+        );
+
+        let retry = handle.request_native_usage_scan();
+        let next = take_native_usage_refresh(pending).unwrap();
+        next.send_replace(Some(Ok(())));
+        assert_eq!(retry.await, Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_usage_refresh_reports_a_distinct_timeout() {
+        let (handle, _shutdown) = GuardianHandle::new(false);
+
+        assert_eq!(
+            handle.request_native_usage_scan().await,
+            Err(NativeUsageRefreshError::ScanTimedOut)
+        );
+        assert!(handle.native_usage_refresh.borrow().is_some());
+    }
+
+    #[test]
+    fn native_usage_refresh_errors_use_stable_ipc_codes() {
+        for (error, code) in [
+            (NativeUsageRefreshError::ScanTimedOut, "scanTimedOut"),
+            (NativeUsageRefreshError::ObserverStopped, "observerStopped"),
+            (
+                NativeUsageRefreshError::ObserverUnavailable,
+                "observerUnavailable",
+            ),
+            (
+                NativeUsageRefreshError::DesktopNotRunning,
+                "desktopNotRunning",
+            ),
+            (
+                NativeUsageRefreshError::DesktopNotLinked,
+                "desktopNotLinked",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(error).unwrap(), json!(code));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_usage_refresh_stops_waiting_on_guardian_shutdown() {
+        let (handle, shutdown) = GuardianHandle::new(false);
+        let waiter = handle.request_native_usage_scan();
+        tokio::pin!(waiter);
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+        let refresh = take_native_usage_refresh(&handle.native_usage_refresh).unwrap();
+
+        handle.shutdown_tx.send(true).expect("signal shutdown");
+        publish_native_usage_limit_candidates(
+            &shutdown,
+            Ok(NativeUsageLimitSnapshot::default()),
+            Some(&refresh),
+        );
+
+        assert_eq!(waiter.await, Err(NativeUsageRefreshError::ObserverStopped));
+        assert!(refresh.borrow().is_none());
     }
 
     fn observed_target(

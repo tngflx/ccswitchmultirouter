@@ -9215,16 +9215,20 @@ function CodexProjectionStatusPanel({
   queryError,
   retryError,
   isRefreshing,
+  isInitialLoading,
   onRetry,
 }: {
   status?: CodexRoutingProjectionStatus;
   queryError: Error | null;
   retryError: string | null;
   isRefreshing: boolean;
+  isInitialLoading: boolean;
   onRetry: () => void;
 }) {
   const inactive = status?.state === "not_required";
-  const pending = Boolean(queryError) || status?.state === "pending" || !status;
+  const checking = isRefreshing;
+  const pending = Boolean(queryError) || status?.state === "pending";
+  const needsAttention = checking || pending;
   const errorMessage =
     retryError ||
     status?.lastError ||
@@ -9236,7 +9240,7 @@ function CodexProjectionStatusPanel({
       role="status"
       className={cn(
         "mt-3 rounded-lg border p-3 text-xs leading-5",
-        pending
+        needsAttention
           ? "border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-700/50 dark:bg-amber-950/25 dark:text-amber-100"
           : inactive
             ? "border-slate-200 bg-slate-50 text-slate-700 dark:border-slate-600/50 dark:bg-slate-900/60 dark:text-slate-200"
@@ -9248,11 +9252,13 @@ function CodexProjectionStatusPanel({
           MultiRouter catalog projection:
           {inactive
             ? "Generated on activation"
-            : pending
-              ? "Pending sync"
-              : "Synchronized"}
+            : checking
+              ? "Checking…"
+              : pending
+                ? "Pending sync"
+                : "Synchronized"}
         </div>
-        {pending && !inactive ? (
+        {pending && !inactive && !checking ? (
           <Button
             size="sm"
             variant="outline"
@@ -9270,9 +9276,13 @@ function CodexProjectionStatusPanel({
       <div className="mt-1">
         {inactive
           ? "This is not the active MultiRouter; it does not own the shared live file and is generated from the latest provider config when activated."
-          : pending
-            ? "The current provider/model catalog may differ from the Codex live projection; resync before sending requests."
-            : `Confirmed ${status?.routes.length ?? 0} rule model mappings match the current provider catalog.`}
+          : checking
+            ? isInitialLoading
+              ? "Checking the current provider/model catalog projection."
+              : "Checking the updated provider/model catalog projection."
+            : pending
+              ? "The current provider/model catalog may differ from the Codex live projection; resync before sending requests."
+              : `Confirmed ${status?.routes.length ?? 0} rule model mappings match the current provider catalog.`}
       </div>
       {errorMessage ? (
         <div className="mt-1">
@@ -9399,6 +9409,7 @@ function StatusTab({
   const {
     data: projectionStatus,
     error: projectionError,
+    isLoading: isProjectionLoading,
     isFetching: isRefreshingProjection,
   } = useQuery<CodexRoutingProjectionStatus>({
     queryKey: ["codexMultiRouterProjection", selectedPlan?.id],
@@ -9919,6 +9930,7 @@ function StatusTab({
                 queryError={projectionError}
                 retryError={projectionRetryError}
                 isRefreshing={isRefreshingProjection || isRetryingProjection}
+                isInitialLoading={isProjectionLoading}
                 onRetry={retryProjection}
               />
             ) : null}

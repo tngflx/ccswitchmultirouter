@@ -415,6 +415,31 @@ describe("Codex form discovery lifecycle", () => {
       ]),
     );
   });
+
+  it("applies a complete sync directly for an empty catalog", async () => {
+    vi.mocked(fetchModelsForConfig).mockResolvedValue(response);
+    const onCatalogModelsChange = vi.fn();
+    const onModelChange = vi.fn();
+    const props = formProps({
+      catalogModels: [],
+      onCatalogModelsChange,
+      onModelChange,
+    });
+    render(<CodexFormFields {...props} />);
+    act(() => readiness().onSyncModels());
+
+    await waitFor(() => expect(onCatalogModelsChange).toHaveBeenCalledOnce());
+
+    expect(
+      screen.queryByRole("dialog", { name: "Review model sync" }),
+    ).toBeNull();
+    expect(catalogModelIds()).toEqual(["wire-new"]);
+    expect(onCatalogModelsChange).toHaveBeenCalledWith([
+      expect.objectContaining({ model: "wire-new", enabled: true }),
+    ]);
+    expect(onModelChange).toHaveBeenCalledWith("wire-new");
+    expect(toast.success).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("Codex API-key model sync review", () => {

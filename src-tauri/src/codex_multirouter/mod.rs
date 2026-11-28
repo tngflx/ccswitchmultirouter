@@ -41,18 +41,45 @@ pub(crate) fn active_codex_router_id_with_local(
                 .and_then(serde_json::Value::as_str)
                 .filter(|id| !id.is_empty())
             {
-                if db.get_provider_by_id(id, "codex")?.is_some() {
-                    return Ok(Some(id.to_string()));
+                if let Some(id) = canonical_codex_router_id(db, id)? {
+                    return Ok(Some(id));
                 }
             }
         }
     }
     if let Some(id) = local_provider_id.filter(|id| !id.is_empty()) {
-        if db.get_provider_by_id(id, "codex")?.is_some() {
-            return Ok(Some(id.to_string()));
+        if let Some(id) = canonical_codex_router_id(db, id)? {
+            return Ok(Some(id));
         }
     }
-    db.get_current_provider("codex")
+    let current = db.get_current_provider("codex")?;
+    current
+        .as_deref()
+        .map(|id| canonical_codex_router_id(db, id))
+        .transpose()
+        .map(|id| id.flatten())
+}
+
+/// Provider Set leaves are persistence/runtime implementation details. Resolve
+/// them back to their user-facing facade before projection ownership checks.
+fn canonical_codex_router_id(db: &Database, provider_id: &str) -> Result<Option<String>, AppError> {
+    let Some(provider) = db.get_provider_by_id(provider_id, "codex")? else {
+        return Ok(None);
+    };
+    let Some(parent_id) = provider_set::codex_provider_set_leaf_parent_id(&provider) else {
+        return Ok(Some(provider_id.to_string()));
+    };
+    let parent = db.get_provider_by_id(parent_id, "codex")?;
+    if parent
+        .as_ref()
+        .is_some_and(provider_set::is_codex_provider_set_facade)
+    {
+        return Ok(Some(parent_id.to_string()));
+    }
+    log::warn!(
+        "Codex current Provider points to an orphaned internal Provider Set leaf: {provider_id}"
+    );
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -90,6 +117,46 @@ mod tests {
             active_codex_router_id_with_local(&db, Some("router-local"))
                 .expect("resolve active router"),
             Some("router-local".to_string())
+        );
+    }
+
+    #[test]
+    fn generated_leaf_current_provider_resolves_to_its_facade() {
+        let db = Database::memory().expect("memory db");
+        let facade = Provider::with_id(
+            "router-facade".to_string(),
+            "Router facade".to_string(),
+            serde_json::json!({
+                "codexProtocolSet": {
+                    "version": 1,
+                    "role": "facade",
+                    "responsesProviderId": "router-facade::responses",
+                    "chatProviderId": "router-facade::chat"
+                }
+            }),
+            None,
+        );
+        let leaf = Provider::with_id(
+            "router-facade::chat".to_string(),
+            "Router facade (Chat)".to_string(),
+            serde_json::json!({
+                "codexProtocolSet": {
+                    "version": 1,
+                    "role": "leaf",
+                    "transport": "open_ai_chat",
+                    "parentProviderId": "router-facade"
+                }
+            }),
+            None,
+        );
+        db.save_provider("codex", &facade).expect("save facade");
+        db.save_provider("codex", &leaf).expect("save leaf");
+        db.set_current_provider("codex", &leaf.id)
+            .expect("set leaf current");
+
+        assert_eq!(
+            active_codex_router_id_with_local(&db, None).expect("resolve active router"),
+            Some(facade.id)
         );
     }
 }

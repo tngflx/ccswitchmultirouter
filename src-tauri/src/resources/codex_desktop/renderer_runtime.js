@@ -1249,6 +1249,17 @@
       if (patched > 0) state.appServerPatchInstalled = true;
       return patched;
     };
+    const reconcileNativeReasoningVisibility = () => {
+      if (typeof reconcileCodexNativeReasoningVisibility !== "function") return;
+      try {
+        state.nativeReasoningVisibilityReconciliation =
+          reconcileCodexNativeReasoningVisibility(
+            codexNativeReasoningManagedEfforts(),
+          );
+      } catch (error) {
+        recordFailure(error);
+      }
+    };
     const patchedCaches = new Set();
     // Rebinding a known, positively mounted family client is synchronous. Do
     // it before async Webpack/Fiber inventory so reinjection immediately
@@ -1293,6 +1304,10 @@
           // immediately, without gating the canonical tree scan on this import.
           refreshMountedAppServerScopeHints(patchedCaches);
           scanInitialUsageLimitIfReady();
+          // Numeric picker discovery can finish after this heartbeat. Reconcile
+          // immediately so the mounted native picker does not wait for another
+          // scheduler turn before exposing the catalog-approved efforts.
+          if (!recoveryOnly) reconcileNativeReasoningVisibility();
           const known = recoveryOnly
             ? codexContinuationLocalClients().length > 0
             : Array.isArray(state.nativeReasoningVisibilityAtoms) &&
@@ -1488,16 +1503,7 @@
         }
       }
     }
-    if (typeof reconcileCodexNativeReasoningVisibility === "function") {
-      try {
-        state.nativeReasoningVisibilityReconciliation =
-          reconcileCodexNativeReasoningVisibility(
-            codexNativeReasoningManagedEfforts(),
-          );
-      } catch (error) {
-        recordFailure(error);
-      }
-    }
+    reconcileNativeReasoningVisibility();
     state.appServerPatchInstalled = patched > 0;
     if (patched > 0 && state.historyQueryRefreshCompleted) {
       state.reactRequestClientPatchVersion = appServerRequestPatchVersion;

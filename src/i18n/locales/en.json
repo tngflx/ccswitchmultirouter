@@ -4113,6 +4113,40 @@
       "partialEmptyAction": "Waiting for detection",
       "checkingStatus": "Scanning for verified sessions…",
       "unavailableStatus": "Verified session scan unavailable",
+      "errors": {
+        "scanTimedOut": {
+          "status": "Session scan timed out",
+          "description": "Keep Codex Desktop open and use the refresh button to try the scan again."
+        },
+        "observerStopped": {
+          "status": "Session observer stopped",
+          "description": "Use the refresh button to retry. If the observer keeps stopping, reopen CC Switch."
+        },
+        "observerUnavailable": {
+          "status": "Session observer unavailable",
+          "description": "Open Codex Desktop and check its connection in CC Switch, then try the refresh button again."
+        },
+        "desktopNotLinked": {
+          "status": "Codex Desktop needs linking",
+          "description": "Save your work and fully quit Codex Desktop. In CC Switch, go to Codex multi-model routing → Status → Link → Unlock model picker to relaunch and link it."
+        },
+        "desktopNotRunning": {
+          "status": "Codex Desktop is closed",
+          "description": "In CC Switch, go to Codex multi-model routing → Status → Link → Unlock model picker to start Codex Desktop and link it."
+        },
+        "refreshUnsupported": {
+          "status": "Session refresh unsupported",
+          "description": "This version of CC Switch does not support manual Session Recovery scans. Update CC Switch to use the refresh button."
+        },
+        "countReadFailed": {
+          "status": "Couldn't read ready sessions",
+          "description": "CC Switch could not read the list of verified sessions. Use the refresh button to try again."
+        },
+        "evidenceStorageUnavailable": {
+          "status": "Recovery storage unavailable",
+          "description": "CC Switch could not access its local session recovery data. Check access to the CC Switch data folder, then reopen CC Switch and try again."
+        }
+      },
       "refreshing": "Refreshing session scan",
       "refresh": "Check for ready sessions",
       "sendingStatus": "Sending continue…",

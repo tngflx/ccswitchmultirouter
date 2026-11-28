@@ -11019,6 +11019,44 @@ describe("Codex MultiRouter workspace route persistence helpers", () => {
     expect(inspect).toHaveBeenCalledTimes(3);
   });
 
+  it("does not offer a second resync action while the projection check is loading", async () => {
+    const source: Provider = {
+      id: "projection-loading-source",
+      name: "Projection loading source",
+      category: "custom",
+      settingsConfig: {
+        modelCatalog: { models: [{ model: "loading-model" }] },
+      },
+    };
+    const plan = createDraftRoutingPlan([source], [source]);
+    vi.mocked(
+      providersApi.inspectCodexMultiRouterProjection,
+    ).mockImplementationOnce(
+      () => new Promise<CodexRoutingProjectionStatus>(() => {}),
+    );
+
+    renderWorkspace(
+      React.createElement(CodexRouterWorkspacePage, {
+        providers: [source, plan],
+        isProxyRunning: true,
+        isCodexTakeoverActive: true,
+        activeProviderId: plan.id,
+        initialProviderId: plan.id,
+        initialTab: "status",
+        onEditProvider: vi.fn(),
+        onDeletePlan: vi.fn(),
+        onCreateProvider: vi.fn(),
+      }),
+    );
+
+    expect(
+      await screen.findByText("MultiRouter catalog projection:Checking…"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Resync catalog" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("shows stale projection details and lets the user resync with readable provider names", async () => {
     const source: Provider = {
       id: "5626e6b9-33cb-4c3b-8d16-af8176e16209",

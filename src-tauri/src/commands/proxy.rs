@@ -675,11 +675,15 @@ pub async fn get_codex_guardian_status(
 #[tauri::command]
 pub async fn refresh_codex_usage_limit_resume_count(
     state: tauri::State<'_, crate::AppState>,
-) -> Result<(), String> {
-    state
+) -> Result<(), crate::codex_guardian::NativeUsageRefreshError> {
+    let result = state
         .proxy_service
         .request_codex_usage_limit_refresh()
-        .await
+        .await;
+    if let Err(error) = &result {
+        log::warn!("[Codex/Recovery] manual session scan failed: {error:?}");
+    }
+    result
 }
 
 #[tauri::command]

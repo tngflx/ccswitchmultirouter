@@ -1,5 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { act, fireEvent, render } from "@testing-library/react";
+import { createElement, useSyncExternalStore } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 const resources = path.resolve(
@@ -49,7 +51,7 @@ const fixtureWindow = {
   __codexRoot: { _internalRoot: { current: fixtureRoot } },
 };
 type FixtureDocument = {
-  getElementById: () => null;
+  getElementById: () => object | null;
   querySelectorAll?: () => object[];
 };
 const fixtureDocument: FixtureDocument = { getElementById: () => null };
@@ -97,6 +99,58 @@ const createScope = <T>(cache: object, enabled: T) => {
     },
   };
   return { scope, client, scopeGetter };
+};
+const createSubscribedScope = (cache: object, baseline: Set<string>) => {
+  const brand = { id: Symbol() };
+  const resolvedAtom = { read: () => baseline };
+  const listeners = new Set<() => void>();
+  const store = {
+    get: vi.fn((_atom: object) => baseline),
+    sub: vi.fn((_atom: object, listener: () => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    }),
+    set: vi.fn(),
+  };
+  const { scope, client } = createScope(cache, baseline);
+  const node = {
+    token: brand,
+    queryClient: client,
+    store,
+    cachedBindings: new WeakMap<object, typeof resolvedAtom>(),
+  };
+  const chain = new Map([[brand.id, node]]);
+  const signal = {
+    scope: brand,
+    cache: "cached",
+    resolve: vi.fn((_node: typeof node) => resolvedAtom),
+  };
+  const resolveSignal = (owner: typeof node, definition: typeof signal) => {
+    const cached = owner.cachedBindings.get(definition);
+    if (cached) return cached;
+    const binding = definition.resolve(owner);
+    owner.cachedBindings.set(definition, binding);
+    return binding;
+  };
+  Object.assign(scope, {
+    chain,
+    node,
+    get: (atom: typeof signal) => {
+      const owner =
+        node.token === atom.scope ? node : chain.get(atom.scope.id)!;
+      return owner.store.get(resolveSignal(owner, atom));
+    },
+  });
+  return {
+    scope,
+    signal,
+    node,
+    chain,
+    store,
+    listeners,
+    resolvedAtom,
+    resolveSignal,
+  };
 };
 const createState = (atom: object, ...scopes: object[]): State => ({
   nativeReasoningVisibilityRequired: true,
@@ -436,6 +490,228 @@ describe("Codex Desktop read-only native reasoning visibility", () => {
 });
 
 describe("Codex Desktop managed native graded-effort reconciliation", () => {
+  it("refreshes a mounted composer reading the resolved store atom and selects Max between Extra High and Ultra", () => {
+    const model = "gpt-6.2-sol";
+    const rows = allEfforts.map((reasoningEffort) => ({
+      model,
+      reasoningEffort,
+    }));
+    const nativeEfforts = allEfforts.filter((effort) => effort !== "max");
+    const baseline = new Set(nativeEfforts);
+    const cache = createManagedCache();
+    const {
+      scope,
+      signal,
+      chain,
+      store,
+      listeners,
+      resolvedAtom,
+      resolveSignal,
+    } = createSubscribedScope(cache, baseline);
+    const unrelatedAtom = { read: () => baseline };
+    const foreignStore = { ...store, get: vi.fn((_atom: object) => baseline) };
+    const readSnapshot = () => {
+      const owner = chain.get(signal.scope.id)!;
+      return owner.store.get(resolveSignal(owner, signal));
+    };
+    const subscribe = (listener: () => void) => {
+      const owner = chain.get(signal.scope.id)!;
+      return owner.store.sub(resolveSignal(owner, signal), listener);
+    };
+    const onSelectPower = vi.fn();
+    function ComposerPicker({ refreshVersion }: { refreshVersion: number }) {
+      const enabled = useSyncExternalStore(subscribe, readSnapshot);
+      const powerSelections = rows.filter(({ reasoningEffort }) =>
+        enabled.has(reasoningEffort),
+      );
+      return createElement(
+        "div",
+        { "data-refresh-version": refreshVersion },
+        createElement(
+          "ol",
+          null,
+          powerSelections.map(({ reasoningEffort }) =>
+            createElement("li", { key: reasoningEffort }, reasoningEffort),
+          ),
+        ),
+        createElement("input", {
+          "aria-label": "Power",
+          type: "range",
+          defaultValue: 3,
+          min: 0,
+          max: powerSelections.length - 1,
+          onChange: (event) =>
+            onSelectPower(powerSelections[Number(event.currentTarget.value)]),
+        }),
+      );
+    }
+    const state = createState(signal, scope);
+    state.payload!.modelNames = [model];
+    state.payload!.models = [
+      { model, supported_reasoning_levels: [...allEfforts] },
+    ];
+    const view = render(createElement(ComposerPicker, { refreshVersion: 0 }));
+    const refreshNative = vi.fn((refreshVersion: number) => {
+      view.rerender(createElement(ComposerPicker, { refreshVersion }));
+    });
+    state.reasoningQueryCaches = new Map([[cache, { refreshNative }]]);
+    const reconcile = createReconciler(state);
+    const visibleEfforts = () =>
+      view.getAllByRole("listitem").map((row) => row.textContent);
+    const originalGet = store.get;
+
+    expect(visibleEfforts()).toEqual(nativeEfforts);
+    expect(store.sub).toHaveBeenCalledWith(resolvedAtom, expect.any(Function));
+    act(() => {
+      expect(reconcile(allEfforts)).toMatchObject({
+        status: "known",
+        managed: true,
+        patchedScopes: 1,
+      });
+    });
+    expect(visibleEfforts()).toEqual(allEfforts);
+    const slider = view.getByRole("slider", { name: "Power" });
+    expect(slider).toHaveAttribute("max", "5");
+    fireEvent.change(slider, { target: { value: "4" } });
+    expect(onSelectPower).toHaveBeenLastCalledWith({
+      model,
+      reasoningEffort: "max",
+    });
+    expect(readSnapshot()).toBe(readSnapshot());
+    expect(store.get(unrelatedAtom)).toBe(baseline);
+    expect(foreignStore.get(resolvedAtom)).toBe(baseline);
+    expect(baseline.has("max")).toBe(false);
+    expect(store.set).not.toHaveBeenCalled();
+
+    act(() => {
+      expect(reconcile([])).toMatchObject({
+        managed: false,
+        restoredScopes: 1,
+      });
+    });
+    expect(visibleEfforts()).toEqual(nativeEfforts);
+    expect(store.get).toBe(originalGet);
+    expect(readSnapshot()).toBe(baseline);
+    view.unmount();
+    expect(listeners.size).toBe(0);
+  });
+
+  it("refuses native visibility when the composer and scope getter resolve different stores", () => {
+    const cache = createManagedCache();
+    const baseline = new Set(allEfforts.filter((effort) => effort !== "max"));
+    const { scope, signal, node, chain, store, resolvedAtom } =
+      createSubscribedScope(cache, baseline);
+    const otherStore = { ...store, get: vi.fn((_atom: object) => baseline) };
+    chain.set(signal.scope.id, {
+      ...node,
+      store: otherStore,
+      cachedBindings: new WeakMap([[signal, resolvedAtom]]),
+    });
+    const originalScopeGet = scope.get;
+    const originalStoreGet = store.get;
+    const originalOtherStoreGet = otherStore.get;
+    const state = createState(signal, scope);
+
+    expect(createReconciler(state)(allEfforts)).toMatchObject({
+      status: "unverified",
+      patchedScopes: 0,
+    });
+    expect(scope.get).toBe(originalScopeGet);
+    expect(store.get).toBe(originalStoreGet);
+    expect(otherStore.get).toBe(originalOtherStoreGet);
+    expect(scope.get(signal)).toBe(baseline);
+    expect(store.get(resolvedAtom)).toBe(baseline);
+    expect(otherStore.get(resolvedAtom)).toBe(baseline);
+  });
+
+  it("restores one store getter shared by two managed owners of the same resolved atom", () => {
+    const cache = createManagedCache();
+    const baseline = new Set(allEfforts.filter((effort) => effort !== "max"));
+    const { scope, signal, node, chain, store, resolvedAtom } =
+      createSubscribedScope(cache, baseline);
+    const sibling = createScope(cache, baseline).scope;
+    Object.assign(sibling, { node, chain, get: scope.get });
+    const originalStoreGet = store.get;
+    const originalScopeGet = scope.get;
+    const state = createState(signal, scope, sibling);
+    const reconcile = createReconciler(state);
+
+    expect(reconcile(allEfforts)).toMatchObject({
+      status: "known",
+      patchedScopes: 2,
+    });
+    const projected = store.get(resolvedAtom);
+    expect(projected.has("max")).toBe(true);
+    expect(scope.get(signal)).toBe(projected);
+    expect(sibling.get(signal)).toBe(projected);
+
+    expect(reconcile([])).toMatchObject({ managed: false, restoredScopes: 2 });
+    expect(store.get).toBe(originalStoreGet);
+    expect(scope.get).toBe(originalScopeGet);
+    expect(sibling.get).toBe(originalScopeGet);
+    expect(store.get(resolvedAtom)).toBe(baseline);
+  });
+
+  it("retains one store getter when reinjection discovers another managed owner", () => {
+    const cache = createManagedCache();
+    const baseline = new Set(allEfforts.filter((effort) => effort !== "max"));
+    const { scope, signal, node, chain, store, resolvedAtom } =
+      createSubscribedScope(cache, baseline);
+    const originalGet = store.get;
+    const state = createState(signal, scope);
+    expect(createReconciler(state)(allEfforts)).toMatchObject({
+      status: "known",
+      patchedScopes: 1,
+    });
+    const projectedGet = store.get;
+
+    const sibling = createScope(cache, baseline).scope;
+    Object.assign(sibling, { node, chain, get: scope.get });
+    state.scopedAppServerScopeCandidates = new Set([scope, sibling]);
+    const reconcileAfterReinjection = createReconciler(state);
+    expect(reconcileAfterReinjection(allEfforts)).toMatchObject({
+      status: "known",
+      patchedScopes: 2,
+    });
+    expect(store.get).toBe(projectedGet);
+    expect(store.get(resolvedAtom).has("max")).toBe(true);
+
+    expect(reconcileAfterReinjection([])).toMatchObject({ restoredScopes: 2 });
+    expect(store.get).toBe(originalGet);
+    expect(store.get(resolvedAtom)).toBe(baseline);
+  });
+
+  it("reuses the current catalog effort projection across composer snapshots", () => {
+    const cache = createManagedCache();
+    const baseline = new Set(allEfforts.filter((effort) => effort !== "max"));
+    const { scope, signal, store, resolvedAtom } = createSubscribedScope(
+      cache,
+      baseline,
+    );
+    const state = createState(signal, scope);
+    const catalog = state.payload!;
+    const readModels = vi.fn(() => catalog.models);
+    state.payload = {
+      ...catalog,
+      get models() {
+        return readModels();
+      },
+    };
+    const reconcile = createReconciler(state);
+    expect(reconcile(allEfforts)).toMatchObject({ status: "known" });
+    expect(readModels).toHaveBeenCalled();
+    readModels.mockClear();
+
+    const projected = store.get(resolvedAtom);
+    expect(projected.has("max")).toBe(true);
+    expect(store.get(resolvedAtom)).toBe(projected);
+    expect(readModels).not.toHaveBeenCalled();
+
+    state.payload = { ...catalog, models: [] };
+    expect(store.get(resolvedAtom)).toBe(baseline);
+    expect(reconcile([])).toMatchObject({ restoredScopes: 1 });
+  });
+
   it("notifies the explicit picker refresh boundary without mutating native scope state", () => {
     const cache = createManagedCache();
     const atom = createAtom();
@@ -510,6 +786,9 @@ describe("Codex Desktop managed native graded-effort reconciliation", () => {
     expect(props.powerSelections.map((row) => row.reasoningEffort)).toEqual(
       allEfforts,
     );
+    expect(props.powerSelections.map((row) => row.powerSettingIndex)).toEqual([
+      0, 1, 2, 3, 4, 5,
+    ]);
     expect(props.powerSelections).not.toBe(originalSelections);
     expect(state.nativeReasoningVisibilityPowerPatches?.size).toBe(1);
 
@@ -836,7 +1115,7 @@ const createCurrentCacheReader = (state: State) =>
 
 const createScannedReconciler = (
   state: State,
-  root: object,
+  root: object | null,
   document = fixtureDocument,
   timers: { setInterval?: (callback: () => void) => number } = {},
 ) =>
@@ -875,6 +1154,80 @@ return {
   };
 
 describe("Codex Desktop retained native ownership provenance", () => {
+  it.each(["replaced", "detached"])(
+    "keeps Max through a React alternate commit and clears it when the scope is %s",
+    async (change) => {
+      const cache = createManagedCache();
+      const baseline = new Set(allEfforts.filter((effort) => effort !== "max"));
+      const { scope, signal, node, chain, store, resolvedAtom } =
+        createSubscribedScope(cache, baseline);
+      const owner = {
+        scope: signal.scope,
+        chain,
+        node,
+        queryClient: node.queryClient,
+        get: scope.get,
+        set: scope.set,
+        watch: scope.watch,
+      };
+      const readSnapshot = () => store.get(resolvedAtom);
+      const subscribe = (listener: () => void) =>
+        store.sub(resolvedAtom, listener);
+      function Composer({
+        revision,
+      }: {
+        owner: object | null;
+        revision: number;
+      }) {
+        const efforts = useSyncExternalStore(subscribe, readSnapshot);
+        return createElement(
+          "output",
+          { "data-revision": revision },
+          efforts.has("max") ? "Max" : "Extra High",
+        );
+      }
+      const view = render(createElement(Composer, { owner, revision: 0 }));
+      const containerKey = Object.keys(view.container).find((key) =>
+        key.startsWith("__reactContainer"),
+      )!;
+      const root = Object.getOwnPropertyDescriptor(view.container, containerKey)
+        ?.value.stateNode as { current: { alternate: object | null } };
+      const state = createState(signal);
+      state.appServerStatusAtoms = [signal];
+      const api = createScannedReconciler(state, null, {
+        getElementById: () => view.container,
+      });
+      const originalGet = store.get;
+      expect(await api.scan()).toContain(owner);
+      expect(api.snapshotCurrent()).toBe(true);
+      expect(api.reconcile(["max"])).toMatchObject({
+        status: "known",
+        patchedScopes: 1,
+      });
+      const projected = readSnapshot();
+      expect(projected.has("max")).toBe(true);
+
+      const firstCommit = root.current;
+      view.rerender(createElement(Composer, { owner, revision: 1 }));
+      expect(root.current).not.toBe(firstCommit);
+      expect(root.current.alternate).toBe(firstCommit);
+      expect(firstCommit.alternate).toBe(root.current);
+      expect(readSnapshot()).toBe(projected);
+      expect(view.getByRole("status")).toHaveTextContent("Max");
+
+      const nextOwner = change === "replaced" ? { ...owner } : null;
+      view.rerender(createElement(Composer, { owner: nextOwner, revision: 2 }));
+      expect(readSnapshot()).toBe(baseline);
+      expect(api.reconcile(["max"])).toMatchObject({
+        status: "unverified",
+        patchedScopes: 0,
+        restoredScopes: 1,
+      });
+      expect(store.get).toBe(originalGet);
+      expect(readSnapshot()).toBe(baseline);
+    },
+  );
+
   it("validates complete scope snapshots once per reconciliation phase", async () => {
     const atom = createAtom();
     const { scope } = createScope(createManagedCache(), new Set(["high"]));

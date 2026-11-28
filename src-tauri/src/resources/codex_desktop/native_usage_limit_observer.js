@@ -253,9 +253,11 @@ const codexNativeUsageLimitReadPersisted = async (scan, source) => {
   const readStates = new Map();
   const cursors = new Set();
   let cursor = null;
-  for (let pageIndex = 0; ; pageIndex += 1) {
-    if (pageIndex >= codexNativeUsageLimitMaxDiscoveryPages)
-      throw new Error("Codex persisted-session discovery exceeded its bound");
+  for (
+    let pageIndex = 0;
+    pageIndex < codexNativeUsageLimitMaxDiscoveryPages;
+    pageIndex += 1
+  ) {
     let result;
     try {
       result = await readOwnedCodexContinuationRequest(
@@ -272,16 +274,8 @@ const codexNativeUsageLimitReadPersisted = async (scan, source) => {
         },
       );
     } catch (error) {
-      // Older app-server clients do not expose thread/list. The loaded-session
-      // source remains authoritative for those clients, so keep that scan
-      // usable while preserving strict validation for responses we received.
-      if (
-        error instanceof CodexContinuationReadUnavailable &&
-        error.message === "Codex thread/list could not be read" &&
-        pageIndex === 0
-      )
-        return { threads, readStates, complete: true };
-      throw error;
+      if (!(error instanceof CodexContinuationReadUnavailable)) throw error;
+      break;
     }
     if (
       !codexNativeUsageLimitScanIsCurrent(scan) ||
@@ -349,6 +343,9 @@ const codexNativeUsageLimitReadPersisted = async (scan, source) => {
     if (nextCursor === null) return { threads, readStates, complete: true };
     cursor = nextCursor;
   }
+  // Keep the verified prefix after a read failure or the page limit. Each
+  // unread receipt still needs to match the thread's current latest turn.
+  return { threads, readStates, complete: false };
 };
 
 const codexNativeUsageLimitReadTurn = async (
@@ -359,6 +356,7 @@ const codexNativeUsageLimitReadTurn = async (
   idlePeers,
   proxyHeads,
   fallbackReadState,
+  onUnloadedCandidate,
 ) => {
   const userAction = captureCodexOwnerUserActionEvidence(threadId);
   if (!userAction) throw new Error("Codex user-action evidence is unavailable");
@@ -399,6 +397,7 @@ const codexNativeUsageLimitReadTurn = async (
   }
   if (!["active", "idle", "systemError", "notLoaded"].includes(status))
     throw new Error("Codex thread status is unavailable");
+  if (status === "notLoaded") onUnloadedCandidate?.();
 
   const acknowledgement = readAcknowledgement();
   const priorObservation =
@@ -638,34 +637,15 @@ const codexNativeUsageLimitReadLatestTurn = async ({
   const eligibleUnreadTurn =
     unreadTurn?.turnId === turnId &&
     codexNativeUsageLimitUnreadActionAllows(userAction, turn, turnId);
-  if (status === "notLoaded" && !pendingStateIsClear)
-    return hasRunningProof && eligibleUnreadTurn ? currentTurn : rejectedTurn;
-  if (status === "notLoaded" && !eligibleUnreadTurn)
-    // Keep exact running proof across renderer eviction without publishing a
-    // candidate until a durable unread receipt verifies the failed turn.
-    return hasRunningProof
-      ? { ...currentTurn, observedAtMs: undefined }
-      : rejectedTurn;
-  if (status === "notLoaded" && !hasRunningProof) {
-    if (!eligibleUnreadTurn)
-      return {
-        ...rejectedTurn,
-        settledUsageLimit:
-          !previous?.unreadRevision || previous.turnId !== turnId,
-      };
-    const verifiedAtMs = Date.now();
+  if (!pendingStateIsClear) return hasRunningProof ? currentTurn : rejectedTurn;
+  if (status === "notLoaded") {
+    // Continuation needs a loaded thread. Keep running proof for a later
+    // read and let an exact unread failure corroborate a loaded peer.
     return {
-      ...rejectedTurn,
-      unreadRevision: unreadTurn.revision,
-      observedAtMs:
-        priorObservation?.turnId === turnId &&
-        priorObservation.unreadRevision === unreadTurn.revision
-          ? (priorObservation.observedAtMs ?? verifiedAtMs)
-          : verifiedAtMs,
-      verifiedAtMs,
+      ...(hasRunningProof ? currentTurn : rejectedTurn),
+      settledUsageLimit: eligibleUnreadTurn,
     };
   }
-  if (!pendingStateIsClear) return hasRunningProof ? currentTurn : rejectedTurn;
   const verifiedAtMs = Date.now();
   if (!hasRunningProof) {
     if (!eligibleUnreadTurn)
@@ -685,7 +665,6 @@ const codexNativeUsageLimitReadLatestTurn = async ({
       verifiedAtMs,
     };
   }
-  if (status === "notLoaded" && !eligibleUnreadTurn) return rejectedTurn;
   return {
     ...currentTurn,
     observedAtMs: previousTurn?.observedAtMs ?? verifiedAtMs,
@@ -923,7 +902,6 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
     const acknowledgements = new Map(codexNativeUsageLimitAcknowledgements);
     const loadedBySource = new Map();
     const persistedBySource = new Map();
-    const readStatesBySource = new Map();
     for (
       let index = 0;
       index < sources.length && codexNativeUsageLimitScanIsCurrent(scan);
@@ -945,8 +923,7 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
       batch.forEach((source, offset) => {
         const { loaded, persisted } = results[offset];
         loadedBySource.set(source, loaded);
-        persistedBySource.set(source, persisted?.threads ?? null);
-        readStatesBySource.set(source, persisted?.readStates ?? null);
+        persistedBySource.set(source, persisted);
       });
     }
     if (!codexNativeUsageLimitScanIsCurrent(scan)) return false;
@@ -959,15 +936,14 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
         allThreadsRead = false;
         continue;
       }
-      if (!loaded || !persisted) allThreadsRead = false;
+      if (!loaded || !persisted?.complete) allThreadsRead = false;
       const discovered = new Set(loaded ?? []);
       // Persisted rows matter for recovery when a renderer has evicted the
       // session from its loaded list. Only an exact unread receipt can make
       // such a row eligible, so avoid binding every persisted session to
       // every overlapping renderer.
-      const readStates = readStatesBySource.get(source);
-      for (const threadId of persisted ?? []) {
-        if (readStates?.has(threadId)) discovered.add(threadId);
+      for (const threadId of persisted?.threads ?? []) {
+        if (persisted.readStates.has(threadId)) discovered.add(threadId);
       }
       for (const threadId of discovered) {
         // Loaded thread IDs alone cannot identify an app-server connection.
@@ -979,6 +955,7 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
     scan.threadSources = threadSources;
     const allSourcesListed = allThreadsRead;
     const now = Date.now();
+    const unlistedCandidateSources = new Map();
     for (const [threadId, observations] of codexNativeUsageLimitTurns) {
       for (const [source, previous] of observations) {
         const loaded = loadedBySource.get(source);
@@ -990,6 +967,15 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
         ) {
           observations.delete(source);
         } else if (loaded && !loaded.has(threadId)) {
+          if (
+            previous.observedAtMs &&
+            threadSources.get(threadId)?.has(source)
+          ) {
+            const candidateSources =
+              unlistedCandidateSources.get(threadId) ?? new Set();
+            candidateSources.add(source);
+            unlistedCandidateSources.set(threadId, candidateSources);
+          }
           // A thread can disappear from the in-memory list while a turn
           // settles. Keep exact running proof until a short reload window
           // expires, without treating the absent thread as a candidate.
@@ -1062,6 +1048,7 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
               listedSources.add(acknowledgement.source);
             if (listedSources.size > 1) scan.pendingSharedThreads.add(threadId);
             const observations = new Map();
+            let previouslyCountedSourceUnloaded = false;
             for (const [source, turn] of previous ?? []) {
               if (turn.unlistedAtMs != null && !listedSources.has(source))
                 observations.set(source, turn);
@@ -1090,16 +1077,25 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
               if (turn) observations.set(source, turn);
             };
             for (const source of listedSources) {
+              const prior = previous?.get(source);
+              const wasCandidate =
+                prior?.observedAtMs ||
+                unlistedCandidateSources.get(threadId)?.has(source);
               await observe(
                 source,
                 codexNativeUsageLimitReadTurn(
                   scan,
                   source,
                   threadId,
-                  previous?.get(source),
+                  prior,
                   idlePeers,
                   proxyHeads,
-                  readStatesBySource.get(source)?.get(threadId),
+                  persistedBySource.get(source)?.readStates.get(threadId),
+                  wasCandidate
+                    ? () => {
+                        previouslyCountedSourceUnloaded = true;
+                      }
+                    : null,
                 ),
               );
               if (!codexNativeUsageLimitScanIsCurrent(scan)) return;
@@ -1116,17 +1112,19 @@ const scanCodexNativeUsageLimitCandidates = async (scan) => {
               }
             }
             if (
-              previous &&
               ![...observations.values()].some((turn) => turn.observedAtMs) &&
-              [...observations].some(([source, turn]) => {
-                const prior = previous.get(source);
-                return (
-                  prior?.observedAtMs &&
-                  !turn.readFailed &&
-                  ((turn.runningProof === false && !turn.settledUsageLimit) ||
-                    (turn.userAction && turn.turnId !== prior.turnId))
-                );
-              })
+              (previouslyCountedSourceUnloaded ||
+                (previous &&
+                  [...observations].some(([source, turn]) => {
+                    const prior = previous.get(source);
+                    return (
+                      prior?.observedAtMs &&
+                      !turn.readFailed &&
+                      ((turn.runningProof === false &&
+                        !turn.settledUsageLimit) ||
+                        (turn.userAction && turn.turnId !== prior.turnId))
+                    );
+                  })))
             ) {
               // A verified change to a previously counted failure must reach
               // the guardian even if another thread makes this scan partial.

@@ -426,8 +426,15 @@ impl Default for RecoveryState {
 #[derive(Default)]
 struct RecoveryStates {
     threads: HashMap<String, RecoveryState>,
-    native_usage_limit_snapshot_completed_at: Option<Instant>,
+    native_usage_limit_scan: Option<NativeUsageLimitScanReceipt>,
+    last_logged_usage_limit_count: Option<(usize, &'static str)>,
     last_persisted_at: Option<Instant>,
+}
+
+struct NativeUsageLimitScanReceipt {
+    verified_at: Instant,
+    verified_at_ms: i64,
+    complete: bool,
 }
 
 impl Deref for RecoveryStates {
@@ -2054,7 +2061,7 @@ pub(crate) fn proxy_usage_limit_turns() -> Vec<ProxyUsageLimitTurn> {
 }
 
 pub(crate) fn replace_native_usage_limit_candidates(
-    snapshot: crate::codex_desktop::NativeUsageLimitSnapshot,
+    snapshot: Option<crate::codex_desktop::NativeUsageLimitSnapshot>,
 ) {
     ensure_owner_ledger_loaded();
     let Ok(mut states) = recovery_states().lock() else {
@@ -2093,19 +2100,22 @@ impl RecoveryStates {
         conflicting_thread_ids: Vec<String>,
         complete: bool,
     ) {
-        self.apply_native_usage_limit_snapshot(crate::codex_desktop::NativeUsageLimitSnapshot {
-            candidates: turns,
-            conflicting_thread_ids,
-            complete,
-            ..Default::default()
-        });
+        self.apply_native_usage_limit_snapshot(Some(
+            crate::codex_desktop::NativeUsageLimitSnapshot {
+                candidates: turns,
+                conflicting_thread_ids,
+                complete,
+                ..Default::default()
+            },
+        ));
     }
 
     fn apply_native_usage_limit_snapshot(
         &mut self,
-        snapshot: crate::codex_desktop::NativeUsageLimitSnapshot,
+        snapshot: Option<crate::codex_desktop::NativeUsageLimitSnapshot>,
     ) {
-        self.native_usage_limit_snapshot_completed_at = snapshot.complete.then(Instant::now);
+        let scan_was_verified = snapshot.is_some();
+        let snapshot = snapshot.unwrap_or_default();
         merge_native_usage_limit_candidates(
             &mut self.threads,
             snapshot.candidates,
@@ -2113,6 +2123,11 @@ impl RecoveryStates {
             snapshot.stale_proxy_turns,
             snapshot.complete,
         );
+        self.native_usage_limit_scan = scan_was_verified.then(|| NativeUsageLimitScanReceipt {
+            verified_at: Instant::now(),
+            verified_at_ms: chrono::Utc::now().timestamp_millis(),
+            complete: snapshot.complete,
+        });
     }
 
     fn clear_native_usage_limit_snapshot(&mut self) {
@@ -2123,21 +2138,22 @@ impl RecoveryStates {
             Vec::new(),
             true,
         );
-        self.native_usage_limit_snapshot_completed_at = None;
+        self.native_usage_limit_scan = None;
     }
 
     fn usage_limit_resume_count(&self) -> UsageLimitResumeCount {
+        let scan = self
+            .native_usage_limit_scan
+            .as_ref()
+            .filter(|scan| scan.verified_at.elapsed() <= NATIVE_USAGE_LIMIT_CONFIRMATION_TTL);
         UsageLimitResumeCount {
             count: self
                 .threads
                 .values()
                 .filter_map(eligible_usage_limit_candidate)
                 .count(),
-            complete: self
-                .native_usage_limit_snapshot_completed_at
-                .is_some_and(|completed_at| {
-                    completed_at.elapsed() <= NATIVE_USAGE_LIMIT_CONFIRMATION_TTL
-                }),
+            complete: scan.is_some_and(|scan| scan.complete),
+            scan_verified_at_ms: scan.map(|scan| scan.verified_at_ms),
         }
     }
 }
@@ -2376,10 +2392,34 @@ fn usage_limit_resume_snapshot(
 pub struct UsageLimitResumeCount {
     count: usize,
     complete: bool,
+    #[serde(rename = "scanVerifiedAtMs", skip_serializing_if = "Option::is_none")]
+    scan_verified_at_ms: Option<i64>,
 }
 
 pub(crate) fn codex_usage_limit_resume_count() -> Result<UsageLimitResumeCount, String> {
-    Ok(usage_limit_resume_states()?.usage_limit_resume_count())
+    let (count, scan, changed) = {
+        let mut states = usage_limit_resume_states()?;
+        let count = states.usage_limit_resume_count();
+        let scan = if count.complete {
+            "complete"
+        } else if count.scan_verified_at_ms.is_some() {
+            "partial"
+        } else {
+            "unverified"
+        };
+        // Report the same projection that the ribbon reads. New timestamps
+        // from unchanged polling results don't create additional log entries.
+        let current = (count.count, scan);
+        let changed = states.last_logged_usage_limit_count.replace(current) != Some(current);
+        (count, scan, changed)
+    };
+    if changed {
+        log::info!(
+            "[Codex/Recovery] session count eligible={} scan={scan}",
+            count.count
+        );
+    }
+    Ok(count)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3730,13 +3770,10 @@ mod tests {
 
         states.replace_native_usage_limit_snapshot(vec![newer.clone()], Vec::new(), false);
 
-        assert_eq!(
-            states.usage_limit_resume_count(),
-            UsageLimitResumeCount {
-                count: 1,
-                complete: false,
-            }
-        );
+        let count = states.usage_limit_resume_count();
+        assert_eq!(count.count, 1);
+        assert!(!count.complete);
+        assert!(count.scan_verified_at_ms.is_some());
         let state = &states[&turn.thread_id];
         assert_eq!(eligible_usage_limit_candidate(state).unwrap().turn, newer);
         assert!(!usage_limit_candidate_is_current(state, &previous));
@@ -3831,13 +3868,10 @@ mod tests {
             false,
         );
 
-        assert_eq!(
-            states.usage_limit_resume_count(),
-            UsageLimitResumeCount {
-                count: 1,
-                complete: false,
-            }
-        );
+        let count = states.usage_limit_resume_count();
+        assert_eq!(count.count, 1);
+        assert!(!count.complete);
+        assert!(count.scan_verified_at_ms.is_some());
         assert!(!states.contains_key(&native.thread_id));
         let proxy_state = &states[&proxy.thread_id];
         assert!(!usage_limit_candidate_is_current(
@@ -4012,13 +4046,9 @@ mod tests {
             UsageLimitResumeCount::default()
         );
         states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), true);
-        assert_eq!(
-            states.usage_limit_resume_count(),
-            UsageLimitResumeCount {
-                count: 0,
-                complete: true
-            }
-        );
+        let count = states.usage_limit_resume_count();
+        assert_eq!(count.count, 0);
+        assert!(count.complete);
 
         let turn = ObservedUsageLimitTurn {
             thread_id: "native-count-thread".into(),
@@ -4031,23 +4061,19 @@ mod tests {
             Vec::new(),
             true,
         );
-        assert_eq!(
-            states.usage_limit_resume_count(),
-            UsageLimitResumeCount {
-                count: 1,
-                complete: true
-            }
-        );
+        let count = states.usage_limit_resume_count();
+        assert_eq!(count.count, 1);
+        assert!(count.complete);
 
         let thread_id = turn.thread_id.clone();
         let confirmed_observation = eligible_usage_limit_candidate(&states[&thread_id])
             .unwrap()
             .continuation_observation();
         states.replace_native_usage_limit_snapshot(vec![turn.clone()], Vec::new(), false);
-        assert_eq!(
-            serde_json::to_value(states.usage_limit_resume_count()).unwrap(),
-            serde_json::json!({ "count": 1, "complete": false })
-        );
+        let count = states.usage_limit_resume_count();
+        assert_eq!(count.count, 1);
+        assert!(!count.complete);
+        assert!(count.scan_verified_at_ms.is_some());
         assert_eq!(
             eligible_usage_limit_candidate(&states[&thread_id])
                 .unwrap()
@@ -4056,13 +4082,10 @@ mod tests {
         );
 
         states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), false);
-        assert_eq!(
-            states.usage_limit_resume_count(),
-            UsageLimitResumeCount {
-                count: 1,
-                complete: false
-            }
-        );
+        let count = states.usage_limit_resume_count();
+        assert_eq!(count.count, 1);
+        assert!(!count.complete);
+        assert!(count.scan_verified_at_ms.is_some());
         assert!(states.threads.contains_key(&thread_id));
         assert_eq!(
             eligible_usage_limit_candidate(&states[&thread_id])
@@ -4074,18 +4097,44 @@ mod tests {
         // A new action invalidates the last confirmed candidate between scans.
         states.replace_native_usage_limit_snapshot(vec![turn], Vec::new(), false);
         advance_action_epoch(states.get_mut(&thread_id).unwrap());
-        assert_eq!(
-            states.usage_limit_resume_count(),
-            UsageLimitResumeCount::default()
-        );
+        let count = states.usage_limit_resume_count();
+        assert_eq!(count.count, 0);
+        assert!(!count.complete);
+        assert!(count.scan_verified_at_ms.is_some());
 
         states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), true);
+        let count = states.usage_limit_resume_count();
+        assert_eq!(count.count, 0);
+        assert!(count.complete);
+    }
+
+    #[test]
+    fn usage_limit_count_identifies_current_verified_scans_even_when_partial() {
+        let mut states = RecoveryStates::default();
+        let before_publish_ms = chrono::Utc::now().timestamp_millis();
+        for complete in [true, false] {
+            states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), complete);
+            let count = states.usage_limit_resume_count();
+            let verified_at_ms = count.scan_verified_at_ms.unwrap();
+            assert!(verified_at_ms >= before_publish_ms);
+            assert_eq!(
+                serde_json::to_value(count).unwrap(),
+                serde_json::json!({"count": 0, "complete": complete, "scanVerifiedAtMs": verified_at_ms})
+            );
+
+            states.native_usage_limit_scan.as_mut().unwrap().verified_at =
+                Instant::now() - NATIVE_USAGE_LIMIT_CONFIRMATION_TTL - Duration::from_secs(1);
+            assert_eq!(
+                states.usage_limit_resume_count(),
+                UsageLimitResumeCount::default()
+            );
+        }
+
+        states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), true);
+        states.apply_native_usage_limit_snapshot(None);
         assert_eq!(
-            states.usage_limit_resume_count(),
-            UsageLimitResumeCount {
-                count: 0,
-                complete: true
-            }
+            serde_json::to_value(states.usage_limit_resume_count()).unwrap(),
+            serde_json::json!({"count": 0, "complete": false})
         );
     }
 
@@ -4108,25 +4157,21 @@ mod tests {
             states.usage_limit_resume_count(),
             UsageLimitResumeCount {
                 count: 1,
-                complete: false
+                ..Default::default()
             }
         );
 
         states.replace_native_usage_limit_snapshot(vec![turn.clone()], Vec::new(), true);
-        assert_eq!(
-            states.usage_limit_resume_count(),
-            UsageLimitResumeCount {
-                count: 1,
-                complete: true
-            }
-        );
+        let count = states.usage_limit_resume_count();
+        assert_eq!(count.count, 1);
+        assert!(count.complete);
 
-        states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), false);
+        states.apply_native_usage_limit_snapshot(None);
         assert_eq!(
             states.usage_limit_resume_count(),
             UsageLimitResumeCount {
                 count: 1,
-                complete: false
+                ..Default::default()
             }
         );
 
@@ -4233,21 +4278,23 @@ mod tests {
                 ..observed.clone()
             },
         ] {
-            states.apply_native_usage_limit_snapshot(
+            states.apply_native_usage_limit_snapshot(Some(
                 crate::codex_desktop::NativeUsageLimitSnapshot {
                     stale_proxy_turns: vec![stale],
                     ..Default::default()
                 },
-            );
+            ));
             assert_eq!(states.usage_limit_resume_count().count, 2);
         }
 
-        states.apply_native_usage_limit_snapshot(crate::codex_desktop::NativeUsageLimitSnapshot {
-            candidates: vec![turn.clone()],
-            stale_proxy_turns: vec![observed],
-            complete: true,
-            ..Default::default()
-        });
+        states.apply_native_usage_limit_snapshot(Some(
+            crate::codex_desktop::NativeUsageLimitSnapshot {
+                candidates: vec![turn.clone()],
+                stale_proxy_turns: vec![observed],
+                complete: true,
+                ..Default::default()
+            },
+        ));
         assert_eq!(states.usage_limit_resume_count().count, 1);
         assert!(!usage_limit_candidate_is_current(
             &states[&turn.thread_id],
@@ -4294,7 +4341,7 @@ mod tests {
 
         let stale_at =
             Instant::now() - NATIVE_USAGE_LIMIT_CONFIRMATION_TTL - Duration::from_secs(1);
-        states.native_usage_limit_snapshot_completed_at = Some(stale_at);
+        states.native_usage_limit_scan.as_mut().unwrap().verified_at = stale_at;
         let candidate = states
             .get_mut(&turn.thread_id)
             .unwrap()
@@ -4317,19 +4364,16 @@ mod tests {
         ));
 
         states.replace_native_usage_limit_snapshot(Vec::new(), Vec::new(), false);
-        assert_eq!(
-            states.usage_limit_resume_count(),
-            UsageLimitResumeCount::default()
-        );
+        let count = states.usage_limit_resume_count();
+        assert_eq!(count.count, 0);
+        assert!(!count.complete);
+        assert!(count.scan_verified_at_ms.is_some());
 
         states.replace_native_usage_limit_snapshot(vec![turn.clone()], Vec::new(), false);
-        assert_eq!(
-            states.usage_limit_resume_count(),
-            UsageLimitResumeCount {
-                count: 1,
-                complete: false
-            }
-        );
+        let count = states.usage_limit_resume_count();
+        assert_eq!(count.count, 1);
+        assert!(!count.complete);
+        assert!(count.scan_verified_at_ms.is_some());
         assert!(usage_limit_candidate_is_current(
             &states[&turn.thread_id],
             &previous_confirmation
@@ -4346,13 +4390,9 @@ mod tests {
         };
         let mut states = RecoveryStates::default();
         states.replace_native_usage_limit_snapshot(vec![turn], Vec::new(), true);
-        assert_eq!(
-            states.usage_limit_resume_count(),
-            UsageLimitResumeCount {
-                count: 1,
-                complete: true
-            }
-        );
+        let count = states.usage_limit_resume_count();
+        assert_eq!(count.count, 1);
+        assert!(count.complete);
 
         states.clear_native_usage_limit_snapshot();
         assert_eq!(

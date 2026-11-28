@@ -209,12 +209,17 @@ const harness = (...sessions: Session[]) => {
       throw new Error("Unexpected test RPC");
     },
   );
-  const makeClient = (hostId = "local", original = request) => {
+  const makeClient = (
+    hostId = "local",
+    original = request,
+    { usePersistedFixtureOnError = true } = {},
+  ) => {
     const persistedAwareRequest = async (
       method: string,
       params: Record<string, unknown>,
     ) => {
-      if (method !== "thread/list") return original(method, params);
+      if (method !== "thread/list" || !usePersistedFixtureOnError)
+        return original(method, params);
       try {
         return await original(method, params);
       } catch {
@@ -1781,6 +1786,113 @@ describe("native Codex usage-limit observation", () => {
   });
 
   it.each([
+    { interruption: "page limit", pageReads: 8, eligible: true },
+    { interruption: "later read failure", pageReads: 2, eligible: true },
+    { interruption: "duplicate binding", pageReads: 2, eligible: false },
+  ])(
+    "checks independently validated persisted rows after $interruption",
+    async ({ interruption, pageReads, eligible }) => {
+      const confirmed = [
+        session("persisted-first"),
+        session("persisted-second"),
+      ];
+      const stale = session("persisted-stale");
+      for (const target of [...confirmed, stale]) {
+        fail(target);
+        target.readState = {
+          firstUnread: { type: "turn", turnId: target.turn.id },
+          revision: "persisted-delivery",
+        };
+      }
+      stale.turn.id = "replaced-turn";
+      const history = Array.from({ length: 254 }, (_, index) =>
+        session(`older-${index}`),
+      );
+      const { state, request, makeClient } = harness(
+        ...confirmed,
+        stale,
+        ...history,
+      );
+      state.appServerClients = [
+        makeClient("local", request, { usePersistedFixtureOnError: false }),
+      ];
+      const original = request.getMockImplementation()!;
+      request.mockImplementation(async (method, params) => {
+        if (method === "thread/loaded/list")
+          return { data: [], nextCursor: null };
+        if (method === "thread/read") {
+          const response = (await original(method, params)) as {
+            thread: Session["thread"];
+          };
+          return { thread: response.thread };
+        }
+        if (method === "thread/list" && params.cursor !== null) {
+          if (interruption === "later read failure")
+            throw new Error("Fixture persisted list unavailable");
+          if (interruption === "duplicate binding")
+            return {
+              data: [confirmed[0].thread],
+              readStates: {},
+              nextCursor: null,
+            };
+        }
+        return original(method, params);
+      });
+
+      expect(await state.collectCodexNativeUsageLimitCandidates()).toEqual(
+        incompleteScan(
+          eligible
+            ? confirmed.map((target) =>
+                expect.objectContaining({
+                  threadId: target.thread.id,
+                  turnId: target.turn.id,
+                }),
+              )
+            : [],
+        ),
+      );
+      expect(
+        request.mock.calls.filter(([method]) => method === "thread/list"),
+      ).toHaveLength(pageReads);
+      expect(
+        request.mock.calls.filter(([method]) => method === "thread/turns/list"),
+      ).toHaveLength(eligible ? 3 : 0);
+    },
+  );
+
+  it("preserves a verified loaded candidate when the first persisted page fails", async () => {
+    const target = session("loaded-with-persisted-list-error");
+    fail(target);
+    target.readState = {
+      firstUnread: { type: "turn", turnId: target.turn.id },
+      revision: "loaded-delivery",
+    };
+    const { state, request, makeClient } = harness(target);
+    state.appServerClients = [
+      makeClient("local", request, { usePersistedFixtureOnError: false }),
+    ];
+    const original = request.getMockImplementation()!;
+    request.mockImplementation(async (method, params) => {
+      if (method === "thread/list")
+        throw new Error("Fixture persisted list unavailable");
+      return original(method, params);
+    });
+
+    const candidate = expect.objectContaining({
+      threadId: target.thread.id,
+      turnId: target.turn.id,
+    });
+    expect(await state.collectCodexNativeUsageLimitCandidates()).toEqual(
+      incompleteScan([candidate]),
+    );
+
+    request.mockImplementation(original);
+    expectCompleteScan(
+      await state.collectCodexNativeUsageLimitCandidates(),
+    ).toEqual([candidate]);
+  });
+
+  it.each([
     { method: "turn/start", actionOffsetMs: 400, counted: true },
     { method: "turn/start", actionOffsetMs: 600, counted: false },
     { method: "turn/interrupt", actionOffsetMs: 600, counted: false },
@@ -1975,6 +2087,98 @@ describe("native Codex usage-limit observation", () => {
       }),
     ]);
   });
+
+  it("does not count an unloaded failure even with running proof and an exact unread receipt", async () => {
+    const target = session("unloaded-unread-after-running");
+    const { state } = harness(target);
+    expectCompleteScan(
+      await state.collectCodexNativeUsageLimitCandidates(),
+    ).toEqual([]);
+
+    fail(target);
+    target.readState = {
+      firstUnread: { type: "turn", turnId: target.turn.id },
+      revision: "delivery-revision",
+    };
+    target.thread.status.type = "notLoaded";
+    expectCompleteScan(
+      await state.collectCodexNativeUsageLimitCandidates(),
+    ).toEqual([]);
+    expect(
+      state.getCodexNativeUsageLimitCandidate(target.thread.id, target.turn.id),
+    ).toBeNull();
+
+    target.thread.status.type = "systemError";
+    target.readState = undefined;
+    expectCompleteScan(
+      await state.collectCodexNativeUsageLimitCandidates(),
+    ).toEqual([
+      expect.objectContaining({
+        threadId: target.thread.id,
+        turnId: target.turn.id,
+      }),
+    ]);
+  });
+
+  it.each([true, false])(
+    "withdraws only the unloaded candidate during a partial scan (still listed: %s)",
+    async (stillListed) => {
+      const target = session("evicted-after-counting");
+      const other = session("other-verified-candidate");
+      const unreadable = session("unrelated-incomplete-read");
+      const { state, request } = harness(target, other, unreadable);
+      await state.collectCodexNativeUsageLimitCandidates();
+      fail(target);
+      fail(other);
+      target.readState = {
+        firstUnread: { type: "turn", turnId: target.turn.id },
+        revision: "delivery-revision",
+      };
+      const targetCandidate = expect.objectContaining({
+        threadId: target.thread.id,
+        turnId: target.turn.id,
+      });
+      const otherCandidate = expect.objectContaining({
+        threadId: other.thread.id,
+        turnId: other.turn.id,
+      });
+      const bothCandidates = expect.arrayContaining([
+        targetCandidate,
+        otherCandidate,
+      ]);
+      expectCompleteScan(
+        await state.collectCodexNativeUsageLimitCandidates(),
+      ).toEqual(bothCandidates);
+
+      target.thread.status.type = "notLoaded";
+      const original = request.getMockImplementation()!;
+      request.mockImplementation(async (method, params) => {
+        if (
+          method === "thread/read" &&
+          params.threadId === unreadable.thread.id
+        )
+          throw new Error("Fixture unrelated thread unavailable");
+        if (method === "thread/loaded/list" && !stillListed)
+          return {
+            data: [other.thread.id, unreadable.thread.id],
+            nextCursor: null,
+          };
+        return original(method, params);
+      });
+      expect(await state.collectCodexNativeUsageLimitCandidates()).toEqual({
+        candidates: [otherCandidate],
+        complete: false,
+        conflictingThreadIds: [target.thread.id],
+      });
+
+      request.mockImplementation(original);
+      target.thread.status.type = "systemError";
+      target.readState = undefined;
+      expectCompleteScan(
+        await state.collectCodexNativeUsageLimitCandidates(),
+      ).toEqual(bothCandidates);
+    },
+  );
 
   it.each([
     { transition: "the same turn returns", expected: true },

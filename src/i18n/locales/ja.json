@@ -4113,6 +4113,40 @@
       "partialEmptyAction": "検出待ち",
       "checkingStatus": "確認済みセッションをスキャン中…",
       "unavailableStatus": "確認済みセッションのスキャンを利用できません",
+      "errors": {
+        "scanTimedOut": {
+          "status": "セッションのスキャンがタイムアウトしました",
+          "description": "Codex Desktop を開いたまま、更新ボタンを押してもう一度スキャンしてください。"
+        },
+        "observerStopped": {
+          "status": "セッションの監視が停止しました",
+          "description": "更新ボタンを押して再試行してください。監視が繰り返し停止する場合は、CC Switch を開き直してください。"
+        },
+        "observerUnavailable": {
+          "status": "セッションを監視できません",
+          "description": "Codex Desktop を開き、CC Switch で接続を確認してから、更新ボタンをもう一度押してください。"
+        },
+        "desktopNotLinked": {
+          "status": "Codex Desktop の接続が必要です",
+          "description": "作業を保存して Codex Desktop を完全に終了してください。CC Switch の Codex マルチモデルルーティング → Status → Link → Unlock model picker を選択すると、再起動して接続できます。"
+        },
+        "desktopNotRunning": {
+          "status": "Codex Desktop は起動していません",
+          "description": "CC Switch の Codex マルチモデルルーティング → Status → Link → Unlock model picker を選択して、Codex Desktop を起動し接続してください。"
+        },
+        "refreshUnsupported": {
+          "status": "セッションの手動スキャンに未対応です",
+          "description": "このバージョンの CC Switch は、セッション復旧の手動スキャンに対応していません。更新ボタンを使うには、CC Switch をアップデートしてください。"
+        },
+        "countReadFailed": {
+          "status": "続行できるセッションを読み取れません",
+          "description": "確認済みセッションの一覧を読み取れませんでした。更新ボタンを押して再試行してください。"
+        },
+        "evidenceStorageUnavailable": {
+          "status": "セッション復旧データにアクセスできません",
+          "description": "CC Switch がローカルのセッション復旧データにアクセスできません。CC Switch のデータフォルダーへのアクセスを確認し、アプリを開き直して再試行してください。"
+        }
+      },
       "refreshing": "セッションの確認を更新中",
       "refresh": "続行できるセッションを確認",
       "sendingStatus": "Continue を送信中…",

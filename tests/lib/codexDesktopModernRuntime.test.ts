@@ -450,6 +450,8 @@ describe("Codex Desktop current numeric-bundle runtime integration", () => {
         async (method: string, _params?: object, _options?: unknown) => {
           if (method === "thread/loaded/list")
             return { data: ["fixture-thread"], nextCursor: null };
+          if (method === "thread/list")
+            return { data: [], readStates: {}, nextCursor: null };
           if (method === "thread/read")
             return {
               thread: {
@@ -985,6 +987,45 @@ describe("Codex Desktop current numeric-bundle runtime integration", () => {
       resolveImport(native.webpack.namespace);
       await installation;
       now.mockRestore();
+      harness.dispose();
+      picker.dispose();
+      client.clear();
+    }
+  });
+
+  it("reconciles native reasoning visibility when numeric discovery resolves after the heartbeat", async () => {
+    const client = new QueryClient();
+    const picker = createPicker(client);
+    const native = createNativeVisibilityFixture(client, new Set(nativeVisibleEfforts));
+    let resolveImport!: (namespace: object) => void;
+    const numericImport = new Promise<object>((resolve) => {
+      resolveImport = resolve;
+    });
+    const harness = createHarness(native.webpack.namespace, {
+      reactScope: native.scope,
+      numericImport,
+    });
+    try {
+      await harness.execute();
+      expect(picker.efforts()).toEqual(allEfforts);
+      resolveImport(native.webpack.namespace);
+      for (let index = 0; index < 256; index += 1) await Promise.resolve();
+      expect(picker.efforts()).toEqual(allEfforts);
+      expect(harness.state.readCodexModelPickerDiagnostics?.()).toMatchObject({
+        status: "mismatch",
+        missingMaxModelCount: 0,
+        missingUltraModelCount: 1,
+      });
+      expect(
+        harness.state.nativeReasoningVisibilityReconciliation,
+      ).toMatchObject({
+        status: "known",
+        managed: true,
+        patchedScopes: 1,
+      });
+    } finally {
+      resolveImport(native.webpack.namespace);
+      for (let index = 0; index < 256; index += 1) await Promise.resolve();
       harness.dispose();
       picker.dispose();
       client.clear();

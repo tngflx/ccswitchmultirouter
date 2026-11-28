@@ -17,10 +17,16 @@ const codexNativeReasoningOwnerRefusal = (inspection, reason) => {
   return null;
 };
 const codexNativeReasoningScopeQueryCache = (scope, inspection) => {
+  if (!codexDeclaredDependencyScope(scope))
+    return codexNativeReasoningOwnerRefusal(inspection, "scope_contract");
+  return codexNativeReasoningNodeQueryCache(
+    codexNativeReasoningOwnData(scope, "node"),
+    inspection,
+  );
+};
+const codexNativeReasoningNodeQueryCache = (node, inspection) => {
   const refuse = (reason) =>
     codexNativeReasoningOwnerRefusal(inspection, reason);
-  if (!codexDeclaredDependencyScope(scope)) return refuse("scope_contract");
-  const node = codexNativeReasoningOwnData(scope, "node");
   // Modern retained nodes may use one exact generated forwarding triple. The
   // shared helper validates every descriptor before invoking only its pure
   // queryClient forwarder; arbitrary accessors remain untrusted.
@@ -79,6 +85,10 @@ const codexNativeReasoningCompleteOwnerProof = (
               kind: "complete",
               scopes: currentScopes,
               scopeCaches,
+              scopeBindings:
+                state.scopedAppServerScopeProvenance?.scopeBindings,
+              roots: codexRendererScopeRootIdentities(),
+              mutationGeneration: codexRendererMutationGeneration(),
               caches: new Set(scopeCaches.values()),
             }
           : refuse("inventory_empty");
@@ -368,11 +378,9 @@ const readCodexNativeReasoningVisibility = (cache, efforts, ownerProof) => {
 // The native model projection reads Q3tq.pN through the same current dependency
 // scope that owns the picker query cache. Native account defaults can omit
 // provider-declared levels (for example OpenRouter minimal or native Max).
-// Keep the repair renderer-local and reversible: wrap only that exact
-// scope.get/atom pair, return a Set clone with declared native graded levels,
-// and never persist or mutate the user's
-// Codex preference store. A release or renderer reinjection restores the exact
-// original method.
+// The composer subscribes to the resolved atom through its store. Scopes
+// without that store contract still read their native preference via scope.get.
+// Both readers project a Set without changing the stored preference.
 const codexNativeReasoningCloneSet = (value) => {
   try {
     Set.prototype.has.call(value, "");
@@ -622,17 +630,20 @@ const codexNativeReasoningPatchPickerPowerSelections = () => {
     const existing = new Map();
     const residual = [];
     let removed = 0;
-    for (const selection of selections) {
-      const effort = codexNativeReasoningOwnData(selection, "reasoningEffort");
+    const ownsSelection = (selection) => {
       const selectedModel = codexNativeReasoningOwnData(selection, "model");
-      const owned =
+      return (
         typeof selectedModel === "string" &&
         normalizedIdentity(selectedModel) === normalizedIdentity(model) &&
         codexNativeReasoningMatchesPickerProvider(
           selection,
           payload.modelProvider.trim(),
-        );
-      if (!owned || typeof effort !== "string") {
+        )
+      );
+    };
+    for (const selection of selections) {
+      const effort = codexNativeReasoningOwnData(selection, "reasoningEffort");
+      if (!ownsSelection(selection) || typeof effort !== "string") {
         residual.push(selection);
       } else if (!allowed.has(effort) || existing.has(effort)) {
         removed += 1;
@@ -671,7 +682,20 @@ const codexNativeReasoningPatchPickerPowerSelections = () => {
       next.push(generated);
     }
     next.push(...residual);
-    updates.set(props, { field, next });
+    updates.set(props, {
+      field,
+      next: next.map((row, index) => {
+        const previous = codexNativeReasoningOwnData(row, "powerSettingIndex");
+        return Number.isSafeInteger(previous) &&
+          previous !== index &&
+          ownsSelection(row)
+          ? {
+              ...codexNativeReasoningCopyEnumerableData(row),
+              powerSettingIndex: index,
+            }
+          : row;
+      }),
+    });
   }
   // DOM and Fiber lookups precede one inventory check for the whole batch.
   if (
@@ -782,6 +806,221 @@ const codexNativeReasoningPatchMap = () => {
     state.nativeReasoningVisibilityPatches = new Map();
   return state.nativeReasoningVisibilityPatches;
 };
+const codexNativeReasoningComposerNode = (scope, brand) => {
+  try {
+    return Map.prototype.get.call(
+      codexNativeReasoningOwnData(scope, "chain"),
+      codexNativeReasoningOwnData(brand, "id"),
+    );
+  } catch {
+    return undefined;
+  }
+};
+const codexNativeReasoningResolvedAtom = (node, atom) => {
+  try {
+    // Desktop's cached signal resolver retains one atom per definition on
+    // its owning node. Inspect that exact binding without resolving it again.
+    return WeakMap.prototype.get.call(
+      codexNativeReasoningOwnData(node, "cachedBindings"),
+      atom,
+    );
+  } catch {
+    return undefined;
+  }
+};
+const codexNativeReasoningAgreesWithScopeGet = (scope, brand, owner) => {
+  // React uses the context chain. The imperative getter first checks the
+  // nearest matching node, then falls back to the chain.
+  let node = codexNativeReasoningOwnData(scope, "node");
+  for (let depth = 0; node && depth < 32; depth += 1) {
+    if (codexNativeReasoningOwnData(node, "token") === brand)
+      return node === owner;
+    const parent = Object.getOwnPropertyDescriptor(node, "parent");
+    if (!parent || "value" in parent) node = parent?.value;
+    else if (codexForwardedNodeQueryClientDescriptor(node))
+      node = parent.get.call(node);
+    else return false;
+  }
+  return node == null;
+};
+const codexNativeReasoningRestoreGet = (target, record) => {
+  try {
+    if (codexNativeReasoningOwnData(target, "get") !== record.patched)
+      return false;
+    if (record.originalOwnDescriptor)
+      Object.defineProperty(target, "get", record.originalOwnDescriptor);
+    else delete target.get;
+    return true;
+  } catch {
+    return false;
+  }
+};
+// A same-fingerprint reinjection retains the installed readers. Share their
+// registry so a new scope cannot wrap an already patched store again.
+const codexNativeReasoningStorePatches =
+  (state.nativeReasoningVisibilityStorePatches ??= new Map());
+const codexNativeReasoningSameFiber = (saved, current) =>
+  saved === current ||
+  (codexNativeReasoningOwnData(saved, "alternate") === current &&
+    codexNativeReasoningOwnData(current, "alternate") === saved);
+const codexNativeReasoningStoreScopeIsCurrent = (scope, cache) => {
+  if (codexNativeReasoningScopeIsCurrent(scope, cache)) return true;
+  // React checks the external-store snapshot after committing the alternate
+  // HostRoot. Revalidate the exact mounted scope along the committed edges
+  // so that a renderer commit alone does not change the store snapshot.
+  const proof = state.nativeReasoningVisibilityOwnerProof;
+  if (
+    proof?.scopeCaches.get(scope) !== cache ||
+    proof.mutationGeneration !== codexRendererMutationGeneration() ||
+    state.pendingReactNodes?.size > 0
+  )
+    return false;
+  const binding = proof.scopeBindings?.get(scope);
+  if (binding?.value !== scope) return false;
+  const roots = codexRendererScopeRootIdentities();
+  if (
+    roots.length !== proof.roots.length ||
+    !roots.every(
+      (root, index) =>
+        codexNativeReasoningSameFiber(proof.roots[index], root) &&
+        codexNativeReasoningOwnData(proof.roots[index], "stateNode") ===
+          codexNativeReasoningOwnData(root, "stateNode"),
+    )
+  )
+    return false;
+  const path = [];
+  let ancestor = binding;
+  while (ancestor.parent) {
+    if (path.length >= CODEX_RENDERER_FIBER_SCAN_LIMIT + 16) return false;
+    path.push(ancestor);
+    ancestor = ancestor.parent;
+  }
+  let value = roots[proof.roots.indexOf(ancestor.value)];
+  let onFiber = true;
+  for (let index = path.length - 1; index >= 0; index -= 1) {
+    const { key, value: saved } = path[index];
+    value = codexNativeReasoningOwnData(value, key);
+    if (!value) return false;
+    onFiber = onFiber && (key === "child" || key === "sibling");
+    if (onFiber && !codexNativeReasoningSameFiber(saved, value)) return false;
+  }
+  return (
+    value === scope && codexNativeReasoningScopeQueryCache(scope) === cache
+  );
+};
+const codexNativeReasoningStoreBindingIsCurrent = (scope, binding) => {
+  const {
+    atom,
+    brand,
+    cache,
+    node,
+    store,
+    scopeBrand,
+    scopeGet,
+    scopeNode,
+    resolve,
+    resolved,
+    patch,
+  } = binding;
+  try {
+    const atoms = state.nativeReasoningVisibilityAtoms;
+    return (
+      Array.isArray(atoms) &&
+      codexNativeReasoningOwnData(atoms, "length") === 1 &&
+      codexNativeReasoningOwnData(atoms, "0") === atom &&
+      codexNativeReasoningOwnData(atom, "scope") === brand &&
+      codexNativeReasoningOwnData(atom, "resolve") === resolve &&
+      codexNativeReasoningOwnData(scope, "scope") === scopeBrand &&
+      codexNativeReasoningOwnData(scope, "get") === scopeGet &&
+      codexNativeReasoningOwnData(scope, "node") === scopeNode &&
+      codexNativeReasoningOwnData(store, "get") === patch.patched &&
+      codexNativeReasoningOwnData(node, "store") === store &&
+      codexNativeReasoningComposerNode(scope, brand) === node &&
+      codexNativeReasoningResolvedAtom(node, atom) === resolved &&
+      codexNativeReasoningAgreesWithScopeGet(scope, brand, node) &&
+      codexNativeReasoningStoreScopeIsCurrent(scope, cache) &&
+      (node === scopeNode ||
+        codexNativeReasoningNodeQueryCache(node) === cache) &&
+      codexNativeReasoningCacheHasManagedQuery(cache)
+    );
+  } catch {
+    return false;
+  }
+};
+const codexNativeReasoningProjectStoreValue = (reader, value) => {
+  if (state.nativeReasoningVisibilityOwnerProof?.payload !== currentPayload())
+    return value;
+  const native = codexNativeReasoningCloneSet(value);
+  if (!native) return value;
+  const missing = state.nativeReasoningVisibilityManagedEfforts.filter(
+    (effort) => !native.includes(effort),
+  );
+  if (!missing.length) return value;
+  const values = [...native, ...missing];
+  // useSyncExternalStore compares snapshots by identity. A new Set on each
+  // read would make React continually render even when membership is unchanged.
+  if (
+    reader.values?.length !== values.length ||
+    values.some((effort, index) => reader.values[index] !== effort)
+  ) {
+    reader.values = values;
+    reader.snapshot = new Set(values);
+  }
+  return reader.snapshot;
+};
+const codexNativeReasoningAttachStoreReader = (scope, binding) => {
+  const { resolved, store } = binding;
+  let patch = codexNativeReasoningStorePatches.get(store);
+  if (!patch) {
+    const originalOwnDescriptor = Object.getOwnPropertyDescriptor(store, "get");
+    const original = originalOwnDescriptor?.value;
+    if (
+      typeof original !== "function" ||
+      !originalOwnDescriptor.configurable ||
+      !originalOwnDescriptor.writable ||
+      typeof codexNativeReasoningOwnData(store, "sub") !== "function"
+    )
+      return false;
+    patch = { originalOwnDescriptor, readers: new Map() };
+    patch.patched = function ccSwitchNativeReasoningStoreGet(atom, ...args) {
+      const value = original.call(this, atom, ...args);
+      if (this !== store) return value;
+      const reader = patch.readers.get(atom);
+      if (state.nativeReasoningVisibilityEnabled === true && reader) {
+        for (const [owner, current] of reader.bindings)
+          if (codexNativeReasoningStoreBindingIsCurrent(owner, current))
+            return codexNativeReasoningProjectStoreValue(reader, value);
+      }
+      return value;
+    };
+    Object.defineProperty(store, "get", {
+      ...originalOwnDescriptor,
+      value: patch.patched,
+    });
+    codexNativeReasoningStorePatches.set(store, patch);
+  }
+  if (codexNativeReasoningOwnData(store, "get") !== patch.patched) return false;
+  let reader = patch.readers.get(resolved);
+  if (!reader) {
+    reader = { bindings: new Map() };
+    patch.readers.set(resolved, reader);
+  }
+  binding.patch = patch;
+  reader.bindings.set(scope, binding);
+  return true;
+};
+const codexNativeReasoningRestoreScope = (scope, record) => {
+  if (!record.store) return codexNativeReasoningRestoreGet(scope, record);
+  const { store, resolved, patch } = record;
+  const reader = patch.readers.get(resolved);
+  reader.bindings.delete(scope);
+  if (!reader.bindings.size) patch.readers.delete(resolved);
+  if (!patch.readers.size) {
+    codexNativeReasoningRestoreGet(store, patch);
+    codexNativeReasoningStorePatches.delete(store);
+  }
+  return true;
+};
 const restoreCodexNativeReasoningVisibility = () => {
   const patches = state.nativeReasoningVisibilityPatches;
   state.nativeReasoningVisibilityEnabled = false;
@@ -791,15 +1030,7 @@ const restoreCodexNativeReasoningVisibility = () => {
   if (!(patches instanceof Map)) return 0;
   let restored = 0;
   for (const [scope, record] of patches) {
-    try {
-      const current = Object.getOwnPropertyDescriptor(scope, "get");
-      if (current?.value === record.patched) {
-        if (record.originalOwnDescriptor)
-          Object.defineProperty(scope, "get", record.originalOwnDescriptor);
-        else delete scope.get;
-        restored += 1;
-      }
-    } catch {}
+    if (codexNativeReasoningRestoreScope(scope, record)) restored += 1;
     patches.delete(scope);
   }
   return restored;
@@ -911,10 +1142,8 @@ const reconcileCodexNativeReasoningVisibility = (requestedEfforts) => {
   // canonical atom-owner proof may authorize only native visibility.
   const atom = codexNativeReasoningOwnData(atoms, "0");
   const atomScope = codexNativeReasoningOwnData(atom, "scope");
-  if (
-    !atomScope ||
-    typeof codexNativeReasoningOwnData(atom, "resolve") !== "function"
-  ) {
+  const resolve = codexNativeReasoningOwnData(atom, "resolve");
+  if (!atomScope || typeof resolve !== "function") {
     result.refusalReason = "native_atom_definition_unverified";
     result.restoredScopes = codexNativeReasoningRestoreAndRefresh();
     return result;
@@ -941,8 +1170,22 @@ const reconcileCodexNativeReasoningVisibility = (requestedEfforts) => {
             codexNativeReasoningCacheHasManagedQuery,
           ),
         );
-  state.nativeReasoningVisibilityOwnerProof = ownerProof;
+  state.nativeReasoningVisibilityOwnerProof = {
+    ...ownerProof,
+    payload: currentPayload(),
+  };
   const patches = codexNativeReasoningPatchMap();
+  const usesComposerStore =
+    typeof codexNativeReasoningOwnData(atomScope, "id") === "symbol";
+  const unmanagedStores = new Set();
+  if (usesComposerStore) {
+    for (const [scope, cache] of ownerProof.scopeCaches) {
+      if (managedCaches.has(cache)) continue;
+      const node = codexNativeReasoningComposerNode(scope, atomScope);
+      const store = codexNativeReasoningOwnData(node, "store");
+      if (store) unmanagedStores.add(store);
+    }
+  }
   let newlyPatchedScopes = 0;
   // A changed atom, scope, or renderer ownership snapshot invalidates the old
   // wrapper. Restore it before installing the new exact current-owner patch.
@@ -950,27 +1193,23 @@ const reconcileCodexNativeReasoningVisibility = (requestedEfforts) => {
     let retained = record.atom === atom && currentScopes.has(scope);
     if (retained) {
       try {
-        const getDescriptor = Object.getOwnPropertyDescriptor(scope, "get");
         const cache = ownerProof.scopeCaches.get(scope);
         retained =
-          getDescriptor?.value === record.patched &&
-          Boolean(cache) &&
           cache === record.cache &&
-          managedCaches.has(cache);
+          managedCaches.has(cache) &&
+          (record.store
+            ? usesComposerStore &&
+              !unmanagedStores.has(record.store) &&
+              codexNativeReasoningStoreBindingIsCurrent(scope, record)
+            : !usesComposerStore &&
+              codexNativeReasoningOwnData(scope, "get") === record.patched);
       } catch {
         retained = false;
       }
     }
     if (!retained) {
-      try {
-        const current = Object.getOwnPropertyDescriptor(scope, "get");
-        if (current?.value === record.patched) {
-          if (record.originalOwnDescriptor)
-            Object.defineProperty(scope, "get", record.originalOwnDescriptor);
-          else delete scope.get;
-          result.restoredScopes += 1;
-        }
-      } catch {}
+      if (codexNativeReasoningRestoreScope(scope, record))
+        result.restoredScopes += 1;
       patches.delete(scope);
     }
   }
@@ -999,6 +1238,55 @@ const reconcileCodexNativeReasoningVisibility = (requestedEfforts) => {
     }
     const ownDescriptor = Object.getOwnPropertyDescriptor(scope, "get");
     const original = codexDeclaredMethod(scope, "get");
+    if (usesComposerStore) {
+      try {
+        const node = codexNativeReasoningComposerNode(scope, atomScope);
+        const store = codexNativeReasoningOwnData(node, "store");
+        if (
+          codexNativeReasoningOwnData(atom, "cache") !== "cached" ||
+          typeof original !== "function" ||
+          codexNativeReasoningOwnData(node, "token") !== atomScope ||
+          !store ||
+          unmanagedStores.has(store) ||
+          codexNativeReasoningNodeQueryCache(node) !== cache ||
+          !codexNativeReasoningAgreesWithScopeGet(scope, atomScope, node)
+        ) {
+          result.refusalReason = "native_store_owner_unverified";
+          break;
+        }
+        if (!codexNativeReasoningCloneSet(original.call(scope, atom))) {
+          result.refusalReason = "native_set_unverified";
+          break;
+        }
+        const resolved = codexNativeReasoningResolvedAtom(node, atom);
+        const record = {
+          atom,
+          brand: atomScope,
+          cache,
+          node,
+          resolve,
+          resolved,
+          scopeBrand: codexNativeReasoningOwnData(scope, "scope"),
+          scopeGet: original,
+          scopeNode: codexNativeReasoningOwnData(scope, "node"),
+          store,
+        };
+        if (
+          typeof codexNativeReasoningOwnData(resolved, "read") !== "function" ||
+          !codexNativeReasoningAttachStoreReader(scope, record)
+        ) {
+          result.refusalReason = "native_store_reader_unverified";
+          break;
+        }
+        patches.set(scope, record);
+        newlyPatchedScopes += 1;
+        result.patchedScopes += 1;
+        continue;
+      } catch {
+        result.refusalReason = "native_store_read_failed";
+        break;
+      }
+    }
     if (
       typeof original !== "function" ||
       (ownDescriptor &&

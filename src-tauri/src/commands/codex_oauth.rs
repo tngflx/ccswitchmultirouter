@@ -5,12 +5,10 @@
 //! 大部分认证命令通过通用 `auth_*` 命令（参见 `commands::auth`）暴露给前端，
 //! 此处定义 State wrapper 以及 Codex OAuth 专属的订阅额度和模型列表查询命令。
 
-use crate::app_config::AppType;
 use crate::proxy::providers::codex_oauth_auth::{
     CodexAccountPoolPolicy, CodexOAuthError, CodexOAuthManager,
 };
 use crate::services::model_fetch::FetchedModel;
-use crate::services::provider::ProviderService;
 use crate::services::subscription::{query_codex_quota, CredentialStatus, SubscriptionQuota};
 use crate::store::AppState;
 use std::sync::Arc;
@@ -284,75 +282,30 @@ pub async fn refresh_codex_official_model_catalog(
         return Ok(status);
     }
 
-    let takeover_enabled = match state
-        .db
-        .get_proxy_config_for_app(AppType::Codex.as_str())
+    match state
+        .proxy_service
+        .reproject_official_codex_catalog_if_owned()
         .await
     {
-        Ok(config) => config.enabled,
-        Err(error) => {
-            log::warn!(
-                "unable to determine Codex takeover state during official catalog refresh: {error}"
-            );
-            status.projection_reason = Some("takeover_status_unavailable".to_string());
-            status.refresh_error.get_or_insert_with(|| {
-                "Unable to determine whether Codex takeover is active".to_string()
-            });
-            return Ok(status);
-        }
-    };
-    let live_config = match crate::codex_config::read_codex_config_text() {
-        Ok(config) => config,
-        Err(error) => {
-            log::warn!(
-                "unable to read Codex configuration during official catalog refresh: {error}"
-            );
-            status.projection_reason = Some("codex_config_unreadable".to_string());
-            status.refresh_error.get_or_insert_with(|| {
-                "Unable to read Codex configuration for safe projection".to_string()
-            });
-            return Ok(status);
-        }
-    };
-    if let Err(reason) = crate::codex_config::manual_official_catalog_projection_eligibility(
-        takeover_enabled,
-        &live_config,
-        &crate::codex_config::get_codex_config_dir(),
-    ) {
-        status.projection_reason = Some(reason.to_string());
-        return Ok(status);
-    }
-    let Some(provider_id) =
-        ProviderService::user_operable_current_provider_id(state.inner(), &AppType::Codex)
-            .map_err(|error| error.to_string())?
-    else {
-        status.projection_reason = Some("no_active_codex_provider".to_string());
-        return Ok(status);
-    };
-    let Some(provider) = state
-        .db
-        .get_provider_by_id(&provider_id, AppType::Codex.as_str())
-        .map_err(|error| error.to_string())?
-    else {
-        status.projection_reason = Some("no_active_codex_provider".to_string());
-        return Ok(status);
-    };
-
-    // This is deliberately the catalog-only builder, not
-    // `sync_current_provider_for_app`: a manual directory refresh must not
-    // rewrite user routing, auth, or other live config fields. The builder's
-    // existing projection chain publishes the generated catalog/cache pair
-    // through its compensating rollback boundary, and propagates either write
-    // failure. A failed result means pair synchronization was not confirmed.
-    match crate::services::provider::build_codex_live_config_for_provider(&state.db, &provider) {
-        Ok(_) => status.projection_applied = true,
-        Err(error) => {
-            log::warn!("official catalog refresh projection failed: {error}");
-            status.projection_reason = Some("projection_outputs_unconfirmed".to_string());
-            status.refresh_error.get_or_insert_with(|| {
-                "Official catalog refreshed, but CCSM could not confirm synchronized generated catalog outputs"
-                    .to_string()
-            });
+        Ok(()) => status.projection_applied = true,
+        Err(reason) => {
+            status.projection_reason = Some(reason.to_string());
+            let projection_error = match reason {
+                "takeover_status_unavailable" => {
+                    Some("Unable to determine whether Codex takeover is active".to_string())
+                }
+                "codex_config_unreadable" => {
+                    Some("Unable to read Codex configuration for safe projection".to_string())
+                }
+                "projection_outputs_unconfirmed" => Some(
+                    "Official catalog refreshed, but CCSM could not confirm synchronized generated catalog outputs"
+                        .to_string(),
+                ),
+                _ => None,
+            };
+            if let Some(error) = projection_error {
+                status.refresh_error.get_or_insert(error);
+            }
         }
     }
     Ok(status)
